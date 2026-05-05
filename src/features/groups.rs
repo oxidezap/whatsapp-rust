@@ -172,9 +172,9 @@ impl From<GroupInfoResponse> for GroupMetadata {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CreateGroupResult {
-    pub gid: Jid,
+    pub metadata: GroupMetadata,
 }
 
 pub struct Groups<'a> {
@@ -303,9 +303,11 @@ impl<'a> Groups<'a> {
                 .await;
         }
 
-        let gid = self.client.execute(GroupCreateIq::new(options)).await?;
+        let group = self.client.execute(GroupCreateIq::new(options)).await?;
 
-        Ok(CreateGroupResult { gid })
+        Ok(CreateGroupResult {
+            metadata: GroupMetadata::from(group),
+        })
     }
 
     pub async fn set_subject(&self, jid: &Jid, subject: GroupSubject) -> Result<(), anyhow::Error> {

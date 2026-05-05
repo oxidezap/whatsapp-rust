@@ -1029,7 +1029,9 @@ impl GroupCreateIq {
 }
 
 impl IqSpec for GroupCreateIq {
-    type Response = Jid;
+    // Server's `<create>` reply carries the full `<group>` node, so callers
+    // can skip a follow-up `get_metadata` IQ. Mirrors WA Web's CreateJob.
+    type Response = GroupInfoResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set(
@@ -1043,13 +1045,7 @@ impl IqSpec for GroupCreateIq {
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
         let group_node = required_child(response, "group")?;
-        let group_id_str = required_attr(group_node, "id")?;
-
-        if group_id_str.contains('@') {
-            group_id_str.parse().map_err(Into::into)
-        } else {
-            Ok(Jid::group(group_id_str))
-        }
+        GroupInfoResponse::try_from_node_ref(group_node)
     }
 }
 
@@ -3498,6 +3494,67 @@ mod tests {
             Some("5511999999999@s.whatsapp.net".parse().unwrap())
         );
         assert_eq!(response.description_time, Some(1700000000));
+    }
+
+    /// Mirrors a real `<create>` IQ result captured from WA Web (LID community).
+    /// The create reply omits `<description>`, `<locked>`, `<announcement>`,
+    /// `size`, etc. — only `id` is required by `try_from_node_ref`, so this
+    /// guards against accidentally promoting any of those to required.
+    #[test]
+    fn test_group_info_response_parses_create_response() {
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363424766426717")
+            .attr("addressing_mode", "lid")
+            .attr("subject", "test")
+            .attr("creator", "236395184570386@lid")
+            .attr("creation", "1769039112")
+            .attr("s_t", "1769039112")
+            .attr("s_o", "236395184570386@lid")
+            .children([
+                NodeBuilder::new("ephemeral")
+                    .attr("expiration", 0u32)
+                    .build(),
+                NodeBuilder::new("member_link_mode")
+                    .string_content("admin_link")
+                    .build(),
+                NodeBuilder::new("member_add_mode")
+                    .string_content("all_member_add")
+                    .build(),
+                NodeBuilder::new("member_share_group_history_mode")
+                    .string_content("all_member_share")
+                    .build(),
+                NodeBuilder::new("participant")
+                    .attr("jid", "236395184570386@lid")
+                    .attr("type", "superadmin")
+                    .attr("phone_number", "559984726662@s.whatsapp.net")
+                    .build(),
+                NodeBuilder::new("participant")
+                    .attr("jid", "119009819262985@lid")
+                    .attr("phone_number", "559984696848@s.whatsapp.net")
+                    .build(),
+            ])
+            .build();
+
+        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+
+        assert_eq!(response.id.to_string(), "120363424766426717@g.us");
+        assert_eq!(response.subject.as_str(), "test");
+        assert_eq!(response.addressing_mode, AddressingMode::Lid);
+        assert_eq!(response.creation_time, Some(1769039112));
+        assert_eq!(response.subject_time, Some(1769039112));
+        assert_eq!(response.member_link_mode, Some(MemberLinkMode::AdminLink));
+        assert_eq!(response.member_add_mode, Some(MemberAddMode::AllMemberAdd));
+        assert_eq!(
+            response.member_share_history_mode,
+            Some(MemberShareHistoryMode::AllMemberShare)
+        );
+        assert_eq!(response.participants.len(), 2);
+        // Fields absent from the create response: should default cleanly
+        assert!(response.description.is_none());
+        assert!(!response.is_locked);
+        assert!(!response.is_announcement);
+        assert!(!response.is_parent_group);
+        assert!(response.size.is_none());
     }
 
     #[test]

@@ -16,15 +16,19 @@ async fn test_community_create() -> anyhow::Result<()> {
         .await?;
 
     assert!(
-        result.gid.server == "g.us",
+        result.metadata.id.server == "g.us",
         "community JID should be a group: {}",
-        result.gid
+        result.metadata.id
     );
 
-    info!("Created community: {}", result.gid);
+    info!("Created community: {}", result.metadata.id);
 
     // Query the community and verify it's a parent group
-    let metadata = client.client.groups().get_metadata(&result.gid).await?;
+    let metadata = client
+        .client
+        .groups()
+        .get_metadata(&result.metadata.id)
+        .await?;
     assert!(metadata.is_parent_group, "should be a parent group");
     assert_eq!(group_type(&metadata), GroupType::Community);
 
@@ -50,10 +54,14 @@ async fn test_community_create_with_general_chat() -> anyhow::Result<()> {
         })
         .await?;
 
-    info!("Created community: {}", result.gid);
+    info!("Created community: {}", result.metadata.id);
 
     // Fetch subgroups — should have at least a default announcement subgroup
-    let subgroups = client.client.community().get_subgroups(&result.gid).await?;
+    let subgroups = client
+        .client
+        .community()
+        .get_subgroups(&result.metadata.id)
+        .await?;
 
     assert!(
         !subgroups.is_empty(),
@@ -106,7 +114,11 @@ async fn test_community_get_subgroups() -> anyhow::Result<()> {
         .create(CreateCommunityOptions::new("Subgroups Test"))
         .await?;
 
-    let subgroups = client.client.community().get_subgroups(&result.gid).await?;
+    let subgroups = client
+        .client
+        .community()
+        .get_subgroups(&result.metadata.id)
+        .await?;
 
     // A newly created community should have an auto-created default subgroup
     assert!(
@@ -116,7 +128,7 @@ async fn test_community_get_subgroups() -> anyhow::Result<()> {
 
     info!(
         "Community {} has {} subgroup(s)",
-        result.gid,
+        result.metadata.id,
         subgroups.len()
     );
 
@@ -137,7 +149,7 @@ async fn test_community_link_subgroup() -> anyhow::Result<()> {
         .create(CreateCommunityOptions::new("Link Test Community"))
         .await?;
 
-    info!("Created community: {}", community.gid);
+    info!("Created community: {}", community.metadata.id);
 
     // Create a regular group to link as a subgroup
     let group = client
@@ -146,13 +158,16 @@ async fn test_community_link_subgroup() -> anyhow::Result<()> {
         .create_group(GroupCreateOptions::new("Sub Group"))
         .await?;
 
-    info!("Created group: {}", group.gid);
+    info!("Created group: {}", group.metadata.id);
 
     // Link the group to the community
     let link_result = client
         .client
         .community()
-        .link_subgroups(&community.gid, std::slice::from_ref(&group.gid))
+        .link_subgroups(
+            &community.metadata.id,
+            std::slice::from_ref(&group.metadata.id),
+        )
         .await?;
 
     assert!(
@@ -161,21 +176,21 @@ async fn test_community_link_subgroup() -> anyhow::Result<()> {
         link_result.failed_groups
     );
     assert!(
-        link_result.linked_jids.contains(&group.gid),
+        link_result.linked_jids.contains(&group.metadata.id),
         "linked JIDs should contain the subgroup"
     );
 
-    info!("Linked subgroup {} to community", group.gid);
+    info!("Linked subgroup {} to community", group.metadata.id);
 
     // Verify the subgroup appears in the community's subgroup list
     let subgroups = client
         .client
         .community()
-        .get_subgroups(&community.gid)
+        .get_subgroups(&community.metadata.id)
         .await?;
 
     assert!(
-        subgroups.iter().any(|s| s.id == group.gid),
+        subgroups.iter().any(|s| s.id == group.metadata.id),
         "linked group should appear in subgroup list"
     );
 
@@ -205,19 +220,26 @@ async fn test_community_unlink_subgroup() -> anyhow::Result<()> {
     client
         .client
         .community()
-        .link_subgroups(&community.gid, std::slice::from_ref(&group.gid))
+        .link_subgroups(
+            &community.metadata.id,
+            std::slice::from_ref(&group.metadata.id),
+        )
         .await?;
 
     info!(
         "Linked subgroup {} to community {}",
-        group.gid, community.gid
+        group.metadata.id, community.metadata.id
     );
 
     // Unlink the subgroup
     let unlink_result = client
         .client
         .community()
-        .unlink_subgroups(&community.gid, std::slice::from_ref(&group.gid), false)
+        .unlink_subgroups(
+            &community.metadata.id,
+            std::slice::from_ref(&group.metadata.id),
+            false,
+        )
         .await?;
 
     assert!(
@@ -225,21 +247,21 @@ async fn test_community_unlink_subgroup() -> anyhow::Result<()> {
         "no groups should fail unlinking"
     );
     assert!(
-        unlink_result.unlinked_jids.contains(&group.gid),
+        unlink_result.unlinked_jids.contains(&group.metadata.id),
         "unlinked JIDs should contain the subgroup"
     );
 
-    info!("Unlinked subgroup {}", group.gid);
+    info!("Unlinked subgroup {}", group.metadata.id);
 
     // Verify it's gone from the subgroup list
     let subgroups = client
         .client
         .community()
-        .get_subgroups(&community.gid)
+        .get_subgroups(&community.metadata.id)
         .await?;
 
     assert!(
-        !subgroups.iter().any(|s| s.id == group.gid),
+        !subgroups.iter().any(|s| s.id == group.metadata.id),
         "unlinked group should not appear in subgroup list"
     );
 
@@ -259,15 +281,23 @@ async fn test_community_deactivate() -> anyhow::Result<()> {
         .create(CreateCommunityOptions::new("Deactivate Test"))
         .await?;
 
-    info!("Created community: {}", community.gid);
+    info!("Created community: {}", community.metadata.id);
 
     // Deactivate the community
-    client.client.community().deactivate(&community.gid).await?;
+    client
+        .client
+        .community()
+        .deactivate(&community.metadata.id)
+        .await?;
 
-    info!("Deactivated community: {}", community.gid);
+    info!("Deactivated community: {}", community.metadata.id);
 
     // Querying the deactivated community should fail or return non-parent
-    let metadata_result = client.client.groups().get_metadata(&community.gid).await;
+    let metadata_result = client
+        .client
+        .groups()
+        .get_metadata(&community.metadata.id)
+        .await;
     match metadata_result {
         Ok(metadata) => {
             // If the server still returns the group, it should no longer be a parent
@@ -307,17 +337,20 @@ async fn test_community_query_linked_group() -> anyhow::Result<()> {
     client
         .client
         .community()
-        .link_subgroups(&community.gid, std::slice::from_ref(&group.gid))
+        .link_subgroups(
+            &community.metadata.id,
+            std::slice::from_ref(&group.metadata.id),
+        )
         .await?;
 
     // Query the linked group's metadata from the community
     let metadata = client
         .client
         .community()
-        .query_linked_group(&community.gid, &group.gid)
+        .query_linked_group(&community.metadata.id, &group.metadata.id)
         .await?;
 
-    assert_eq!(metadata.id, group.gid, "metadata JID should match");
+    assert_eq!(metadata.id, group.metadata.id, "metadata JID should match");
     assert_eq!(metadata.subject, "Queryable Sub");
 
     info!(
@@ -365,14 +398,17 @@ async fn test_community_join_subgroup() -> anyhow::Result<()> {
     client_a
         .client
         .community()
-        .link_subgroups(&community.gid, std::slice::from_ref(&group.gid))
+        .link_subgroups(
+            &community.metadata.id,
+            std::slice::from_ref(&group.metadata.id),
+        )
         .await?;
 
     // Add Client B to the community parent group first
     client_a
         .client
         .groups()
-        .add_participants(&community.gid, std::slice::from_ref(&jid_b_lid))
+        .add_participants(&community.metadata.id, std::slice::from_ref(&jid_b_lid))
         .await?;
 
     info!("Added client B to community, now joining subgroup");
@@ -381,10 +417,10 @@ async fn test_community_join_subgroup() -> anyhow::Result<()> {
     let metadata = client_b
         .client
         .community()
-        .join_subgroup(&community.gid, &group.gid)
+        .join_subgroup(&community.metadata.id, &group.metadata.id)
         .await?;
 
-    assert_eq!(metadata.id, group.gid);
+    assert_eq!(metadata.id, group.metadata.id);
 
     // Verify client B is in the subgroup's participant list (may be LID or PN)
     let b_in_subgroup = metadata.participants.iter().any(|p| {
@@ -402,7 +438,7 @@ async fn test_community_join_subgroup() -> anyhow::Result<()> {
             .collect::<Vec<_>>()
     );
 
-    info!("Client B joined subgroup {}", group.gid);
+    info!("Client B joined subgroup {}", group.metadata.id);
 
     client_a.disconnect().await;
     client_b.disconnect().await;
@@ -431,14 +467,17 @@ async fn test_community_get_linked_groups_participants() -> anyhow::Result<()> {
     client
         .client
         .community()
-        .link_subgroups(&community.gid, std::slice::from_ref(&group.gid))
+        .link_subgroups(
+            &community.metadata.id,
+            std::slice::from_ref(&group.metadata.id),
+        )
         .await?;
 
     // Get all participants across linked groups
     let participants = client
         .client
         .community()
-        .get_linked_groups_participants(&community.gid)
+        .get_linked_groups_participants(&community.metadata.id)
         .await?;
 
     let own_pn = client
@@ -501,14 +540,17 @@ async fn test_community_subgroup_participant_counts() -> anyhow::Result<()> {
     client
         .client
         .community()
-        .link_subgroups(&community.gid, std::slice::from_ref(&group.gid))
+        .link_subgroups(
+            &community.metadata.id,
+            std::slice::from_ref(&group.metadata.id),
+        )
         .await?;
 
     // Fetch participant counts
     let counts = client
         .client
         .community()
-        .get_subgroup_participant_counts(&community.gid)
+        .get_subgroup_participant_counts(&community.metadata.id)
         .await?;
 
     info!("Subgroup participant counts: {:?}", counts);
@@ -516,7 +558,7 @@ async fn test_community_subgroup_participant_counts() -> anyhow::Result<()> {
     // The linked subgroup should appear with a count >= 1 (at least the creator)
     let subgroup_count = counts
         .iter()
-        .find(|(jid, _)| *jid == group.gid)
+        .find(|(jid, _)| *jid == group.metadata.id)
         .map(|(_, count)| *count);
 
     assert!(

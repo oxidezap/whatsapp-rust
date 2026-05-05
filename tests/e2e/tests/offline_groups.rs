@@ -31,7 +31,8 @@ async fn test_offline_group_notification() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group created: {group_jid}");
 
     // Drain create notifications before testing offline delivery
@@ -95,7 +96,8 @@ async fn test_mixed_offline_event_ordering() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group created: {group_jid}");
 
     client_c.wait_for_group_notification(10).await?;
@@ -217,7 +219,8 @@ async fn test_offline_group_message_delivery() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group created: {group_jid}");
 
     client_b.wait_for_group_notification(10).await?;
@@ -301,7 +304,8 @@ async fn test_offline_multi_sender_group_messages() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group 1 created: {group1_jid}");
 
     let group2_jid = client_a
@@ -317,7 +321,8 @@ async fn test_offline_multi_sender_group_messages() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group 2 created: {group2_jid}");
 
     // Drain group creation notifications for all participants
