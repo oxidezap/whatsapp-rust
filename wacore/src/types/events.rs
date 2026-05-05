@@ -30,6 +30,9 @@ pub struct LazyHistorySync {
     sync_type: i32,
     chunk_order: Option<u32>,
     progress: Option<u32>,
+    /// Set on ON_DEMAND syncs so consumers can correlate the answer with their
+    /// outstanding `fetchMessageHistory` / `requestPlaceholderResend` request.
+    peer_data_request_session_id: Option<String>,
     parsed: OnceLock<Option<Box<wa::HistorySync>>>,
 }
 
@@ -40,6 +43,7 @@ impl Clone for LazyHistorySync {
             sync_type: self.sync_type,
             chunk_order: self.chunk_order,
             progress: self.progress,
+            peer_data_request_session_id: self.peer_data_request_session_id.clone(),
             parsed: OnceLock::new(), // don't deep-copy the decoded proto
         }
     }
@@ -57,8 +61,14 @@ impl LazyHistorySync {
             sync_type,
             chunk_order,
             progress,
+            peer_data_request_session_id: None,
             parsed: OnceLock::new(),
         }
+    }
+
+    pub fn with_peer_data_request_session_id(mut self, id: Option<String>) -> Self {
+        self.peer_data_request_session_id = id;
+        self
     }
 
     /// History sync type (e.g. InitialBootstrap, Recent, PushName).
@@ -75,6 +85,11 @@ impl LazyHistorySync {
     /// Sync progress (0-100).
     pub fn progress(&self) -> Option<u32> {
         self.progress
+    }
+
+    /// `None` for server-pushed syncs (e.g. `INITIAL_BOOTSTRAP`).
+    pub fn peer_data_request_session_id(&self) -> Option<&str> {
+        self.peer_data_request_session_id.as_deref()
     }
 
     /// Full decode of the history sync proto, cached via OnceLock.
@@ -106,6 +121,10 @@ impl fmt::Debug for LazyHistorySync {
             .field("sync_type", &self.sync_type)
             .field("chunk_order", &self.chunk_order)
             .field("progress", &self.progress)
+            .field(
+                "peer_data_request_session_id",
+                &self.peer_data_request_session_id,
+            )
             .field("raw_size", &self.raw_bytes.len())
             .field(
                 "parsed",
@@ -121,10 +140,14 @@ impl Serialize for LazyHistorySync {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("LazyHistorySync", 3)?;
+        let mut s = serializer.serialize_struct("LazyHistorySync", 4)?;
         s.serialize_field("sync_type", &self.sync_type)?;
         s.serialize_field("chunk_order", &self.chunk_order)?;
         s.serialize_field("progress", &self.progress)?;
+        s.serialize_field(
+            "peer_data_request_session_id",
+            &self.peer_data_request_session_id,
+        )?;
         s.end()
     }
 }
@@ -940,6 +963,22 @@ mod tests {
         assert_eq!(lazy.sync_type(), 3);
         assert_eq!(lazy.chunk_order(), Some(2));
         assert_eq!(lazy.progress(), Some(50));
+    }
+
+    #[test]
+    fn lazy_history_sync_peer_data_request_session_id() {
+        let bytes = make_history_sync_bytes(vec![]);
+
+        let unset = LazyHistorySync::new(Bytes::from(bytes.clone()), 0, None, None);
+        assert_eq!(unset.peer_data_request_session_id(), None);
+
+        let set = LazyHistorySync::new(Bytes::from(bytes), 0, None, None)
+            .with_peer_data_request_session_id(Some("session-123".to_string()));
+        assert_eq!(set.peer_data_request_session_id(), Some("session-123"));
+
+        // Round-trip through Clone
+        let cloned = set.clone();
+        assert_eq!(cloned.peer_data_request_session_id(), Some("session-123"));
     }
 
     #[test]

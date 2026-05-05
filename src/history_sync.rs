@@ -222,6 +222,9 @@ impl Client {
                         notification.sync_type().into(),
                         notification.chunk_order,
                         notification.progress,
+                    )
+                    .with_peer_data_request_session_id(
+                        notification.peer_data_request_session_id.take(),
                     );
                     self.core
                         .event_bus
