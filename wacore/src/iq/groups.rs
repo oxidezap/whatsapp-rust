@@ -1029,7 +1029,9 @@ impl GroupCreateIq {
 }
 
 impl IqSpec for GroupCreateIq {
-    type Response = Jid;
+    // Server's `<create>` reply carries the full `<group>` node, so callers
+    // can skip a follow-up `get_metadata` IQ. Mirrors WA Web's CreateJob.
+    type Response = GroupInfoResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set(
@@ -1043,13 +1045,22 @@ impl IqSpec for GroupCreateIq {
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
         let group_node = required_child(response, "group")?;
-        let group_id_str = required_attr(group_node, "id")?;
+        let mut info = GroupInfoResponse::try_from_node_ref(group_node)?;
 
-        if group_id_str.contains('@') {
-            group_id_str.parse().map_err(Into::into)
-        } else {
-            Ok(Jid::group(group_id_str))
+        // The server may omit `<parent>` / `<allow_non_admin_sub_group_creation>`
+        // from the create reply (WA Web's CreateJob never reads them either),
+        // so propagate the request flags so a freshly created community classifies
+        // correctly via `group_type()` without a follow-up metadata query.
+        // `allow_non_admin_sub_group_creation` is one-directional (request only
+        // fills when server omitted) so a server-set `true` is never clobbered
+        // by a `false` request flag.
+        if self.options.is_parent {
+            info.is_parent_group = true;
+            info.allow_non_admin_sub_group_creation |=
+                self.options.allow_non_admin_sub_group_creation;
         }
+
+        Ok(info)
     }
 }
 
@@ -3498,6 +3509,171 @@ mod tests {
             Some("5511999999999@s.whatsapp.net".parse().unwrap())
         );
         assert_eq!(response.description_time, Some(1700000000));
+    }
+
+    /// `parse_response` should overlay `is_parent_group` and
+    /// `allow_non_admin_sub_group_creation` from the request when the server
+    /// omits `<parent>` from a community-create reply (WA Web's CreateJob
+    /// never reads parent markers from the response either).
+    #[test]
+    fn test_group_create_iq_overlays_parent_flags() {
+        let options = GroupCreateOptions {
+            subject: "My Community".into(),
+            is_parent: true,
+            allow_non_admin_sub_group_creation: true,
+            ..Default::default()
+        };
+        let spec = GroupCreateIq::new(options);
+
+        // Server reply with no `<parent>` / `<allow_non_admin_sub_group_creation>`
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000001")
+                .attr("subject", "My Community")
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+
+        assert!(response.is_parent_group);
+        assert!(response.allow_non_admin_sub_group_creation);
+    }
+
+    /// Overlay must not promote a `false` request flag to `true`.
+    /// With `is_parent = true` but `allow_non_admin_sub_group_creation = false`,
+    /// `is_parent_group` is restored from the request, but
+    /// `allow_non_admin_sub_group_creation` stays `false`.
+    #[test]
+    fn test_group_create_iq_overlay_does_not_elevate_false_flag() {
+        let options = GroupCreateOptions {
+            subject: "Closed Community".into(),
+            is_parent: true,
+            allow_non_admin_sub_group_creation: false,
+            ..Default::default()
+        };
+        let spec = GroupCreateIq::new(options);
+
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000001")
+                .attr("subject", "Closed Community")
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+
+        assert!(response.is_parent_group);
+        assert!(!response.allow_non_admin_sub_group_creation);
+    }
+
+    /// Server-set `<allow_non_admin_sub_group_creation>` must survive a
+    /// `false` request flag — overlay is one-directional (request fills only
+    /// when server omitted).
+    #[test]
+    fn test_group_create_iq_overlay_preserves_server_true() {
+        let options = GroupCreateOptions {
+            subject: "Community".into(),
+            is_parent: true,
+            allow_non_admin_sub_group_creation: false,
+            ..Default::default()
+        };
+        let spec = GroupCreateIq::new(options);
+
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000001")
+                .attr("subject", "Community")
+                .children([NodeBuilder::new("allow_non_admin_sub_group_creation").build()])
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+
+        assert!(response.is_parent_group);
+        assert!(response.allow_non_admin_sub_group_creation);
+    }
+
+    /// Plain (non-community) group create: overlay branch must not run, both
+    /// flags stay at the parsed defaults (`false`).
+    #[test]
+    fn test_group_create_iq_no_overlay_for_plain_group() {
+        let options = GroupCreateOptions {
+            subject: "Plain Group".into(),
+            is_parent: false,
+            allow_non_admin_sub_group_creation: false,
+            ..Default::default()
+        };
+        let spec = GroupCreateIq::new(options);
+
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000001")
+                .attr("subject", "Plain Group")
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+
+        assert!(!response.is_parent_group);
+        assert!(!response.allow_non_admin_sub_group_creation);
+    }
+
+    /// Mirrors the wire-format shape of a real `<create>` IQ result for a LID
+    /// community: only `id` is required, and the create reply omits
+    /// `<description>`, `<locked>`, `<announcement>`, `size`, etc. — guards
+    /// against accidentally promoting any of those to required.
+    /// JIDs/timestamps below are fictitious per the AGENTS.md test policy.
+    #[test]
+    fn test_group_info_response_parses_create_response() {
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000001")
+            .attr("addressing_mode", "lid")
+            .attr("subject", "test")
+            .attr("creator", "100000000000001@lid")
+            .attr("creation", "1700000000")
+            .attr("s_t", "1700000000")
+            .attr("s_o", "100000000000001@lid")
+            .children([
+                NodeBuilder::new("ephemeral")
+                    .attr("expiration", 0u32)
+                    .build(),
+                NodeBuilder::new("member_link_mode")
+                    .string_content("admin_link")
+                    .build(),
+                NodeBuilder::new("member_add_mode")
+                    .string_content("all_member_add")
+                    .build(),
+                NodeBuilder::new("member_share_group_history_mode")
+                    .string_content("all_member_share")
+                    .build(),
+                NodeBuilder::new("participant")
+                    .attr("jid", "100000000000001@lid")
+                    .attr("type", "superadmin")
+                    .attr("phone_number", "5511999999999@s.whatsapp.net")
+                    .build(),
+                NodeBuilder::new("participant")
+                    .attr("jid", "100000000000002@lid")
+                    .attr("phone_number", "5511988888888@s.whatsapp.net")
+                    .build(),
+            ])
+            .build();
+
+        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+
+        assert_eq!(response.id.to_string(), "120363000000000001@g.us");
+        assert_eq!(response.subject.as_str(), "test");
+        assert_eq!(response.addressing_mode, AddressingMode::Lid);
+        assert_eq!(response.creation_time, Some(1700000000));
+        assert_eq!(response.subject_time, Some(1700000000));
+        assert_eq!(response.member_link_mode, Some(MemberLinkMode::AdminLink));
+        assert_eq!(response.member_add_mode, Some(MemberAddMode::AllMemberAdd));
+        assert_eq!(
+            response.member_share_history_mode,
+            Some(MemberShareHistoryMode::AllMemberShare)
+        );
+        assert_eq!(response.participants.len(), 2);
+        // Fields absent from the create response: should default cleanly
+        assert!(response.description.is_none());
+        assert!(!response.is_locked);
+        assert!(!response.is_announcement);
+        assert!(!response.is_parent_group);
+        assert!(response.size.is_none());
     }
 
     #[test]

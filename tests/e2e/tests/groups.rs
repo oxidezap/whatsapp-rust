@@ -31,7 +31,7 @@ async fn test_group_create_send_message_and_add_member() -> anyhow::Result<()> {
         })
         .await?;
 
-    let group_jid = create_result.gid;
+    let group_jid = create_result.metadata.id;
     info!("Group created: {group_jid}");
 
     let text_1 = "Hello group from A!";
@@ -120,7 +120,8 @@ async fn test_group_remove_member() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group created: {group_jid}");
 
     let text_before = "Before removal";
@@ -235,7 +236,7 @@ async fn test_group_promote_and_demote_admin() -> anyhow::Result<()> {
         })
         .await?;
 
-    let group_jid = create_result.gid;
+    let group_jid = create_result.metadata.id;
     info!("Group created: {group_jid}");
 
     // Verify B is NOT an admin initially
@@ -310,7 +311,8 @@ async fn test_group_cache_invalidation_on_add() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group created: {group_jid}");
 
     // B sends a message to prime its group participant cache
@@ -381,7 +383,8 @@ async fn test_group_settings() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group created: {group_jid}");
 
     // Verify initial state
@@ -544,7 +547,8 @@ async fn test_group_leave() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group created: {group_jid}");
 
     let text_before = "Before B leaves";
@@ -636,7 +640,8 @@ async fn test_per_device_sender_key_tracking() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group created: {group_jid}");
 
     // A sends first message — triggers full SKDM distribution to B
@@ -744,7 +749,8 @@ async fn test_query_info_populates_lid_pn_cache_for_participants() -> anyhow::Re
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
 
     // create_group doesn't populate the group cache, so the first query_info
     // hits the network and runs the lid_pn_cache populate loop.

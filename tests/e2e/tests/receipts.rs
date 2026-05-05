@@ -321,7 +321,8 @@ async fn test_group_delivery_receipt() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group created: {group_jid}");
 
     client_b.wait_for_group_notification(10).await?;

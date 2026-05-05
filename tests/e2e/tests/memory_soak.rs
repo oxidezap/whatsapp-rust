@@ -390,7 +390,8 @@ async fn test_heavy_group_soak() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group 1: {g1}");
 
     // Wait for notifications
@@ -412,7 +413,8 @@ async fn test_heavy_group_soak() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group 2: {g2}");
 
     client_b
@@ -533,7 +535,8 @@ async fn test_heavy_mixed_soak() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group: {group_jid}");
 
     for client in [&mut client_b, &mut client_c] {

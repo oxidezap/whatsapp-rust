@@ -27,7 +27,7 @@ async fn test_group_send_uses_registry_cache_after_reconnect() -> anyhow::Result
             ..Default::default()
         })
         .await?;
-    let group_jid = group.gid;
+    let group_jid = group.metadata.id;
 
     // First send — populates device registry (in-memory cache + SQLite DB)
     let text_1 = "before reconnect";
