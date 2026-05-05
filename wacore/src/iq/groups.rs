@@ -1051,9 +1051,12 @@ impl IqSpec for GroupCreateIq {
         // from the create reply (WA Web's CreateJob never reads them either),
         // so propagate the request flags so a freshly created community classifies
         // correctly via `group_type()` without a follow-up metadata query.
+        // `allow_non_admin_sub_group_creation` is one-directional (request only
+        // fills when server omitted) so a server-set `true` is never clobbered
+        // by a `false` request flag.
         if self.options.is_parent {
             info.is_parent_group = true;
-            info.allow_non_admin_sub_group_creation =
+            info.allow_non_admin_sub_group_creation |=
                 self.options.allow_non_admin_sub_group_creation;
         }
 
@@ -3533,6 +3536,82 @@ mod tests {
 
         assert!(response.is_parent_group);
         assert!(response.allow_non_admin_sub_group_creation);
+    }
+
+    /// Overlay must not promote a `false` request flag to `true`.
+    /// With `is_parent = true` but `allow_non_admin_sub_group_creation = false`,
+    /// `is_parent_group` is restored from the request, but
+    /// `allow_non_admin_sub_group_creation` stays `false`.
+    #[test]
+    fn test_group_create_iq_overlay_does_not_elevate_false_flag() {
+        let options = GroupCreateOptions {
+            subject: "Closed Community".into(),
+            is_parent: true,
+            allow_non_admin_sub_group_creation: false,
+            ..Default::default()
+        };
+        let spec = GroupCreateIq::new(options);
+
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000001")
+                .attr("subject", "Closed Community")
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+
+        assert!(response.is_parent_group);
+        assert!(!response.allow_non_admin_sub_group_creation);
+    }
+
+    /// Server-set `<allow_non_admin_sub_group_creation>` must survive a
+    /// `false` request flag — overlay is one-directional (request fills only
+    /// when server omitted).
+    #[test]
+    fn test_group_create_iq_overlay_preserves_server_true() {
+        let options = GroupCreateOptions {
+            subject: "Community".into(),
+            is_parent: true,
+            allow_non_admin_sub_group_creation: false,
+            ..Default::default()
+        };
+        let spec = GroupCreateIq::new(options);
+
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000001")
+                .attr("subject", "Community")
+                .children([NodeBuilder::new("allow_non_admin_sub_group_creation").build()])
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+
+        assert!(response.is_parent_group);
+        assert!(response.allow_non_admin_sub_group_creation);
+    }
+
+    /// Plain (non-community) group create: overlay branch must not run, both
+    /// flags stay at the parsed defaults (`false`).
+    #[test]
+    fn test_group_create_iq_no_overlay_for_plain_group() {
+        let options = GroupCreateOptions {
+            subject: "Plain Group".into(),
+            is_parent: false,
+            allow_non_admin_sub_group_creation: false,
+            ..Default::default()
+        };
+        let spec = GroupCreateIq::new(options);
+
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000001")
+                .attr("subject", "Plain Group")
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+
+        assert!(!response.is_parent_group);
+        assert!(!response.allow_non_admin_sub_group_creation);
     }
 
     /// Mirrors the wire-format shape of a real `<create>` IQ result for a LID
