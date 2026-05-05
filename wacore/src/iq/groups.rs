@@ -3535,20 +3535,21 @@ mod tests {
         assert!(response.allow_non_admin_sub_group_creation);
     }
 
-    /// Mirrors a real `<create>` IQ result captured from WA Web (LID community).
-    /// The create reply omits `<description>`, `<locked>`, `<announcement>`,
-    /// `size`, etc. — only `id` is required by `try_from_node_ref`, so this
-    /// guards against accidentally promoting any of those to required.
+    /// Mirrors the wire-format shape of a real `<create>` IQ result for a LID
+    /// community: only `id` is required, and the create reply omits
+    /// `<description>`, `<locked>`, `<announcement>`, `size`, etc. — guards
+    /// against accidentally promoting any of those to required.
+    /// JIDs/timestamps below are fictitious per the AGENTS.md test policy.
     #[test]
     fn test_group_info_response_parses_create_response() {
         let node = NodeBuilder::new("group")
-            .attr("id", "120363424766426717")
+            .attr("id", "120363000000000001")
             .attr("addressing_mode", "lid")
             .attr("subject", "test")
-            .attr("creator", "236395184570386@lid")
-            .attr("creation", "1769039112")
-            .attr("s_t", "1769039112")
-            .attr("s_o", "236395184570386@lid")
+            .attr("creator", "100000000000001@lid")
+            .attr("creation", "1700000000")
+            .attr("s_t", "1700000000")
+            .attr("s_o", "100000000000001@lid")
             .children([
                 NodeBuilder::new("ephemeral")
                     .attr("expiration", 0u32)
@@ -3563,24 +3564,24 @@ mod tests {
                     .string_content("all_member_share")
                     .build(),
                 NodeBuilder::new("participant")
-                    .attr("jid", "236395184570386@lid")
+                    .attr("jid", "100000000000001@lid")
                     .attr("type", "superadmin")
-                    .attr("phone_number", "559984726662@s.whatsapp.net")
+                    .attr("phone_number", "5511999999999@s.whatsapp.net")
                     .build(),
                 NodeBuilder::new("participant")
-                    .attr("jid", "119009819262985@lid")
-                    .attr("phone_number", "559984696848@s.whatsapp.net")
+                    .attr("jid", "100000000000002@lid")
+                    .attr("phone_number", "5511988888888@s.whatsapp.net")
                     .build(),
             ])
             .build();
 
         let response = GroupInfoResponse::try_from_node(&node).unwrap();
 
-        assert_eq!(response.id.to_string(), "120363424766426717@g.us");
+        assert_eq!(response.id.to_string(), "120363000000000001@g.us");
         assert_eq!(response.subject.as_str(), "test");
         assert_eq!(response.addressing_mode, AddressingMode::Lid);
-        assert_eq!(response.creation_time, Some(1769039112));
-        assert_eq!(response.subject_time, Some(1769039112));
+        assert_eq!(response.creation_time, Some(1700000000));
+        assert_eq!(response.subject_time, Some(1700000000));
         assert_eq!(response.member_link_mode, Some(MemberLinkMode::AdminLink));
         assert_eq!(response.member_add_mode, Some(MemberAddMode::AllMemberAdd));
         assert_eq!(
