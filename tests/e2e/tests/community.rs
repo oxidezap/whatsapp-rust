@@ -23,7 +23,16 @@ async fn test_community_create() -> anyhow::Result<()> {
 
     info!("Created community: {}", result.metadata.id);
 
-    // Query the community and verify it's a parent group
+    // The create response itself should classify as a community without
+    // a follow-up metadata query — overlay in `GroupCreateIq::parse_response`
+    // restores `is_parent_group` even if the server omits `<parent>`.
+    assert!(
+        result.metadata.is_parent_group,
+        "create result should classify as a parent group"
+    );
+    assert_eq!(group_type(&result.metadata), GroupType::Community);
+
+    // Cross-check against a fresh `get_metadata` query.
     let metadata = client
         .client
         .groups()

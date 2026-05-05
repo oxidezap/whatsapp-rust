@@ -1045,7 +1045,19 @@ impl IqSpec for GroupCreateIq {
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
         let group_node = required_child(response, "group")?;
-        GroupInfoResponse::try_from_node_ref(group_node)
+        let mut info = GroupInfoResponse::try_from_node_ref(group_node)?;
+
+        // The server may omit `<parent>` / `<allow_non_admin_sub_group_creation>`
+        // from the create reply (WA Web's CreateJob never reads them either),
+        // so propagate the request flags so a freshly created community classifies
+        // correctly via `group_type()` without a follow-up metadata query.
+        if self.options.is_parent {
+            info.is_parent_group = true;
+            info.allow_non_admin_sub_group_creation =
+                self.options.allow_non_admin_sub_group_creation;
+        }
+
+        Ok(info)
     }
 }
 
@@ -3494,6 +3506,33 @@ mod tests {
             Some("5511999999999@s.whatsapp.net".parse().unwrap())
         );
         assert_eq!(response.description_time, Some(1700000000));
+    }
+
+    /// `parse_response` should overlay `is_parent_group` and
+    /// `allow_non_admin_sub_group_creation` from the request when the server
+    /// omits `<parent>` from a community-create reply (WA Web's CreateJob
+    /// never reads parent markers from the response either).
+    #[test]
+    fn test_group_create_iq_overlays_parent_flags() {
+        let options = GroupCreateOptions {
+            subject: "My Community".into(),
+            is_parent: true,
+            allow_non_admin_sub_group_creation: true,
+            ..Default::default()
+        };
+        let spec = GroupCreateIq::new(options);
+
+        // Server reply with no `<parent>` / `<allow_non_admin_sub_group_creation>`
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000001")
+                .attr("subject", "My Community")
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+
+        assert!(response.is_parent_group);
+        assert!(response.allow_non_admin_sub_group_creation);
     }
 
     /// Mirrors a real `<create>` IQ result captured from WA Web (LID community).
