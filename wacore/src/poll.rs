@@ -6,9 +6,25 @@
 use anyhow::{Result, anyhow};
 use sha2::{Digest, Sha256};
 
-use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
+use crate::secret_enc_addon::{
+    AddonContext, ModificationType, build_aad, decrypt_addon, encrypt_addon,
+};
 
 const GCM_IV_SIZE: usize = 12;
+const GCM_TAG_SIZE: usize = 16;
+
+fn poll_vote_addon_ctx<'a>(
+    stanza_id: &'a str,
+    poll_creator_jid: &'a str,
+    voter_jid: &'a str,
+) -> AddonContext<'a> {
+    AddonContext {
+        stanza_id,
+        parent_msg_original_sender: poll_creator_jid,
+        modification_sender: voter_jid,
+        modification_type: ModificationType::PollVote,
+    }
+}
 
 /// Votes reference options by SHA-256 hash, not by name.
 pub fn compute_option_hash(option_name: &str) -> [u8; 32] {
@@ -29,13 +45,43 @@ pub fn derive_vote_encryption_key(
 ) -> Result<[u8; 32]> {
     crate::secret_enc_addon::derive_use_case_secret(
         message_secret,
-        &AddonContext {
-            stanza_id,
-            parent_msg_original_sender: poll_creator_jid,
-            modification_sender: voter_jid,
-            modification_type: ModificationType::PollVote,
-        },
+        &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
     )
+}
+
+/// Encrypt a poll vote with a pre-derived 32-byte key, symmetric to
+/// [`decrypt_poll_vote`]. Returns `(payload_with_tag, iv)`.
+///
+/// Kept for callers that built their own key via [`derive_vote_encryption_key`].
+/// New code should prefer [`encrypt_poll_vote_with_secret`], which derives
+/// the key in a single step from the parent poll's `messageSecret`.
+pub fn encrypt_poll_vote(
+    selected_option_hashes: &[Vec<u8>],
+    encryption_key: &[u8; 32],
+    stanza_id: &str,
+    voter_jid: &str,
+) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE])> {
+    use crate::libsignal::crypto::aes_256_gcm_encrypt;
+    use prost::Message;
+    use rand::Rng;
+
+    let vote_msg = waproto::whatsapp::message::PollVoteMessage {
+        selected_options: selected_option_hashes.to_vec(),
+    };
+    let mut plaintext = Vec::new();
+    vote_msg.encode(&mut plaintext)?;
+
+    let mut iv = [0u8; GCM_IV_SIZE];
+    rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
+
+    // poll_creator_jid is not part of the AAD; supply an empty placeholder.
+    let aad = build_aad(&poll_vote_addon_ctx(stanza_id, "", voter_jid));
+
+    let mut payload = Vec::with_capacity(plaintext.len() + GCM_TAG_SIZE);
+    aes_256_gcm_encrypt(encryption_key, &iv, &aad, &plaintext, &mut payload)
+        .map_err(|e| anyhow!("AES-GCM encrypt failed: {e}"))?;
+
+    Ok((payload, iv))
 }
 
 /// Encrypt a poll vote given the parent poll's `messageSecret`. Returns
@@ -58,12 +104,7 @@ pub fn encrypt_poll_vote_with_secret(
     encrypt_addon(
         &plaintext,
         message_secret,
-        &AddonContext {
-            stanza_id,
-            parent_msg_original_sender: poll_creator_jid,
-            modification_sender: voter_jid,
-            modification_type: ModificationType::PollVote,
-        },
+        &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
     )
 }
 
@@ -81,7 +122,6 @@ pub fn decrypt_poll_vote(
     use crate::libsignal::crypto::aes_256_gcm_decrypt;
     use prost::Message as _;
 
-    const GCM_TAG_SIZE: usize = 16;
     let nonce: &[u8; GCM_IV_SIZE] = iv
         .try_into()
         .map_err(|_| anyhow!("Invalid IV size: expected {GCM_IV_SIZE}, got {}", iv.len()))?;
@@ -92,10 +132,8 @@ pub fn decrypt_poll_vote(
         ));
     }
 
-    let mut aad = Vec::with_capacity(stanza_id.len() + 1 + voter_jid.len());
-    aad.extend_from_slice(stanza_id.as_bytes());
-    aad.push(0);
-    aad.extend_from_slice(voter_jid.as_bytes());
+    // poll_creator_jid is not part of the AAD; supply an empty placeholder.
+    let aad = build_aad(&poll_vote_addon_ctx(stanza_id, "", voter_jid));
 
     let mut plaintext = Vec::with_capacity(enc_payload.len().saturating_sub(GCM_TAG_SIZE));
     aes_256_gcm_decrypt(encryption_key, nonce, &aad, enc_payload, &mut plaintext)
@@ -121,12 +159,7 @@ pub fn decrypt_poll_vote_with_secret(
         enc_payload,
         iv,
         message_secret,
-        &AddonContext {
-            stanza_id,
-            parent_msg_original_sender: poll_creator_jid,
-            modification_sender: voter_jid,
-            modification_type: ModificationType::PollVote,
-        },
+        &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
     )?;
     let vote_msg = waproto::whatsapp::message::PollVoteMessage::decode(&plaintext[..])?;
     Ok(vote_msg.selected_options)

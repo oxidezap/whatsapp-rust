@@ -124,7 +124,7 @@ pub fn derive_use_case_secret(
     Ok(key)
 }
 
-fn build_aad(ctx: &AddonContext<'_>) -> Vec<u8> {
+pub(crate) fn build_aad(ctx: &AddonContext<'_>) -> Vec<u8> {
     match ctx.modification_type.aad_mode() {
         AadMode::Empty => Vec::new(),
         AadMode::StanzaAndSender => {
@@ -329,16 +329,38 @@ mod tests {
     }
 
     #[test]
-    fn message_edit_aad_is_empty_unlike_poll_vote() {
-        // Encrypt with MessageEdit then change AAD-mode by re-tagging as PollVote —
-        // since MessageEdit has empty AAD, decrypting with the same key under a context
-        // that produces non-empty AAD must fail. Confirms the AAD branches are wired.
-        let secret = [0x33u8; 32];
-        let ed = ctx(ModificationType::MessageEdit, "id", "p@s", "s@s");
-        let (ct, iv) = encrypt_addon(b"x", &secret, &ed).unwrap();
+    fn aad_mismatch_under_same_key_fails_decrypt() {
+        // Prove the AAD branch is actually load-bearing in the GCM check, not
+        // just an unused field. Bypass derive (which would also change with
+        // modification_type) and hand-roll an encrypt with one AAD shape, then
+        // try to decrypt with the other under the same key.
+        use crate::libsignal::crypto::{aes_256_gcm_decrypt, aes_256_gcm_encrypt};
 
-        // Sanity: decrypts fine with MessageEdit context.
-        assert!(decrypt_addon(&ct, &iv, &secret, &ed).is_ok());
+        let secret = [0x33u8; 32];
+        let pv_ctx = ctx(ModificationType::PollVote, "stanza", "p@s", "s@s");
+        let me_ctx = ctx(ModificationType::MessageEdit, "stanza", "p@s", "s@s");
+        let aad_pv = build_aad(&pv_ctx);
+        let aad_me = build_aad(&me_ctx);
+        assert!(!aad_pv.is_empty(), "PollVote AAD must bind stanza+sender");
+        assert!(aad_me.is_empty(), "MessageEdit AAD must be empty");
+
+        // Pick one key (PollVote's) and use it for both encrypt and decrypt
+        // attempts so the only thing that varies is the AAD.
+        let key = derive_use_case_secret(&secret, &pv_ctx).unwrap();
+        let iv = [0u8; GCM_IV_SIZE];
+        let plaintext = b"vote payload";
+
+        let mut ct = Vec::with_capacity(plaintext.len() + GCM_TAG_SIZE);
+        aes_256_gcm_encrypt(&key, &iv, &aad_pv, plaintext, &mut ct).unwrap();
+
+        // Same key, PollVote AAD → ok.
+        let mut out = Vec::new();
+        aes_256_gcm_decrypt(&key, &iv, &aad_pv, &ct, &mut out).unwrap();
+        assert_eq!(out, plaintext);
+
+        // Same key, MessageEdit AAD (empty) → must fail despite identical key.
+        let mut out2 = Vec::new();
+        assert!(aes_256_gcm_decrypt(&key, &iv, &aad_me, &ct, &mut out2).is_err());
     }
 
     #[test]
