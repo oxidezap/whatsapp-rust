@@ -44,7 +44,9 @@ jobs:
           tool: protoc@${{ env.PROTOC_VERSION }}
 
       - name: Install cargo-release
-        run: cargo install cargo-release --locked --version 0.25.20
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release@0.25.20
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
