@@ -127,15 +127,13 @@ impl<'a> Polls<'a> {
             .map(|name| poll::compute_option_hash(name).to_vec())
             .collect();
 
-        let key = poll::derive_vote_encryption_key(
+        let (enc_payload, iv) = poll::encrypt_poll_vote_with_secret(
+            &selected_hashes,
             message_secret,
             poll_msg_id,
             &creator_jid_str,
             &voter_jid_str,
         )?;
-
-        let (enc_payload, iv) =
-            poll::encrypt_poll_vote(&selected_hashes, &key, poll_msg_id, &voter_jid_str)?;
 
         let from_me = my_base.is_same_user_as(poll_creator_jid);
 
@@ -178,8 +176,14 @@ impl<'a> Polls<'a> {
     ) -> Result<Vec<Vec<u8>>> {
         let creator = poll_creator_jid.to_non_ad().to_string();
         let voter = voter_jid.to_non_ad().to_string();
-        let key = poll::derive_vote_encryption_key(message_secret, poll_msg_id, &creator, &voter)?;
-        poll::decrypt_poll_vote(enc_payload, enc_iv, &key, poll_msg_id, &voter)
+        poll::decrypt_poll_vote_with_secret(
+            enc_payload,
+            enc_iv,
+            message_secret,
+            poll_msg_id,
+            &creator,
+            &voter,
+        )
     }
 
     /// Decrypts each vote and tallies per-option results.
@@ -205,19 +209,14 @@ impl<'a> Polls<'a> {
         let mut latest_votes: HashMap<String, Vec<Vec<u8>>> = HashMap::with_capacity(votes.len());
         for (voter_jid, enc_payload, enc_iv) in votes {
             let voter_str = voter_jid.to_non_ad().to_string();
-            let key = match poll::derive_vote_encryption_key(
+            match poll::decrypt_poll_vote_with_secret(
+                enc_payload,
+                enc_iv,
                 message_secret,
                 poll_msg_id,
                 &creator_str,
                 &voter_str,
             ) {
-                Ok(k) => k,
-                Err(e) => {
-                    log::warn!("Failed to derive vote key for {voter_jid}: {e}");
-                    continue;
-                }
-            };
-            match poll::decrypt_poll_vote(enc_payload, enc_iv, &key, poll_msg_id, &voter_str) {
                 Ok(selected_hashes) => {
                     if selected_hashes.is_empty() {
                         // Empty selection = voter cleared their vote
