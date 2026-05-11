@@ -91,13 +91,21 @@ pub fn decrypt_with_fallback(
 
     let fb_orig = fallback_original_sender.map(|j| j.to_non_ad().to_string());
     let fb_editor = fallback_editor.map(|j| j.to_non_ad().to_string());
-    let fallback_ctx = match (fb_orig.as_deref(), fb_editor.as_deref()) {
-        (None, None) => None,
-        (orig, editor) => Some(MessageEditContext {
+    let fb_orig_resolved = fb_orig.as_deref().unwrap_or(primary.original_sender_jid);
+    let fb_editor_resolved = fb_editor.as_deref().unwrap_or(primary.editor_jid);
+    // Skip the retry when the fallback would key the HKDF identically to
+    // primary — covers both "no fallback supplied" and "fallback normalises
+    // to the same JIDs". Avoids a guaranteed-failing duplicate decrypt.
+    let fallback_ctx = if fb_orig_resolved == primary.original_sender_jid
+        && fb_editor_resolved == primary.editor_jid
+    {
+        None
+    } else {
+        Some(MessageEditContext {
             original_msg_id,
-            original_sender_jid: orig.unwrap_or(primary.original_sender_jid),
-            editor_jid: editor.unwrap_or(primary.editor_jid),
-        }),
+            original_sender_jid: fb_orig_resolved,
+            editor_jid: fb_editor_resolved,
+        })
     };
 
     message_edit::decrypt_message_edit_with_fallback(
@@ -383,6 +391,42 @@ mod tests {
             ..Default::default()
         };
         assert!(extract_envelope(&msg).is_none());
+    }
+
+    #[test]
+    fn fallback_normalising_to_primary_jids_is_skipped() {
+        // wacore::message_edit::decrypt_message_edit_with_fallback returns the
+        // bare primary error when no fallback is run, or a combined
+        // "edit decrypt failed: primary=...; fallback=..." when both attempts
+        // run. We use that to assert the dedup path.
+        let secret = [0xAAu8; 32];
+        let real_ctx = MessageEditContext {
+            original_msg_id: "ID",
+            original_sender_jid: "5511777@s.whatsapp.net",
+            editor_jid: "5511777@s.whatsapp.net",
+        };
+        let (enc, iv) = encrypt_message_edit(&inner("hi"), &secret, &real_ctx).unwrap();
+
+        // Wrong primary JID so decrypt fails; fallback is a device-suffixed
+        // form of the *same* wrong jid → normalises identical → must be skipped.
+        let wrong = "5511000@s.whatsapp.net".parse::<Jid>().unwrap();
+        let wrong_with_device = "5511000:5@s.whatsapp.net".parse::<Jid>().unwrap();
+
+        let err = decrypt_with_fallback(
+            &enc,
+            &iv,
+            &secret,
+            "ID",
+            &wrong,
+            &wrong,
+            Some(&wrong_with_device),
+            Some(&wrong_with_device),
+        )
+        .expect_err("decryption should fail");
+        assert!(
+            !err.to_string().contains("fallback="),
+            "no-op fallback must be skipped, got: {err}"
+        );
     }
 
     #[test]
