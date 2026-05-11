@@ -185,17 +185,35 @@ impl<'a> EncryptedEdit<'a> {
     }
 
     /// Resolve the original sender JID from the target message key.
-    /// For groups WA puts the sender in `participant`; for 1:1 it's the
-    /// `remote_jid` field. Returns `None` when both are missing.
-    pub fn original_sender_jid(&self) -> Result<Jid> {
+    ///
+    /// `my_jid` is the receiver's own JID in the addressing mode of the chat
+    /// (PN or LID). It is needed because for self-sent edits — e.g. edits to
+    /// our own messages that arrive via device sync — `target_message_key`
+    /// has `from_me = true` and its `remote_jid` points to the *other* party,
+    /// not us. WA Web's `MsgGetters.getOriginalSender` reads
+    /// `originalSelfAuthor || sender` from its msg-row store; we have no row
+    /// here, so we reconstruct the same fact from `from_me` + own jid.
+    ///
+    /// Resolution order:
+    /// 1. `participant` if present (always set in groups).
+    /// 2. `my_jid` if `from_me == Some(true)` (self-sent edit sync).
+    /// 3. `remote_jid` (1:1 incoming edit; the chat is the other party).
+    pub fn original_sender_jid(&self, my_jid: &Jid) -> Result<Jid> {
+        if let Some(p) = self.target_message_key.participant.as_deref() {
+            return p
+                .parse::<Jid>()
+                .map_err(|e| anyhow!("invalid participant jid in target key: {e}"));
+        }
+        if self.target_message_key.from_me == Some(true) {
+            return Ok(my_jid.to_non_ad());
+        }
         let raw = self
             .target_message_key
-            .participant
+            .remote_jid
             .as_deref()
-            .or(self.target_message_key.remote_jid.as_deref())
             .ok_or_else(|| anyhow!("target message key missing participant and remote_jid"))?;
         raw.parse::<Jid>()
-            .map_err(|e| anyhow!("invalid sender jid in target key: {e}"))
+            .map_err(|e| anyhow!("invalid remote_jid in target key: {e}"))
     }
 }
 
@@ -276,10 +294,69 @@ mod tests {
         };
         let env = MessageEdits::extract_envelope(&msg).expect("recognised");
         assert_eq!(env.target_id(), Some("AC1"));
-        // Group: participant takes priority over remote_jid.
+        // Group: participant takes priority over my_jid and remote_jid.
+        let my_jid = "999@s.whatsapp.net".parse::<Jid>().unwrap();
         assert_eq!(
-            env.original_sender_jid().unwrap().to_non_ad().to_string(),
+            env.original_sender_jid(&my_jid).unwrap().to_string(),
             "5511999@s.whatsapp.net"
+        );
+    }
+
+    #[test]
+    fn original_sender_jid_uses_my_jid_for_self_sent_edits() {
+        // 1:1 self-sent edit synced via device_sent: from_me=true, no participant,
+        // remote_jid points to the *other* party. Original sender is OURSELVES.
+        let msg = wa::Message {
+            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                target_message_key: Some(wa::MessageKey {
+                    remote_jid: Some("5510000@s.whatsapp.net".to_string()),
+                    from_me: Some(true),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(
+                    wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
+                ),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = MessageEdits::extract_envelope(&msg).expect("recognised");
+        let my_jid = "5511999:13@s.whatsapp.net".parse::<Jid>().unwrap();
+        // Must return my_jid (stripped of device), NOT remote_jid (the other party).
+        assert_eq!(
+            env.original_sender_jid(&my_jid).unwrap().to_string(),
+            "5511999@s.whatsapp.net"
+        );
+    }
+
+    #[test]
+    fn original_sender_jid_falls_back_to_remote_jid_for_incoming_one_to_one_edit() {
+        // 1:1 incoming edit: from_me=false, no participant, remote_jid = sender.
+        let msg = wa::Message {
+            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                target_message_key: Some(wa::MessageKey {
+                    remote_jid: Some("5510000@s.whatsapp.net".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(
+                    wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
+                ),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = MessageEdits::extract_envelope(&msg).expect("recognised");
+        let my_jid = "5511999@s.whatsapp.net".parse::<Jid>().unwrap();
+        assert_eq!(
+            env.original_sender_jid(&my_jid).unwrap().to_string(),
+            "5510000@s.whatsapp.net"
         );
     }
 
