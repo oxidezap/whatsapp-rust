@@ -434,6 +434,8 @@ impl Client {
             let _session_guard = session_mutex.lock().await;
             let mut store_adapter = self.signal_adapter().await;
 
+            let edit_attr =
+                wacore::types::message::EditAttribute::infer_from_message(&original_msg);
             let stanza = wacore::send::prepare_group_retry_stanza(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
@@ -445,6 +447,7 @@ impl Client {
                 retry_count,
                 device_snapshot.account.as_ref(),
                 addressing_mode,
+                edit_attr,
             )
             .await?;
 
@@ -464,6 +467,8 @@ impl Client {
             let _session_guard = session_mutex.lock().await;
             let mut store_adapter = self.signal_adapter().await;
 
+            let edit_attr =
+                wacore::types::message::EditAttribute::infer_from_message(&original_msg);
             let stanza = wacore::send::prepare_dm_retry_stanza(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
@@ -474,6 +479,7 @@ impl Client {
                 message_id,
                 retry_count,
                 device_snapshot.account.as_ref(),
+                edit_attr,
             )
             .await?;
 
