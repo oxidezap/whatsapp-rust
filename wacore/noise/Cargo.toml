@@ -14,6 +14,10 @@ crate-type = ["rlib"]
 # Exposes `wacore_noise::test_util` (cert-chain bytes builder, etc.) so
 # downstream crates can share fixtures with the unit tests in this crate.
 test-util = []
+# Skips XEdDSA signature verification of the server's Noise cert chain.
+# Required for the e2e mock server, which uses self-signed certs that
+# can't be verified against the real WA root key. NEVER enable in prod.
+danger-skip-cert-chain-verify = []
 
 [dependencies]
 anyhow = { workspace = true }

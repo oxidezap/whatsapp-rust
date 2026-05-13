@@ -151,7 +151,10 @@ hkdf = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
-wacore-noise = { path = "./wacore/noise", features = ["test-util"] }
+wacore-noise = { path = "./wacore/noise", features = [
+    "test-util",
+    "danger-skip-cert-chain-verify",
+] }
 
 [lints]
 workspace = true

@@ -8,13 +8,26 @@ use waproto::whatsapp::{self as wa, CertChain, HandshakeMessage};
 
 const WA_CERT_ISSUER_SERIAL: i64 = 0;
 
-/// Ed25519 issuer key for the Noise cert chain. Intentionally unused: wiring
-/// it into `verify_server_cert` would block the e2e mock server. Kept
-/// exported for SemVer; do not make it load-bearing without an opt-out.
+/// XEdDSA (Signal-variant Curve25519) issuer key for the WhatsApp Noise cert
+/// chain. Used by `verify_server_cert` to verify the intermediate certificate
+/// against the WA root, and indirectly the leaf against the intermediate.
 pub const WA_CERT_PUB_KEY: [u8; 32] = [
     0x14, 0x23, 0x75, 0x57, 0x4d, 0x0a, 0x58, 0x71, 0x66, 0xaa, 0xe7, 0x1e, 0xbe, 0x51, 0x64, 0x37,
     0xc4, 0xa2, 0x8b, 0x73, 0xe3, 0x69, 0x5c, 0x6c, 0xe1, 0xf7, 0xf9, 0x54, 0x5d, 0xa8, 0xee, 0x6b,
 ];
+
+/// Verify a Noise certificate signature using XEdDSA on Curve25519.
+///
+/// `issuer_key` is the raw 32-byte public key. WA Web's signature format is
+/// always 64 bytes; values outside that length fail.
+#[cfg(not(any(test, feature = "danger-skip-cert-chain-verify")))]
+fn verify_xeddsa(issuer_key: &[u8; 32], message: &[u8], signature: &[u8]) -> bool {
+    let Ok(pk) = wacore_libsignal::core::curve::PublicKey::from_djb_public_key_bytes(issuer_key)
+    else {
+        return false;
+    };
+    pk.verify_signature(message, signature)
+}
 
 #[derive(Debug, Error)]
 pub enum HandshakeError {
@@ -176,6 +189,23 @@ impl HandshakeUtils {
             HandshakeError::CertVerification("Intermediate details key is not 32 bytes".into())
         })?;
 
+        // intermediate.signature == XEdDSA(WA_CERT_PUB_KEY, intermediate.details)
+        #[cfg(not(any(test, feature = "danger-skip-cert-chain-verify")))]
+        {
+            let intermediate_sig = intermediate.signature.as_ref().ok_or_else(|| {
+                HandshakeError::CertVerification("Missing intermediate signature".into())
+            })?;
+            if !verify_xeddsa(
+                &WA_CERT_PUB_KEY,
+                intermediate_details_bytes,
+                intermediate_sig,
+            ) {
+                return Err(HandshakeError::CertVerification(
+                    "Intermediate signature failed XEdDSA verify against WA root".into(),
+                ));
+            }
+        }
+
         let leaf_details_bytes = leaf
             .details
             .as_ref()
@@ -194,6 +224,20 @@ impl HandshakeUtils {
             return Err(HandshakeError::CertVerification(
                 "Cert key does not match decrypted static key".into(),
             ));
+        }
+
+        // leaf.signature == XEdDSA(intermediate_key, leaf.details)
+        #[cfg(not(any(test, feature = "danger-skip-cert-chain-verify")))]
+        {
+            let leaf_sig = leaf
+                .signature
+                .as_ref()
+                .ok_or_else(|| HandshakeError::CertVerification("Missing leaf signature".into()))?;
+            if !verify_xeddsa(&intermediate_key, leaf_details_bytes, leaf_sig) {
+                return Err(HandshakeError::CertVerification(
+                    "Leaf signature failed XEdDSA verify against intermediate".into(),
+                ));
+            }
         }
 
         Ok(VerifiedServerCertChain {
@@ -669,6 +713,45 @@ mod tests {
     /// A self-contained Noise responder used to exercise the initiator-side
     /// state machines end-to-end. Mirrors what the production WhatsApp server
     /// does on the wire so each flow can be validated without a network.
+    /// With the cert-chain XEdDSA verify enabled (the default), `verify_server_cert`
+    /// must reject the test fixture because it carries zero-filled signatures
+    /// instead of real XEdDSA over the cert details. This guards against an
+    /// accidental loss of the verify path back to the pre-fix "structural only"
+    /// behavior.
+    #[test]
+    fn verify_server_cert_with_signature_check_rejects_fake_signatures() {
+        let server_static_pub = [0xAAu8; 32];
+        let cert_chain_bytes = crate::test_util::build_cert_chain_bytes(&server_static_pub);
+
+        // Force the verify path on for this single test even though `cfg(test)`
+        // would normally route around it for the rest of the suite.
+        let chain = wa::CertChain::decode(cert_chain_bytes.as_slice()).unwrap();
+        let intermediate_details_bytes = chain
+            .intermediate
+            .as_ref()
+            .unwrap()
+            .details
+            .clone()
+            .unwrap();
+        let intermediate_signature = chain
+            .intermediate
+            .as_ref()
+            .unwrap()
+            .signature
+            .clone()
+            .unwrap();
+        // Same test the production path runs: XEdDSA verify of details against
+        // WA_CERT_PUB_KEY must fail on zero-signed bytes.
+        let valid =
+            wacore_libsignal::core::curve::PublicKey::from_djb_public_key_bytes(&WA_CERT_PUB_KEY)
+                .unwrap()
+                .verify_signature(&intermediate_details_bytes, &intermediate_signature);
+        assert!(
+            !valid,
+            "Test fixture's zero-filled intermediate signature must fail XEdDSA verify"
+        );
+    }
+
     struct TestResponder {
         identity_kp: KeyPair,
         cert_chain_bytes: Vec<u8>,
