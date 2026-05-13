@@ -50,13 +50,9 @@ pub fn extract_ciphertext(msg: CiphertextMessage) -> Option<(&'static str, bool,
 }
 
 /// Unwrap wrapper message types to reach the inner message.
-/// Matches WA Web's getUnwrappedProtobufMessage (EProtoUtils.js:19-35).
-///
-/// Public so the retry-edit-inference path can descend through neutral
-/// wrappers (ephemeral / view_once / device_sent) before checking for
-/// pin/edit/revoke fields. Does **not** unwrap `edited_message` — that field
-/// is itself the signal we're trying to detect.
-pub fn unwrap_message(msg: &wa::Message) -> &wa::Message {
+/// Matches WA Web's getUnwrappedProtobufMessage. Does not unwrap
+/// `edited_message`; that field is itself a signal callers may need.
+pub(crate) fn unwrap_message(msg: &wa::Message) -> &wa::Message {
     macro_rules! try_unwrap {
         ($($field:ident),+ $(,)?) => {
             $(
@@ -211,18 +207,10 @@ pub fn media_type_from_message(msg: &wa::Message) -> Option<&'static str> {
     None
 }
 
-/// Canonical rule for the `decrypt-fail="hide"` attribute on outgoing `<enc>`
-/// nodes. Centralizes the predicate used across DM peer fanout, group SKDM
-/// distribution and group SKMSG to avoid drift — that drift was the root
-/// cause of admin revokes silently failing for the SKDM path.
-///
-/// `true` means: emit `decrypt-fail="hide"`. Returns:
-/// * `true` for any non-`Empty` edit *except* `AdminRevoke` — the server
-///   rejects revoke stanzas carrying the hide attribute (per the
-///   `test_decrypt_fail_hide_logic_for_edits` test in `types::message`).
-/// * `true` for infrastructure messages that match `should_hide_decrypt_fail`
-///   (reactions, pin changes, poll updates, etc.).
-/// * `false` otherwise.
+/// Canonical rule for `decrypt-fail="hide"` on outgoing `<enc>` nodes.
+/// Shared by DM fanout, group SKDM and group SKMSG so the three paths can't drift.
+/// `AdminRevoke` is excluded because the server drops revoke stanzas carrying the
+/// hide attribute.
 pub fn should_hide_decrypt_fail_for_send(
     edit: Option<&crate::types::message::EditAttribute>,
     msg: &wa::Message,
@@ -1067,7 +1055,8 @@ where
         .attr("id", message_id)
         .attr("type", stanza_type_from_message(message));
 
-    // Preserve edit attribute on retry — same reason as the group path.
+    // Without `edit`, the resend looks like a normal message and the client never
+    // applies the revoke/edit.
     if let Some(e) = edit
         && e != crate::types::message::EditAttribute::Empty
     {
@@ -1137,11 +1126,8 @@ where
     // WA Web always sets addressing_mode for groups (MsgCreateDeviceStanza.js:131-135)
     stanza_builder = stanza_builder.attr("addressing_mode", addressing_mode.as_str());
 
-    // Preserve the edit attribute on retry — without it the client receives the
-    // resend as a normal message and never applies the revoke/edit. Symptom:
-    // admin revoke worked for devices that decrypted on first try, but devices
-    // that sent a retry receipt got the resend without `edit="8"` and the
-    // image/message stayed visible for them.
+    // Without `edit`, the resend looks like a normal message and the client never
+    // applies the revoke/edit.
     if let Some(e) = edit
         && e != crate::types::message::EditAttribute::Empty
     {
@@ -1367,11 +1353,9 @@ pub async fn prepare_group_stanza<
         // WA Web's GroupSkmsgJob wraps ensureE2ESessions in try/catch — logs error
         // but does NOT rethrow. SKDM distribution failure must not prevent the group
         // message from being sent. Only successfully encrypted devices are tracked.
-        //
-        // hide_decrypt_fail: matches the main skmsg payload — `false` for AdminRevoke
-        // (server rejects revoke when SKDM has `decrypt-fail="hide"`; some clients
-        // never decrypt the skmsg principal and never apply the revoke), `true` for
-        // other edits and infrastructure messages.
+        // Must match the rule applied to the main skmsg payload below: if SKDM carries
+        // `decrypt-fail="hide"` but the payload does not (e.g. AdminRevoke), recipients
+        // without a sender key never decrypt the skmsg and the revoke is silently dropped.
         let skdm_hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
         match encrypt_for_devices(
             runtime,
@@ -3089,9 +3073,6 @@ mod tests {
             );
         }
 
-        // Regression: retry resends must preserve the original `edit` wire
-        // attribute. Without it, admin revokes were re-sent as plain messages
-        // on retry and the client never applied the revoke for that device.
         #[tokio::test]
         async fn group_retry_preserves_edit_attribute() {
             let (mut ss, mut is, jid) = setup_session().await;

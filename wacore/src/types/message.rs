@@ -96,56 +96,33 @@ impl EditAttribute {
         self.as_str()
     }
 
-    /// Infer the wire `edit` attribute from a fully-constructed message body.
-    /// Used by the retry path to preserve the original `edit="N"` when
-    /// resending — without it, the client receives the resend as a plain
-    /// message and never applies the revoke/edit/pin operation.
-    ///
-    /// Recognizes (in order):
-    /// * `pin_in_chat_message` → `PinInChat`
-    /// * top-level `edited_message` (FutureProofMessage edit envelope, current
-    ///   WA Web format) → `MessageEdit`
-    /// * `protocol_message.r#type == Revoke` with `key.from_me` →
-    ///   `SenderRevoke` (true) / `AdminRevoke` (false)
-    /// * `protocol_message.r#type == MessageEdit` with `key.from_me` →
-    ///   `MessageEdit` (true) / `AdminEdit` (false)
-    /// * legacy `protocol_message.edited_message` (no explicit type) → `MessageEdit`
+    /// Recover the wire `edit` value from a cached protobuf so the retry path can
+    /// re-emit `edit="N"` on resends. The original `subtype` (used by WA Web's
+    /// `editAttribute`) isn't persisted, so `key.from_me` is used as a proxy to
+    /// distinguish admin-vs-sender revoke: WA Web sets `from_me=false` on the
+    /// revoke proto's `MessageKey` when an admin revokes someone else's message.
     pub fn infer_from_message(msg: &waproto::whatsapp::Message) -> Option<Self> {
         use waproto::whatsapp::message::protocol_message::Type as ProtocolType;
 
-        // Descend through neutral wrappers (ephemeral / view_once / device_sent /
-        // doc_with_caption / etc.) before inspecting semantic fields — the
-        // operation signal can be nested under any of them and we'd otherwise
-        // silently drop the `edit` attribute on retry.
+        // The operation signal can be nested under any neutral wrapper.
         let msg = crate::send::unwrap_message(msg);
 
         if msg.pin_in_chat_message.is_some() {
             return Some(Self::PinInChat);
         }
-        // Top-level `edited_message` envelope (current WA Web format) doesn't
-        // carry a from_me flag — default to `MessageEdit`. The Admin variant
-        // is only distinguishable when the operation is wrapped in a
-        // `protocol_message` with `key.from_me` set explicitly.
         if msg.edited_message.is_some() {
             return Some(Self::MessageEdit);
         }
         if let Some(pm) = msg.protocol_message.as_deref() {
-            let from_me = pm.key.as_ref().and_then(|k| k.from_me).unwrap_or(false);
             if pm.r#type == Some(ProtocolType::Revoke as i32) {
+                let from_me = pm.key.as_ref().and_then(|k| k.from_me).unwrap_or(false);
                 return Some(if from_me {
                     Self::SenderRevoke
                 } else {
                     Self::AdminRevoke
                 });
             }
-            if pm.r#type == Some(ProtocolType::MessageEdit as i32) {
-                return Some(if from_me {
-                    Self::MessageEdit
-                } else {
-                    Self::AdminEdit
-                });
-            }
-            if pm.edited_message.is_some() {
+            if pm.r#type == Some(ProtocolType::MessageEdit as i32) || pm.edited_message.is_some() {
                 return Some(Self::MessageEdit);
             }
         }
@@ -305,9 +282,6 @@ mod tests {
 
     #[test]
     fn infer_from_message_top_level_edit() {
-        // FutureProofMessage edit envelope — current WA Web format. Without
-        // this branch in `infer_from_message`, edits get resent on retry as
-        // plain messages and never apply.
         let msg = waproto::whatsapp::Message {
             edited_message: Some(Box::new(waproto::whatsapp::message::FutureProofMessage {
                 message: Some(Box::new(waproto::whatsapp::Message::default())),
@@ -358,30 +332,6 @@ mod tests {
     }
 
     #[test]
-    fn infer_from_message_admin_edit() {
-        // Admin editing someone else's message: protocol_message wraps the
-        // edit with `key.from_me = false`, mirroring the AdminRevoke convention.
-        let msg = waproto::whatsapp::Message {
-            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
-                key: Some(waproto::whatsapp::MessageKey {
-                    from_me: Some(false),
-                    ..Default::default()
-                }),
-                r#type: Some(
-                    waproto::whatsapp::message::protocol_message::Type::MessageEdit as i32,
-                ),
-                edited_message: Some(Box::new(waproto::whatsapp::Message::default())),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        assert_eq!(
-            EditAttribute::infer_from_message(&msg),
-            Some(EditAttribute::AdminEdit)
-        );
-    }
-
-    #[test]
     fn infer_from_message_plain_returns_none() {
         let msg = waproto::whatsapp::Message {
             conversation: Some("plain".into()),
@@ -392,8 +342,6 @@ mod tests {
 
     #[test]
     fn infer_from_message_unwraps_neutral_wrappers() {
-        // Admin revoke wrapped in ephemeral_message — retry path must still
-        // recover the `edit="8"` attribute.
         let inner_revoke = waproto::whatsapp::Message {
             protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
                 key: Some(waproto::whatsapp::MessageKey {
