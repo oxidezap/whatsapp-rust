@@ -16,63 +16,30 @@ use wacore::types::message::EditAttribute;
 use waproto::whatsapp as wa;
 
 // ---------------------------------------------------------------------------
-// A1. Edit attribute incomplete on outgoing message stanzas
+// A1. Edit attribute coverage parity with WAWebSendMsgCommonApi.editAttribute
 // ---------------------------------------------------------------------------
 //
-// Ground truth (verified in `docs/captured-js/WAWeb/Send/MsgCommonApi.js`,
-// function `editAttribute(message, subtype)`):
-//   reactionMessage.text === ''           -> "7"  (SENDER_REVOKE)
-//   keepInChatMessage UNDO_KEEP_FOR_ALL   -> "7"
-//   editedMessage (top-level)             -> "1"  (MESSAGE_EDIT)
-//   secretEncryptedMessage MESSAGE_EDIT   -> "1"
-//   secretEncryptedMessage EVENT_EDIT     -> "1"
-//   protocolMessage.type == REVOKE        -> "7"/"8" depending on subtype
-//   pinInChatMessage                      -> "2"
-//
-// whatsapp-rust:
-//   - `src/send.rs:infer_stanza_metadata` only emits `EditAttribute::PinInChat`
-//     for `pin_in_chat_message`; nothing else.
-//   - `EditAttribute::infer_from_message` (the retry-side inference, public API)
-//     handles pin/edited_message/protocol_message but misses reaction-revoke,
-//     keep_in_chat undo, and secret_encrypted edit envelopes.
-//
-// The POCs below exercise the PUBLIC `EditAttribute::infer_from_message`,
-// which is the canonical source of truth used both on initial send (via
-// `infer_stanza_metadata`) and on retry resend. Each `assert_eq!(.., None)`
-// documents the bug; the comment immediately above states what WA Web does.
+// Each regression test below pins one branch of WA Web's `editAttribute(msg,
+// subtype)` so the wire `edit="N"` attribute is correctly emitted by both
+// initial send and retry resend.
 
 #[test]
-fn bug_a1_revoked_reaction_misses_sender_revoke() {
-    println!("\nBUG A1.1: revoked reaction (text=\"\") does NOT emit edit=\"7\"");
-
-    // A reaction-revoke in WhatsApp Web is just a reaction_message with empty
-    // text. WA Web's editAttribute() returns SENDER_REVOKE ("7") for this so
-    // the recipient knows to UN-react, not just show an empty reaction.
+fn regression_a1_revoked_reaction_returns_sender_revoke() {
     let msg = wa::Message {
         reaction_message: Some(wa::message::ReactionMessage {
-            text: Some(String::new()), // empty = revoked
+            text: Some(String::new()),
             ..Default::default()
         }),
         ..Default::default()
     };
-
-    let inferred = EditAttribute::infer_from_message(&msg);
-    println!("  WA Web expected: Some(SenderRevoke) -> edit=\"7\"");
-    println!("  whatsapp-rust : {:?}", inferred);
-
-    // The bug: returns None instead of SenderRevoke.
     assert_eq!(
-        inferred, None,
-        "POC outdated: lib now recognizes revoked reactions"
+        EditAttribute::infer_from_message(&msg),
+        Some(EditAttribute::SenderRevoke),
     );
 }
 
 #[test]
-fn bug_a1_keep_in_chat_undo_misses_sender_revoke() {
-    println!("\nBUG A1.2: keep_in_chat UNDO_KEEP_FOR_ALL does NOT emit edit=\"7\"");
-
-    // KeepInChat "undo keep for all" is also a sender-revoke at the wire level.
-    // WA Web special-cases this in editAttribute().
+fn regression_a1_keep_in_chat_undo_returns_sender_revoke() {
     let msg = wa::Message {
         keep_in_chat_message: Some(wa::message::KeepInChatMessage {
             key: Some(wa::MessageKey {
@@ -84,24 +51,14 @@ fn bug_a1_keep_in_chat_undo_misses_sender_revoke() {
         }),
         ..Default::default()
     };
-
-    let inferred = EditAttribute::infer_from_message(&msg);
-    println!("  WA Web expected: Some(SenderRevoke) -> edit=\"7\"");
-    println!("  whatsapp-rust : {:?}", inferred);
-
     assert_eq!(
-        inferred, None,
-        "POC outdated: lib now recognizes UNDO_KEEP_FOR_ALL"
+        EditAttribute::infer_from_message(&msg),
+        Some(EditAttribute::SenderRevoke),
     );
 }
 
 #[test]
-fn bug_a1_secret_encrypted_message_edit_misses_message_edit() {
-    println!("\nBUG A1.3: secretEncryptedMessage MESSAGE_EDIT does NOT emit edit=\"1\"");
-
-    // The newer encrypted-edit envelope (`secret_encrypted_message`) is the
-    // current WA Web format. editAttribute() returns MESSAGE_EDIT for both
-    // EVENT_EDIT and MESSAGE_EDIT secret enc types.
+fn regression_a1_secret_encrypted_message_edit_returns_message_edit() {
     let msg = wa::Message {
         secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
             secret_enc_type: Some(
@@ -111,21 +68,14 @@ fn bug_a1_secret_encrypted_message_edit_misses_message_edit() {
         }),
         ..Default::default()
     };
-
-    let inferred = EditAttribute::infer_from_message(&msg);
-    println!("  WA Web expected: Some(MessageEdit) -> edit=\"1\"");
-    println!("  whatsapp-rust : {:?}", inferred);
-
     assert_eq!(
-        inferred, None,
-        "POC outdated: lib now recognizes secret_encrypted MESSAGE_EDIT"
+        EditAttribute::infer_from_message(&msg),
+        Some(EditAttribute::MessageEdit),
     );
 }
 
 #[test]
-fn bug_a1_secret_encrypted_event_edit_misses_message_edit() {
-    println!("\nBUG A1.4: secretEncryptedMessage EVENT_EDIT does NOT emit edit=\"1\"");
-
+fn regression_a1_secret_encrypted_event_edit_returns_message_edit() {
     let msg = wa::Message {
         secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
             secret_enc_type: Some(
@@ -135,14 +85,9 @@ fn bug_a1_secret_encrypted_event_edit_misses_message_edit() {
         }),
         ..Default::default()
     };
-
-    let inferred = EditAttribute::infer_from_message(&msg);
-    println!("  WA Web expected: Some(MessageEdit) -> edit=\"1\"");
-    println!("  whatsapp-rust : {:?}", inferred);
-
     assert_eq!(
-        inferred, None,
-        "POC outdated: lib now recognizes secret_encrypted EVENT_EDIT"
+        EditAttribute::infer_from_message(&msg),
+        Some(EditAttribute::MessageEdit),
     );
 }
 

@@ -96,15 +96,20 @@ impl EditAttribute {
         self.as_str()
     }
 
-    /// Recover the wire `edit` value from a cached protobuf so the retry path can
-    /// re-emit `edit="N"` on resends. The original `subtype` (used by WA Web's
-    /// `editAttribute`) isn't persisted, so `key.from_me` is used as a proxy to
-    /// distinguish admin-vs-sender revoke: WA Web sets `from_me=false` on the
-    /// revoke proto's `MessageKey` when an admin revokes someone else's message.
+    /// Wire `edit` value derived from a fully-constructed message body.
+    /// Mirrors WAWebSendMsgCommonApi.editAttribute. Used both for the initial
+    /// send (so the outer `<message>` carries the right attribute) and for the
+    /// retry-resend path (which has no other signal source than the cached
+    /// protobuf).
+    ///
+    /// `from_me` for the protocolMessage Revoke branch comes from
+    /// `protocolMessage.key.fromMe` as a proxy for the `subtype` argument WA
+    /// Web threads through from the MessageRecord. The convention is that an
+    /// admin revoking someone else's message sets `fromMe=false`.
     pub fn infer_from_message(msg: &waproto::whatsapp::Message) -> Option<Self> {
         use waproto::whatsapp::message::protocol_message::Type as ProtocolType;
+        use waproto::whatsapp::message::secret_encrypted_message::SecretEncType;
 
-        // The operation signal can be nested under any neutral wrapper.
         let msg = crate::send::unwrap_message(msg);
 
         if msg.pin_in_chat_message.is_some() {
@@ -125,6 +130,26 @@ impl EditAttribute {
             if pm.r#type == Some(ProtocolType::MessageEdit as i32) || pm.edited_message.is_some() {
                 return Some(Self::MessageEdit);
             }
+        }
+        if let Some(sec) = msg.secret_encrypted_message.as_ref()
+            && let Some(enc_type) = sec.secret_enc_type
+            && (enc_type == SecretEncType::MessageEdit as i32
+                || enc_type == SecretEncType::EventEdit as i32)
+        {
+            return Some(Self::MessageEdit);
+        }
+        // Reaction with empty text == sender-revoke of a previous reaction.
+        if let Some(react) = msg.reaction_message.as_ref()
+            && react.text.as_deref() == Some("")
+        {
+            return Some(Self::SenderRevoke);
+        }
+        // KeepInChat UNDO_KEEP_FOR_ALL is a sender-revoke at the wire level.
+        if let Some(keep) = msg.keep_in_chat_message.as_ref()
+            && keep.key.as_ref().and_then(|k| k.from_me) == Some(true)
+            && keep.keep_type == Some(waproto::whatsapp::KeepType::UndoKeepForAll as i32)
+        {
+            return Some(Self::SenderRevoke);
         }
         None
     }
