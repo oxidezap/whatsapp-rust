@@ -194,6 +194,36 @@ fn regression_a6_login_counter_increments() {
 }
 
 // ---------------------------------------------------------------------------
+// A11. default HistorySyncConfig advertises the WA Web support_* flags
+// ---------------------------------------------------------------------------
+
+#[test]
+fn regression_a11_history_sync_config_advertises_support_flags() {
+    let cfg = wacore::store::device::default_history_sync_config();
+
+    // Static booleans WA Web's WAWebClientPayload always sends.
+    assert_eq!(cfg.inline_initial_payload_in_e2_ee_msg, Some(true));
+    assert_eq!(cfg.support_bot_user_agent_chat_history, Some(true));
+    assert_eq!(cfg.support_cag_reactions_and_polls, Some(true));
+    assert_eq!(
+        cfg.support_recent_sync_chunk_message_count_tuning,
+        Some(true)
+    );
+    assert_eq!(cfg.support_hosted_group_msg, Some(true));
+    assert_eq!(cfg.support_biz_hosted_msg, Some(true));
+    assert_eq!(cfg.support_fbid_bot_chat_history, Some(true));
+    assert_eq!(cfg.support_message_association, Some(true));
+
+    // Newer support flags previously missing from this lib.
+    assert_eq!(cfg.support_group_history, Some(true));
+    assert_eq!(cfg.support_manus_history, Some(true));
+    assert_eq!(cfg.support_hatch_history, Some(true));
+
+    // Platform-gated in WA Web: only Windows clients advertise it.
+    assert_eq!(cfg.support_call_log_history, Some(false));
+}
+
+// ---------------------------------------------------------------------------
 // A7. value-MAC `octet-length` encoding diverges bytewise from WA Web
 // ---------------------------------------------------------------------------
 //

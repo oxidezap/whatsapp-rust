@@ -166,10 +166,16 @@ impl DevicePropsOverride {
 
 /// Default `HistorySyncConfig` aligned with WA Web's static claims
 /// (`Payload.js` in `WAWebClientPayload`). Runtime-derived fields like
-/// `storage_quota_mb`, `on_demand_ready`, and justknobx-gated flags are left
-/// unset so callers can populate them through
+/// `storage_quota_mb`, `on_demand_ready`, and the justknobx-gated numeric
+/// limits are left unset so callers can populate them through
 /// [`DevicePropsOverride::with_history_sync_config`] without fighting stale
 /// hardcoded values.
+///
+/// `support_*` capability flags are advertised as `true`: they tell the
+/// server which history payload variants the client can ingest, and the
+/// library either handles them or treats them as opaque (no harm). The
+/// platform-gated `support_call_log_history` is `false` because the call
+/// log history payload is bound to the Windows desktop client.
 pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
     wa::device_props::HistorySyncConfig {
         full_sync_days_limit: Some(30),
@@ -181,6 +187,10 @@ pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
         support_biz_hosted_msg: Some(true),
         support_fbid_bot_chat_history: Some(true),
         support_message_association: Some(true),
+        support_call_log_history: Some(false),
+        support_group_history: Some(true),
+        support_manus_history: Some(true),
+        support_hatch_history: Some(true),
         ..Default::default()
     }
 }
