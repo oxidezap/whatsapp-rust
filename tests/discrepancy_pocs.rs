@@ -512,32 +512,22 @@ fn bug_a10_mac_compare_not_constant_time_timing_signal() {
 }
 
 #[test]
-fn bug_a10_mac_compare_uses_short_circuit_eq() {
-    println!("\nBUG A10 (static evidence): MAC compare uses `!=`, not ConstantTimeEq");
-
-    // Read the source line at runtime and assert it still uses `!=`. This
-    // makes the POC fail the day someone swaps in a constant-time compare,
-    // signalling that the fix landed and the assertion should be flipped.
+fn regression_a10_mac_compare_uses_constant_time() {
+    // Source-level check that the media-decrypt MAC compare uses a
+    // constant-time primitive. Guards against accidental reintroduction of
+    // the `slice != slice` short-circuit pattern.
     let src = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/wacore/src/download.rs"
     ))
     .expect("download.rs is in the workspace");
 
-    let uses_non_constant_time = src.contains("&computed_mac_full[..MAC_SIZE] != received_mac");
-    let uses_constant_time = src.contains("ct_eq") || src.contains("ConstantTimeEq");
-
-    println!(
-        "  Found `!= received_mac` short-circuit: {}",
-        uses_non_constant_time
-    );
-    println!(
-        "  Found `ConstantTimeEq` / `ct_eq`     : {}",
-        uses_constant_time
-    );
-
     assert!(
-        uses_non_constant_time && !uses_constant_time,
-        "POC outdated: download.rs no longer uses the short-circuit MAC compare"
+        !src.contains("&computed_mac_full[..MAC_SIZE] != received_mac"),
+        "regression: download.rs reintroduced non-constant-time MAC compare"
+    );
+    assert!(
+        src.contains("ct_eq") || src.contains("ConstantTimeEq"),
+        "regression: download.rs no longer uses a constant-time compare for MAC verify"
     );
 }

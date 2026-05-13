@@ -44,6 +44,7 @@ serde-big-array = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 typed-builder = "0.23"
 wacore-appstate = { workspace = true }

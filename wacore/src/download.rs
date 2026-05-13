@@ -435,7 +435,7 @@ impl DownloadUtils {
         hmac.update(final_ciphertext);
         let expected_mac_full = hmac.finalize().into_bytes();
         let expected_mac = &expected_mac_full[..MAC_SIZE];
-        if mac_bytes != expected_mac {
+        if subtle::ConstantTimeEq::ct_eq(mac_bytes, expected_mac).unwrap_u8() == 0 {
             return Err(anyhow!("MAC mismatch"));
         }
 
@@ -528,7 +528,9 @@ impl DownloadUtils {
             mac.update(ciphertext);
             mac.finalize()
         };
-        if &computed_mac_full[..MAC_SIZE] != received_mac {
+        if subtle::ConstantTimeEq::ct_eq(&computed_mac_full[..MAC_SIZE], received_mac).unwrap_u8()
+            == 0
+        {
             return Err(MediaDecryptionError::InvalidMac);
         }
 
