@@ -83,6 +83,7 @@ struct DeviceRow {
     nct_salt: Option<Vec<u8>>,
     server_has_prekeys: bool,
     server_cert_chain: Option<Vec<u8>>,
+    login_counter: i32,
 }
 
 #[derive(Clone)]
@@ -337,6 +338,7 @@ impl SqliteStore {
                     .map_err(|e| StoreError::Serialization(Box::new(e)))
             })
             .transpose()?;
+        let login_counter = device_data.login_counter;
         let new_lid: Arc<str> = Arc::from(
             device_data
                 .lid
@@ -394,6 +396,7 @@ impl SqliteStore {
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(nct_salt.as_deref()),
                         device::server_cert_chain.eq(server_cert_chain.as_deref()),
+                        device::login_counter.eq(login_counter),
                     ))
                     .on_conflict(device::id)
                     .do_update()
@@ -421,6 +424,7 @@ impl SqliteStore {
                         device::server_has_prekeys.eq(excluded(device::server_has_prekeys)),
                         device::nct_salt.eq(excluded(device::nct_salt)),
                         device::server_cert_chain.eq(excluded(device::server_cert_chain)),
+                        device::login_counter.eq(excluded(device::login_counter)),
                     ))
                     .execute(conn)
                     .map(|_| ())
@@ -483,6 +487,7 @@ impl SqliteStore {
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(None::<&[u8]>),
                         device::server_cert_chain.eq(None::<&[u8]>),
+                        device::login_counter.eq(0i32),
                     ))
                     .execute(conn)
                     .map(|_| device_id)
@@ -613,6 +618,7 @@ impl SqliteStore {
                             }
                         }
                     }),
+                login_counter: row.login_counter,
             }))
         } else {
             Ok(None)

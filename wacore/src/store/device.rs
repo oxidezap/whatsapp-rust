@@ -255,6 +255,12 @@ pub struct Device {
     /// `None` forces XX on the next connect.
     #[serde(default)]
     pub server_cert_chain: Option<CachedServerCertChain>,
+    /// Login counter sent as `ClientPayload.lc` on every login. WA Web's
+    /// `WAWebUserPrefsGeneral.getLoginCounter()` reads (and bumps) this from
+    /// localStorage on each connect; the server uses it as an anti-abuse
+    /// signal. Persisted so it survives restarts.
+    #[serde(default)]
+    pub login_counter: i32,
 }
 
 /// Minimal cached form of a Noise certificate. Mirrors the JSON shape WA Web
@@ -349,6 +355,7 @@ impl Device {
             nct_salt: None,
             nct_salt_sync_seen: false,
             server_cert_chain: None,
+            login_counter: 0,
         }
     }
 
@@ -414,7 +421,17 @@ impl Device {
         payload.username = jid.user.parse::<u64>().ok();
         payload.device = Some(jid.device as u32);
         payload.passive = Some(self.client_profile.passive_login);
+        payload.lc = Some(self.login_counter);
+        // Always false: the lib has no LID migration path. WA Web sends this
+        // unconditionally so the server can branch on it.
+        payload.lid_db_migrated = Some(false);
         payload
+    }
+
+    /// Bump the persisted `lc` counter ahead of an outgoing login payload.
+    /// Mirrors WA Web's `WAWebUserPrefsGeneral.getLoginCounter()` increment.
+    pub fn increment_login_counter(&mut self) {
+        self.login_counter = self.login_counter.saturating_add(1);
     }
 
     fn get_registration_payload(&self) -> wa::ClientPayload {

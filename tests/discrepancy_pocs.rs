@@ -169,40 +169,29 @@ fn regression_a5_useragent_locale_is_configurable_and_default_is_country_code() 
 }
 
 // ---------------------------------------------------------------------------
-// A6. Login payload: `lc` (login counter) and `lidDbMigrated` missing
+// A6. Login payload includes `lc` and `lid_db_migrated`
 // ---------------------------------------------------------------------------
-//
-// Ground truth: `Payload.js`, function `s()` (login payload builder):
-//   { ..., lc: getLoginCounter(), lidDbMigrated: Lid1X1MigrationUtils.isLidMigrated() }
-//
-// Both fields are sent on every login. The wa6 protobuf has the corresponding
-// fields, so this is a true protocol omission, not a schema gap.
-//
-// whatsapp-rust: `device.rs:401-413` only sets `username`, `device`, and
-// `passive`. Misses `lc` and `lid_db_migrated`.
 
 #[test]
-fn bug_a6_login_payload_missing_lc() {
-    println!("\nBUG A6.1: login payload missing `lc` (login counter)");
-
+fn regression_a6_login_payload_carries_lc_and_lid_db_migrated() {
     let mut device = Device::new();
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
 
     let payload = device.get_client_payload();
-
-    println!("  WA Web expected: lc = Some(<counter>)");
-    println!("  whatsapp-rust : lc = {:?}", payload.lc);
-
-    // The bug: `lc` is None on every login. WA Web increments this each login
-    // and sends it; it informs server-side anti-spam / session tracking.
-    assert_eq!(payload.lc, None, "POC outdated: lc is now populated");
+    assert_eq!(payload.lc, Some(0));
+    assert_eq!(payload.lid_db_migrated, Some(false));
 }
 
-// `lidDbMigrated` would map to a separate boolean field on the ClientPayload
-// proto. If the field exists in the proto, the bug is "not populated"; if
-// the proto doesn't expose it, the bug is "schema missing". We cannot probe
-// the proto without depending on its exact field name, so the lc check above
-// is sufficient evidence that the login payload is incomplete.
+#[test]
+fn regression_a6_login_counter_increments() {
+    let mut device = Device::new();
+    device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
+    assert_eq!(device.get_client_payload().lc, Some(0));
+
+    device.increment_login_counter();
+    device.increment_login_counter();
+    assert_eq!(device.get_client_payload().lc, Some(2));
+}
 
 // ---------------------------------------------------------------------------
 // A7. value-MAC `octet-length` encoding diverges bytewise from WA Web

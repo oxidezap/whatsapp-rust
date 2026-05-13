@@ -72,6 +72,7 @@ diesel::table! {
         nct_salt -> Nullable<Binary>,
         server_has_prekeys -> Bool,
         server_cert_chain -> Nullable<Binary>,
+        login_counter -> Integer,
     }
 }
 
