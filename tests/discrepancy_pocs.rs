@@ -92,37 +92,30 @@ fn regression_a1_secret_encrypted_event_edit_returns_message_edit() {
 }
 
 // ---------------------------------------------------------------------------
-// A4. `passive = true` hardcoded on login
+// A4. `passive` flag defaults to WA Web's `false` and is configurable
 // ---------------------------------------------------------------------------
-//
-// Ground truth: `docs/captured-js/WAWeb/Client/Payload.js`, function `m()`:
-//   passive: (e?.passive) != null ? e.passive : false
-// Default is `false`. WA Web only sends `passive=true` when the caller
-// explicitly overrides it (e.g. background reconnects).
-//
-// whatsapp-rust: `wacore/src/store/device.rs:411`
-//   payload.passive = Some(true);   // hardcoded, no opt-out
-//
-// Note: whatsmeow also uses `passive=true`, so this MAY be intentional. Verify
-// against real-world offline-sync behaviour before flipping.
 
 #[test]
-fn bug_a4_login_payload_passive_hardcoded_true() {
-    println!("\nBUG A4: login payload has passive=true hardcoded (WA Web default: false)");
-
+fn regression_a4_login_payload_passive_defaults_to_false() {
+    // WA Web's m() in Payload.js defaults `passive: false`. Match that.
     let mut device = Device::new();
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
 
     let payload = device.get_client_payload();
+    assert_eq!(payload.passive, Some(false));
+}
 
-    println!("  WA Web default: passive=false (unless caller overrides)");
-    println!("  whatsapp-rust : passive={:?}", payload.passive);
+#[test]
+fn regression_a4_login_payload_passive_is_configurable() {
+    // Callers that want the whatsmeow-style passive=true must be able to opt in.
+    let mut profile = wacore::client_profile::ClientProfile::web();
+    profile.passive_login = true;
 
-    assert_eq!(
-        payload.passive,
-        Some(true),
-        "POC outdated: passive is no longer hardcoded to true"
-    );
+    let mut device = Device::new();
+    device.set_client_profile(profile);
+    device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
+
+    assert_eq!(device.get_client_payload().passive, Some(true));
 }
 
 // ---------------------------------------------------------------------------

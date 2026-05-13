@@ -10,6 +10,11 @@ pub struct ClientProfile {
     pub os_version: String,
     pub manufacturer: String,
     pub include_web_info: bool,
+    /// `ClientPayload.passive` value on login. WA Web defaults to `false` so
+    /// the server delivers queued offline messages on (re)connect. Set to
+    /// `true` to keep the connection passive (server holds queued messages
+    /// until pulled), matching the whatsmeow convention.
+    pub passive_login: bool,
 }
 
 impl Default for ClientProfile {
@@ -26,6 +31,7 @@ impl ClientProfile {
             os_version: "0.1.0".to_string(),
             manufacturer: String::new(),
             include_web_info: true,
+            passive_login: false,
         }
     }
 
@@ -36,6 +42,7 @@ impl ClientProfile {
             os_version: os_version.into(),
             manufacturer: String::new(),
             include_web_info: false,
+            passive_login: false,
         }
     }
 
@@ -46,6 +53,7 @@ impl ClientProfile {
             os_version: os_version.into(),
             manufacturer: String::new(),
             include_web_info: false,
+            passive_login: false,
         }
     }
 
@@ -56,6 +64,7 @@ impl ClientProfile {
             os_version: os_version.into(),
             manufacturer: "Apple".to_string(),
             include_web_info: false,
+            passive_login: false,
         }
     }
 
@@ -66,6 +75,7 @@ impl ClientProfile {
             os_version: os_version.into(),
             manufacturer: "Apple".to_string(),
             include_web_info: false,
+            passive_login: false,
         }
     }
 
@@ -76,6 +86,7 @@ impl ClientProfile {
             os_version: os_version.into(),
             manufacturer: String::new(),
             include_web_info: false,
+            passive_login: false,
         }
     }
 }

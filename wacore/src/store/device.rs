@@ -408,7 +408,7 @@ impl Device {
         let mut payload = build_base_client_payload(app_version, &self.client_profile);
         payload.username = jid.user.parse::<u64>().ok();
         payload.device = Some(jid.device as u32);
-        payload.passive = Some(true);
+        payload.passive = Some(self.client_profile.passive_login);
         payload
     }
 
