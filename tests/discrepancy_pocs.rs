@@ -119,65 +119,53 @@ fn regression_a4_login_payload_passive_is_configurable() {
 }
 
 // ---------------------------------------------------------------------------
-// A5. UserAgent: `phoneId` (UUID) missing, locale hardcoded
+// A5. UserAgent: phone_id auto-populated, locale country is ISO-3166-1
 // ---------------------------------------------------------------------------
-//
-// Ground truth: `Payload.js`, function `y()` (UserAgent builder). The real
-// UserAgent carries `phoneId: randomUUID()` plus locale fields derived from
-// the device's actual locale. Reference: zapo correctly populates `phoneId`
-// in `src/transport/noise/WaClientPayload.ts:109`.
-//
-// whatsapp-rust: `wacore/src/store/device.rs:81-112`
-//   - `phoneId` is never set (field doesn't exist on the UserAgent the lib
-//     builds — `..Default::default()` covers it but it never gets populated).
-//   - `locale_language_iso6391` / `locale_country_iso31661_alpha2` are
-//     hardcoded `"en"/"en"`.
 
 #[test]
-fn bug_a5_useragent_phone_id_missing() {
-    println!("\nBUG A5.1: UserAgent.phone_id is None (WA Web sends a UUID per connect)");
-
+fn regression_a5_useragent_phone_id_is_uuid_v4_by_default() {
     let mut device = Device::new();
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
 
-    let payload = device.get_client_payload();
-    let user_agent = payload.user_agent.expect("user_agent is always populated");
+    let user_agent = device.get_client_payload().user_agent.unwrap();
+    let phone_id = user_agent.phone_id.expect("phone_id must be populated");
+    uuid::Uuid::parse_str(&phone_id).expect("phone_id must be a valid UUID");
+}
 
-    println!("  WA Web expected: phone_id = Some(\"<uuid>\")");
-    println!("  whatsapp-rust : phone_id = {:?}", user_agent.phone_id);
+#[test]
+fn regression_a5_useragent_phone_id_can_be_overridden() {
+    let mut profile = wacore::client_profile::ClientProfile::web();
+    profile.phone_id = Some("deadbeef-0000-0000-0000-000000000000".into());
+
+    let mut device = Device::new();
+    device.set_client_profile(profile);
+    device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
 
     assert_eq!(
-        user_agent.phone_id, None,
-        "POC outdated: phone_id is now populated"
+        device.get_client_payload().user_agent.unwrap().phone_id,
+        Some("deadbeef-0000-0000-0000-000000000000".to_string()),
     );
 }
 
 #[test]
-fn bug_a5_useragent_locale_hardcoded_en() {
-    println!("\nBUG A5.2: locale_country hardcoded \"en\" (should be a country code)");
-
+fn regression_a5_useragent_locale_is_configurable_and_default_is_country_code() {
+    // Default locale: en / US (US is a valid ISO-3166-1 alpha-2; "en" was not).
     let mut device = Device::new();
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
+    let ua = device.get_client_payload().user_agent.unwrap();
+    assert_eq!(ua.locale_language_iso6391.as_deref(), Some("en"));
+    assert_eq!(ua.locale_country_iso31661_alpha2.as_deref(), Some("US"));
 
-    let payload = device.get_client_payload();
-    let user_agent = payload.user_agent.unwrap();
-
-    println!(
-        "  Observed locale_language={:?} locale_country={:?}",
-        user_agent.locale_language_iso6391, user_agent.locale_country_iso31661_alpha2
-    );
-    println!("  WA Web expected: language=\"<ISO-639-1>\" country=\"<ISO-3166-1 alpha2>\"");
-    println!(
-        "  whatsapp-rust : both hardcoded \"en\" - the country code is wrong (\"en\" is not ISO-3166-1)"
-    );
-
-    // The literal divergence: country code is "en" (a language code, not a
-    // country code per ISO-3166-1 alpha-2). WA Web would send e.g. "BR"/"pt".
-    assert_eq!(
-        user_agent.locale_country_iso31661_alpha2.as_deref(),
-        Some("en"),
-        "POC outdated: country code is no longer the literal \"en\""
-    );
+    // And it's overridable.
+    let mut profile = wacore::client_profile::ClientProfile::web();
+    profile.locale_language = "pt".into();
+    profile.locale_country = "BR".into();
+    let mut device = Device::new();
+    device.set_client_profile(profile);
+    device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
+    let ua = device.get_client_payload().user_agent.unwrap();
+    assert_eq!(ua.locale_language_iso6391.as_deref(), Some("pt"));
+    assert_eq!(ua.locale_country_iso31661_alpha2.as_deref(), Some("BR"));
 }
 
 // ---------------------------------------------------------------------------

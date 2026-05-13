@@ -82,6 +82,10 @@ fn build_base_client_payload(
     app_version: wa::client_payload::user_agent::AppVersion,
     profile: &ClientProfile,
 ) -> wa::ClientPayload {
+    let phone_id = profile
+        .phone_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     wa::ClientPayload {
         user_agent: Some(wa::client_payload::UserAgent {
             platform: Some(profile.user_agent_platform as i32),
@@ -93,8 +97,9 @@ fn build_base_client_payload(
             manufacturer: Some(profile.manufacturer.clone()),
             device: Some(profile.device.clone()),
             os_build_number: Some(profile.os_version.clone()),
-            locale_language_iso6391: Some("en".to_string()),
-            locale_country_iso31661_alpha2: Some("en".to_string()),
+            locale_language_iso6391: Some(profile.locale_language.clone()),
+            locale_country_iso31661_alpha2: Some(profile.locale_country.clone()),
+            phone_id: Some(phone_id),
             ..Default::default()
         }),
         web_info: profile
