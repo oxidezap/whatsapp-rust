@@ -299,82 +299,60 @@ fn bug_a6_login_payload_missing_lc() {
 // This is a literal protocol-divergence; today it never bites because keyIds
 // are short, but it's a spec violation.
 
-#[test]
-fn bug_a7_content_mac_octet_length_diverges_for_long_key_id() {
-    println!("\nBUG A7: content-MAC octet-length encoding diverges for long key_id");
-
-    use wacore::appstate::hash::generate_content_mac;
-
-    let op = wa::syncd_mutation::SyncdOperation::Set;
-    let data = b"some-encrypted-value";
-    let mac_key = [0u8; 32];
-
-    // Construct a key_id with len = 255 so that ad.length = key_id.len()+1 = 256.
-    // WA Web: octetLength[7] = 256 & 0xff = 0  ->  [0,0,0,0,0,0,0,0]
-    // Rust  : 256.to_be_bytes()                 ->  [0,0,0,0,0,0,1,0]
-    // The HMAC inputs differ, so the MACs differ.
-    let key_id_short = vec![0xAA; 6]; // typical: 6-byte key_id
-    let key_id_long = vec![0xAA; 255]; // ad.length = 256, the wrap boundary
-
-    let mac_short = generate_content_mac(op, data, &key_id_short, &mac_key);
-    let mac_long = generate_content_mac(op, data, &key_id_long, &mac_key);
-
-    println!(
-        "  short key_id (6 bytes)  -> mac[0..4] = {:02x?}",
-        &mac_short[..4]
-    );
-    println!(
-        "  long  key_id (255 byte) -> mac[0..4] = {:02x?}",
-        &mac_long[..4]
-    );
-
-    // Demonstrate the divergence semantically by reimplementing both encodings
-    // and comparing the trailing 8 bytes of the HMAC input.
-    let wa_web_octet: [u8; 8] = {
-        let mut b = [0u8; 8];
-        b[7] = ((key_id_long.len() + 1) & 0xff) as u8; // = 0 for len 255
-        b
-    };
-    let whatsapp_rust_octet: [u8; 8] = ((key_id_long.len() + 1) as u64).to_be_bytes(); // = [0,0,0,0,0,0,1,0]
-
-    println!("  WA Web octet bytes      : {:?}", wa_web_octet);
-    println!("  whatsapp-rust octet bytes: {:?}", whatsapp_rust_octet);
-
-    assert_ne!(
-        wa_web_octet, whatsapp_rust_octet,
-        "octet-length encodings should differ at the 256-byte boundary"
-    );
-
-    // For the typical (short) key_id, both encodings coincide -> MACs would
-    // match. For the long one, the encodings differ -> MACs would differ.
-    // We don't have a WA Web oracle here, so we just demonstrate the encoding
-    // divergence at the spec level.
+/// Recompute the value-MAC the way WA Web does (`Crypto.js`): u8 packed at
+/// offset 7 of an 8-byte zero buffer. Used as the spec-correct oracle.
+fn wa_web_value_mac(
+    operation: wa::syncd_mutation::SyncdOperation,
+    data: &[u8],
+    key_id: &[u8],
+    key: &[u8],
+) -> [u8; 32] {
+    use hmac::Mac;
+    type HmacSha512 = hmac::Hmac<sha2::Sha512>;
+    let mut mac = <HmacSha512 as hmac::KeyInit>::new_from_slice(key).unwrap();
+    mac.update(&[operation as u8 + 1]);
+    mac.update(key_id);
+    mac.update(data);
+    let mut octet = [0u8; 8];
+    octet[7] = ((key_id.len() + 1) & 0xff) as u8;
+    mac.update(&octet);
+    let out = mac.finalize().into_bytes();
+    let mut r = [0u8; 32];
+    r.copy_from_slice(&out[..32]);
+    r
 }
 
 #[test]
-fn bug_a7_content_mac_coincides_for_typical_key_ids() {
-    println!("\nNote A7: for typical key_id sizes the MAC matches WA Web");
-
+fn regression_a7_content_mac_matches_wa_web_at_short_key_id() {
     use wacore::appstate::hash::generate_content_mac;
 
-    // Typical key_id is 6 bytes (key:int + version:byte). ad.length = 7.
-    // WA Web octet:        [0,0,0,0,0,0,0,7]
-    // whatsapp-rust octet: 7u64.to_be_bytes() = [0,0,0,0,0,0,0,7]
-    // -> they coincide, MAC matches.
-    let key_id = vec![0u8, 0, 0, 0, 42, 1]; // typical shape
     let op = wa::syncd_mutation::SyncdOperation::Set;
-    let mac = generate_content_mac(op, b"data", &key_id, &[0u8; 32]);
+    let key = [7u8; 32];
+    let key_id = vec![0u8, 0, 0, 0, 42, 1]; // 6 bytes, ad.length = 7
+    let data = b"some-value";
 
-    let expected_octet: [u8; 8] = {
-        let mut b = [0u8; 8];
-        b[7] = ((key_id.len() + 1) & 0xff) as u8;
-        b
-    };
-    let actual_octet: [u8; 8] = ((key_id.len() + 1) as u64).to_be_bytes();
-    assert_eq!(expected_octet, actual_octet);
+    let ours = generate_content_mac(op, data, &key_id, &key);
+    let theirs = wa_web_value_mac(op, data, &key_id, &key);
+    assert_eq!(ours, theirs, "MAC must match WA Web for typical key_id");
+}
 
-    println!("  key_id len=6 -> ad.length=7 -> both libs encode [0,0,0,0,0,0,0,7]");
-    println!("  MAC head: {:02x?}", &mac[..4]);
+#[test]
+fn regression_a7_content_mac_matches_wa_web_at_wrap_boundary() {
+    use wacore::appstate::hash::generate_content_mac;
+
+    // ad.length = 256: WA Web encodes octet[7] = 0; the pre-fix Rust code
+    // encoded [0,0,0,0,0,0,1,0] (256 BE), which differed.
+    let op = wa::syncd_mutation::SyncdOperation::Set;
+    let key = [9u8; 32];
+    let key_id = vec![0xAA; 255];
+    let data = b"x";
+
+    let ours = generate_content_mac(op, data, &key_id, &key);
+    let theirs = wa_web_value_mac(op, data, &key_id, &key);
+    assert_eq!(
+        ours, theirs,
+        "MAC must match WA Web even at the 256-byte wrap"
+    );
 }
 
 // ---------------------------------------------------------------------------
