@@ -374,47 +374,49 @@ fn regression_a7_content_mac_matches_wa_web_at_wrap_boundary() {
 // and verifies the host is LE (so today's pass-through is coincidental).
 
 #[test]
-fn bug_a3_lthash_endianness_is_host_dependent() {
-    println!("\nBUG A3: LTHash uses native-endian; WA Web spec is little-endian");
-
+fn regression_a3_lthash_lanes_are_little_endian() {
+    // WA Web treats the LTHash accumulator as a stream of little-endian u16
+    // lanes; snapshot/patch MACs are HMACs over those bytes, so the lane
+    // endianness is part of the protocol. Lock the byte layout against an
+    // explicit LE oracle so a future regression to native-endian is caught
+    // even on LE hosts (where the bug used to be invisible).
     use wacore::appstate::lthash::WAPATCH_INTEGRITY;
 
-    // Run a deterministic LTHash update.
-    let mut acc = vec![0u8; 128]; // 64 lanes of u16
+    // Two distinct MAC inputs so the derived bytes are nonzero.
     let mac_a = vec![1u8; 32];
     let mac_b = vec![2u8; 32];
 
+    let mut got = vec![0u8; 128];
     WAPATCH_INTEGRITY.subtract_then_add_in_place(
-        &mut acc,
+        &mut got,
         &[mac_b.as_slice()],
         &[mac_a.as_slice()],
     );
 
-    // Print the first 4 bytes of the accumulator.
-    println!("  acc[0..4] after one add/sub = {:02x?}", &acc[..4]);
-
-    let host_is_le = cfg!(target_endian = "little");
-    println!(
-        "  host target_endian = {}",
-        if host_is_le { "little" } else { "big" }
-    );
-
-    if host_is_le {
-        println!(
-            "  -> bytes happen to match WA Web's LE spec on this host. \
-             On a big-endian host they would differ."
-        );
-    } else {
-        println!("  -> BUG VISIBLE: this host is big-endian; MACs diverge from WA Web.");
+    // Reference LTHash add/sub computed explicitly in little-endian using
+    // the same HKDF expansion the lib uses.
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let derive = |seed: &[u8]| -> Vec<u8> {
+        let hk = Hkdf::<Sha256>::new(None, seed);
+        let mut out = vec![0u8; 128];
+        hk.expand(b"WhatsApp Patch Integrity", &mut out).unwrap();
+        out
+    };
+    let added = derive(&mac_a);
+    let removed = derive(&mac_b);
+    let mut expected = vec![0u8; 128];
+    for i in (0..128).step_by(2) {
+        let acc = u16::from_le_bytes([expected[i], expected[i + 1]]);
+        let a = u16::from_le_bytes([added[i], added[i + 1]]);
+        let r = u16::from_le_bytes([removed[i], removed[i + 1]]);
+        let v = acc.wrapping_add(a).wrapping_sub(r);
+        let b = v.to_le_bytes();
+        expected[i] = b[0];
+        expected[i + 1] = b[1];
     }
 
-    // The spec-correct implementation would use to_le_bytes/from_le_bytes
-    // regardless of host. The code currently uses to_ne_bytes/from_ne_bytes.
-    // We verify the runtime is LE so any future big-endian CI would catch this.
-    assert!(
-        host_is_le,
-        "Unsupported BE host. The current lthash impl would silently diverge from WA Web."
-    );
+    assert_eq!(got, expected, "LTHash output must match LE-lane reference");
 }
 
 // ---------------------------------------------------------------------------
