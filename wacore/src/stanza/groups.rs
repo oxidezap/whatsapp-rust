@@ -50,13 +50,23 @@ pub struct GroupNotification {
 ///
 /// Wire format:
 /// ```xml
-/// <participant jid="1234567890@s.whatsapp.net" phone_number="1234567890@s.whatsapp.net"/>
+/// <participant jid="..." phone_number="..." display_name="..."/>
 /// ```
+///
+/// `display_name` is the server-rendered label (e.g. `"+55∙∙∙∙∙∙∙∙∙79"` when
+/// the requester is not in the participant's contacts). WA Web carries it
+/// directly into the participant model so the UI can render the change
+/// notification without resolving the contact locally.
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupParticipantInfo {
     pub jid: Jid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phone_number: Option<Jid>,
+    /// Server-provided display label for this participant. Only populated for
+    /// `<participant>` children inside group notifications; `None` for
+    /// `<requested_user>` (WA Web doesn't read it there either).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// All possible group notification action types.
@@ -560,9 +570,17 @@ fn parse_participants(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                 .iter()
                 .filter(|c| c.tag == "participant")
                 .filter_map(|c| {
-                    let jid = c.attrs().optional_jid("jid")?;
-                    let phone_number = c.attrs().optional_jid("phone_number");
-                    Some(GroupParticipantInfo { jid, phone_number })
+                    let mut attrs = c.attrs();
+                    let jid = attrs.optional_jid("jid")?;
+                    let phone_number = attrs.optional_jid("phone_number");
+                    let display_name = attrs
+                        .optional_string("display_name")
+                        .map(|s| s.into_owned());
+                    Some(GroupParticipantInfo {
+                        jid,
+                        phone_number,
+                        display_name,
+                    })
                 })
                 .collect()
         })
@@ -570,6 +588,7 @@ fn parse_participants(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
 }
 
 /// Parses `<requested_user>` children from `<created_membership_requests>`.
+/// WA Web does not read `display_name` here; it stays `None`.
 fn parse_requested_users(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
     node.children()
         .map(|children| {
@@ -579,7 +598,11 @@ fn parse_requested_users(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                 .filter_map(|c| {
                     let jid = c.attrs().optional_jid("jid")?;
                     let phone_number = c.attrs().optional_jid("phone_number");
-                    Some(GroupParticipantInfo { jid, phone_number })
+                    Some(GroupParticipantInfo {
+                        jid,
+                        phone_number,
+                        display_name: None,
+                    })
                 })
                 .collect()
         })
@@ -678,6 +701,61 @@ mod tests {
                 assert_eq!(participants.len(), 1);
                 assert_eq!(participants[0].jid, user_jid());
                 assert!(reason.is_none());
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// Real captured `<modify>` stanza shape with `display_name` and
+    /// versioning attrs (`v_id`/`prev_v_id`, ignored). The masked display
+    /// label uses U+2219 (bullet operator) for privacy.
+    #[test]
+    fn test_parse_modify_carries_display_name() {
+        let node = make_notification(vec![
+            NodeBuilder::new("modify")
+                .attr("v_id", "1778606476221940")
+                .attr("prev_v_id", "1778602920091375")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", "140059672064241@lid")
+                        .attr("display_name", "+55\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}79")
+                        .build(),
+                ])
+                .build(),
+        ]);
+
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Modify { participants } => {
+                assert_eq!(participants.len(), 1);
+                assert_eq!(
+                    participants[0].display_name.as_deref(),
+                    Some(
+                        "+55\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}79"
+                    )
+                );
+            }
+            other => panic!("expected Modify, got {:?}", other),
+        }
+    }
+
+    /// `<add>`/`<remove>` etc. with no `display_name` attr yield `None`,
+    /// which serializes as omitted thanks to `skip_serializing_if`.
+    #[test]
+    fn test_parse_participant_without_display_name_is_none() {
+        let node = make_notification(vec![
+            NodeBuilder::new("add")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", user_jid())
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Add { participants, .. } => {
+                assert!(participants[0].display_name.is_none());
             }
             other => panic!("expected Add, got {:?}", other),
         }
