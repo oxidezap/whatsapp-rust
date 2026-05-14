@@ -275,11 +275,14 @@ pub enum GroupNotificationAction {
         raw: Node,
     },
 
-    /// `<change_number>` — Participant changed their phone number; new
-    /// participant data is in the `<participant>` child.
+    /// `<change_number>` — Owner of subgroup suggestions migrated to a new
+    /// number. The old owner is in the parent notification's `participant`
+    /// attribute; the new owner is in the `jid` attribute on the child.
+    /// `sub_group_suggestions` lists the affected subgroup JIDs.
     #[wire = "change_number"]
     ChangeNumber {
-        participants: Vec<GroupParticipantInfo>,
+        new_owner: Option<Jid>,
+        sub_group_suggestions: Vec<Jid>,
     },
 
     // -- Catch-all --
@@ -540,7 +543,8 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
             raw: node.to_owned(),
         },
         T::ChangeNumber => GroupNotificationAction::ChangeNumber {
-            participants: parse_participants(node),
+            new_owner: node.attrs().optional_jid("jid"),
+            sub_group_suggestions: parse_sub_group_suggestion_jids(node),
         },
         T::Unknown(_) => GroupNotificationAction::Unknown {
             tag: node.tag.to_string(),
@@ -577,6 +581,19 @@ fn parse_requested_users(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                     let phone_number = c.attrs().optional_jid("phone_number");
                     Some(GroupParticipantInfo { jid, phone_number })
                 })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parses `<sub_group_suggestion jid="..."/>` children into subgroup JIDs.
+fn parse_sub_group_suggestion_jids(node: &NodeRef<'_>) -> Vec<Jid> {
+    node.children()
+        .map(|children| {
+            children
+                .iter()
+                .filter(|c| c.tag == "sub_group_suggestion")
+                .filter_map(|c| c.attrs().optional_jid("jid"))
                 .collect()
         })
         .unwrap_or_default()
@@ -1099,10 +1116,70 @@ mod tests {
         }
     }
 
+    /// Verifies the actual wire shape from `WAWebHandleGroupNotification`:
+    /// `<change_number jid="<new_owner>"><sub_group_suggestion jid="<sg>"/>...`.
+    /// The old owner stays in `notification.participant`.
     #[test]
-    fn test_parse_change_number_carries_participants() {
+    fn test_parse_change_number_real_shape() {
+        let new_owner_jid = "5511888888888@s.whatsapp.net";
+        let sg_a = "111111111111111@g.us";
+        let sg_b = "222222222222222@g.us";
         let node = make_notification(vec![
             NodeBuilder::new("change_number")
+                .attr("jid", new_owner_jid)
+                .children(vec![
+                    NodeBuilder::new("sub_group_suggestion")
+                        .attr("jid", sg_a)
+                        .build(),
+                    NodeBuilder::new("sub_group_suggestion")
+                        .attr("jid", sg_b)
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::ChangeNumber {
+                new_owner,
+                sub_group_suggestions,
+            } => {
+                assert_eq!(
+                    new_owner.as_ref().map(|j| j.to_string()).as_deref(),
+                    Some(new_owner_jid)
+                );
+                assert_eq!(sub_group_suggestions.len(), 2);
+                assert_eq!(sub_group_suggestions[0].to_string(), sg_a);
+                assert_eq!(sub_group_suggestions[1].to_string(), sg_b);
+            }
+            other => panic!("expected ChangeNumber, got {:?}", other),
+        }
+    }
+
+    /// Missing `jid` attribute yields `new_owner: None` instead of dropping
+    /// the entire action.
+    #[test]
+    fn test_parse_change_number_missing_jid_is_tolerant() {
+        let node = make_notification(vec![NodeBuilder::new("change_number").build()]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::ChangeNumber {
+                new_owner,
+                sub_group_suggestions,
+            } => {
+                assert!(new_owner.is_none());
+                assert!(sub_group_suggestions.is_empty());
+            }
+            other => panic!("expected ChangeNumber, got {:?}", other),
+        }
+    }
+
+    /// `<participant>` children inside `<change_number>` must NOT leak into
+    /// `sub_group_suggestions`; only `<sub_group_suggestion>` is read.
+    #[test]
+    fn test_parse_change_number_ignores_participant_children() {
+        let node = make_notification(vec![
+            NodeBuilder::new("change_number")
+                .attr("jid", "5511888888888@s.whatsapp.net")
                 .children(vec![
                     NodeBuilder::new("participant")
                         .attr("jid", user_jid())
@@ -1112,8 +1189,11 @@ mod tests {
         ]);
         let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
         match &notif.actions[0] {
-            GroupNotificationAction::ChangeNumber { participants } => {
-                assert_eq!(participants.len(), 1);
+            GroupNotificationAction::ChangeNumber {
+                sub_group_suggestions,
+                ..
+            } => {
+                assert!(sub_group_suggestions.is_empty());
             }
             other => panic!("expected ChangeNumber, got {:?}", other),
         }
@@ -1244,7 +1324,8 @@ mod tests {
                 raw: dummy_node.clone(),
             },
             GroupNotificationAction::ChangeNumber {
-                participants: vec![],
+                new_owner: None,
+                sub_group_suggestions: vec![],
             },
             GroupNotificationAction::Unknown {
                 tag: "future_tag".into(),
