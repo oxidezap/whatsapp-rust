@@ -46,17 +46,33 @@ pub struct GroupNotification {
     pub actions: Vec<GroupNotificationAction>,
 }
 
+/// Admin tier from `<participant type="...">`. Mirrors
+/// `GROUP_PARTICIPANT_TYPES` in `WAWebGroupApiConst`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
+pub enum GroupParticipantType {
+    #[wire_default]
+    #[wire = "participant"]
+    Participant,
+    #[wire = "admin"]
+    Admin,
+    #[wire = "superadmin"]
+    SuperAdmin,
+}
+
 /// Participant info extracted from `<participant>` child elements.
 ///
 /// Wire format:
 /// ```xml
-/// <participant jid="..." phone_number="..." display_name="..."/>
+/// <participant jid="..." type="..." lid="..." phone_number="..."
+///              username="..." display_name="..." join_time="..."/>
 /// ```
 ///
 /// `display_name` is the server-rendered label (e.g. `"+55∙∙∙∙∙∙∙∙∙79"` when
-/// the requester is not in the participant's contacts). WA Web carries it
-/// directly into the participant model so the UI can render the change
-/// notification without resolving the contact locally.
+/// the requester is not in the participant's contacts). `type` flags
+/// admin/superadmin tier; LID-addressed groups also carry `lid` and
+/// `username`. WA Web's `WAWebHandleGroupNotification` y() reads all of
+/// these into the participant model so the UI can render notifications
+/// and patch admin caches without resolving the contact locally.
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupParticipantInfo {
     pub jid: Jid,
@@ -67,6 +83,21 @@ pub struct GroupParticipantInfo {
     /// `<requested_user>` (WA Web doesn't read it there either).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Admin tier. Defaults to `Participant` when the attr is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<GroupParticipantType>,
+    /// LID JID when this `<participant>` carries a separate `lid` attr.
+    /// Distinct from `jid` which may already be a LID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lid: Option<Jid>,
+    /// Username, gated by `WAWebUsernameGatingUtils`. Empty in classic
+    /// PN-addressed groups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Unix seconds since the participant joined the group. Used by
+    /// admin UI for tenure display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub join_time: Option<u64>,
 }
 
 /// All possible group notification action types.
@@ -576,10 +607,21 @@ fn parse_participants(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                     let display_name = attrs
                         .optional_string("display_name")
                         .map(|s| s.into_owned());
+                    let r#type = attrs.optional_string("type").map(|s| {
+                        GroupParticipantType::try_from(s.as_ref())
+                            .unwrap_or(GroupParticipantType::Participant)
+                    });
+                    let lid = attrs.optional_jid("lid");
+                    let username = attrs.optional_string("username").map(|s| s.into_owned());
+                    let join_time = attrs.optional_u64("join_time");
                     Some(GroupParticipantInfo {
                         jid,
                         phone_number,
                         display_name,
+                        r#type,
+                        lid,
+                        username,
+                        join_time,
                     })
                 })
                 .collect()
@@ -588,7 +630,8 @@ fn parse_participants(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
 }
 
 /// Parses `<requested_user>` children from `<created_membership_requests>`.
-/// WA Web does not read `display_name` here; it stays `None`.
+/// WA Web's `WAWebHandleGroupNotification` reads only `jid`, `phone_number`,
+/// and `username` from these (`y()` is not called); other fields stay `None`.
 fn parse_requested_users(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
     node.children()
         .map(|children| {
@@ -596,12 +639,18 @@ fn parse_requested_users(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                 .iter()
                 .filter(|c| c.tag == "requested_user")
                 .filter_map(|c| {
-                    let jid = c.attrs().optional_jid("jid")?;
-                    let phone_number = c.attrs().optional_jid("phone_number");
+                    let mut attrs = c.attrs();
+                    let jid = attrs.optional_jid("jid")?;
+                    let phone_number = attrs.optional_jid("phone_number");
+                    let username = attrs.optional_string("username").map(|s| s.into_owned());
                     Some(GroupParticipantInfo {
                         jid,
                         phone_number,
                         display_name: None,
+                        r#type: None,
+                        lid: None,
+                        username,
+                        join_time: None,
                     })
                 })
                 .collect()
@@ -757,6 +806,110 @@ mod tests {
                 assert!(participants[0].display_name.is_none());
             }
             other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// `<participant type="admin" lid="..." username="..." join_time="...">`
+    /// surface all extras. Real shape used by `WAWebHandleGroupNotification`
+    /// when admin tier and LID addressing are set.
+    #[test]
+    fn test_parse_participant_with_admin_extras() {
+        let node = make_notification(vec![
+            NodeBuilder::new("add")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", "55510000001@s.whatsapp.net")
+                        .attr("type", "admin")
+                        .attr("lid", "99900000000001@lid")
+                        .attr("username", "alice")
+                        .attr("join_time", "1700000000")
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Add { participants, .. } => {
+                assert_eq!(participants.len(), 1);
+                let p = &participants[0];
+                assert_eq!(p.r#type, Some(GroupParticipantType::Admin));
+                assert_eq!(
+                    p.lid.as_ref().map(|j| j.user.as_str()),
+                    Some("99900000000001")
+                );
+                assert_eq!(p.username.as_deref(), Some("alice"));
+                assert_eq!(p.join_time, Some(1700000000));
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// `type="superadmin"` parses correctly, and `type` survives an unknown
+    /// future value by defaulting to `Participant` instead of dropping the
+    /// participant.
+    #[test]
+    fn test_participant_type_superadmin_and_unknown_fallback() {
+        let node = make_notification(vec![
+            NodeBuilder::new("add")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", "55510000002@s.whatsapp.net")
+                        .attr("type", "superadmin")
+                        .build(),
+                    NodeBuilder::new("participant")
+                        .attr("jid", "55510000003@s.whatsapp.net")
+                        .attr("type", "future_role")
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Add { participants, .. } => {
+                assert_eq!(
+                    participants[0].r#type,
+                    Some(GroupParticipantType::SuperAdmin)
+                );
+                assert_eq!(
+                    participants[1].r#type,
+                    Some(GroupParticipantType::Participant)
+                );
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// `<requested_user>` only reads `jid`, `phone_number`, `username` per
+    /// WA Web; the other new fields stay `None`.
+    #[test]
+    fn test_requested_user_does_not_read_admin_extras() {
+        let node = make_notification(vec![
+            NodeBuilder::new("created_membership_requests")
+                .children(vec![
+                    NodeBuilder::new("requested_user")
+                        .attr("jid", "55510000005@s.whatsapp.net")
+                        .attr("type", "admin")
+                        .attr("lid", "99900000000005@lid")
+                        .attr("username", "bob")
+                        .attr("join_time", "1700000005")
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::CreatedMembershipRequests { requests, .. } => {
+                assert_eq!(requests.len(), 1);
+                let r = &requests[0];
+                assert!(
+                    r.r#type.is_none(),
+                    "type must NOT be read on requested_user"
+                );
+                assert!(r.lid.is_none());
+                assert!(r.join_time.is_none());
+                assert_eq!(r.username.as_deref(), Some("bob"));
+            }
+            other => panic!("expected CreatedMembershipRequests, got {:?}", other),
         }
     }
 
