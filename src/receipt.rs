@@ -74,8 +74,11 @@ impl Client {
                 users.len()
             );
             for user in users {
-                let user_ts = i64::try_from(user.timestamp)
-                    .ok()
+                // Missing `<user t>` means the server didn't disambiguate the
+                // per-user time; fall back to the stanza-level `t`.
+                let user_ts = user
+                    .timestamp
+                    .and_then(|t| i64::try_from(t).ok())
                     .and_then(wacore::time::from_secs)
                     .unwrap_or(stanza_ts);
                 // aggregated_by_message: each <user> carries its own type;
@@ -699,6 +702,41 @@ mod tests {
         assert_eq!(receipts[0].source.sender.user, "99000000000001");
         assert_eq!(receipts[1].r#type, ReceiptType::Read);
         assert_eq!(receipts[2].r#type, ReceiptType::Inactive);
+    }
+
+    /// Missing per-user `t`: the fan-out event's timestamp falls back to
+    /// the stanza-level `t` rather than collapsing to epoch zero (which
+    /// was the previous behavior).
+    #[tokio::test]
+    async fn test_aggregated_user_missing_t_uses_stanza_timestamp() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        let node = node_to_arc(
+            NodeBuilder::new("receipt")
+                .attr("from", "120363000000000001@g.us")
+                .attr("id", "STANZA-AGG-NOT")
+                .attr("t", "1700000000")
+                .children([NodeBuilder::new("participants")
+                    .attr("message_id", "REAL-MSG-NOT")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "99000000000001@lid")
+                        .attr("type", "delivery")
+                        .build()])
+                    .build()])
+                .build(),
+        );
+        client.handle_receipt(node).await;
+
+        let events = collector.events();
+        let r = events
+            .iter()
+            .find_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .expect("expected Receipt");
+        let expected = wacore::time::from_secs(1700000000).expect("valid ts");
+        assert_eq!(r.timestamp, expected);
     }
 
     /// Aggregated-by-type receipt: `<participants key="...">` without

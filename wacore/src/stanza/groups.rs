@@ -607,10 +607,15 @@ fn parse_participants(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                     let display_name = attrs
                         .optional_string("display_name")
                         .map(|s| s.into_owned());
-                    let r#type = attrs.optional_string("type").map(|s| {
-                        GroupParticipantType::try_from(s.as_ref())
-                            .unwrap_or(GroupParticipantType::Participant)
-                    });
+                    // WA Web y(): `maybeAttrEnum("type", GROUP_PARTICIPANT_TYPES)
+                    // != null ? _ : "participant"`. Missing and unknown both
+                    // collapse to `Participant`, so the field is always Some.
+                    let r#type = Some(
+                        attrs
+                            .optional_string("type")
+                            .and_then(|s| GroupParticipantType::try_from(s.as_ref()).ok())
+                            .unwrap_or(GroupParticipantType::Participant),
+                    );
                     let lid = attrs.optional_jid("lid");
                     let username = attrs.optional_string("username").map(|s| s.into_owned());
                     let join_time = attrs.optional_u64("join_time");
@@ -839,6 +844,31 @@ mod tests {
                 );
                 assert_eq!(p.username.as_deref(), Some("alice"));
                 assert_eq!(p.join_time, Some(1700000000));
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// Missing `type` attr collapses to `Some(Participant)` (not `None`).
+    /// Mirrors WA Web y()'s `maybeAttrEnum("type") != null ? _ : "participant"`.
+    #[test]
+    fn test_participant_missing_type_defaults_to_participant() {
+        let node = make_notification(vec![
+            NodeBuilder::new("add")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", "55510000004@s.whatsapp.net")
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Add { participants, .. } => {
+                assert_eq!(
+                    participants[0].r#type,
+                    Some(GroupParticipantType::Participant)
+                );
             }
             other => panic!("expected Add, got {:?}", other),
         }

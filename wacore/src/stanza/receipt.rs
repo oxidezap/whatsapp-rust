@@ -10,12 +10,15 @@ use wacore_binary::{Jid, JidExt as _, STATUS_BROADCAST_USER};
 /// Parsed `<user>` entry inside `<receipt><participants>`.
 ///
 /// Mirrors `WAWebHandleMsgReceiptParser` (`d`/`m` branches): each user has a
-/// device JID and timestamp; for `aggregated_by_message` shapes the user also
-/// carries its own type, otherwise the receipt-level type applies.
+/// device JID and per-user timestamp; for `aggregated_by_message` shapes the
+/// user also carries its own type, otherwise the receipt-level type applies.
+///
+/// `timestamp` is `None` when the `<user t>` attr is missing (malformed
+/// stanza). The handler falls back to the stanza-level `t` in that case.
 #[derive(Debug, Clone)]
 pub struct ReceiptUser {
     pub jid: Jid,
-    pub timestamp: u64,
+    pub timestamp: Option<u64>,
     /// Per-user `type` attr (only on aggregated_by_message shape).
     pub r#type: Option<String>,
     pub participant_pn: Option<Jid>,
@@ -41,7 +44,7 @@ pub fn parse_participants(
                 .filter_map(|c| {
                     let mut a = c.attrs();
                     let jid = a.optional_jid("jid")?;
-                    let timestamp = a.optional_u64("t").unwrap_or(0);
+                    let timestamp = a.optional_u64("t");
                     let r#type = a.optional_string("type").map(|s| s.into_owned());
                     let participant_pn = a.optional_jid("participant_pn");
                     let participant_username = a
@@ -247,9 +250,34 @@ mod tests {
         assert!(key.is_none());
         assert_eq!(users.len(), 2);
         assert_eq!(users[0].jid.user, "11111");
-        assert_eq!(users[0].timestamp, 1700000001);
+        assert_eq!(users[0].timestamp, Some(1700000001));
         assert_eq!(users[0].r#type.as_deref(), Some("delivery"));
         assert_eq!(users[1].r#type.as_deref(), Some("read"));
+    }
+
+    /// Missing `<user t>` attr leaves `timestamp` as `None` so the handler
+    /// can fall back to the stanza-level `t`. Previous code defaulted to 0,
+    /// which silently produced an epoch-zero `DateTime` instead of the
+    /// stanza ts.
+    #[test]
+    fn participants_user_missing_t_yields_none_timestamp() {
+        let node = NodeBuilder::new("receipt")
+            .attr("id", "STANZA-NOT")
+            .children([NodeBuilder::new("participants")
+                .attr("message_id", "MSG-NOT")
+                .children([NodeBuilder::new("user")
+                    .attr("jid", "99000000000001@lid")
+                    .attr("type", "delivery")
+                    .build()])
+                .build()])
+            .build();
+        let part = node.get_optional_child("participants").unwrap();
+        let (_, _, users) = parse_participants(&part.as_node_ref());
+        assert_eq!(users.len(), 1);
+        assert!(
+            users[0].timestamp.is_none(),
+            "missing <user t> must yield None"
+        );
     }
 
     /// `<participants key="...">` without `message_id` — aggregated_by_type.

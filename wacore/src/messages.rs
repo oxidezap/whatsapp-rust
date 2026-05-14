@@ -283,17 +283,24 @@ pub fn parse_message_info(
         meta_info.content_type = ma.optional_string("content_type").map(|s| s.into_owned());
         meta_info.appdata = ma.optional_string("appdata").map(|s| s.into_owned());
     }
-    if let Some(reporting) = node.get_optional_child("reporting") {
-        if let Some(tag) = reporting.get_optional_child("reporting_tag") {
-            meta_info.reporting_tag = tag.content_bytes().map(|b| b.to_vec());
-        }
-        if let Some(token) = reporting.get_optional_child("reporting_token") {
-            meta_info.reporting_token = token.content_bytes().map(|b| b.to_vec());
-            meta_info.reporting_token_version = token
+    if let Some(reporting) = node.get_optional_child("reporting")
+        && let Some(tag) = reporting.get_optional_child("reporting_tag")
+    {
+        meta_info.reporting_tag = tag.content_bytes().map(|b| b.to_vec());
+    }
+    if let Some(reporting) = node.get_optional_child("reporting")
+        && let Some(token) = reporting.get_optional_child("reporting_token")
+    {
+        meta_info.reporting_token = token.content_bytes().map(|b| b.to_vec());
+        // WA Web `I()`: `c.maybeAttrInt("v")!=null?_:1`. Missing `v` is
+        // not a parse failure — token format version defaults to 1.
+        meta_info.reporting_token_version = Some(
+            token
                 .attrs()
                 .optional_u64("v")
-                .and_then(|v| i64::try_from(v).ok());
-        }
+                .and_then(|v| i64::try_from(v).ok())
+                .unwrap_or(1),
+        );
     }
 
     Ok(MessageInfo {
@@ -460,6 +467,26 @@ mod parse_message_info_tests {
             Some(token_bytes.as_slice())
         );
         assert_eq!(info.meta_info.reporting_token_version, Some(2));
+    }
+
+    /// Missing `v` attr on `<reporting_token>` defaults the version to 1
+    /// (matches WA Web `I()`: `c.maybeAttrInt("v") != null ? _ : 1`).
+    #[test]
+    fn reporting_token_missing_version_defaults_to_one() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "MSG-REP-V")
+            .attr("t", "1777415965")
+            .children([NodeBuilder::new("reporting")
+                .children([NodeBuilder::new("reporting_token")
+                    .bytes(vec![0xAA; 16])
+                    .build()])
+                .build()])
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+        assert_eq!(info.meta_info.reporting_token_version, Some(1));
     }
 
     /// `<reporting>` with ONLY `<reporting_tag>` (no token) is also valid
