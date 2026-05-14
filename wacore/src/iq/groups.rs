@@ -267,6 +267,16 @@ pub struct GroupCreateOptions {
     /// Only used when `is_parent` is true.
     #[builder(default)]
     pub create_general_chat: bool,
+    /// JID of an existing community parent to link this subgroup to. Emits
+    /// `<linked_parent jid="..."/>` so a subgroup can be created atomically
+    /// (matches `OutGroupsCreateRequest`).
+    #[builder(default, setter(strip_option, into))]
+    pub linked_parent: Option<Jid>,
+    /// Optional `<description id="<token>"><body>{text}</body></description>`
+    /// child on the create stanza. WA Web supports inline description on
+    /// create so callers can avoid a follow-up set-description IQ.
+    #[builder(default, setter(strip_option, into))]
+    pub description: Option<String>,
 }
 
 impl GroupCreateOptions {
@@ -322,6 +332,8 @@ impl Default for GroupCreateOptions {
             closed: false,
             allow_non_admin_sub_group_creation: false,
             create_general_chat: false,
+            linked_parent: None,
+            description: None,
         }
     }
 }
@@ -421,6 +433,36 @@ pub fn build_create_group_node(options: &GroupCreateOptions) -> Node {
         if options.create_general_chat {
             children.push(NodeBuilder::new("create_general_chat").build());
         }
+    }
+
+    // Link this subgroup to an existing community parent atomically.
+    if let Some(parent_jid) = &options.linked_parent {
+        children.push(
+            NodeBuilder::new("linked_parent")
+                .attr("jid", parent_jid)
+                .build(),
+        );
+    }
+
+    // Inline description: WA Web emits `<description id="<token>"><body>{text}</body></description>`.
+    if let Some(desc) = &options.description {
+        use rand::Rng as _;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut id_bytes = [0u8; 8];
+        rng.fill_bytes(&mut id_bytes);
+        let id = id_bytes
+            .iter()
+            .fold(String::with_capacity(16), |mut acc, b| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, "{b:02X}");
+                acc
+            });
+        children.push(
+            NodeBuilder::new("description")
+                .attr("id", id)
+                .children([NodeBuilder::new("body").string_content(desc).build()])
+                .build(),
+        );
     }
 
     NodeBuilder::new("create")
@@ -3743,6 +3785,69 @@ mod tests {
 
         assert!(response.is_parent_group);
         assert!(response.allow_non_admin_sub_group_creation);
+    }
+
+    #[test]
+    fn test_group_create_iq_emits_linked_parent() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let options = GroupCreateOptions {
+            subject: "Subgroup".into(),
+            linked_parent: Some(parent.clone()),
+            ..Default::default()
+        };
+        let iq = GroupCreateIq::new(options).build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected <create>");
+        };
+        let linked = nodes[0]
+            .get_optional_child("linked_parent")
+            .expect("linked_parent child must be emitted");
+        assert_eq!(
+            linked.attrs().jid("jid"),
+            parent,
+            "linked_parent jid must match the requested parent"
+        );
+    }
+
+    #[test]
+    fn test_group_create_iq_emits_description_with_body() {
+        let options = GroupCreateOptions {
+            subject: "Group with desc".into(),
+            description: Some("Hello, group".into()),
+            ..Default::default()
+        };
+        let iq = GroupCreateIq::new(options).build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected <create>");
+        };
+        let desc = nodes[0]
+            .get_optional_child("description")
+            .expect("description child must be emitted");
+        assert!(
+            desc.attrs()
+                .optional_string("id")
+                .is_some_and(|id| !id.is_empty()),
+            "description must carry an opaque id token"
+        );
+        let body = desc
+            .get_optional_child("body")
+            .expect("description must have a body child");
+        let text = match &body.content {
+            Some(NodeContent::String(s)) => s.to_string(),
+            Some(NodeContent::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+            _ => panic!("description body must carry text"),
+        };
+        assert_eq!(text, "Hello, group");
+    }
+
+    #[test]
+    fn test_group_create_iq_omits_linked_parent_and_description_by_default() {
+        let iq = GroupCreateIq::new(GroupCreateOptions::new("Plain")).build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected <create>");
+        };
+        assert!(nodes[0].get_optional_child("linked_parent").is_none());
+        assert!(nodes[0].get_optional_child("description").is_none());
     }
 
     /// Plain (non-community) group create: overlay branch must not run, both
