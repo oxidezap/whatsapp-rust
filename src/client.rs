@@ -527,6 +527,19 @@ impl Client {
         self.shutdown_notifier.subscribe()
     }
 
+    /// Synchronous flag-only equivalent of the first lines of `disconnect()`.
+    /// Spawned tasks watching `is_shutting_down()` / `shutdown_notifier` exit
+    /// on their next poll. Does NOT flush, close the transport, or touch
+    /// persistence — prefer `disconnect()` whenever you can `await`. Exists
+    /// for `Drop` impls on FFI wrappers (e.g. `WasmWhatsAppClient`) that
+    /// can't run async cleanup synchronously.
+    pub fn signal_shutdown_sync(&self) {
+        self.expected_disconnect.store(true, Ordering::Relaxed);
+        self.is_running.store(false, Ordering::Relaxed);
+        self.shutdown_notifier.notify();
+        self.notify_connection_shutdown();
+    }
+
     pub(crate) fn connection_shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
         self.connection_shutdown
             .lock()
