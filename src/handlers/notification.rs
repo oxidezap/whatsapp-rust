@@ -1976,6 +1976,145 @@ mod tests {
         );
     }
 
+    /// Same PN on both sides is still dispatched as a ContactNumberChanged
+    /// event (with `old_jid == new_jid`). WA Web JS has no special guard for
+    /// this case either; the LID mapping update is a no-op when LIDs are
+    /// also equal. Consumers can filter if they care.
+    #[tokio::test]
+    async fn test_contacts_modify_same_jid_still_dispatches() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "contacts")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "contacts-modify-same")
+            .children([NodeBuilder::new("modify")
+                .attr("old", "5511999999999@s.whatsapp.net")
+                .attr("new", "5511999999999@s.whatsapp.net")
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        let events = collector.events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &*events[0],
+            Event::ContactNumberChanged(ContactNumberChanged { old_jid, new_jid, .. })
+                if old_jid == new_jid
+        ));
+    }
+
+    /// Partial LID (only `new_lid`, missing `old_lid`) must NOT create any
+    /// LID-PN mapping, since WA Web requires BOTH for createLidPnMappings.
+    #[tokio::test]
+    async fn test_contacts_modify_partial_lid_skips_mappings() {
+        let client = create_test_client().await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "contacts")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "contacts-modify-partial")
+            .children([NodeBuilder::new("modify")
+                .attr("old", "5511999999999@s.whatsapp.net")
+                .attr("new", "5511888888888@s.whatsapp.net")
+                .attr("new_lid", "100000022222222@lid")
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        assert!(
+            client
+                .lid_pn_cache
+                .get_phone_number("100000022222222")
+                .await
+                .is_none(),
+            "no mapping should be created when old_lid is missing"
+        );
+    }
+
+    /// Missing `new` attribute: the parser should warn and not dispatch
+    /// anything, mirroring WA Web's parser error path.
+    #[tokio::test]
+    async fn test_contacts_modify_missing_new_attr_drops_event() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "contacts")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "contacts-modify-bad")
+            .children([NodeBuilder::new("modify")
+                .attr("old", "5511999999999@s.whatsapp.net")
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        assert!(collector.events().is_empty());
+    }
+
+    /// Group `w:gp2` change_number: the parsed action must carry the new
+    /// owner from the child's `jid` attr and the sub_group_suggestions from
+    /// `<sub_group_suggestion jid=.../>` children. The old owner is the
+    /// notification's top-level `participant` attribute, surfaced on
+    /// `GroupUpdate.participant`.
+    #[tokio::test]
+    async fn test_group_change_number_dispatches_with_new_owner_and_suggestions() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "w:gp2")
+            .attr("from", "120363000000000000@g.us")
+            .attr("participant", "5511999999999@s.whatsapp.net")
+            .attr("id", "gp2-change-1")
+            .attr("t", "1773519041")
+            .children([NodeBuilder::new("change_number")
+                .attr("jid", "5511888888888@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("sub_group_suggestion")
+                        .attr("jid", "120363111111111111@g.us")
+                        .build(),
+                    NodeBuilder::new("sub_group_suggestion")
+                        .attr("jid", "120363222222222222@g.us")
+                        .build(),
+                ])
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        let events = collector.events();
+        let group_update = events
+            .iter()
+            .find_map(|e| match &**e {
+                Event::GroupUpdate(u) => Some(u),
+                _ => None,
+            })
+            .expect("expected GroupUpdate");
+
+        assert_eq!(
+            group_update.participant.as_ref().map(|j| j.user.as_str()),
+            Some("5511999999999"),
+            "old owner comes from notification.participant"
+        );
+        match &group_update.action {
+            GroupNotificationAction::ChangeNumber {
+                new_owner,
+                sub_group_suggestions,
+            } => {
+                assert_eq!(
+                    new_owner.as_ref().map(|j| j.user.as_str()),
+                    Some("5511888888888")
+                );
+                assert_eq!(sub_group_suggestions.len(), 2);
+            }
+            other => panic!("expected ChangeNumber, got {:?}", other),
+        }
+    }
+
     #[tokio::test]
     async fn test_contacts_update_hash_only_ignored() {
         // WA Web sends <update hash="Quvc"/> without jid when using hash-based lookup.

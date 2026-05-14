@@ -772,8 +772,12 @@ pub struct ContactUpdated {
 /// Emitted from `<notification type="contacts"><modify old="..." new="..."
 /// old_lid="..." new_lid="..."/>`.
 ///
-/// WA Web creates two LID-PN mappings (`old_lid→old_jid`, `new_lid→new_jid`)
-/// and generates a system notification message in both old and new chats.
+/// The library updates the global LID-PN cache when both `old_lid` and
+/// `new_lid` are present, mirroring `WAWebDBCreateLidPnMappings`. No Signal
+/// session is wiped (WA Web `WAWebHandleContactNotification` also leaves
+/// sessions intact). Group participant updates arrive via separate
+/// `w:gp2` notifications, so per-group caches are not touched here.
+/// Consumers can subscribe and refresh their own caches if needed.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContactNumberChanged {
     /// Old phone number JID.
