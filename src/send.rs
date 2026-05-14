@@ -118,9 +118,64 @@ fn meta_node(key: &'static str, value: &'static str) -> Node {
     NodeBuilder::new("meta").attr(key, value).build()
 }
 
+/// Offset subtracted from the current unix timestamp to produce the
+/// `privacy_mode_ts` attr value on a `<biz>` stanza. The value is the one
+/// the upstream Baileys reproducer emits (Issue oxidezap/baileyrs#7) and is
+/// confirmed to work against the live WhatsApp servers.
+const BIZ_PRIVACY_MODE_TS_OFFSET: u64 = 77_980_457;
+
+struct BizNodeInfo {
+    biz: Node,
+}
+
+enum BizCategory<'a> {
+    /// `<biz actual_actors host_storage privacy_mode_ts native_flow_name=X/>` — no children.
+    PaymentSimple(&'a str),
+    /// Nested form preserving the button's flow name.
+    NestedNamed(&'a str),
+    /// Nested form with `name="mixed"`. Fallback for buttons the server
+    /// silently drops when sent under their literal name.
+    Mixed,
+}
+
+fn classify_button(button_name: &str) -> BizCategory<'_> {
+    match button_name {
+        "payment_info" => BizCategory::PaymentSimple("payment_info"),
+        "review_and_pay" => BizCategory::PaymentSimple("order_details"),
+        "review_order" | "order_status" => BizCategory::PaymentSimple("order_status"),
+        "payment_status" => BizCategory::PaymentSimple("payment_status"),
+        "payment_method" => BizCategory::PaymentSimple("payment_method"),
+        "payment_reminder" => BizCategory::PaymentSimple("payment_reminder"),
+
+        "cta_url" => BizCategory::NestedNamed("cta_url"),
+        "cta_catalog" => BizCategory::NestedNamed("cta_catalog"),
+        "catalog_message" => BizCategory::NestedNamed("catalog_message"),
+        "galaxy_message" => BizCategory::NestedNamed("galaxy_message"),
+        "booking_confirmation" => BizCategory::NestedNamed("booking_confirmation"),
+        "call_permission_request" => BizCategory::NestedNamed("call_permission_request"),
+        "open_webview" => BizCategory::NestedNamed("message_with_link"),
+        "message_with_link_status" => BizCategory::NestedNamed("message_with_link_status"),
+
+        // quick_reply / cta_copy / cta_call / single_select / send_location
+        // and every other unknown name go through the mixed fallback. The
+        // server silently drops messages sent under the literal name for
+        // these buttons.
+        _ => BizCategory::Mixed,
+    }
+}
+
 /// Derive the `<biz>` stanza child for native-flow interactive messages.
-/// All native flow types use the same nested structure (confirmed via protocol capture).
-fn infer_biz_node(msg: &wa::Message) -> Option<Node> {
+///
+/// Returns `None` when the message has no native-flow interactive payload.
+/// Otherwise returns a `BizNodeInfo` carrying the assembled `<biz>` node.
+/// The caller is responsible for prepending `<bot biz_bot="1"/>` for DM-bound
+/// sends (see `build_extra_stanza_nodes`).
+///
+/// `now_unix_secs` is the current wall-clock time in unix seconds. Taking it
+/// as a parameter keeps the function pure and lets tests pin the resulting
+/// `privacy_mode_ts` deterministically without touching the global time
+/// provider.
+fn infer_biz_node_info(msg: &wa::Message, now_unix_secs: u64) -> Option<BizNodeInfo> {
     let interactive = extract_interactive_message(msg)?;
     let wa::message::interactive_message::InteractiveMessage::NativeFlowMessage(nf) =
         interactive.interactive_message.as_ref()?
@@ -129,19 +184,44 @@ fn infer_biz_node(msg: &wa::Message) -> Option<Node> {
     };
 
     let first_button_name = nf.buttons.first()?.name.as_deref()?;
-    let flow_name = button_name_to_flow_name(first_button_name);
+    let category = classify_button(first_button_name);
+    let privacy_mode_ts = now_unix_secs
+        .saturating_sub(BIZ_PRIVACY_MODE_TS_OFFSET)
+        .to_string();
 
-    Some(
-        NodeBuilder::new("biz")
-            .children([NodeBuilder::new("interactive")
+    let biz = match category {
+        BizCategory::PaymentSimple(flow_name) => NodeBuilder::new("biz")
+            .attr("actual_actors", "2")
+            .attr("host_storage", "2")
+            .attr("privacy_mode_ts", &privacy_mode_ts)
+            .attr("native_flow_name", flow_name)
+            .build(),
+        BizCategory::NestedNamed(flow_name) => build_nested_biz(&privacy_mode_ts, flow_name),
+        BizCategory::Mixed => build_nested_biz(&privacy_mode_ts, "mixed"),
+    };
+
+    Some(BizNodeInfo { biz })
+}
+
+fn build_nested_biz(privacy_mode_ts: &str, flow_name: &str) -> Node {
+    NodeBuilder::new("biz")
+        .attr("actual_actors", "2")
+        .attr("host_storage", "2")
+        .attr("privacy_mode_ts", privacy_mode_ts)
+        .children([
+            NodeBuilder::new("interactive")
                 .attr("type", "native_flow")
                 .attr("v", "1")
                 .children([NodeBuilder::new("native_flow")
+                    .attr("v", "9")
                     .attr("name", flow_name)
                     .build()])
-                .build()])
-            .build(),
-    )
+                .build(),
+            NodeBuilder::new("quality_control")
+                .attr("source_type", "third_party")
+                .build(),
+        ])
+        .build()
 }
 
 fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::InteractiveMessage> {
@@ -156,27 +236,31 @@ fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::Intera
     msg.interactive_message.as_deref()
 }
 
-fn button_name_to_flow_name(button_name: &str) -> &str {
-    match button_name {
-        "review_and_pay" => "order_details",
-        "payment_info" => "payment_info",
-        "review_order" | "order_status" => "order_status",
-        "payment_status" => "payment_status",
-        "payment_method" => "payment_method",
-        "payment_reminder" => "payment_reminder",
-        "open_webview" => "message_with_link",
-        "message_with_link_status" => "message_with_link_status",
-        "cta_url" => "cta_url",
-        "cta_call" => "cta_call",
-        "cta_copy" => "cta_copy",
-        "cta_catalog" => "cta_catalog",
-        "catalog_message" => "catalog_message",
-        "quick_reply" => "quick_reply",
-        "galaxy_message" => "galaxy_message",
-        "booking_confirmation" => "booking_confirmation",
-        "call_permission_request" => "call_permission_request",
-        other => other,
+/// Assemble the `extra_stanza_nodes` vector for a non-newsletter send.
+///
+/// Order: `inferred_meta`, optional `<bot biz_bot="1"/>` (DM only), `<biz>`,
+/// then any user-provided extra nodes. Matches the upstream Baileys
+/// reproducer (Issue oxidezap/baileyrs#7). Pure so the caller stays trivial
+/// and the assembly logic is unit-testable.
+fn build_extra_stanza_nodes(
+    to: &Jid,
+    inferred_meta: Option<Node>,
+    biz_info: Option<BizNodeInfo>,
+    user_nodes: Vec<Node>,
+) -> Vec<Node> {
+    if inferred_meta.is_none() && biz_info.is_none() {
+        return user_nodes;
     }
+    let mut nodes = Vec::with_capacity(3 + user_nodes.len());
+    nodes.extend(inferred_meta);
+    if let Some(info) = biz_info {
+        if !to.is_group() {
+            nodes.push(NodeBuilder::new("bot").attr("biz_bot", "1").build());
+        }
+        nodes.push(info.biz);
+    }
+    nodes.extend(user_nodes);
+    nodes
 }
 
 fn build_revoke_message(
@@ -265,17 +349,11 @@ impl Client {
         }
 
         let (edit, inferred_meta) = infer_stanza_metadata(&message);
-        let inferred_biz = infer_biz_node(&message);
+        let now_unix_secs = wacore::time::now_secs().max(0) as u64;
+        let biz_info = infer_biz_node_info(&message, now_unix_secs);
 
-        let extra_nodes = if inferred_meta.is_none() && inferred_biz.is_none() {
-            options.extra_stanza_nodes
-        } else {
-            let mut nodes = Vec::with_capacity(2 + options.extra_stanza_nodes.len());
-            nodes.extend(inferred_meta);
-            nodes.extend(inferred_biz);
-            nodes.extend(options.extra_stanza_nodes);
-            nodes
-        };
+        let extra_nodes =
+            build_extra_stanza_nodes(&to, inferred_meta, biz_info, options.extra_stanza_nodes);
         self.send_message_impl(
             to,
             &message,
@@ -2507,84 +2585,182 @@ mod tests {
         }
     }
 
-    mod infer_biz {
+    mod biz_node_tests {
         use super::*;
+        use std::str::FromStr;
         use wa::message::interactive_message::{
             self, NativeFlowMessage, native_flow_message::NativeFlowButton,
         };
 
-        fn msg_with_native_flow(button_name: &str) -> wa::Message {
+        // Fixed unix seconds for deterministic privacy_mode_ts assertions.
+        const FIXED_NOW: u64 = 1_700_000_000;
+        // FIXED_NOW - BIZ_PRIVACY_MODE_TS_OFFSET = 1_700_000_000 - 77_980_457
+        const EXPECTED_PRIVACY_TS: &str = "1622019543";
+
+        fn msg_with_native_flow_button(button_name: &str) -> wa::Message {
             wa::Message {
-                document_with_caption_message: Some(Box::new(wa::message::FutureProofMessage {
-                    message: Some(Box::new(wa::Message {
-                        interactive_message: Some(Box::new(wa::message::InteractiveMessage {
-                            interactive_message: Some(
-                                interactive_message::InteractiveMessage::NativeFlowMessage(
-                                    NativeFlowMessage {
-                                        buttons: vec![NativeFlowButton {
-                                            name: Some(button_name.to_string()),
-                                            button_params_json: None,
-                                        }],
-                                        message_version: Some(1),
-                                        message_params_json: None,
-                                    },
-                                ),
-                            ),
-                            ..Default::default()
-                        })),
-                        ..Default::default()
-                    })),
+                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
+                    interactive_message: Some(
+                        interactive_message::InteractiveMessage::NativeFlowMessage(
+                            NativeFlowMessage {
+                                buttons: vec![NativeFlowButton {
+                                    name: Some(button_name.to_string()),
+                                    button_params_json: None,
+                                }],
+                                message_version: Some(1),
+                                message_params_json: None,
+                            },
+                        ),
+                    ),
+                    ..Default::default()
                 })),
                 ..Default::default()
             }
         }
 
-        fn assert_biz_node(node: &Node, expected_flow_name: &str) {
-            assert_eq!(node.tag, "biz");
-            assert!(
-                node.attrs().optional_string("native_flow_name").is_none(),
-                "should NOT use simple attribute form"
-            );
-            let interactive = node.get_optional_child("interactive").unwrap();
-            let mut attrs = interactive.attrs();
+        fn assert_biz_common_attrs(node: &Node, ctx: &str) {
+            assert_eq!(node.tag, "biz", "{ctx}");
+            let mut a = node.attrs();
             assert_eq!(
-                attrs.optional_string("type").unwrap().as_ref(),
-                "native_flow"
+                a.optional_string("actual_actors").unwrap().as_ref(),
+                "2",
+                "{ctx}"
             );
-            assert_eq!(attrs.optional_string("v").unwrap().as_ref(), "1");
-            let nf = interactive.get_optional_child("native_flow").unwrap();
-            let mut nf_attrs = nf.attrs();
             assert_eq!(
-                nf_attrs.optional_string("name").unwrap().as_ref(),
-                expected_flow_name
+                a.optional_string("host_storage").unwrap().as_ref(),
+                "2",
+                "{ctx}"
+            );
+            assert_eq!(
+                a.optional_string("privacy_mode_ts").unwrap().as_ref(),
+                EXPECTED_PRIVACY_TS,
+                "{ctx}"
             );
         }
 
+        fn assert_nested_biz(node: &Node, expected_flow_name: &str, ctx: &str) {
+            assert_biz_common_attrs(node, ctx);
+            assert!(
+                node.attrs().optional_string("native_flow_name").is_none(),
+                "{ctx}: nested form has no native_flow_name attr"
+            );
+            let interactive = node
+                .get_optional_child("interactive")
+                .unwrap_or_else(|| panic!("{ctx}: missing <interactive>"));
+            let mut ia = interactive.attrs();
+            assert_eq!(
+                ia.optional_string("type").unwrap().as_ref(),
+                "native_flow",
+                "{ctx}"
+            );
+            assert_eq!(ia.optional_string("v").unwrap().as_ref(), "1", "{ctx}");
+
+            let nf = interactive
+                .get_optional_child("native_flow")
+                .unwrap_or_else(|| panic!("{ctx}: missing <native_flow>"));
+            let mut nfa = nf.attrs();
+            assert_eq!(nfa.optional_string("v").unwrap().as_ref(), "9", "{ctx}");
+            assert_eq!(
+                nfa.optional_string("name").unwrap().as_ref(),
+                expected_flow_name,
+                "{ctx}"
+            );
+
+            let qc = node
+                .get_optional_child("quality_control")
+                .unwrap_or_else(|| panic!("{ctx}: missing <quality_control>"));
+            assert_eq!(
+                qc.attrs().optional_string("source_type").unwrap().as_ref(),
+                "third_party",
+                "{ctx}"
+            );
+        }
+
+        /// Payment-family buttons emit the flat `<biz>` form with
+        /// `native_flow_name` as an attr and NO children.
         #[test]
-        fn all_button_types_use_nested_structure() {
-            for (button, expected_flow) in [
-                ("cta_url", "cta_url"),
+        fn payment_simple_form() {
+            let cases: &[(&str, &str)] = &[
                 ("payment_info", "payment_info"),
                 ("review_and_pay", "order_details"),
-                ("cta_catalog", "cta_catalog"),
-                ("mpm", "mpm"),
-                ("quick_reply", "quick_reply"),
-            ] {
-                let node = infer_biz_node(&msg_with_native_flow(button))
-                    .unwrap_or_else(|| panic!("{button} should produce biz node"));
-                assert_biz_node(&node, expected_flow);
+                ("review_order", "order_status"),
+                ("order_status", "order_status"),
+                ("payment_status", "payment_status"),
+                ("payment_method", "payment_method"),
+                ("payment_reminder", "payment_reminder"),
+            ];
+            for (button, expected_flow) in cases {
+                let info = infer_biz_node_info(&msg_with_native_flow_button(button), FIXED_NOW)
+                    .unwrap_or_else(|| panic!("{button}: should produce biz"));
+                assert_biz_common_attrs(&info.biz, button);
+                assert_eq!(
+                    info.biz
+                        .attrs()
+                        .optional_string("native_flow_name")
+                        .unwrap()
+                        .as_ref(),
+                    *expected_flow,
+                    "{button}: native_flow_name attr"
+                );
+                assert!(
+                    info.biz.children().unwrap_or(&[]).is_empty(),
+                    "{button}: PaymentSimple has no children"
+                );
             }
         }
 
+        /// Named-nested buttons keep their flow name and gain the new
+        /// privacy attrs plus `<quality_control>`.
+        #[test]
+        fn nested_named_form() {
+            let cases: &[(&str, &str)] = &[
+                ("cta_url", "cta_url"),
+                ("cta_catalog", "cta_catalog"),
+                ("catalog_message", "catalog_message"),
+                ("galaxy_message", "galaxy_message"),
+                ("booking_confirmation", "booking_confirmation"),
+                ("call_permission_request", "call_permission_request"),
+                ("open_webview", "message_with_link"),
+                ("message_with_link_status", "message_with_link_status"),
+            ];
+            for (button, expected_flow) in cases {
+                let info = infer_biz_node_info(&msg_with_native_flow_button(button), FIXED_NOW)
+                    .unwrap_or_else(|| panic!("{button}: should produce biz"));
+                assert_nested_biz(&info.biz, expected_flow, button);
+            }
+        }
+
+        /// quick_reply / cta_copy / cta_call / single_select / send_location
+        /// and unknown future button names route through `name="mixed"`.
+        #[test]
+        fn mixed_form_for_dropped_buttons() {
+            let cases: &[&str] = &[
+                "quick_reply",
+                "cta_copy",
+                "cta_call",
+                "single_select",
+                "send_location",
+                "future_button_xyz",
+            ];
+            for button in cases {
+                let info = infer_biz_node_info(&msg_with_native_flow_button(button), FIXED_NOW)
+                    .unwrap_or_else(|| panic!("{button}: should produce biz"));
+                assert_nested_biz(&info.biz, "mixed", button);
+            }
+        }
+
+        /// Non-interactive messages produce no `<biz>` (no fan-out into the
+        /// extra_stanza_nodes path).
         #[test]
         fn no_interactive_returns_none() {
             let msg = wa::Message {
                 conversation: Some("hello".into()),
                 ..Default::default()
             };
-            assert!(infer_biz_node(&msg).is_none());
+            assert!(infer_biz_node_info(&msg, FIXED_NOW).is_none());
         }
 
+        /// Interactive but not native-flow (e.g. CollectionMessage) yields None.
         #[test]
         fn interactive_without_native_flow_returns_none() {
             let msg = wa::Message {
@@ -2598,9 +2774,10 @@ mod tests {
                 })),
                 ..Default::default()
             };
-            assert!(infer_biz_node(&msg).is_none());
+            assert!(infer_biz_node_info(&msg, FIXED_NOW).is_none());
         }
 
+        /// NativeFlow with empty button list yields None — no signal to classify.
         #[test]
         fn native_flow_without_buttons_returns_none() {
             let msg = wa::Message {
@@ -2618,18 +2795,19 @@ mod tests {
                 })),
                 ..Default::default()
             };
-            assert!(infer_biz_node(&msg).is_none());
+            assert!(infer_biz_node_info(&msg, FIXED_NOW).is_none());
         }
 
+        /// Button with `name = None` is treated as missing classifier → None.
         #[test]
-        fn direct_interactive_message_without_wrapper() {
+        fn button_without_name_returns_none() {
             let msg = wa::Message {
                 interactive_message: Some(Box::new(wa::message::InteractiveMessage {
                     interactive_message: Some(
                         interactive_message::InteractiveMessage::NativeFlowMessage(
                             NativeFlowMessage {
                                 buttons: vec![NativeFlowButton {
-                                    name: Some("cta_url".to_string()),
+                                    name: None,
                                     button_params_json: None,
                                 }],
                                 message_version: Some(1),
@@ -2641,8 +2819,148 @@ mod tests {
                 })),
                 ..Default::default()
             };
-            let node = infer_biz_node(&msg).unwrap();
-            assert_biz_node(&node, "cta_url");
+            assert!(infer_biz_node_info(&msg, FIXED_NOW).is_none());
+        }
+
+        /// Messages wrapped in `documentWithCaptionMessage` still pick up the
+        /// native_flow payload from the inner message.
+        #[test]
+        fn document_with_caption_wrapper() {
+            let inner = wa::Message {
+                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
+                    interactive_message: Some(
+                        interactive_message::InteractiveMessage::NativeFlowMessage(
+                            NativeFlowMessage {
+                                buttons: vec![NativeFlowButton {
+                                    name: Some("quick_reply".into()),
+                                    button_params_json: None,
+                                }],
+                                message_version: Some(1),
+                                message_params_json: None,
+                            },
+                        ),
+                    ),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let msg = wa::Message {
+                document_with_caption_message: Some(Box::new(wa::message::FutureProofMessage {
+                    message: Some(Box::new(inner)),
+                })),
+                ..Default::default()
+            };
+            let info = infer_biz_node_info(&msg, FIXED_NOW)
+                .expect("doc-with-caption wrapper should propagate the inner native_flow");
+            assert_nested_biz(&info.biz, "mixed", "doc-with-caption/quick_reply");
+        }
+
+        // -- build_extra_stanza_nodes assembly tests --
+
+        fn quick_reply_biz_info() -> BizNodeInfo {
+            infer_biz_node_info(&msg_with_native_flow_button("quick_reply"), FIXED_NOW)
+                .expect("quick_reply produces biz")
+        }
+
+        fn payment_biz_info() -> BizNodeInfo {
+            infer_biz_node_info(&msg_with_native_flow_button("payment_info"), FIXED_NOW)
+                .expect("payment_info produces biz")
+        }
+
+        fn jid(s: &str) -> Jid {
+            Jid::from_str(s).expect("valid jid in test")
+        }
+
+        /// DM: `<bot biz_bot="1"/>` is prepended before the `<biz>`. The
+        /// order matters — this is the shape the upstream Baileys
+        /// reproducer emits.
+        #[test]
+        fn dm_emits_bot_before_biz() {
+            let nodes = build_extra_stanza_nodes(
+                &jid("5511999999999@s.whatsapp.net"),
+                None,
+                Some(quick_reply_biz_info()),
+                vec![],
+            );
+            assert_eq!(nodes.len(), 2, "expected [<bot>, <biz>]");
+            assert_eq!(nodes[0].tag, "bot");
+            assert_eq!(
+                nodes[0]
+                    .attrs()
+                    .optional_string("biz_bot")
+                    .unwrap()
+                    .as_ref(),
+                "1"
+            );
+            assert_eq!(nodes[1].tag, "biz");
+        }
+
+        /// Group: `<bot>` is NOT emitted; only `<biz>`.
+        #[test]
+        fn group_omits_bot() {
+            let nodes = build_extra_stanza_nodes(
+                &jid("120363000000000001@g.us"),
+                None,
+                Some(quick_reply_biz_info()),
+                vec![],
+            );
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].tag, "biz");
+        }
+
+        /// LID DM (non-group): `<bot>` is still emitted.
+        #[test]
+        fn lid_dm_emits_bot() {
+            let nodes = build_extra_stanza_nodes(
+                &jid("100000000000001@lid"),
+                None,
+                Some(payment_biz_info()),
+                vec![],
+            );
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(nodes[0].tag, "bot");
+        }
+
+        /// No biz + no meta → user nodes pass through untouched.
+        #[test]
+        fn no_biz_no_meta_passthrough() {
+            let user_nodes = vec![NodeBuilder::new("custom").build()];
+            let nodes =
+                build_extra_stanza_nodes(&jid("X@s.whatsapp.net"), None, None, user_nodes.clone());
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].tag, "custom");
+        }
+
+        /// Full ordering: [meta, bot, biz, user_nodes...].
+        #[test]
+        fn full_ordering_meta_bot_biz_user() {
+            let meta = NodeBuilder::new("meta").attr("appdata", "default").build();
+            let user_a = NodeBuilder::new("user_a").build();
+            let user_b = NodeBuilder::new("user_b").build();
+            let nodes = build_extra_stanza_nodes(
+                &jid("X@s.whatsapp.net"),
+                Some(meta),
+                Some(quick_reply_biz_info()),
+                vec![user_a, user_b],
+            );
+            assert_eq!(nodes.len(), 5);
+            assert_eq!(nodes[0].tag, "meta");
+            assert_eq!(nodes[1].tag, "bot");
+            assert_eq!(nodes[2].tag, "biz");
+            assert_eq!(nodes[3].tag, "user_a");
+            assert_eq!(nodes[4].tag, "user_b");
+        }
+
+        /// Meta-only (no biz) preserves order: meta then user nodes; no bot.
+        #[test]
+        fn meta_only_preserves_order() {
+            let meta = NodeBuilder::new("meta").build();
+            let user = NodeBuilder::new("u").build();
+            let nodes =
+                build_extra_stanza_nodes(&jid("X@s.whatsapp.net"), Some(meta), None, vec![user]);
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(nodes[0].tag, "meta");
+            assert_eq!(nodes[1].tag, "u");
         }
     }
 
