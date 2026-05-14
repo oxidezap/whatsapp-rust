@@ -3858,7 +3858,13 @@ fn encode_ack_bytes(
     let Some(from_val) = node.get_attr("from") else {
         return Ok(None);
     };
-    let participant_val = node.get_attr("participant");
+    // WAWebReceiptAck: `participant: r && r !== e ? DEVICE_JID(r) : DROP_ATTR`.
+    // Drop the attribute when it would duplicate `to` (which is the flipped `from`).
+    let participant_val = node.get_attr("participant").filter(|p| {
+        let p_str = p.as_str();
+        let from_str = from_val.as_str();
+        p_str.as_ref() != from_str.as_ref()
+    });
     let tag = node.tag.as_ref();
 
     let typ_val = if tag != "message" && !is_encrypt_identity_notification(node) {
@@ -3947,8 +3953,13 @@ fn encode_ack_bytes(
 #[cfg(test)]
 fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>) -> Option<Node> {
     let id = node.get_attr("id")?.to_node_value();
-    let from = node.get_attr("from")?.to_node_value();
-    let participant = node.get_attr("participant").map(|v| v.to_node_value());
+    let from_ref = node.get_attr("from")?;
+    let from = from_ref.to_node_value();
+    // Drop participant when it duplicates `to` (the flipped `from`).
+    let participant = node
+        .get_attr("participant")
+        .filter(|p| p.as_str().as_ref() != from_ref.as_str().as_ref())
+        .map(|v| v.to_node_value());
     let tag = node.tag.as_ref();
     let typ = if tag != "message" && !is_encrypt_identity_notification(node) {
         node.get_attr("type").map(|v| v.to_node_value())
@@ -5731,6 +5742,47 @@ mod tests {
         assert!(
             !ack.attrs.contains_key("from"),
             "receipt ACKs should not include our device PN"
+        );
+    }
+
+    #[test]
+    fn test_build_ack_node_drops_participant_when_equal_to_from() {
+        // WAWebReceiptAck: `participant: r && r !== e ? DEVICE_JID(r) : DROP_ATTR`.
+        // When the incoming stanza carries participant == from (redundant),
+        // the ack must not echo it.
+        let incoming = NodeBuilder::new("receipt")
+            .attr("from", "156535032389744@lid")
+            .attr("participant", "156535032389744@lid")
+            .attr("id", "RCPT-PARTICIPANT-EQ-FROM")
+            .build();
+        let own_device_pn: Jid = "155500012345:48@s.whatsapp.net".parse().unwrap();
+
+        let ack = build_ack_node(&incoming.as_node_ref(), Some(&own_device_pn))
+            .expect("ack should build");
+        assert!(
+            !ack.attrs.contains_key("participant"),
+            "ack must drop participant when it duplicates `to` (the flipped from); got {:?}",
+            ack.attrs.get("participant")
+        );
+    }
+
+    #[test]
+    fn test_build_ack_node_keeps_participant_when_distinct_from_from() {
+        // Group receipt: participant = sender (user), from = group jid; must be kept.
+        let incoming = NodeBuilder::new("receipt")
+            .attr("from", "120363098765432100@g.us")
+            .attr("participant", "5511999999999@s.whatsapp.net")
+            .attr("id", "RCPT-GROUP")
+            .build();
+        let own_device_pn: Jid = "155500012345:48@s.whatsapp.net".parse().unwrap();
+
+        let ack = build_ack_node(&incoming.as_node_ref(), Some(&own_device_pn))
+            .expect("ack should build");
+        assert!(
+            ack.attrs
+                .get("participant")
+                .is_some_and(|v| v == "5511999999999@s.whatsapp.net"),
+            "ack must keep participant when it differs from `to`"
         );
     }
 
