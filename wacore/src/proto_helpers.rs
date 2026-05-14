@@ -2,12 +2,10 @@ use std::str::FromStr;
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
-/// Invokes a callback macro with the list of all message types that have `context_info`.
-///
-/// This macro ensures both `for_each_context_info_message!` and `set_context_info_on_message!`
-/// use the same list of message types, making it easy to add new types in one place.
-///
-/// When WhatsApp adds new message types with context_info, add them here.
+/// Single source of truth for the message types that carry a `context_info`
+/// field. Consumed by `for_each_context_info_message!`, `set_context_info`
+/// (via an inlined `try_attach!`), `get_ephemeral_expiration`, and
+/// `set_ephemeral_expiration`. Add new WA message types with context_info here.
 macro_rules! with_context_info_fields {
     ($callback:ident!($($prefix:tt)*)) => {
         $callback!($($prefix)*
@@ -949,6 +947,8 @@ mod tests {
             ..Default::default()
         };
         assert!(!msg.set_context_info(context));
+        assert!(msg.conversation.is_none());
+        assert!(msg.extended_text_message.is_none());
     }
 
     /// Test: build_quote_context produces correct structure.

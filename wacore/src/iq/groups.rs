@@ -272,9 +272,10 @@ pub struct GroupCreateOptions {
     #[builder(default, setter(strip_option, into))]
     pub linked_parent: Option<Jid>,
     /// Inline description carried on the create stanza; avoids a follow-up
-    /// SetGroupDescription IQ.
+    /// SetGroupDescription IQ. Validation (length cap) goes through
+    /// [`GroupDescription`] so both create paths share the same contract.
     #[builder(default, setter(strip_option, into))]
-    pub description: Option<String>,
+    pub description: Option<GroupDescription>,
 }
 
 impl GroupCreateOptions {
@@ -430,7 +431,21 @@ pub fn build_create_group_node(options: &GroupCreateOptions) -> Node {
     // `<parent>` (this group IS a community) and `<linked_parent>` (this
     // group is a subgroup of X) are mutually exclusive. When both are
     // requested, `linked_parent` wins; it carries an explicit target.
+    debug_assert!(
+        options.linked_parent.is_none() || !options.is_parent,
+        "GroupCreateOptions: linked_parent and is_parent are mutually exclusive"
+    );
     if let Some(parent_jid) = &options.linked_parent {
+        if options.is_parent {
+            log::warn!(
+                "GroupCreateOptions has both linked_parent={parent_jid} and is_parent=true \
+                 (closed={}, allow_non_admin_sub_group_creation={}, create_general_chat={}); \
+                 dropping parent-only flags",
+                options.closed,
+                options.allow_non_admin_sub_group_creation,
+                options.create_general_chat,
+            );
+        }
         children.push(
             NodeBuilder::new("linked_parent")
                 .attr("jid", parent_jid)
@@ -457,7 +472,9 @@ pub fn build_create_group_node(options: &GroupCreateOptions) -> Node {
         children.push(
             NodeBuilder::new("description")
                 .attr("id", generate_description_id())
-                .children([NodeBuilder::new("body").string_content(desc).build()])
+                .children([NodeBuilder::new("body")
+                    .string_content(desc.as_str())
+                    .build()])
                 .build(),
         );
     }
@@ -1808,11 +1825,12 @@ impl IqSpec for SetGroupEphemeralIq {
         let node = match self.expiration {
             Some(exp) => {
                 let mut b = NodeBuilder::new("ephemeral").attr("expiration", exp.get());
-                if let Some(trigger) = self.trigger {
-                    debug_assert!(
-                        trigger <= EPHEMERAL_TRIGGER_MAX,
-                        "ephemeral trigger out of range (0..={EPHEMERAL_TRIGGER_MAX}): {trigger}"
-                    );
+                // Skip out-of-range triggers instead of emitting them; the
+                // constructor asserts on misuse, this is the defence-in-depth
+                // path for direct field assignment.
+                if let Some(trigger) = self.trigger
+                    && trigger <= EPHEMERAL_TRIGGER_MAX
+                {
                     b = b.attr("trigger", trigger);
                 }
                 b.build()
@@ -3484,6 +3502,23 @@ mod tests {
     }
 
     #[test]
+    fn test_set_group_ephemeral_iq_skips_out_of_range_trigger_in_build_iq() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        // Bypass the constructor and write directly to mimic a caller that
+        // sets the public field to an invalid value.
+        let mut iq_spec = SetGroupEphemeralIq::enable(&group, NonZeroU32::new(86400).unwrap());
+        iq_spec.trigger = Some(EPHEMERAL_TRIGGER_MAX + 1);
+        let iq = iq_spec.build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected nodes content");
+        };
+        assert!(
+            nodes[0].attrs().optional_string("trigger").is_none(),
+            "out-of-range trigger must be dropped on the wire"
+        );
+    }
+
+    #[test]
     fn test_set_group_membership_approval_iq() {
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
 
@@ -3884,11 +3919,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "mutually exclusive"))]
     fn test_group_create_iq_linked_parent_excludes_parent_block() {
-        // `<parent>` ("I am a community") and `<linked_parent>` ("I am a
-        // subgroup of X") are semantically exclusive. When both are set,
-        // linked_parent must win and <parent>/<allow_non_admin_sub_group_creation>
-        // /<create_general_chat> must be omitted.
+        // Setting both is a programmer error: debug builds panic on the
+        // debug_assert; release builds silently emit only <linked_parent>.
         let parent: Jid = "120363000000000001@g.us".parse().unwrap();
         let options = GroupCreateOptions {
             subject: "Conflicting".into(),
@@ -3904,20 +3938,13 @@ mod tests {
             panic!("expected <create>");
         };
         assert!(nodes[0].get_optional_child("linked_parent").is_some());
-        assert!(
-            nodes[0].get_optional_child("parent").is_none(),
-            "<parent> must be omitted when linked_parent is set"
-        );
+        assert!(nodes[0].get_optional_child("parent").is_none());
         assert!(
             nodes[0]
                 .get_optional_child("allow_non_admin_sub_group_creation")
-                .is_none(),
-            "community-only children must also be omitted"
+                .is_none()
         );
-        assert!(
-            nodes[0].get_optional_child("create_general_chat").is_none(),
-            "community-only children must also be omitted"
-        );
+        assert!(nodes[0].get_optional_child("create_general_chat").is_none());
     }
 
     #[test]
@@ -3952,7 +3979,7 @@ mod tests {
     fn test_group_create_iq_emits_description_with_body() {
         let options = GroupCreateOptions {
             subject: "Group with desc".into(),
-            description: Some("Hello, group".into()),
+            description: Some(GroupDescription::new("Hello, group").unwrap()),
             ..Default::default()
         };
         let iq = GroupCreateIq::new(options).build_iq();
@@ -3977,6 +4004,12 @@ mod tests {
             _ => panic!("description body must carry text"),
         };
         assert_eq!(text, "Hello, group");
+    }
+
+    #[test]
+    fn test_group_create_iq_description_rejects_over_max_length() {
+        let too_long = "x".repeat(GROUP_DESCRIPTION_MAX_LENGTH + 1);
+        assert!(GroupDescription::new(too_long).is_err());
     }
 
     #[test]

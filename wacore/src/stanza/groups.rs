@@ -1063,6 +1063,43 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_limit_sharing_enabled_overflow_yields_none() {
+        // trigger > u32::MAX must yield None instead of truncating.
+        let node = make_notification(vec![
+            NodeBuilder::new("limit_sharing_enabled")
+                .attr("trigger", "4294967296")
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::LimitSharingEnabled { trigger } => assert!(trigger.is_none()),
+            other => panic!("expected LimitSharingEnabled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_ephemeral_overflow_yields_zero_and_none() {
+        // expiration > u32::MAX falls back to 0; trigger > u32::MAX yields None.
+        let node = make_notification(vec![
+            NodeBuilder::new("ephemeral")
+                .attr("expiration", "4294967296")
+                .attr("trigger", "4294967296")
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Ephemeral {
+                expiration,
+                trigger,
+            } => {
+                assert_eq!(*expiration, 0);
+                assert!(trigger.is_none());
+            }
+            other => panic!("expected Ephemeral, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_parse_change_number_carries_participants() {
         let node = make_notification(vec![
             NodeBuilder::new("change_number")
