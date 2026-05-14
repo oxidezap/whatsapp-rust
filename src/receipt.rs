@@ -31,7 +31,7 @@ impl Client {
         let nr = node.get();
         let mut attrs = nr.attrs();
         let from = attrs.jid("from");
-        let id = match attrs.optional_string("id") {
+        let stanza_id = match attrs.optional_string("id") {
             Some(id) => id.to_string(),
             None => {
                 log::warn!("Receipt stanza missing required 'id' attribute");
@@ -41,26 +41,82 @@ impl Client {
         let receipt_type_cow = attrs.optional_string("type");
         let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
         let participant = attrs.optional_jid("participant");
+        let stanza_ts = attrs
+            .optional_u64("t")
+            .and_then(|t| i64::try_from(t).ok())
+            .and_then(wacore::time::from_secs)
+            .unwrap_or_else(wacore::time::now_utc);
 
         let receipt_type = ReceiptType::parse(receipt_type_str);
-
-        debug!("Received receipt type '{receipt_type:?}' for message {id} from {from}");
-
+        let is_view = receipt_type_str == "view";
         let is_group = from.is_group();
-        let sender = if is_group {
+        let default_sender = if is_group {
             participant.unwrap_or_else(|| from.clone())
         } else {
             from.clone()
         };
 
+        // Aggregated shape (`<participants>` child): WAWebHandleMsgReceiptParser
+        // produces one entry per `<user>`. Fan out into one Receipt event per
+        // user so per-user type/timestamp/sender are not lost. Retries and
+        // enc_rekey_retry never use the aggregated shape, so this short-circuits
+        // before the retry pipeline below.
+        if let Some(part_node) = nr.get_optional_child("participants") {
+            let (agg_msg_id, agg_key, users) =
+                wacore::stanza::receipt::parse_participants(part_node);
+            let fan_out_id = agg_msg_id
+                .clone()
+                .or_else(|| agg_key.clone())
+                .unwrap_or_else(|| stanza_id.clone());
+            debug!(
+                "Aggregated receipt from {from}: stanza={stanza_id} \
+                 message_id={agg_msg_id:?} key={agg_key:?} users={}",
+                users.len()
+            );
+            for user in users {
+                let user_ts = i64::try_from(user.timestamp)
+                    .ok()
+                    .and_then(wacore::time::from_secs)
+                    .unwrap_or(stanza_ts);
+                // aggregated_by_message: each <user> carries its own type;
+                // aggregated_by_type: all users share the receipt-level type.
+                let effective_type = match user.r#type.as_deref() {
+                    Some(t) => ReceiptType::parse(t),
+                    None => receipt_type.clone(),
+                };
+                let r = Receipt {
+                    message_ids: vec![fan_out_id.clone()],
+                    source: crate::types::message::MessageSource {
+                        chat: from.clone(),
+                        sender: user.jid,
+                        ..Default::default()
+                    },
+                    timestamp: user_ts,
+                    r#type: effective_type,
+                };
+                self.core.event_bus.dispatch(Event::Receipt(r));
+            }
+            return;
+        }
+
+        // Simple receipt: collect `<list><item id=.../>` items plus the stanza
+        // id (for non-view receipts), matching the JS p() branch.
+        let message_ids =
+            wacore::stanza::receipt::collect_simple_message_ids(nr, &stanza_id, is_view);
+
+        debug!(
+            "Received receipt type '{receipt_type:?}' for {} message(s) from {from}",
+            message_ids.len()
+        );
+
         let receipt = Receipt {
-            message_ids: vec![id],
+            message_ids,
             source: crate::types::message::MessageSource {
                 chat: from,
-                sender,
+                sender: default_sender,
                 ..Default::default()
             },
-            timestamp: wacore::time::now_utc(),
+            timestamp: stanza_ts,
             r#type: receipt_type,
         };
 
@@ -584,6 +640,163 @@ mod tests {
             !Client::should_send_delivery_receipt(&info),
             "non-peer self messages must not get delivery receipts"
         );
+    }
+
+    /// Aggregated-by-message receipt: fan out one Receipt event per `<user>`
+    /// with that user's type, and use the `message_id` attr (not the stanza
+    /// id) as the message id. Matches `WAWebHandleMsgReceiptParser` m() branch.
+    #[tokio::test]
+    async fn test_aggregated_by_message_receipt_fans_out_per_user() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        let node = node_to_arc(
+            NodeBuilder::new("receipt")
+                .attr("from", "120363000000000001@g.us")
+                .attr("id", "STANZA-AGG-XYZ")
+                .attr("t", "1700000000")
+                .children([NodeBuilder::new("participants")
+                    .attr("message_id", "REAL-MSG-ID")
+                    .children([
+                        NodeBuilder::new("user")
+                            .attr("jid", "99000000000001@lid")
+                            .attr("t", "1700000001")
+                            .attr("type", "delivery")
+                            .build(),
+                        NodeBuilder::new("user")
+                            .attr("jid", "99000000000002@lid")
+                            .attr("t", "1700000002")
+                            .attr("type", "read")
+                            .build(),
+                        NodeBuilder::new("user")
+                            .attr("jid", "99000000000003@lid")
+                            .attr("t", "1700000003")
+                            .attr("type", "inactive")
+                            .build(),
+                    ])
+                    .build()])
+                .build(),
+        );
+        client.handle_receipt(node).await;
+
+        let events = collector.events();
+        let receipts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(receipts.len(), 3, "must dispatch one event per <user>");
+        for r in &receipts {
+            assert_eq!(
+                r.message_ids,
+                vec!["REAL-MSG-ID"],
+                "fan-out events must use participants.message_id, not stanza id"
+            );
+            assert_eq!(r.source.chat.user, "120363000000000001");
+        }
+        assert_eq!(receipts[0].r#type, ReceiptType::Delivered);
+        assert_eq!(receipts[0].source.sender.user, "99000000000001");
+        assert_eq!(receipts[1].r#type, ReceiptType::Read);
+        assert_eq!(receipts[2].r#type, ReceiptType::Inactive);
+    }
+
+    /// Aggregated-by-type receipt: `<participants key="...">` without
+    /// `message_id`. All users inherit the receipt-level type. Mirrors d() branch.
+    #[tokio::test]
+    async fn test_aggregated_by_type_receipt_uses_receipt_level_type() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        let node = node_to_arc(
+            NodeBuilder::new("receipt")
+                .attr("from", "120363000000000001@g.us")
+                .attr("id", "STANZA-KEY")
+                .attr("type", "read")
+                .attr("t", "1700000000")
+                .children([NodeBuilder::new("participants")
+                    .attr("key", "AGG-KEY")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "99000000000001@lid")
+                        .attr("t", "1700000001")
+                        .build()])
+                    .build()])
+                .build(),
+        );
+        client.handle_receipt(node).await;
+
+        let events = collector.events();
+        let receipts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].r#type, ReceiptType::Read);
+        assert_eq!(receipts[0].message_ids, vec!["AGG-KEY"]);
+    }
+
+    /// `<list><item id=.../>` batched read receipt: all items plus the stanza
+    /// id (appended last) must end up in `message_ids`. Pre-fix only the
+    /// stanza id was kept.
+    #[tokio::test]
+    async fn test_simple_receipt_with_list_collects_all_ids() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        let node = node_to_arc(
+            NodeBuilder::new("receipt")
+                .attr("from", "99000000000001@s.whatsapp.net")
+                .attr("id", "MSG-A")
+                .attr("type", "read")
+                .attr("t", "1700000000")
+                .children([NodeBuilder::new("list")
+                    .children([
+                        NodeBuilder::new("item").attr("id", "MSG-B").build(),
+                        NodeBuilder::new("item").attr("id", "MSG-C").build(),
+                    ])
+                    .build()])
+                .build(),
+        );
+        client.handle_receipt(node).await;
+
+        let events = collector.events();
+        let r = events
+            .iter()
+            .find_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .expect("expected Receipt");
+        // Stanza id is appended LAST per WAWebHandleMsgReceiptParser.
+        assert_eq!(r.message_ids, vec!["MSG-B", "MSG-C", "MSG-A"]);
+        assert_eq!(r.r#type, ReceiptType::Read);
+    }
+
+    /// Simple receipt without `<list>`: only the stanza id is in message_ids.
+    #[tokio::test]
+    async fn test_simple_receipt_without_list_uses_stanza_id() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        let node = node_to_arc(
+            NodeBuilder::new("receipt")
+                .attr("from", "99000000000001@s.whatsapp.net")
+                .attr("id", "SOLO-MSG")
+                .attr("t", "1700000000")
+                .build(),
+        );
+        client.handle_receipt(node).await;
+
+        let events = collector.events();
+        let r = events
+            .iter()
+            .find_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .expect("expected Receipt");
+        assert_eq!(r.message_ids, vec!["SOLO-MSG"]);
+        assert_eq!(r.r#type, ReceiptType::Delivered);
     }
 
     /// Verify that receipt nodes use JID-typed attrs for `to` and `participant`,
