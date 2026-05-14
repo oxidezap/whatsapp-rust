@@ -354,6 +354,22 @@ impl MessageExt for wa::Message {
             };
         }
         with_context_info_fields!(try_set!());
+
+        // WAWebMessageSendUtils: when a bare <conversation> body needs a
+        // ContextInfo, promote it to <extended_text_message> so the timer
+        // attaches. Without this, the lib silently drops the ephemeral flag.
+        if let Some(text) = self.conversation.take() {
+            self.extended_text_message = Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some(text),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    expiration: Some(expiration),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }));
+            return true;
+        }
+
         false
     }
 }
@@ -1824,6 +1840,37 @@ mod tests {
             ..Default::default()
         };
         assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn set_ephemeral_expiration_promotes_bare_conversation_to_extended_text() {
+        // WAWebMessageSendUtils: bare conversation needs to be promoted so a
+        // ContextInfo (and thus the timer) can attach.
+        let mut msg = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        assert!(msg.set_ephemeral_expiration(86400));
+        assert!(
+            msg.conversation.is_none(),
+            "conversation must be moved out, not duplicated"
+        );
+        let ext = msg
+            .extended_text_message
+            .expect("conversation must have been promoted");
+        assert_eq!(ext.text.as_deref(), Some("hello"));
+        assert_eq!(
+            ext.context_info.as_ref().and_then(|c| c.expiration),
+            Some(86400)
+        );
+    }
+
+    #[test]
+    fn set_ephemeral_expiration_returns_false_on_empty_message() {
+        let mut msg = wa::Message::default();
+        assert!(!msg.set_ephemeral_expiration(60));
+        assert!(msg.conversation.is_none());
+        assert!(msg.extended_text_message.is_none());
     }
 
     #[test]
