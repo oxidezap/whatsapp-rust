@@ -16,30 +16,16 @@ pub const WA_CERT_PUB_KEY: [u8; 32] = [
     0xc4, 0xa2, 0x8b, 0x73, 0xe3, 0x69, 0x5c, 0x6c, 0xe1, 0xf7, 0xf9, 0x54, 0x5d, 0xa8, 0xee, 0x6b,
 ];
 
-/// Verify one step of the Noise cert chain. Centralizes the
-/// `danger-skip-cert-chain-verify` opt-out so callers don't have to repeat
-/// the cfg guard, and so the only path into XEdDSA verification (or its
-/// skip) lives in a single place.
-///
-/// Under the `danger-skip-cert-chain-verify` feature this is a no-op.
-/// Otherwise it XEdDSA-verifies `signature` over `details` using
-/// `issuer_key`. WA Web's signature format is always 64 bytes; values
-/// outside that length fail.
-///
-/// `label` is included in the returned error to disambiguate intermediate vs
-/// leaf failures in logs.
+/// XEdDSA-verifies one step of the Noise cert chain (`signature` over
+/// `details` with `issuer_key`). Skipped under `cfg(test)` and the
+/// `danger-skip-cert-chain-verify` feature, both of which exist so callers
+/// can drive the surrounding code against zero-signed fixtures.
 fn verify_cert_step(
     issuer_key: &[u8; 32],
     details: &[u8],
     signature: Option<&Vec<u8>>,
     label: &'static str,
 ) -> Result<()> {
-    // The in-crate unit tests (`#[cfg(test)] mod tests` below) and downstream
-    // e2e mocks operate against zero-signed cert fixtures, so the `cfg(test)`
-    // and `danger-skip-cert-chain-verify` paths both skip verification. The
-    // production cert-chain regression coverage lives in
-    // `wacore/noise/tests/cert_chain_verify.rs`, where this crate is compiled
-    // without `cfg(test)` so the real XEdDSA path actually runs.
     if cfg!(test) || cfg!(feature = "danger-skip-cert-chain-verify") {
         return Ok(());
     }
