@@ -1637,6 +1637,10 @@ pub struct SetGroupEphemeralIq {
     pub group_jid: Jid,
     /// Expiration in seconds. `None` means disable.
     pub expiration: Option<NonZeroU32>,
+    /// Optional `trigger` attribute on `<ephemeral>` (WA Web range 0..20).
+    /// Identifies the disappearing-mode source (e.g. per-chat setting vs
+    /// device-wide default). `None` omits the attribute.
+    pub trigger: Option<u32>,
 }
 
 impl SetGroupEphemeralIq {
@@ -1645,6 +1649,16 @@ impl SetGroupEphemeralIq {
         Self {
             group_jid: group_jid.clone(),
             expiration: Some(expiration),
+            trigger: None,
+        }
+    }
+
+    /// Enable ephemeral messages with both expiration and explicit `trigger`.
+    pub fn enable_with_trigger(group_jid: &Jid, expiration: NonZeroU32, trigger: u32) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            expiration: Some(expiration),
+            trigger: Some(trigger),
         }
     }
 
@@ -1653,6 +1667,7 @@ impl SetGroupEphemeralIq {
         Self {
             group_jid: group_jid.clone(),
             expiration: None,
+            trigger: None,
         }
     }
 }
@@ -1662,9 +1677,13 @@ impl IqSpec for SetGroupEphemeralIq {
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let node = match self.expiration {
-            Some(exp) => NodeBuilder::new("ephemeral")
-                .attr("expiration", exp.get())
-                .build(),
+            Some(exp) => {
+                let mut b = NodeBuilder::new("ephemeral").attr("expiration", exp.get());
+                if let Some(trigger) = self.trigger {
+                    b = b.attr("trigger", trigger);
+                }
+                b.build()
+            }
             None => NodeBuilder::new("not_ephemeral").build(),
         };
         InfoQuery::set_ref(
@@ -3210,6 +3229,36 @@ mod tests {
         } else {
             panic!("expected nodes content");
         }
+    }
+
+    #[test]
+    fn test_set_group_ephemeral_iq_with_trigger() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let with_trigger =
+            SetGroupEphemeralIq::enable_with_trigger(&group, NonZeroU32::new(604800).unwrap(), 7);
+        let iq = with_trigger.build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected nodes content");
+        };
+        let mut attrs = nodes[0].attrs();
+        assert_eq!(
+            attrs.optional_string("expiration").as_deref(),
+            Some("604800")
+        );
+        assert_eq!(attrs.optional_string("trigger").as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn test_set_group_ephemeral_iq_without_trigger_omits_attr() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let iq = SetGroupEphemeralIq::enable(&group, NonZeroU32::new(86400).unwrap()).build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected nodes content");
+        };
+        assert!(
+            nodes[0].attrs().optional_string("trigger").is_none(),
+            "default enable() must not emit a trigger attribute"
+        );
     }
 
     #[test]
