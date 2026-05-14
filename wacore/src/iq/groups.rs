@@ -1068,27 +1068,102 @@ impl IqSpec for GroupCreateIq {
 // Group Management IQ Specs
 // ---------------------------------------------------------------------------
 
+/// V4 invite-token returned on `<participant error="403">` when the target's
+/// privacy settings block a direct add. The app can fall back to sending a
+/// `GroupInviteMessage` carrying these fields.
+///
+/// Wire shape: `<add_request code="..." expiration="N"/>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddRequestInfo {
+    pub code: String,
+    pub expiration: u64,
+}
+
 /// Response for participant change operations.
 ///
 /// Success is signaled by absent `error`; `type` is often omitted by the server.
-#[derive(Debug, Clone, crate::ProtocolNode)]
-#[protocol(tag = "participant")]
+/// When `error == "403"` an `<add_request>` child may be present carrying the
+/// V4 invite fallback token (see `add_request`).
+#[derive(Debug, Clone)]
 pub struct ParticipantChangeResponse {
-    #[attr(name = "jid", jid)]
     pub jid: Jid,
-    #[attr(name = "type")]
     pub status: Option<String>,
-    #[attr(name = "error")]
     pub error: Option<String>,
-    #[attr(name = "phone_number", jid)]
     pub phone_number: Option<Jid>,
-    #[attr(name = "username")]
     pub username: Option<String>,
+    pub add_request: Option<AddRequestInfo>,
 }
 
 impl ParticipantChangeResponse {
     pub fn is_ok(&self) -> bool {
         self.error.is_none()
+    }
+}
+
+impl crate::protocol::ProtocolNode for ParticipantChangeResponse {
+    fn tag(&self) -> &'static str {
+        "participant"
+    }
+
+    fn into_node(self) -> ::wacore_binary::node::Node {
+        let mut builder =
+            ::wacore_binary::builder::NodeBuilder::new("participant").attr("jid", &self.jid);
+        if let Some(s) = self.status {
+            builder = builder.attr("type", s);
+        }
+        if let Some(e) = self.error {
+            builder = builder.attr("error", e);
+        }
+        if let Some(ref pn) = self.phone_number {
+            builder = builder.attr("phone_number", pn);
+        }
+        if let Some(u) = self.username {
+            builder = builder.attr("username", u);
+        }
+        if let Some(ar) = self.add_request {
+            builder = builder.children([::wacore_binary::builder::NodeBuilder::new("add_request")
+                .attr("code", ar.code)
+                .attr("expiration", ar.expiration)
+                .build()]);
+        }
+        builder.build()
+    }
+
+    fn try_from_node_ref(node: &::wacore_binary::node::NodeRef<'_>) -> ::anyhow::Result<Self> {
+        if node.tag != "participant" {
+            return Err(::anyhow::anyhow!(
+                "expected <participant>, got <{}>",
+                node.tag
+            ));
+        }
+        let mut attrs = node.attrs();
+        let jid = attrs.jid("jid");
+        let status = attrs.optional_string("type").map(|c| c.into_owned());
+        let error = attrs.optional_string("error").map(|c| c.into_owned());
+        let phone_number = attrs.optional_jid("phone_number");
+        let username = attrs.optional_string("username").map(|c| c.into_owned());
+
+        // <add_request code="..." expiration="N"/> appears on error="403"
+        // (WAWebInGroupsParticipantRequestCodeCanBeSentMixin). Only attempt
+        // to parse it when the child is actually present so non-403 entries
+        // keep returning None.
+        let add_request = node.get_optional_child("add_request").and_then(|n| {
+            let mut a = n.attrs();
+            let code = a.optional_string("code")?.into_owned();
+            let expiration = a
+                .optional_string("expiration")
+                .and_then(|s| s.parse::<u64>().ok())?;
+            Some(AddRequestInfo { code, expiration })
+        });
+
+        Ok(Self {
+            jid,
+            status,
+            error,
+            phone_number,
+            username,
+            add_request,
+        })
     }
 }
 
@@ -3160,6 +3235,37 @@ mod tests {
             Some("15555550100")
         );
         assert_eq!(result.username.as_deref(), Some("example_user"));
+    }
+
+    #[test]
+    fn test_participant_change_response_parses_add_request_on_403() {
+        // WAWebInGroupsParticipantRequestCodeCanBeSentMixin: on error="403"
+        // the server returns the V4 invite token in <add_request code=... expiration=N/>.
+        let node = NodeBuilder::new("participant")
+            .attr("jid", "5511999999999@s.whatsapp.net")
+            .attr("error", "403")
+            .children([NodeBuilder::new("add_request")
+                .attr("code", "ABC123DEF")
+                .attr("expiration", "1735689600")
+                .build()])
+            .build();
+
+        let result = ParticipantChangeResponse::try_from_node(&node).unwrap();
+        assert_eq!(result.error.as_deref(), Some("403"));
+        let ar = result
+            .add_request
+            .expect("403 response must carry the add_request token");
+        assert_eq!(ar.code, "ABC123DEF");
+        assert_eq!(ar.expiration, 1735689600);
+    }
+
+    #[test]
+    fn test_participant_change_response_no_add_request_on_success() {
+        let node = NodeBuilder::new("participant")
+            .attr("jid", "5511999999999@s.whatsapp.net")
+            .build();
+        let result = ParticipantChangeResponse::try_from_node(&node).unwrap();
+        assert!(result.add_request.is_none());
     }
 
     #[test]
