@@ -267,14 +267,12 @@ pub struct GroupCreateOptions {
     /// Only used when `is_parent` is true.
     #[builder(default)]
     pub create_general_chat: bool,
-    /// JID of an existing community parent to link this subgroup to. Emits
-    /// `<linked_parent jid="..."/>` so a subgroup can be created atomically
-    /// (matches `OutGroupsCreateRequest`).
+    /// Parent community to link this subgroup to. Atomic alternative to
+    /// creating then linking; mutually exclusive with `is_parent`.
     #[builder(default, setter(strip_option, into))]
     pub linked_parent: Option<Jid>,
-    /// Optional `<description id="<token>"><body>{text}</body></description>`
-    /// child on the create stanza. WA Web supports inline description on
-    /// create so callers can avoid a follow-up set-description IQ.
+    /// Inline description carried on the create stanza; avoids a follow-up
+    /// SetGroupDescription IQ.
     #[builder(default, setter(strip_option, into))]
     pub description: Option<String>,
 }
@@ -339,10 +337,9 @@ impl Default for GroupCreateOptions {
 }
 
 /// Normalize participants: drop phone_number for non-LID JIDs.
-/// Random 8-char hex token for a `<description id="...">` attribute. WA Web
-/// uses an opaque server-echoed id; the format only needs to be unique. Both
-/// `GroupCreateIq` (inline description) and `SetGroupDescriptionIq` (update)
-/// route through this so the seeding strategy stays centralized.
+/// Random 8-char hex token for a `<description id="...">` attribute. Shared
+/// between create-with-inline-description and SetGroupDescriptionIq so the
+/// RNG seeding stays in one place.
 fn generate_description_id() -> String {
     use rand::RngExt as _;
     format!(
@@ -430,10 +427,9 @@ pub fn build_create_group_node(options: &GroupCreateOptions) -> Node {
         );
     }
 
-    // `<parent>` ("this group IS a community") and `<linked_parent jid=...>`
-    // ("this group is a subgroup of X") are semantically exclusive — a group
-    // can't be both a community and a child of one. When both are requested,
-    // `linked_parent` wins since it carries an explicit target.
+    // `<parent>` (this group IS a community) and `<linked_parent>` (this
+    // group is a subgroup of X) are mutually exclusive. When both are
+    // requested, `linked_parent` wins; it carries an explicit target.
     if let Some(parent_jid) = &options.linked_parent {
         children.push(
             NodeBuilder::new("linked_parent")
@@ -1090,14 +1086,13 @@ impl IqSpec for GroupCreateIq {
         let group_node = required_child(response, "group")?;
         let mut info = GroupInfoResponse::try_from_node_ref(group_node)?;
 
-        // The server may omit `<parent>` / `<allow_non_admin_sub_group_creation>`
-        // from the create reply (WA Web's CreateJob never reads them either),
-        // so propagate the request flags so a freshly created community classifies
-        // correctly via `group_type()` without a follow-up metadata query.
-        // `allow_non_admin_sub_group_creation` is one-directional (request only
-        // fills when server omitted) so a server-set `true` is never clobbered
-        // by a `false` request flag.
-        if self.options.is_parent {
+        // Server may omit `<parent>` from a community-create reply; overlay
+        // request flags so `group_type()` classifies without a follow-up query.
+        // A `linked_parent` (in request or response) means this is a subgroup,
+        // so don't promote it to parent even if `is_parent` was requested.
+        let is_linked_subgroup =
+            info.parent_group_jid.is_some() || self.options.linked_parent.is_some();
+        if self.options.is_parent && !is_linked_subgroup {
             info.is_parent_group = true;
             info.allow_non_admin_sub_group_creation |=
                 self.options.allow_non_admin_sub_group_creation;
@@ -1111,22 +1106,18 @@ impl IqSpec for GroupCreateIq {
 // Group Management IQ Specs
 // ---------------------------------------------------------------------------
 
-/// V4 invite-token returned on `<participant error="403">` when the target's
-/// privacy settings block a direct add. The app can fall back to sending a
-/// `GroupInviteMessage` carrying these fields.
-///
-/// Wire shape: `<add_request code="..." expiration="N"/>`.
+/// V4 invite token returned in `<participant error="403">` when privacy
+/// blocks a direct add; lets callers fall back to a `GroupInviteMessage`.
+/// Wire: `<add_request code="..." expiration="N"/>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddRequestInfo {
     pub code: String,
     pub expiration: u64,
 }
 
-/// Response for participant change operations.
-///
-/// Success is signaled by absent `error`; `type` is often omitted by the server.
-/// When `error == "403"` an `<add_request>` child may be present carrying the
-/// V4 invite fallback token (see `add_request`).
+/// Response for participant change operations. Success: `error` is None;
+/// `type` is often omitted by the server. On `error == "403"` the
+/// `<add_request>` child (`add_request` field) carries the V4 invite token.
 #[derive(Debug, Clone)]
 pub struct ParticipantChangeResponse {
     pub jid: Jid,
@@ -1188,10 +1179,8 @@ impl crate::protocol::ProtocolNode for ParticipantChangeResponse {
         let phone_number = attrs.optional_jid("phone_number");
         let username = attrs.optional_string("username").map(|c| c.into_owned());
 
-        // <add_request code="..." expiration="N"/> appears on error="403"
-        // (WAWebInGroupsParticipantRequestCodeCanBeSentMixin). Absent → None;
-        // present but malformed → hard error, since a 403 response that drops
-        // the V4 invite token is a server bug we want to surface.
+        // Absent → None. Present but malformed → hard error so a server-side
+        // drop of the V4 invite token doesn't silently disappear.
         let add_request = node
             .get_optional_child("add_request")
             .map(|n| -> ::anyhow::Result<AddRequestInfo> {
@@ -1746,8 +1735,7 @@ impl IqSpec for SetGroupAnnouncementIq {
     }
 }
 
-/// Max value for the `<ephemeral trigger>` attribute, per
-/// `WASmaxInGroupsGroupInfoMixin` (range 0..=20).
+/// Max for `<ephemeral trigger>`, per `WASmaxInGroupsGroupInfoMixin`.
 pub const EPHEMERAL_TRIGGER_MAX: u32 = 20;
 
 /// IQ specification for setting ephemeral (disappearing) messages on a group.
@@ -1772,10 +1760,8 @@ pub struct SetGroupEphemeralIq {
     pub group_jid: Jid,
     /// Expiration in seconds. `None` means disable.
     pub expiration: Option<NonZeroU32>,
-    /// Optional `trigger` attribute on `<ephemeral>` (WA Web range
-    /// 0..=[`EPHEMERAL_TRIGGER_MAX`]). Identifies the disappearing-mode
-    /// source (e.g. per-chat setting vs device-wide default). `None` omits
-    /// the attribute.
+    /// `trigger` attr on `<ephemeral>` (0..=[`EPHEMERAL_TRIGGER_MAX`]);
+    /// identifies the disappearing-mode source. `None` omits the attr.
     pub trigger: Option<u32>,
 }
 
@@ -1789,11 +1775,10 @@ impl SetGroupEphemeralIq {
         }
     }
 
-    /// Enable ephemeral messages with both expiration and explicit `trigger`.
+    /// Enable ephemeral messages with an explicit `trigger`.
     ///
     /// # Panics
-    /// If `trigger > [EPHEMERAL_TRIGGER_MAX]` (WA Web's `attrIntRange(0,20)`
-    /// constraint). Out-of-range values would be rejected by the server.
+    /// If `trigger > EPHEMERAL_TRIGGER_MAX`.
     pub fn enable_with_trigger(group_jid: &Jid, expiration: NonZeroU32, trigger: u32) -> Self {
         assert!(
             trigger <= EPHEMERAL_TRIGGER_MAX,
@@ -3933,6 +3918,34 @@ mod tests {
             nodes[0].get_optional_child("create_general_chat").is_none(),
             "community-only children must also be omitted"
         );
+    }
+
+    #[test]
+    fn test_group_create_iq_parse_response_does_not_promote_subgroup_to_parent() {
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let options = GroupCreateOptions {
+            subject: "Subgroup".into(),
+            is_parent: true,
+            allow_non_admin_sub_group_creation: true,
+            linked_parent: Some(parent.clone()),
+            ..Default::default()
+        };
+        let spec = GroupCreateIq::new(options);
+
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363999999999999")
+                .attr("subject", "Subgroup")
+                .children([NodeBuilder::new("linked_parent")
+                    .attr("jid", &parent)
+                    .build()])
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+
+        assert!(!response.is_parent_group);
+        assert_eq!(response.parent_group_jid, Some(parent));
+        assert!(!response.allow_non_admin_sub_group_creation);
     }
 
     #[test]

@@ -132,16 +132,11 @@ pub trait MessageExt {
     /// Reads `context_info.expiration` from the first message type that has it.
     fn get_ephemeral_expiration(&self) -> Option<u32>;
 
-    /// Sets `context_info.expiration` on the first message type found.
-    /// Creates a default `context_info` if needed.
-    ///
-    /// For a bare `conversation` body, this promotes the message to
-    /// `extended_text_message { text, context_info { expiration } }` so the
-    /// timer can attach — matching `WAWebMessageSendUtils`. Returns `true`
-    /// after a successful set or promotion; `false` only when there is no
-    /// supported body to carry the timer (e.g. an empty `Message::default()`).
-    ///
-    /// See [`set_ephemeral_expiration`](Self::set_ephemeral_expiration) impl.
+    /// Sets `context_info.expiration` on the first message type found, creating
+    /// a default `context_info` if needed. A bare `conversation` body is
+    /// promoted to `extended_text_message { text, context_info { expiration } }`
+    /// (mirrors `WAWebMessageSendUtils`). Returns `true` on success or
+    /// promotion, `false` only when no body can carry the timer.
     fn set_ephemeral_expiration(&mut self, expiration: u32) -> bool;
 }
 
@@ -301,9 +296,6 @@ impl MessageExt for wa::Message {
     }
 
     fn set_context_info(&mut self, context: wa::ContextInfo) -> bool {
-        // Existing fields first (image/video/extended_text/...): the macro
-        // expands to a sequence of `if let ... { ...; return true; }` blocks
-        // so a match here exits the function before the conversation fallback.
         macro_rules! try_attach {
             ($($field:ident),+ $(,)?) => {
                 $(
@@ -316,9 +308,8 @@ impl MessageExt for wa::Message {
         }
         with_context_info_fields!(try_attach!());
 
-        // Bare conversation: promote to extended_text_message. Mirrors the
-        // ephemeral-expiration path; WA Web upgrades text-only bodies
-        // whenever a ContextInfo field needs to be populated.
+        // Promote bare conversation to extended_text_message so the context
+        // can attach; matches WAWebMessageSendUtils.
         if let Some(text) = self.conversation.take() {
             self.extended_text_message = Some(Box::new(wa::message::ExtendedTextMessage {
                 text: Some(text),
@@ -367,9 +358,8 @@ impl MessageExt for wa::Message {
         }
         with_context_info_fields!(try_set!());
 
-        // WAWebMessageSendUtils: when a bare <conversation> body needs a
-        // ContextInfo, promote it to <extended_text_message> so the timer
-        // attaches. Without this, the lib silently drops the ephemeral flag.
+        // Promote bare conversation so the timer can attach; matches
+        // WAWebMessageSendUtils.
         if let Some(text) = self.conversation.take() {
             self.extended_text_message = Some(Box::new(wa::message::ExtendedTextMessage {
                 text: Some(text),
@@ -925,12 +915,8 @@ mod tests {
         assert!(loc.context_info.is_some());
     }
 
-    /// Test: set_context_info returns false for unsupported message types
     #[test]
     fn test_set_context_info_promotes_bare_conversation() {
-        // Mirrors WAWebMessageSendUtils: a bare `conversation` body is
-        // promoted to `extended_text_message` when a ContextInfo needs to
-        // attach (e.g. quote, mention, ephemeral timer).
         let mut msg = wa::Message {
             conversation: Some("Simple text".to_string()),
             ..Default::default()
@@ -1880,20 +1866,13 @@ mod tests {
 
     #[test]
     fn set_ephemeral_expiration_promotes_bare_conversation_to_extended_text() {
-        // WAWebMessageSendUtils: bare conversation needs to be promoted so a
-        // ContextInfo (and thus the timer) can attach.
         let mut msg = wa::Message {
             conversation: Some("hello".to_string()),
             ..Default::default()
         };
         assert!(msg.set_ephemeral_expiration(86400));
-        assert!(
-            msg.conversation.is_none(),
-            "conversation must be moved out, not duplicated"
-        );
-        let ext = msg
-            .extended_text_message
-            .expect("conversation must have been promoted");
+        assert!(msg.conversation.is_none());
+        let ext = msg.extended_text_message.unwrap();
         assert_eq!(ext.text.as_deref(), Some("hello"));
         assert_eq!(
             ext.context_info.as_ref().and_then(|c| c.expiration),

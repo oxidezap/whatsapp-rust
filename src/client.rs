@@ -1843,12 +1843,10 @@ impl Client {
 
     /// Determine if a node should be acknowledged with <ack/>.
     ///
-    /// WA Web only emits `<ack class="message">` for newsletter deliveries
-    /// (`OutMessageDeliverCommonAckMixin`); regular DMs / groups send a
-    /// `<receipt>` instead. Status broadcasts also get a `<receipt
-    /// context="status">` in WA Web, but the receipt path here currently
-    /// skips them — so we keep the ack as a server-level acknowledgement
-    /// safety-net until the status-receipt path is fixed.
+    /// Newsletter messages need `<ack class="message">` (per
+    /// `OutMessageDeliverCommonAckMixin`); regular DM/group send a
+    /// `<receipt>` instead. Status broadcasts also need the ack until
+    /// `send_delivery_receipt` stops skipping them.
     fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         let tag = node.tag.as_ref();
         if node.get_attr("id").is_none() {
@@ -4123,8 +4121,8 @@ mod tests {
             "should_ack must return TRUE for newsletter <message>."
         );
 
-        // Status broadcasts: send_delivery_receipt currently skips them, so the
-        // <ack> stays in place as a server-level acknowledgement safety net.
+        // send_delivery_receipt skips status@broadcast, so the ack stays
+        // as the server-level acknowledgement until receipts cover it.
         let mut status_attrs = Attrs::new();
         status_attrs.insert("from".to_string(), "status@broadcast".to_string());
         status_attrs.insert("id".to_string(), "MSG-STATUS-1".to_string());

@@ -290,10 +290,9 @@ pub enum GroupNotificationAction {
 }
 
 impl GroupNotification {
-    /// Parse from a `NodeRef`.
-    ///
-    /// Most fields are parsed zero-copy. Only `Create`/`Link`/`Unlink` actions
-    /// call `.to_owned()` on their specific child node (structurally required to store `raw: Node`).
+    /// Parse from a `NodeRef`. Most fields are zero-copy; `Create`, `Link`,
+    /// `Unlink`, `CreatedSubGroupSuggestion` and `RevokedSubGroupSuggestions`
+    /// call `.to_owned()` to store their child as `raw: Node`.
     pub fn try_from_node_ref(node: &NodeRef<'_>) -> Option<Self> {
         let mut attrs = node.attrs();
         let group_jid = attrs.optional_jid("from")?;
@@ -328,7 +327,9 @@ impl GroupNotification {
 /// function. If the `#[wire = "..."]` attribute on a variant changes, both
 /// the serializer and this dispatcher track it automatically.
 ///
-/// Only `Create`/`Link`/`Unlink` call `.to_owned()` because those variants store `raw: Node`.
+/// `Create`, `Link`, `Unlink`, `CreatedSubGroupSuggestion` and
+/// `RevokedSubGroupSuggestions` call `.to_owned()` because those variants
+/// store `raw: Node`.
 fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
     use GroupNotificationActionTag as T;
     use wacore_binary::NodeContentRef;
@@ -993,9 +994,6 @@ mod tests {
 
     #[test]
     fn test_parse_suspended_toggle_variants() {
-        // (wire_tag, matcher) pairs. Type-safe `matches!` on the parsed
-        // enum guarantees a parser regression (e.g. landing in `Unknown`)
-        // surfaces immediately, instead of relying on `Debug` string prefix.
         type Matcher = fn(&GroupNotificationAction) -> bool;
         let table: &[(&str, Matcher)] = &[
             ("suspended", |a| {
@@ -1183,12 +1181,39 @@ mod tests {
             GroupNotificationAction::Unlink {
                 unlink_type: "x".into(),
                 unlink_reason: None,
-                raw: dummy_node,
+                raw: dummy_node.clone(),
+            },
+            GroupNotificationAction::LinkedGroupPromote {
+                participants: vec![],
+            },
+            GroupNotificationAction::LinkedGroupDemote {
+                participants: vec![],
+            },
+            GroupNotificationAction::Suspended,
+            GroupNotificationAction::Unsuspended,
+            GroupNotificationAction::AutoAddDisabled,
+            GroupNotificationAction::IsCapiHostedGroup,
+            GroupNotificationAction::GroupSafetyCheck,
+            GroupNotificationAction::LimitSharingEnabled { trigger: None },
+            GroupNotificationAction::AllowAdminReports,
+            GroupNotificationAction::NotAllowAdminReports,
+            GroupNotificationAction::Reports,
+            GroupNotificationAction::AllowNonAdminSubGroupCreation,
+            GroupNotificationAction::NotAllowNonAdminSubGroupCreation,
+            GroupNotificationAction::CreatedSubGroupSuggestion {
+                raw: dummy_node.clone(),
+            },
+            GroupNotificationAction::RevokedSubGroupSuggestions {
+                raw: dummy_node.clone(),
+            },
+            GroupNotificationAction::ChangeNumber {
+                participants: vec![],
             },
             GroupNotificationAction::Unknown {
                 tag: "future_tag".into(),
             },
         ];
+        let _ = dummy_node;
 
         for action in &samples {
             let value = serde_json::to_value(action).expect("serialize");

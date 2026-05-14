@@ -197,7 +197,7 @@ pub struct SetProfilePictureResponse {
 /// ```xml
 /// <iq xmlns="w:profile:picture" type="set" to="s.whatsapp.net" id="..."/>
 /// ```
-/// No `<picture>` child — `WAWebSendProfilePictureJob` emits an empty IQ.
+/// No `<picture>` child: `WAWebSendProfilePictureJob` emits an empty IQ.
 ///
 /// ## Response
 /// ```xml
