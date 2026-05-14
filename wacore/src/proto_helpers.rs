@@ -133,8 +133,15 @@ pub trait MessageExt {
     fn get_ephemeral_expiration(&self) -> Option<u32>;
 
     /// Sets `context_info.expiration` on the first message type found.
-    /// Creates a default `context_info` if needed. Returns `false` for
-    /// bare `conversation` messages (use `ExtendedTextMessage` instead).
+    /// Creates a default `context_info` if needed.
+    ///
+    /// For a bare `conversation` body, this promotes the message to
+    /// `extended_text_message { text, context_info { expiration } }` so the
+    /// timer can attach — matching `WAWebMessageSendUtils`. Returns `true`
+    /// after a successful set or promotion; `false` only when there is no
+    /// supported body to carry the timer (e.g. an empty `Message::default()`).
+    ///
+    /// See [`set_ephemeral_expiration`](Self::set_ephemeral_expiration) impl.
     fn set_ephemeral_expiration(&mut self, expiration: u32) -> bool;
 }
 

@@ -339,6 +339,18 @@ impl Default for GroupCreateOptions {
 }
 
 /// Normalize participants: drop phone_number for non-LID JIDs.
+/// Random 8-char hex token for a `<description id="...">` attribute. WA Web
+/// uses an opaque server-echoed id; the format only needs to be unique. Both
+/// `GroupCreateIq` (inline description) and `SetGroupDescriptionIq` (update)
+/// route through this so the seeding strategy stays centralized.
+fn generate_description_id() -> String {
+    use rand::RngExt as _;
+    format!(
+        "{:08X}",
+        rand::make_rng::<rand::rngs::StdRng>().random::<u32>()
+    )
+}
+
 pub fn normalize_participants(
     participants: &[GroupParticipantOptions],
 ) -> Vec<GroupParticipantOptions> {
@@ -418,8 +430,17 @@ pub fn build_create_group_node(options: &GroupCreateOptions) -> Node {
         );
     }
 
-    // Community (parent group) fields
-    if options.is_parent {
+    // `<parent>` ("this group IS a community") and `<linked_parent jid=...>`
+    // ("this group is a subgroup of X") are semantically exclusive — a group
+    // can't be both a community and a child of one. When both are requested,
+    // `linked_parent` wins since it carries an explicit target.
+    if let Some(parent_jid) = &options.linked_parent {
+        children.push(
+            NodeBuilder::new("linked_parent")
+                .attr("jid", parent_jid)
+                .build(),
+        );
+    } else if options.is_parent {
         let mut parent_builder = NodeBuilder::new("parent");
         if options.closed {
             parent_builder =
@@ -435,26 +456,11 @@ pub fn build_create_group_node(options: &GroupCreateOptions) -> Node {
         }
     }
 
-    // Link this subgroup to an existing community parent atomically.
-    if let Some(parent_jid) = &options.linked_parent {
-        children.push(
-            NodeBuilder::new("linked_parent")
-                .attr("jid", parent_jid)
-                .build(),
-        );
-    }
-
     // Inline description: WA Web emits `<description id="<token>"><body>{text}</body></description>`.
-    // Matches SetGroupDescriptionIq's 8-char hex id format for consistency.
     if let Some(desc) = &options.description {
-        use rand::RngExt as _;
-        let id = format!(
-            "{:08X}",
-            rand::make_rng::<rand::rngs::StdRng>().random::<u32>()
-        );
         children.push(
             NodeBuilder::new("description")
-                .attr("id", id)
+                .attr("id", generate_description_id())
                 .children([NodeBuilder::new("body").string_content(desc).build()])
                 .build(),
         );
@@ -1174,24 +1180,40 @@ impl crate::protocol::ProtocolNode for ParticipantChangeResponse {
             ));
         }
         let mut attrs = node.attrs();
-        let jid = attrs.jid("jid");
+        let jid = attrs
+            .optional_jid("jid")
+            .ok_or_else(|| ::anyhow::anyhow!("participant missing required 'jid' attribute"))?;
         let status = attrs.optional_string("type").map(|c| c.into_owned());
         let error = attrs.optional_string("error").map(|c| c.into_owned());
         let phone_number = attrs.optional_jid("phone_number");
         let username = attrs.optional_string("username").map(|c| c.into_owned());
 
         // <add_request code="..." expiration="N"/> appears on error="403"
-        // (WAWebInGroupsParticipantRequestCodeCanBeSentMixin). Only attempt
-        // to parse it when the child is actually present so non-403 entries
-        // keep returning None.
-        let add_request = node.get_optional_child("add_request").and_then(|n| {
-            let mut a = n.attrs();
-            let code = a.optional_string("code")?.into_owned();
-            let expiration = a
-                .optional_string("expiration")
-                .and_then(|s| s.parse::<u64>().ok())?;
-            Some(AddRequestInfo { code, expiration })
-        });
+        // (WAWebInGroupsParticipantRequestCodeCanBeSentMixin). Absent → None;
+        // present but malformed → hard error, since a 403 response that drops
+        // the V4 invite token is a server bug we want to surface.
+        let add_request = node
+            .get_optional_child("add_request")
+            .map(|n| -> ::anyhow::Result<AddRequestInfo> {
+                let mut a = n.attrs();
+                let code = a
+                    .optional_string("code")
+                    .ok_or_else(|| {
+                        ::anyhow::anyhow!("<add_request> missing required 'code' attribute")
+                    })?
+                    .into_owned();
+                let expiration = a
+                    .optional_string("expiration")
+                    .ok_or_else(|| {
+                        ::anyhow::anyhow!("<add_request> missing required 'expiration' attribute")
+                    })?
+                    .parse::<u64>()
+                    .map_err(|e| {
+                        ::anyhow::anyhow!("<add_request> 'expiration' is not a u64: {e}")
+                    })?;
+                Ok(AddRequestInfo { code, expiration })
+            })
+            .transpose()?;
 
         Ok(Self {
             jid,
@@ -1275,11 +1297,7 @@ impl SetGroupDescriptionIq {
         description: Option<GroupDescription>,
         prev: Option<String>,
     ) -> Self {
-        use rand::RngExt;
-        let id = format!(
-            "{:08X}",
-            rand::make_rng::<rand::rngs::StdRng>().random::<u32>()
-        );
+        let id = generate_description_id();
         Self {
             group_jid: group_jid.clone(),
             description,
@@ -1728,6 +1746,10 @@ impl IqSpec for SetGroupAnnouncementIq {
     }
 }
 
+/// Max value for the `<ephemeral trigger>` attribute, per
+/// `WASmaxInGroupsGroupInfoMixin` (range 0..=20).
+pub const EPHEMERAL_TRIGGER_MAX: u32 = 20;
+
 /// IQ specification for setting ephemeral (disappearing) messages on a group.
 ///
 /// Wire format:
@@ -1740,6 +1762,7 @@ impl IqSpec for SetGroupAnnouncementIq {
 /// ```
 ///
 /// Common expiration values (seconds):
+///
 /// - 86400 (24 hours)
 /// - 604800 (7 days)
 /// - 7776000 (90 days)
@@ -1749,9 +1772,10 @@ pub struct SetGroupEphemeralIq {
     pub group_jid: Jid,
     /// Expiration in seconds. `None` means disable.
     pub expiration: Option<NonZeroU32>,
-    /// Optional `trigger` attribute on `<ephemeral>` (WA Web range 0..20).
-    /// Identifies the disappearing-mode source (e.g. per-chat setting vs
-    /// device-wide default). `None` omits the attribute.
+    /// Optional `trigger` attribute on `<ephemeral>` (WA Web range
+    /// 0..=[`EPHEMERAL_TRIGGER_MAX`]). Identifies the disappearing-mode
+    /// source (e.g. per-chat setting vs device-wide default). `None` omits
+    /// the attribute.
     pub trigger: Option<u32>,
 }
 
@@ -1766,7 +1790,15 @@ impl SetGroupEphemeralIq {
     }
 
     /// Enable ephemeral messages with both expiration and explicit `trigger`.
+    ///
+    /// # Panics
+    /// If `trigger > [EPHEMERAL_TRIGGER_MAX]` (WA Web's `attrIntRange(0,20)`
+    /// constraint). Out-of-range values would be rejected by the server.
     pub fn enable_with_trigger(group_jid: &Jid, expiration: NonZeroU32, trigger: u32) -> Self {
+        assert!(
+            trigger <= EPHEMERAL_TRIGGER_MAX,
+            "ephemeral trigger must be in 0..={EPHEMERAL_TRIGGER_MAX}, got {trigger}"
+        );
         Self {
             group_jid: group_jid.clone(),
             expiration: Some(expiration),
@@ -1792,6 +1824,10 @@ impl IqSpec for SetGroupEphemeralIq {
             Some(exp) => {
                 let mut b = NodeBuilder::new("ephemeral").attr("expiration", exp.get());
                 if let Some(trigger) = self.trigger {
+                    debug_assert!(
+                        trigger <= EPHEMERAL_TRIGGER_MAX,
+                        "ephemeral trigger out of range (0..={EPHEMERAL_TRIGGER_MAX}): {trigger}"
+                    );
                     b = b.attr("trigger", trigger);
                 }
                 b.build()
@@ -3306,6 +3342,42 @@ mod tests {
     }
 
     #[test]
+    fn test_participant_change_response_rejects_missing_jid() {
+        let node = NodeBuilder::new("participant").attr("error", "403").build();
+        let err = ParticipantChangeResponse::try_from_node(&node)
+            .expect_err("missing jid must be a hard error");
+        assert!(err.to_string().contains("missing required 'jid' attribute"));
+    }
+
+    #[test]
+    fn test_participant_change_response_rejects_malformed_add_request() {
+        // <add_request> present but no code → hard error.
+        let node = NodeBuilder::new("participant")
+            .attr("jid", "5511999999999@s.whatsapp.net")
+            .attr("error", "403")
+            .children([NodeBuilder::new("add_request")
+                .attr("expiration", "1735689600")
+                .build()])
+            .build();
+        let err = ParticipantChangeResponse::try_from_node(&node)
+            .expect_err("missing add_request code must be a hard error");
+        assert!(err.to_string().contains("missing required 'code'"));
+
+        // <add_request> with non-numeric expiration → hard error.
+        let node = NodeBuilder::new("participant")
+            .attr("jid", "5511999999999@s.whatsapp.net")
+            .attr("error", "403")
+            .children([NodeBuilder::new("add_request")
+                .attr("code", "ABC")
+                .attr("expiration", "not-a-number")
+                .build()])
+            .build();
+        let err = ParticipantChangeResponse::try_from_node(&node)
+            .expect_err("non-u64 expiration must be a hard error");
+        assert!(err.to_string().contains("'expiration' is not a u64"));
+    }
+
+    #[test]
     fn test_set_group_locked_iq() {
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
 
@@ -3389,6 +3461,28 @@ mod tests {
             Some("604800")
         );
         assert_eq!(attrs.optional_string("trigger").as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn test_set_group_ephemeral_iq_accepts_trigger_at_max() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        // Boundary: trigger == EPHEMERAL_TRIGGER_MAX must succeed.
+        let _iq = SetGroupEphemeralIq::enable_with_trigger(
+            &group,
+            NonZeroU32::new(86400).unwrap(),
+            EPHEMERAL_TRIGGER_MAX,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ephemeral trigger must be in 0..=20")]
+    fn test_set_group_ephemeral_iq_rejects_trigger_above_max() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let _ = SetGroupEphemeralIq::enable_with_trigger(
+            &group,
+            NonZeroU32::new(86400).unwrap(),
+            EPHEMERAL_TRIGGER_MAX + 1,
+        );
     }
 
     #[test]
@@ -3801,6 +3895,43 @@ mod tests {
             linked.attrs().jid("jid"),
             parent,
             "linked_parent jid must match the requested parent"
+        );
+    }
+
+    #[test]
+    fn test_group_create_iq_linked_parent_excludes_parent_block() {
+        // `<parent>` ("I am a community") and `<linked_parent>` ("I am a
+        // subgroup of X") are semantically exclusive. When both are set,
+        // linked_parent must win and <parent>/<allow_non_admin_sub_group_creation>
+        // /<create_general_chat> must be omitted.
+        let parent: Jid = "120363000000000001@g.us".parse().unwrap();
+        let options = GroupCreateOptions {
+            subject: "Conflicting".into(),
+            is_parent: true,
+            closed: true,
+            allow_non_admin_sub_group_creation: true,
+            create_general_chat: true,
+            linked_parent: Some(parent.clone()),
+            ..Default::default()
+        };
+        let iq = GroupCreateIq::new(options).build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected <create>");
+        };
+        assert!(nodes[0].get_optional_child("linked_parent").is_some());
+        assert!(
+            nodes[0].get_optional_child("parent").is_none(),
+            "<parent> must be omitted when linked_parent is set"
+        );
+        assert!(
+            nodes[0]
+                .get_optional_child("allow_non_admin_sub_group_creation")
+                .is_none(),
+            "community-only children must also be omitted"
+        );
+        assert!(
+            nodes[0].get_optional_child("create_general_chat").is_none(),
+            "community-only children must also be omitted"
         );
     }
 

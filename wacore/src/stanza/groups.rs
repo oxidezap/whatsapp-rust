@@ -404,8 +404,15 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
         // below produce `Ephemeral { expiration: 0, trigger: None }`, matching
         // WA Web's collapse of the two wire tags into one action.
         T::Ephemeral => GroupNotificationAction::Ephemeral {
-            expiration: node.attrs().optional_u64("expiration").unwrap_or(0) as u32,
-            trigger: node.attrs().optional_u64("trigger").map(|t| t as u32),
+            expiration: node
+                .attrs()
+                .optional_u64("expiration")
+                .and_then(|t| t.try_into().ok())
+                .unwrap_or(0),
+            trigger: node
+                .attrs()
+                .optional_u64("trigger")
+                .and_then(|t| t.try_into().ok()),
         },
         T::MembershipApprovalMode => {
             let enabled = node
@@ -456,7 +463,11 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
         },
         T::RevokeInvite => GroupNotificationAction::RevokeInvite,
         T::GrowthLocked => GroupNotificationAction::GrowthLocked {
-            expiration: node.attrs().optional_u64("expiration").unwrap_or(0) as u32,
+            expiration: node
+                .attrs()
+                .optional_u64("expiration")
+                .and_then(|t| t.try_into().ok())
+                .unwrap_or(0),
             lock_type: node
                 .attrs()
                 .optional_string("type")
@@ -508,7 +519,11 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
         T::IsCapiHostedGroup => GroupNotificationAction::IsCapiHostedGroup,
         T::GroupSafetyCheck => GroupNotificationAction::GroupSafetyCheck,
         T::LimitSharingEnabled => GroupNotificationAction::LimitSharingEnabled {
-            trigger: node.attrs().optional_u64("trigger").map(|t| t as u32),
+            // try_into so >u32::MAX yields None instead of silently truncating.
+            trigger: node
+                .attrs()
+                .optional_u64("trigger")
+                .and_then(|t| t.try_into().ok()),
         },
         T::AllowAdminReports => GroupNotificationAction::AllowAdminReports,
         T::NotAllowAdminReports => GroupNotificationAction::NotAllowAdminReports,
@@ -978,32 +993,50 @@ mod tests {
 
     #[test]
     fn test_parse_suspended_toggle_variants() {
-        let table = [
-            ("suspended", "Suspended"),
-            ("unsuspended", "Unsuspended"),
-            ("auto_add_disabled", "AutoAddDisabled"),
-            ("is_capi_hosted_group", "IsCapiHostedGroup"),
-            ("group_safety_check", "GroupSafetyCheck"),
-            ("limit_sharing_enabled", "LimitSharingEnabled"),
-            ("allow_admin_reports", "AllowAdminReports"),
-            ("not_allow_admin_reports", "NotAllowAdminReports"),
-            ("reports", "Reports"),
-            (
-                "allow_non_admin_sub_group_creation",
-                "AllowNonAdminSubGroupCreation",
-            ),
-            (
-                "not_allow_non_admin_sub_group_creation",
-                "NotAllowNonAdminSubGroupCreation",
-            ),
+        // (wire_tag, matcher) pairs. Type-safe `matches!` on the parsed
+        // enum guarantees a parser regression (e.g. landing in `Unknown`)
+        // surfaces immediately, instead of relying on `Debug` string prefix.
+        type Matcher = fn(&GroupNotificationAction) -> bool;
+        let table: &[(&str, Matcher)] = &[
+            ("suspended", |a| {
+                matches!(a, GroupNotificationAction::Suspended)
+            }),
+            ("unsuspended", |a| {
+                matches!(a, GroupNotificationAction::Unsuspended)
+            }),
+            ("auto_add_disabled", |a| {
+                matches!(a, GroupNotificationAction::AutoAddDisabled)
+            }),
+            ("is_capi_hosted_group", |a| {
+                matches!(a, GroupNotificationAction::IsCapiHostedGroup)
+            }),
+            ("group_safety_check", |a| {
+                matches!(a, GroupNotificationAction::GroupSafetyCheck)
+            }),
+            ("limit_sharing_enabled", |a| {
+                matches!(a, GroupNotificationAction::LimitSharingEnabled { .. })
+            }),
+            ("allow_admin_reports", |a| {
+                matches!(a, GroupNotificationAction::AllowAdminReports)
+            }),
+            ("not_allow_admin_reports", |a| {
+                matches!(a, GroupNotificationAction::NotAllowAdminReports)
+            }),
+            ("reports", |a| matches!(a, GroupNotificationAction::Reports)),
+            ("allow_non_admin_sub_group_creation", |a| {
+                matches!(a, GroupNotificationAction::AllowNonAdminSubGroupCreation)
+            }),
+            ("not_allow_non_admin_sub_group_creation", |a| {
+                matches!(a, GroupNotificationAction::NotAllowNonAdminSubGroupCreation)
+            }),
         ];
-        for (tag, expected) in table {
+        for (tag, matcher) in table {
             let node = make_notification(vec![NodeBuilder::new(tag).build()]);
             let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
-            let action_name = format!("{:?}", notif.actions[0]);
             assert!(
-                action_name.starts_with(expected),
-                "wire tag {tag} must parse to {expected}, got {action_name}"
+                matcher(&notif.actions[0]),
+                "wire tag {tag} parsed to unexpected variant: {:?}",
+                notif.actions[0]
             );
         }
     }

@@ -195,10 +195,9 @@ pub struct SetProfilePictureResponse {
 ///
 /// ## Wire Format (Remove)
 /// ```xml
-/// <iq xmlns="w:profile:picture" type="set" to="s.whatsapp.net" id="...">
-///   <picture type="image"/>
-/// </iq>
+/// <iq xmlns="w:profile:picture" type="set" to="s.whatsapp.net" id="..."/>
 /// ```
+/// No `<picture>` child — `WAWebSendProfilePictureJob` emits an empty IQ.
 ///
 /// ## Response
 /// ```xml
