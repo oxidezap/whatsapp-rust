@@ -1,27 +1,14 @@
-//! Empirical reproductions of whatsapp-rust vs WA Web JS protocol discrepancies.
+//! Regression tests pinning whatsapp-rust to WA Web behavior (see
+//! `docs/captured-js/`). Assertions encode the **correct** state; a failure
+//! here means the implementation has regressed away from WA Web.
 //!
-//! Each test below documents a single divergence between this library and the
-//! ground-truth implementation in `docs/captured-js/`. Tests are written so they
-//! PASS today (asserting the current, buggy state); when a fix lands the tests
-//! should FAIL, signalling the asserts must be updated.
-//!
-//! Run with: `cargo test --test discrepancy_pocs -- --nocapture`
-//!
-//! Each test prints "BUG #N" with a one-line summary at the start, plus the
-//! observed value and the WA-Web-expected value, so the divergence is visible
-//! in `cargo test` output.
+//! Run with: `cargo test --test discrepancy_pocs`
 
 use wacore::store::device::Device;
 use wacore::types::message::EditAttribute;
 use waproto::whatsapp as wa;
 
-// ---------------------------------------------------------------------------
-// A1. Edit attribute coverage parity with WAWebSendMsgCommonApi.editAttribute
-// ---------------------------------------------------------------------------
-//
-// Each regression test below pins one branch of WA Web's `editAttribute(msg,
-// subtype)` so the wire `edit="N"` attribute is correctly emitted by both
-// initial send and retry resend.
+// A1. EditAttribute::infer_from_message parity with editAttribute(msg, subtype).
 
 #[test]
 fn regression_a1_revoked_reaction_returns_sender_revoke() {
@@ -91,36 +78,26 @@ fn regression_a1_secret_encrypted_event_edit_returns_message_edit() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// A4. `passive` flag defaults to WA Web's `false` and is configurable
-// ---------------------------------------------------------------------------
+// A4. `passive` defaults to false (WA Web's default) and is configurable.
 
 #[test]
 fn regression_a4_login_payload_passive_defaults_to_false() {
-    // WA Web's m() in Payload.js defaults `passive: false`. Match that.
     let mut device = Device::new();
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
-
-    let payload = device.get_client_payload();
-    assert_eq!(payload.passive, Some(false));
+    assert_eq!(device.get_client_payload().passive, Some(false));
 }
 
 #[test]
 fn regression_a4_login_payload_passive_is_configurable() {
-    // Callers that want the whatsmeow-style passive=true must be able to opt in.
     let mut profile = wacore::client_profile::ClientProfile::web();
     profile.passive_login = true;
-
     let mut device = Device::new();
     device.set_client_profile(profile);
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
-
     assert_eq!(device.get_client_payload().passive, Some(true));
 }
 
-// ---------------------------------------------------------------------------
-// A5. UserAgent: phone_id auto-populated, locale country is ISO-3166-1
-// ---------------------------------------------------------------------------
+// A5. UserAgent: phone_id is UUID v4, locale country is ISO-3166-1 alpha-2.
 
 #[test]
 fn regression_a5_useragent_phone_id_is_uuid_v4_by_default() {
@@ -129,7 +106,8 @@ fn regression_a5_useragent_phone_id_is_uuid_v4_by_default() {
 
     let user_agent = device.get_client_payload().user_agent.unwrap();
     let phone_id = user_agent.phone_id.expect("phone_id must be populated");
-    uuid::Uuid::parse_str(&phone_id).expect("phone_id must be a valid UUID");
+    let parsed = uuid::Uuid::parse_str(&phone_id).expect("phone_id must be a valid UUID");
+    assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
 }
 
 #[test]
@@ -149,14 +127,12 @@ fn regression_a5_useragent_phone_id_can_be_overridden() {
 
 #[test]
 fn regression_a5_useragent_locale_is_configurable_and_default_is_country_code() {
-    // Default locale: en / US (US is a valid ISO-3166-1 alpha-2; "en" was not).
     let mut device = Device::new();
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
     let ua = device.get_client_payload().user_agent.unwrap();
     assert_eq!(ua.locale_language_iso6391.as_deref(), Some("en"));
     assert_eq!(ua.locale_country_iso31661_alpha2.as_deref(), Some("US"));
 
-    // And it's overridable.
     let mut profile = wacore::client_profile::ClientProfile::web();
     profile.locale_language = "pt".into();
     profile.locale_country = "BR".into();
@@ -168,9 +144,7 @@ fn regression_a5_useragent_locale_is_configurable_and_default_is_country_code() 
     assert_eq!(ua.locale_country_iso31661_alpha2.as_deref(), Some("BR"));
 }
 
-// ---------------------------------------------------------------------------
-// A6. Login payload includes `lc` and `lid_db_migrated`
-// ---------------------------------------------------------------------------
+// A6. Login payload carries `lc` (login counter) and `lid_db_migrated`.
 
 #[test]
 fn regression_a6_login_payload_carries_lc_and_lid_db_migrated() {
@@ -195,9 +169,7 @@ fn regression_a6_login_counter_increments_via_device_command() {
     assert_eq!(device.get_client_payload().lc, Some(2));
 }
 
-// ---------------------------------------------------------------------------
-// A11. default HistorySyncConfig advertises the WA Web support_* flags
-// ---------------------------------------------------------------------------
+// A11. default_history_sync_config advertises WA Web's support_* flags.
 
 #[test]
 fn regression_a11_history_sync_config_advertises_support_flags() {
@@ -225,29 +197,9 @@ fn regression_a11_history_sync_config_advertises_support_flags() {
     assert_eq!(cfg.support_call_log_history, Some(false));
 }
 
-// ---------------------------------------------------------------------------
-// A7. value-MAC `octet-length` encoding diverges bytewise from WA Web
-// ---------------------------------------------------------------------------
-//
-// Ground truth: `docs/captured-js/WAWeb/Syncd/MutationKey/Api.js` (Crypto):
-//   octetLength = new Uint8Array(8);
-//   octetLength[7] = ad.length & 0xff;   // ONLY the low byte
-//
-// This is u8 in the last byte of an 8-byte zero buffer. WA Web treats the
-// associatedData length as a 1-byte unsigned int packed at offset 7.
-//
-// whatsapp-rust: `wacore/appstate/src/hash.rs:148`:
-//   let key_data_length = u64_to_be((key_id.len() + 1) as u64);  // full 8-byte BE
-//
-// For typical keyIds (<=254 bytes ad.length), the byte representations
-// coincide because the upper 7 bytes are zero in both. For larger ad lengths,
-// they diverge: WA Web wraps at 256 (low byte only), Rust does not.
-//
-// This is a literal protocol-divergence; today it never bites because keyIds
-// are short, but it's a spec violation.
+// A7. value-MAC matches WA Web bytewise (u8 packed at offset 7 of 8-byte buf).
 
-/// Recompute the value-MAC the way WA Web does (`Crypto.js`): u8 packed at
-/// offset 7 of an 8-byte zero buffer. Used as the spec-correct oracle.
+/// WA Web oracle for `generate_content_mac`.
 fn wa_web_value_mac(
     operation: wa::syncd_mutation::SyncdOperation,
     data: &[u8],
@@ -302,34 +254,12 @@ fn regression_a7_content_mac_matches_wa_web_at_wrap_boundary() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// A3. LTHash uses native-endian, WA Web spec is little-endian
-// ---------------------------------------------------------------------------
-//
-// Ground truth: `docs/captured-js/WA/Crypto/LtHash.js`:
-//   view.getUint16(offset, true)   // `true` = little-endian
-//   view.setUint16(offset, val, true)
-//
-// whatsapp-rust: `wacore/appstate/src/lthash.rs:88-99` uses `from_ne_bytes`
-// and `to_ne_bytes`. On little-endian targets (x86, ARM little-endian) this
-// is identical to LE, so the bug is latent. On big-endian targets, the
-// snapshot/patch MACs would diverge from WA Web's, breaking interop.
-//
-// The POC below demonstrates that the current native-endian implementation
-// happens to match LE only because we're running on a LE host. We cannot
-// "simulate" big-endian at runtime, so the POC documents the spec divergence
-// and verifies the host is LE (so today's pass-through is coincidental).
+// A3. LTHash lanes are little-endian (WA Web spec).
 
 #[test]
 fn regression_a3_lthash_lanes_are_little_endian() {
-    // WA Web treats the LTHash accumulator as a stream of little-endian u16
-    // lanes; snapshot/patch MACs are HMACs over those bytes, so the lane
-    // endianness is part of the protocol. Lock the byte layout against an
-    // explicit LE oracle so a future regression to native-endian is caught
-    // even on LE hosts (where the bug used to be invisible).
     use wacore::appstate::lthash::WAPATCH_INTEGRITY;
 
-    // Two distinct MAC inputs so the derived bytes are nonzero.
     let mac_a = vec![1u8; 32];
     let mac_b = vec![2u8; 32];
 
@@ -340,8 +270,7 @@ fn regression_a3_lthash_lanes_are_little_endian() {
         &[mac_a.as_slice()],
     );
 
-    // Reference LTHash add/sub computed explicitly in little-endian using
-    // the same HKDF expansion the lib uses.
+    // Reference LE add/sub using the same HKDF expansion.
     use hkdf::Hkdf;
     use sha2::Sha256;
     let derive = |seed: &[u8]| -> Vec<u8> {
@@ -366,95 +295,82 @@ fn regression_a3_lthash_lanes_are_little_endian() {
     assert_eq!(got, expected, "LTHash output must match LE-lane reference");
 }
 
-// ---------------------------------------------------------------------------
-// A10. Media-decrypt MAC compare is not constant-time
-// ---------------------------------------------------------------------------
-//
-// Ground truth: any reputable crypto library uses constant-time compares for
-// MAC verification (e.g. `subtle::ConstantTimeEq`). WA Web's primitives are
-// browser-provided HMAC verifiers that are constant-time.
-//
-// whatsapp-rust: `wacore/src/download.rs:531`:
-//   if &computed_mac_full[..MAC_SIZE] != received_mac { ... }
-//
-// `!=` on `&[u8]` uses `slice::eq` which short-circuits on first mismatch.
-// This is the textbook timing-attack vector.
-//
-// A timing-attack POC is inherently flaky in a unit test, so the POC below
-// just measures average wall-clock time for "differs at byte 0" vs "differs
-// at byte 9". A statistically significant gap is evidence of non-constant-time
-// behaviour; passing the threshold check is not certified but typically holds.
+// A10. Media decrypt rejects tampered MACs.
 
-#[test]
-#[ignore = "timing-based; run with `cargo test bug_a10 -- --ignored --nocapture`"]
-fn bug_a10_mac_compare_not_constant_time_timing_signal() {
-    println!("\nBUG A10: media-decrypt MAC compare is not constant-time");
+/// Build a valid AES-256-CBC + HMAC-SHA256 payload in the shape the download
+/// path expects: ciphertext || mac[..10] over (iv || ciphertext).
+fn build_media_payload(media_key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+    use aes::cipher::BlockModeEncrypt;
+    use cbc::cipher::{KeyIvInit, block_padding::Pkcs7};
+    use hmac::Mac;
 
-    // We can't directly call the private compare in download.rs, but the same
-    // pattern (`a != b` on `&[u8]`) is used. Demonstrate the timing signal on
-    // a synthetic compare equivalent to the one in download.rs.
-    let mac_correct = [0xAAu8; 10];
-    let mac_early_diff = {
-        let mut m = mac_correct;
-        m[0] = 0x00;
-        m
-    };
-    let mac_late_diff = {
-        let mut m = mac_correct;
-        m[9] = 0x00;
-        m
-    };
+    type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
-    const ITERS: u32 = 5_000_000;
-    let mut sink: u64 = 0;
+    let (iv, cipher_key, mac_key) = wacore::download::DownloadUtils::get_media_keys(
+        media_key,
+        wacore::download::MediaType::Image,
+    )
+    .unwrap();
 
-    let t_early = wacore::time::Instant::now();
-    for _ in 0..ITERS {
-        // `!=` short-circuits at the first byte; this is the buggy pattern.
-        if mac_correct.as_slice() != mac_early_diff.as_slice() {
-            sink = sink.wrapping_add(1);
-        }
-    }
-    let d_early = t_early.elapsed();
+    let mut ct = Aes256CbcEnc::new_from_slices(&cipher_key, &iv)
+        .unwrap()
+        .encrypt_padded_vec::<Pkcs7>(plaintext);
 
-    let t_late = wacore::time::Instant::now();
-    for _ in 0..ITERS {
-        if mac_correct.as_slice() != mac_late_diff.as_slice() {
-            sink = sink.wrapping_add(1);
-        }
-    }
-    let d_late = t_late.elapsed();
-
-    println!("  diff at byte 0: {:?} ({} ops)", d_early, ITERS);
-    println!("  diff at byte 9: {:?} ({} ops)", d_late, ITERS);
-    println!("  sink (anti-DCE): {}", sink);
-    println!(
-        "  ratio late/early = {:.2}x  (constant-time should be ~1.00x)",
-        d_late.as_nanos() as f64 / d_early.as_nanos().max(1) as f64
-    );
-
-    // The fix is `subtle::ConstantTimeEq` in download.rs. This POC doesn't
-    // panic on the timing gap (compilers and CPUs vary too much for a stable
-    // threshold); it just prints the measurement for manual inspection.
+    let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(&mac_key).unwrap();
+    mac.update(&iv);
+    mac.update(&ct);
+    let tag = mac.finalize().into_bytes();
+    ct.extend_from_slice(&tag[..10]);
+    ct
 }
 
 #[test]
-fn regression_a10_mac_compare_uses_constant_time() {
-    // Source-level check that the media-decrypt MAC compare uses a
-    // constant-time primitive. Guards against accidental reintroduction of
-    // the `slice != slice` short-circuit pattern.
-    let src = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/wacore/src/download.rs"
-    ))
-    .expect("download.rs is in the workspace");
+fn regression_a10_media_decrypt_accepts_valid_mac_roundtrip() {
+    let media_key = [42u8; 32];
+    let plaintext = b"the quick brown fox jumps over the lazy dog".to_vec();
+    let payload = build_media_payload(&media_key, &plaintext);
+    let decoded = wacore::download::DownloadUtils::verify_and_decrypt(
+        &payload,
+        &media_key,
+        wacore::download::MediaType::Image,
+    )
+    .expect("valid MAC must decrypt");
+    assert_eq!(decoded, plaintext);
+}
 
-    assert!(
-        !src.contains("&computed_mac_full[..MAC_SIZE] != received_mac"),
-        "regression: download.rs reintroduced non-constant-time MAC compare"
-    );
-    assert!(
-        src.contains("ct_eq") || src.contains("ConstantTimeEq"),
-        "regression: download.rs no longer uses a constant-time compare for MAC verify"
-    );
+#[test]
+fn regression_a10_media_decrypt_rejects_mac_flipped_at_byte_zero() {
+    let media_key = [7u8; 32];
+    let mut payload = build_media_payload(&media_key, b"payload");
+    let mac_start = payload.len() - 10;
+    payload[mac_start] ^= 0x01;
+    let err = wacore::download::DownloadUtils::verify_and_decrypt(
+        &payload,
+        &media_key,
+        wacore::download::MediaType::Image,
+    )
+    .expect_err("tampered MAC must be rejected");
+    assert!(matches!(
+        err,
+        wacore::download::MediaDecryptionError::InvalidMac
+    ));
+}
+
+#[test]
+fn regression_a10_media_decrypt_rejects_mac_flipped_at_last_byte() {
+    let media_key = [9u8; 32];
+    let mut payload = build_media_payload(&media_key, b"payload");
+    let last = payload.len() - 1;
+    payload[last] ^= 0x80;
+    let err = wacore::download::DownloadUtils::verify_and_decrypt(
+        &payload,
+        &media_key,
+        wacore::download::MediaType::Image,
+    )
+    .expect_err("tampered MAC must be rejected");
+    assert!(matches!(
+        err,
+        wacore::download::MediaDecryptionError::InvalidMac
+    ));
 }

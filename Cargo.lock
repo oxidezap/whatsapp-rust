@@ -2385,12 +2385,14 @@ dependencies = [
 name = "whatsapp-rust"
 version = "0.6.0"
 dependencies = [
+ "aes",
  "anyhow",
  "async-channel",
  "async-lock",
  "async-trait",
  "base64",
  "bytes",
+ "cbc",
  "chrono",
  "env_logger",
  "event-listener",
