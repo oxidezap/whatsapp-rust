@@ -25,6 +25,8 @@ pub enum DeviceCommand {
     /// crypto-fatal error, signalling that the cached `leaf.key` is stale).
     /// Forces XX on the next connect.
     ClearServerCertChain,
+    /// Bump the persisted `lc` (login counter) ahead of a login payload.
+    IncrementLoginCounter,
 }
 
 pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
@@ -76,6 +78,9 @@ pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
         }
         DeviceCommand::ClearServerCertChain => {
             device.server_cert_chain = None;
+        }
+        DeviceCommand::IncrementLoginCounter => {
+            device.login_counter = device.login_counter.saturating_add(1);
         }
     }
 }
@@ -187,6 +192,20 @@ mod tests {
 
         assert_eq!(device.nct_salt, Some(syncd_salt));
         assert!(device.nct_salt_sync_seen);
+    }
+
+    #[test]
+    fn increment_login_counter_bumps_and_saturates() {
+        let mut device = Device::new();
+        assert_eq!(device.login_counter, 0);
+
+        apply_command_to_device(&mut device, DeviceCommand::IncrementLoginCounter);
+        apply_command_to_device(&mut device, DeviceCommand::IncrementLoginCounter);
+        assert_eq!(device.login_counter, 2);
+
+        device.login_counter = i32::MAX;
+        apply_command_to_device(&mut device, DeviceCommand::IncrementLoginCounter);
+        assert_eq!(device.login_counter, i32::MAX);
     }
 
     #[test]

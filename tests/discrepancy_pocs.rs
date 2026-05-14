@@ -183,13 +183,15 @@ fn regression_a6_login_payload_carries_lc_and_lid_db_migrated() {
 }
 
 #[test]
-fn regression_a6_login_counter_increments() {
+fn regression_a6_login_counter_increments_via_device_command() {
+    use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+
     let mut device = Device::new();
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
     assert_eq!(device.get_client_payload().lc, Some(0));
 
-    device.increment_login_counter();
-    device.increment_login_counter();
+    apply_command_to_device(&mut device, DeviceCommand::IncrementLoginCounter);
+    apply_command_to_device(&mut device, DeviceCommand::IncrementLoginCounter);
     assert_eq!(device.get_client_payload().lc, Some(2));
 }
 

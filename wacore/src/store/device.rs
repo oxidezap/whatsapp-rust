@@ -438,12 +438,6 @@ impl Device {
         payload
     }
 
-    /// Bump the persisted `lc` counter ahead of an outgoing login payload.
-    /// Mirrors WA Web's `WAWebUserPrefsGeneral.getLoginCounter()` increment.
-    pub fn increment_login_counter(&mut self) {
-        self.login_counter = self.login_counter.saturating_add(1);
-    }
-
     fn get_registration_payload(&self) -> wa::ClientPayload {
         let app_version = wa::client_payload::user_agent::AppVersion {
             primary: Some(self.app_version_primary),
