@@ -1844,9 +1844,11 @@ impl Client {
     /// Determine if a node should be acknowledged with <ack/>.
     ///
     /// WA Web only emits `<ack class="message">` for newsletter deliveries
-    /// (`OutMessageDeliverCommonAckMixin`). Regular DMs / groups / status
-    /// rely on the `<receipt>` (delivery / read / played) for ack semantics
-    /// — sending both would be redundant.
+    /// (`OutMessageDeliverCommonAckMixin`); regular DMs / groups send a
+    /// `<receipt>` instead. Status broadcasts also get a `<receipt
+    /// context="status">` in WA Web, but the receipt path here currently
+    /// skips them — so we keep the ack as a server-level acknowledgement
+    /// safety-net until the status-receipt path is fixed.
     fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         let tag = node.tag.as_ref();
         if node.get_attr("id").is_none() {
@@ -1857,7 +1859,9 @@ impl Client {
         };
         match tag {
             "receipt" | "notification" | "call" => true,
-            "message" => from.to_jid().is_some_and(|j| j.is_newsletter()),
+            "message" => from
+                .to_jid()
+                .is_some_and(|j| j.is_newsletter() || j.is_status_broadcast()),
             _ => false,
         }
     }
@@ -4117,6 +4121,17 @@ mod tests {
         assert!(
             client.should_ack(&newsletter_message.as_node_ref()),
             "should_ack must return TRUE for newsletter <message>."
+        );
+
+        // Status broadcasts: send_delivery_receipt currently skips them, so the
+        // <ack> stays in place as a server-level acknowledgement safety net.
+        let mut status_attrs = Attrs::new();
+        status_attrs.insert("from".to_string(), "status@broadcast".to_string());
+        status_attrs.insert("id".to_string(), "MSG-STATUS-1".to_string());
+        let status_message = Node::new("message", status_attrs, None);
+        assert!(
+            client.should_ack(&status_message.as_node_ref()),
+            "should_ack must return TRUE for status@broadcast <message> until receipts cover it."
         );
 
         info!(

@@ -238,9 +238,11 @@ pub enum GroupNotificationAction {
     /// `<group_safety_check/>` — Integrity check toggle.
     #[wire = "group_safety_check"]
     GroupSafetyCheck,
-    /// `<limit_sharing_enabled trigger="..."/>` — Limit sharing toggle.
+    /// `<limit_sharing_enabled trigger="..."/>` — Limit sharing toggle. The
+    /// optional `trigger` attribute (range 0..20 per
+    /// `WASmaxInGroupsGroupInfoMixin`) identifies the source of the change.
     #[wire = "limit_sharing_enabled"]
-    LimitSharingEnabled,
+    LimitSharingEnabled { trigger: Option<u32> },
     /// `<allow_admin_reports/>` — Admins may receive report alerts.
     #[wire = "allow_admin_reports"]
     AllowAdminReports,
@@ -505,7 +507,9 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
         T::AutoAddDisabled => GroupNotificationAction::AutoAddDisabled,
         T::IsCapiHostedGroup => GroupNotificationAction::IsCapiHostedGroup,
         T::GroupSafetyCheck => GroupNotificationAction::GroupSafetyCheck,
-        T::LimitSharingEnabled => GroupNotificationAction::LimitSharingEnabled,
+        T::LimitSharingEnabled => GroupNotificationAction::LimitSharingEnabled {
+            trigger: node.attrs().optional_u64("trigger").map(|t| t as u32),
+        },
         T::AllowAdminReports => GroupNotificationAction::AllowAdminReports,
         T::NotAllowAdminReports => GroupNotificationAction::NotAllowAdminReports,
         T::Reports => GroupNotificationAction::Reports,
@@ -1001,6 +1005,29 @@ mod tests {
                 action_name.starts_with(expected),
                 "wire tag {tag} must parse to {expected}, got {action_name}"
             );
+        }
+    }
+
+    #[test]
+    fn test_parse_limit_sharing_enabled_captures_trigger() {
+        let with_trigger = make_notification(vec![
+            NodeBuilder::new("limit_sharing_enabled")
+                .attr("trigger", "5")
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&with_trigger.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::LimitSharingEnabled { trigger } => {
+                assert_eq!(*trigger, Some(5));
+            }
+            other => panic!("expected LimitSharingEnabled, got {:?}", other),
+        }
+
+        let no_trigger = make_notification(vec![NodeBuilder::new("limit_sharing_enabled").build()]);
+        let notif = GroupNotification::try_from_node_ref(&no_trigger.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::LimitSharingEnabled { trigger } => assert!(trigger.is_none()),
+            other => panic!("expected LimitSharingEnabled, got {:?}", other),
         }
     }
 

@@ -66,27 +66,6 @@ macro_rules! for_each_context_info_impl {
     };
 }
 
-/// Sets context_info on the first matching message type.
-/// Returns true if context was set, false otherwise.
-macro_rules! set_context_info_on_message {
-    ($msg:expr, $ctx:expr) => {
-        with_context_info_fields!(set_context_info_impl!($msg, $ctx,))
-    };
-}
-
-macro_rules! set_context_info_impl {
-    ($msg:expr, $ctx:expr, $($field:ident),+ $(,)?) => {{
-        let ctx = $ctx;
-        $(
-            if let Some(ref mut m) = $msg.$field {
-                m.context_info = Some(ctx);
-                return true;
-            }
-        )+
-        false
-    }};
-}
-
 /// Extension trait for wa::Message
 pub trait MessageExt {
     /// Recursively unwraps ephemeral/view-once/document_with_caption/edited wrappers to get the core message.
@@ -315,7 +294,33 @@ impl MessageExt for wa::Message {
     }
 
     fn set_context_info(&mut self, context: wa::ContextInfo) -> bool {
-        set_context_info_on_message!(self, Box::new(context))
+        // Existing fields first (image/video/extended_text/...): the macro
+        // expands to a sequence of `if let ... { ...; return true; }` blocks
+        // so a match here exits the function before the conversation fallback.
+        macro_rules! try_attach {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if let Some(ref mut m) = self.$field {
+                        m.context_info = Some(Box::new(context));
+                        return true;
+                    }
+                )+
+            };
+        }
+        with_context_info_fields!(try_attach!());
+
+        // Bare conversation: promote to extended_text_message. Mirrors the
+        // ephemeral-expiration path; WA Web upgrades text-only bodies
+        // whenever a ContextInfo field needs to be populated.
+        if let Some(text) = self.conversation.take() {
+            self.extended_text_message = Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some(text),
+                context_info: Some(Box::new(context)),
+                ..Default::default()
+            }));
+            return true;
+        }
+        false
     }
 
     fn get_ephemeral_expiration(&self) -> Option<u32> {
@@ -915,7 +920,10 @@ mod tests {
 
     /// Test: set_context_info returns false for unsupported message types
     #[test]
-    fn test_set_context_info_unsupported() {
+    fn test_set_context_info_promotes_bare_conversation() {
+        // Mirrors WAWebMessageSendUtils: a bare `conversation` body is
+        // promoted to `extended_text_message` when a ContextInfo needs to
+        // attach (e.g. quote, mention, ephemeral timer).
         let mut msg = wa::Message {
             conversation: Some("Simple text".to_string()),
             ..Default::default()
@@ -926,6 +934,27 @@ mod tests {
             ..Default::default()
         };
 
+        assert!(msg.set_context_info(context));
+        assert!(msg.conversation.is_none(), "conversation must be moved out");
+        let ext = msg
+            .extended_text_message
+            .expect("promoted to extended_text_message");
+        assert_eq!(ext.text.as_deref(), Some("Simple text"));
+        assert_eq!(
+            ext.context_info
+                .as_ref()
+                .and_then(|c| c.stanza_id.as_deref()),
+            Some("test-id")
+        );
+    }
+
+    #[test]
+    fn test_set_context_info_returns_false_on_empty_message() {
+        let mut msg = wa::Message::default();
+        let context = wa::ContextInfo {
+            stanza_id: Some("test-id".to_string()),
+            ..Default::default()
+        };
         assert!(!msg.set_context_info(context));
     }
 

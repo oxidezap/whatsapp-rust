@@ -445,18 +445,13 @@ pub fn build_create_group_node(options: &GroupCreateOptions) -> Node {
     }
 
     // Inline description: WA Web emits `<description id="<token>"><body>{text}</body></description>`.
+    // Matches SetGroupDescriptionIq's 8-char hex id format for consistency.
     if let Some(desc) = &options.description {
-        use rand::Rng as _;
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let mut id_bytes = [0u8; 8];
-        rng.fill_bytes(&mut id_bytes);
-        let id = id_bytes
-            .iter()
-            .fold(String::with_capacity(16), |mut acc, b| {
-                use std::fmt::Write as _;
-                let _ = write!(acc, "{b:02X}");
-                acc
-            });
+        use rand::RngExt as _;
+        let id = format!(
+            "{:08X}",
+            rand::make_rng::<rand::rngs::StdRng>().random::<u32>()
+        );
         children.push(
             NodeBuilder::new("description")
                 .attr("id", id)
