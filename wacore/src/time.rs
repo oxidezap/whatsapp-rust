@@ -64,6 +64,17 @@ pub fn now_secs() -> i64 {
     now_millis() / 1000
 }
 
+/// Current time in seconds since Unix epoch, saturated at 0.
+///
+/// Most stanza encodings carry timestamps as unsigned u64. A naive
+/// `now_secs() as u64` silently wraps when the clock is pre-1970 (e.g. an
+/// uninitialized system clock during early boot) and corrupts the stanza.
+/// This helper clamps to 0 instead.
+#[inline]
+pub fn now_secs_u64() -> u64 {
+    now_secs().max(0) as u64
+}
+
 /// Current time as `chrono::DateTime<Utc>`.
 #[inline]
 pub fn now_utc() -> chrono::DateTime<chrono::Utc> {

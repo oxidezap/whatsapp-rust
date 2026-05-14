@@ -124,10 +124,6 @@ fn meta_node(key: &'static str, value: &'static str) -> Node {
 /// confirmed to work against the live WhatsApp servers.
 const BIZ_PRIVACY_MODE_TS_OFFSET: u64 = 77_980_457;
 
-struct BizNodeInfo {
-    biz: Node,
-}
-
 enum BizCategory<'a> {
     /// `<biz actual_actors host_storage privacy_mode_ts native_flow_name=X/>` — no children.
     PaymentSimple(&'a str),
@@ -167,15 +163,15 @@ fn classify_button(button_name: &str) -> BizCategory<'_> {
 /// Derive the `<biz>` stanza child for native-flow interactive messages.
 ///
 /// Returns `None` when the message has no native-flow interactive payload.
-/// Otherwise returns a `BizNodeInfo` carrying the assembled `<biz>` node.
-/// The caller is responsible for prepending `<bot biz_bot="1"/>` for DM-bound
-/// sends (see `build_extra_stanza_nodes`).
+/// Otherwise returns the assembled `<biz>` node. The caller is responsible
+/// for prepending `<bot biz_bot="1"/>` for DM-bound sends (see
+/// `build_extra_stanza_nodes`).
 ///
 /// `now_unix_secs` is the current wall-clock time in unix seconds. Taking it
 /// as a parameter keeps the function pure and lets tests pin the resulting
 /// `privacy_mode_ts` deterministically without touching the global time
 /// provider.
-fn infer_biz_node_info(msg: &wa::Message, now_unix_secs: u64) -> Option<BizNodeInfo> {
+fn infer_biz_node(msg: &wa::Message, now_unix_secs: u64) -> Option<Node> {
     let interactive = extract_interactive_message(msg)?;
     let wa::message::interactive_message::InteractiveMessage::NativeFlowMessage(nf) =
         interactive.interactive_message.as_ref()?
@@ -189,7 +185,7 @@ fn infer_biz_node_info(msg: &wa::Message, now_unix_secs: u64) -> Option<BizNodeI
         .saturating_sub(BIZ_PRIVACY_MODE_TS_OFFSET)
         .to_string();
 
-    let biz = match category {
+    Some(match category {
         BizCategory::PaymentSimple(flow_name) => NodeBuilder::new("biz")
             .attr("actual_actors", "2")
             .attr("host_storage", "2")
@@ -198,9 +194,7 @@ fn infer_biz_node_info(msg: &wa::Message, now_unix_secs: u64) -> Option<BizNodeI
             .build(),
         BizCategory::NestedNamed(flow_name) => build_nested_biz(&privacy_mode_ts, flow_name),
         BizCategory::Mixed => build_nested_biz(&privacy_mode_ts, "mixed"),
-    };
-
-    Some(BizNodeInfo { biz })
+    })
 }
 
 fn build_nested_biz(privacy_mode_ts: &str, flow_name: &str) -> Node {
@@ -245,19 +239,21 @@ fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::Intera
 fn build_extra_stanza_nodes(
     to: &Jid,
     inferred_meta: Option<Node>,
-    biz_info: Option<BizNodeInfo>,
+    biz: Option<Node>,
     user_nodes: Vec<Node>,
 ) -> Vec<Node> {
-    if inferred_meta.is_none() && biz_info.is_none() {
+    if inferred_meta.is_none() && biz.is_none() {
         return user_nodes;
     }
-    let mut nodes = Vec::with_capacity(3 + user_nodes.len());
+    let bot_emitted = biz.is_some() && !to.is_group();
+    let extra = inferred_meta.is_some() as usize + biz.is_some() as usize + bot_emitted as usize;
+    let mut nodes = Vec::with_capacity(user_nodes.len() + extra);
     nodes.extend(inferred_meta);
-    if let Some(info) = biz_info {
-        if !to.is_group() {
+    if let Some(node) = biz {
+        if bot_emitted {
             nodes.push(NodeBuilder::new("bot").attr("biz_bot", "1").build());
         }
-        nodes.push(info.biz);
+        nodes.push(node);
     }
     nodes.extend(user_nodes);
     nodes
@@ -349,11 +345,11 @@ impl Client {
         }
 
         let (edit, inferred_meta) = infer_stanza_metadata(&message);
-        let now_unix_secs = wacore::time::now_secs().max(0) as u64;
-        let biz_info = infer_biz_node_info(&message, now_unix_secs);
+        let now_unix_secs = wacore::time::now_secs_u64();
+        let biz = infer_biz_node(&message, now_unix_secs);
 
         let extra_nodes =
-            build_extra_stanza_nodes(&to, inferred_meta, biz_info, options.extra_stanza_nodes);
+            build_extra_stanza_nodes(&to, inferred_meta, biz, options.extra_stanza_nodes);
         self.send_message_impl(
             to,
             &message,
@@ -2690,12 +2686,11 @@ mod tests {
                 ("payment_reminder", "payment_reminder"),
             ];
             for (button, expected_flow) in cases {
-                let info = infer_biz_node_info(&msg_with_native_flow_button(button), FIXED_NOW)
+                let biz = infer_biz_node(&msg_with_native_flow_button(button), FIXED_NOW)
                     .unwrap_or_else(|| panic!("{button}: should produce biz"));
-                assert_biz_common_attrs(&info.biz, button);
+                assert_biz_common_attrs(&biz, button);
                 assert_eq!(
-                    info.biz
-                        .attrs()
+                    biz.attrs()
                         .optional_string("native_flow_name")
                         .unwrap()
                         .as_ref(),
@@ -2703,7 +2698,7 @@ mod tests {
                     "{button}: native_flow_name attr"
                 );
                 assert!(
-                    info.biz.children().unwrap_or(&[]).is_empty(),
+                    biz.children().unwrap_or(&[]).is_empty(),
                     "{button}: PaymentSimple has no children"
                 );
             }
@@ -2724,9 +2719,9 @@ mod tests {
                 ("message_with_link_status", "message_with_link_status"),
             ];
             for (button, expected_flow) in cases {
-                let info = infer_biz_node_info(&msg_with_native_flow_button(button), FIXED_NOW)
+                let biz = infer_biz_node(&msg_with_native_flow_button(button), FIXED_NOW)
                     .unwrap_or_else(|| panic!("{button}: should produce biz"));
-                assert_nested_biz(&info.biz, expected_flow, button);
+                assert_nested_biz(&biz, expected_flow, button);
             }
         }
 
@@ -2743,9 +2738,9 @@ mod tests {
                 "future_button_xyz",
             ];
             for button in cases {
-                let info = infer_biz_node_info(&msg_with_native_flow_button(button), FIXED_NOW)
+                let biz = infer_biz_node(&msg_with_native_flow_button(button), FIXED_NOW)
                     .unwrap_or_else(|| panic!("{button}: should produce biz"));
-                assert_nested_biz(&info.biz, "mixed", button);
+                assert_nested_biz(&biz, "mixed", button);
             }
         }
 
@@ -2757,7 +2752,7 @@ mod tests {
                 conversation: Some("hello".into()),
                 ..Default::default()
             };
-            assert!(infer_biz_node_info(&msg, FIXED_NOW).is_none());
+            assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
         }
 
         /// Interactive but not native-flow (e.g. CollectionMessage) yields None.
@@ -2774,7 +2769,7 @@ mod tests {
                 })),
                 ..Default::default()
             };
-            assert!(infer_biz_node_info(&msg, FIXED_NOW).is_none());
+            assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
         }
 
         /// NativeFlow with empty button list yields None — no signal to classify.
@@ -2795,7 +2790,7 @@ mod tests {
                 })),
                 ..Default::default()
             };
-            assert!(infer_biz_node_info(&msg, FIXED_NOW).is_none());
+            assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
         }
 
         /// Button with `name = None` is treated as missing classifier → None.
@@ -2819,7 +2814,7 @@ mod tests {
                 })),
                 ..Default::default()
             };
-            assert!(infer_biz_node_info(&msg, FIXED_NOW).is_none());
+            assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
         }
 
         /// Messages wrapped in `documentWithCaptionMessage` still pick up the
@@ -2850,20 +2845,20 @@ mod tests {
                 })),
                 ..Default::default()
             };
-            let info = infer_biz_node_info(&msg, FIXED_NOW)
+            let biz = infer_biz_node(&msg, FIXED_NOW)
                 .expect("doc-with-caption wrapper should propagate the inner native_flow");
-            assert_nested_biz(&info.biz, "mixed", "doc-with-caption/quick_reply");
+            assert_nested_biz(&biz, "mixed", "doc-with-caption/quick_reply");
         }
 
         // -- build_extra_stanza_nodes assembly tests --
 
-        fn quick_reply_biz_info() -> BizNodeInfo {
-            infer_biz_node_info(&msg_with_native_flow_button("quick_reply"), FIXED_NOW)
+        fn quick_reply_biz() -> Node {
+            infer_biz_node(&msg_with_native_flow_button("quick_reply"), FIXED_NOW)
                 .expect("quick_reply produces biz")
         }
 
-        fn payment_biz_info() -> BizNodeInfo {
-            infer_biz_node_info(&msg_with_native_flow_button("payment_info"), FIXED_NOW)
+        fn payment_biz() -> Node {
+            infer_biz_node(&msg_with_native_flow_button("payment_info"), FIXED_NOW)
                 .expect("payment_info produces biz")
         }
 
@@ -2879,7 +2874,7 @@ mod tests {
             let nodes = build_extra_stanza_nodes(
                 &jid("5511999999999@s.whatsapp.net"),
                 None,
-                Some(quick_reply_biz_info()),
+                Some(quick_reply_biz()),
                 vec![],
             );
             assert_eq!(nodes.len(), 2, "expected [<bot>, <biz>]");
@@ -2901,7 +2896,7 @@ mod tests {
             let nodes = build_extra_stanza_nodes(
                 &jid("120363000000000001@g.us"),
                 None,
-                Some(quick_reply_biz_info()),
+                Some(quick_reply_biz()),
                 vec![],
             );
             assert_eq!(nodes.len(), 1);
@@ -2914,7 +2909,7 @@ mod tests {
             let nodes = build_extra_stanza_nodes(
                 &jid("100000000000001@lid"),
                 None,
-                Some(payment_biz_info()),
+                Some(payment_biz()),
                 vec![],
             );
             assert_eq!(nodes.len(), 2);
@@ -2940,7 +2935,7 @@ mod tests {
             let nodes = build_extra_stanza_nodes(
                 &jid("X@s.whatsapp.net"),
                 Some(meta),
-                Some(quick_reply_biz_info()),
+                Some(quick_reply_biz()),
                 vec![user_a, user_b],
             );
             assert_eq!(nodes.len(), 5);

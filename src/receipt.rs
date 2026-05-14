@@ -228,7 +228,7 @@ impl Client {
             return Ok(());
         }
 
-        let timestamp = (wacore::time::now_secs() as u64).to_string();
+        let timestamp = wacore::time::now_secs_u64().to_string();
 
         let mut builder = NodeBuilder::new("receipt")
             .attr("to", chat)

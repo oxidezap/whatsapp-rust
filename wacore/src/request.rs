@@ -148,7 +148,7 @@ impl RequestUtils {
     pub fn generate_message_id(&self, user_jid: Option<&Jid>) -> String {
         let mut data = Vec::with_capacity(8 + 20 + 16);
 
-        let timestamp = crate::time::now_secs() as u64;
+        let timestamp = crate::time::now_secs_u64();
         data.extend_from_slice(&timestamp.to_be_bytes());
 
         if let Some(jid) = user_jid {
