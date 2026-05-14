@@ -97,6 +97,7 @@ yoke = { version = "0.8", features = ["derive"] }
 debug-diagnostics = ["wacore/debug-diagnostics"]
 debug-snapshots = ["wacore/debug-snapshots"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
+danger-skip-cert-chain-verify = ["wacore/danger-skip-cert-chain-verify"]
 default = [
     "moka-cache",
     "simd",
