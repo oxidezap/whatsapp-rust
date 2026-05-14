@@ -1829,12 +1829,24 @@ impl Client {
     }
 
     /// Determine if a node should be acknowledged with <ack/>.
+    ///
+    /// WA Web only emits `<ack class="message">` for newsletter deliveries
+    /// (`OutMessageDeliverCommonAckMixin`). Regular DMs / groups / status
+    /// rely on the `<receipt>` (delivery / read / played) for ack semantics
+    /// — sending both would be redundant.
     fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
-        matches!(
-            node.tag.as_ref(),
-            "message" | "receipt" | "notification" | "call"
-        ) && node.get_attr("id").is_some()
-            && node.get_attr("from").is_some()
+        let tag = node.tag.as_ref();
+        if node.get_attr("id").is_none() {
+            return false;
+        }
+        let Some(from) = node.get_attr("from") else {
+            return false;
+        };
+        match tag {
+            "receipt" | "notification" | "call" => true,
+            "message" => from.to_jid().is_some_and(|j| j.is_newsletter()),
+            _ => false,
+        }
     }
 
     /// Possibly send a deferred ack: either immediately or via spawned task.
@@ -4045,6 +4057,42 @@ mod tests {
         assert!(
             client.should_ack(&notification_node.as_node_ref()),
             "should_ack must still return TRUE for <notification> stanzas."
+        );
+
+        // Regular <message> stanzas (DM / group) are acked via the delivery
+        // <receipt>, not a bare <ack class="message">. WA Web only emits
+        // <ack class="message"> for newsletter deliveries.
+        let mut dm_attrs = Attrs::new();
+        dm_attrs.insert(
+            "from".to_string(),
+            "5511999999999@s.whatsapp.net".to_string(),
+        );
+        dm_attrs.insert("id".to_string(), "MSG-DM-1".to_string());
+        let dm_message = Node::new("message", dm_attrs, None);
+        assert!(
+            !client.should_ack(&dm_message.as_node_ref()),
+            "should_ack must return FALSE for regular DM <message> (delivery receipt covers it)."
+        );
+
+        let mut group_attrs = Attrs::new();
+        group_attrs.insert("from".to_string(), "120363098765432100@g.us".to_string());
+        group_attrs.insert("id".to_string(), "MSG-GROUP-1".to_string());
+        let group_message = Node::new("message", group_attrs, None);
+        assert!(
+            !client.should_ack(&group_message.as_node_ref()),
+            "should_ack must return FALSE for group <message>."
+        );
+
+        let mut newsletter_attrs = Attrs::new();
+        newsletter_attrs.insert(
+            "from".to_string(),
+            "120363298765432100@newsletter".to_string(),
+        );
+        newsletter_attrs.insert("id".to_string(), "MSG-NL-1".to_string());
+        let newsletter_message = Node::new("message", newsletter_attrs, None);
+        assert!(
+            client.should_ack(&newsletter_message.as_node_ref()),
+            "should_ack must return TRUE for newsletter <message>."
         );
 
         info!(
