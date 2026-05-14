@@ -211,6 +211,74 @@ pub enum GroupNotificationAction {
         #[wire(skip)]
         raw: Node,
     },
+    /// `<linked_group_promote>` — Subgroup admin elevated (community parent).
+    #[wire = "linked_group_promote"]
+    LinkedGroupPromote {
+        participants: Vec<GroupParticipantInfo>,
+    },
+    /// `<linked_group_demote>` — Subgroup admin demoted.
+    #[wire = "linked_group_demote"]
+    LinkedGroupDemote {
+        participants: Vec<GroupParticipantInfo>,
+    },
+
+    // -- State toggles --
+    /// `<suspended/>` — Group suspended by Meta moderation.
+    #[wire = "suspended"]
+    Suspended,
+    /// `<unsuspended/>` — Suspension lifted.
+    #[wire = "unsuspended"]
+    Unsuspended,
+    /// `<auto_add_disabled/>` — Community auto-add to general chat disabled.
+    #[wire = "auto_add_disabled"]
+    AutoAddDisabled,
+    /// `<is_capi_hosted_group/>` — Group routed through CAPI hosted server.
+    #[wire = "is_capi_hosted_group"]
+    IsCapiHostedGroup,
+    /// `<group_safety_check/>` — Integrity check toggle.
+    #[wire = "group_safety_check"]
+    GroupSafetyCheck,
+    /// `<limit_sharing_enabled trigger="..."/>` — Limit sharing toggle.
+    #[wire = "limit_sharing_enabled"]
+    LimitSharingEnabled,
+    /// `<allow_admin_reports/>` — Admins may receive report alerts.
+    #[wire = "allow_admin_reports"]
+    AllowAdminReports,
+    /// `<not_allow_admin_reports/>` — Admin reports disabled.
+    #[wire = "not_allow_admin_reports"]
+    NotAllowAdminReports,
+    /// `<reports/>` — Generic reports notification.
+    #[wire = "reports"]
+    Reports,
+    /// `<allow_non_admin_sub_group_creation/>` — Community permits members to
+    /// create subgroups without admin approval.
+    #[wire = "allow_non_admin_sub_group_creation"]
+    AllowNonAdminSubGroupCreation,
+    /// `<not_allow_non_admin_sub_group_creation/>` — Community restricts
+    /// subgroup creation to admins.
+    #[wire = "not_allow_non_admin_sub_group_creation"]
+    NotAllowNonAdminSubGroupCreation,
+
+    // -- Subgroup suggestions (community) --
+    /// `<created_sub_group_suggestion>` — Suggested subgroup added.
+    #[wire = "created_sub_group_suggestion"]
+    CreatedSubGroupSuggestion {
+        #[wire(skip)]
+        raw: Node,
+    },
+    /// `<revoked_sub_group_suggestions>` — Subgroup suggestion revoked.
+    #[wire = "revoked_sub_group_suggestions"]
+    RevokedSubGroupSuggestions {
+        #[wire(skip)]
+        raw: Node,
+    },
+
+    /// `<change_number>` — Participant changed their phone number; new
+    /// participant data is in the `<participant>` child.
+    #[wire = "change_number"]
+    ChangeNumber {
+        participants: Vec<GroupParticipantInfo>,
+    },
 
     // -- Catch-all --
     /// Unknown child tag — preserved for forward compatibility. The `tag`
@@ -425,6 +493,34 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
                 .optional_string("unlink_reason")
                 .map(|s| s.into_owned()),
             raw: node.to_owned(),
+        },
+        T::LinkedGroupPromote => GroupNotificationAction::LinkedGroupPromote {
+            participants: parse_participants(node),
+        },
+        T::LinkedGroupDemote => GroupNotificationAction::LinkedGroupDemote {
+            participants: parse_participants(node),
+        },
+        T::Suspended => GroupNotificationAction::Suspended,
+        T::Unsuspended => GroupNotificationAction::Unsuspended,
+        T::AutoAddDisabled => GroupNotificationAction::AutoAddDisabled,
+        T::IsCapiHostedGroup => GroupNotificationAction::IsCapiHostedGroup,
+        T::GroupSafetyCheck => GroupNotificationAction::GroupSafetyCheck,
+        T::LimitSharingEnabled => GroupNotificationAction::LimitSharingEnabled,
+        T::AllowAdminReports => GroupNotificationAction::AllowAdminReports,
+        T::NotAllowAdminReports => GroupNotificationAction::NotAllowAdminReports,
+        T::Reports => GroupNotificationAction::Reports,
+        T::AllowNonAdminSubGroupCreation => GroupNotificationAction::AllowNonAdminSubGroupCreation,
+        T::NotAllowNonAdminSubGroupCreation => {
+            GroupNotificationAction::NotAllowNonAdminSubGroupCreation
+        }
+        T::CreatedSubGroupSuggestion => GroupNotificationAction::CreatedSubGroupSuggestion {
+            raw: node.to_owned(),
+        },
+        T::RevokedSubGroupSuggestions => GroupNotificationAction::RevokedSubGroupSuggestions {
+            raw: node.to_owned(),
+        },
+        T::ChangeNumber => GroupNotificationAction::ChangeNumber {
+            participants: parse_participants(node),
         },
         T::Unknown(_) => GroupNotificationAction::Unknown {
             tag: node.tag.to_string(),
@@ -837,6 +933,94 @@ mod tests {
                 assert_eq!(requests[0].jid, user_jid());
             }
             other => panic!("expected CreatedMembershipRequests, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_linked_group_promote_demote_carry_participants() {
+        let promote_node = make_notification(vec![
+            NodeBuilder::new("linked_group_promote")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", user_jid())
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&promote_node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::LinkedGroupPromote { participants } => {
+                assert_eq!(participants.len(), 1);
+                assert_eq!(participants[0].jid, user_jid());
+            }
+            other => panic!("expected LinkedGroupPromote, got {:?}", other),
+        }
+
+        let demote_node = make_notification(vec![
+            NodeBuilder::new("linked_group_demote")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", user_jid())
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&demote_node.as_node_ref()).unwrap();
+        assert!(matches!(
+            notif.actions[0],
+            GroupNotificationAction::LinkedGroupDemote { .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_suspended_toggle_variants() {
+        let table = [
+            ("suspended", "Suspended"),
+            ("unsuspended", "Unsuspended"),
+            ("auto_add_disabled", "AutoAddDisabled"),
+            ("is_capi_hosted_group", "IsCapiHostedGroup"),
+            ("group_safety_check", "GroupSafetyCheck"),
+            ("limit_sharing_enabled", "LimitSharingEnabled"),
+            ("allow_admin_reports", "AllowAdminReports"),
+            ("not_allow_admin_reports", "NotAllowAdminReports"),
+            ("reports", "Reports"),
+            (
+                "allow_non_admin_sub_group_creation",
+                "AllowNonAdminSubGroupCreation",
+            ),
+            (
+                "not_allow_non_admin_sub_group_creation",
+                "NotAllowNonAdminSubGroupCreation",
+            ),
+        ];
+        for (tag, expected) in table {
+            let node = make_notification(vec![NodeBuilder::new(tag).build()]);
+            let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+            let action_name = format!("{:?}", notif.actions[0]);
+            assert!(
+                action_name.starts_with(expected),
+                "wire tag {tag} must parse to {expected}, got {action_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_change_number_carries_participants() {
+        let node = make_notification(vec![
+            NodeBuilder::new("change_number")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", user_jid())
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::ChangeNumber { participants } => {
+                assert_eq!(participants.len(), 1);
+            }
+            other => panic!("expected ChangeNumber, got {:?}", other),
         }
     }
 
