@@ -176,6 +176,24 @@ pub struct MsgMetaInfo {
     pub deprecated_lid_session: Option<bool>,
     pub thread_message_id: Option<MessageId>,
     pub thread_message_sender_jid: Option<Jid>,
+    /// `<meta content_type=...>` attr. Server marks reactions/edits as
+    /// `"add_on"`; mirrors `WAWebHandleMsgParser` b()'s metadata read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// `<meta appdata=...>` attr. `"default"` is the only observed value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub appdata: Option<String>,
+    /// `<reporting><reporting_tag>` content bytes (16 or 20). Pre-requisite
+    /// for the server-side report-abuse flow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reporting_tag: Option<Vec<u8>>,
+    /// `<reporting><reporting_token>` content bytes (16). Pre-requisite
+    /// for the server-side report-abuse flow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reporting_token: Option<Vec<u8>>,
+    /// `v` attr on `<reporting_token>`. WA Web defaults to 1 when missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reporting_token_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
