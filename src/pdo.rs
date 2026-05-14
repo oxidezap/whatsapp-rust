@@ -444,6 +444,10 @@ impl Client {
             ephemeral_expiration: None,
             is_offline: false,
             unavailable_request_id: None,
+            server_timestamp_us: None,
+            verified_level: None,
+            verified_name_serial: None,
+            peer_recipient_pn: None,
         })
     }
 

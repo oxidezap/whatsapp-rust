@@ -263,6 +263,18 @@ pub fn parse_message_info(
 
     let is_offline = attrs.optional_string("offline").is_some();
 
+    // Envelope enrichment (mirrors WAWebHandleMsgParser y() function).
+    let server_timestamp_us = attrs
+        .optional_u64("sts")
+        .and_then(|v| i64::try_from(v).ok());
+    let verified_level = attrs
+        .optional_string("verified_level")
+        .map(|s| s.into_owned());
+    let verified_name_serial = attrs
+        .optional_u64("verified_name")
+        .and_then(|v| i64::try_from(v).ok());
+    let peer_recipient_pn = attrs.optional_jid("peer_recipient_pn");
+
     Ok(MessageInfo {
         source,
         id,
@@ -278,6 +290,10 @@ pub fn parse_message_info(
             .map(|s| EditAttribute::from(s.to_string()))
             .unwrap_or_default(),
         is_offline,
+        server_timestamp_us,
+        verified_level,
+        verified_name_serial,
+        peer_recipient_pn,
         ..Default::default()
     })
 }
@@ -316,6 +332,55 @@ mod parse_message_info_tests {
             .expect("status broadcast must expose participant_lid as sender_alt");
         assert_eq!(alt.user, lid_user);
         assert_eq!(alt.server, wacore_binary::Server::Lid);
+    }
+
+    /// Envelope-enrichment attributes (`sts`, `verified_level`,
+    /// `verified_name`, `peer_recipient_pn`) flow into `MessageInfo` fields.
+    /// Mirrors `WAWebHandleMsgParser` y() function which threads
+    /// `serverStoreTimeMicros`/`verifiedLevel`/`verifiedNameSerial`/
+    /// `peerRecipientPn` into the msgInfo result.
+    #[test]
+    fn envelope_enrichment_fields_are_captured() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "MSG-ENV-1")
+            .attr("t", "1777415965")
+            .attr("sts", "1777415965123456")
+            .attr("verified_level", "unknown")
+            .attr("verified_name", "12345")
+            .attr("peer_recipient_pn", "559980000099@s.whatsapp.net")
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+
+        assert_eq!(info.server_timestamp_us, Some(1777415965123456));
+        assert_eq!(info.verified_level.as_deref(), Some("unknown"));
+        assert_eq!(info.verified_name_serial, Some(12345));
+        assert_eq!(
+            info.peer_recipient_pn.as_ref().map(|j| j.user.as_str()),
+            Some("559980000099")
+        );
+    }
+
+    /// Envelope without any of the optional enrichment attrs leaves all
+    /// four fields as `None`. Regression guard against accidentally
+    /// defaulting them.
+    #[test]
+    fn envelope_enrichment_is_optional() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "MSG-ENV-NONE")
+            .attr("t", "1777415965")
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+
+        assert!(info.server_timestamp_us.is_none());
+        assert!(info.verified_level.is_none());
+        assert!(info.verified_name_serial.is_none());
+        assert!(info.peer_recipient_pn.is_none());
     }
 
     /// Symmetric branch: when `participant` is a LID, `sender_alt` must come

@@ -201,6 +201,25 @@ pub struct MessageInfo {
     /// Set when this message was recovered via PDO rather than normal decryption.
     /// Contains the PDO request message ID.
     pub unavailable_request_id: Option<String>,
+    /// Server-store timestamp in microseconds (envelope `sts` attr). Used by
+    /// WA Web for read-self watermark ordering across companion devices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_timestamp_us: Option<i64>,
+    /// Envelope `verified_level` attr (e.g. "unknown"/"low"/"high"). For
+    /// business messages this is the server-asserted verification tier; for
+    /// regular messages it is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_level: Option<String>,
+    /// Envelope `verified_name` int attr (business name certificate serial).
+    /// Separate from the `verified_name` child cert bytes already on this
+    /// struct.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_name_serial: Option<i64>,
+    /// Envelope `peer_recipient_pn` attr. Present on companion-device
+    /// self-synced DM stanzas to identify the peer's PN (so the receipt
+    /// goes to the right routing target).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_recipient_pn: Option<Jid>,
 }
 
 impl MessageInfo {
