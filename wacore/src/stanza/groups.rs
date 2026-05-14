@@ -706,19 +706,23 @@ mod tests {
         }
     }
 
-    /// Real captured `<modify>` stanza shape with `display_name` and
-    /// versioning attrs (`v_id`/`prev_v_id`, ignored). The masked display
-    /// label uses U+2219 (bullet operator) for privacy.
+    /// Mirrors the wire shape seen on `<modify>` in `w:gp2`: versioning
+    /// attrs `v_id`/`prev_v_id` (ignored) plus a `<participant>` carrying
+    /// `display_name`. The label is the server-rendered masked variant
+    /// using U+2219 (bullet operator) when the requester is not in the
+    /// participant's contacts.
     #[test]
     fn test_parse_modify_carries_display_name() {
+        let masked =
+            "+55\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}00";
         let node = make_notification(vec![
             NodeBuilder::new("modify")
-                .attr("v_id", "1778606476221940")
-                .attr("prev_v_id", "1778602920091375")
+                .attr("v_id", "1700000000000001")
+                .attr("prev_v_id", "1700000000000000")
                 .children(vec![
                     NodeBuilder::new("participant")
-                        .attr("jid", "140059672064241@lid")
-                        .attr("display_name", "+55\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}79")
+                        .attr("jid", "999000000000001@lid")
+                        .attr("display_name", masked)
                         .build(),
                 ])
                 .build(),
@@ -728,12 +732,7 @@ mod tests {
         match &notif.actions[0] {
             GroupNotificationAction::Modify { participants } => {
                 assert_eq!(participants.len(), 1);
-                assert_eq!(
-                    participants[0].display_name.as_deref(),
-                    Some(
-                        "+55\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}79"
-                    )
-                );
+                assert_eq!(participants[0].display_name.as_deref(), Some(masked));
             }
             other => panic!("expected Modify, got {:?}", other),
         }
