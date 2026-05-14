@@ -8,13 +8,43 @@ use waproto::whatsapp::{self as wa, CertChain, HandshakeMessage};
 
 const WA_CERT_ISSUER_SERIAL: i64 = 0;
 
-/// Ed25519 issuer key for the Noise cert chain. Intentionally unused: wiring
-/// it into `verify_server_cert` would block the e2e mock server. Kept
-/// exported for SemVer; do not make it load-bearing without an opt-out.
+/// XEdDSA (Signal-variant Curve25519) issuer key for the WhatsApp Noise cert
+/// chain. Used by `verify_server_cert` to verify the intermediate certificate
+/// against the WA root, and indirectly the leaf against the intermediate.
 pub const WA_CERT_PUB_KEY: [u8; 32] = [
     0x14, 0x23, 0x75, 0x57, 0x4d, 0x0a, 0x58, 0x71, 0x66, 0xaa, 0xe7, 0x1e, 0xbe, 0x51, 0x64, 0x37,
     0xc4, 0xa2, 0x8b, 0x73, 0xe3, 0x69, 0x5c, 0x6c, 0xe1, 0xf7, 0xf9, 0x54, 0x5d, 0xa8, 0xee, 0x6b,
 ];
+
+/// XEdDSA-verifies one step of the Noise cert chain (`signature` over
+/// `details` with `issuer_key`). Skipped under `cfg(test)` and the
+/// `danger-skip-cert-chain-verify` feature, both of which exist so callers
+/// can drive the surrounding code against zero-signed fixtures.
+fn verify_cert_step(
+    issuer_key: &[u8; 32],
+    details: &[u8],
+    signature: Option<&Vec<u8>>,
+    label: &'static str,
+) -> Result<()> {
+    if cfg!(test) || cfg!(feature = "danger-skip-cert-chain-verify") {
+        return Ok(());
+    }
+    let signature = signature
+        .ok_or_else(|| HandshakeError::CertVerification(format!("Missing {label} signature")))?;
+    let pk = wacore_libsignal::core::curve::PublicKey::from_djb_public_key_bytes(issuer_key)
+        .map_err(|_| {
+            HandshakeError::CertVerification(format!(
+                "Invalid {label} issuer key (not Djb/Curve25519)"
+            ))
+        })?;
+    if pk.verify_signature(details, signature) {
+        Ok(())
+    } else {
+        Err(HandshakeError::CertVerification(format!(
+            "{label} signature failed XEdDSA verify"
+        )))
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum HandshakeError {
@@ -176,6 +206,14 @@ impl HandshakeUtils {
             HandshakeError::CertVerification("Intermediate details key is not 32 bytes".into())
         })?;
 
+        // intermediate.signature == XEdDSA(WA_CERT_PUB_KEY, intermediate.details)
+        verify_cert_step(
+            &WA_CERT_PUB_KEY,
+            intermediate_details_bytes,
+            intermediate.signature.as_ref(),
+            "intermediate",
+        )?;
+
         let leaf_details_bytes = leaf
             .details
             .as_ref()
@@ -195,6 +233,14 @@ impl HandshakeUtils {
                 "Cert key does not match decrypted static key".into(),
             ));
         }
+
+        // leaf.signature == XEdDSA(intermediate_key, leaf.details)
+        verify_cert_step(
+            &intermediate_key,
+            leaf_details_bytes,
+            leaf.signature.as_ref(),
+            "leaf",
+        )?;
 
         Ok(VerifiedServerCertChain {
             intermediate_key,

@@ -138,6 +138,10 @@ pub fn generate_patch_mac(patch: &wa::SyncdPatch, name: &str, key: &[u8], versio
     mac.finalize()
 }
 
+fn u64_to_be(val: u64) -> [u8; 8] {
+    val.to_be_bytes()
+}
+
 pub fn generate_content_mac(
     operation: wa::syncd_mutation::SyncdOperation,
     data: &[u8],
@@ -145,7 +149,12 @@ pub fn generate_content_mac(
     key: &[u8],
 ) -> [u8; 32] {
     let op_byte = [operation as u8 + 1];
-    let key_data_length = u64_to_be((key_id.len() + 1) as u64);
+    // WA Web (WAWebSyncdMutationKeyApi.Crypto) packs the associated-data length as
+    // a single u8 at the low byte of an 8-byte zero buffer:
+    //   octetLength = new Uint8Array(8); octetLength[7] = ad.length & 0xff
+    // We mirror that exactly so the HMAC input is bytewise identical.
+    let mut key_data_length = [0u8; 8];
+    key_data_length[7] = ((key_id.len() + 1) & 0xff) as u8;
     let mut mac =
         CryptographicMac::new("HmacSha512", key).expect("HmacSha512 is a valid algorithm");
     mac.update(&op_byte);
@@ -158,10 +167,6 @@ pub fn generate_content_mac(
     let mut result = [0u8; 32];
     result.copy_from_slice(&out[..32]);
     result
-}
-
-fn u64_to_be(val: u64) -> [u8; 8] {
-    val.to_be_bytes()
 }
 
 pub fn validate_index_mac(

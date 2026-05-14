@@ -82,6 +82,10 @@ fn build_base_client_payload(
     app_version: wa::client_payload::user_agent::AppVersion,
     profile: &ClientProfile,
 ) -> wa::ClientPayload {
+    let phone_id = profile
+        .phone_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     wa::ClientPayload {
         user_agent: Some(wa::client_payload::UserAgent {
             platform: Some(profile.user_agent_platform as i32),
@@ -93,8 +97,9 @@ fn build_base_client_payload(
             manufacturer: Some(profile.manufacturer.clone()),
             device: Some(profile.device.clone()),
             os_build_number: Some(profile.os_version.clone()),
-            locale_language_iso6391: Some("en".to_string()),
-            locale_country_iso31661_alpha2: Some("en".to_string()),
+            locale_language_iso6391: Some(profile.locale_language.clone()),
+            locale_country_iso31661_alpha2: Some(profile.locale_country.clone()),
+            phone_id: Some(phone_id),
             ..Default::default()
         }),
         web_info: profile
@@ -161,10 +166,16 @@ impl DevicePropsOverride {
 
 /// Default `HistorySyncConfig` aligned with WA Web's static claims
 /// (`Payload.js` in `WAWebClientPayload`). Runtime-derived fields like
-/// `storage_quota_mb`, `on_demand_ready`, and justknobx-gated flags are left
-/// unset so callers can populate them through
+/// `storage_quota_mb`, `on_demand_ready`, and the justknobx-gated numeric
+/// limits are left unset so callers can populate them through
 /// [`DevicePropsOverride::with_history_sync_config`] without fighting stale
 /// hardcoded values.
+///
+/// `support_*` capability flags are advertised as `true`: they tell the
+/// server which history payload variants the client can ingest, and the
+/// library either handles them or treats them as opaque (no harm). The
+/// platform-gated `support_call_log_history` is `false` because the call
+/// log history payload is bound to the Windows desktop client.
 pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
     wa::device_props::HistorySyncConfig {
         full_sync_days_limit: Some(30),
@@ -176,6 +187,10 @@ pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
         support_biz_hosted_msg: Some(true),
         support_fbid_bot_chat_history: Some(true),
         support_message_association: Some(true),
+        support_call_log_history: Some(false),
+        support_group_history: Some(true),
+        support_manus_history: Some(true),
+        support_hatch_history: Some(true),
         ..Default::default()
     }
 }
@@ -250,6 +265,12 @@ pub struct Device {
     /// `None` forces XX on the next connect.
     #[serde(default)]
     pub server_cert_chain: Option<CachedServerCertChain>,
+    /// Login counter sent as `ClientPayload.lc` on every login. WA Web's
+    /// `WAWebUserPrefsGeneral.getLoginCounter()` reads (and bumps) this from
+    /// localStorage on each connect; the server uses it as an anti-abuse
+    /// signal. Persisted so it survives restarts.
+    #[serde(default)]
+    pub login_counter: i32,
 }
 
 /// Minimal cached form of a Noise certificate. Mirrors the JSON shape WA Web
@@ -344,6 +365,7 @@ impl Device {
             nct_salt: None,
             nct_salt_sync_seen: false,
             server_cert_chain: None,
+            login_counter: 0,
         }
     }
 
@@ -408,7 +430,11 @@ impl Device {
         let mut payload = build_base_client_payload(app_version, &self.client_profile);
         payload.username = jid.user.parse::<u64>().ok();
         payload.device = Some(jid.device as u32);
-        payload.passive = Some(true);
+        payload.passive = Some(self.client_profile.passive_login);
+        payload.lc = Some(self.login_counter);
+        // Always false: the lib has no LID migration path. WA Web sends this
+        // unconditionally so the server can branch on it.
+        payload.lid_db_migrated = Some(false);
         payload
     }
 

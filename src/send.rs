@@ -79,40 +79,39 @@ pub enum RevokeType {
 }
 
 /// Derive stanza-level edit attribute and meta node from message content.
+///
+/// The `edit` attribute and the `<meta>` child are independent in WA Web: the
+/// edit attribute comes from `editAttribute(msg, subtype)` and the meta node
+/// from `genMetaNode(...)`. A message can carry both (e.g. a poll vote sets
+/// `polltype=vote` meta; an event edit sets both `event_type=edit` meta and
+/// `edit="1"` attribute).
 fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>, Option<Node>) {
-    if msg.pin_in_chat_message.is_some() {
-        return (Some(EditAttribute::PinInChat), None);
-    }
+    let edit = EditAttribute::infer_from_message(msg);
 
-    // Poll messages
-    if msg.poll_creation_message.is_some()
+    let meta = if msg.poll_creation_message.is_some()
         || msg.poll_creation_message_v2.is_some()
         || msg.poll_creation_message_v3.is_some()
     {
-        return (None, Some(meta_node("polltype", "creation")));
-    }
-    if let Some(ref poll_update) = msg.poll_update_message
+        Some(meta_node("polltype", "creation"))
+    } else if let Some(ref poll_update) = msg.poll_update_message
         && poll_update.vote.is_some()
     {
-        return (None, Some(meta_node("polltype", "vote")));
-    }
-    // TODO: polltype="result_snapshot" for poll_result_snapshot_message (gated behind AB flag)
-
-    // Event messages
-    if msg.event_message.is_some() {
-        return (None, Some(meta_node("event_type", "creation")));
-    }
-    if msg.enc_event_response_message.is_some() {
-        return (None, Some(meta_node("event_type", "response")));
-    }
-    if let Some(ref sec) = msg.secret_encrypted_message
+        Some(meta_node("polltype", "vote"))
+        // TODO: polltype="result_snapshot" for poll_result_snapshot_message (gated behind AB flag)
+    } else if msg.event_message.is_some() {
+        Some(meta_node("event_type", "creation"))
+    } else if msg.enc_event_response_message.is_some() {
+        Some(meta_node("event_type", "response"))
+    } else if let Some(ref sec) = msg.secret_encrypted_message
         && sec.secret_enc_type
             == Some(wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32)
     {
-        return (None, Some(meta_node("event_type", "edit")));
-    }
+        Some(meta_node("event_type", "edit"))
+    } else {
+        None
+    };
 
-    (None, None)
+    (edit, meta)
 }
 
 fn meta_node(key: &'static str, value: &'static str) -> Node {
@@ -2426,6 +2425,85 @@ mod tests {
             let (edit, node) = infer_stanza_metadata(&msg);
             assert!(edit.is_none());
             assert!(node.is_none());
+        }
+
+        #[test]
+        fn revoked_reaction_returns_sender_revoke() {
+            let msg = wa::Message {
+                reaction_message: Some(wa::message::ReactionMessage {
+                    text: Some(String::new()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let (edit, _) = infer_stanza_metadata(&msg);
+            assert_eq!(edit, Some(EditAttribute::SenderRevoke));
+        }
+
+        #[test]
+        fn keep_in_chat_undo_returns_sender_revoke() {
+            let msg = wa::Message {
+                keep_in_chat_message: Some(wa::message::KeepInChatMessage {
+                    key: Some(wa::MessageKey {
+                        from_me: Some(true),
+                        ..Default::default()
+                    }),
+                    keep_type: Some(wa::KeepType::UndoKeepForAll as i32),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let (edit, _) = infer_stanza_metadata(&msg);
+            assert_eq!(edit, Some(EditAttribute::SenderRevoke));
+        }
+
+        #[test]
+        fn secret_encrypted_message_edit_returns_message_edit() {
+            let msg = wa::Message {
+                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(
+                        wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let (edit, _) = infer_stanza_metadata(&msg);
+            assert_eq!(edit, Some(EditAttribute::MessageEdit));
+        }
+
+        #[test]
+        fn secret_encrypted_event_edit_emits_both_edit_attr_and_meta_node() {
+            // EVENT_EDIT is the one case where the edit attribute AND the
+            // meta node both fire: `event_type=edit` meta + `edit="1"` attr.
+            let msg = wa::Message {
+                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(
+                        wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32,
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let (edit, node) = infer_stanza_metadata(&msg);
+            assert_eq!(edit, Some(EditAttribute::MessageEdit));
+            let node = node.expect("should have meta node");
+            assert_eq!(
+                node.attrs().optional_string("event_type").unwrap().as_ref(),
+                "edit"
+            );
+        }
+
+        #[test]
+        fn top_level_edited_message_returns_message_edit() {
+            let msg = wa::Message {
+                edited_message: Some(Box::new(wa::message::FutureProofMessage {
+                    message: Some(Box::new(wa::Message::default())),
+                })),
+                ..Default::default()
+            };
+            let (edit, _) = infer_stanza_metadata(&msg);
+            assert_eq!(edit, Some(EditAttribute::MessageEdit));
         }
     }
 

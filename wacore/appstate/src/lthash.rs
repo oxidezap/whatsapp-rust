@@ -56,14 +56,28 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
     #[allow(unused_mut, unused_assignments)]
     let (mut base_remaining, mut input_remaining): (&mut [u8], &[u8]) = (base, input);
 
+    // WA Web treats the accumulator as little-endian u16 lanes
+    // (`new DataView(...).getUint16(off, true)` in WA/Crypto/LtHash.js).
+    // Snapshot/patch MACs are HMACs over the accumulator bytes, so the lane
+    // endianness is part of the wire spec.
     #[cfg(feature = "simd")]
     {
         let (base_chunks, base_rem) = base_remaining.as_chunks_mut::<16>();
         let (input_chunks, input_rem) = input_remaining.as_chunks::<16>();
 
         for (base_chunk, input_chunk) in base_chunks.iter_mut().zip(input_chunks) {
-            let base_simd = u16x8::from_array(bytemuck::cast(*base_chunk));
-            let input_simd = u16x8::from_array(bytemuck::cast(*input_chunk));
+            let mut base_arr: [u16; 8] = bytemuck::cast(*base_chunk);
+            let mut input_arr: [u16; 8] = bytemuck::cast(*input_chunk);
+            if cfg!(target_endian = "big") {
+                for v in &mut base_arr {
+                    *v = v.swap_bytes();
+                }
+                for v in &mut input_arr {
+                    *v = v.swap_bytes();
+                }
+            }
+            let base_simd = u16x8::from_array(base_arr);
+            let input_simd = u16x8::from_array(input_arr);
 
             let result_simd = if subtract {
                 base_simd - input_simd
@@ -71,29 +85,32 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
                 base_simd + input_simd
             };
 
-            *base_chunk = bytemuck::cast(result_simd.to_array());
+            let mut out = result_simd.to_array();
+            if cfg!(target_endian = "big") {
+                for v in &mut out {
+                    *v = v.swap_bytes();
+                }
+            }
+            *base_chunk = bytemuck::cast(out);
         }
 
         base_remaining = base_rem;
         input_remaining = input_rem;
     }
 
-    // Use native endianness to match the SIMD path (bytemuck::cast reinterprets bytes as
-    // native-endian u16). The actual endianness doesn't matter for LTHash correctness —
-    // what matters is that SIMD and scalar paths agree.
     for (base_pair, input_pair) in base_remaining
         .chunks_exact_mut(2)
         .zip(input_remaining.chunks_exact(2))
     {
-        let x = u16::from_ne_bytes([base_pair[0], base_pair[1]]);
-        let y = u16::from_ne_bytes([input_pair[0], input_pair[1]]);
+        let x = u16::from_le_bytes([base_pair[0], base_pair[1]]);
+        let y = u16::from_le_bytes([input_pair[0], input_pair[1]]);
 
         let result = if subtract {
             x.wrapping_sub(y)
         } else {
             x.wrapping_add(y)
         };
-        let bytes = result.to_ne_bytes();
+        let bytes = result.to_le_bytes();
         base_pair[0] = bytes[0];
         base_pair[1] = bytes[1];
     }

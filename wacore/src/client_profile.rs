@@ -10,6 +10,20 @@ pub struct ClientProfile {
     pub os_version: String,
     pub manufacturer: String,
     pub include_web_info: bool,
+    /// `ClientPayload.passive` value on login. WA Web defaults to `false` so
+    /// the server delivers queued offline messages on (re)connect. Set to
+    /// `true` to keep the connection passive (server holds queued messages
+    /// until pulled), matching the whatsmeow convention.
+    pub passive_login: bool,
+    /// `UserAgent.phone_id`. WA Web sends a random UUID per connect; the
+    /// server uses it for anti-abuse / device-tracking heuristics. `None`
+    /// auto-generates a fresh UUID-v4 on every payload build.
+    pub phone_id: Option<String>,
+    /// `UserAgent.locale_language_iso6391` (ISO-639-1, e.g. "pt").
+    pub locale_language: String,
+    /// `UserAgent.locale_country_iso31661_alpha2` (ISO-3166-1 alpha-2,
+    /// e.g. "BR"). The previous hardcoded `"en"` is not a valid country code.
+    pub locale_country: String,
 }
 
 impl Default for ClientProfile {
@@ -26,6 +40,10 @@ impl ClientProfile {
             os_version: "0.1.0".to_string(),
             manufacturer: String::new(),
             include_web_info: true,
+            passive_login: false,
+            phone_id: None,
+            locale_language: "en".to_string(),
+            locale_country: "US".to_string(),
         }
     }
 
@@ -36,6 +54,10 @@ impl ClientProfile {
             os_version: os_version.into(),
             manufacturer: String::new(),
             include_web_info: false,
+            passive_login: false,
+            phone_id: None,
+            locale_language: "en".to_string(),
+            locale_country: "US".to_string(),
         }
     }
 
@@ -46,6 +68,10 @@ impl ClientProfile {
             os_version: os_version.into(),
             manufacturer: String::new(),
             include_web_info: false,
+            passive_login: false,
+            phone_id: None,
+            locale_language: "en".to_string(),
+            locale_country: "US".to_string(),
         }
     }
 
@@ -56,6 +82,10 @@ impl ClientProfile {
             os_version: os_version.into(),
             manufacturer: "Apple".to_string(),
             include_web_info: false,
+            passive_login: false,
+            phone_id: None,
+            locale_language: "en".to_string(),
+            locale_country: "US".to_string(),
         }
     }
 
@@ -66,6 +96,10 @@ impl ClientProfile {
             os_version: os_version.into(),
             manufacturer: "Apple".to_string(),
             include_web_info: false,
+            passive_login: false,
+            phone_id: None,
+            locale_language: "en".to_string(),
+            locale_country: "US".to_string(),
         }
     }
 
@@ -76,6 +110,10 @@ impl ClientProfile {
             os_version: os_version.into(),
             manufacturer: String::new(),
             include_web_info: false,
+            passive_login: false,
+            phone_id: None,
+            locale_language: "en".to_string(),
+            locale_country: "US".to_string(),
         }
     }
 }
