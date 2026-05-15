@@ -156,6 +156,24 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                         notifications,
                         receipts,
                     }));
+
+                // Drive pull-based delivery: without this the server stops
+                // after the ~5-stanza primer and the rest of the backlog is
+                // never delivered (`WAWebOfflineHandler`).
+                if total > 0 {
+                    let client_clone = Arc::clone(&client);
+                    let total_usize = total as usize;
+                    client
+                        .runtime
+                        .spawn(Box::pin(async move {
+                            crate::client::offline_resume::send_first_batch(
+                                client_clone,
+                                total_usize,
+                            )
+                            .await;
+                        }))
+                        .detach();
+                }
             }
             "offline" => {
                 let mut attrs = child.attrs();

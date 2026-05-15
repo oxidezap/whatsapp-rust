@@ -1,6 +1,7 @@
 mod context_impl;
 mod device_registry;
 mod lid_pn;
+pub(crate) mod offline_resume;
 mod sender_keys;
 mod sessions;
 
@@ -454,6 +455,8 @@ pub struct Client {
     pub(crate) presence_subscriptions: Arc<async_lock::Mutex<HashSet<Jid>>>,
     /// Metrics for granular offline sync logging
     pub(crate) offline_sync_metrics: Arc<OfflineSyncMetrics>,
+    /// Drives the WA Web pull-batch loop for offline backlog delivery.
+    pub(crate) offline_batch: Arc<crate::client::offline_resume::OfflineBatchCoordinator>,
     /// Notifier for when the noise socket is established (before login).
     /// Use this to wait for the socket to be ready for sending messages.
     pub(crate) socket_ready_notifier: Arc<event_listener::Event>,
@@ -818,6 +821,7 @@ impl Client {
                 processed_messages: AtomicUsize::new(0),
                 start_time: std::sync::Mutex::new(None),
             }),
+            offline_batch: Arc::new(crate::client::offline_resume::OfflineBatchCoordinator::new()),
 
             enable_auto_reconnect: Arc::new(AtomicBool::new(true)),
             auto_reconnect_errors: Arc::new(AtomicU32::new(0)),
@@ -1188,6 +1192,7 @@ impl Client {
         self.is_ready.store(false, Ordering::Relaxed);
         self.is_connected.store(false, Ordering::Relaxed);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.offline_batch.reset();
         self.outbound_flush.reopen();
 
         // WA Web: both MQTT and DGW transports use a 20s connect timeout.
@@ -1410,6 +1415,7 @@ impl Client {
         self.pending_device_sync.clear().await;
         // Reset offline sync state for next connection
         self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.offline_batch.reset();
         self.offline_sync_metrics
             .active
             .store(false, Ordering::Release);
@@ -1757,6 +1763,12 @@ impl Client {
                 if processed.is_multiple_of(50) || processed == total {
                     trace!(target: "Client/OfflineSync", "Sync Progress: {}/{}", processed, total);
                 }
+
+                // Drive WA Web pull-batch loop (non-adaptive `$13`): when
+                // remaining drops to <=C and no batch request is in flight,
+                // schedule the next one.
+                let pending = total.saturating_sub(processed);
+                crate::client::offline_resume::on_offline_stanza_arrived(self, pending);
 
                 if processed >= total {
                     let elapsed = match self.offline_sync_metrics.start_time.lock() {
