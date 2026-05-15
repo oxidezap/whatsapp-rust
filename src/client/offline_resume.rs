@@ -157,9 +157,13 @@ fn schedule_continuation(client: Arc<Client>, generation: u64) {
                 BATCH_SIZE,
             );
             let _ = send_batch(&client, BATCH_SIZE).await;
-            // Same as send_first_batch: republish so the next first-arrival
-            // wins the CAS regardless of send outcome.
-            client.offline_batch.mark_batch_inflight();
+            // Re-check generation after the await: a disconnect+reconnect+rearm
+            // during the send would leave the coordinator owned by a newer
+            // cycle, and republishing here would overwrite that cycle's CAS
+            // state and let a duplicate continuation slip through.
+            if client.offline_batch.is_armed_for(generation) {
+                client.offline_batch.mark_batch_inflight();
+            }
         }))
         .detach();
 }
