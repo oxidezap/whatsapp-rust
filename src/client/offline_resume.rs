@@ -148,7 +148,7 @@ fn schedule_continuation(client: Arc<Client>, generation: u64) {
             if client.connection_generation.load(Ordering::Acquire) != generation {
                 return;
             }
-            if client.offline_sync_completed.load(Ordering::Relaxed) {
+            if client.offline_sync_completed.load(Ordering::Acquire) {
                 return;
             }
             debug!(
