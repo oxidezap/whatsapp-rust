@@ -98,11 +98,11 @@ pub(crate) async fn send_first_batch(client: Arc<Client>, total: usize) {
         total,
         BATCH_SIZE,
     );
+    // arm() already published prev_batch_inflight=true. Do NOT republish after
+    // the await: an arrival (primer) processed concurrently with this send may
+    // have legitimately won the CAS already, and republishing would let a
+    // second arrival win again and schedule a duplicate continuation.
     let _ = send_batch(&client, BATCH_SIZE).await;
-    // Whether the send succeeded or not, leave prev_batch_inflight=true so the
-    // next observed offline= stanza wins the CAS and either chains the loop
-    // (success) or retries after a transient send error.
-    client.offline_batch.mark_batch_inflight();
 }
 
 /// Called from `process_node` after the per-stanza `processed_messages` bump.
