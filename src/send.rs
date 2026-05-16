@@ -119,9 +119,8 @@ fn meta_node(key: &'static str, value: &'static str) -> Node {
 }
 
 /// Offset subtracted from the current unix timestamp to produce the
-/// `privacy_mode_ts` attr value on a `<biz>` stanza. The value is the one
-/// the upstream Baileys reproducer emits (Issue oxidezap/baileyrs#7) and is
-/// confirmed to work against the live WhatsApp servers.
+/// `privacy_mode_ts` attr value on a `<biz>` stanza. Empirically confirmed
+/// against live WhatsApp servers.
 const BIZ_PRIVACY_MODE_TS_OFFSET: u64 = 77_980_457;
 
 enum BizCategory<'a> {
@@ -233,9 +232,8 @@ fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::Intera
 /// Assemble the `extra_stanza_nodes` vector for a non-newsletter send.
 ///
 /// Order: `inferred_meta`, optional `<bot biz_bot="1"/>` (DM only), `<biz>`,
-/// then any user-provided extra nodes. Matches the upstream Baileys
-/// reproducer (Issue oxidezap/baileyrs#7). Pure so the caller stays trivial
-/// and the assembly logic is unit-testable.
+/// then any user-provided extra nodes. Pure so the caller stays trivial and
+/// the assembly logic is unit-testable.
 fn build_extra_stanza_nodes(
     to: &Jid,
     inferred_meta: Option<Node>,
