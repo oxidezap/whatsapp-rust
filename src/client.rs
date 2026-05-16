@@ -1853,12 +1853,10 @@ impl Client {
         }
     }
 
-    /// Determine if a node should be acknowledged with <ack/>.
-    ///
-    /// Newsletter messages need `<ack class="message">` (per
-    /// `OutMessageDeliverCommonAckMixin`); regular DM/group send a
-    /// `<receipt>` instead. Status broadcasts also need the ack until
-    /// `send_delivery_receipt` stops skipping them.
+    /// Per WA Web (`Handle/MsgSendReceipt.js`), only newsletter `<message>`
+    /// gets `<ack class="message">` on the success path; DM/group/status all
+    /// use `<receipt>`. Failure paths (retry/backfill/nack) emit `<ack>` from
+    /// their dedicated handlers, not via this gate.
     fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         let tag = node.tag.as_ref();
         if node.get_attr("id").is_none() {
@@ -1869,9 +1867,7 @@ impl Client {
         };
         match tag {
             "receipt" | "notification" | "call" => true,
-            "message" => from
-                .to_jid()
-                .is_some_and(|j| j.is_newsletter() || j.is_status_broadcast()),
+            "message" => from.to_jid().is_some_and(|j| j.is_newsletter()),
             _ => false,
         }
     }
@@ -4143,15 +4139,15 @@ mod tests {
             "should_ack must return TRUE for newsletter <message>."
         );
 
-        // send_delivery_receipt skips status@broadcast, so the ack stays
-        // as the server-level acknowledgement until receipts cover it.
+        // WA Web sends `<receipt context="status">` for status@broadcast,
+        // not `<ack>`. send_delivery_receipt covers it.
         let mut status_attrs = Attrs::new();
         status_attrs.insert("from".to_string(), "status@broadcast".to_string());
         status_attrs.insert("id".to_string(), "MSG-STATUS-1".to_string());
         let status_message = Node::new("message", status_attrs, None);
         assert!(
-            client.should_ack(&status_message.as_node_ref()),
-            "should_ack must return TRUE for status@broadcast <message> until receipts cover it."
+            !client.should_ack(&status_message.as_node_ref()),
+            "should_ack must return FALSE for status@broadcast <message> (receipt covers it)."
         );
 
         info!(
