@@ -2156,7 +2156,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "typed-builder",
- "uuid",
  "wacore-appstate",
  "wacore-binary",
  "wacore-derive",

@@ -50,7 +50,6 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 typed-builder = "0.23"
-uuid = { workspace = true, features = ["v4"] }
 wacore-appstate = { workspace = true }
 wacore-binary = { workspace = true, features = ["serde"] }
 wacore-derive = { workspace = true }

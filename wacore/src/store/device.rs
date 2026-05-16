@@ -82,10 +82,9 @@ fn build_base_client_payload(
     app_version: wa::client_payload::user_agent::AppVersion,
     profile: &ClientProfile,
 ) -> wa::ClientPayload {
-    let phone_id = profile
-        .phone_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // WA Web (`Client/Payload.js`) never sets `UserAgent.phoneId`; a previous
+    // audit auto-generated a UUID per build, which the server flagged as a
+    // rotating device fingerprint and silently invalidated the session.
     wa::ClientPayload {
         user_agent: Some(wa::client_payload::UserAgent {
             platform: Some(profile.user_agent_platform as i32),
@@ -99,7 +98,7 @@ fn build_base_client_payload(
             os_build_number: Some(profile.os_version.clone()),
             locale_language_iso6391: Some(profile.locale_language.clone()),
             locale_country_iso31661_alpha2: Some(profile.locale_country.clone()),
-            phone_id: Some(phone_id),
+            phone_id: profile.phone_id.clone(),
             ..Default::default()
         }),
         web_info: profile
@@ -431,9 +430,12 @@ impl Device {
         payload.username = jid.user.parse::<u64>().ok();
         payload.device = Some(jid.device as u32);
         payload.passive = Some(self.client_profile.passive_login);
+        // WA Web's `Get/ClientPayloadForLogin.js` hardcodes `pull: true` on
+        // the login wrapper; only `passive` is dynamic.
+        payload.pull = Some(true);
         payload.lc = Some(self.login_counter);
-        // Always false: the lib has no LID migration path. WA Web sends this
-        // unconditionally so the server can branch on it.
+        // Hardcoded false: no LID migration path here. WA Web sends this on
+        // every login so the server can branch on it.
         payload.lid_db_migrated = Some(false);
         payload
     }
@@ -751,6 +753,123 @@ mod tests {
                 "{platform:?} must omit web_info"
             );
         }
+    }
+
+    /// Per-connect `phone_id` UUID is flagged by the server as a rotating
+    /// fingerprint and silently kills the session. Must stay omitted.
+    #[test]
+    fn phone_id_default_is_omitted_and_payload_is_deterministic() {
+        let device = Device::new();
+        let payload_a = device.get_client_payload();
+        let payload_b = device.get_client_payload();
+        let ua_a = payload_a.user_agent.as_ref().expect("user_agent");
+        let ua_b = payload_b.user_agent.as_ref().expect("user_agent");
+        assert!(
+            ua_a.phone_id.is_none(),
+            "default ClientProfile must leave UserAgent.phoneId unset (got {:?})",
+            ua_a.phone_id
+        );
+        assert_eq!(
+            ua_a.phone_id, ua_b.phone_id,
+            "phoneId must not change between payload builds"
+        );
+        // Wire-level determinism: encoded bytes must match across builds.
+        let bytes_a = payload_a.encode_to_vec();
+        let bytes_b = payload_b.encode_to_vec();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "get_client_payload() must be deterministic across calls"
+        );
+    }
+
+    #[test]
+    fn phone_id_passes_through_from_profile_when_set() {
+        let mut profile = ClientProfile::web();
+        profile.phone_id = Some("fixed-test-id".to_string());
+        let mut device = Device::new();
+        device.set_client_profile(profile);
+
+        let payload = device.get_client_payload();
+        let ua = payload.user_agent.expect("user_agent");
+        assert_eq!(ua.phone_id.as_deref(), Some("fixed-test-id"));
+    }
+
+    #[test]
+    fn login_payload_phone_id_is_omitted_by_default() {
+        let mut device = Device::new();
+        device.pn = Some("12345:0@s.whatsapp.net".parse().unwrap());
+        let payload = device.get_client_payload();
+        let ua = payload.user_agent.expect("user_agent");
+        assert!(
+            ua.phone_id.is_none(),
+            "login payload phoneId must be omitted (WA Web compliance)"
+        );
+    }
+
+    /// `lc` must be bumped per successful login, not stuck at 0.
+    #[test]
+    fn login_payload_lc_reflects_login_counter() {
+        use crate::store::commands::{DeviceCommand, apply_command_to_device};
+
+        let mut device = Device::new();
+        device.pn = Some("12345:0@s.whatsapp.net".parse().unwrap());
+
+        // Fresh device: lc = 0.
+        assert_eq!(device.get_client_payload().lc, Some(0));
+
+        // After one successful login (one IncrementLoginCounter dispatch),
+        // the NEXT payload's lc must be 1.
+        apply_command_to_device(&mut device, DeviceCommand::IncrementLoginCounter);
+        assert_eq!(device.get_client_payload().lc, Some(1));
+
+        apply_command_to_device(&mut device, DeviceCommand::IncrementLoginCounter);
+        apply_command_to_device(&mut device, DeviceCommand::IncrementLoginCounter);
+        assert_eq!(device.get_client_payload().lc, Some(3));
+    }
+
+    /// `Get/ClientPayloadForLogin.js` hardcodes `pull: true` on login wrapper.
+    #[test]
+    fn login_payload_pull_is_true() {
+        let mut device = Device::new();
+        device.pn = Some("12345:0@s.whatsapp.net".parse().unwrap());
+        let payload = device.get_client_payload();
+        assert_eq!(
+            payload.pull,
+            Some(true),
+            "login payload must send pull=true (WA Web compliance)"
+        );
+    }
+
+    #[test]
+    fn registration_payload_pull_is_false() {
+        // Fresh device without `pn` exercises the registration path.
+        let device = Device::new();
+        assert!(device.pn.is_none());
+        let payload = device.get_client_payload();
+        assert_eq!(
+            payload.pull,
+            Some(false),
+            "registration payload must send pull=false"
+        );
+    }
+
+    /// `lc` must survive process restarts (WA Web persists in IndexedDB).
+    #[test]
+    fn login_counter_survives_serde_roundtrip() {
+        use crate::store::commands::{DeviceCommand, apply_command_to_device};
+
+        let mut device = Device::new();
+        for _ in 0..5 {
+            apply_command_to_device(&mut device, DeviceCommand::IncrementLoginCounter);
+        }
+        assert_eq!(device.login_counter, 5);
+
+        let json = serde_json::to_string(&device).expect("serialize");
+        let restored: Device = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            restored.login_counter, 5,
+            "login_counter must survive Device serde roundtrip"
+        );
     }
 
     /// Backward compat: missing `account` field deserializes as `None`.
