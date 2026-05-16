@@ -1853,12 +1853,18 @@ impl Client {
         }
     }
 
-    /// Determine if a node should be acknowledged with <ack/>.
+    /// Per WA Web (`Handle/MsgSendReceipt.js`), only newsletter `<message>`
+    /// gets `<ack class="message">` on the success path; DM/group use
+    /// `<receipt>`. Failure paths (retry/backfill/nack) emit `<ack>` from
+    /// their dedicated handlers, not via this gate.
     ///
-    /// Newsletter messages need `<ack class="message">` (per
-    /// `OutMessageDeliverCommonAckMixin`); regular DM/group send a
-    /// `<receipt>` instead. Status broadcasts also need the ack until
-    /// `send_delivery_receipt` stops skipping them.
+    /// status@broadcast is included as a fallback: drop paths in
+    /// `process_group_enc_batch` (expired status, missing sender key, generic
+    /// decrypt error) intentionally skip the delivery receipt to avoid
+    /// inflating the server-side offline counter for messages we'll never
+    /// process. Without the transport `<ack>` from this gate, the server
+    /// would redeliver indefinitely. WA Web emits `<receipt context="status">`
+    /// in the success path on top of this; the duplicate is tolerated.
     fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         let tag = node.tag.as_ref();
         if node.get_attr("id").is_none() {
@@ -2144,6 +2150,25 @@ impl Client {
                         .await;
                 }
             }
+
+            // WA Web bumps `lc` after each successful auth (Start/Backend.js
+            // listener on `onOpenSocketStream`). The Comms `onConnect` handler
+            // gates the trigger on `isRegistered()`, so the bump only happens
+            // for already-paired logins — never during the pairing XX
+            // handshake. We mirror that by skipping when `device.pn` is None.
+            let already_paired = client_clone
+                .persistence_manager
+                .get_device_snapshot()
+                .await
+                .pn
+                .is_some();
+            if already_paired {
+                client_clone
+                    .persistence_manager
+                    .process_command(DeviceCommand::IncrementLoginCounter)
+                    .await;
+            }
+
             // Macro to check if this task is still valid (connection hasn't been replaced)
             macro_rules! check_generation {
                 () => {
@@ -4133,15 +4158,18 @@ mod tests {
             "should_ack must return TRUE for newsletter <message>."
         );
 
-        // send_delivery_receipt skips status@broadcast, so the ack stays
-        // as the server-level acknowledgement until receipts cover it.
+        // status@broadcast gets the transport <ack> as a fallback so that
+        // drop paths in process_group_enc_batch (expired status, missing
+        // sender key, decrypt error) don't leave the server retransmitting.
+        // The success path also emits <receipt context="status">; the
+        // duplicate is tolerated.
         let mut status_attrs = Attrs::new();
         status_attrs.insert("from".to_string(), "status@broadcast".to_string());
         status_attrs.insert("id".to_string(), "MSG-STATUS-1".to_string());
         let status_message = Node::new("message", status_attrs, None);
         assert!(
             client.should_ack(&status_message.as_node_ref()),
-            "should_ack must return TRUE for status@broadcast <message> until receipts cover it."
+            "should_ack must return TRUE for status@broadcast <message> (fallback for drop paths)."
         );
 
         info!(

@@ -227,12 +227,11 @@ mod tests {
         );
     }
 
-    /// Regression for the field report from baileyrs (PR #576): if the outer
-    /// wrapping future is dropped *before its first poll* (e.g. the executor
-    /// is shutting down), the guard must still be dropped so the counter
-    /// decrements. Before the fix (guard constructed INSIDE the async body),
-    /// this would leak the counter and cause `flush()` to wait its full
-    /// timeout on every disconnect.
+    /// If the outer wrapping future is dropped *before its first poll* (e.g.
+    /// the executor is shutting down), the guard must still be dropped so the
+    /// counter decrements. Before the fix (guard constructed INSIDE the async
+    /// body), this would leak the counter and cause `flush()` to wait its
+    /// full timeout on every disconnect.
     #[tokio::test]
     async fn decrement_runs_when_future_is_dropped_before_first_poll() {
         let scope = Arc::new(FlushScope::new());

@@ -97,17 +97,19 @@ fn regression_a4_login_payload_passive_is_configurable() {
     assert_eq!(device.get_client_payload().passive, Some(true));
 }
 
-// A5. UserAgent: phone_id is UUID v4, locale country is ISO-3166-1 alpha-2.
+// A5. UserAgent: phone_id is omitted by default (WA Web parity, see
+// Client/Payload.js), locale country is ISO-3166-1 alpha-2.
 
 #[test]
-fn regression_a5_useragent_phone_id_is_uuid_v4_by_default() {
+fn regression_a5_useragent_phone_id_is_omitted_by_default() {
     let mut device = Device::new();
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
 
     let user_agent = device.get_client_payload().user_agent.unwrap();
-    let phone_id = user_agent.phone_id.expect("phone_id must be populated");
-    let parsed = uuid::Uuid::parse_str(&phone_id).expect("phone_id must be a valid UUID");
-    assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+    assert!(
+        user_agent.phone_id.is_none(),
+        "phone_id must stay unset on the wire (WA Web never assigns UserAgent.phoneId)"
+    );
 }
 
 #[test]
