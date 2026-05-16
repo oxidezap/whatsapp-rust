@@ -2144,6 +2144,16 @@ impl Client {
                         .await;
                 }
             }
+
+            // WA Web bumps `lc` after each successful auth (Start/Backend.js
+            // listener on `onOpenSocketStream`, fired by Comms `onConnect`
+            // post-handshake). Server treats a flat-zero counter as an
+            // anti-abuse signal and silently invalidates the session.
+            client_clone
+                .persistence_manager
+                .process_command(DeviceCommand::IncrementLoginCounter)
+                .await;
+
             // Macro to check if this task is still valid (connection hasn't been replaced)
             macro_rules! check_generation {
                 () => {
