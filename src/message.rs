@@ -16,6 +16,7 @@ use wacore::libsignal::protocol::{
     PublicKey as SignalPublicKey, SENDERKEY_MESSAGE_CURRENT_VERSION,
 };
 use wacore::message_processing::EncType;
+use wacore::protocol::nack::NackReason;
 use wacore::types::jid::{JidExt, make_sender_key_name};
 use wacore_binary::Jid;
 use wacore_binary::JidExt as _;
@@ -764,11 +765,30 @@ impl Client {
             let enc_type_str = enc_type.as_wire_str();
             let padding_version = payload.padding_version;
 
+            // WA Web `MsgSendReceipt.js` nacks PARSE_ERROR; without it the
+            // server retransmits the malformed stanza forever. Mirrors the
+            // `handle_decrypt_failure` shape (dispatch event + spawn wire I/O
+            // so the session lock isn't held across the send).
             let parsed_message = if enc_type == EncType::PreKeyMessage {
                 match PreKeySignalMessage::try_from(ciphertext) {
                     Ok(m) => CiphertextMessage::PreKeySignalMessage(m),
                     Err(e) => {
-                        log::error!("Failed to parse PreKeySignalMessage: {e:?}");
+                        log::error!(
+                            "[msg:{}] Failed to parse PreKeySignalMessage from {}: {e:?}. Sending nack.",
+                            info.id,
+                            info.source.sender
+                        );
+                        // |= so a later dedup'd return (false) can't clobber
+                        // a true set by a prior iteration in this batch.
+                        dispatched_undecryptable |= self
+                            .dispatch_undecryptable_event(
+                                Arc::clone(info),
+                                false,
+                                crate::types::events::UnavailableType::Unknown,
+                                decrypt_fail_mode,
+                            )
+                            .await;
+                        self.spawn_nack(info, NackReason::ParsingError, None);
                         continue;
                     }
                 }
@@ -776,7 +796,20 @@ impl Client {
                 match SignalMessage::try_from(ciphertext) {
                     Ok(m) => CiphertextMessage::SignalMessage(m),
                     Err(e) => {
-                        log::error!("Failed to parse SignalMessage: {e:?}");
+                        log::error!(
+                            "[msg:{}] Failed to parse SignalMessage from {}: {e:?}. Sending nack.",
+                            info.id,
+                            info.source.sender
+                        );
+                        dispatched_undecryptable |= self
+                            .dispatch_undecryptable_event(
+                                Arc::clone(info),
+                                false,
+                                crate::types::events::UnavailableType::Unknown,
+                                decrypt_fail_mode,
+                            )
+                            .await;
+                        self.spawn_nack(info, NackReason::ParsingError, None);
                         continue;
                     }
                 }
@@ -1116,14 +1149,23 @@ impl Client {
                             .await;
                         continue;
                     } else {
-                        // For other unexpected errors, just log them
+                        // Catch-all → WA Web's UnhandledError nack (500).
                         log::error!(
-                            "[msg:{}] Batch session decrypt failed (type: {}) from {}: {:?}",
+                            "[msg:{}] Batch session decrypt failed (type: {}) from {}: {:?}. Sending nack.",
                             info.id,
                             enc_type,
                             info.source.sender,
                             e
                         );
+                        dispatched_undecryptable |= self
+                            .dispatch_undecryptable_event(
+                                Arc::clone(info),
+                                false,
+                                crate::types::events::UnavailableType::Unknown,
+                                decrypt_fail_mode,
+                            )
+                            .await;
+                        self.spawn_nack(info, NackReason::UnhandledError, None);
                         continue;
                     }
                 }
@@ -5779,6 +5821,165 @@ mod tests {
             &event.is_unavailable,
             &event.unavailable_type,
             &event.decrypt_fail_mode,
+        );
+    }
+
+    /// Seed `device.pn` so `send_nack` clears its `get_pn()` guard.
+    async fn seed_test_pn(client: &Arc<Client>) {
+        use crate::store::commands::DeviceCommand;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(
+                "5511000000001:0@s.whatsapp.net"
+                    .parse()
+                    .expect("test PN should parse"),
+            )))
+            .await;
+    }
+
+    /// Build a Client wired to a CapturingMockTransport + a noise socket so
+    /// `send_node` reaches the wire. Returns the transport so the caller can
+    /// inspect captured frames.
+    async fn capturing_client(
+        test_id: &str,
+    ) -> (
+        Arc<Client>,
+        Arc<crate::transport::mock::CapturingMockTransport>,
+    ) {
+        use crate::socket::NoiseSocket;
+        use crate::store::SqliteStore;
+        use crate::store::persistence_manager::PersistenceManager;
+        use crate::transport::mock::CapturingMockTransportFactory;
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        use wacore::handshake::NoiseCipher;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique_id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let db_name = format!(
+            "file:memdb_capt_{}_{}_{}?mode=memory&cache=shared",
+            test_id,
+            unique_id,
+            std::process::id()
+        );
+
+        let backend = Arc::new(
+            SqliteStore::new(&db_name)
+                .await
+                .expect("test backend should initialize"),
+        );
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        let factory = CapturingMockTransportFactory::new();
+        let transport = factory.transport();
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(factory),
+            Arc::new(MockHttpClient),
+            None,
+        )
+        .await;
+
+        let key = [0u8; 32];
+        let write_key = NoiseCipher::new(&key).expect("32-byte key");
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        let noise_socket = NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            transport.clone() as Arc<dyn crate::transport::Transport>,
+            write_key,
+            read_key,
+        );
+        // send_node only needs noise_socket Some; is_connected is read by
+        // other layers but not on this path.
+        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        seed_test_pn(&client).await;
+        (client, transport)
+    }
+
+    /// Regression: a malformed pkmsg used to fall through silently. Now
+    /// it dispatches the consumer event AND emits a nack on the wire so
+    /// the server stops retransmitting.
+    #[tokio::test]
+    async fn pkmsg_parse_error_dispatches_parsing_error_nack() {
+        use crate::types::events::DecryptFailMode;
+        use wacore::message_processing::EncType;
+
+        let (client, transport) = capturing_client("pkmsg_parse_nack").await;
+        let info = Arc::new(create_test_message_info(
+            "5511999998888@s.whatsapp.net",
+            "REGRESSION_PKMSG_PARSE",
+            "5511777776666@s.whatsapp.net",
+        ));
+        let sender_jid: Jid = info.source.sender.clone();
+
+        // 1-byte ciphertext is a guaranteed parse failure.
+        let bad_payload = EncPayload {
+            ciphertext: bytes::Bytes::from_static(&[0xFF]),
+            enc_type: EncType::PreKeyMessage,
+            padding_version: 2,
+        };
+
+        let (any_success, any_duplicate, dispatched_undecryptable) = client
+            .process_session_enc_batch(&[bad_payload], &info, &sender_jid, DecryptFailMode::Show)
+            .await;
+
+        assert!(!any_success);
+        assert!(!any_duplicate);
+        assert!(dispatched_undecryptable);
+
+        // spawn_nack is detached; give it a tick to flush through the
+        // noise_socket sender_task to our CapturingMockTransport.
+        for _ in 0..40 {
+            if !transport.sent().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let sent = transport.sent();
+        assert!(
+            !sent.is_empty(),
+            "spawn_nack must produce at least one outbound frame on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_message_parse_error_dispatches_parsing_error_nack() {
+        use crate::types::events::DecryptFailMode;
+        use wacore::message_processing::EncType;
+
+        let (client, transport) = capturing_client("sig_parse_nack").await;
+        let info = Arc::new(create_test_message_info(
+            "5511999998888@s.whatsapp.net",
+            "REGRESSION_SIG_PARSE",
+            "5511777776666@s.whatsapp.net",
+        ));
+        let sender_jid: Jid = info.source.sender.clone();
+
+        let bad_payload = EncPayload {
+            ciphertext: bytes::Bytes::from_static(&[0xFF]),
+            enc_type: EncType::Message,
+            padding_version: 2,
+        };
+
+        let (_any_success, _any_duplicate, dispatched_undecryptable) = client
+            .process_session_enc_batch(&[bad_payload], &info, &sender_jid, DecryptFailMode::Show)
+            .await;
+
+        assert!(dispatched_undecryptable);
+
+        for _ in 0..40 {
+            if !transport.sent().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !transport.sent().is_empty(),
+            "spawn_nack must produce at least one outbound frame on the wire"
         );
     }
 }
