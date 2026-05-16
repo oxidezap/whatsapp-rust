@@ -1854,9 +1854,17 @@ impl Client {
     }
 
     /// Per WA Web (`Handle/MsgSendReceipt.js`), only newsletter `<message>`
-    /// gets `<ack class="message">` on the success path; DM/group/status all
-    /// use `<receipt>`. Failure paths (retry/backfill/nack) emit `<ack>` from
+    /// gets `<ack class="message">` on the success path; DM/group use
+    /// `<receipt>`. Failure paths (retry/backfill/nack) emit `<ack>` from
     /// their dedicated handlers, not via this gate.
+    ///
+    /// status@broadcast is included as a fallback: drop paths in
+    /// `process_group_enc_batch` (expired status, missing sender key, generic
+    /// decrypt error) intentionally skip the delivery receipt to avoid
+    /// inflating the server-side offline counter for messages we'll never
+    /// process. Without the transport `<ack>` from this gate, the server
+    /// would redeliver indefinitely. WA Web emits `<receipt context="status">`
+    /// in the success path on top of this; the duplicate is tolerated.
     fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         let tag = node.tag.as_ref();
         if node.get_attr("id").is_none() {
@@ -1867,7 +1875,9 @@ impl Client {
         };
         match tag {
             "receipt" | "notification" | "call" => true,
-            "message" => from.to_jid().is_some_and(|j| j.is_newsletter()),
+            "message" => from
+                .to_jid()
+                .is_some_and(|j| j.is_newsletter() || j.is_status_broadcast()),
             _ => false,
         }
     }
@@ -4139,15 +4149,18 @@ mod tests {
             "should_ack must return TRUE for newsletter <message>."
         );
 
-        // WA Web sends `<receipt context="status">` for status@broadcast,
-        // not `<ack>`. send_delivery_receipt covers it.
+        // status@broadcast gets the transport <ack> as a fallback so that
+        // drop paths in process_group_enc_batch (expired status, missing
+        // sender key, decrypt error) don't leave the server retransmitting.
+        // The success path also emits <receipt context="status">; the
+        // duplicate is tolerated.
         let mut status_attrs = Attrs::new();
         status_attrs.insert("from".to_string(), "status@broadcast".to_string());
         status_attrs.insert("id".to_string(), "MSG-STATUS-1".to_string());
         let status_message = Node::new("message", status_attrs, None);
         assert!(
-            !client.should_ack(&status_message.as_node_ref()),
-            "should_ack must return FALSE for status@broadcast <message> (receipt covers it)."
+            client.should_ack(&status_message.as_node_ref()),
+            "should_ack must return TRUE for status@broadcast <message> (fallback for drop paths)."
         );
 
         info!(
