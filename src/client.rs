@@ -2152,13 +2152,22 @@ impl Client {
             }
 
             // WA Web bumps `lc` after each successful auth (Start/Backend.js
-            // listener on `onOpenSocketStream`, fired by Comms `onConnect`
-            // post-handshake). Server treats a flat-zero counter as an
-            // anti-abuse signal and silently invalidates the session.
-            client_clone
+            // listener on `onOpenSocketStream`). The Comms `onConnect` handler
+            // gates the trigger on `isRegistered()`, so the bump only happens
+            // for already-paired logins — never during the pairing XX
+            // handshake. We mirror that by skipping when `device.pn` is None.
+            let already_paired = client_clone
                 .persistence_manager
-                .process_command(DeviceCommand::IncrementLoginCounter)
-                .await;
+                .get_device_snapshot()
+                .await
+                .pn
+                .is_some();
+            if already_paired {
+                client_clone
+                    .persistence_manager
+                    .process_command(DeviceCommand::IncrementLoginCounter)
+                    .await;
+            }
 
             // Macro to check if this task is still valid (connection hasn't been replaced)
             macro_rules! check_generation {

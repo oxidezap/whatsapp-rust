@@ -853,6 +853,18 @@ mod tests {
         );
     }
 
+    /// `lc` is part of the LOGIN payload only. Registration payloads use a
+    /// different protobuf path (`get_registration_payload`) that doesn't read
+    /// it; the field MUST stay None on the wire there, matching WA Web's
+    /// `getClientPayloadForRegistration` which omits the field.
+    #[test]
+    fn registration_payload_does_not_carry_lc() {
+        let device = Device::new();
+        assert!(device.pn.is_none());
+        let payload = device.get_client_payload();
+        assert!(payload.lc.is_none(), "registration payload must omit lc");
+    }
+
     /// `lc` must survive process restarts (WA Web persists in IndexedDB).
     #[test]
     fn login_counter_survives_serde_roundtrip() {
