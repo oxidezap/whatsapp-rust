@@ -11,7 +11,10 @@ use wacore_binary::OwnedNodeRef;
 
 /// Pure builder for the delivery `<receipt>` node. Extracted so unit tests
 /// can assert wire shape without spinning a transport. Mirrors WA Web's
-/// `Send/DeliveryReceiptJob.js` (`<receipt id to type? participant? context?>`).
+/// `Send/DeliveryReceiptJob.js` — the participant gate there is
+/// `(t.isGroup() || t.isBroadcast()) && r ? DEVICE_JID(r) : DROP_ATTR`, so
+/// status broadcasts (isBroadcast = true) also carry the original poster's
+/// JID. Without it the server can't map the ack back to the status owner.
 fn build_delivery_receipt_node(info: &crate::types::message::MessageInfo) -> wacore_binary::Node {
     let mut builder = NodeBuilder::new("receipt")
         .attr("id", &info.id)
@@ -21,11 +24,12 @@ fn build_delivery_receipt_node(info: &crate::types::message::MessageInfo) -> wac
         builder = builder.attr("type", "peer_msg");
     }
 
-    if info.source.is_group {
+    let is_status = info.source.chat.is_status_broadcast();
+    if info.source.is_group || is_status {
         builder = builder.attr("participant", &info.source.sender);
     }
 
-    if info.source.chat.is_status_broadcast() {
+    if is_status {
         builder = builder.attr("context", "status");
     }
 
@@ -297,9 +301,11 @@ mod tests {
     }
 
     #[test]
-    fn delivery_receipt_for_status_broadcast_carries_context_status() {
-        // `Send/DeliveryReceiptJob.js` emits `<receipt context="status">` for
-        // status messages; without the attr the server keeps retransmitting.
+    fn delivery_receipt_for_status_broadcast_carries_context_status_and_participant() {
+        // WA Web's gate is `(isGroup || isBroadcast) && participant` for the
+        // participant attr, and `isStatus && gating` for context — see
+        // `Send/DeliveryReceiptJob.js`. Status broadcasts must carry BOTH so
+        // the server can map the ack back to the status owner.
         let info = info_with("status@broadcast", "12345@s.whatsapp.net", false);
         let node = build_delivery_receipt_node(&info);
         assert_eq!(node.tag, "receipt");
@@ -307,7 +313,10 @@ mod tests {
             node.attrs.get("context").map(|v| v.as_str()).as_deref(),
             Some("status")
         );
-        assert!(node.attrs.get("participant").is_none());
+        assert_eq!(
+            node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
+            Some("12345@s.whatsapp.net")
+        );
     }
 
     #[test]
@@ -341,6 +350,39 @@ mod tests {
     }
 
     #[test]
+    fn delivery_receipt_for_peer_dm_carries_type_peer_msg() {
+        // category=Peer + DM (self device sync) → type="peer_msg", no
+        // participant, no context. Matches WA Web's DROP_ATTR gating.
+        let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        info.category = MessageCategory::Peer;
+        let node = build_delivery_receipt_node(&info);
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("peer_msg")
+        );
+        assert!(node.attrs.get("participant").is_none());
+        assert!(node.attrs.get("context").is_none());
+    }
+
+    #[test]
+    fn delivery_receipt_for_status_broadcast_keeps_participant_even_with_peer_type() {
+        // Defensive: if a status broadcast ever surfaces with category=Peer,
+        // the participant attr must still be there — server identifies the
+        // status owner from it regardless of the peer_msg type.
+        let mut info = info_with("status@broadcast", "12345@s.whatsapp.net", false);
+        info.category = MessageCategory::Peer;
+        let node = build_delivery_receipt_node(&info);
+        assert_eq!(
+            node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
+            Some("12345@s.whatsapp.net")
+        );
+        assert_eq!(
+            node.attrs.get("context").map(|v| v.as_str()).as_deref(),
+            Some("status")
+        );
+    }
+
+    #[test]
     fn should_send_delivery_receipt_skips_newsletter() {
         let info = info_with(
             "120363298765432100@newsletter",
@@ -348,6 +390,32 @@ mod tests {
             false,
         );
         assert!(!Client::should_send_delivery_receipt(&info));
+    }
+
+    #[test]
+    fn should_send_delivery_receipt_skips_empty_id() {
+        let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        info.id = String::new();
+        assert!(!Client::should_send_delivery_receipt(&info));
+    }
+
+    #[test]
+    fn should_send_delivery_receipt_skips_own_dm() {
+        // Self-sent DM with category=Regular: no receipt (we don't ack our own
+        // messages). Peer-category self-sync messages are handled below.
+        let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        info.source.is_from_me = true;
+        assert!(!Client::should_send_delivery_receipt(&info));
+    }
+
+    #[test]
+    fn should_send_delivery_receipt_allows_own_peer_msg() {
+        // Self-synced messages from the primary phone (category=Peer) DO need
+        // a receipt with type="peer_msg", per the WA Web `OUR_OWN_DEVICE` ack.
+        let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        info.source.is_from_me = true;
+        info.category = MessageCategory::Peer;
+        assert!(Client::should_send_delivery_receipt(&info));
     }
 
     #[tokio::test]
