@@ -1,8 +1,10 @@
 use crate::client::Client;
 use crate::types::events::{Event, Receipt};
+use crate::types::message::MessageInfo;
 use crate::types::presence::ReceiptType;
 use log::debug;
 use std::sync::Arc;
+use wacore::protocol::nack::NackReason;
 use wacore::types::message::MessageCategory;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, JidExt as _};
@@ -31,6 +33,43 @@ fn build_delivery_receipt_node(info: &crate::types::message::MessageInfo) -> wac
 
     if is_status {
         builder = builder.attr("context", "status");
+    }
+
+    builder.build()
+}
+
+/// `<ack class="message" error=N>` builder, mirrors WA Web's
+/// `Handle/MsgSendAck.js::sendNack`. `failure_reason` is only emitted
+/// for `InvalidProtobuf` (as `<meta failure_reason=N>` child).
+fn build_nack_node(
+    info: &MessageInfo,
+    own_pn: &Jid,
+    reason: NackReason,
+    failure_reason: Option<i32>,
+) -> wacore_binary::Node {
+    let mut builder = NodeBuilder::new("ack")
+        .attr("class", "message")
+        .attr("id", &info.id)
+        .attr("from", own_pn)
+        .attr("to", &info.source.chat)
+        .attr("error", reason.code().to_string());
+
+    let is_status = info.source.chat.is_status_broadcast();
+    if info.source.is_group || is_status {
+        builder = builder.attr("participant", &info.source.sender);
+    }
+
+    if !info.r#type.is_empty() {
+        builder = builder.attr("type", &info.r#type);
+    }
+
+    if reason == NackReason::InvalidProtobuf
+        && let Some(code) = failure_reason
+    {
+        let meta = NodeBuilder::new("meta")
+            .attr("failure_reason", code.to_string())
+            .build();
+        builder = builder.children(vec![meta]);
     }
 
     builder.build()
@@ -231,6 +270,57 @@ impl Client {
         }
     }
 
+    /// Spawn an async nack so the caller doesn't await network I/O while
+    /// holding a session lock. Mirrors `spawn_retry_receipt`.
+    pub(crate) fn spawn_nack(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        reason: NackReason,
+        failure_reason: Option<i32>,
+    ) {
+        let client = Arc::clone(self);
+        let info = Arc::clone(info);
+        self.runtime
+            .spawn(Box::pin(async move {
+                client.send_nack(&info, reason, failure_reason).await;
+            }))
+            .detach();
+    }
+
+    /// Emits a nack so the server stops retransmitting an unrecoverable
+    /// failure. Prefer [`Client::send_retry_receipt`] for recoverable
+    /// errors (BadMac, NoSession, etc).
+    pub(crate) async fn send_nack(
+        &self,
+        info: &MessageInfo,
+        reason: NackReason,
+        failure_reason: Option<i32>,
+    ) {
+        if info.id.is_empty() {
+            return;
+        }
+        let Some(own_pn) = self.get_pn().await else {
+            log::debug!(
+                "[msg:{}] Skipping nack ({:?}): own PN not yet set",
+                info.id,
+                reason
+            );
+            return;
+        };
+
+        let nack = build_nack_node(info, &own_pn, reason, failure_reason);
+        debug!(target: "Client/Receipt",
+            "Sending nack (reason={:?}, code={}) for message {} from {}",
+            reason, reason.code(), info.id, info.source.sender);
+
+        if let Err(e) = self.send_node(nack).await
+            && !matches!(e, crate::client::ClientError::NotConnected)
+        {
+            log::warn!(target: "Client/Receipt",
+                "Failed to send nack for message {}: {:?}", info.id, e);
+        }
+    }
+
     /// Sends read receipts for one or more messages.
     ///
     /// For group messages, pass the message sender as `sender`.
@@ -380,6 +470,120 @@ mod tests {
             node.attrs.get("context").map(|v| v.as_str()).as_deref(),
             Some("status")
         );
+    }
+
+    fn own_pn() -> Jid {
+        "5511000000001:0@s.whatsapp.net"
+            .parse()
+            .expect("own PN should parse")
+    }
+
+    #[test]
+    fn nack_for_dm_carries_class_message_and_error_code() {
+        let info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None);
+
+        assert_eq!(node.tag, "ack");
+        assert_eq!(
+            node.attrs.get("class").map(|v| v.as_str()).as_deref(),
+            Some("message")
+        );
+        assert_eq!(
+            node.attrs.get("error").map(|v| v.as_str()).as_deref(),
+            Some("487")
+        );
+        assert_eq!(
+            node.attrs.get("id").map(|v| v.as_str()).as_deref(),
+            Some("MID")
+        );
+        assert!(node.attrs.get("from").is_some());
+        assert!(node.attrs.get("to").is_some());
+        assert!(node.attrs.get("participant").is_none());
+    }
+
+    #[test]
+    fn nack_for_group_carries_participant() {
+        let info = info_with(
+            "120363021033254949@g.us",
+            "15551234567@s.whatsapp.net",
+            true,
+        );
+        let node = build_nack_node(&info, &own_pn(), NackReason::UnhandledError, None);
+
+        assert_eq!(
+            node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
+            Some("15551234567@s.whatsapp.net")
+        );
+        assert_eq!(
+            node.attrs.get("error").map(|v| v.as_str()).as_deref(),
+            Some("500")
+        );
+    }
+
+    #[test]
+    fn nack_for_status_broadcast_carries_participant() {
+        let info = info_with("status@broadcast", "12345@s.whatsapp.net", false);
+        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None);
+
+        assert_eq!(
+            node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
+            Some("12345@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn nack_invalid_protobuf_includes_meta_failure_reason() {
+        let info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        let node = build_nack_node(&info, &own_pn(), NackReason::InvalidProtobuf, Some(42));
+
+        assert_eq!(
+            node.attrs.get("error").map(|v| v.as_str()).as_deref(),
+            Some("491")
+        );
+        let meta = node
+            .get_optional_child("meta")
+            .expect("InvalidProtobuf nack must have <meta> child");
+        assert_eq!(
+            meta.attrs
+                .get("failure_reason")
+                .map(|v| v.as_str())
+                .as_deref(),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn nack_invalid_protobuf_without_failure_reason_omits_meta() {
+        let info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        let node = build_nack_node(&info, &own_pn(), NackReason::InvalidProtobuf, None);
+        assert!(node.get_optional_child("meta").is_none());
+    }
+
+    /// failure_reason only applies to InvalidProtobuf.
+    #[test]
+    fn nack_omits_meta_for_non_invalid_protobuf_even_with_failure_reason() {
+        let info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, Some(99));
+        assert!(node.get_optional_child("meta").is_none());
+    }
+
+    #[test]
+    fn nack_includes_type_when_present() {
+        let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        info.r#type = "text".to_string();
+        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None);
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("text")
+        );
+    }
+
+    #[test]
+    fn nack_omits_type_when_empty() {
+        let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        info.r#type = String::new();
+        let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None);
+        assert!(node.attrs.get("type").is_none());
     }
 
     #[test]
