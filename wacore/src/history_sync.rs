@@ -89,11 +89,14 @@ pub fn process_history_sync(
                 pos = end;
             }
 
-            // field 7 = pushnames (repeated, length-delimited)
-            7 if let Some(own) = own_user
+            // field 7 = pushnames (repeated, length-delimited).
+            // Uses `Option::is_some()` in the guard rather than an
+            // `if let` guard — the latter requires Rust 1.94+.
+            7 if own_user.is_some()
                 && result.own_pushname.is_none()
                 && wire_type_raw == wire_type::LENGTH_DELIMITED =>
             {
+                let Some(own) = own_user else { unreachable!() };
                 let (len, vlen) = read_varint(&buf[pos..])?;
                 pos += vlen;
                 let end = checked_end(pos, len, buf.len(), "pushname")?;
