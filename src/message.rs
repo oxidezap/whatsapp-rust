@@ -1077,9 +1077,13 @@ impl Client {
                         e,
                         SignalProtocolError::BadMac(_) | SignalProtocolError::InvalidMessage(_, _)
                     ) {
-                        // BadMac: MAC verification specifically failed (WA Web error code 7).
-                        // InvalidMessage: session out of sync or other decryption failure (code 4).
-                        // In both cases we delete the stale session and request re-establishment.
+                        // WAWebMsgProcessingDecryptionHandler classifies both as
+                        // SignalRetryable -> sendRetryReceipt only, no session ops.
+                        // When the sender resends as pkmsg, process_prekey_bundle
+                        // calls promote_state on the existing record, archiving
+                        // current into previous_sessions[0]. That archived state
+                        // is the only fallback for in-flight messages still on
+                        // the old ratchet (see decrypt_message_with_record).
                         let (reason, label) = if matches!(e, SignalProtocolError::BadMac(_)) {
                             (RetryReason::BadMac, "BadMac")
                         } else {
@@ -1087,23 +1091,12 @@ impl Client {
                         };
                         log::warn!(
                             "[msg:{}] Decryption failed for {} message from {} due to {label}. \
-                             Deleting stale session and sending retry receipt.",
+                             Sending retry receipt.",
                             info.id,
                             enc_type,
                             info.source.sender
                         );
 
-                        // Delete the stale session from the signal cache.
-                        // IMPORTANT: Must go through the cache, not directly to the backend!
-                        // Going to the backend directly leaves the stale session in the cache,
-                        // which causes retry messages to also fail (they'd load the stale session).
-                        self.signal_cache.delete_session(&signal_address).await;
-                        log::info!(
-                            "Deleted stale session for {} from cache to allow re-establishment",
-                            signal_address
-                        );
-
-                        // Send retry receipt so the sender resends with a PreKeySignalMessage
                         dispatched_undecryptable = self
                             .handle_decrypt_failure(info, reason, decrypt_fail_mode)
                             .await;
@@ -2175,24 +2168,604 @@ mod tests {
              expected (false, false, true), got ({success}, {had_duplicates}, {dispatched})"
         );
 
-        // Verify we took the SessionNotFound path (error code 1 / NoSession) rather
-        // than the InvalidMessage path (error code 4). The key difference:
-        // - SessionNotFound does NOT delete the session from the cache
-        // - InvalidMessage/BadMac DOES delete it (via signal_cache.delete_session)
-        //
-        // If the session record is still present in the cache, we know the
-        // SessionNotFound branch ran, which sends RetryReason::NoSession (code 1)
-        // and triggers early key inclusion on retry #1 via should_include_keys().
+        // After the WA Web compliance fix (no delete on BadMac/InvalidMessage either),
+        // every inbound-decrypt failure preserves the session. This still pins
+        // that the empty-record path does not regress to a delete.
         let backend = client.persistence_manager.backend();
         let session_still_exists = client
             .signal_cache
             .has_session(&signal_address, &*backend)
             .await
             .expect("has_session should not fail");
-        assert!(
-            session_still_exists,
-            "Session should NOT have been deleted — SessionNotFound path preserves it. \
-             If deleted, the InvalidMessage path ran instead (wrong error code)."
+        assert!(session_still_exists);
+    }
+
+    // ─── Fixtures for session-preservation tests ─────────────────────────────
+    //
+    // Mirrors the WAWebSignalProtocolStore tests in spirit: a synthetic peer
+    // holds its own Signal stores in memory so the test can drive X3DH end to
+    // end against the Client. Inlined (not exported from a helper crate)
+    // because these are message.rs-specific scenarios.
+
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use wacore::libsignal::protocol::{
+        CiphertextMessage, Direction, IdentityChange, IdentityKey, IdentityKeyPair, KeyPair,
+        PreKeyBundle, ProtocolAddress, PublicKey, SessionRecord, SessionStore as SigSessionStore,
+        UsePQRatchet, message_encrypt, process_prekey_bundle,
+    };
+    use wacore::libsignal::protocol::{
+        IdentityKeyStore as SigIdentityKeyStore, SignalProtocolError,
+    };
+
+    #[derive(Default)]
+    struct MemSessionStore(HashMap<ProtocolAddress, SessionRecord>);
+
+    #[async_trait]
+    impl SigSessionStore for MemSessionStore {
+        async fn load_session(
+            &self,
+            a: &ProtocolAddress,
+        ) -> Result<Option<SessionRecord>, SignalProtocolError> {
+            Ok(self.0.get(a).cloned())
+        }
+        async fn has_session(&self, a: &ProtocolAddress) -> Result<bool, SignalProtocolError> {
+            Ok(self.0.contains_key(a))
+        }
+        async fn store_session(
+            &mut self,
+            a: &ProtocolAddress,
+            r: SessionRecord,
+        ) -> Result<(), SignalProtocolError> {
+            self.0.insert(a.clone(), r);
+            Ok(())
+        }
+    }
+
+    struct MemIdentityStore {
+        kp: IdentityKeyPair,
+        reg_id: u32,
+        known: HashMap<ProtocolAddress, IdentityKey>,
+    }
+
+    #[async_trait]
+    impl SigIdentityKeyStore for MemIdentityStore {
+        async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair, SignalProtocolError> {
+            Ok(self.kp.clone())
+        }
+        async fn get_local_registration_id(&self) -> Result<u32, SignalProtocolError> {
+            Ok(self.reg_id)
+        }
+        async fn save_identity(
+            &mut self,
+            a: &ProtocolAddress,
+            id: &IdentityKey,
+        ) -> Result<IdentityChange, SignalProtocolError> {
+            let prev = self.known.insert(a.clone(), *id);
+            Ok(match prev {
+                None => IdentityChange::NewOrUnchanged,
+                Some(p) if &p == id => IdentityChange::NewOrUnchanged,
+                _ => IdentityChange::ReplacedExisting,
+            })
+        }
+        async fn is_trusted_identity(
+            &self,
+            _: &ProtocolAddress,
+            _: &IdentityKey,
+            _: Direction,
+        ) -> Result<bool, SignalProtocolError> {
+            Ok(true)
+        }
+        async fn get_identity(
+            &self,
+            a: &ProtocolAddress,
+        ) -> Result<Option<IdentityKey>, SignalProtocolError> {
+            Ok(self.known.get(a).copied())
+        }
+    }
+
+    struct AlicePeer {
+        jid: Jid,
+        address: ProtocolAddress,
+        identity: MemIdentityStore,
+        sessions: MemSessionStore,
+    }
+
+    impl AlicePeer {
+        async fn new(jid_str: &str) -> Self {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let kp = IdentityKeyPair::generate(&mut rng);
+            let jid: Jid = jid_str.parse().expect("valid jid");
+            let address = jid.to_protocol_address();
+            Self {
+                jid,
+                address,
+                identity: MemIdentityStore {
+                    kp,
+                    reg_id: 12345,
+                    known: HashMap::new(),
+                },
+                sessions: MemSessionStore::default(),
+            }
+        }
+
+        async fn install_bob_session(&mut self, bob_addr: &ProtocolAddress, bundle: &PreKeyBundle) {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            process_prekey_bundle(
+                bob_addr,
+                &mut self.sessions,
+                &mut self.identity,
+                bundle,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("process bob bundle");
+        }
+
+        async fn encrypt(
+            &mut self,
+            bob_addr: &ProtocolAddress,
+            plaintext: &[u8],
+        ) -> CiphertextMessage {
+            message_encrypt(plaintext, bob_addr, &mut self.sessions, &mut self.identity)
+                .await
+                .expect("encrypt")
+        }
+    }
+
+    /// Ensure the test `Client` has an identity (`pn`/`lid`) provisioned —
+    /// `create_test_client_with_name` returns an unpaired client by default
+    /// so `device_snapshot.lid` / `.pn` are both `None`.
+    async fn ensure_bob_paired(client: &Arc<Client>) {
+        let snapshot = client.persistence_manager.get_device_snapshot().await;
+        if snapshot.lid.is_some() || snapshot.pn.is_some() {
+            return;
+        }
+        let pn: Jid = "9000000000000:1@s.whatsapp.net".parse().expect("pn");
+        let lid: Jid = "999999999999999:1@lid".parse().expect("lid");
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(pn)))
+            .await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(lid)))
+            .await;
+    }
+
+    /// Read Bob's currently provisioned identity / signed prekey from the test
+    /// client and build a `PreKeyBundle` that Alice can use to initialize
+    /// her side of the session. Mirrors how the real `RetryReceiptJob` ships
+    /// keys back to the sender, but assembled directly from the device state.
+    async fn bobs_prekey_bundle(client: &Arc<Client>) -> (PreKeyBundle, Jid) {
+        ensure_bob_paired(client).await;
+        use wacore::libsignal::store::PreKeyStore as _;
+        use wacore::libsignal::store::SignedPreKeyStore as _;
+        let snapshot = client.persistence_manager.get_device_snapshot().await;
+        let identity_kp = snapshot.core.identity_key.clone();
+        let reg_id = snapshot.core.registration_id;
+        let device_arc = client.persistence_manager.get_device_arc().await;
+        let device_guard = device_arc.read().await;
+        // Bob always has signed prekey id 1 from device init.
+        let spk_struct = device_guard
+            .load_signed_prekey(1)
+            .await
+            .expect("load spk")
+            .expect("spk present");
+        let spk_pub_bytes = spk_struct
+            .public_key
+            .as_deref()
+            .expect("spk has public key");
+        let spk_pub = PublicKey::from_djb_public_key_bytes(spk_pub_bytes).expect("spk pub");
+        let spk_sig_vec: Vec<u8> = spk_struct.signature.clone().expect("spk has signature");
+        // Provision a fresh one-time prekey for this test.
+        let pk_id_u32: u32 = 9001;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let pk_pair = KeyPair::generate(&mut rng);
+        let pk_struct = waproto::whatsapp::PreKeyRecordStructure {
+            id: Some(pk_id_u32),
+            public_key: Some(pk_pair.public_key.public_key_bytes().to_vec()),
+            private_key: Some(pk_pair.private_key.serialize().to_vec()),
+        };
+        device_guard
+            .store_prekey(pk_id_u32, pk_struct, false)
+            .await
+            .expect("store pk");
+        let bob_jid: Jid = snapshot
+            .lid
+            .clone()
+            .or_else(|| snapshot.pn.clone())
+            .expect("own jid")
+            .to_non_ad();
+        let bob_device_jid: Jid = snapshot
+            .lid
+            .clone()
+            .or_else(|| snapshot.pn.clone())
+            .expect("own device jid");
+        let bundle = PreKeyBundle::new(
+            reg_id,
+            u32::from(bob_device_jid.device).into(),
+            Some((pk_id_u32.into(), pk_pair.public_key)),
+            1.into(),
+            spk_pub,
+            spk_sig_vec,
+            IdentityKey::new(identity_kp.public_key),
+        )
+        .expect("bundle");
+        (bundle, bob_jid)
+    }
+
+    /// Build an EncPayload-style stanza node and run `process_session_enc_batch`.
+    /// Returns whether the session for `peer_jid` still exists in the cache afterwards.
+    async fn submit_and_check_session(
+        client: &Arc<Client>,
+        peer_jid: &Jid,
+        ct: &CiphertextMessage,
+    ) -> (bool, bool, bool, bool) {
+        let (enc_type, bytes) = match ct {
+            CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
+            CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
+            _ => panic!("unexpected ciphertext type"),
+        };
+        let enc_node = NodeBuilder::new("enc")
+            .attr("type", enc_type)
+            .bytes(bytes)
+            .build();
+        let enc_ref = enc_node.as_node_ref();
+        let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+        let info = Arc::new(MessageInfo {
+            source: crate::types::message::MessageSource {
+                sender: peer_jid.clone(),
+                chat: peer_jid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let (success, dups, dispatched) = client
+            .clone()
+            .process_session_enc_batch(
+                &payloads,
+                &info,
+                peer_jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        let backend = client.persistence_manager.backend();
+        let still = client
+            .signal_cache
+            .has_session(&peer_jid.to_protocol_address(), &*backend)
+            .await
+            .expect("has_session");
+        (success, dups, dispatched, still)
+    }
+
+    /// Smoking-gun regression: a `BadMac` on the inbound path must NOT delete
+    /// the session. Pre-fix, `src/message.rs:1100` called
+    /// `signal_cache.delete_session(...)` here — this test would fail with
+    /// `still=false`. WA Web's `RetryReceiptJob` keeps the session untouched
+    /// (see `docs/captured-js/WAWeb/Send/RetryReceiptJob.js`).
+    #[tokio::test]
+    async fn test_badmac_preserves_session() {
+        let client = crate::test_utils::create_test_client_with_name("badmac_preserves").await;
+        let mut alice = AlicePeer::new("1111111111111@s.whatsapp.net").await;
+        let alice_addr = alice.address.clone();
+
+        // X3DH: Alice consumes Bob's bundle to set up her outgoing session.
+        let (bob_bundle, _) = bobs_prekey_bundle(&client).await;
+        alice
+            .install_bob_session(
+                &client
+                    .persistence_manager
+                    .get_device_snapshot()
+                    .await
+                    .lid
+                    .clone()
+                    .or(client
+                        .persistence_manager
+                        .get_device_snapshot()
+                        .await
+                        .pn
+                        .clone())
+                    .expect("own jid")
+                    .to_protocol_address(),
+                &bob_bundle,
+            )
+            .await;
+
+        // First message: pkmsg lands on Bob and installs Bob's reciprocal session.
+        let bob_addr = client
+            .persistence_manager
+            .get_device_snapshot()
+            .await
+            .lid
+            .clone()
+            .or(client
+                .persistence_manager
+                .get_device_snapshot()
+                .await
+                .pn
+                .clone())
+            .expect("own jid")
+            .to_protocol_address();
+        let pkmsg = alice.encrypt(&bob_addr, b"hello").await;
+        let (s1, _, _, still1) = submit_and_check_session(&client, &alice.jid, &pkmsg).await;
+        assert!(s1, "pkmsg should establish session and decrypt");
+        assert!(still1, "session must exist after first message");
+
+        // Second message: tamper the MAC bytes. Alice's session may still
+        // emit pkmsg if Bob hasn't sent her anything yet, but the trailing
+        // MAC bytes of the inner SignalMessage are still the last bytes of
+        // the serialized envelope either way — flipping them triggers
+        // BadMac in libsignal's MAC verification path.
+        let msg2 = alice.encrypt(&bob_addr, b"world").await;
+        let (enc_type, mut bytes) = match &msg2 {
+            CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
+            CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
+            _ => panic!("unexpected ciphertext type"),
+        };
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        let enc_node = NodeBuilder::new("enc")
+            .attr("type", enc_type)
+            .bytes(bytes)
+            .build();
+        let enc_ref = enc_node.as_node_ref();
+        let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+        let info = Arc::new(MessageInfo {
+            source: crate::types::message::MessageSource {
+                sender: alice.jid.clone(),
+                chat: alice.jid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let (success, _, dispatched) = client
+            .clone()
+            .process_session_enc_batch(
+                &payloads,
+                &info,
+                &alice.jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        assert!(!success, "tampered MAC must not decrypt");
+        assert!(dispatched, "undecryptable event must be dispatched");
+
+        // The fix asserts the session lives on so the eventual sender pkmsg
+        // can archive it into previous_sessions[0].
+        let backend = client.persistence_manager.backend();
+        let still = client
+            .signal_cache
+            .has_session(&alice_addr, &*backend)
+            .await
+            .expect("has_session");
+        assert!(still, "BadMac must NOT delete the session (WA Web parity)");
+    }
+
+    /// Same invariant on the `InvalidMessage` arm of the same branch.
+    /// Triggered by feeding a SignalMessage built from a key pair the local
+    /// session never saw, so all states fail without producing BadMac.
+    #[tokio::test]
+    async fn test_invalid_message_preserves_session() {
+        use wacore::libsignal::protocol::SignalMessage;
+        let client =
+            crate::test_utils::create_test_client_with_name("invalid_message_preserves").await;
+        let mut alice = AlicePeer::new("2222222222222@s.whatsapp.net").await;
+        let alice_addr = alice.address.clone();
+        let (bob_bundle, _) = bobs_prekey_bundle(&client).await;
+        let bob_addr = client
+            .persistence_manager
+            .get_device_snapshot()
+            .await
+            .lid
+            .clone()
+            .or(client
+                .persistence_manager
+                .get_device_snapshot()
+                .await
+                .pn
+                .clone())
+            .expect("own jid")
+            .to_protocol_address();
+        alice.install_bob_session(&bob_addr, &bob_bundle).await;
+        let pkmsg = alice.encrypt(&bob_addr, b"hello").await;
+        let (s1, _, _, still1) = submit_and_check_session(&client, &alice.jid, &pkmsg).await;
+        assert!(s1 && still1);
+
+        // Synthesize a Whisper message with a random ratchet key and identity
+        // pair — the existing session has no matching chain, libsignal walks
+        // through current state, fails MAC verification with the wrong key,
+        // then falls through. Same code branch as BadMac.
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let stray_ratchet = KeyPair::generate(&mut rng).public_key;
+        let stray_identity = IdentityKeyPair::generate(&mut rng);
+        let other_identity = IdentityKeyPair::generate(&mut rng);
+        let bogus = SignalMessage::new(
+            4,
+            &[0u8; 32],
+            stray_ratchet,
+            0,
+            0,
+            b"x",
+            stray_identity.identity_key(),
+            other_identity.identity_key(),
+        )
+        .expect("SignalMessage::new");
+        let enc_node = NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .bytes(bogus.serialized().to_vec())
+            .build();
+        let enc_ref = enc_node.as_node_ref();
+        let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+        let info = Arc::new(MessageInfo {
+            source: crate::types::message::MessageSource {
+                sender: alice.jid.clone(),
+                chat: alice.jid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let (success, _, dispatched) = client
+            .clone()
+            .process_session_enc_batch(
+                &payloads,
+                &info,
+                &alice.jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        assert!(!success);
+        assert!(dispatched);
+
+        let backend = client.persistence_manager.backend();
+        let still = client
+            .signal_cache
+            .has_session(&alice_addr, &*backend)
+            .await
+            .expect("has_session");
+        assert!(still, "InvalidMessage must NOT delete the session");
+    }
+
+    /// Integration test: reproduces the production loop observed in
+    /// `k8awqjsgww2lnkt89urp3de1-191402150615-...`. After a BadMac the bot
+    /// used to delete the session; when the sender then sent a fresh pkmsg
+    /// (post-retry-receipt), `process_prekey_bundle` ran on an empty record
+    /// and `previous_sessions[0]` stayed empty — any in-flight messages on
+    /// the OLD ratchet failed permanently. With the fix the old session
+    /// survives the BadMac, the pkmsg's `promote_state` archives it, and
+    /// the archived state lives in `previous_sessions[0]` exactly as WA Web
+    /// expects (see `libsignal/src/protocol/state/session.rs:751-768`).
+    #[tokio::test]
+    async fn test_prod_scenario_pkmsg_archives_old_session_after_badmac() {
+        let client = crate::test_utils::create_test_client_with_name("prod_archive").await;
+        let mut alice = AlicePeer::new("3333333333333@s.whatsapp.net").await;
+
+        // X3DH round 1 — Alice initiates with Bob's bundle, sends pkmsg.
+        let (bundle_v1, _) = bobs_prekey_bundle(&client).await;
+        let bob_addr = client
+            .persistence_manager
+            .get_device_snapshot()
+            .await
+            .lid
+            .clone()
+            .or(client
+                .persistence_manager
+                .get_device_snapshot()
+                .await
+                .pn
+                .clone())
+            .expect("own jid")
+            .to_protocol_address();
+        alice.install_bob_session(&bob_addr, &bundle_v1).await;
+        let pkmsg_v1 = alice.encrypt(&bob_addr, b"v1").await;
+        let (s1, _, _, _) = submit_and_check_session(&client, &alice.jid, &pkmsg_v1).await;
+        assert!(s1);
+
+        // Snapshot Bob's session_v1 base key for later comparison. Use
+        // peek (non-destructive): `get_session` marks the cache entry as
+        // CheckedOut, which would prevent libsignal from re-loading the
+        // session in the BadMac path that follows.
+        let alice_addr = alice.address.clone();
+        let backend = client.persistence_manager.backend();
+        let v1_record = client
+            .signal_cache
+            .peek_session(&alice_addr, &*backend)
+            .await
+            .expect("peek_session")
+            .expect("v1 session present");
+        let v1_base_key = v1_record
+            .session_state()
+            .expect("v1 current state")
+            .sender_ratchet_key_for_logging()
+            .expect("v1 base key");
+
+        // Tampered envelope → BadMac branch (with the fix this no longer
+        // deletes Bob's session).
+        let msg = alice.encrypt(&bob_addr, b"stale").await;
+        let (enc_type, mut bytes) = match &msg {
+            CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
+            CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
+            _ => panic!("unexpected ciphertext type"),
+        };
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        let enc_node = NodeBuilder::new("enc")
+            .attr("type", enc_type)
+            .bytes(bytes)
+            .build();
+        let enc_ref = enc_node.as_node_ref();
+        let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+        let info = Arc::new(MessageInfo {
+            source: crate::types::message::MessageSource {
+                sender: alice.jid.clone(),
+                chat: alice.jid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let (_, _, _) = client
+            .clone()
+            .process_session_enc_batch(
+                &payloads,
+                &info,
+                &alice.jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        // Pre-fix: this assertion would have failed (session deleted).
+        let preserved = client
+            .signal_cache
+            .has_session(&alice_addr, &*backend)
+            .await
+            .expect("has_session");
+        assert!(preserved, "BadMac must preserve session");
+
+        // X3DH round 2 — Alice rebuilds her side from a fresh Bob bundle
+        // (simulates the bot re-issuing prekeys via a retry receipt) and
+        // sends another pkmsg. Bob's `process_prekey_bundle` must archive
+        // session_v1 into previous_sessions[0].
+        let (bundle_v2, _) = bobs_prekey_bundle(&client).await;
+        alice.sessions = MemSessionStore::default(); // forget Alice's v1 to force a fresh X3DH
+        alice.install_bob_session(&bob_addr, &bundle_v2).await;
+        let pkmsg_v2 = alice.encrypt(&bob_addr, b"v2").await;
+        let (s2, _, _, still2) = submit_and_check_session(&client, &alice.jid, &pkmsg_v2).await;
+        assert!(s2, "pkmsg_v2 should decrypt");
+        assert!(still2);
+
+        let v2_record = client
+            .signal_cache
+            .peek_session(&alice_addr, &*backend)
+            .await
+            .expect("peek_session")
+            .expect("v2 session present");
+        let v2_base_key = v2_record
+            .session_state()
+            .expect("v2 current state")
+            .sender_ratchet_key_for_logging()
+            .expect("v2 base key");
+        assert_ne!(
+            v1_base_key, v2_base_key,
+            "current session must be the new v2"
+        );
+        assert_eq!(
+            v2_record.previous_session_count(),
+            1,
+            "session_v1 must be archived as previous_sessions[0]"
+        );
+        let archived_state = v2_record
+            .previous_session_states()
+            .next()
+            .expect("archived state")
+            .expect("archived state decodes");
+        let archived_base_key = archived_state
+            .sender_ratchet_key_for_logging()
+            .expect("archived base key");
+        assert_eq!(
+            archived_base_key, v1_base_key,
+            "archived previous_sessions[0] must be the original v1"
         );
     }
 
