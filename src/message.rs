@@ -2191,8 +2191,9 @@ mod tests {
     use std::collections::HashMap;
     use wacore::libsignal::protocol::{
         CiphertextMessage, Direction, IdentityChange, IdentityKey, IdentityKeyPair, KeyPair,
-        PreKeyBundle, ProtocolAddress, PublicKey, SessionRecord, SessionStore as SigSessionStore,
-        UsePQRatchet, message_encrypt, process_prekey_bundle,
+        PreKeyBundle, PreKeyRecord, PreKeyStore as SigPreKeyStore, ProtocolAddress, SessionRecord,
+        SessionStore as SigSessionStore, SignedPreKeyStore as SigSignedPreKeyStore, UsePQRatchet,
+        message_encrypt, process_prekey_bundle,
     };
     use wacore::libsignal::protocol::{
         IdentityKeyStore as SigIdentityKeyStore, SignalProtocolError,
@@ -2337,55 +2338,48 @@ mod tests {
     /// Read Bob's currently provisioned identity / signed prekey from the test
     /// client and build a `PreKeyBundle` that Alice can use to initialize
     /// her side of the session. Mirrors how the real `RetryReceiptJob` ships
-    /// keys back to the sender, but assembled directly from the device state.
+    /// keys back to the sender — assembled through the same
+    /// `SignalProtocolStoreAdapter` traits production uses.
     async fn bobs_prekey_bundle(client: &Arc<Client>) -> (PreKeyBundle, Jid) {
+        use wacore::libsignal::protocol::GenericSignedPreKey;
         ensure_bob_paired(client).await;
-        use wacore::libsignal::store::PreKeyStore as _;
-        use wacore::libsignal::store::SignedPreKeyStore as _;
         let snapshot = client.persistence_manager.get_device_snapshot().await;
         let identity_kp = snapshot.core.identity_key.clone();
         let reg_id = snapshot.core.registration_id;
-        let device_arc = client.persistence_manager.get_device_arc().await;
-        let device_guard = device_arc.read().await;
-        // Bob always has signed prekey id 1 from device init.
-        let spk_struct = device_guard
-            .load_signed_prekey(1)
+
+        // Read/write prekeys through the same trait surface production uses
+        // (see signal_adapter.rs). Avoids reaching past `PersistenceManager`
+        // to mutate device storage directly.
+        let mut adapter = client.signal_adapter().await;
+        let spk_record = adapter
+            .signed_pre_key_store
+            .get_signed_pre_key(1.into())
             .await
-            .expect("load spk")
             .expect("spk present");
-        let spk_pub_bytes = spk_struct
-            .public_key
-            .as_deref()
-            .expect("spk has public key");
-        let spk_pub = PublicKey::from_djb_public_key_bytes(spk_pub_bytes).expect("spk pub");
-        let spk_sig_vec: Vec<u8> = spk_struct.signature.clone().expect("spk has signature");
-        // Provision a fresh one-time prekey for this test.
+        let spk_pub = spk_record.public_key().expect("spk pub");
+        let spk_sig_vec = spk_record.signature().expect("spk sig");
+
+        // Provision a fresh one-time prekey for this test through the
+        // adapter's `PreKeyStore` impl.
         let pk_id_u32: u32 = 9001;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let pk_pair = KeyPair::generate(&mut rng);
-        let pk_struct = waproto::whatsapp::PreKeyRecordStructure {
-            id: Some(pk_id_u32),
-            public_key: Some(pk_pair.public_key.public_key_bytes().to_vec()),
-            private_key: Some(pk_pair.private_key.serialize().to_vec()),
-        };
-        device_guard
-            .store_prekey(pk_id_u32, pk_struct, false)
+        let pk_record = PreKeyRecord::new(pk_id_u32.into(), &pk_pair);
+        adapter
+            .pre_key_store
+            .save_pre_key(pk_id_u32.into(), &pk_record)
             .await
-            .expect("store pk");
-        let bob_jid: Jid = snapshot
+            .expect("save pk");
+
+        let own_device_jid: Jid = snapshot
             .lid
             .clone()
             .or_else(|| snapshot.pn.clone())
-            .expect("own jid")
-            .to_non_ad();
-        let bob_device_jid: Jid = snapshot
-            .lid
-            .clone()
-            .or_else(|| snapshot.pn.clone())
-            .expect("own device jid");
+            .expect("own jid");
+        let bob_jid = own_device_jid.to_non_ad();
         let bundle = PreKeyBundle::new(
             reg_id,
-            u32::from(bob_device_jid.device).into(),
+            u32::from(own_device_jid.device).into(),
             Some((pk_id_u32.into(), pk_pair.public_key)),
             1.into(),
             spk_pub,
@@ -2590,94 +2584,15 @@ mod tests {
         panic!("expected retry count {expected} for {cache_key}, got {actual:?}");
     }
 
-    /// Same invariant on the `InvalidMessage` arm of the same branch.
-    /// Triggered by feeding a SignalMessage built from a key pair the local
-    /// session never saw, so all states fail without producing BadMac.
-    #[tokio::test]
-    async fn test_invalid_message_preserves_session() {
-        use wacore::libsignal::protocol::SignalMessage;
-        let client =
-            crate::test_utils::create_test_client_with_name("invalid_message_preserves").await;
-        let mut alice = AlicePeer::new("2222222222222@s.whatsapp.net").await;
-        let alice_addr = alice.address.clone();
-        let (bob_bundle, _) = bobs_prekey_bundle(&client).await;
-        let bob_addr = client
-            .persistence_manager
-            .get_device_snapshot()
-            .await
-            .lid
-            .clone()
-            .or(client
-                .persistence_manager
-                .get_device_snapshot()
-                .await
-                .pn
-                .clone())
-            .expect("own jid")
-            .to_protocol_address();
-        alice.install_bob_session(&bob_addr, &bob_bundle).await;
-        let pkmsg = alice.encrypt(&bob_addr, b"hello").await;
-        let (s1, _, _, still1) = submit_and_check_session(&client, &alice.jid, &pkmsg).await;
-        assert!(s1 && still1);
-
-        // Synthesize a Whisper message with a random ratchet key and identity
-        // pair — the existing session has no matching chain, libsignal walks
-        // through current state, fails MAC verification with the wrong key,
-        // then falls through. Same code branch as BadMac.
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let stray_ratchet = KeyPair::generate(&mut rng).public_key;
-        let stray_identity = IdentityKeyPair::generate(&mut rng);
-        let other_identity = IdentityKeyPair::generate(&mut rng);
-        let bogus = SignalMessage::new(
-            4,
-            &[0u8; 32],
-            stray_ratchet,
-            0,
-            0,
-            b"x",
-            stray_identity.identity_key(),
-            other_identity.identity_key(),
-        )
-        .expect("SignalMessage::new");
-        let enc_node = NodeBuilder::new("enc")
-            .attr("type", "msg")
-            .bytes(bogus.serialized().to_vec())
-            .build();
-        let enc_ref = enc_node.as_node_ref();
-        let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
-        let info = Arc::new(MessageInfo {
-            id: "INVALID_MSG_STRAY_KEYS".to_string(),
-            source: crate::types::message::MessageSource {
-                sender: alice.jid.clone(),
-                chat: alice.jid.clone(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-
-        let (success, _, dispatched) = client
-            .clone()
-            .process_session_enc_batch(
-                &payloads,
-                &info,
-                &alice.jid,
-                crate::types::events::DecryptFailMode::Show,
-            )
-            .await;
-        assert!(!success);
-        assert!(dispatched);
-
-        let backend = client.persistence_manager.backend();
-        let still = client
-            .signal_cache
-            .has_session(&alice_addr, &*backend)
-            .await
-            .expect("has_session");
-        assert!(still, "InvalidMessage must NOT delete the session");
-        // Discriminate from parse-error path: only the BadMac/InvalidMessage
-        // branch reaches `spawn_retry_receipt` and bumps the counter.
-        await_retry_count_eq(&client, &info, 1).await;
-    }
+    // NOTE: the `InvalidMessage` arm of the `matches!()` block in
+    // `process_session_enc_batch` is exercised by `test_badmac_preserves_session`
+    // too — libsignal returns `BadMac` whenever *any* candidate state derives a
+    // message key (which is what a random-ratchet `SignalMessage::new(...)`
+    // ends up doing as well), so a separate "InvalidMessage" regression test
+    // would be indistinguishable from the BadMac one. Reaching the
+    // `InvalidMessage` constructor specifically would require crafting a
+    // SignalMessage that *parses* but where no state derives any message
+    // key — empirically impractical without major libsignal-side scaffolding.
 
     /// Integration test: reproduces the production loop observed in
     /// `k8awqjsgww2lnkt89urp3de1-191402150615-...`. After a BadMac the bot
