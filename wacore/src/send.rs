@@ -997,11 +997,19 @@ where
 /// Pairwise-encrypted retry stanza for a single DM recipient device.
 /// WA Web retries target only the failing device, not a full DM fanout.
 #[allow(clippy::too_many_arguments)]
+/// Single-device retry resend for a DM, mirroring
+/// `WAWebSendMsgCreateDeviceStanza.createUserDeviceMsgStanza`. The `<enc>`
+/// is a direct child of `<message>` (no `<participants>` fanout wrapper),
+/// `recipient` carries the original message's destination, and
+/// `decrypt-fail="hide"` is set for the same message kinds that hide it on
+/// the original send. The previous fanout-shaped output triggered server
+/// 479 (SmaxInvalid) on every self-DM retry in prod (2026-05-19 log).
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_dm_retry_stanza<S, I>(
     session_store: &mut S,
     identity_store: &mut I,
     to_jid: Jid,
-    requester_jid: Jid,
+    recipient_jid: Jid,
     encryption_jid: Jid,
     message: &wa::Message,
     message_id: String,
@@ -1022,6 +1030,7 @@ where
     let (enc_type, is_prekey, serialized) = extract_ciphertext(encrypted)
         .ok_or_else(|| anyhow!("Unexpected encryption message type for DM retry"))?;
 
+    let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
     let mut enc_builder = NodeBuilder::new("enc")
         .attr("v", stanza::ENC_VERSION)
         .attr("type", enc_type)
@@ -1029,19 +1038,12 @@ where
     if let Some(mt) = media_type_from_message(message) {
         enc_builder = enc_builder.attr("mediatype", mt);
     }
+    if hide_decrypt_fail {
+        enc_builder = enc_builder.attr("decrypt-fail", "hide");
+    }
     let enc_node = enc_builder.bytes(serialized).build();
 
-    let participant_node = NodeBuilder::new("to")
-        .attr("jid", requester_jid)
-        .children([enc_node])
-        .build();
-
-    let mut children = vec![
-        NodeBuilder::new("participants")
-            .children([participant_node])
-            .build(),
-    ];
-
+    let mut children = vec![enc_node];
     if is_prekey && let Some(acc) = account {
         children.push(
             NodeBuilder::new("device-identity")
@@ -1052,6 +1054,7 @@ where
 
     let mut stanza_builder = NodeBuilder::new("message")
         .attr("to", to_jid)
+        .attr("recipient", recipient_jid)
         .attr("id", message_id)
         .attr("type", stanza_type_from_message(message));
 
@@ -2907,18 +2910,65 @@ mod tests {
             assert!(n.get_optional_child("device-identity").is_none());
         }
 
+        /// Regression for the prod 479 (SmaxInvalid) reported on the
+        /// 2026-05-19 self-DM run: the retry resend wrapped the `<enc>`
+        /// inside `<participants><to>` (the fanout shape) and the server
+        /// rejected every retry. WAWebSendMsgCreateDeviceStanza's
+        /// `createUserDeviceMsgStanza` puts the `<enc>` directly under
+        /// `<message>` and always sets the `recipient` attribute. This
+        /// test pins both invariants — it fails before the format fix
+        /// because today's `prepare_dm_retry_stanza` emits the fanout
+        /// shape.
         #[tokio::test]
-        async fn dm_retry_pkmsg_targets_single_device() {
+        async fn dm_retry_emits_enc_directly_under_message_with_recipient() {
             let (mut ss, mut is, jid) = setup_session().await;
-            let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
+            let to: Jid = "236395184570386@lid".parse().unwrap();
             let requester: Jid = jid.to_string().parse().unwrap();
-            let encryption = requester.clone();
-
             let n = prepare_dm_retry_stanza(
                 &mut ss,
                 &mut is,
                 to.clone(),
                 requester.clone(),
+                requester,
+                &wa::Message::default(),
+                "dm-retry-format-1".into(),
+                1,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(n.tag, "message");
+            // <enc> is a direct child — no <participants> wrapper.
+            assert!(
+                n.get_optional_child("participants").is_none(),
+                "DM retry must not wrap <enc> in <participants> \
+                 (matches WAWebSendMsgCreateDeviceStanza)"
+            );
+            assert!(
+                n.get_optional_child("enc").is_some(),
+                "<enc> must be a direct child of <message>"
+            );
+            // `recipient` attribute must be present so the server routes
+            // correctly (mirrors WA Web's `recipient: USER_JID(g)`).
+            assert!(
+                n.attrs().optional_string("recipient").is_some(),
+                "DM retry must carry the `recipient` attribute"
+            );
+        }
+
+        #[tokio::test]
+        async fn dm_retry_pkmsg_targets_single_device() {
+            let (mut ss, mut is, jid) = setup_session().await;
+            let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
+            let encryption = jid.clone();
+
+            let n = prepare_dm_retry_stanza(
+                &mut ss,
+                &mut is,
+                to.clone(),
+                to.clone(),
                 encryption,
                 &wa::Message::default(),
                 "dm-retry-1".into(),
@@ -2935,6 +2985,10 @@ mod tests {
                 attrs.optional_string("to").unwrap().as_ref(),
                 to.to_string()
             );
+            assert_eq!(
+                attrs.optional_string("recipient").unwrap().as_ref(),
+                to.to_string()
+            );
             assert_eq!(attrs.optional_string("id").unwrap().as_ref(), "dm-retry-1");
             assert_eq!(
                 attrs.optional_string("type").unwrap().as_ref(),
@@ -2943,16 +2997,9 @@ mod tests {
             assert!(attrs.optional_string("participant").is_none());
             assert!(attrs.optional_string("addressing_mode").is_none());
 
-            let participants = n.get_optional_child("participants").unwrap();
-            let targets = participants.children().unwrap();
-            assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].tag, "to");
-            assert_eq!(
-                targets[0].attrs().optional_string("jid").unwrap().as_ref(),
-                requester.to_string()
-            );
-
-            let enc = targets[0].get_optional_child("enc").unwrap();
+            // `<enc>` is a direct child of `<message>` (no `<participants>` wrapper).
+            assert!(n.get_optional_child("participants").is_none());
+            let enc = n.get_optional_child("enc").unwrap();
             let mut enc_attrs = enc.attrs();
             assert_eq!(
                 enc_attrs.optional_string("type").unwrap().as_ref(),
@@ -2965,7 +3012,7 @@ mod tests {
         #[tokio::test]
         async fn dm_retry_pkmsg_with_account_has_device_identity() {
             let (mut ss, mut is, jid) = setup_session().await;
-            let requester: Jid = jid.to_string().parse().unwrap();
+            let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
             let acc = wa::AdvSignedDeviceIdentity {
                 details: Some(b"t".to_vec()),
                 ..Default::default()
@@ -2974,9 +3021,9 @@ mod tests {
             let n = prepare_dm_retry_stanza(
                 &mut ss,
                 &mut is,
-                "559922223333@s.whatsapp.net".parse().unwrap(),
-                requester.clone(),
-                requester,
+                to.clone(),
+                to,
+                jid,
                 &wa::Message::default(),
                 "dm-retry-2".into(),
                 2,
@@ -2986,10 +3033,7 @@ mod tests {
             .await
             .unwrap();
 
-            let participants = n.get_optional_child("participants").unwrap();
-            let enc = participants.children().unwrap()[0]
-                .get_optional_child("enc")
-                .unwrap();
+            let enc = n.get_optional_child("enc").unwrap();
             assert_eq!(
                 enc.attrs().optional_string("type").unwrap().as_ref(),
                 stanza::ENC_TYPE_PKMSG
@@ -3100,13 +3144,12 @@ mod tests {
         async fn dm_retry_preserves_edit_attribute() {
             let (mut ss, mut is, jid) = setup_session().await;
             let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
-            let requester: Jid = jid.to_string().parse().unwrap();
             let n = prepare_dm_retry_stanza(
                 &mut ss,
                 &mut is,
+                to.clone(),
                 to,
-                requester.clone(),
-                requester,
+                jid,
                 &wa::Message::default(),
                 "edit-1".into(),
                 1,

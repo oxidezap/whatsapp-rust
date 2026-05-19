@@ -469,11 +469,16 @@ impl Client {
 
             let edit_attr =
                 wacore::types::message::EditAttribute::infer_from_message(&original_msg);
+            // For DM retries WA Web sets `recipient` to the original message's
+            // recipient (= `to` for the resend), matching
+            // WAWebSendMsgCreateDeviceStanza's `recipient: USER_JID(g)`.
+            // `info.chat` is the resolved original chat target (PN/LID-normalized).
+            let recipient_jid = info.chat.clone();
             let stanza = wacore::send::prepare_dm_retry_stanza(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
                 info.original_from,
-                info.requester,
+                recipient_jid,
                 resolved_jid.clone(),
                 &original_msg,
                 message_id,
