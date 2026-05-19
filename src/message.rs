@@ -1046,7 +1046,6 @@ impl Client {
 
                         continue;
                     }
-                    eprintln!("DEBUG decrypt err for msg:{}: {:?}", info.id, e);
                     // Try PN→LID session migration before sending retry receipt
                     if let SignalProtocolError::SessionNotFound(_) = e {
                         if self
