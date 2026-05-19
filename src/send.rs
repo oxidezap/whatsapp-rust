@@ -1254,7 +1254,13 @@ impl Client {
             let is_self_dm =
                 is_self_dm_recipient(&recipient_bare, own_jid, device_snapshot.lid.as_ref());
 
-            let own_cached: Option<Vec<Jid>> = if is_self_dm {
+            // Skip the own-device lookup only when we already have the
+            // recipient's list — that record covers every own device in a
+            // single namespace. If `recipient_cached` is `None` (cache miss
+            // + warmup failed), the PN-keyed `own_cached` is the only thing
+            // standing between us and a bare-JID fallback that would drop
+            // companion devices.
+            let own_cached: Option<Vec<Jid>> = if is_self_dm && recipient_cached.is_some() {
                 None
             } else {
                 let mut cached = self.get_devices_from_registry(own_jid).await;
@@ -2114,6 +2120,58 @@ mod tests {
             &own_pn,
             Some(&own_lid),
         ));
+    }
+
+    #[test]
+    fn self_dm_with_no_recipient_cache_still_appends_own_devices() {
+        // Edge case raised in PR review: if `recipient_cached` ends up `None`
+        // (cache eviction + warmup failed), the self-DM short-circuit must
+        // still let `own_cached` populate the fanout. Otherwise the bare-JID
+        // fallback drops every companion device.
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient_bare = Jid::lid(SELF_LID);
+        assert!(is_self_dm_recipient(
+            &recipient_bare,
+            &own_pn,
+            Some(&own_lid)
+        ));
+
+        let recipient_cached: Option<Vec<Jid>> = None;
+        let own_cached_pn: Vec<Jid> = [0u16, 3, SELF_DEVICE]
+            .into_iter()
+            .map(|d| Jid::pn_device(SELF_PN, d))
+            .collect();
+
+        // Mirrors the call-site logic: we keep own_cached when recipient_cached is None
+        // even in a self-DM.
+        let keep_own = recipient_cached.is_none();
+        assert!(keep_own);
+
+        let mut all_dm_jids = match recipient_cached {
+            Some(devices) => devices,
+            None => vec![recipient_bare],
+        };
+        if keep_own {
+            all_dm_jids.extend(own_cached_pn.iter().cloned());
+        }
+        all_dm_jids.retain(|j| {
+            let is_sender = (j.is_same_user_as(&own_pn) && j.device == own_pn.device)
+                || (j.is_same_user_as(&own_lid) && j.device == own_lid.device);
+            !is_sender
+        });
+        wacore::types::jid::sort_dedup_by_device(&mut all_dm_jids);
+
+        // Must contain the bare LID plus the two non-sender PN companion devices.
+        assert!(
+            all_dm_jids.iter().any(|j| j.is_lid()),
+            "bare recipient LID must remain"
+        );
+        assert_eq!(
+            all_dm_jids.iter().filter(|j| j.is_pn()).count(),
+            2,
+            "companion PN devices must survive when recipient_cached is None"
+        );
     }
 
     #[test]

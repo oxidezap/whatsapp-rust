@@ -1046,6 +1046,7 @@ impl Client {
 
                         continue;
                     }
+                    eprintln!("DEBUG decrypt err for msg:{}: {:?}", info.id, e);
                     // Try PN→LID session migration before sending retry receipt
                     if let SignalProtocolError::SessionNotFound(_) = e {
                         if self
@@ -2493,26 +2494,45 @@ mod tests {
         assert!(s1, "pkmsg should establish session and decrypt");
         assert!(still1, "session must exist after first message");
 
-        // Second message: tamper the MAC bytes. Alice's session may still
-        // emit pkmsg if Bob hasn't sent her anything yet, but the trailing
-        // MAC bytes of the inner SignalMessage are still the last bytes of
-        // the serialized envelope either way — flipping them triggers
-        // BadMac in libsignal's MAC verification path.
+        // Force Alice's next encrypt to be a plain SignalMessage rather than a
+        // pkmsg by clearing her unacknowledged-pkmsg flag. Tampering the trailing
+        // bytes of a pkmsg breaks the outer protobuf parse (because reg_id /
+        // signed_pre_key_id varints are encoded *after* the embedded message
+        // field), which would short-circuit into the parse-error nack path
+        // before ever reaching the BadMac arm we want to exercise.
+        {
+            let record = alice
+                .sessions
+                .0
+                .get_mut(&bob_addr)
+                .expect("alice has a session for bob");
+            if let Some(state) = record.session_state_mut() {
+                state.clear_unacknowledged_pre_key_message();
+            }
+        }
+
+        // Second message: tamper the trailing MAC byte of a real SignalMessage.
+        // The format is `[version][protobuf body][8-byte MAC]`, so the last byte
+        // is squarely inside the MAC region — parse succeeds, MAC verification
+        // fails -> libsignal returns BadMac.
         let msg2 = alice.encrypt(&bob_addr, b"world").await;
-        let (enc_type, mut bytes) = match &msg2 {
-            CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
-            CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
-            _ => panic!("unexpected ciphertext type"),
+        let mut bytes = match &msg2 {
+            CiphertextMessage::SignalMessage(m) => m.serialized().to_vec(),
+            other => panic!(
+                "expected SignalMessage, got {:?}",
+                std::mem::discriminant(other)
+            ),
         };
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         let enc_node = NodeBuilder::new("enc")
-            .attr("type", enc_type)
+            .attr("type", "msg")
             .bytes(bytes)
             .build();
         let enc_ref = enc_node.as_node_ref();
         let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
         let info = Arc::new(MessageInfo {
+            id: "BADMAC_TAMPER_MSG".to_string(),
             source: crate::types::message::MessageSource {
                 sender: alice.jid.clone(),
                 chat: alice.jid.clone(),
@@ -2542,6 +2562,33 @@ mod tests {
             .await
             .expect("has_session");
         assert!(still, "BadMac must NOT delete the session (WA Web parity)");
+
+        // Discriminate from the parse-error path (which also preserves the
+        // session): the BadMac/InvalidMessage branch routes through
+        // `handle_decrypt_failure` -> `spawn_retry_receipt`, which bumps
+        // `message_retry_counts`. Parse errors take the nack path instead
+        // and never touch this counter.
+        await_retry_count_eq(&client, &info, 1).await;
+    }
+
+    /// Poll `message_retry_counts` for the given message until it matches
+    /// `expected` (or fail after a short timeout). `spawn_retry_receipt`
+    /// detaches the increment onto the runtime, so the counter may lag the
+    /// `process_session_enc_batch` return.
+    async fn await_retry_count_eq(client: &Arc<Client>, info: &MessageInfo, expected: u8) {
+        let cache_key = client
+            .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+            .await;
+        for _ in 0..200 {
+            if let Some(c) = client.message_retry_counts.get(&cache_key).await
+                && c == expected
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let actual = client.message_retry_counts.get(&cache_key).await;
+        panic!("expected retry count {expected} for {cache_key}, got {actual:?}");
     }
 
     /// Same invariant on the `InvalidMessage` arm of the same branch.
@@ -2600,6 +2647,7 @@ mod tests {
         let enc_ref = enc_node.as_node_ref();
         let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
         let info = Arc::new(MessageInfo {
+            id: "INVALID_MSG_STRAY_KEYS".to_string(),
             source: crate::types::message::MessageSource {
                 sender: alice.jid.clone(),
                 chat: alice.jid.clone(),
@@ -2627,6 +2675,9 @@ mod tests {
             .await
             .expect("has_session");
         assert!(still, "InvalidMessage must NOT delete the session");
+        // Discriminate from parse-error path: only the BadMac/InvalidMessage
+        // branch reaches `spawn_retry_receipt` and bumps the counter.
+        await_retry_count_eq(&client, &info, 1).await;
     }
 
     /// Integration test: reproduces the production loop observed in
@@ -2682,23 +2733,41 @@ mod tests {
             .sender_ratchet_key_for_logging()
             .expect("v1 base key");
 
-        // Tampered envelope → BadMac branch (with the fix this no longer
+        // Force Alice's next encrypt to be a plain SignalMessage so tampering
+        // the last byte lands inside the MAC region (see comment in
+        // `test_badmac_preserves_session` for why pkmsg cannot be tampered
+        // at the tail without breaking the outer protobuf parse).
+        {
+            let record = alice
+                .sessions
+                .0
+                .get_mut(&bob_addr)
+                .expect("alice has a session for bob");
+            if let Some(state) = record.session_state_mut() {
+                state.clear_unacknowledged_pre_key_message();
+            }
+        }
+
+        // Tampered SignalMessage → BadMac branch (with the fix this no longer
         // deletes Bob's session).
         let msg = alice.encrypt(&bob_addr, b"stale").await;
-        let (enc_type, mut bytes) = match &msg {
-            CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
-            CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
-            _ => panic!("unexpected ciphertext type"),
+        let mut bytes = match &msg {
+            CiphertextMessage::SignalMessage(m) => m.serialized().to_vec(),
+            other => panic!(
+                "expected SignalMessage, got {:?}",
+                std::mem::discriminant(other)
+            ),
         };
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         let enc_node = NodeBuilder::new("enc")
-            .attr("type", enc_type)
+            .attr("type", "msg")
             .bytes(bytes)
             .build();
         let enc_ref = enc_node.as_node_ref();
         let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
         let info = Arc::new(MessageInfo {
+            id: "PROD_LOOP_REPRO_STALE".to_string(),
             source: crate::types::message::MessageSource {
                 sender: alice.jid.clone(),
                 chat: alice.jid.clone(),
@@ -2715,6 +2784,9 @@ mod tests {
                 crate::types::events::DecryptFailMode::Show,
             )
             .await;
+        // Confirm the BadMac branch executed (parse-error path would skip
+        // the retry counter increment).
+        await_retry_count_eq(&client, &info, 1).await;
         // Pre-fix: this assertion would have failed (session deleted).
         let preserved = client
             .signal_cache
