@@ -208,21 +208,19 @@ impl Client {
     /// `spawn_retry_receipt` detaches. In practice, retries for the same
     /// message are rare and a double-send is benign (recipients deduplicate
     /// by message ID).
-    async fn increment_retry_count(&self, cache_key: &str) -> Option<u8> {
+    async fn increment_retry_count(&self, cache_key: &str, reason: RetryReason) -> Option<u8> {
         let cache_key = cache_key.to_owned();
         let current = self.message_retry_counts.get(&cache_key).await;
-        match current {
-            Some(count) if count >= MAX_DECRYPT_RETRIES => None,
-            Some(count) => {
-                let new_count = count + 1;
-                self.message_retry_counts.insert(cache_key, new_count).await;
-                Some(new_count)
-            }
-            None => {
-                self.message_retry_counts.insert(cache_key, 1_u8).await;
-                Some(1)
-            }
-        }
+        let new_count = match current {
+            Some(count) if count >= MAX_DECRYPT_RETRIES => return None,
+            Some(count) => count + 1,
+            None => 1,
+        };
+        self.message_retry_counts
+            .insert(cache_key.clone(), new_count)
+            .await;
+        self.recent_retry_reasons.insert(cache_key, reason).await;
+        Some(new_count)
     }
 
     /// Generate consistent cache key for retry logic.
@@ -277,7 +275,7 @@ impl Client {
                 .await;
 
             // Atomically increment retry count and check if we should continue
-            let Some(retry_count) = client.increment_retry_count(&cache_key).await else {
+            let Some(retry_count) = client.increment_retry_count(&cache_key, reason).await else {
                 // Max retries reached
                 log::info!(
                     "Max retries ({}) reached for message {} from {} [{:?}]. Sending immediate PDO request.",
@@ -2178,6 +2176,13 @@ mod tests {
             .await
             .expect("has_session should not fail");
         assert!(session_still_exists);
+
+        // Discriminate from the BadMac / InvalidMessage arms (which also
+        // preserve the session post-fix): the empty-record path must end up
+        // in the SessionNotFound branch, which fires a retry receipt with
+        // `RetryReason::NoSession`. Anything else means the libsignal-side
+        // empty-record short-circuit regressed.
+        await_retry_receipt(&client, &info, 1, RetryReason::NoSession).await;
     }
 
     // ─── Fixtures for session-preservation tests ─────────────────────────────
@@ -2559,29 +2564,43 @@ mod tests {
         // Discriminate from the parse-error path (which also preserves the
         // session): the BadMac/InvalidMessage branch routes through
         // `handle_decrypt_failure` -> `spawn_retry_receipt`, which bumps
-        // `message_retry_counts`. Parse errors take the nack path instead
-        // and never touch this counter.
-        await_retry_count_eq(&client, &info, 1).await;
+        // both caches with `RetryReason::BadMac`. Parse errors take the
+        // nack path instead and never touch either cache.
+        await_retry_receipt(&client, &info, 1, RetryReason::BadMac).await;
     }
 
-    /// Poll `message_retry_counts` for the given message until it matches
-    /// `expected` (or fail after a short timeout). `spawn_retry_receipt`
-    /// detaches the increment onto the runtime, so the counter may lag the
-    /// `process_session_enc_batch` return.
-    async fn await_retry_count_eq(client: &Arc<Client>, info: &MessageInfo, expected: u8) {
+    /// Poll for `message_retry_counts == expected_count` AND
+    /// `recent_retry_reasons == expected_reason` (or fail after a short
+    /// timeout). `spawn_retry_receipt` detaches the increment onto the
+    /// runtime, so both caches may lag the `process_session_enc_batch` return.
+    /// Reading both is what tells the BadMac arm apart from a parse-error
+    /// regression (which never bumps these caches).
+    async fn await_retry_receipt(
+        client: &Arc<Client>,
+        info: &MessageInfo,
+        expected_count: u8,
+        expected_reason: RetryReason,
+    ) {
         let cache_key = client
             .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
             .await;
         for _ in 0..200 {
-            if let Some(c) = client.message_retry_counts.get(&cache_key).await
-                && c == expected
+            if let (Some(c), Some(r)) = (
+                client.message_retry_counts.get(&cache_key).await,
+                client.recent_retry_reasons.get(&cache_key).await,
+            ) && c == expected_count
+                && r == expected_reason
             {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let actual = client.message_retry_counts.get(&cache_key).await;
-        panic!("expected retry count {expected} for {cache_key}, got {actual:?}");
+        let count = client.message_retry_counts.get(&cache_key).await;
+        let reason = client.recent_retry_reasons.get(&cache_key).await;
+        panic!(
+            "expected retry ({expected_count}, {expected_reason:?}) for {cache_key}, \
+             got ({count:?}, {reason:?})"
+        );
     }
 
     // NOTE: the `InvalidMessage` arm of the `matches!()` block in
@@ -2699,8 +2718,8 @@ mod tests {
             )
             .await;
         // Confirm the BadMac branch executed (parse-error path would skip
-        // the retry counter increment).
-        await_retry_count_eq(&client, &info, 1).await;
+        // both retry caches; another arm would record a different reason).
+        await_retry_receipt(&client, &info, 1, RetryReason::BadMac).await;
         // Pre-fix: this assertion would have failed (session deleted).
         let preserved = client
             .signal_cache
@@ -4854,7 +4873,9 @@ mod tests {
         let cache_key = "test_chat:msg123:sender456";
 
         // First increment should return 1
-        let count = client.increment_retry_count(cache_key).await;
+        let count = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
         assert_eq!(count, Some(1), "First retry should be count 1");
 
         // Verify it's stored in cache
@@ -4869,9 +4890,15 @@ mod tests {
         let cache_key = "test_chat:msg456:sender789";
 
         // Simulate multiple retries
-        let count1 = client.increment_retry_count(cache_key).await;
-        let count2 = client.increment_retry_count(cache_key).await;
-        let count3 = client.increment_retry_count(cache_key).await;
+        let count1 = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
+        let count2 = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
+        let count3 = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
 
         assert_eq!(count1, Some(1), "First retry should be 1");
         assert_eq!(count2, Some(2), "Second retry should be 2");
@@ -4886,12 +4913,16 @@ mod tests {
 
         // Exhaust all retries (MAX_DECRYPT_RETRIES = 5)
         for i in 1..=5 {
-            let count = client.increment_retry_count(cache_key).await;
+            let count = client
+                .increment_retry_count(cache_key, RetryReason::NoSession)
+                .await;
             assert_eq!(count, Some(i), "Retry {} should return {}", i, i);
         }
 
         // 6th attempt should return None (max reached)
-        let count_after_max = client.increment_retry_count(cache_key).await;
+        let count_after_max = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
         assert_eq!(
             count_after_max, None,
             "After max retries, should return None"
@@ -4911,14 +4942,26 @@ mod tests {
         let key3 = "chat2:msg1:sender2"; // Different chat and sender
 
         // Increment each independently
-        let _ = client.increment_retry_count(key1).await;
-        let _ = client.increment_retry_count(key1).await;
-        let _ = client.increment_retry_count(key1).await; // key1 = 3
+        let _ = client
+            .increment_retry_count(key1, RetryReason::NoSession)
+            .await;
+        let _ = client
+            .increment_retry_count(key1, RetryReason::NoSession)
+            .await;
+        let _ = client
+            .increment_retry_count(key1, RetryReason::NoSession)
+            .await; // key1 = 3
 
-        let _ = client.increment_retry_count(key2).await; // key2 = 1
+        let _ = client
+            .increment_retry_count(key2, RetryReason::NoSession)
+            .await; // key2 = 1
 
-        let _ = client.increment_retry_count(key3).await;
-        let _ = client.increment_retry_count(key3).await; // key3 = 2
+        let _ = client
+            .increment_retry_count(key3, RetryReason::NoSession)
+            .await;
+        let _ = client
+            .increment_retry_count(key3, RetryReason::NoSession)
+            .await; // key3 = 2
 
         // Verify each has independent counts
         assert_eq!(client.message_retry_counts.get(key1).await, Some(3));
@@ -4972,7 +5015,11 @@ mod tests {
         for _ in 0..10 {
             let client_clone = client.clone();
             let key = cache_key.to_string();
-            tasks.spawn(async move { client_clone.increment_retry_count(&key).await });
+            tasks.spawn(async move {
+                client_clone
+                    .increment_retry_count(&key, RetryReason::NoSession)
+                    .await
+            });
         }
 
         // Collect all results
@@ -5067,7 +5114,9 @@ mod tests {
         // We can verify entries are being stored and the cache is functional
         let cache_key = "expiry_test:msg:sender";
 
-        let count = client.increment_retry_count(cache_key).await;
+        let count = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
         assert_eq!(count, Some(1));
 
         // Entry should still exist immediately after
@@ -5187,12 +5236,20 @@ mod tests {
         let key2 = format!("{}:{}:{}", group, msg_id, sender2);
 
         // Increment for sender1 multiple times
-        client.increment_retry_count(&key1).await;
-        client.increment_retry_count(&key1).await;
-        client.increment_retry_count(&key1).await;
+        client
+            .increment_retry_count(&key1, RetryReason::NoSession)
+            .await;
+        client
+            .increment_retry_count(&key1, RetryReason::NoSession)
+            .await;
+        client
+            .increment_retry_count(&key1, RetryReason::NoSession)
+            .await;
 
         // Increment for sender2 once
-        client.increment_retry_count(&key2).await;
+        client
+            .increment_retry_count(&key2, RetryReason::NoSession)
+            .await;
 
         // Verify independent tracking
         assert_eq!(
