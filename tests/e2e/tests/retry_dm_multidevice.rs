@@ -7,6 +7,8 @@ use wacore_binary::JidExt as _;
 use wacore_binary::node::Node;
 use whatsapp_rust::{NodeFilter, SendOptions};
 
+/// A non-empty `<participants>` on a DM retry would mean we regressed to
+/// the fanout shape (server rejects with 479 SmaxInvalid).
 fn participant_target_count(message_node: &Node) -> usize {
     message_node
         .get_optional_child("participants")
@@ -16,9 +18,7 @@ fn participant_target_count(message_node: &Node) -> usize {
 }
 
 fn retry_enc_count(message_node: &Node) -> Option<String> {
-    let participants = message_node.get_optional_child("participants")?;
-    let target = participants.children()?.first()?;
-    let enc = target.get_optional_child("enc")?;
+    let enc = message_node.get_optional_child("enc")?;
     enc.attrs().optional_string("count").map(|s| s.into_owned())
 }
 
@@ -100,8 +100,12 @@ async fn test_dm_retry_recovers_after_session_deletion() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("retry DM send waiter was canceled"))?;
     assert_eq!(
         participant_target_count(&retry_node),
-        1,
-        "Retry resend should target exactly one device"
+        0,
+        "DM retry resend must not use the <participants><to> fanout shape"
+    );
+    assert!(
+        retry_node.get_optional_child("enc").is_some(),
+        "Retry resend should carry an <enc> directly under <message>"
     );
     assert_eq!(
         retry_enc_count(&retry_node).as_deref(),

@@ -994,16 +994,10 @@ where
     Ok(stanza)
 }
 
-/// Pairwise-encrypted retry stanza for a single DM recipient device.
-/// WA Web retries target only the failing device, not a full DM fanout.
-#[allow(clippy::too_many_arguments)]
-/// Single-device retry resend for a DM, mirroring
-/// `WAWebSendMsgCreateDeviceStanza.createUserDeviceMsgStanza`. The `<enc>`
-/// is a direct child of `<message>` (no `<participants>` fanout wrapper),
-/// `recipient` carries the original message's destination, and
-/// `decrypt-fail="hide"` is set for the same message kinds that hide it on
-/// the original send. The previous fanout-shaped output triggered server
-/// 479 (SmaxInvalid) on every self-DM retry in prod (2026-05-19 log).
+/// Mirrors `WAWebSendMsgCreateDeviceStanza.createUserDeviceMsgStanza`:
+/// `<enc>` directly under `<message>`, `recipient` carries the original
+/// destination. The fanout shape (`<participants><to>`) is server-rejected
+/// with 479 (SmaxInvalid) on retries.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_dm_retry_stanza<S, I>(
     session_store: &mut S,
@@ -2910,15 +2904,10 @@ mod tests {
             assert!(n.get_optional_child("device-identity").is_none());
         }
 
-        /// Regression for the prod 479 (SmaxInvalid) reported on the
-        /// 2026-05-19 self-DM run: the retry resend wrapped the `<enc>`
-        /// inside `<participants><to>` (the fanout shape) and the server
-        /// rejected every retry. WAWebSendMsgCreateDeviceStanza's
-        /// `createUserDeviceMsgStanza` puts the `<enc>` directly under
-        /// `<message>` and always sets the `recipient` attribute. This
-        /// test pins both invariants — it fails before the format fix
-        /// because today's `prepare_dm_retry_stanza` emits the fanout
-        /// shape.
+        /// Pins the WAWebSendMsgCreateDeviceStanza retry shape: `<enc>`
+        /// directly under `<message>` plus a `recipient` attribute.
+        /// Pre-fix this regressed to the fanout shape and the server
+        /// rejected every retry with 479.
         #[tokio::test]
         async fn dm_retry_emits_enc_directly_under_message_with_recipient() {
             let (mut ss, mut is, jid) = setup_session().await;
