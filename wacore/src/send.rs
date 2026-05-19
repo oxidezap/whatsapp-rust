@@ -994,16 +994,18 @@ where
     Ok(stanza)
 }
 
-/// Mirrors `WAWebSendMsgCreateDeviceStanza.createUserDeviceMsgStanza`:
-/// `<enc>` directly under `<message>`, `recipient` carries the original
-/// destination. The fanout shape (`<participants><to>`) is server-rejected
-/// with 479 (SmaxInvalid) on retries.
+/// Mirrors `WAWebSendMsgCreateDeviceStanza.createUserDeviceMsgStanza`.
+/// `<enc>` goes directly under `<message>`; the fanout wrapper
+/// (`<participants><to>`) is server-rejected with 479 on retries.
+/// `recipient_jid` is propagated verbatim from the retry receipt
+/// (`f && (k.recipient = f)` in `WAWebHandleRetryRequest`); pass `None`
+/// when the incoming receipt didn't carry it.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_dm_retry_stanza<S, I>(
     session_store: &mut S,
     identity_store: &mut I,
     to_jid: Jid,
-    recipient_jid: Jid,
+    recipient_jid: Option<Jid>,
     encryption_jid: Jid,
     message: &wa::Message,
     message_id: String,
@@ -1048,9 +1050,11 @@ where
 
     let mut stanza_builder = NodeBuilder::new("message")
         .attr("to", to_jid)
-        .attr("recipient", recipient_jid)
         .attr("id", message_id)
         .attr("type", stanza_type_from_message(message));
+    if let Some(r) = recipient_jid {
+        stanza_builder = stanza_builder.attr("recipient", r);
+    }
 
     // Without `edit`, the resend looks like a normal message and the client never
     // applies the revoke/edit.
@@ -2917,7 +2921,7 @@ mod tests {
                 &mut ss,
                 &mut is,
                 to.clone(),
-                requester.clone(),
+                Some(to.clone()),
                 requester,
                 &wa::Message::default(),
                 "dm-retry-format-1".into(),
@@ -2939,8 +2943,8 @@ mod tests {
                 n.get_optional_child("enc").is_some(),
                 "<enc> must be a direct child of <message>"
             );
-            // `recipient` attribute must be present so the server routes
-            // correctly (mirrors WA Web's `recipient: USER_JID(g)`).
+            // `recipient` attribute is forwarded from the retry receipt
+            // (mirrors WA Web's `f && (k.recipient = f)`).
             assert!(
                 n.attrs().optional_string("recipient").is_some(),
                 "DM retry must carry the `recipient` attribute"
@@ -2957,7 +2961,7 @@ mod tests {
                 &mut ss,
                 &mut is,
                 to.clone(),
-                to.clone(),
+                Some(to.clone()),
                 encryption,
                 &wa::Message::default(),
                 "dm-retry-1".into(),
@@ -3011,7 +3015,7 @@ mod tests {
                 &mut ss,
                 &mut is,
                 to.clone(),
-                to,
+                Some(to),
                 jid,
                 &wa::Message::default(),
                 "dm-retry-2".into(),
@@ -3137,7 +3141,7 @@ mod tests {
                 &mut ss,
                 &mut is,
                 to.clone(),
-                to,
+                Some(to),
                 jid,
                 &wa::Message::default(),
                 "edit-1".into(),

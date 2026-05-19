@@ -92,6 +92,10 @@ struct RetryChatInfo {
     /// Raw `from` JID from the receipt, for stanza `to` attribute.
     /// WA Web preserves the original `from` (variable `m`) for the retry stanza.
     original_from: Jid,
+    /// Receipt's `recipient` attribute, if present. WA Web's
+    /// `handleRetryRequest` propagates this verbatim into the retry resend
+    /// (only self-DM and bot receipts carry it).
+    recipient: Option<Jid>,
     /// True if the requester is a bot JID (skip namespace normalization).
     is_bot: bool,
 }
@@ -118,6 +122,7 @@ fn resolve_retry_chat_info(
             chat: from.clone(),
             requester,
             original_from: from.clone(),
+            recipient: node.attrs().optional_jid("recipient"),
             is_bot: false,
         }
     } else {
@@ -161,6 +166,7 @@ fn resolve_retry_chat_info(
             chat,
             requester,
             original_from: from.clone(),
+            recipient,
             is_bot,
         }
     }
@@ -469,16 +475,14 @@ impl Client {
 
             let edit_attr =
                 wacore::types::message::EditAttribute::infer_from_message(&original_msg);
-            // For DM retries WA Web sets `recipient` to the original message's
-            // recipient (= `to` for the resend), matching
-            // WAWebSendMsgCreateDeviceStanza's `recipient: USER_JID(g)`.
-            // `info.chat` is the resolved original chat target (PN/LID-normalized).
-            let recipient_jid = info.chat.clone();
+            // WA Web forwards the receipt's `recipient` verbatim
+            // (`f && (k.recipient = f)` in handleRetryRequest); for non-self
+            // DM receipts the attribute is absent and the resend drops it.
             let stanza = wacore::send::prepare_dm_retry_stanza(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
                 info.original_from,
-                recipient_jid,
+                info.recipient.clone(),
                 resolved_jid.clone(),
                 &original_msg,
                 message_id,
@@ -1600,6 +1604,7 @@ mod tests {
             chat: resolved_jid.to_non_ad(),
             requester: resolved_jid.clone(),
             original_from: resolved_jid.clone(),
+            recipient: None,
             is_bot: false,
         }
     }
@@ -1822,6 +1827,7 @@ mod tests {
             chat: group_chat.clone(),
             requester: resolved_jid.clone(),
             original_from: group_chat,
+            recipient: None,
             is_bot: false,
         };
 
