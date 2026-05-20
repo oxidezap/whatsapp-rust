@@ -349,6 +349,31 @@ impl Client {
     /// from the backend when the cache has unflushed mutations (e.g., after
     /// SKDM encryption ratcheted the session).
     pub(crate) async fn migrate_signal_sessions_on_lid_discovery(&self, pn: &str, lid: &str) {
+        self.migrate_signal_sessions_on_lid_discovery_inner(pn, lid, None)
+            .await;
+    }
+
+    /// Variant called from inside `decrypt_message`, which already holds
+    /// `session_lock_for(<lid_addr>.<device_id>)`. `async_lock::Mutex` is
+    /// not reentrant, so re-acquiring that lock in the migration loop
+    /// deadlocks. `skip_lid_lock_for_device` tells us which LID device
+    /// lock to skip (caller already serializes it).
+    pub(crate) async fn migrate_signal_sessions_on_lid_discovery_with_held_lock(
+        &self,
+        pn: &str,
+        lid: &str,
+        held_device_id: u16,
+    ) {
+        self.migrate_signal_sessions_on_lid_discovery_inner(pn, lid, Some(held_device_id))
+            .await;
+    }
+
+    async fn migrate_signal_sessions_on_lid_discovery_inner(
+        &self,
+        pn: &str,
+        lid: &str,
+        skip_lid_lock_for_device: Option<u16>,
+    ) {
         use log::{info, warn};
         use wacore::types::jid::JidExt;
 
@@ -367,20 +392,28 @@ impl Client {
             // session (or read mid-update state). Acquire in stable
             // (lexicographic) order to avoid deadlocks with operations that
             // legitimately hold one and not the other.
+            let skip_lid = skip_lid_lock_for_device == Some(device_id);
             let pn_key = pn_proto.to_string();
             let lid_key = lid_proto.to_string();
-            let (first_key, second_key) = if pn_key <= lid_key {
-                (pn_key.clone(), lid_key.clone())
+            let pn_lock = self.session_lock_for(&pn_key).await;
+            // Lock guards must outlive the read-modify-write window. Storing
+            // them as separately-typed Options keeps stable acquisition order
+            // (PN first when both are taken; LID-only acquisition only when
+            // PN ordering would put LID before PN but the caller still holds
+            // PN — not possible here, so PN-first is unconditional and safe).
+            let (_pn_guard_opt, _lid_guard_opt) = if skip_lid {
+                (Some(pn_lock.lock_arc().await), None)
             } else {
-                (lid_key.clone(), pn_key.clone())
-            };
-            let first_lock = self.session_lock_for(&first_key).await;
-            let _first_guard = first_lock.lock().await;
-            let _second_guard = if first_key == second_key {
-                None
-            } else {
-                let second_lock = self.session_lock_for(&second_key).await;
-                Some(second_lock.lock_arc().await)
+                let lid_lock = self.session_lock_for(&lid_key).await;
+                if pn_key <= lid_key {
+                    let pn_g = pn_lock.lock_arc().await;
+                    let lid_g = lid_lock.lock_arc().await;
+                    (Some(pn_g), Some(lid_g))
+                } else {
+                    let lid_g = lid_lock.lock_arc().await;
+                    let pn_g = pn_lock.lock_arc().await;
+                    (Some(pn_g), Some(lid_g))
+                }
             };
 
             // PN wins on conflict — mirrors whatsmeow's `MigratePNToLID`

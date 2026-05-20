@@ -1434,8 +1434,16 @@ impl Client {
             return false;
         };
 
-        self.migrate_signal_sessions_on_lid_discovery(&pn, &sender_jid.user)
-            .await;
+        // The caller (decrypt_message) already holds session_lock_for(signal_address).
+        // async_lock::Mutex is not reentrant, so use the held-lock variant to skip
+        // re-acquiring that specific device's LID lock.
+        let held_device_id: u32 = signal_address.device_id().into();
+        self.migrate_signal_sessions_on_lid_discovery_with_held_lock(
+            &pn,
+            &sender_jid.user,
+            held_device_id as u16,
+        )
+        .await;
 
         // Migration now goes through signal_cache, so no manual reload needed
 
