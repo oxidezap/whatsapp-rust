@@ -1057,6 +1057,28 @@ where
     let plaintext = MessageUtils::encode_and_pad(message);
     let signal_address = encryption_jid.to_protocol_address();
 
+    // Symmetric to prepare_peer_stanza's pre-flight: if the next encrypt
+    // would be pkmsg (no session yet, or pending pre-key on existing
+    // session) and we have no AdvSignedDeviceIdentity to ship in
+    // <device-identity>, refuse before message_encrypt persists the
+    // advanced chain. Otherwise we'd burn the ratchet for a stanza the
+    // peer's Signal layer can't promote.
+    if account.is_none() {
+        let needs_account = match session_store.load_session(&signal_address).await? {
+            None => true,
+            Some(record) => record
+                .session_state()
+                .and_then(|st| st.unacknowledged_pre_key_message_items().ok().flatten())
+                .is_some(),
+        };
+        if needs_account {
+            bail!(
+                "DM retry pkmsg requires <device-identity> (account is None); \
+                 refusing before message_encrypt to avoid advancing the sender chain"
+            );
+        }
+    }
+
     let encrypted =
         message_encrypt(&plaintext, &signal_address, session_store, identity_store).await?;
 
@@ -1077,7 +1099,12 @@ where
     let enc_node = enc_builder.bytes(serialized).build();
 
     let mut children = vec![enc_node];
-    if is_prekey && let Some(acc) = account {
+    if is_prekey {
+        // Defense in depth: pre-flight should have caught this, but a corrupt
+        // session that triggers a fresh pkmsg mid-call would slip past.
+        let acc = account.ok_or_else(|| {
+            anyhow!("DM retry pkmsg without <device-identity> (unreachable via pre-flight)")
+        })?;
         children.push(
             NodeBuilder::new("device-identity")
                 .bytes(acc.encode_to_vec())
@@ -2957,6 +2984,7 @@ mod tests {
             let to: Jid = "559922223333:5@s.whatsapp.net".parse().unwrap();
             let recipient: Jid = "100000000000456@lid".parse().unwrap();
             let requester: Jid = jid.to_string().parse().unwrap();
+            let account = pkmsg_account_proto();
             let n = prepare_dm_retry_stanza(
                 &mut ss,
                 &mut is,
@@ -2966,7 +2994,7 @@ mod tests {
                 &wa::Message::default(),
                 "dm-retry-format-1".into(),
                 1,
-                None,
+                Some(&account),
                 None,
             )
             .await
@@ -3001,6 +3029,7 @@ mod tests {
             let (mut ss, mut is, jid) = setup_session().await;
             let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
             let encryption = jid.clone();
+            let account = pkmsg_account_proto();
 
             let n = prepare_dm_retry_stanza(
                 &mut ss,
@@ -3011,7 +3040,7 @@ mod tests {
                 &wa::Message::default(),
                 "dm-retry-1".into(),
                 1,
-                None,
+                Some(&account),
                 None,
             )
             .await
@@ -3044,7 +3073,10 @@ mod tests {
                 stanza::ENC_TYPE_PKMSG
             );
             assert_eq!(enc_attrs.optional_string("count").unwrap().as_ref(), "1");
-            assert!(n.get_optional_child("device-identity").is_none());
+            assert!(
+                n.get_optional_child("device-identity").is_some(),
+                "pkmsg DM retry with account must include <device-identity>"
+            );
         }
 
         #[tokio::test]
@@ -3182,6 +3214,7 @@ mod tests {
         async fn dm_retry_preserves_edit_attribute() {
             let (mut ss, mut is, jid) = setup_session().await;
             let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
+            let account = pkmsg_account_proto();
             let n = prepare_dm_retry_stanza(
                 &mut ss,
                 &mut is,
@@ -3191,7 +3224,7 @@ mod tests {
                 &wa::Message::default(),
                 "edit-1".into(),
                 1,
-                None,
+                Some(&account),
                 Some(crate::types::message::EditAttribute::MessageEdit),
             )
             .await
@@ -3390,6 +3423,56 @@ mod tests {
                 !ss.has_session(&addr).await.unwrap(),
                 "pre-flight must NOT advance/persist a session — the ratchet \
                  must remain unburned for the retry attempt"
+            );
+        }
+
+        /// Symmetric to peer_pkmsg_preflight: prepare_dm_retry_stanza must
+        /// also refuse to ship pkmsg without <device-identity>, otherwise
+        /// message_encrypt would advance the sender chain for a stanza the
+        /// peer's Signal layer cannot promote.
+        #[tokio::test]
+        async fn dm_retry_pkmsg_preflight_errors_when_account_missing() {
+            let (mut ss, mut is, jid) = setup_session().await;
+            let addr = jid.to_protocol_address();
+
+            let before = ss
+                .load_session(&addr)
+                .await
+                .unwrap()
+                .expect("pre-condition: session present")
+                .serialize()
+                .expect("serialize before");
+
+            let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
+            let result = prepare_dm_retry_stanza(
+                &mut ss,
+                &mut is,
+                to.clone(),
+                Some(to),
+                jid.clone(),
+                &wa::Message::default(),
+                "dm-retry-no-account".into(),
+                1,
+                None,
+                None,
+            )
+            .await;
+            let err = result.expect_err("DM retry pkmsg path must reject missing account");
+            assert!(
+                err.to_string().contains("device-identity"),
+                "error must name <device-identity>; got: {err}"
+            );
+
+            let after = ss
+                .load_session(&addr)
+                .await
+                .unwrap()
+                .expect("session still present")
+                .serialize()
+                .expect("serialize after");
+            assert_eq!(
+                before, after,
+                "DM retry pre-flight must leave the session byte-identical"
             );
         }
     }

@@ -19,6 +19,12 @@ use wacore_binary::Jid;
 use super::Client;
 use crate::lid_pn_cache::{LearningSource, LidPnEntry};
 
+/// Exclusive upper bound for the device-id range we iterate when migrating
+/// PN→LID. WhatsApp's protocol caps companion devices well below this, but
+/// the conservative bound covers paired devices learned via offline syncs
+/// without unbounded looping.
+const MIGRATION_DEVICE_RANGE: u16 = 100;
+
 /// Backend `LidPnMappingEntry` → in-memory `LidPnEntry`.
 fn mapping_to_entry(m: LidPnMappingEntry) -> LidPnEntry {
     LidPnEntry::with_timestamp(
@@ -361,9 +367,11 @@ impl Client {
 
         let backend = self.persistence_manager.backend();
 
-        for device_id in 0..=99u16 {
-            let pn_jid = Jid::pn_device(pn.to_string(), device_id);
-            let lid_jid = Jid::lid_device(lid.to_string(), device_id);
+        for device_id in 0..MIGRATION_DEVICE_RANGE {
+            // `&str` → `CompactString` is inline for ≤24-byte user parts
+            // (all PN/LID identifiers fit), so no String intermediate.
+            let pn_jid = Jid::pn_device(pn, device_id);
+            let lid_jid = Jid::lid_device(lid, device_id);
 
             let pn_proto = pn_jid.to_protocol_address();
             let lid_proto = lid_jid.to_protocol_address();
@@ -398,6 +406,13 @@ impl Client {
                 );
             }
 
+            // Identity uses LID-wins (the inverse of session). For the same
+            // physical device the identity_key is stable across PN/LID, so
+            // either policy yields the same bytes in the steady state. The
+            // asymmetry only matters if the peer re-paired between our PN
+            // and LID identity captures — in that case the fresher LID
+            // identity is on the namespace we're migrating *to*, and PN's
+            // stale value should not clobber it.
             if let Ok(Some(identity_data)) = self
                 .signal_cache
                 .get_identity(&pn_proto, backend.as_ref())

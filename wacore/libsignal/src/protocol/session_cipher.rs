@@ -246,6 +246,12 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
 ) -> Result<Vec<u8>> {
     let existing = session_store.load_session(remote_address).await?;
     let had_session = existing.is_some();
+    // Snapshot before process_prekey so a BadMac/InvalidMessage at the
+    // record-level decrypt doesn't persist the promoted (but unusable)
+    // session. Without this, an attacker that crafts a pkmsg with a valid
+    // prekey header but tampered payload would replace our current_session
+    // with a session only they can write to.
+    let pre_call_snapshot = existing.clone();
     let mut session_record = existing.unwrap_or_else(SessionRecord::new_fresh);
 
     let result = message_decrypt_prekey_inner(
@@ -260,12 +266,21 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     )
     .await;
 
-    // Persist if we checked out an existing session (must return it) or
-    // if process_prekey populated the record (even if a later step failed).
-    if had_session || session_record.session_state().is_some() {
-        session_store
-            .store_session(remote_address, session_record)
-            .await?;
+    // Persistence rules:
+    //   - Ok: store the (mutated) record with the promoted session.
+    //   - Err + had_session: restore the pre-call snapshot so the cache's
+    //     CheckedOut marker is replaced with the original record.
+    //   - Err + !had_session: nothing to put back; new_fresh wasn't
+    //     persisted before the call and there's no CheckedOut to honor.
+    let store_target = match (&result, pre_call_snapshot) {
+        (Ok(_), _) => Some(session_record),
+        (Err(_), Some(snapshot)) => Some(snapshot),
+        (Err(_), None) => None,
+    };
+    if let Some(record) = store_target
+        && (had_session || record.session_state().is_some())
+    {
+        session_store.store_session(remote_address, record).await?;
     }
 
     let (plaintext, pre_key_used) = result?;

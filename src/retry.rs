@@ -141,7 +141,10 @@ fn resolve_retry_chat_info(
         // WA Web getTargetChat (RetryRequest.js:339-371):
         // 1. Bot + recipient → chat = recipient
         // 2. Peer device + recipient → chat = recipient
-        // 3. Peer device without recipient → abort (return null)
+        // 3. Peer device without recipient → WA Web aborts (returns null).
+        //    We log+fall back to `from.to_non_ad()` rather than dropping
+        //    the receipt; the message lookup will likely miss but the
+        //    retry receipt is at least acknowledged downstream.
         // 4. Normal user → chat = asUserWidOrThrow(from) = from.to_non_ad()
         let is_peer = own_pn.is_some_and(|pn| from.is_same_user_as(pn))
             || own_lid.is_some_and(|lid| from.is_same_user_as(lid));
@@ -578,13 +581,24 @@ impl Client {
 
         // 2. processKeyBundle (WA Web L51). Previously gated behind
         //    `!is_status_broadcast()`; WA Web runs it unconditionally.
+        let keys_node_present = node.get_optional_child("keys").is_some();
         let key_bundle_result = self
             .process_retry_key_bundle(node, resolved_jid, is_peer)
             .await;
         let key_bundle_processed = key_bundle_result.is_ok();
 
         // 3. No bundle + regId mismatch → delete session (WA Web L52-65).
-        if !key_bundle_processed {
+        //    Gate on `!keys_node_present` so a rejected bundle (security
+        //    refusal for peer reg-ID change, parse errors, invalid reg ID)
+        //    doesn't trigger destructive session deletion as a side effect.
+        if !key_bundle_processed && keys_node_present {
+            log::warn!(
+                "Key bundle present but rejected for {}: {:?} — skipping regId mismatch deletion",
+                resolved_jid,
+                key_bundle_result.as_ref().err()
+            );
+        }
+        if !key_bundle_processed && !keys_node_present {
             if let Err(ref e) = key_bundle_result {
                 // Demoted to debug on the happy path (peer retry without re-key):
                 // only warn when a regId mismatch triggers a delete below.

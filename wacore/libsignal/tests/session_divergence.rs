@@ -744,3 +744,85 @@ fn in_flight_msgs_decrypt_through_archived_session_after_rebuild() {
         assert_eq!(&pt[..], format!("queued {i}").as_bytes());
     }
 }
+
+/// Tampered pkmsg must NOT persist the promoted-but-unusable session.
+/// `process_prekey` runs successfully (the prekey header is well-formed),
+/// then the inner decrypt fails on the tampered payload with BadMac. Pre-fix,
+/// `message_decrypt_prekey` would still call `store_session` on the mutated
+/// record, replacing the receiver's current_session with one only an attacker
+/// could write to. The fix snapshots the record before `process_prekey` and
+/// restores it on inner failure.
+#[test]
+fn pkmsg_decrypt_failure_does_not_persist_promoted_session() {
+    use wacore_libsignal::protocol::{PreKeySignalMessage, SignalMessage};
+
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+
+    // Alice gets Bob's bundle, encrypts a pkmsg. Bob has no session yet.
+    let bundle = bob.bundle();
+    process_bundle(&mut alice, &bob.address, &bundle);
+    let ct = send(&mut alice, &bob.address, b"hello bob");
+
+    // Bob's store is empty for Alice — precondition for the bug.
+    let bob_pre = futures::executor::block_on(async {
+        bob.session_store
+            .load_session(&alice.address)
+            .await
+            .unwrap()
+    });
+    assert!(
+        bob_pre.is_none(),
+        "precondition: Bob has no session for Alice before the tampered pkmsg arrives"
+    );
+
+    // Tamper the inner SignalMessage's MAC. Pkmsg is protobuf-encoded so
+    // a byte-flip on the wire bytes breaks parsing; rebuild the pkmsg via
+    // PreKeySignalMessage::new with a tampered inner. process_prekey only
+    // validates the header (prekey refs + identity_key + base_key signature)
+    // so the rebuilt pkmsg still passes that step; the inner verify_mac
+    // then fires.
+    let CiphertextMessage::PreKeySignalMessage(pkmsg) = &ct else {
+        panic!("Alice's fresh-session encrypt must produce a pkmsg, got {ct:?}");
+    };
+    let inner = pkmsg.message();
+    let mut inner_bytes = inner.serialized().to_vec();
+    let last = inner_bytes.len() - 1;
+    inner_bytes[last] ^= 0x80;
+    let tampered_inner = SignalMessage::try_from(&inner_bytes[..])
+        .expect("tampered inner bytes still parse as SignalMessage");
+    let tampered_pkmsg = PreKeySignalMessage::new(
+        pkmsg.message_version(),
+        pkmsg.registration_id(),
+        pkmsg.pre_key_id(),
+        pkmsg.signed_pre_key_id(),
+        *pkmsg.base_key(),
+        *pkmsg.identity_key(),
+        tampered_inner,
+    )
+    .expect("reconstructed pkmsg with tampered inner");
+    let tampered = CiphertextMessage::PreKeySignalMessage(tampered_pkmsg);
+
+    let err = receive(&mut bob, &alice.address, &tampered)
+        .expect_err("tampered payload must fail decrypt");
+    assert!(
+        matches!(
+            err,
+            SignalProtocolError::BadMac(_) | SignalProtocolError::InvalidMessage(_, _)
+        ),
+        "expected BadMac/InvalidMessage on tampered pkmsg, got {err:?}"
+    );
+
+    let bob_post = futures::executor::block_on(async {
+        bob.session_store
+            .load_session(&alice.address)
+            .await
+            .unwrap()
+    });
+    assert!(
+        bob_post.is_none(),
+        "BadMac on pkmsg must NOT persist the promoted session — an attacker \
+         who can craft pkmsg headers with valid prekeys could otherwise force \
+         the receiver into a session only they can write to."
+    );
+}
