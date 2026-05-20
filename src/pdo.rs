@@ -32,6 +32,30 @@ pub struct PendingPdoRequest {
     pub requested_at: wacore::time::Instant,
 }
 
+/// Self peer-message destination (device 0 of our own account). Mirrors
+/// WA Web `WAWebSendNonMessageDataRequest`:
+///
+/// ```text
+/// u = getMePnUserOrThrow()
+/// c = u.isLid() && getMaybeMeDeviceLid() ? getMaybeMeDeviceLid() : getMeDevicePnOrThrow()
+/// ```
+///
+/// Critical for session recovery: the pkmsg that `ensure_e2e_sessions`
+/// emits on this target lands in the namespace's session slot on the
+/// recipient device. If the device is LID-migrated and we address it
+/// over PN, we rebuild the wrong slot and the LID-namespace ratchet that
+/// the device actually uses on its outbound side stays diverged.
+fn self_peer_target(device: &wacore::store::Device) -> Result<Jid, crate::client::ClientError> {
+    if let Some(lid) = device.lid.as_ref() {
+        return Ok(Jid::lid_device(lid.user.clone(), 0));
+    }
+    let pn = device
+        .pn
+        .as_ref()
+        .ok_or(crate::client::ClientError::NotLoggedIn)?;
+    Ok(Jid::pn_device(pn.user.clone(), 0))
+}
+
 impl Client {
     /// Sends a PDO (Peer Data Operation) request to our own primary phone to get the
     /// decrypted content of a message that we failed to decrypt.
@@ -52,16 +76,14 @@ impl Client {
     ) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
 
-        // We need to send PDO to our PRIMARY PHONE (device 0), not to ourselves (linked device).
-        // The primary phone has already decrypted the message and can share the content with us.
-        let own_pn = device_snapshot
-            .pn
-            .clone()
-            .ok_or_else(|| anyhow::Error::from(crate::client::ClientError::NotLoggedIn))?;
-
-        // Send to bare own JID (no device suffix); server routes to all devices
-        // including device 0. Matches whatsmeow's SendPeerMessage(ownID.ToNonAD()).
-        let peer_target = own_pn.to_non_ad();
+        // PDO target = our PRIMARY PHONE (device 0). The pkmsg produced by
+        // `ensure_e2e_sessions` here is also the only mechanism that resets
+        // the Signal session with that device after divergence — so the
+        // namespace must match the one the phone uses on its outbound side,
+        // otherwise we rebuild the wrong session slot and the peer stays
+        // stuck. WA Web's `WAWebSendNonMessageDataRequest`:
+        //   `u.isLid() && getMaybeMeDeviceLid() ? meDeviceLid : meDevicePn`
+        let peer_target = self_peer_target(&device_snapshot)?;
 
         // Resolve to LID for the MessageKey when LID-migrated, matching WA Web's
         // NonMessageDataRequest.js:412-421 (toUserLid when isLidMigrated).
@@ -179,11 +201,7 @@ impl Client {
         count: i32,
     ) -> Result<String, anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
-        let own_pn = device_snapshot
-            .pn
-            .clone()
-            .ok_or_else(|| anyhow::Error::from(crate::client::ClientError::NotLoggedIn))?;
-        let peer_target = own_pn.to_non_ad();
+        let peer_target = self_peer_target(&device_snapshot)?;
 
         let pdo_request = wa::message::PeerDataOperationRequestMessage {
             peer_data_operation_request_type: Some(
@@ -533,34 +551,63 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use super::self_peer_target;
+    use wacore::store::Device;
     use wacore_binary::{Jid, JidExt, Server};
 
-    #[test]
-    fn test_pdo_peer_target_is_device_0() {
-        let own_pn = Jid::pn("559999999999");
-        let peer_target = own_pn.to_non_ad();
-
-        assert_eq!(peer_target.device, 0);
-        assert!(!peer_target.is_ad());
+    fn empty_device() -> Device {
+        Device {
+            pn: None,
+            lid: None,
+            ..Device::default()
+        }
     }
 
+    /// LID-migrated account: outbound peer messages must land in the LID
+    /// session slot, otherwise the recipient's LID-namespace ratchet (the
+    /// one its app uses on its outbound side) never gets reset by the
+    /// pkmsg we emit alongside the PDO. WA Web's
+    /// `WAWebSendNonMessageDataRequest` makes the same choice.
     #[test]
-    fn test_pdo_peer_target_preserves_user() {
-        let own_pn = Jid::pn("559999999999");
-        let peer_target = own_pn.to_non_ad();
+    fn self_peer_target_prefers_lid_when_present() {
+        let mut device = empty_device();
+        device.pn = Some(Jid::pn_device("559999999999", 33));
+        device.lid = Some(Jid::lid_device("111111111111111", 33));
 
-        assert_eq!(peer_target.user, "559999999999");
-        assert_eq!(peer_target.server, Server::Pn);
+        let target = self_peer_target(&device).expect("LID present");
+
+        assert_eq!(target.user, "111111111111111");
+        assert_eq!(target.server, Server::Lid);
+        assert_eq!(target.device, 0, "must address primary device");
+        assert!(!target.is_ad());
     }
 
+    /// Pre-LID-migration accounts only have a PN. Fall back so peer
+    /// messages still route to the primary phone.
     #[test]
-    fn test_pdo_peer_target_from_linked_device() {
-        let own_pn = Jid::pn_device("559999999999", 33);
-        let peer_target = own_pn.to_non_ad();
+    fn self_peer_target_falls_back_to_pn_without_lid() {
+        let mut device = empty_device();
+        device.pn = Some(Jid::pn_device("559999999999", 33));
 
-        assert_eq!(peer_target.user, "559999999999");
-        assert_eq!(peer_target.device, 0);
-        assert_eq!(peer_target.agent, 0);
+        let target = self_peer_target(&device).expect("PN present");
+
+        assert_eq!(target.user, "559999999999");
+        assert_eq!(target.server, Server::Pn);
+        assert_eq!(target.device, 0);
+    }
+
+    /// Pre-login (no PN/LID yet) must surface as a typed error rather
+    /// than addressing a bogus JID.
+    #[test]
+    fn self_peer_target_errors_when_no_identity_known() {
+        let device = empty_device();
+        assert!(
+            matches!(
+                self_peer_target(&device),
+                Err(crate::client::ClientError::NotLoggedIn)
+            ),
+            "must require either PN or LID"
+        );
     }
 
     // Reconstruction-path tests share a bare Client wired to mock transport
