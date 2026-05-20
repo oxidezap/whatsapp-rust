@@ -423,6 +423,15 @@ pub struct Client {
     /// ran (the count alone can't separate NoSession from BadMac etc.).
     pub(crate) recent_retry_reasons: Cache<String, wacore::protocol::retry::RetryReason>,
 
+    /// Per-peer timestamp of the last forced session recreate via the
+    /// "no keys + retry≥2 + >1h since last" path (whatsmeow parity).
+    /// WA Web's updateLocalSignalSession only deletes on regId mismatch /
+    /// base-key collision — sessions that diverged without either trigger
+    /// stay stuck. This map throttles the fallback so a noisy peer can't
+    /// loop us through prekey fetches.
+    pub(crate) session_recreate_history:
+        Arc<std::sync::Mutex<HashMap<wacore_binary::jid::Jid, wacore::time::Instant>>>,
+
     /// Dispatch-once gate for `UndecryptableMessage`: a server resend of a
     /// failed id re-enters the failure path and would otherwise fire a
     /// duplicate event. Mirrors WA Web's DB-level placeholder uniqueness
@@ -820,6 +829,8 @@ impl Client {
             message_retry_counts: cache_config.message_retry_counts.build_with_ttl(),
 
             recent_retry_reasons: cache_config.message_retry_counts.build_with_ttl(),
+
+            session_recreate_history: Arc::new(std::sync::Mutex::new(HashMap::new())),
 
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
 
