@@ -782,10 +782,28 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
 
     let their_ephemeral = ciphertext.sender_ratchet_key();
     let counter = ciphertext.counter();
-    let chain_key = get_or_create_chain_key(state, their_ephemeral, remote_address, csprng)?;
+
+    // Transactional decrypt: `get_or_create_chain_key` (DH may add a
+    // new receiver chain + rotate root/sender key) and
+    // `get_or_create_message_key` (saves skipped keys + advances the
+    // receiver chain index past `counter`) both mutate `state`. If we
+    // committed those mutations and then MAC failed we'd leave the
+    // chain ratcheted past a message we never actually decrypted —
+    // the next legit msg derives keys from the wrong starting point
+    // and BadMac becomes permanent. This is the prod deadlock for
+    // `236395184570386@lid.0` (chain pinned at index 846 across six
+    // archived sessions, counter 940+ from peer, none decryptable).
+    //
+    // Work on a scratch copy and only commit if MAC verifies. Clone
+    // cost is bounded — SessionState wraps a `SessionStructure`
+    // protobuf with at most a handful of chains plus their bounded
+    // skipped-key buffers.
+    let mut scratch = state.clone();
+
+    let chain_key = get_or_create_chain_key(&mut scratch, their_ephemeral, remote_address, csprng)?;
 
     let message_key_gen = get_or_create_message_key(
-        state,
+        &mut scratch,
         their_ephemeral,
         remote_address,
         original_message_type,
@@ -796,13 +814,13 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     let message_keys = message_key_gen.generate_keys();
 
     let their_identity_key =
-        state
+        scratch
             .remote_identity_key()?
             .ok_or(SignalProtocolError::InvalidSessionStructure(
                 "cannot decrypt without remote identity key",
             ))?;
 
-    let local_identity_key = state.local_identity_key()?;
+    let local_identity_key = scratch.local_identity_key()?;
 
     let mac_valid = ciphertext.verify_mac(
         &their_identity_key,
@@ -827,6 +845,7 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
             local_id_fingerprint,
             mac_key_fingerprint
         );
+        // Drop scratch — `state` is untouched.
         return Err(SignalProtocolError::BadMac(original_message_type));
     }
 
@@ -861,7 +880,10 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
         }
     })?;
 
-    state.clear_unacknowledged_pre_key_message();
+    // MAC + plaintext both verified — commit the scratch mutations
+    // (chain advance, saved skipped keys, optional DH ratchet step).
+    scratch.clear_unacknowledged_pre_key_message();
+    *state = scratch;
 
     Ok(ptext)
 }

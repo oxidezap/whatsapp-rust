@@ -516,6 +516,100 @@ fn alice_delete_then_rebuild_loses_old_chain() {
     );
 }
 
+/// CRITICAL: a failed-MAC decryption attempt must NOT advance Alice's
+/// receiver-chain state.
+///
+/// In the prod log the candidate sessions for `236395184570386@lid.0`
+/// all show the SAME `574b6be3...` chain at index 846 — six freshly
+/// rebuilt sessions, each with a different `alice_base_key`, none of
+/// which could ever have produced index 846 by successful decrypt
+/// (all their MACs failed). The only way the index reaches 846 across
+/// six independent sessions is if every failed attempt commits the
+/// chain step regardless of MAC verdict. From there the 94-step jump
+/// to counter 940 derives keys against the wrong chain root and the
+/// deadlock is permanent.
+///
+/// This test pins the contract: Bob sends N junk-ciphertext msgs that
+/// claim to be on his ratchet but carry random MACs. Each should fail
+/// without touching Alice's saved chain key for that ratchet. After
+/// the bombardment Alice's chain index for the ratchet must be the
+/// same as it was before — otherwise a real Bob msg later in the same
+/// chain will derive against the wrong starting point.
+#[test]
+fn failed_mac_must_not_advance_receiver_chain() {
+    use wacore_libsignal::protocol::SignalMessage;
+
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+    establish(&mut alice, &mut bob);
+
+    // Warm Bob's send chain so Alice has the receiver chain set up
+    // and we have a captured pristine state.
+    for i in 0..3 {
+        let ct = send(&mut bob, &alice.address, format!("warm {i}").as_bytes());
+        receive(&mut alice, &bob.address, &ct).expect("warm decrypts");
+    }
+
+    // Snapshot Alice's chain index for Bob's current sender ratchet.
+    /// Sum of receiver chain indices across all of Alice's chains for
+    /// Bob's address. We sum (rather than read one specific chain)
+    /// because after X3DH the session has the signed-prekey ratchet at
+    /// index 0 that stays unused, and after Bob's first send Alice
+    /// adds a second chain for Bob's actual sender ratchet. The
+    /// invariant the test wants is "no advance on MAC failure" — sum
+    /// captures it without depending on which chain is at which
+    /// vec position.
+    fn alice_chain_total(alice: &Peer, bob: &Peer) -> u32 {
+        let Some(rec) = alice.session_store.0.get(&bob.address) else {
+            return 0;
+        };
+        let Some(current) = rec.session_state() else {
+            return 0;
+        };
+        current
+            .all_receiver_chain_logging_info()
+            .into_iter()
+            .filter_map(|(_pubkey, idx)| idx)
+            .sum()
+    }
+    let index_before = alice_chain_total(&alice, &bob);
+    assert!(
+        index_before > 0,
+        "post-warm Alice's receiver chain must have advanced"
+    );
+
+    // Fabricate a real ciphertext from Bob then corrupt the trailing
+    // MAC bytes. The header (version + ratchet pubkey + counter) stays
+    // valid so Alice walks the same chain-derive path she would on a
+    // real msg; only verify_mac fails.
+    for tamper_round in 0..10u32 {
+        let ct = send(&mut bob, &alice.address, b"clean");
+        let bytes = ct.serialize().to_vec();
+        let mut tampered = bytes.clone();
+        let last = tampered.len() - 1;
+        // Flip the high bit of the last MAC byte. Must be a stable
+        // flip — XORing `tamper_round` in cancels the change once
+        // the byte already has that bit set.
+        tampered[last] ^= 0x80;
+        let parsed = SignalMessage::try_from(&tampered[..])
+            .expect("tampered bytes still parse as SignalMessage");
+        let bad = CiphertextMessage::SignalMessage(parsed);
+        let err = receive(&mut alice, &bob.address, &bad).unwrap_err();
+        assert!(
+            matches!(err, SignalProtocolError::BadMac(_)),
+            "round {tamper_round} expected BadMac, got {err:?}"
+        );
+        let now = alice_chain_total(&alice, &bob);
+        assert_eq!(
+            now, index_before,
+            "round {tamper_round}: failed-MAC attempt advanced chain \
+             from {index_before} to {now}. Once this happens a real \
+             msg later in the chain will derive keys from the wrong \
+             starting point — that's the prod deadlock."
+        );
+    }
+}
+
 /// Out-of-order delivery within a single chain. Tests the
 /// `MAX_MESSAGE_KEYS = 2000` skipped-keys buffer — Alice must hold
 /// msg_keys for indices N+1..N+K and use them when the late msg shows
