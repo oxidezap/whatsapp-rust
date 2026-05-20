@@ -3222,8 +3222,10 @@ impl Client {
     }
 
     pub(crate) async fn handle_stream_error(&self, node: &wacore_binary::NodeRef<'_>) {
-        self.is_logged_in.store(false, Ordering::Relaxed);
-
+        // is_logged_in is cleared only inside fatal branches below. 429, 503,
+        // and unknown/code-less errors leave the session alive — clearing it
+        // unconditionally here would make is_fully_ready() flip and prekey
+        // uploads bail with "Connection lost" while the socket is still up.
         let mut attrs = node.attrs();
         let code_cow = attrs.optional_string("code");
         let code = code_cow.as_deref().unwrap_or("");
@@ -3246,6 +3248,7 @@ impl Client {
                 "Got stream error indicating client was removed or replaced (conflict={}). Logging out.",
                 conflict_type
             );
+            self.is_logged_in.store(false, Ordering::Relaxed);
             self.expected_disconnect.store(true, Ordering::Relaxed);
             self.enable_auto_reconnect.store(false, Ordering::Relaxed);
 
@@ -3265,11 +3268,13 @@ impl Client {
                     info!(
                         "Got 515 stream error, server is closing stream (expected after pairing). Will auto-reconnect."
                     );
+                    self.is_logged_in.store(false, Ordering::Relaxed);
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     should_disconnect = true;
                 }
                 "516" => {
                     info!("Got 516 stream error (device removed). Logging out.");
+                    self.is_logged_in.store(false, Ordering::Relaxed);
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::LoggedOut(
@@ -3282,6 +3287,7 @@ impl Client {
                 }
                 "401" => {
                     info!("Got 401 stream error (unauthorized). Logging out.");
+                    self.is_logged_in.store(false, Ordering::Relaxed);
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::LoggedOut(
@@ -3294,6 +3300,7 @@ impl Client {
                 }
                 "409" => {
                     info!("Got 409 stream error (conflict). Another session replaced this one.");
+                    self.is_logged_in.store(false, Ordering::Relaxed);
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core
@@ -6104,8 +6111,14 @@ mod tests {
         // expected disconnect. Setting that flag silently swallows the next
         // real disconnect and races the read loop into shutdown.
         let client = create_offline_sync_test_client().await;
+        // Simulate an authenticated session before the stream error arrives.
+        client.is_logged_in.store(true, Ordering::Relaxed);
         let node = NodeBuilder::new("stream:error").build();
         client.handle_stream_error(&node.as_node_ref()).await;
+        assert!(
+            client.is_logged_in.load(Ordering::Relaxed),
+            "unknown stream:error must NOT log the client out"
+        );
         assert!(
             !client.expected_disconnect.load(Ordering::Relaxed),
             "unknown stream:error must not mark the disconnect as expected"
@@ -6122,6 +6135,7 @@ mod tests {
         // with no `code` attribute. Treat as informational, not as a fatal
         // stream teardown.
         let client = create_offline_sync_test_client().await;
+        client.is_logged_in.store(true, Ordering::Relaxed);
         let ack_child = NodeBuilder::new("ack")
             .attr("class", "message")
             .attr("type", "text")
@@ -6131,6 +6145,10 @@ mod tests {
             .children([ack_child])
             .build();
         client.handle_stream_error(&node.as_node_ref()).await;
+        assert!(
+            client.is_logged_in.load(Ordering::Relaxed),
+            "ack-shaped stream:error must NOT log the client out"
+        );
         assert!(
             !client.expected_disconnect.load(Ordering::Relaxed),
             "ack-shaped stream:error must not mark the disconnect as expected"
