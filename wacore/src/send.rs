@@ -958,6 +958,40 @@ pub async fn prepare_dm_stanza<
     })
 }
 
+/// Returns true if `message_encrypt` on `signal_address` would produce
+/// a pkmsg (no session yet, or session with un-acked pre-key still
+/// pending). Used before `message_encrypt` to fail-fast when `account`
+/// is None — pkmsg without `<device-identity>` reproduces the linked
+/// device deadlock.
+///
+/// `SessionStore::load_session` is take-semantics in production
+/// (`SessionAdapter` → `SignalStoreCache::get_session` marks the slot
+/// `CheckedOut`); the loaded record is put back via `store_session`
+/// so the subsequent `message_encrypt` finds the slot Present.
+async fn pkmsg_would_be_emitted<S>(
+    session_store: &mut S,
+    signal_address: &ProtocolAddress,
+) -> Result<bool>
+where
+    S: crate::libsignal::protocol::SessionStore,
+{
+    let loaded = session_store.load_session(signal_address).await?;
+    let needs_pkmsg = match &loaded {
+        None => true,
+        Some(record) => record
+            .session_state()
+            .and_then(|st| st.unacknowledged_pre_key_message_items().ok().flatten())
+            .is_some(),
+    };
+    if let Some(record) = loaded {
+        session_store
+            .store_session(signal_address, record)
+            .await
+            .map_err(|e| anyhow!("restoring checked-out session after pre-flight: {e}"))?;
+    }
+    Ok(needs_pkmsg)
+}
+
 pub async fn prepare_peer_stanza<S, I>(
     session_store: &mut S,
     identity_store: &mut I,
@@ -973,24 +1007,11 @@ where
 {
     let plaintext = MessageUtils::encode_and_pad(message);
 
-    // Pre-flight: if account is missing and the next encrypt would be pkmsg,
-    // refuse before message_encrypt persists the advanced chain. pkmsg is
-    // produced when either (a) no session exists or (b) the session has an
-    // un-acked pre-key still pending — both cases require <device-identity>.
-    if account.is_none() {
-        let needs_account = match session_store.load_session(signal_address).await? {
-            None => true,
-            Some(record) => record
-                .session_state()
-                .and_then(|st| st.unacknowledged_pre_key_message_items().ok().flatten())
-                .is_some(),
-        };
-        if needs_account {
-            bail!(
-                "peer pkmsg requires <device-identity> (account is None); \
-                 refusing before message_encrypt to avoid advancing the sender chain"
-            );
-        }
+    if account.is_none() && pkmsg_would_be_emitted(session_store, signal_address).await? {
+        bail!(
+            "peer pkmsg requires <device-identity> (account is None); \
+             refusing before message_encrypt to avoid advancing the sender chain"
+        );
     }
 
     let encrypted_message =
@@ -1057,26 +1078,11 @@ where
     let plaintext = MessageUtils::encode_and_pad(message);
     let signal_address = encryption_jid.to_protocol_address();
 
-    // Symmetric to prepare_peer_stanza's pre-flight: if the next encrypt
-    // would be pkmsg (no session yet, or pending pre-key on existing
-    // session) and we have no AdvSignedDeviceIdentity to ship in
-    // <device-identity>, refuse before message_encrypt persists the
-    // advanced chain. Otherwise we'd burn the ratchet for a stanza the
-    // peer's Signal layer can't promote.
-    if account.is_none() {
-        let needs_account = match session_store.load_session(&signal_address).await? {
-            None => true,
-            Some(record) => record
-                .session_state()
-                .and_then(|st| st.unacknowledged_pre_key_message_items().ok().flatten())
-                .is_some(),
-        };
-        if needs_account {
-            bail!(
-                "DM retry pkmsg requires <device-identity> (account is None); \
-                 refusing before message_encrypt to avoid advancing the sender chain"
-            );
-        }
+    if account.is_none() && pkmsg_would_be_emitted(session_store, &signal_address).await? {
+        bail!(
+            "DM retry pkmsg requires <device-identity> (account is None); \
+             refusing before message_encrypt to avoid advancing the sender chain"
+        );
     }
 
     let encrypted =
@@ -3473,6 +3479,131 @@ mod tests {
             assert_eq!(
                 before, after,
                 "DM retry pre-flight must leave the session byte-identical"
+            );
+        }
+
+        /// Production's SessionAdapter::load_session has TAKE semantics
+        /// (SignalStoreCache marks the slot CheckedOut until store_session
+        /// puts the record back). If the pre-flight only loads without
+        /// restoring, the slot stays stranded and message_encrypt sees no
+        /// session. The mock here mirrors that contract via interior
+        /// mutability (Mutex) on the &self load_session.
+        #[tokio::test]
+        async fn preflight_restores_session_with_take_store_semantics() {
+            use std::collections::{HashMap, HashSet};
+            use std::sync::Mutex;
+
+            struct TakeStore {
+                inner: Mutex<TakeInner>,
+            }
+            struct TakeInner {
+                present: HashMap<ProtocolAddress, Vec<u8>>,
+                taken: HashSet<ProtocolAddress>,
+            }
+            impl TakeStore {
+                fn from(ss: &MemSessionStore) -> Self {
+                    Self {
+                        inner: Mutex::new(TakeInner {
+                            present: ss.0.clone(),
+                            taken: HashSet::new(),
+                        }),
+                    }
+                }
+                fn is_present(&self, addr: &ProtocolAddress) -> bool {
+                    let g = self.inner.lock().unwrap();
+                    g.present.contains_key(addr) && !g.taken.contains(addr)
+                }
+            }
+            #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+            #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+            impl SessionStore for TakeStore {
+                async fn load_session(
+                    &self,
+                    a: &ProtocolAddress,
+                ) -> crate::libsignal::protocol::error::Result<
+                    Option<crate::libsignal::protocol::SessionRecord>,
+                > {
+                    let mut g = self.inner.lock().unwrap();
+                    if g.taken.contains(a) {
+                        return Ok(None);
+                    }
+                    let rec = g.present.get(a).and_then(|b| {
+                        crate::libsignal::protocol::SessionRecord::deserialize(b).ok()
+                    });
+                    if rec.is_some() {
+                        g.taken.insert(a.clone());
+                    }
+                    Ok(rec)
+                }
+                async fn has_session(
+                    &self,
+                    a: &ProtocolAddress,
+                ) -> crate::libsignal::protocol::error::Result<bool> {
+                    let g = self.inner.lock().unwrap();
+                    Ok(g.present.contains_key(a) && !g.taken.contains(a))
+                }
+                async fn store_session(
+                    &mut self,
+                    a: &ProtocolAddress,
+                    r: crate::libsignal::protocol::SessionRecord,
+                ) -> crate::libsignal::protocol::error::Result<()> {
+                    let mut g = self.inner.lock().unwrap();
+                    g.present.insert(a.clone(), r.serialize()?);
+                    g.taken.remove(a);
+                    Ok(())
+                }
+            }
+
+            let (mem_ss, mut is, jid) = setup_session().await;
+            let mut ss = TakeStore::from(&mem_ss);
+            let addr = jid.to_protocol_address();
+
+            // setup_session leaves pending_pre_key set, so account=None
+            // would bail. Use Some(account) — pre-flight still runs
+            // load+restore because it's gated on account.is_none() at the
+            // call site; switch to account=None and we want the assertion
+            // to verify that the BAIL path also restores the slot.
+            assert!(
+                ss.is_present(&addr),
+                "precondition: session is Present before pre-flight"
+            );
+
+            // Drive the bail path: account=None + session has pending_pre_key
+            // → pre-flight bails. Even on bail, the loaded record must be
+            // put back so a retry with Some(account) doesn't see a stranded slot.
+            let bail = prepare_peer_stanza(
+                &mut ss,
+                &mut is,
+                jid.clone(),
+                &addr,
+                &wa::Message::default(),
+                "preflight-take-bail".into(),
+                None,
+            )
+            .await;
+            bail.expect_err("must bail with account=None on a pending-pkmsg session");
+            assert!(
+                ss.is_present(&addr),
+                "pre-flight bail path must still restore the checked-out session"
+            );
+
+            // And the pass path: with Some(account), the pre-flight still
+            // does load+restore, then message_encrypt runs successfully.
+            let account = pkmsg_account_proto();
+            let ok = prepare_peer_stanza(
+                &mut ss,
+                &mut is,
+                jid.clone(),
+                &addr,
+                &wa::Message::default(),
+                "preflight-take-pass".into(),
+                Some(&account),
+            )
+            .await;
+            ok.expect("peer stanza builds with Some(account)");
+            assert!(
+                ss.is_present(&addr),
+                "session must be Present after a successful encrypt+store"
             );
         }
     }

@@ -413,25 +413,39 @@ impl Client {
             // and LID identity captures — in that case the fresher LID
             // identity is on the namespace we're migrating *to*, and PN's
             // stale value should not clobber it.
+            //
+            // Match the LID lookup result explicitly so a transient read
+            // failure isn't collapsed with `Ok(None)` and used as license
+            // to overwrite a potentially-valid LID identity.
             if let Ok(Some(identity_data)) = self
                 .signal_cache
                 .get_identity(&pn_proto, backend.as_ref())
                 .await
             {
-                if self
+                match self
                     .signal_cache
                     .get_identity(&lid_proto, backend.as_ref())
                     .await
-                    .ok()
-                    .flatten()
-                    .is_none()
                 {
-                    self.signal_cache
-                        .put_identity(&lid_proto, &identity_data)
-                        .await;
-                    info!("Migrated identity {} -> {}", pn_proto, lid_proto);
+                    Ok(None) => {
+                        self.signal_cache
+                            .put_identity(&lid_proto, &identity_data)
+                            .await;
+                        self.signal_cache.delete_identity(&pn_proto).await;
+                        info!("Migrated identity {} -> {}", pn_proto, lid_proto);
+                    }
+                    Ok(Some(_)) => {
+                        // LID-wins: existing LID identity preserved; drop the PN copy.
+                        self.signal_cache.delete_identity(&pn_proto).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Skipping identity migration {} -> {}: \
+                             failed to read LID identity: {e:?}",
+                            pn_proto, lid_proto
+                        );
+                    }
                 }
-                self.signal_cache.delete_identity(&pn_proto).await;
             }
         }
 
