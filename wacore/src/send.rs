@@ -965,6 +965,7 @@ pub async fn prepare_peer_stanza<S, I>(
     signal_address: &ProtocolAddress,
     message: &wa::Message,
     request_id: String,
+    account: Option<&wa::AdvSignedDeviceIdentity>,
 ) -> Result<Node>
 where
     S: crate::libsignal::protocol::SessionStore,
@@ -975,7 +976,7 @@ where
     let encrypted_message =
         message_encrypt(&plaintext, signal_address, session_store, identity_store).await?;
 
-    let (enc_type, _, serialized_bytes) = extract_ciphertext(encrypted_message)
+    let (enc_type, is_prekey, serialized_bytes) = extract_ciphertext(encrypted_message)
         .ok_or_else(|| anyhow!("Unexpected peer encryption message type"))?;
 
     let enc_node = NodeBuilder::new("enc")
@@ -983,12 +984,33 @@ where
         .bytes(serialized_bytes)
         .build();
 
+    // Whatsmeow's `preparePeerMessageNode`:
+    //   content = [<meta appdata="default"/>, <enc>]
+    //   if isPreKey: content.push(<device-identity>)
+    // The `device-identity` element carries the ADVSignedDeviceIdentity
+    // the primary phone needs to verify the linked device's identity
+    // before processing a pkmsg — without it the phone ack's the
+    // stanza but never promotes the new Signal session, so its
+    // outbound ratchet stays on the old chain and the bot can never
+    // catch up. (Cost us the prod deadlock for `236395184570386@lid.0`.)
+    let meta_node = NodeBuilder::new("meta").attr("appdata", "default").build();
+
+    let mut children = vec![meta_node, enc_node];
+    if is_prekey && let Some(account) = account {
+        let identity_bytes = account.encode_to_vec();
+        children.push(
+            NodeBuilder::new("device-identity")
+                .bytes(identity_bytes)
+                .build(),
+        );
+    }
+
     let stanza = NodeBuilder::new("message")
         .attr("to", transport_jid)
         .attr("id", request_id)
         .attr("type", stanza::MSG_TYPE_TEXT)
         .attr("category", "peer")
-        .children([enc_node])
+        .children(children)
         .build();
 
     Ok(stanza)
