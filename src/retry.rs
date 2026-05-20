@@ -762,7 +762,12 @@ impl Client {
             return None;
         }
 
-        if history.contains_key(jid) {
+        // Check age explicitly — lazy pruning may leave an expired entry in
+        // the map. Without this check a peer would stay pinned to its first
+        // recreate forever in low-traffic deployments.
+        if let Some(prev) = history.get(jid)
+            && now.saturating_duration_since(*prev) < RECREATE_SESSION_TIMEOUT
+        {
             return None;
         }
 
@@ -2010,6 +2015,13 @@ mod tests {
             after_first, after_second,
             "throttled path must not re-stamp the history"
         );
+
+        // NB: "entry past the throttle window allows recreate" cannot be
+        // exercised here without faking the wall clock — wacore::time::Instant
+        // is std::time::Instant-backed and can't go back in time. The age
+        // check in should_recreate_session is load-bearing because lazy
+        // pruning leaves expired entries in the map for small deployments;
+        // dropping it would pin a peer forever.
 
         // 4) no session → recreate regardless of retry count.
         assert!(

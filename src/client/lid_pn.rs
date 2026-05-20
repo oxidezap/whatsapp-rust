@@ -361,10 +361,30 @@ impl Client {
             let pn_proto = pn_jid.to_protocol_address();
             let lid_proto = lid_jid.to_protocol_address();
 
+            // Read-modify-write of both PN and LID slots must hold the same
+            // per-address locks that encrypt/decrypt take, otherwise a
+            // concurrent message_encrypt on LID can clobber the migrated
+            // session (or read mid-update state). Acquire in stable
+            // (lexicographic) order to avoid deadlocks with operations that
+            // legitimately hold one and not the other.
+            let pn_key = pn_proto.to_string();
+            let lid_key = lid_proto.to_string();
+            let (first_key, second_key) = if pn_key <= lid_key {
+                (pn_key.clone(), lid_key.clone())
+            } else {
+                (lid_key.clone(), pn_key.clone())
+            };
+            let first_lock = self.session_lock_for(&first_key).await;
+            let _first_guard = first_lock.lock().await;
+            let _second_guard = if first_key == second_key {
+                None
+            } else {
+                let second_lock = self.session_lock_for(&second_key).await;
+                Some(second_lock.lock_arc().await)
+            };
+
             // PN wins on conflict — mirrors whatsmeow's `MigratePNToLID`
-            // (`ON CONFLICT DO UPDATE SET session=excluded.session`). The
-            // inverse "keep LID stub" branch dropped the only ratchet
-            // linked to the peer's outbound chain.
+            // (`ON CONFLICT DO UPDATE SET session=excluded.session`).
             if let Ok(Some(session)) = self
                 .signal_cache
                 .get_session(&pn_proto, backend.as_ref())
@@ -378,7 +398,6 @@ impl Client {
                 );
             }
 
-            // Migrate identity: same cache-first pattern
             if let Ok(Some(identity_data)) = self
                 .signal_cache
                 .get_identity(&pn_proto, backend.as_ref())
@@ -947,5 +966,52 @@ mod tests {
              link to the peer's outbound chain.",
             surviving_regid, WORKING_REGID
         );
+    }
+
+    /// Migration must hold the same per-address session locks that
+    /// encrypt/decrypt take. Otherwise a concurrent `message_encrypt`
+    /// on the LID slot can clobber the just-migrated session (or read
+    /// mid-update state). Externally hold the LID lock, kick off
+    /// migration, and assert it blocks until the lock is released.
+    #[tokio::test]
+    async fn migration_blocks_on_per_address_session_lock() {
+        use std::time::Duration;
+        use wacore::types::jid::JidExt as _;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000000000";
+        let lid = "111111111111111";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+
+        let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
+        let lid_lock = client.session_lock_for(lid_addr.as_str()).await;
+        let held = lid_lock.lock().await;
+
+        let migrate_client = client.clone();
+        let pn_s = pn.to_string();
+        let lid_s = lid.to_string();
+        let mut handle = tokio::spawn(async move {
+            migrate_client
+                .migrate_signal_sessions_on_lid_discovery(&pn_s, &lid_s)
+                .await;
+        });
+
+        let blocked = tokio::time::timeout(Duration::from_millis(200), &mut handle).await;
+        assert!(
+            blocked.is_err(),
+            "migration must block while another holder owns the LID address \
+             session lock — otherwise concurrent encrypt/decrypt races"
+        );
+
+        // Release the lock; migration should now complete so the spawned task
+        // doesn't outlive the test (and contaminate parallel test state).
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("migration must complete once the lock is released")
+            .expect("migration task must not panic");
     }
 }
