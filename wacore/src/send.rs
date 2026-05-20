@@ -984,15 +984,10 @@ where
         .bytes(serialized_bytes)
         .build();
 
-    // Whatsmeow's `preparePeerMessageNode`:
-    //   content = [<meta appdata="default"/>, <enc>]
-    //   if isPreKey: content.push(<device-identity>)
-    // The `device-identity` element carries the ADVSignedDeviceIdentity
-    // the primary phone needs to verify the linked device's identity
-    // before processing a pkmsg — without it the phone ack's the
-    // stanza but never promotes the new Signal session, so its
-    // outbound ratchet stays on the old chain and the bot can never
-    // catch up. (Cost us the prod deadlock for `236395184570386@lid.0`.)
+    // `<device-identity>` is required by the phone's Signal layer on
+    // pkmsg peer messages — without it the stanza is XMPP-acked but
+    // the new session is never promoted (mirrors whatsmeow's
+    // `preparePeerMessageNode`).
     let meta_node = NodeBuilder::new("meta").attr("appdata", "default").build();
 
     let mut children = vec![meta_node, enc_node];

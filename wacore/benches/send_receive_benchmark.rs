@@ -670,6 +670,7 @@ fn bench_dm_send(mut d: DmSendData) {
         &signal_addr,
         &d.msg,
         "b-001".into(),
+        None,
     ))
     .unwrap();
     black_box(marshal(&node).unwrap());

@@ -744,8 +744,13 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
+        // Drop entries past the throttle window — they no longer block
+        // a recreate, and without pruning the map only grows.
+        let now = wacore::time::Instant::now();
+        history.retain(|_, prev| now.saturating_duration_since(*prev) < RECREATE_SESSION_TIMEOUT);
+
         if !has_session {
-            history.insert(jid.clone(), wacore::time::Instant::now());
+            history.insert(jid.clone(), now);
             return Some("we don't have a Signal session with them");
         }
 
@@ -753,12 +758,7 @@ impl Client {
             return None;
         }
 
-        let now = wacore::time::Instant::now();
-        let recent = history
-            .get(jid)
-            .copied()
-            .is_some_and(|prev| now.saturating_duration_since(prev) < RECREATE_SESSION_TIMEOUT);
-        if recent {
+        if history.contains_key(jid) {
             return None;
         }
 

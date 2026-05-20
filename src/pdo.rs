@@ -32,21 +32,10 @@ pub struct PendingPdoRequest {
     pub requested_at: wacore::time::Instant,
 }
 
-/// Self peer-message destination = our primary phone, in the namespace
-/// the phone actually keys its Signal store under. Mirrors whatsmeow's
-/// `SendPeerMessage` → `cli.getOwnID().ToNonAD()`: `Store.GetJID()`
-/// returns the LID JID once the bot is LID-migrated.
-///
-/// WA Web's `WAWebSendNonMessageDataRequest` still uses
-/// `getMeDevicePnOrThrow_DO_NOT_USE()` (the "DO_NOT_USE" suffix flags
-/// it as an un-migrated PN-only API the project hasn't moved off
-/// yet). Empirically that target leaves the peer's LID-keyed session
-/// untouched: the bot's pkmsg lands at PN address, the primary's
-/// post-migration Signal store keys by LID, the LID slot stays on
-/// the diverged ratchet, and the inbound side never recovers.
-/// Whatsmeow's choice — LID when present, PN otherwise — is the path
-/// that actually triggers the phone's session refresh on its
-/// outbound chain too.
+/// Peer-message destination keyed by the namespace the phone's Signal
+/// store actually uses — LID after migration, PN before. Mirrors
+/// whatsmeow's `SendPeerMessage` → `cli.getOwnID().ToNonAD()`. WA Web's
+/// PN-only target leaves the LID slot stranded post-migration.
 fn self_peer_target(device: &wacore::store::Device) -> Result<Jid, crate::client::ClientError> {
     if let Some(lid) = device.lid.as_ref() {
         return Ok(Jid::lid(lid.user.clone()));
@@ -77,11 +66,6 @@ impl Client {
         info: &Arc<MessageInfo>,
     ) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
-
-        // PDO target = our primary phone (device 0). Whatsmeow parity:
-        // address by LID when the bot is LID-migrated; otherwise PN.
-        // See `self_peer_target` for the rationale and the contrast
-        // with WA Web's still-PN-pinned `WAWebSendNonMessageDataRequest`.
         let peer_target = self_peer_target(&device_snapshot)?;
 
         // Resolve to LID for the MessageKey when LID-migrated, matching WA Web's
