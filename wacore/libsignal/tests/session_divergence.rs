@@ -467,17 +467,10 @@ fn alice_loses_session_entirely_yields_session_not_found() {
     );
 }
 
-/// Repeats the prod sequence end-to-end:
-///   1. session established + warmed
-///   2. Alice's record wiped (the manual SQLite DELETE we did in prod)
-///   3. Alice fetches a fresh bundle from Bob and builds a NEW session
-///   4. Bob still sends from the OLD session
-///
-/// Step 4 fails BadMac/InvalidMessage because Alice's new current
-/// can't decrypt Bob's old-chain msg and there's no archived previous
-/// to fall back on. This is the deadlock the migration fix is meant
-/// to avoid in the first place: keeping the working session under the
-/// LID address means we never enter this state.
+/// Wiping the session record then rebuilding via prekey bundle while the
+/// peer still sends from the old chain is unrecoverable at the libsignal
+/// layer — the new current_session can't decrypt the old-chain msg and
+/// there's no archived previous. Motivates the LID-keeps-PN policy.
 #[test]
 fn alice_delete_then_rebuild_loses_old_chain() {
     let mut alice = Peer::new("alice", 1);
@@ -610,6 +603,17 @@ fn failed_mac_must_not_advance_receiver_chain() {
         "post-warm Alice's receiver chain must have advanced"
     );
 
+    // Full byte-level snapshot — a chain-index check alone would miss a
+    // partial rollback that restores indices but corrupts message_keys,
+    // root_key, or previous_counter.
+    let bytes_before = alice
+        .session_store
+        .0
+        .get(&bob.address)
+        .expect("alice has session for bob")
+        .serialize()
+        .expect("serialize before tamper rounds");
+
     // Fabricate a real ciphertext from Bob then corrupt the trailing
     // MAC bytes. The header (version + ratchet pubkey + counter) stays
     // valid so Alice walks the same chain-derive path she would on a
@@ -619,9 +623,6 @@ fn failed_mac_must_not_advance_receiver_chain() {
         let bytes = ct.serialize().to_vec();
         let mut tampered = bytes.clone();
         let last = tampered.len() - 1;
-        // Flip the high bit of the last MAC byte. Must be a stable
-        // flip — XORing `tamper_round` in cancels the change once
-        // the byte already has that bit set.
         tampered[last] ^= 0x80;
         let parsed = SignalMessage::try_from(&tampered[..])
             .expect("tampered bytes still parse as SignalMessage");
@@ -634,9 +635,19 @@ fn failed_mac_must_not_advance_receiver_chain() {
         let now = alice_chain_total(&alice, &bob);
         assert_eq!(
             now, index_before,
-            "round {tamper_round}: failed-MAC attempt advanced chain \
-             from {index_before} to {now}; next msg will derive keys \
-             against the wrong starting point."
+            "round {tamper_round}: failed-MAC attempt advanced chain"
+        );
+        let bytes_now = alice
+            .session_store
+            .0
+            .get(&bob.address)
+            .unwrap()
+            .serialize()
+            .unwrap();
+        assert_eq!(
+            bytes_before, bytes_now,
+            "round {tamper_round}: failed-MAC must leave the session record \
+             byte-identical; a partial restore would let other fields drift"
         );
     }
 }

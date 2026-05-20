@@ -86,6 +86,10 @@ const MIN_RETRY_FOR_BASE_KEY_CHECK: u8 = 2;
 /// whatsmeow's `recreateSessionTimeout` (`retry.go:156`).
 const RECREATE_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Prune `session_recreate_history` only when it crosses this size, to avoid
+/// paying O(n) under a global Mutex on every retry receipt.
+const SESSION_RECREATE_HISTORY_PRUNE_THRESHOLD: usize = 256;
+
 /// Separated chat and requester JIDs for retry receipt handling.
 /// Mirrors WAWebHandleRetryRequest `getActualChatInfo` + `getTargetChat`.
 struct RetryChatInfo {
@@ -405,12 +409,8 @@ impl Client {
         )
         .await;
 
-        // Whatsmeow parity (`retry.go:284`). WA Web only deletes on regId
-        // mismatch / base-key collision, which doesn't cover sessions that
-        // diverged silently — those stay stuck forever. When the receipt has
-        // no <keys> and `should_recreate_session` agrees, drop the local
-        // session so the subsequent `ensure_e2e_sessions_resolved` fetches a
-        // fresh prekey bundle and rebuilds.
+        // Whatsmeow parity (`retry.go:284`). WA Web's regId/base-key check
+        // doesn't catch silently-diverged sessions; this fallback does.
         if nr.get_optional_child("keys").is_none()
             && let Some(reason) = self
                 .should_recreate_session(retry_count, &resolved_jid)
@@ -744,10 +744,14 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
-        // Drop entries past the throttle window — they no longer block
-        // a recreate, and without pruning the map only grows.
+        // Prune lazily — every call under a global Mutex is O(n) and serializes
+        // retry receipts across sessions. Threshold tuned so the map can't grow
+        // unbounded but the common case skips the scan.
         let now = wacore::time::Instant::now();
-        history.retain(|_, prev| now.saturating_duration_since(*prev) < RECREATE_SESSION_TIMEOUT);
+        if history.len() > SESSION_RECREATE_HISTORY_PRUNE_THRESHOLD {
+            history
+                .retain(|_, prev| now.saturating_duration_since(*prev) < RECREATE_SESSION_TIMEOUT);
+        }
 
         if !has_session {
             history.insert(jid.clone(), now);

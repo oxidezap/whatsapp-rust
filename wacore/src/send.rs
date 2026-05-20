@@ -10,7 +10,7 @@ use crate::reporting_token::{
 use crate::runtime::{AbortHandle, Runtime};
 use crate::types::jid::JidExt;
 use crate::types::jid::make_sender_key_name;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use prost::Message as ProtoMessage;
 use rand::{CryptoRng, Rng};
@@ -973,6 +973,26 @@ where
 {
     let plaintext = MessageUtils::encode_and_pad(message);
 
+    // Pre-flight: if account is missing and the next encrypt would be pkmsg,
+    // refuse before message_encrypt persists the advanced chain. pkmsg is
+    // produced when either (a) no session exists or (b) the session has an
+    // un-acked pre-key still pending — both cases require <device-identity>.
+    if account.is_none() {
+        let needs_account = match session_store.load_session(signal_address).await? {
+            None => true,
+            Some(record) => record
+                .session_state()
+                .and_then(|st| st.unacknowledged_pre_key_message_items().ok().flatten())
+                .is_some(),
+        };
+        if needs_account {
+            bail!(
+                "peer pkmsg requires <device-identity> (account is None); \
+                 refusing before message_encrypt to avoid advancing the sender chain"
+            );
+        }
+    }
+
     let encrypted_message =
         message_encrypt(&plaintext, signal_address, session_store, identity_store).await?;
 
@@ -984,20 +1004,14 @@ where
         .bytes(serialized_bytes)
         .build();
 
-    // `<device-identity>` is required by the phone's Signal layer on
-    // pkmsg peer messages — without it the stanza is XMPP-acked but
-    // the new session is never promoted (mirrors whatsmeow's
-    // `preparePeerMessageNode`). Refuse to ship a pkmsg without it
-    // rather than silently omit and reintroduce the deadlock.
     let meta_node = NodeBuilder::new("meta").attr("appdata", "default").build();
 
     let mut children = vec![meta_node, enc_node];
     if is_prekey {
+        // Defense in depth: pre-flight should have caught this, but a corrupt
+        // session that triggers a fresh pkmsg mid-call would slip past.
         let account = account.ok_or_else(|| {
-            anyhow!(
-                "peer pkmsg requires AdvSignedDeviceIdentity (caller passed None); \
-                 emitting without <device-identity> would reproduce the prod deadlock"
-            )
+            anyhow!("peer pkmsg without <device-identity> (unreachable via pre-flight)")
         })?;
         children.push(
             NodeBuilder::new("device-identity")
@@ -3291,13 +3305,21 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn peer_pkmsg_errors_when_account_missing() {
-            // Silently shipping a pkmsg without <device-identity> is
-            // the exact prod deadlock this PR fixed (phone XMPP-acks
-            // the stanza but the Signal layer never promotes the new
-            // session). Refuse to send instead of regressing.
+        async fn peer_pkmsg_errors_when_account_missing_without_ratchet_advance() {
+            // Pkmsg without <device-identity> would reproduce the deadlock —
+            // refuse AND prove the session is byte-identical after the failed
+            // call so the next retry has the same ratchet position.
             let (mut ss, mut is, jid) = setup_session().await;
             let addr = jid.to_protocol_address();
+
+            let before = ss
+                .load_session(&addr)
+                .await
+                .unwrap()
+                .expect("pre-condition: session loaded")
+                .serialize()
+                .expect("serialize before");
+
             let result = prepare_peer_stanza(
                 &mut ss,
                 &mut is,
@@ -3309,10 +3331,65 @@ mod tests {
             )
             .await;
             let err = result.expect_err("pkmsg path must reject missing account");
-            let msg = err.to_string();
             assert!(
-                msg.contains("device-identity"),
-                "error must name the missing element so the caller can debug; got: {msg}"
+                err.to_string().contains("device-identity"),
+                "error must name the missing element; got: {err}"
+            );
+
+            let after = ss
+                .load_session(&addr)
+                .await
+                .unwrap()
+                .expect("session still present after failed call")
+                .serialize()
+                .expect("serialize after");
+            assert_eq!(
+                before, after,
+                "session record must be byte-identical after a failed prepare — \
+                 any difference means a ratchet step was committed for a stanza we couldn't ship"
+            );
+        }
+
+        /// Pre-flight check: when no session exists and account is None,
+        /// `prepare_peer_stanza` must refuse before `message_encrypt` runs,
+        /// otherwise the sender chain is persisted for a stanza we cannot ship
+        /// (CodeRabbit-flagged ratchet-burn-on-fail-fast).
+        #[tokio::test]
+        async fn peer_pkmsg_preflight_no_ratchet_burn_without_session() {
+            let jid: Jid = "559911112222@s.whatsapp.net".parse().unwrap();
+            let addr = jid.to_protocol_address();
+            let mut ss = MemSessionStore::new();
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut is = MemIdentityStore {
+                pair: IdentityKeyPair::generate(&mut rng),
+                reg_id: 42,
+                known: HashMap::new(),
+            };
+
+            assert!(
+                !ss.has_session(&addr).await.unwrap(),
+                "precondition: store has no session for this address"
+            );
+
+            let result = prepare_peer_stanza(
+                &mut ss,
+                &mut is,
+                jid.clone(),
+                &addr,
+                &wa::Message::default(),
+                "peer-preflight-1".into(),
+                None,
+            )
+            .await;
+            let err = result.expect_err("must refuse before message_encrypt");
+            assert!(
+                err.to_string().contains("device-identity"),
+                "error must name <device-identity>; got: {err}"
+            );
+            assert!(
+                !ss.has_session(&addr).await.unwrap(),
+                "pre-flight must NOT advance/persist a session — the ratchet \
+                 must remain unburned for the retry attempt"
             );
         }
     }

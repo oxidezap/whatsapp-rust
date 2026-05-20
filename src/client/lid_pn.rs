@@ -361,16 +361,10 @@ impl Client {
             let pn_proto = pn_jid.to_protocol_address();
             let lid_proto = lid_jid.to_protocol_address();
 
-            // Migrate session: take from cache (authoritative), write to cache.
-            // PN slot wins over a pre-existing LID slot — mirrors
-            // whatsmeow's `MigratePNToLID`:
-            //     INSERT … SELECT … ON CONFLICT DO UPDATE SET session=excluded.session
-            // The historic "deleted stale PN, kept LID" branch was the
-            // prod deadlock: a fresh LID session built by
-            // `process_prekey_bundle` (no link to the peer's outbound
-            // ratchet) would shadow the real PN-namespace session that
-            // had been ratcheting with Android since pairing. Once the
-            // PN side was dropped there was no path back.
+            // PN wins on conflict — mirrors whatsmeow's `MigratePNToLID`
+            // (`ON CONFLICT DO UPDATE SET session=excluded.session`). The
+            // inverse "keep LID stub" branch dropped the only ratchet
+            // linked to the peer's outbound chain.
             if let Ok(Some(session)) = self
                 .signal_cache
                 .get_session(&pn_proto, backend.as_ref())
