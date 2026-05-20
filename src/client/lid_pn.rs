@@ -142,10 +142,21 @@ impl Client {
         if mappings.is_empty() {
             return;
         }
+        // Dedup by phone_number, last lid wins. Otherwise the same phone
+        // appearing twice in one batch yields is_new=true for the first
+        // (lid_A) and is_new=false for the second (lid_B), so signal
+        // migration runs for lid_A while the persisted mapping ends up
+        // pointing at lid_B — migration done against the wrong LID.
         let cap = mappings.len();
-        let mut entries: Vec<LidPnEntry> = Vec::with_capacity(cap);
-        let mut is_new_flags: Vec<bool> = Vec::with_capacity(cap);
+        let mut deduped: std::collections::HashMap<String, String> =
+            std::collections::HashMap::with_capacity(cap);
         for (lid, phone_number) in mappings {
+            deduped.insert(phone_number, lid);
+        }
+
+        let mut entries: Vec<LidPnEntry> = Vec::with_capacity(deduped.len());
+        let mut is_new_flags: Vec<bool> = Vec::with_capacity(deduped.len());
+        for (phone_number, lid) in deduped {
             let is_new = self
                 .lid_pn_cache
                 .get_current_lid(&phone_number)
@@ -877,6 +888,38 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "offline batch must not persist to DB"
+        );
+    }
+
+    /// Duplicate phone_numbers in a single batch must collapse to one
+    /// (lid, phone) → migration entry, and that entry must use the FINAL
+    /// lid for the phone. Otherwise migration runs against the stale lid
+    /// while the persisted mapping resolves to the fresh one.
+    #[tokio::test]
+    async fn test_learn_lid_pn_mappings_batch_dedups_duplicate_phones() {
+        use wacore_binary::Jid;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5511900000007";
+        let lid_stale = "200000000007777";
+        let lid_fresh = "200000000007999";
+
+        client
+            .learn_lid_pn_mappings_batch(
+                vec![
+                    (lid_stale.to_string(), pn.to_string()),
+                    (lid_fresh.to_string(), pn.to_string()),
+                ],
+                LearningSource::Other,
+                true, // offline → no spawned persist, no migration races
+            )
+            .await;
+
+        // Final cache state must reflect the LAST mapping for this phone.
+        let resolved = client.resolve_encryption_jid(&Jid::pn(pn)).await;
+        assert_eq!(
+            resolved.user, lid_fresh,
+            "dedup must keep the last lid for a repeated phone_number"
         );
     }
 

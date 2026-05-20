@@ -976,12 +976,20 @@ where
     S: crate::libsignal::protocol::SessionStore,
 {
     let loaded = session_store.load_session(signal_address).await?;
+    // Conservative read: treat any failure to interrogate the session as
+    // "would be pkmsg" so the caller bails. Silently treating Err as false
+    // would let message_encrypt run with a corrupt session and potentially
+    // burn the sender chain.
     let needs_pkmsg = match &loaded {
         None => true,
-        Some(record) => record
-            .session_state()
-            .and_then(|st| st.unacknowledged_pre_key_message_items().ok().flatten())
-            .is_some(),
+        Some(record) => match record.session_state() {
+            None => true,
+            Some(state) => match state.unacknowledged_pre_key_message_items() {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(_) => true,
+            },
+        },
     };
     if let Some(record) = loaded {
         session_store
