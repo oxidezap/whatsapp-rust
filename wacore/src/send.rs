@@ -3206,6 +3206,113 @@ mod tests {
             .unwrap();
             assert!(n.attrs().optional_string("edit").is_none());
         }
+
+        // --- Peer stanza (PDO/AppStateSync) shape -------------------------
+        // The "finally worked" fix: a `<message category="peer">` carrying
+        // a pkmsg must also include `<meta appdata="default"/>` and a
+        // `<device-identity>` element. Without those the primary phone
+        // ack's the stanza but its Signal layer rejects the pkmsg, so its
+        // outbound chain stays on the diverged ratchet (prod's
+        // `574b6be3…`) and the linked device's inbound side never
+        // recovers — exactly the deadlock this PR was originally
+        // chasing. Whatsmeow's `preparePeerMessageNode` builds the same
+        // three-child layout.
+
+        fn pkmsg_account_proto() -> wa::AdvSignedDeviceIdentity {
+            // Realistic-shaped placeholder for the linked device's
+            // identity proof — content opaque to the assertions; we only
+            // verify that the element carries non-empty bytes.
+            wa::AdvSignedDeviceIdentity {
+                details: Some(vec![0u8; 32]),
+                account_signature_key: Some(vec![0u8; 32]),
+                account_signature: Some(vec![0u8; 64]),
+                device_signature: Some(vec![0u8; 64]),
+            }
+        }
+
+        async fn build_peer_stanza(
+            account: Option<&wa::AdvSignedDeviceIdentity>,
+        ) -> wacore_binary::Node {
+            let (mut ss, mut is, jid) = setup_session().await;
+            let addr = jid.to_protocol_address();
+            prepare_peer_stanza(
+                &mut ss,
+                &mut is,
+                jid.clone(),
+                &addr,
+                &wa::Message::default(),
+                "peer-test-1".into(),
+                account,
+            )
+            .await
+            .expect("peer stanza builds")
+        }
+
+        #[tokio::test]
+        async fn peer_pkmsg_includes_meta_and_device_identity() {
+            let account = pkmsg_account_proto();
+            let n = build_peer_stanza(Some(&account)).await;
+
+            assert_eq!(n.tag, "message");
+            assert_eq!(
+                n.attrs().optional_string("category").unwrap().as_ref(),
+                "peer"
+            );
+
+            let children = n.children().expect("peer message has children");
+            let tags: Vec<&str> = children.iter().map(|c| c.tag.as_ref()).collect();
+            // Layout matches whatsmeow's preparePeerMessageNode for pkmsg:
+            // [<meta>, <enc>, <device-identity>].
+            assert_eq!(
+                tags,
+                vec!["meta", "enc", "device-identity"],
+                "peer pkmsg children order/identity must match whatsmeow"
+            );
+
+            let meta = n.get_optional_child("meta").expect("meta present");
+            assert_eq!(
+                meta.attrs().optional_string("appdata").unwrap().as_ref(),
+                "default",
+                "<meta appdata=\"default\"/> is what the phone uses to route the peer payload"
+            );
+
+            let enc = n.get_optional_child("enc").expect("enc present");
+            assert_eq!(
+                enc.attrs().optional_string("type").unwrap().as_ref(),
+                "pkmsg",
+                "fresh session must produce pkmsg, not msg"
+            );
+
+            let device_identity = n
+                .get_optional_child("device-identity")
+                .expect("device-identity present");
+            match &device_identity.content {
+                Some(NodeContent::Bytes(b)) => assert!(
+                    !b.is_empty(),
+                    "device-identity content must be the proto-encoded \
+                     AdvSignedDeviceIdentity, not empty"
+                ),
+                other => panic!("device-identity must carry bytes, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_pkmsg_omits_device_identity_when_account_missing() {
+            // Pre-pairing / migration edge: the bot doesn't yet have an
+            // ADVSignedDeviceIdentity to attach. Better to ship the
+            // pkmsg without the proof than to panic — the phone will
+            // fall back to whatever its store has.
+            let n = build_peer_stanza(None).await;
+            assert!(
+                n.get_optional_child("device-identity").is_none(),
+                "no account -> no device-identity element"
+            );
+            assert!(
+                n.get_optional_child("meta").is_some(),
+                "<meta> still present without account"
+            );
+            assert!(n.get_optional_child("enc").is_some(), "<enc> present");
+        }
     }
 
     mod decrypt_fail {
