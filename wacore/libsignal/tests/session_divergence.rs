@@ -1,0 +1,610 @@
+//! Reproduces the prod deadlock where:
+//! * Alice (bot) keeps failing BadMac on inbound Whisper msgs from Bob
+//!   (Android primary), even after Alice has 5+ archived previous sessions.
+//! * Bob never switches to pkmsg in response to Alice's retry receipts;
+//!   his outbound chain stays on the same ratchet pub key (`574b6be3...`
+//!   in the logs) with counter climbing past 940.
+//!
+//! Each `#[test]` here exercises one hypothesis about how Alice's local
+//! session could end up unable to decrypt despite Bob's encryption being
+//! deterministic from a shared root key. The one that fails is the
+//! reproduction — the matching fix has to land in libsignal/session
+//! handling so this file stays green.
+//!
+//! Async I/O is driven through `futures::executor::block_on` to match the
+//! benchmark setup (this crate doesn't depend on tokio).
+#![allow(clippy::too_many_lines)]
+
+use async_trait::async_trait;
+use std::collections::HashMap;
+use wacore_libsignal::protocol::{
+    CiphertextMessage, Direction, GenericSignedPreKey, IdentityChange, IdentityKey,
+    IdentityKeyPair, IdentityKeyStore, KeyPair, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeyStore,
+    ProtocolAddress, SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId,
+    SignedPreKeyRecord, SignedPreKeyStore, Timestamp, UsePQRatchet, message_decrypt,
+    message_encrypt, process_prekey_bundle,
+};
+
+// ---- in-memory store impls (clones of the bench fixtures, kept local
+// so this test file is self-contained) ---------------------------------------
+
+#[derive(Clone)]
+struct InMemoryIdentityKeyStore {
+    identity_key_pair: IdentityKeyPair,
+    registration_id: u32,
+    identities: HashMap<ProtocolAddress, IdentityKey>,
+}
+
+#[async_trait]
+impl IdentityKeyStore for InMemoryIdentityKeyStore {
+    async fn get_identity_key_pair(
+        &self,
+    ) -> wacore_libsignal::protocol::error::Result<IdentityKeyPair> {
+        Ok(self.identity_key_pair.clone())
+    }
+    async fn get_local_registration_id(&self) -> wacore_libsignal::protocol::error::Result<u32> {
+        Ok(self.registration_id)
+    }
+    async fn save_identity(
+        &mut self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> wacore_libsignal::protocol::error::Result<IdentityChange> {
+        let changed = self
+            .identities
+            .get(address)
+            .is_some_and(|prev| prev != identity);
+        self.identities.insert(address.clone(), *identity);
+        Ok(IdentityChange::from_changed(changed))
+    }
+    async fn is_trusted_identity(
+        &self,
+        _: &ProtocolAddress,
+        _: &IdentityKey,
+        _: Direction,
+    ) -> wacore_libsignal::protocol::error::Result<bool> {
+        Ok(true)
+    }
+    async fn get_identity(
+        &self,
+        address: &ProtocolAddress,
+    ) -> wacore_libsignal::protocol::error::Result<Option<IdentityKey>> {
+        Ok(self.identities.get(address).cloned())
+    }
+}
+
+#[derive(Default, Clone)]
+struct InMemoryPreKeyStore(HashMap<PreKeyId, PreKeyRecord>);
+
+#[async_trait]
+impl PreKeyStore for InMemoryPreKeyStore {
+    async fn get_pre_key(
+        &self,
+        id: PreKeyId,
+    ) -> wacore_libsignal::protocol::error::Result<PreKeyRecord> {
+        self.0
+            .get(&id)
+            .cloned()
+            .ok_or(SignalProtocolError::InvalidPreKeyId)
+    }
+    async fn save_pre_key(
+        &mut self,
+        id: PreKeyId,
+        record: &PreKeyRecord,
+    ) -> wacore_libsignal::protocol::error::Result<()> {
+        self.0.insert(id, record.clone());
+        Ok(())
+    }
+    async fn remove_pre_key(
+        &mut self,
+        id: PreKeyId,
+    ) -> wacore_libsignal::protocol::error::Result<()> {
+        self.0.remove(&id);
+        Ok(())
+    }
+}
+
+#[derive(Default, Clone)]
+struct InMemorySignedPreKeyStore(HashMap<SignedPreKeyId, SignedPreKeyRecord>);
+
+#[async_trait]
+impl SignedPreKeyStore for InMemorySignedPreKeyStore {
+    async fn get_signed_pre_key(
+        &self,
+        id: SignedPreKeyId,
+    ) -> wacore_libsignal::protocol::error::Result<SignedPreKeyRecord> {
+        self.0
+            .get(&id)
+            .cloned()
+            .ok_or(SignalProtocolError::InvalidSignedPreKeyId)
+    }
+    async fn save_signed_pre_key(
+        &mut self,
+        id: SignedPreKeyId,
+        record: &SignedPreKeyRecord,
+    ) -> wacore_libsignal::protocol::error::Result<()> {
+        self.0.insert(id, record.clone());
+        Ok(())
+    }
+}
+
+#[derive(Default, Clone)]
+struct InMemorySessionStore(HashMap<ProtocolAddress, SessionRecord>);
+
+#[async_trait]
+impl SessionStore for InMemorySessionStore {
+    async fn load_session(
+        &self,
+        address: &ProtocolAddress,
+    ) -> wacore_libsignal::protocol::error::Result<Option<SessionRecord>> {
+        Ok(self.0.get(address).cloned())
+    }
+    async fn has_session(
+        &self,
+        address: &ProtocolAddress,
+    ) -> wacore_libsignal::protocol::error::Result<bool> {
+        Ok(self.0.contains_key(address))
+    }
+    async fn store_session(
+        &mut self,
+        address: &ProtocolAddress,
+        record: SessionRecord,
+    ) -> wacore_libsignal::protocol::error::Result<()> {
+        self.0.insert(address.clone(), record);
+        Ok(())
+    }
+}
+
+// ---- peer fixture -----------------------------------------------------------
+
+#[derive(Clone)]
+struct Peer {
+    address: ProtocolAddress,
+    identity_store: InMemoryIdentityKeyStore,
+    prekey_store: InMemoryPreKeyStore,
+    signed_prekey_store: InMemorySignedPreKeyStore,
+    session_store: InMemorySessionStore,
+    /// Most recently issued prekey id — bumped each time the peer generates
+    /// a fresh bundle so the receiver doesn't reuse a one-time-prekey.
+    next_prekey_id: u32,
+    /// Most recently published one-time prekey pair, mirrored alongside
+    /// `next_prekey_id` so callers can build a bundle without re-walking
+    /// the prekey store.
+    prekey_pair: KeyPair,
+    /// Current signed prekey id + pair. Always device-stable; rotated only
+    /// when the test explicitly simulates a server-side rotation.
+    signed_prekey_id: SignedPreKeyId,
+    signed_prekey_pair: KeyPair,
+    signed_prekey_signature: Vec<u8>,
+}
+
+impl Peer {
+    fn new(name: &str, device_id: u32) -> Self {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+        let identity_key_pair = IdentityKeyPair::generate(&mut rng);
+        let registration_id = rand::random::<u32>() & 0x3FFF;
+
+        let prekey_id_int = 1u32;
+        let prekey_id: PreKeyId = prekey_id_int.into();
+        let prekey_pair = KeyPair::generate(&mut rng);
+        let prekey_record = PreKeyRecord::new(prekey_id, &prekey_pair);
+
+        let signed_prekey_id: SignedPreKeyId = 1u32.into();
+        let signed_prekey_pair = KeyPair::generate(&mut rng);
+        let signed_prekey_signature = identity_key_pair
+            .private_key()
+            .calculate_signature(&signed_prekey_pair.public_key.serialize(), &mut rng)
+            .expect("sign");
+        let signed_prekey_record = SignedPreKeyRecord::new(
+            signed_prekey_id,
+            Timestamp::from_epoch_millis(0),
+            &signed_prekey_pair,
+            &signed_prekey_signature,
+        );
+
+        let identity_store = InMemoryIdentityKeyStore {
+            identity_key_pair,
+            registration_id,
+            identities: HashMap::new(),
+        };
+        let mut prekey_store = InMemoryPreKeyStore::default();
+        let mut signed_prekey_store = InMemorySignedPreKeyStore::default();
+
+        futures::executor::block_on(async {
+            prekey_store
+                .save_pre_key(prekey_id, &prekey_record)
+                .await
+                .unwrap();
+            signed_prekey_store
+                .save_signed_pre_key(signed_prekey_id, &signed_prekey_record)
+                .await
+                .unwrap();
+        });
+
+        Self {
+            address: ProtocolAddress::new(name.to_string(), device_id.into()),
+            identity_store,
+            prekey_store,
+            signed_prekey_store,
+            session_store: InMemorySessionStore::default(),
+            next_prekey_id: prekey_id_int,
+            prekey_pair,
+            signed_prekey_id,
+            signed_prekey_pair,
+            signed_prekey_signature: signed_prekey_signature.to_vec(),
+        }
+    }
+
+    fn bundle(&self) -> PreKeyBundle {
+        PreKeyBundle::new(
+            self.identity_store.registration_id,
+            1u32.into(),
+            Some((self.next_prekey_id.into(), self.prekey_pair.public_key)),
+            self.signed_prekey_id,
+            self.signed_prekey_pair.public_key,
+            self.signed_prekey_signature.clone(),
+            *self.identity_store.identity_key_pair.identity_key(),
+        )
+        .expect("valid bundle")
+    }
+
+    /// Generate a brand-new one-time prekey and publish it locally,
+    /// rotating `next_prekey_id`. Used to model the bot uploading a
+    /// fresh one-time prekey alongside a retry-receipt-with-keys.
+    fn rotate_one_time_prekey(&mut self) {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let new_id = self.next_prekey_id + 1;
+        let new_pair = KeyPair::generate(&mut rng);
+        let id: PreKeyId = new_id.into();
+        let record = PreKeyRecord::new(id, &new_pair);
+        futures::executor::block_on(async {
+            self.prekey_store.save_pre_key(id, &record).await.unwrap();
+        });
+        self.next_prekey_id = new_id;
+        self.prekey_pair = new_pair;
+    }
+}
+
+// ---- helpers ----------------------------------------------------------------
+
+/// Hand `bob` Alice's bundle so he can speak to her. Mirrors the bot
+/// pulling a fresh prekey bundle for its primary phone via
+/// `ensure_e2e_sessions` and calling `process_prekey_bundle`.
+fn process_bundle(initiator: &mut Peer, target_address: &ProtocolAddress, bundle: &PreKeyBundle) {
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    futures::executor::block_on(async {
+        process_prekey_bundle(
+            target_address,
+            &mut initiator.session_store,
+            &mut initiator.identity_store,
+            bundle,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .expect("prekey bundle accepted");
+    });
+}
+
+/// `from` encrypts `plaintext` for `to`, returns the wire bytes + the
+/// kind of stanza it produced (pkmsg on a fresh session, msg afterwards).
+/// Mirrors `message_encrypt` on the bot.
+fn send(from: &mut Peer, to: &ProtocolAddress, plaintext: &[u8]) -> CiphertextMessage {
+    futures::executor::block_on(async {
+        message_encrypt(
+            plaintext,
+            to,
+            &mut from.session_store,
+            &mut from.identity_store,
+        )
+        .await
+        .expect("encrypt")
+    })
+}
+
+/// Inverse: `to` decrypts. Returns the plaintext or the SignalProtocolError
+/// that fired, so tests can assert on the specific failure mode (BadMac vs
+/// SessionNotFound vs DuplicatedMessage) the way the bot's message.rs does.
+fn receive(
+    to: &mut Peer,
+    from: &ProtocolAddress,
+    ct: &CiphertextMessage,
+) -> Result<Vec<u8>, SignalProtocolError> {
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    futures::executor::block_on(async {
+        message_decrypt(
+            ct,
+            from,
+            &mut to.session_store,
+            &mut to.identity_store,
+            &mut to.prekey_store,
+            &to.signed_prekey_store,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+    })
+}
+
+/// Establish a working session: Alice has Bob's bundle and sends one
+/// `pkmsg` so Bob has a session record on his side too. After this both
+/// sides hold a current session and can exchange msgs in either direction.
+fn establish(alice: &mut Peer, bob: &mut Peer) {
+    let bundle = bob.bundle();
+    process_bundle(alice, &bob.address, &bundle);
+
+    let ct = send(alice, &bob.address, b"hello bob");
+    let plaintext = receive(bob, &alice.address, &ct).expect("first pkmsg decrypts");
+    assert_eq!(&plaintext[..], b"hello bob");
+}
+
+// ---- scenarios --------------------------------------------------------------
+
+/// Sanity. Baseline ping-pong over a single session. If this regresses
+/// nothing else in the file means anything.
+#[test]
+fn baseline_dm_ping_pong() {
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+    establish(&mut alice, &mut bob);
+
+    for i in 0..10 {
+        let msg = format!("a→b #{i}");
+        let ct = send(&mut alice, &bob.address, msg.as_bytes());
+        let pt = receive(&mut bob, &alice.address, &ct).expect("decrypt");
+        assert_eq!(&pt[..], msg.as_bytes());
+
+        let reply = format!("b→a #{i}");
+        let ct = send(&mut bob, &alice.address, reply.as_bytes());
+        let pt = receive(&mut alice, &bob.address, &ct).expect("decrypt");
+        assert_eq!(&pt[..], reply.as_bytes());
+    }
+}
+
+/// Prod-like long-running chain. Bob sends N msgs straight at Alice
+/// (sender-chain advance without DH-rotating intermissions, the way
+/// the user's Android phone does on a streak of self-DMs). Alice must
+/// keep decrypting; if she falls behind once the chain is past
+/// ~100 counters we'd be reproducing prod.
+#[test]
+fn long_sender_chain_alice_keeps_up() {
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+    establish(&mut alice, &mut bob);
+
+    for i in 0..1000 {
+        let payload = format!("b→a #{i}");
+        let ct = send(&mut bob, &alice.address, payload.as_bytes());
+        let pt = receive(&mut alice, &bob.address, &ct)
+            .unwrap_or_else(|e| panic!("counter {i} failed: {e:?}"));
+        assert_eq!(&pt[..], payload.as_bytes());
+    }
+}
+
+/// The "PDO loop" hypothesis: Alice's bot keeps building fresh sessions
+/// against Bob's prekey bundle (every retry receipt with keys / every
+/// `ensure_e2e_sessions` for a peer message) while Bob's outbound
+/// chain is unchanged. After several rebuilds Alice still has the
+/// originally-working session inside `previous_sessions[N]`; libsignal
+/// is supposed to iterate previous sessions on BadMac and find it.
+#[test]
+fn alice_rebuilds_session_repeatedly_old_chain_still_decrypts() {
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+    establish(&mut alice, &mut bob);
+
+    // Bob advances his send chain a bit so the working session has
+    // some history (mirrors the chain index ~846 we saw in prod).
+    for i in 0..50 {
+        let ct = send(&mut bob, &alice.address, format!("pre {i}").as_bytes());
+        receive(&mut alice, &bob.address, &ct).expect("pre-rotate decrypts");
+    }
+
+    // Alice repeatedly rebuilds her session with Bob from fresh prekey
+    // bundles (one-time prekey rotated each time, matching the bot's
+    // retry-receipt-with-keys + PDO pkmsg sends in prod).
+    for _ in 0..6 {
+        bob.rotate_one_time_prekey();
+        let new_bundle = bob.bundle();
+        process_bundle(&mut alice, &bob.address, &new_bundle);
+    }
+
+    // Bob hasn't seen any of those rebuilds — he keeps using his
+    // original send chain. Alice's CURRENT session won't decrypt this
+    // (different root key), so libsignal has to walk back through the
+    // previous_sessions list and find the original.
+    let ct = send(&mut bob, &alice.address, b"old-chain msg after rebuilds");
+    let pt = receive(&mut alice, &bob.address, &ct)
+        .expect("must decrypt via archived previous_sessions[N]");
+    assert_eq!(&pt[..], b"old-chain msg after rebuilds");
+}
+
+/// Same as above but Bob's chain is much longer (closer to the prod
+/// counter ~940). If chain-step costs or `MAX_MESSAGE_KEYS` eviction
+/// breaks the lookup at deep chains we'd hit it here.
+#[test]
+fn deep_chain_survives_repeat_rebuilds() {
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+    establish(&mut alice, &mut bob);
+
+    // Drive both chains to ~900 like prod (bot's receiver chain index
+    // was at 846, Bob's counter at 940 in the latest log).
+    for i in 0..900 {
+        let ct = send(&mut bob, &alice.address, format!("warm {i}").as_bytes());
+        receive(&mut alice, &bob.address, &ct).expect("warm decrypts");
+    }
+
+    for _ in 0..6 {
+        bob.rotate_one_time_prekey();
+        let new_bundle = bob.bundle();
+        process_bundle(&mut alice, &bob.address, &new_bundle);
+    }
+
+    let ct = send(&mut bob, &alice.address, b"deep chain after rebuilds");
+    let pt =
+        receive(&mut alice, &bob.address, &ct).expect("deep chain must decrypt via archived state");
+    assert_eq!(&pt[..], b"deep chain after rebuilds");
+}
+
+/// The "DB delete" hypothesis: someone wipes Alice's session blob
+/// entirely (matches the manual SQLite DELETE we did in prod). Bob's
+/// next outbound is a `msg` (Whisper) — Alice has no record for the
+/// address so this surfaces as SessionNotFound. Asserts the exact
+/// error variant so the bot's retry-decision code keeps fanning out
+/// keys correctly.
+#[test]
+fn alice_loses_session_entirely_yields_session_not_found() {
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+    establish(&mut alice, &mut bob);
+
+    for i in 0..5 {
+        let ct = send(&mut bob, &alice.address, format!("warm {i}").as_bytes());
+        receive(&mut alice, &bob.address, &ct).expect("warm decrypts");
+    }
+
+    // Drop Alice's record. Mirrors `DELETE FROM sessions WHERE
+    // address = '<bob>.0'`.
+    alice.session_store.0.remove(&bob.address);
+
+    let ct = send(&mut bob, &alice.address, b"first after delete");
+    let err = receive(&mut alice, &bob.address, &ct).unwrap_err();
+    assert!(
+        matches!(err, SignalProtocolError::SessionNotFound(_)),
+        "expected SessionNotFound, got {err:?}"
+    );
+}
+
+/// Repeats the prod sequence end-to-end:
+///   1. session established + warmed
+///   2. Alice's record wiped (the manual SQLite DELETE we did in prod)
+///   3. Alice fetches a fresh bundle from Bob and builds a NEW session
+///   4. Bob still sends from the OLD session
+///
+/// Step 4 fails BadMac/InvalidMessage because Alice's new current
+/// can't decrypt Bob's old-chain msg and there's no archived previous
+/// to fall back on. This is the deadlock the migration fix is meant
+/// to avoid in the first place: keeping the working session under the
+/// LID address means we never enter this state.
+#[test]
+fn alice_delete_then_rebuild_loses_old_chain() {
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+    establish(&mut alice, &mut bob);
+
+    for i in 0..50 {
+        let ct = send(&mut bob, &alice.address, format!("warm {i}").as_bytes());
+        receive(&mut alice, &bob.address, &ct).expect("warm decrypts");
+    }
+
+    alice.session_store.0.remove(&bob.address);
+
+    bob.rotate_one_time_prekey();
+    let bundle = bob.bundle();
+    process_bundle(&mut alice, &bob.address, &bundle);
+
+    let ct = send(&mut bob, &alice.address, b"old chain after delete");
+    let err = receive(&mut alice, &bob.address, &ct).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SignalProtocolError::BadMac(_) | SignalProtocolError::InvalidMessage(..)
+        ),
+        "expected BadMac/InvalidMessage on old-chain msg after rebuild, got {err:?}"
+    );
+}
+
+/// Out-of-order delivery within a single chain. Tests the
+/// `MAX_MESSAGE_KEYS = 2000` skipped-keys buffer — Alice must hold
+/// msg_keys for indices N+1..N+K and use them when the late msg shows
+/// up.
+#[test]
+fn out_of_order_within_chain() {
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+    establish(&mut alice, &mut bob);
+
+    // Bob produces 10 ciphertexts without Alice consuming.
+    let mut pending = Vec::new();
+    for i in 0..10 {
+        let ct = send(&mut bob, &alice.address, format!("ooo {i}").as_bytes());
+        pending.push((i, ct));
+    }
+
+    // Alice consumes in reverse order; the chain index has to jump
+    // forward (saving message_keys) then walk the saved keys for the
+    // earlier indices.
+    pending.reverse();
+    for (i, ct) in pending {
+        let pt =
+            receive(&mut alice, &bob.address, &ct).unwrap_or_else(|e| panic!("ooo {i}: {e:?}"));
+        assert_eq!(&pt[..], format!("ooo {i}").as_bytes());
+    }
+}
+
+/// Mid-stream DH ratchet step: Bob sends a few msgs, Alice replies
+/// (forcing Bob's send chain to ratchet), Bob sends more. Each msg
+/// must still decrypt — this exercises `with_receiver_chain` paths and
+/// confirms the chain switch isn't what hits prod.
+#[test]
+fn dh_ratchet_step_preserves_decryption() {
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+    establish(&mut alice, &mut bob);
+
+    for i in 0..5 {
+        let ct = send(&mut bob, &alice.address, format!("pre {i}").as_bytes());
+        receive(&mut alice, &bob.address, &ct).expect("pre");
+    }
+    // Alice's reply triggers a DH ratchet step on Bob's side for his
+    // next send.
+    let ct = send(&mut alice, &bob.address, b"ratchet me");
+    receive(&mut bob, &alice.address, &ct).expect("bob");
+
+    for i in 0..5 {
+        let ct = send(&mut bob, &alice.address, format!("post {i}").as_bytes());
+        let pt =
+            receive(&mut alice, &bob.address, &ct).unwrap_or_else(|e| panic!("post {i}: {e:?}"));
+        assert_eq!(&pt[..], format!("post {i}").as_bytes());
+    }
+}
+
+/// `process_prekey_bundle` while Bob has unconsumed in-flight msgs.
+/// In prod the bot rebuilds the session via PDO while Android still
+/// has earlier msgs queued. Alice must serve those queued msgs from
+/// the archived previous session even though she's promoted a new
+/// current.
+#[test]
+fn in_flight_msgs_decrypt_through_archived_session_after_rebuild() {
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+    establish(&mut alice, &mut bob);
+
+    // Warm the chain to a non-trivial index so the archived state is
+    // doing real work, not the trivial counter=0 case.
+    for i in 0..30 {
+        let ct = send(&mut bob, &alice.address, format!("warm {i}").as_bytes());
+        receive(&mut alice, &bob.address, &ct).expect("warm");
+    }
+
+    // Bob queues a handful while Alice doesn't decrypt them yet.
+    let mut queue = Vec::new();
+    for i in 0..5 {
+        let ct = send(&mut bob, &alice.address, format!("queued {i}").as_bytes());
+        queue.push((i, ct));
+    }
+
+    // Alice rebuilds. New current is fresh; the chain Bob is on now
+    // lives in previous_sessions[0].
+    bob.rotate_one_time_prekey();
+    let bundle = bob.bundle();
+    process_bundle(&mut alice, &bob.address, &bundle);
+
+    for (i, ct) in queue {
+        let pt =
+            receive(&mut alice, &bob.address, &ct).unwrap_or_else(|e| panic!("queued {i}: {e:?}"));
+        assert_eq!(&pt[..], format!("queued {i}").as_bytes());
+    }
+}

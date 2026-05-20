@@ -361,36 +361,27 @@ impl Client {
             let pn_proto = pn_jid.to_protocol_address();
             let lid_proto = lid_jid.to_protocol_address();
 
-            // Migrate session: take from cache (authoritative), write to cache
+            // Migrate session: take from cache (authoritative), write to cache.
+            // PN slot wins over a pre-existing LID slot — mirrors
+            // whatsmeow's `MigratePNToLID`:
+            //     INSERT … SELECT … ON CONFLICT DO UPDATE SET session=excluded.session
+            // The historic "deleted stale PN, kept LID" branch was the
+            // prod deadlock: a fresh LID session built by
+            // `process_prekey_bundle` (no link to the peer's outbound
+            // ratchet) would shadow the real PN-namespace session that
+            // had been ratcheting with Android since pairing. Once the
+            // PN side was dropped there was no path back.
             if let Ok(Some(session)) = self
                 .signal_cache
                 .get_session(&pn_proto, backend.as_ref())
                 .await
             {
-                match self
-                    .signal_cache
-                    .has_session(&lid_proto, backend.as_ref())
-                    .await
-                {
-                    Ok(true) => {
-                        self.signal_cache.delete_session(&pn_proto).await;
-                        info!("Deleted stale PN session {} (LID exists)", pn_proto);
-                    }
-                    Ok(false) => {
-                        self.signal_cache.put_session(&lid_proto, session).await;
-                        self.signal_cache.delete_session(&pn_proto).await;
-                        info!("Migrated session {} -> {}", pn_proto, lid_proto);
-                    }
-                    Err(e) => {
-                        // Restore the taken PN session to avoid losing it
-                        self.signal_cache.put_session(&pn_proto, session).await;
-                        log::warn!(
-                            "Skipping session migration {} -> {}: {e}",
-                            pn_proto,
-                            lid_proto
-                        );
-                    }
-                }
+                self.signal_cache.put_session(&lid_proto, session).await;
+                self.signal_cache.delete_session(&pn_proto).await;
+                info!(
+                    "Migrated session {} -> {} (PN wins on conflict)",
+                    pn_proto, lid_proto
+                );
             }
 
             // Migrate identity: same cache-first pattern
@@ -844,6 +835,127 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "offline batch must not persist to DB"
+        );
+    }
+
+    /// Produce a SessionRecord blob with a distinctive remote_registration_id
+    /// so we can tell which side of a migration won by parsing the surviving
+    /// session, not by raw-byte comparison.
+    fn tagged_session_blob(remote_regid: u32) -> Vec<u8> {
+        use wacore::libsignal::protocol::{SessionRecord, SessionState};
+        use waproto::whatsapp::SessionStructure;
+
+        let state = SessionState::from_session_structure(SessionStructure {
+            session_version: Some(3),
+            local_identity_public: None,
+            remote_identity_public: None,
+            root_key: None,
+            previous_counter: Some(0),
+            sender_chain: None,
+            receiver_chains: vec![],
+            pending_pre_key: None,
+            remote_registration_id: Some(remote_regid),
+            local_registration_id: Some(0),
+            alice_base_key: Some(vec![]),
+            needs_refresh: None,
+            pending_key_exchange: None,
+        });
+        SessionRecord::new(state)
+            .serialize()
+            .expect("serialize session record")
+    }
+
+    /// Reproduces the prod deadlock for `236395184570386@lid.0`:
+    /// the bot has a working PN-namespace session (real Double Ratchet
+    /// state established with the peer's outbound chain) AND a separate
+    /// LID-namespace session that was created later by a fresh
+    /// `process_prekey_bundle` (no link to the peer's actual chain).
+    ///
+    /// Before this scenario was understood, the migration's "both
+    /// exist" branch deleted PN and kept LID — which discards the only
+    /// session that can decrypt the peer's ongoing msgs and pins us
+    /// to the broken one forever. Reg-id tags identify which side wins.
+    #[tokio::test]
+    async fn migration_preserves_working_session_when_both_namespaces_present() {
+        use wacore::libsignal::protocol::SessionRecord;
+        use wacore::types::jid::JidExt as _;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000000000";
+        let lid = "111111111111111";
+
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+
+        let pn_addr = Jid::pn_device(pn.to_string(), 0).to_protocol_address();
+        let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
+
+        // The working session — what Bob's outbound chain is actually
+        // ratcheted against — lives in the PN slot. Tag it with a
+        // distinctive registration id so post-migration we can prove
+        // the surviving session is the SAME blob.
+        const WORKING_REGID: u32 = 0xDEAD_BEEF;
+        const FRESH_REGID: u32 = 0x0BAD_F00D;
+
+        let backend = client.persistence_manager.backend();
+
+        // Seed both slots through signal_cache so the cache holds Present
+        // entries when migrate runs. Raw backend writes alone leave the
+        // cache cold and migrate's `get_session` then races with whatever
+        // populated Absent markers for unknown peers during test bring-up.
+        client
+            .signal_cache
+            .put_session(
+                &pn_addr,
+                SessionRecord::deserialize(&tagged_session_blob(WORKING_REGID))
+                    .expect("seed PN blob deserializes"),
+            )
+            .await;
+        client
+            .signal_cache
+            .put_session(
+                &lid_addr,
+                SessionRecord::deserialize(&tagged_session_blob(FRESH_REGID))
+                    .expect("seed LID blob deserializes"),
+            )
+            .await;
+        client.signal_cache.flush(backend.as_ref()).await.unwrap();
+
+        client
+            .migrate_signal_sessions_on_lid_discovery(pn, lid)
+            .await;
+
+        // PN must be drained — future loads route to LID once the
+        // mapping is known.
+        assert!(
+            backend
+                .get_session(pn_addr.as_str())
+                .await
+                .unwrap()
+                .is_none(),
+            "PN address must be cleared post-migration"
+        );
+
+        let surviving_bytes = backend
+            .get_session(lid_addr.as_str())
+            .await
+            .unwrap()
+            .expect("LID slot must have a session after migration");
+        let record = SessionRecord::deserialize(&surviving_bytes)
+            .expect("surviving session blob must parse");
+        let surviving_regid = record
+            .remote_registration_id()
+            .expect("surviving session must expose its remote reg id");
+
+        assert_eq!(
+            surviving_regid, WORKING_REGID,
+            "LID slot held the FRESH (regid={:#x}) blob — that's the prod \
+             deadlock: the working PN session ({:#x}) got discarded by the \
+             'both exist' branch, leaving us pinned to a session that has no \
+             link to the peer's outbound chain.",
+            surviving_regid, WORKING_REGID
         );
     }
 }
