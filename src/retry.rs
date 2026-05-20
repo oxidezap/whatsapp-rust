@@ -82,6 +82,10 @@ const MAX_RETRY_COUNT: u8 = 5;
 /// WhatsApp Web saves base key on retry 2, checks on retry > 2.
 const MIN_RETRY_FOR_BASE_KEY_CHECK: u8 = 2;
 
+/// Throttle for the "no-keys + retry≥2" forced-recreate fallback. Mirrors
+/// whatsmeow's `recreateSessionTimeout` (`retry.go:156`).
+const RECREATE_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Separated chat and requester JIDs for retry receipt handling.
 /// Mirrors WAWebHandleRetryRequest `getActualChatInfo` + `getTargetChat`.
 struct RetryChatInfo {
@@ -92,6 +96,10 @@ struct RetryChatInfo {
     /// Raw `from` JID from the receipt, for stanza `to` attribute.
     /// WA Web preserves the original `from` (variable `m`) for the retry stanza.
     original_from: Jid,
+    /// Receipt's `recipient` attribute, if present. WA Web's
+    /// `handleRetryRequest` propagates this verbatim into the retry resend
+    /// (only self-DM and bot receipts carry it).
+    recipient: Option<Jid>,
     /// True if the requester is a bot JID (skip namespace normalization).
     is_bot: bool,
 }
@@ -118,6 +126,7 @@ fn resolve_retry_chat_info(
             chat: from.clone(),
             requester,
             original_from: from.clone(),
+            recipient: node.attrs().optional_jid("recipient"),
             is_bot: false,
         }
     } else {
@@ -161,6 +170,7 @@ fn resolve_retry_chat_info(
             chat,
             requester,
             original_from: from.clone(),
+            recipient,
             is_bot,
         }
     }
@@ -395,6 +405,27 @@ impl Client {
         )
         .await;
 
+        // Whatsmeow parity (`retry.go:284`). WA Web only deletes on regId
+        // mismatch / base-key collision, which doesn't cover sessions that
+        // diverged silently — those stay stuck forever. When the receipt has
+        // no <keys> and `should_recreate_session` agrees, drop the local
+        // session so the subsequent `ensure_e2e_sessions_resolved` fetches a
+        // fresh prekey bundle and rebuilds.
+        if nr.get_optional_child("keys").is_none()
+            && let Some(reason) = self
+                .should_recreate_session(retry_count, &resolved_jid)
+                .await
+        {
+            info!("Recreating session with {resolved_jid} for retry of {message_id}: {reason}");
+            let signal_address = resolved_jid.to_protocol_address();
+            let lock = self.session_lock_for(signal_address.as_str()).await;
+            let _guard = lock.lock().await;
+            self.signal_cache.delete_session(&signal_address).await;
+            drop(_guard);
+            self.flush_signal_cache_logged("should_recreate_session", Some(&message_id))
+                .await;
+        }
+
         // Status broadcasts can't resend (requires explicit recipient list).
         // Participant already marked for fresh SKDM above; next status send includes them.
         if info.chat.is_status_broadcast() {
@@ -469,11 +500,14 @@ impl Client {
 
             let edit_attr =
                 wacore::types::message::EditAttribute::infer_from_message(&original_msg);
+            // WA Web forwards the receipt's `recipient` verbatim
+            // (`f && (k.recipient = f)` in handleRetryRequest); for non-self
+            // DM receipts the attribute is absent and the resend drops it.
             let stanza = wacore::send::prepare_dm_retry_stanza(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
                 info.original_from,
-                info.requester,
+                info.recipient.clone(),
                 resolved_jid.clone(),
                 &original_msg,
                 message_id,
@@ -671,6 +705,65 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Mirrors whatsmeow's `shouldRecreateSession`. Returns `Some(reason)`
+    /// and bumps the history clock if we should drop the local session for
+    /// `jid`; `None` otherwise. Two conditions trigger:
+    ///   1. No session present locally.
+    ///   2. `retry_count >= 2` and >`RECREATE_SESSION_TIMEOUT` since the
+    ///      last recreate for this JID.
+    ///
+    /// Callers pair this with `signal_cache.delete_session` so the next
+    /// `ensure_e2e_sessions_resolved` does the prekey fetch + rebuild.
+    async fn should_recreate_session(&self, retry_count: u8, jid: &Jid) -> Option<&'static str> {
+        let signal_address = jid.to_protocol_address();
+        let device_store = self.persistence_manager.get_device_arc().await;
+        let device_guard = device_store.read().await;
+        // Whatsmeow returns `false` on `ContainsSession` errors so a transient
+        // backend read failure doesn't masquerade as "no session" and trigger
+        // an unnecessary delete + prekey fetch (`retry.go:161-163`).
+        let has_session = match self
+            .signal_cache
+            .has_session(&signal_address, &*device_guard.backend)
+            .await
+        {
+            Ok(present) => present,
+            Err(e) => {
+                warn!(
+                    "should_recreate_session: has_session failed for {}: {} — skipping recreate",
+                    signal_address, e
+                );
+                return None;
+            }
+        };
+        drop(device_guard);
+
+        let mut history = self
+            .session_recreate_history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        if !has_session {
+            history.insert(jid.clone(), wacore::time::Instant::now());
+            return Some("we don't have a Signal session with them");
+        }
+
+        if retry_count < MIN_RETRY_FOR_BASE_KEY_CHECK {
+            return None;
+        }
+
+        let now = wacore::time::Instant::now();
+        let recent = history
+            .get(jid)
+            .copied()
+            .is_some_and(|prev| now.saturating_duration_since(prev) < RECREATE_SESSION_TIMEOUT);
+        if recent {
+            return None;
+        }
+
+        history.insert(jid.clone(), now);
+        Some("retry count > 1 and over an hour since last recreation")
     }
 
     /// Extracts and processes the key bundle from a retry receipt.
@@ -1595,6 +1688,7 @@ mod tests {
             chat: resolved_jid.to_non_ad(),
             requester: resolved_jid.clone(),
             original_from: resolved_jid.clone(),
+            recipient: None,
             is_bot: false,
         }
     }
@@ -1817,6 +1911,7 @@ mod tests {
             chat: group_chat.clone(),
             requester: resolved_jid.clone(),
             original_from: group_chat,
+            recipient: None,
             is_bot: false,
         };
 
@@ -1834,6 +1929,91 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "group retry at #1 should not delete the session"
+        );
+    }
+
+    /// `should_recreate_session` mirrors whatsmeow `shouldRecreateSession`:
+    /// 1) no session → always recreate;
+    /// 2) session exists + retry<2 → never recreate;
+    /// 3) session exists + retry≥2 + first time (or >1h since last) → recreate.
+    /// 4) session exists + retry≥2 + recreated <1h ago → throttled, do not recreate.
+    #[tokio::test]
+    async fn should_recreate_session_matrix() {
+        let client =
+            crate::test_utils::create_test_client_with_failing_http("should_recreate_session")
+                .await;
+
+        // Use disjoint JIDs per scenario so the negative-cache populated by
+        // `has_session` on the "no session" branch can't shadow the later
+        // backend put for the "session present" branches.
+        let jid_with = Jid::lid_device("999999999999991".to_string(), 3);
+        let jid_without = Jid::lid_device("999999999999992".to_string(), 3);
+
+        // Seed a session for jid_with BEFORE the first has_session lookup so
+        // the cache caches the hit, not the miss.
+        let session_bytes = valid_serialized_session(7777, vec![0xEE; 32]);
+        client
+            .persistence_manager
+            .backend()
+            .put_session(jid_with.to_protocol_address().as_str(), &session_bytes)
+            .await
+            .unwrap();
+
+        // 1) session present + retry<2 → never recreate, no history stamp.
+        assert!(
+            client.should_recreate_session(1, &jid_with).await.is_none(),
+            "retry<2 with session present should not recreate"
+        );
+        assert!(
+            client
+                .session_recreate_history
+                .lock()
+                .unwrap()
+                .get(&jid_with)
+                .is_none(),
+            "no-op path must not stamp the history"
+        );
+
+        // 2) session present + retry≥2 + cold history → recreate, stamp history.
+        assert!(
+            client
+                .should_recreate_session(2, &jid_with)
+                .await
+                .is_some_and(|r| r.contains("retry count > 1")),
+            "retry≥2 with cold history should recreate"
+        );
+        let after_first = client
+            .session_recreate_history
+            .lock()
+            .unwrap()
+            .get(&jid_with)
+            .copied();
+        assert!(after_first.is_some(), "first recreate must stamp history");
+
+        // 3) session present + retry≥2 + recent history → throttled.
+        assert!(
+            client.should_recreate_session(3, &jid_with).await.is_none(),
+            "retry≥2 within {}s should be throttled",
+            RECREATE_SESSION_TIMEOUT.as_secs()
+        );
+        let after_second = client
+            .session_recreate_history
+            .lock()
+            .unwrap()
+            .get(&jid_with)
+            .copied();
+        assert_eq!(
+            after_first, after_second,
+            "throttled path must not re-stamp the history"
+        );
+
+        // 4) no session → recreate regardless of retry count.
+        assert!(
+            client
+                .should_recreate_session(0, &jid_without)
+                .await
+                .is_some_and(|r| r.contains("don't have a Signal session")),
+            "missing session should recreate"
         );
     }
 
@@ -2224,6 +2404,48 @@ mod tests {
         assert_eq!(info.requester.device(), 5);
         assert_eq!(info.requester.user, "236395184570386");
         assert!(info.requester.is_lid());
+    }
+
+    /// `info.recipient` must come from the receipt's `recipient` attribute,
+    /// not derived from `info.chat`. Pre-fix, the DM resend used
+    /// `info.chat.clone()` for the stanza's `recipient` — fine on the primary
+    /// namespace but wrong whenever `take_recent_message` hit `alt_chat` (the
+    /// original was sent under PN while the receipt arrived under LID, or
+    /// vice-versa). WA Web's `WAWebHandleRetryRequest` forwards the receipt
+    /// attr verbatim (`f && (k.recipient = f)`), so the resend's `recipient`
+    /// matches the original outbound's namespace regardless of how the
+    /// receipt's `from` was addressed.
+    #[test]
+    fn resolve_retry_chat_info_forwards_recipient_attribute_verbatim() {
+        use wacore_binary::builder::NodeBuilder;
+
+        // Cross-namespace shape: receipt `from` is LID, `recipient` is PN.
+        let node = NodeBuilder::new("receipt")
+            .attr("recipient", "5511999999999@s.whatsapp.net")
+            .build();
+        let receipt = make_test_receipt("236395184570386:5@lid");
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        let recipient = info
+            .recipient
+            .as_ref()
+            .expect("recipient must be populated from the node attr");
+        assert_eq!(recipient.user, "5511999999999");
+        assert!(recipient.is_pn(), "recipient namespace must be PN");
+        assert_ne!(
+            recipient.user, info.chat.user,
+            "recipient must come from the node attr, not info.chat"
+        );
+
+        // Inverse: absent attr → None (drops `recipient` from the resend
+        // stanza, mirroring WA Web's `f && (k.recipient = f)`).
+        let node_no_recipient = NodeBuilder::new("receipt").build();
+        let info_no_recipient =
+            resolve_retry_chat_info(&receipt, &node_no_recipient.as_node_ref(), None, None);
+        assert!(
+            info_no_recipient.recipient.is_none(),
+            "missing `recipient` attr must propagate as None"
+        );
     }
 
     #[test]
