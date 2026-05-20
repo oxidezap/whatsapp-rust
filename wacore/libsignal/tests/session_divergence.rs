@@ -516,6 +516,63 @@ fn alice_delete_then_rebuild_loses_old_chain() {
     );
 }
 
+#[test]
+fn pkmsg_reset_does_not_fix_peer_outbound_if_delivered_to_wrong_store_key() {
+    let bob_lid = ProtocolAddress::new("100000000000001@lid".to_string(), 0.into());
+    let bob_pn = ProtocolAddress::new("15550001000@c.us".to_string(), 0.into());
+
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("100000000000001@lid", 0);
+    establish(&mut alice, &mut bob);
+
+    let warm = send(&mut bob, &alice.address, b"old chain warm");
+    receive(&mut alice, &bob_lid, &warm).expect("old LID-keyed session decrypts");
+
+    alice.session_store.0.remove(&bob_lid);
+
+    bob.rotate_one_time_prekey();
+    let bundle = bob.bundle();
+    let mut wrong_route_bob = bob.clone();
+    process_bundle(&mut alice, &bob_pn, &bundle);
+    let wrong_reset = send(&mut alice, &bob_pn, b"reset over wrong key");
+    assert!(matches!(
+        wrong_reset,
+        CiphertextMessage::PreKeySignalMessage(_)
+    ));
+    let reset_plaintext =
+        receive(&mut wrong_route_bob, &alice.address, &wrong_reset).expect("reset decrypts");
+    assert_eq!(&reset_plaintext[..], b"reset over wrong key");
+
+    let old_chain_msg = send(&mut bob, &alice.address, b"old chain still active");
+    let err = receive(&mut alice, &bob_lid, &old_chain_msg).unwrap_err();
+    assert!(
+        matches!(err, SignalProtocolError::SessionNotFound(_)),
+        "wrong-key reset must not populate Alice's LID record, got {err:?}"
+    );
+
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("100000000000001@lid", 0);
+    establish(&mut alice, &mut bob);
+
+    alice.session_store.0.remove(&bob_lid);
+    bob.rotate_one_time_prekey();
+    let bundle = bob.bundle();
+    process_bundle(&mut alice, &bob_lid, &bundle);
+    let correct_reset = send(&mut alice, &bob_lid, b"reset over correct key");
+    assert!(matches!(
+        correct_reset,
+        CiphertextMessage::PreKeySignalMessage(_)
+    ));
+    let reset_plaintext =
+        receive(&mut bob, &alice.address, &correct_reset).expect("correct reset decrypts");
+    assert_eq!(&reset_plaintext[..], b"reset over correct key");
+
+    let promoted_msg = send(&mut bob, &alice.address, b"new chain active");
+    let plaintext = receive(&mut alice, &bob_lid, &promoted_msg)
+        .expect("correct-key reset promotes Bob's next outbound");
+    assert_eq!(&plaintext[..], b"new chain active");
+}
+
 /// CRITICAL: a failed-MAC decryption attempt must NOT advance Alice's
 /// receiver-chain state.
 ///
