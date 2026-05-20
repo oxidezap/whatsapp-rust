@@ -987,15 +987,21 @@ where
     // `<device-identity>` is required by the phone's Signal layer on
     // pkmsg peer messages — without it the stanza is XMPP-acked but
     // the new session is never promoted (mirrors whatsmeow's
-    // `preparePeerMessageNode`).
+    // `preparePeerMessageNode`). Refuse to ship a pkmsg without it
+    // rather than silently omit and reintroduce the deadlock.
     let meta_node = NodeBuilder::new("meta").attr("appdata", "default").build();
 
     let mut children = vec![meta_node, enc_node];
-    if is_prekey && let Some(account) = account {
-        let identity_bytes = account.encode_to_vec();
+    if is_prekey {
+        let account = account.ok_or_else(|| {
+            anyhow!(
+                "peer pkmsg requires AdvSignedDeviceIdentity (caller passed None); \
+                 emitting without <device-identity> would reproduce the prod deadlock"
+            )
+        })?;
         children.push(
             NodeBuilder::new("device-identity")
-                .bytes(identity_bytes)
+                .bytes(account.encode_to_vec())
                 .build(),
         );
     }
@@ -3292,21 +3298,29 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn peer_pkmsg_omits_device_identity_when_account_missing() {
-            // Pre-pairing / migration edge: the bot doesn't yet have an
-            // ADVSignedDeviceIdentity to attach. Better to ship the
-            // pkmsg without the proof than to panic — the phone will
-            // fall back to whatever its store has.
-            let n = build_peer_stanza(None).await;
+        async fn peer_pkmsg_errors_when_account_missing() {
+            // Silently shipping a pkmsg without <device-identity> is
+            // the exact prod deadlock this PR fixed (phone XMPP-acks
+            // the stanza but the Signal layer never promotes the new
+            // session). Refuse to send instead of regressing.
+            let (mut ss, mut is, jid) = setup_session().await;
+            let addr = jid.to_protocol_address();
+            let result = prepare_peer_stanza(
+                &mut ss,
+                &mut is,
+                jid.clone(),
+                &addr,
+                &wa::Message::default(),
+                "peer-test-no-account".into(),
+                None,
+            )
+            .await;
+            let err = result.expect_err("pkmsg path must reject missing account");
+            let msg = err.to_string();
             assert!(
-                n.get_optional_child("device-identity").is_none(),
-                "no account -> no device-identity element"
+                msg.contains("device-identity"),
+                "error must name the missing element so the caller can debug; got: {msg}"
             );
-            assert!(
-                n.get_optional_child("meta").is_some(),
-                "<meta> still present without account"
-            );
-            assert!(n.get_optional_child("enc").is_some(), "<enc> present");
         }
     }
 
