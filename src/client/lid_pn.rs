@@ -348,32 +348,14 @@ impl Client {
     /// All reads/writes go through `signal_cache` to avoid reading stale data
     /// from the backend when the cache has unflushed mutations (e.g., after
     /// SKDM encryption ratcheted the session).
+    /// Read-modify-write of PN and LID Signal session/identity slots must
+    /// hold the same per-address locks that encrypt/decrypt take, otherwise
+    /// concurrent message_encrypt on LID can clobber the migrated session.
+    ///
+    /// Callers must NOT hold `session_lock_for(<lid_addr>)` for any device
+    /// in [0, 100) — `async_lock::Mutex` is not reentrant. The decrypt path
+    /// drops its address lock around the call (`try_pn_to_lid_migration_decrypt`).
     pub(crate) async fn migrate_signal_sessions_on_lid_discovery(&self, pn: &str, lid: &str) {
-        self.migrate_signal_sessions_on_lid_discovery_inner(pn, lid, None)
-            .await;
-    }
-
-    /// Variant called from inside `decrypt_message`, which already holds
-    /// `session_lock_for(<lid_addr>.<device_id>)`. `async_lock::Mutex` is
-    /// not reentrant, so re-acquiring that lock in the migration loop
-    /// deadlocks. `skip_lid_lock_for_device` tells us which LID device
-    /// lock to skip (caller already serializes it).
-    pub(crate) async fn migrate_signal_sessions_on_lid_discovery_with_held_lock(
-        &self,
-        pn: &str,
-        lid: &str,
-        held_device_id: u16,
-    ) {
-        self.migrate_signal_sessions_on_lid_discovery_inner(pn, lid, Some(held_device_id))
-            .await;
-    }
-
-    async fn migrate_signal_sessions_on_lid_discovery_inner(
-        &self,
-        pn: &str,
-        lid: &str,
-        skip_lid_lock_for_device: Option<u16>,
-    ) {
         use log::{info, warn};
         use wacore::types::jid::JidExt;
 
@@ -386,34 +368,19 @@ impl Client {
             let pn_proto = pn_jid.to_protocol_address();
             let lid_proto = lid_jid.to_protocol_address();
 
-            // Read-modify-write of both PN and LID slots must hold the same
-            // per-address locks that encrypt/decrypt take, otherwise a
-            // concurrent message_encrypt on LID can clobber the migrated
-            // session (or read mid-update state). Acquire in stable
-            // (lexicographic) order to avoid deadlocks with operations that
-            // legitimately hold one and not the other.
-            let skip_lid = skip_lid_lock_for_device == Some(device_id);
-            let pn_key = pn_proto.to_string();
-            let lid_key = lid_proto.to_string();
-            let pn_lock = self.session_lock_for(&pn_key).await;
-            // Lock guards must outlive the read-modify-write window. Storing
-            // them as separately-typed Options keeps stable acquisition order
-            // (PN first when both are taken; LID-only acquisition only when
-            // PN ordering would put LID before PN but the caller still holds
-            // PN — not possible here, so PN-first is unconditional and safe).
-            let (_pn_guard_opt, _lid_guard_opt) = if skip_lid {
-                (Some(pn_lock.lock_arc().await), None)
+            // Acquire both per-address locks in stable lexicographic order to
+            // avoid deadlock against concurrent paths that legitimately hold
+            // only one side. (Callers never hold either lock.)
+            let pn_lock = self.session_lock_for(pn_proto.as_str()).await;
+            let lid_lock = self.session_lock_for(lid_proto.as_str()).await;
+            let (_first_guard, _second_guard) = if pn_proto.as_str() <= lid_proto.as_str() {
+                let pn_g = pn_lock.lock_arc().await;
+                let lid_g = lid_lock.lock_arc().await;
+                (pn_g, lid_g)
             } else {
-                let lid_lock = self.session_lock_for(&lid_key).await;
-                if pn_key <= lid_key {
-                    let pn_g = pn_lock.lock_arc().await;
-                    let lid_g = lid_lock.lock_arc().await;
-                    (Some(pn_g), Some(lid_g))
-                } else {
-                    let lid_g = lid_lock.lock_arc().await;
-                    let pn_g = pn_lock.lock_arc().await;
-                    (Some(pn_g), Some(lid_g))
-                }
+                let lid_g = lid_lock.lock_arc().await;
+                let pn_g = pn_lock.lock_arc().await;
+                (lid_g, pn_g)
             };
 
             // PN wins on conflict — mirrors whatsmeow's `MigratePNToLID`
@@ -1046,5 +1013,50 @@ mod tests {
             .await
             .expect("migration must complete once the lock is released")
             .expect("migration task must not panic");
+    }
+
+    /// Regression guard for the decrypt-path deadlock: `decrypt_message`
+    /// holds `session_lock_for(<lid_addr>)` while invoking
+    /// `try_pn_to_lid_migration_decrypt`, whose migration loop re-enters
+    /// that same mutex. The fix is to drop the guard around the call.
+    /// This test exercises the exact drop → migrate → reacquire dance the
+    /// production code does, asserting it never deadlocks.
+    #[tokio::test]
+    async fn migration_lock_dance_completes_when_caller_drops_guard() {
+        use std::time::Duration;
+        use wacore::types::jid::JidExt as _;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000000000";
+        let lid = "111111111111111";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+
+        let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
+        let session_mutex = client.session_lock_for(lid_addr.as_str()).await;
+        let mut session_guard: Option<async_lock::MutexGuardArc<()>> =
+            Some(session_mutex.lock_arc().await);
+
+        // Exactly mirrors try_pn_to_lid_migration_decrypt: drop, migrate,
+        // reacquire. If the migration's per-device lock loop ever re-enters
+        // a held guard, this hangs and the timeout fires.
+        let dance = async {
+            session_guard = None;
+            client
+                .migrate_signal_sessions_on_lid_discovery(pn, lid)
+                .await;
+            session_guard = Some(session_mutex.lock_arc().await);
+        };
+        tokio::time::timeout(Duration::from_secs(5), dance)
+            .await
+            .expect("drop → migrate → reacquire must not deadlock");
+
+        assert!(
+            session_guard.is_some(),
+            "guard must be re-held after the dance so the next batch payload \
+             stays serialized on the address lock"
+        );
     }
 }

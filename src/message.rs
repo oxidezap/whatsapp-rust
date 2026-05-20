@@ -748,8 +748,12 @@ impl Client {
         // the SignalProtocolStoreAdapter's per-session locks (prevents ratchet counter races).
         let signal_address = sender_encryption_jid.to_protocol_address();
 
+        // `session_guard` is held across the entire batch but dropped around
+        // calls into `try_pn_to_lid_migration_decrypt` because that function's
+        // migration loop re-enters this same mutex (non-reentrant).
         let session_mutex = self.session_lock_for(signal_address.as_str()).await;
-        let _session_guard = session_mutex.lock().await;
+        let mut session_guard: Option<async_lock::MutexGuardArc<()>> =
+            Some(session_mutex.lock_arc().await);
 
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -990,6 +994,8 @@ impl Client {
                                             enc_type,
                                             padding_version,
                                             info,
+                                            &session_mutex,
+                                            &mut session_guard,
                                         )
                                         .await
                                     {
@@ -1056,6 +1062,8 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 info,
+                                &session_mutex,
+                                &mut session_guard,
                             )
                             .await
                         {
@@ -1087,6 +1095,8 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 info,
+                                &session_mutex,
+                                &mut session_guard,
                             )
                             .await
                         {
@@ -1128,6 +1138,8 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 info,
+                                &session_mutex,
+                                &mut session_guard,
                             )
                             .await
                         {
@@ -1412,6 +1424,12 @@ impl Client {
 
     /// Attempt PN→LID session migration and retry decryption.
     /// Returns true if decryption succeeded after migration.
+    ///
+    /// Manages the per-address session lock around the migration loop:
+    /// drops the caller's guard (migration re-enters that mutex and
+    /// async_lock is non-reentrant), then reacquires it for the retry
+    /// decrypt and replaces the caller's `session_guard` on the way out
+    /// so the next payload in the batch stays serialized.
     #[allow(clippy::too_many_arguments)]
     async fn try_pn_to_lid_migration_decrypt(
         self: &Arc<Self>,
@@ -1423,6 +1441,8 @@ impl Client {
         enc_type: &str,
         padding_version: u8,
         info: &Arc<MessageInfo>,
+        session_mutex: &Arc<async_lock::Mutex<()>>,
+        session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
     ) -> bool {
         use wacore::libsignal::protocol::{UsePQRatchet, message_decrypt};
 
@@ -1434,18 +1454,14 @@ impl Client {
             return false;
         };
 
-        // The caller (decrypt_message) already holds session_lock_for(signal_address).
-        // async_lock::Mutex is not reentrant, so use the held-lock variant to skip
-        // re-acquiring that specific device's LID lock.
-        let held_device_id: u32 = signal_address.device_id().into();
-        self.migrate_signal_sessions_on_lid_discovery_with_held_lock(
-            &pn,
-            &sender_jid.user,
-            held_device_id as u16,
-        )
-        .await;
-
-        // Migration now goes through signal_cache, so no manual reload needed
+        // Release the address lock so the migration loop can acquire it for
+        // the matching device without re-entering.
+        *session_guard = None;
+        self.migrate_signal_sessions_on_lid_discovery(&pn, &sender_jid.user)
+            .await;
+        // Re-acquire for the retry decrypt and hand the guard back to the
+        // caller for subsequent payloads in the batch.
+        *session_guard = Some(session_mutex.lock_arc().await);
 
         match message_decrypt(
             parsed_message,
