@@ -417,6 +417,12 @@ pub struct Client {
     /// Matches WhatsApp Web's MAX_RETRY = 5 behavior.
     pub(crate) message_retry_counts: Cache<String, u8>,
 
+    /// Most recent `RetryReason` we attached to a retry receipt for this
+    /// message (same key shape as `message_retry_counts`). Lets diagnostics
+    /// and regression tests distinguish which decrypt-failure arm actually
+    /// ran (the count alone can't separate NoSession from BadMac etc.).
+    pub(crate) recent_retry_reasons: Cache<String, wacore::protocol::retry::RetryReason>,
+
     /// Dispatch-once gate for `UndecryptableMessage`: a server resend of a
     /// failed id re-enters the failure path and would otherwise fire a
     /// duplicate event. Mirrors WA Web's DB-level placeholder uniqueness
@@ -812,6 +818,8 @@ impl Client {
             pending_retries: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
             message_retry_counts: cache_config.message_retry_counts.build_with_ttl(),
+
+            recent_retry_reasons: cache_config.message_retry_counts.build_with_ttl(),
 
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
 

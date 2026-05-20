@@ -208,21 +208,19 @@ impl Client {
     /// `spawn_retry_receipt` detaches. In practice, retries for the same
     /// message are rare and a double-send is benign (recipients deduplicate
     /// by message ID).
-    async fn increment_retry_count(&self, cache_key: &str) -> Option<u8> {
+    async fn increment_retry_count(&self, cache_key: &str, reason: RetryReason) -> Option<u8> {
         let cache_key = cache_key.to_owned();
         let current = self.message_retry_counts.get(&cache_key).await;
-        match current {
-            Some(count) if count >= MAX_DECRYPT_RETRIES => None,
-            Some(count) => {
-                let new_count = count + 1;
-                self.message_retry_counts.insert(cache_key, new_count).await;
-                Some(new_count)
-            }
-            None => {
-                self.message_retry_counts.insert(cache_key, 1_u8).await;
-                Some(1)
-            }
-        }
+        let new_count = match current {
+            Some(count) if count >= MAX_DECRYPT_RETRIES => return None,
+            Some(count) => count + 1,
+            None => 1,
+        };
+        self.message_retry_counts
+            .insert(cache_key.clone(), new_count)
+            .await;
+        self.recent_retry_reasons.insert(cache_key, reason).await;
+        Some(new_count)
     }
 
     /// Generate consistent cache key for retry logic.
@@ -277,7 +275,7 @@ impl Client {
                 .await;
 
             // Atomically increment retry count and check if we should continue
-            let Some(retry_count) = client.increment_retry_count(&cache_key).await else {
+            let Some(retry_count) = client.increment_retry_count(&cache_key, reason).await else {
                 // Max retries reached
                 log::info!(
                     "Max retries ({}) reached for message {} from {} [{:?}]. Sending immediate PDO request.",
@@ -1077,9 +1075,13 @@ impl Client {
                         e,
                         SignalProtocolError::BadMac(_) | SignalProtocolError::InvalidMessage(_, _)
                     ) {
-                        // BadMac: MAC verification specifically failed (WA Web error code 7).
-                        // InvalidMessage: session out of sync or other decryption failure (code 4).
-                        // In both cases we delete the stale session and request re-establishment.
+                        // WAWebMsgProcessingDecryptionHandler classifies both as
+                        // SignalRetryable -> sendRetryReceipt only, no session ops.
+                        // When the sender resends as pkmsg, process_prekey_bundle
+                        // calls promote_state on the existing record, archiving
+                        // current into previous_sessions[0]. That archived state
+                        // is the only fallback for in-flight messages still on
+                        // the old ratchet (see decrypt_message_with_record).
                         let (reason, label) = if matches!(e, SignalProtocolError::BadMac(_)) {
                             (RetryReason::BadMac, "BadMac")
                         } else {
@@ -1087,23 +1089,12 @@ impl Client {
                         };
                         log::warn!(
                             "[msg:{}] Decryption failed for {} message from {} due to {label}. \
-                             Deleting stale session and sending retry receipt.",
+                             Sending retry receipt.",
                             info.id,
                             enc_type,
                             info.source.sender
                         );
 
-                        // Delete the stale session from the signal cache.
-                        // IMPORTANT: Must go through the cache, not directly to the backend!
-                        // Going to the backend directly leaves the stale session in the cache,
-                        // which causes retry messages to also fail (they'd load the stale session).
-                        self.signal_cache.delete_session(&signal_address).await;
-                        log::info!(
-                            "Deleted stale session for {} from cache to allow re-establishment",
-                            signal_address
-                        );
-
-                        // Send retry receipt so the sender resends with a PreKeySignalMessage
                         dispatched_undecryptable = self
                             .handle_decrypt_failure(info, reason, decrypt_fail_mode)
                             .await;
@@ -2175,24 +2166,611 @@ mod tests {
              expected (false, false, true), got ({success}, {had_duplicates}, {dispatched})"
         );
 
-        // Verify we took the SessionNotFound path (error code 1 / NoSession) rather
-        // than the InvalidMessage path (error code 4). The key difference:
-        // - SessionNotFound does NOT delete the session from the cache
-        // - InvalidMessage/BadMac DOES delete it (via signal_cache.delete_session)
-        //
-        // If the session record is still present in the cache, we know the
-        // SessionNotFound branch ran, which sends RetryReason::NoSession (code 1)
-        // and triggers early key inclusion on retry #1 via should_include_keys().
+        // After the WA Web compliance fix (no delete on BadMac/InvalidMessage either),
+        // every inbound-decrypt failure preserves the session. This still pins
+        // that the empty-record path does not regress to a delete.
         let backend = client.persistence_manager.backend();
         let session_still_exists = client
             .signal_cache
             .has_session(&signal_address, &*backend)
             .await
             .expect("has_session should not fail");
-        assert!(
-            session_still_exists,
-            "Session should NOT have been deleted — SessionNotFound path preserves it. \
-             If deleted, the InvalidMessage path ran instead (wrong error code)."
+        assert!(session_still_exists);
+
+        // Discriminate from the BadMac / InvalidMessage arms (which also
+        // preserve the session post-fix): the empty-record path must end up
+        // in the SessionNotFound branch, which fires a retry receipt with
+        // `RetryReason::NoSession`. Anything else means the libsignal-side
+        // empty-record short-circuit regressed.
+        await_retry_receipt(&client, &info, 1, RetryReason::NoSession).await;
+    }
+
+    // ─── Fixtures for session-preservation tests ─────────────────────────────
+    //
+    // Mirrors the WAWebSignalProtocolStore tests in spirit: a synthetic peer
+    // holds its own Signal stores in memory so the test can drive X3DH end to
+    // end against the Client. Inlined (not exported from a helper crate)
+    // because these are message.rs-specific scenarios.
+
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use wacore::libsignal::protocol::{
+        CiphertextMessage, Direction, IdentityChange, IdentityKey, IdentityKeyPair, KeyPair,
+        PreKeyBundle, PreKeyRecord, PreKeyStore as SigPreKeyStore, ProtocolAddress, SessionRecord,
+        SessionStore as SigSessionStore, SignedPreKeyStore as SigSignedPreKeyStore, UsePQRatchet,
+        message_encrypt, process_prekey_bundle,
+    };
+    use wacore::libsignal::protocol::{
+        IdentityKeyStore as SigIdentityKeyStore, SignalProtocolError,
+    };
+
+    #[derive(Default)]
+    struct MemSessionStore(HashMap<ProtocolAddress, SessionRecord>);
+
+    #[async_trait]
+    impl SigSessionStore for MemSessionStore {
+        async fn load_session(
+            &self,
+            a: &ProtocolAddress,
+        ) -> Result<Option<SessionRecord>, SignalProtocolError> {
+            Ok(self.0.get(a).cloned())
+        }
+        async fn has_session(&self, a: &ProtocolAddress) -> Result<bool, SignalProtocolError> {
+            Ok(self.0.contains_key(a))
+        }
+        async fn store_session(
+            &mut self,
+            a: &ProtocolAddress,
+            r: SessionRecord,
+        ) -> Result<(), SignalProtocolError> {
+            self.0.insert(a.clone(), r);
+            Ok(())
+        }
+    }
+
+    struct MemIdentityStore {
+        kp: IdentityKeyPair,
+        reg_id: u32,
+        known: HashMap<ProtocolAddress, IdentityKey>,
+    }
+
+    #[async_trait]
+    impl SigIdentityKeyStore for MemIdentityStore {
+        async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair, SignalProtocolError> {
+            Ok(self.kp.clone())
+        }
+        async fn get_local_registration_id(&self) -> Result<u32, SignalProtocolError> {
+            Ok(self.reg_id)
+        }
+        async fn save_identity(
+            &mut self,
+            a: &ProtocolAddress,
+            id: &IdentityKey,
+        ) -> Result<IdentityChange, SignalProtocolError> {
+            let prev = self.known.insert(a.clone(), *id);
+            Ok(match prev {
+                None => IdentityChange::NewOrUnchanged,
+                Some(p) if &p == id => IdentityChange::NewOrUnchanged,
+                _ => IdentityChange::ReplacedExisting,
+            })
+        }
+        async fn is_trusted_identity(
+            &self,
+            _: &ProtocolAddress,
+            _: &IdentityKey,
+            _: Direction,
+        ) -> Result<bool, SignalProtocolError> {
+            Ok(true)
+        }
+        async fn get_identity(
+            &self,
+            a: &ProtocolAddress,
+        ) -> Result<Option<IdentityKey>, SignalProtocolError> {
+            Ok(self.known.get(a).copied())
+        }
+    }
+
+    struct AlicePeer {
+        jid: Jid,
+        address: ProtocolAddress,
+        identity: MemIdentityStore,
+        sessions: MemSessionStore,
+    }
+
+    impl AlicePeer {
+        async fn new(jid_str: &str) -> Self {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let kp = IdentityKeyPair::generate(&mut rng);
+            let jid: Jid = jid_str.parse().expect("valid jid");
+            let address = jid.to_protocol_address();
+            Self {
+                jid,
+                address,
+                identity: MemIdentityStore {
+                    kp,
+                    reg_id: 12345,
+                    known: HashMap::new(),
+                },
+                sessions: MemSessionStore::default(),
+            }
+        }
+
+        async fn install_bob_session(&mut self, bob_addr: &ProtocolAddress, bundle: &PreKeyBundle) {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            process_prekey_bundle(
+                bob_addr,
+                &mut self.sessions,
+                &mut self.identity,
+                bundle,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("process bob bundle");
+        }
+
+        async fn encrypt(
+            &mut self,
+            bob_addr: &ProtocolAddress,
+            plaintext: &[u8],
+        ) -> CiphertextMessage {
+            message_encrypt(plaintext, bob_addr, &mut self.sessions, &mut self.identity)
+                .await
+                .expect("encrypt")
+        }
+    }
+
+    /// Ensure the test `Client` has an identity (`pn`/`lid`) provisioned —
+    /// `create_test_client_with_name` returns an unpaired client by default
+    /// so `device_snapshot.lid` / `.pn` are both `None`.
+    async fn ensure_bob_paired(client: &Arc<Client>) {
+        let snapshot = client.persistence_manager.get_device_snapshot().await;
+        if snapshot.lid.is_some() || snapshot.pn.is_some() {
+            return;
+        }
+        let pn: Jid = "9000000000000:1@s.whatsapp.net".parse().expect("pn");
+        let lid: Jid = "999999999999999:1@lid".parse().expect("lid");
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(pn)))
+            .await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(lid)))
+            .await;
+    }
+
+    /// Read Bob's currently provisioned identity / signed prekey from the test
+    /// client and build a `PreKeyBundle` that Alice can use to initialize
+    /// her side of the session. Mirrors how the real `RetryReceiptJob` ships
+    /// keys back to the sender — assembled through the same
+    /// `SignalProtocolStoreAdapter` traits production uses.
+    async fn bobs_prekey_bundle(client: &Arc<Client>) -> (PreKeyBundle, Jid) {
+        use wacore::libsignal::protocol::GenericSignedPreKey;
+        ensure_bob_paired(client).await;
+        let snapshot = client.persistence_manager.get_device_snapshot().await;
+        let identity_kp = snapshot.core.identity_key.clone();
+        let reg_id = snapshot.core.registration_id;
+
+        // Read/write prekeys through the same trait surface production uses
+        // (see signal_adapter.rs). Avoids reaching past `PersistenceManager`
+        // to mutate device storage directly.
+        let mut adapter = client.signal_adapter().await;
+        let spk_record = adapter
+            .signed_pre_key_store
+            .get_signed_pre_key(1.into())
+            .await
+            .expect("spk present");
+        let spk_pub = spk_record.public_key().expect("spk pub");
+        let spk_sig_vec = spk_record.signature().expect("spk sig");
+
+        // Provision a fresh one-time prekey for this test through the
+        // adapter's `PreKeyStore` impl.
+        let pk_id_u32: u32 = 9001;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let pk_pair = KeyPair::generate(&mut rng);
+        let pk_record = PreKeyRecord::new(pk_id_u32.into(), &pk_pair);
+        adapter
+            .pre_key_store
+            .save_pre_key(pk_id_u32.into(), &pk_record)
+            .await
+            .expect("save pk");
+
+        let own_device_jid: Jid = snapshot
+            .lid
+            .clone()
+            .or_else(|| snapshot.pn.clone())
+            .expect("own jid");
+        let bob_jid = own_device_jid.to_non_ad();
+        let bundle = PreKeyBundle::new(
+            reg_id,
+            u32::from(own_device_jid.device).into(),
+            Some((pk_id_u32.into(), pk_pair.public_key)),
+            1.into(),
+            spk_pub,
+            spk_sig_vec,
+            IdentityKey::new(identity_kp.public_key),
+        )
+        .expect("bundle");
+        (bundle, bob_jid)
+    }
+
+    /// Build an EncPayload-style stanza node and run `process_session_enc_batch`.
+    /// Returns whether the session for `peer_jid` still exists in the cache afterwards.
+    async fn submit_and_check_session(
+        client: &Arc<Client>,
+        peer_jid: &Jid,
+        ct: &CiphertextMessage,
+    ) -> (bool, bool, bool, bool) {
+        let (enc_type, bytes) = match ct {
+            CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
+            CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
+            _ => panic!("unexpected ciphertext type"),
+        };
+        let enc_node = NodeBuilder::new("enc")
+            .attr("type", enc_type)
+            .bytes(bytes)
+            .build();
+        let enc_ref = enc_node.as_node_ref();
+        let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+        let info = Arc::new(MessageInfo {
+            source: crate::types::message::MessageSource {
+                sender: peer_jid.clone(),
+                chat: peer_jid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let (success, dups, dispatched) = client
+            .clone()
+            .process_session_enc_batch(
+                &payloads,
+                &info,
+                peer_jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        let backend = client.persistence_manager.backend();
+        let still = client
+            .signal_cache
+            .has_session(&peer_jid.to_protocol_address(), &*backend)
+            .await
+            .expect("has_session");
+        (success, dups, dispatched, still)
+    }
+
+    /// Smoking-gun regression: a `BadMac` on the inbound path must NOT delete
+    /// the session. Pre-fix, `src/message.rs:1100` called
+    /// `signal_cache.delete_session(...)` here — this test would fail with
+    /// `still=false`. WA Web's `RetryReceiptJob` keeps the session untouched
+    /// (see `docs/captured-js/WAWeb/Send/RetryReceiptJob.js`).
+    #[tokio::test]
+    async fn test_badmac_preserves_session() {
+        let client = crate::test_utils::create_test_client_with_name("badmac_preserves").await;
+        let mut alice = AlicePeer::new("1111111111111@s.whatsapp.net").await;
+        let alice_addr = alice.address.clone();
+
+        // X3DH: Alice consumes Bob's bundle to set up her outgoing session.
+        let (bob_bundle, _) = bobs_prekey_bundle(&client).await;
+        alice
+            .install_bob_session(
+                &client
+                    .persistence_manager
+                    .get_device_snapshot()
+                    .await
+                    .lid
+                    .clone()
+                    .or(client
+                        .persistence_manager
+                        .get_device_snapshot()
+                        .await
+                        .pn
+                        .clone())
+                    .expect("own jid")
+                    .to_protocol_address(),
+                &bob_bundle,
+            )
+            .await;
+
+        // First message: pkmsg lands on Bob and installs Bob's reciprocal session.
+        let bob_addr = client
+            .persistence_manager
+            .get_device_snapshot()
+            .await
+            .lid
+            .clone()
+            .or(client
+                .persistence_manager
+                .get_device_snapshot()
+                .await
+                .pn
+                .clone())
+            .expect("own jid")
+            .to_protocol_address();
+        let pkmsg = alice.encrypt(&bob_addr, b"hello").await;
+        let (s1, _, _, still1) = submit_and_check_session(&client, &alice.jid, &pkmsg).await;
+        assert!(s1, "pkmsg should establish session and decrypt");
+        assert!(still1, "session must exist after first message");
+
+        // Force Alice's next encrypt to be a plain SignalMessage rather than a
+        // pkmsg by clearing her unacknowledged-pkmsg flag. Tampering the trailing
+        // bytes of a pkmsg breaks the outer protobuf parse (because reg_id /
+        // signed_pre_key_id varints are encoded *after* the embedded message
+        // field), which would short-circuit into the parse-error nack path
+        // before ever reaching the BadMac arm we want to exercise.
+        {
+            let record = alice
+                .sessions
+                .0
+                .get_mut(&bob_addr)
+                .expect("alice has a session for bob");
+            if let Some(state) = record.session_state_mut() {
+                state.clear_unacknowledged_pre_key_message();
+            }
+        }
+
+        // Second message: tamper the trailing MAC byte of a real SignalMessage.
+        // The format is `[version][protobuf body][8-byte MAC]`, so the last byte
+        // is squarely inside the MAC region — parse succeeds, MAC verification
+        // fails -> libsignal returns BadMac.
+        let msg2 = alice.encrypt(&bob_addr, b"world").await;
+        let mut bytes = match &msg2 {
+            CiphertextMessage::SignalMessage(m) => m.serialized().to_vec(),
+            other => panic!(
+                "expected SignalMessage, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        };
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        let enc_node = NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .bytes(bytes)
+            .build();
+        let enc_ref = enc_node.as_node_ref();
+        let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+        let info = Arc::new(MessageInfo {
+            id: "BADMAC_TAMPER_MSG".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: alice.jid.clone(),
+                chat: alice.jid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let (success, _, dispatched) = client
+            .clone()
+            .process_session_enc_batch(
+                &payloads,
+                &info,
+                &alice.jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        assert!(!success, "tampered MAC must not decrypt");
+        assert!(dispatched, "undecryptable event must be dispatched");
+
+        // The fix asserts the session lives on so the eventual sender pkmsg
+        // can archive it into previous_sessions[0].
+        let backend = client.persistence_manager.backend();
+        let still = client
+            .signal_cache
+            .has_session(&alice_addr, &*backend)
+            .await
+            .expect("has_session");
+        assert!(still, "BadMac must NOT delete the session (WA Web parity)");
+
+        // Discriminate from the parse-error path (which also preserves the
+        // session): the BadMac/InvalidMessage branch routes through
+        // `handle_decrypt_failure` -> `spawn_retry_receipt`, which bumps
+        // both caches with `RetryReason::BadMac`. Parse errors take the
+        // nack path instead and never touch either cache.
+        await_retry_receipt(&client, &info, 1, RetryReason::BadMac).await;
+    }
+
+    /// Poll for `message_retry_counts == expected_count` AND
+    /// `recent_retry_reasons == expected_reason` (or fail after a short
+    /// timeout). `spawn_retry_receipt` detaches the increment onto the
+    /// runtime, so both caches may lag the `process_session_enc_batch` return.
+    /// Reading both is what tells the BadMac arm apart from a parse-error
+    /// regression (which never bumps these caches).
+    async fn await_retry_receipt(
+        client: &Arc<Client>,
+        info: &MessageInfo,
+        expected_count: u8,
+        expected_reason: RetryReason,
+    ) {
+        let cache_key = client
+            .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+            .await;
+        for _ in 0..200 {
+            if let (Some(c), Some(r)) = (
+                client.message_retry_counts.get(&cache_key).await,
+                client.recent_retry_reasons.get(&cache_key).await,
+            ) && c == expected_count
+                && r == expected_reason
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let count = client.message_retry_counts.get(&cache_key).await;
+        let reason = client.recent_retry_reasons.get(&cache_key).await;
+        panic!(
+            "expected retry ({expected_count}, {expected_reason:?}) for {cache_key}, \
+             got ({count:?}, {reason:?})"
+        );
+    }
+
+    // NOTE: the `InvalidMessage` arm of the `matches!()` block in
+    // `process_session_enc_batch` is exercised by `test_badmac_preserves_session`
+    // too — libsignal returns `BadMac` whenever *any* candidate state derives a
+    // message key (which is what a random-ratchet `SignalMessage::new(...)`
+    // ends up doing as well), so a separate "InvalidMessage" regression test
+    // would be indistinguishable from the BadMac one. Reaching the
+    // `InvalidMessage` constructor specifically would require crafting a
+    // SignalMessage that *parses* but where no state derives any message
+    // key — empirically impractical without major libsignal-side scaffolding.
+
+    /// Integration test: reproduces the production loop observed in
+    /// `k8awqjsgww2lnkt89urp3de1-191402150615-...`. After a BadMac the bot
+    /// used to delete the session; when the sender then sent a fresh pkmsg
+    /// (post-retry-receipt), `process_prekey_bundle` ran on an empty record
+    /// and `previous_sessions[0]` stayed empty — any in-flight messages on
+    /// the OLD ratchet failed permanently. With the fix the old session
+    /// survives the BadMac, the pkmsg's `promote_state` archives it, and
+    /// the archived state lives in `previous_sessions[0]` exactly as WA Web
+    /// expects (see `libsignal/src/protocol/state/session.rs:751-768`).
+    #[tokio::test]
+    async fn test_prod_scenario_pkmsg_archives_old_session_after_badmac() {
+        let client = crate::test_utils::create_test_client_with_name("prod_archive").await;
+        let mut alice = AlicePeer::new("3333333333333@s.whatsapp.net").await;
+
+        // X3DH round 1 — Alice initiates with Bob's bundle, sends pkmsg.
+        let (bundle_v1, _) = bobs_prekey_bundle(&client).await;
+        let bob_addr = client
+            .persistence_manager
+            .get_device_snapshot()
+            .await
+            .lid
+            .clone()
+            .or(client
+                .persistence_manager
+                .get_device_snapshot()
+                .await
+                .pn
+                .clone())
+            .expect("own jid")
+            .to_protocol_address();
+        alice.install_bob_session(&bob_addr, &bundle_v1).await;
+        let pkmsg_v1 = alice.encrypt(&bob_addr, b"v1").await;
+        let (s1, _, _, _) = submit_and_check_session(&client, &alice.jid, &pkmsg_v1).await;
+        assert!(s1);
+
+        // Snapshot Bob's session_v1 base key for later comparison. Use
+        // peek (non-destructive): `get_session` marks the cache entry as
+        // CheckedOut, which would prevent libsignal from re-loading the
+        // session in the BadMac path that follows.
+        let alice_addr = alice.address.clone();
+        let backend = client.persistence_manager.backend();
+        let v1_record = client
+            .signal_cache
+            .peek_session(&alice_addr, &*backend)
+            .await
+            .expect("peek_session")
+            .expect("v1 session present");
+        let v1_base_key = v1_record
+            .session_state()
+            .expect("v1 current state")
+            .sender_ratchet_key_for_logging()
+            .expect("v1 base key");
+
+        // Force Alice's next encrypt to be a plain SignalMessage so tampering
+        // the last byte lands inside the MAC region (see comment in
+        // `test_badmac_preserves_session` for why pkmsg cannot be tampered
+        // at the tail without breaking the outer protobuf parse).
+        {
+            let record = alice
+                .sessions
+                .0
+                .get_mut(&bob_addr)
+                .expect("alice has a session for bob");
+            if let Some(state) = record.session_state_mut() {
+                state.clear_unacknowledged_pre_key_message();
+            }
+        }
+
+        // Tampered SignalMessage → BadMac branch (with the fix this no longer
+        // deletes Bob's session).
+        let msg = alice.encrypt(&bob_addr, b"stale").await;
+        let mut bytes = match &msg {
+            CiphertextMessage::SignalMessage(m) => m.serialized().to_vec(),
+            other => panic!(
+                "expected SignalMessage, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        };
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        let enc_node = NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .bytes(bytes)
+            .build();
+        let enc_ref = enc_node.as_node_ref();
+        let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+        let info = Arc::new(MessageInfo {
+            id: "PROD_LOOP_REPRO_STALE".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: alice.jid.clone(),
+                chat: alice.jid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let (_, _, _) = client
+            .clone()
+            .process_session_enc_batch(
+                &payloads,
+                &info,
+                &alice.jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        // Confirm the BadMac branch executed (parse-error path would skip
+        // both retry caches; another arm would record a different reason).
+        await_retry_receipt(&client, &info, 1, RetryReason::BadMac).await;
+        // Pre-fix: this assertion would have failed (session deleted).
+        let preserved = client
+            .signal_cache
+            .has_session(&alice_addr, &*backend)
+            .await
+            .expect("has_session");
+        assert!(preserved, "BadMac must preserve session");
+
+        // X3DH round 2 — Alice rebuilds her side from a fresh Bob bundle
+        // (simulates the bot re-issuing prekeys via a retry receipt) and
+        // sends another pkmsg. Bob's `process_prekey_bundle` must archive
+        // session_v1 into previous_sessions[0].
+        let (bundle_v2, _) = bobs_prekey_bundle(&client).await;
+        alice.sessions = MemSessionStore::default(); // forget Alice's v1 to force a fresh X3DH
+        alice.install_bob_session(&bob_addr, &bundle_v2).await;
+        let pkmsg_v2 = alice.encrypt(&bob_addr, b"v2").await;
+        let (s2, _, _, still2) = submit_and_check_session(&client, &alice.jid, &pkmsg_v2).await;
+        assert!(s2, "pkmsg_v2 should decrypt");
+        assert!(still2);
+
+        let v2_record = client
+            .signal_cache
+            .peek_session(&alice_addr, &*backend)
+            .await
+            .expect("peek_session")
+            .expect("v2 session present");
+        let v2_base_key = v2_record
+            .session_state()
+            .expect("v2 current state")
+            .sender_ratchet_key_for_logging()
+            .expect("v2 base key");
+        assert_ne!(
+            v1_base_key, v2_base_key,
+            "current session must be the new v2"
+        );
+        assert_eq!(
+            v2_record.previous_session_count(),
+            1,
+            "session_v1 must be archived as previous_sessions[0]"
+        );
+        let archived_state = v2_record
+            .previous_session_states()
+            .next()
+            .expect("archived state")
+            .expect("archived state decodes");
+        let archived_base_key = archived_state
+            .sender_ratchet_key_for_logging()
+            .expect("archived base key");
+        assert_eq!(
+            archived_base_key, v1_base_key,
+            "archived previous_sessions[0] must be the original v1"
         );
     }
 
@@ -4295,7 +4873,9 @@ mod tests {
         let cache_key = "test_chat:msg123:sender456";
 
         // First increment should return 1
-        let count = client.increment_retry_count(cache_key).await;
+        let count = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
         assert_eq!(count, Some(1), "First retry should be count 1");
 
         // Verify it's stored in cache
@@ -4310,9 +4890,15 @@ mod tests {
         let cache_key = "test_chat:msg456:sender789";
 
         // Simulate multiple retries
-        let count1 = client.increment_retry_count(cache_key).await;
-        let count2 = client.increment_retry_count(cache_key).await;
-        let count3 = client.increment_retry_count(cache_key).await;
+        let count1 = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
+        let count2 = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
+        let count3 = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
 
         assert_eq!(count1, Some(1), "First retry should be 1");
         assert_eq!(count2, Some(2), "Second retry should be 2");
@@ -4327,12 +4913,16 @@ mod tests {
 
         // Exhaust all retries (MAX_DECRYPT_RETRIES = 5)
         for i in 1..=5 {
-            let count = client.increment_retry_count(cache_key).await;
+            let count = client
+                .increment_retry_count(cache_key, RetryReason::NoSession)
+                .await;
             assert_eq!(count, Some(i), "Retry {} should return {}", i, i);
         }
 
         // 6th attempt should return None (max reached)
-        let count_after_max = client.increment_retry_count(cache_key).await;
+        let count_after_max = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
         assert_eq!(
             count_after_max, None,
             "After max retries, should return None"
@@ -4352,14 +4942,26 @@ mod tests {
         let key3 = "chat2:msg1:sender2"; // Different chat and sender
 
         // Increment each independently
-        let _ = client.increment_retry_count(key1).await;
-        let _ = client.increment_retry_count(key1).await;
-        let _ = client.increment_retry_count(key1).await; // key1 = 3
+        let _ = client
+            .increment_retry_count(key1, RetryReason::NoSession)
+            .await;
+        let _ = client
+            .increment_retry_count(key1, RetryReason::NoSession)
+            .await;
+        let _ = client
+            .increment_retry_count(key1, RetryReason::NoSession)
+            .await; // key1 = 3
 
-        let _ = client.increment_retry_count(key2).await; // key2 = 1
+        let _ = client
+            .increment_retry_count(key2, RetryReason::NoSession)
+            .await; // key2 = 1
 
-        let _ = client.increment_retry_count(key3).await;
-        let _ = client.increment_retry_count(key3).await; // key3 = 2
+        let _ = client
+            .increment_retry_count(key3, RetryReason::NoSession)
+            .await;
+        let _ = client
+            .increment_retry_count(key3, RetryReason::NoSession)
+            .await; // key3 = 2
 
         // Verify each has independent counts
         assert_eq!(client.message_retry_counts.get(key1).await, Some(3));
@@ -4413,7 +5015,11 @@ mod tests {
         for _ in 0..10 {
             let client_clone = client.clone();
             let key = cache_key.to_string();
-            tasks.spawn(async move { client_clone.increment_retry_count(&key).await });
+            tasks.spawn(async move {
+                client_clone
+                    .increment_retry_count(&key, RetryReason::NoSession)
+                    .await
+            });
         }
 
         // Collect all results
@@ -4508,7 +5114,9 @@ mod tests {
         // We can verify entries are being stored and the cache is functional
         let cache_key = "expiry_test:msg:sender";
 
-        let count = client.increment_retry_count(cache_key).await;
+        let count = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
         assert_eq!(count, Some(1));
 
         // Entry should still exist immediately after
@@ -4628,12 +5236,20 @@ mod tests {
         let key2 = format!("{}:{}:{}", group, msg_id, sender2);
 
         // Increment for sender1 multiple times
-        client.increment_retry_count(&key1).await;
-        client.increment_retry_count(&key1).await;
-        client.increment_retry_count(&key1).await;
+        client
+            .increment_retry_count(&key1, RetryReason::NoSession)
+            .await;
+        client
+            .increment_retry_count(&key1, RetryReason::NoSession)
+            .await;
+        client
+            .increment_retry_count(&key1, RetryReason::NoSession)
+            .await;
 
         // Increment for sender2 once
-        client.increment_retry_count(&key2).await;
+        client
+            .increment_retry_count(&key2, RetryReason::NoSession)
+            .await;
 
         // Verify independent tracking
         assert_eq!(

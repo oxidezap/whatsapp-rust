@@ -1251,11 +1251,25 @@ impl Client {
                 recipient_cached = self.get_devices_from_registry(&recipient_bare).await;
             }
 
-            let mut own_cached = self.get_devices_from_registry(own_jid).await;
-            if own_cached.is_none() {
-                let _ = self.get_user_devices(std::slice::from_ref(own_jid)).await;
-                own_cached = self.get_devices_from_registry(own_jid).await;
-            }
+            let is_self_dm =
+                is_self_dm_recipient(&recipient_bare, own_jid, device_snapshot.lid.as_ref());
+
+            // Skip the own-device lookup only when we already have the
+            // recipient's list — that record covers every own device in a
+            // single namespace. If `recipient_cached` is `None` (cache miss
+            // + warmup failed), the PN-keyed `own_cached` is the only thing
+            // standing between us and a bare-JID fallback that would drop
+            // companion devices.
+            let own_cached: Option<Vec<Jid>> = if is_self_dm && recipient_cached.is_some() {
+                None
+            } else {
+                let mut cached = self.get_devices_from_registry(own_jid).await;
+                if cached.is_none() {
+                    let _ = self.get_user_devices(std::slice::from_ref(own_jid)).await;
+                    cached = self.get_devices_from_registry(own_jid).await;
+                }
+                cached
+            };
 
             // Build device list, filter hosted in-place, reuse Vecs
             let mut all_dm_jids = match recipient_cached {
@@ -1281,9 +1295,8 @@ impl Client {
                 !is_sender
             });
 
-            // Dedup for self-DMs: recipient and own device lists overlap when
-            // sending to own account. `participant_list_hash` sorts internally,
-            // so reordering here is safe.
+            // Same-namespace dedup only; cross-namespace overlap is avoided
+            // upstream via `is_self_dm_recipient`.
             wacore::types::jid::sort_dedup_by_device(&mut all_dm_jids);
 
             self.ensure_e2e_sessions(&all_dm_jids).await?;
@@ -1828,6 +1841,22 @@ impl Client {
     }
 }
 
+/// Self-DM detection: appending an own-device lookup on top of the
+/// recipient's list would address each physical device twice (LID + PN),
+/// which the server rejects with `ack error="400"`.
+/// WAWebDBDeviceListFanout never re-fetches the own list for the same account.
+pub(crate) fn is_self_dm_recipient(
+    recipient_bare: &Jid,
+    own_pn: &Jid,
+    own_lid: Option<&Jid>,
+) -> bool {
+    match recipient_bare.server {
+        Server::Lid => own_lid.is_some_and(|lid| recipient_bare.user == lid.user),
+        Server::Pn => recipient_bare.user == own_pn.user,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2017,6 +2046,178 @@ mod tests {
         // Participant should be the original sender with device number stripped
         assert_eq!(key.participant, Some("236395184570386@lid".to_string()));
         assert_eq!(key.id, Some(message_id));
+    }
+
+    // Fictitious JIDs (not real PII):
+    //   own PN user = "5500000000000"
+    //   own LID user = "111111111111111"
+    //   other LID user = "222222222222222"
+    const SELF_PN: &str = "5500000000000";
+    const SELF_LID: &str = "111111111111111";
+    const SELF_DEVICE: u16 = 7;
+    const OTHER_LID: &str = "222222222222222";
+
+    #[test]
+    fn self_dm_lid_recipient_matches_own_lid() {
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient = Jid::lid(SELF_LID);
+
+        assert!(is_self_dm_recipient(&recipient, &own_pn, Some(&own_lid)));
+    }
+
+    #[test]
+    fn self_dm_pn_recipient_matches_own_pn() {
+        // Self-DM addressed in PN namespace (no LID mapping resolved yet).
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient = Jid::pn(SELF_PN);
+
+        assert!(is_self_dm_recipient(&recipient, &own_pn, Some(&own_lid)));
+    }
+
+    #[test]
+    fn self_dm_pn_recipient_self_dm_even_without_own_lid() {
+        // PN-keyed self-detection does not require an own_lid to be known.
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let recipient = Jid::pn(SELF_PN);
+
+        assert!(is_self_dm_recipient(&recipient, &own_pn, None));
+    }
+
+    #[test]
+    fn non_self_lid_recipient_is_not_self_dm() {
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient = Jid::lid(OTHER_LID);
+
+        assert!(!is_self_dm_recipient(&recipient, &own_pn, Some(&own_lid)));
+    }
+
+    #[test]
+    fn lid_recipient_without_own_lid_is_not_self_dm() {
+        // WAWebUserPrefsMeUser.isMeAccount keys on isSameAccountAndAddressingMode;
+        // PN-string equality across namespaces must NOT trigger.
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let recipient = Jid::lid(SELF_PN);
+
+        assert!(!is_self_dm_recipient(&recipient, &own_pn, None));
+    }
+
+    #[test]
+    fn group_or_broadcast_recipient_is_not_self_dm() {
+        // Defensive: only PN/LID DMs ever take the self-DM short-circuit.
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+
+        assert!(!is_self_dm_recipient(
+            &Jid::group("120363000000000000"),
+            &own_pn,
+            Some(&own_lid),
+        ));
+        assert!(!is_self_dm_recipient(
+            &Jid::status_broadcast(),
+            &own_pn,
+            Some(&own_lid),
+        ));
+    }
+
+    #[test]
+    fn self_dm_with_no_recipient_cache_still_appends_own_devices() {
+        // Edge case raised in PR review: if `recipient_cached` ends up `None`
+        // (cache eviction + warmup failed), the self-DM short-circuit must
+        // still let `own_cached` populate the fanout. Otherwise the bare-JID
+        // fallback drops every companion device.
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient_bare = Jid::lid(SELF_LID);
+        assert!(is_self_dm_recipient(
+            &recipient_bare,
+            &own_pn,
+            Some(&own_lid)
+        ));
+
+        let recipient_cached: Option<Vec<Jid>> = None;
+        let own_cached_pn: Vec<Jid> = [0u16, 3, SELF_DEVICE]
+            .into_iter()
+            .map(|d| Jid::pn_device(SELF_PN, d))
+            .collect();
+
+        // Mirrors the call-site logic: we keep own_cached when recipient_cached is None
+        // even in a self-DM.
+        let keep_own = recipient_cached.is_none();
+        assert!(keep_own);
+
+        let mut all_dm_jids = match recipient_cached {
+            Some(devices) => devices,
+            None => vec![recipient_bare],
+        };
+        if keep_own {
+            all_dm_jids.extend(own_cached_pn.iter().cloned());
+        }
+        all_dm_jids.retain(|j| {
+            let is_sender = (j.is_same_user_as(&own_pn) && j.device == own_pn.device)
+                || (j.is_same_user_as(&own_lid) && j.device == own_lid.device);
+            !is_sender
+        });
+        wacore::types::jid::sort_dedup_by_device(&mut all_dm_jids);
+
+        // Must contain the bare LID plus the two non-sender PN companion devices.
+        assert!(
+            all_dm_jids.iter().any(|j| j.is_lid()),
+            "bare recipient LID must remain"
+        );
+        assert_eq!(
+            all_dm_jids.iter().filter(|j| j.is_pn()).count(),
+            2,
+            "companion PN devices must survive when recipient_cached is None"
+        );
+    }
+
+    #[test]
+    fn old_merge_produced_lid_pn_duplicates_for_self_dm() {
+        // Pinning regression: the OLD merge path (recipient_cached LID ++
+        // own_cached PN, then sort_dedup_by_device) left every device listed
+        // twice for a self-DM, which the server rejects with ack error="400".
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient_bare = Jid::lid(SELF_LID);
+
+        let devices = [0u16, 3, 5, SELF_DEVICE];
+        let recipient_cached: Vec<Jid> = devices
+            .iter()
+            .map(|&d| Jid::lid_device(SELF_LID, d))
+            .collect();
+        let own_cached: Vec<Jid> = devices
+            .iter()
+            .map(|&d| Jid::pn_device(SELF_PN, d))
+            .collect();
+
+        let retain_non_sender = |j: &Jid| {
+            let is_sender = (j.is_same_user_as(&own_pn) && j.device == own_pn.device)
+                || (j.is_same_user_as(&own_lid) && j.device == own_lid.device);
+            !is_sender
+        };
+
+        let mut buggy = recipient_cached.clone();
+        buggy.extend(own_cached.clone());
+        buggy.retain(retain_non_sender);
+        wacore::types::jid::sort_dedup_by_device(&mut buggy);
+        assert_eq!(buggy.len(), (devices.len() - 1) * 2);
+
+        assert!(is_self_dm_recipient(
+            &recipient_bare,
+            &own_pn,
+            Some(&own_lid)
+        ));
+
+        let mut fixed = recipient_cached;
+        fixed.retain(retain_non_sender);
+        wacore::types::jid::sort_dedup_by_device(&mut fixed);
+        assert_eq!(fixed.len(), devices.len() - 1);
+        for j in &fixed {
+            assert!(j.is_lid());
+        }
     }
 
     #[test]
