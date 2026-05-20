@@ -717,6 +717,20 @@ impl Client {
     /// Callers pair this with `signal_cache.delete_session` so the next
     /// `ensure_e2e_sessions_resolved` does the prekey fetch + rebuild.
     async fn should_recreate_session(&self, retry_count: u8, jid: &Jid) -> Option<&'static str> {
+        self.should_recreate_session_at(retry_count, jid, wacore::time::Instant::now())
+            .await
+    }
+
+    /// Injectable-clock variant for testing the throttle expiry path.
+    /// wacore::time::Instant is std::time::Instant-backed so subtracting a
+    /// Duration to fabricate a "past" stamp saturates to 0 in young test
+    /// runtimes; passing a future `now` instead exercises the same branch.
+    async fn should_recreate_session_at(
+        &self,
+        retry_count: u8,
+        jid: &Jid,
+        now: wacore::time::Instant,
+    ) -> Option<&'static str> {
         let signal_address = jid.to_protocol_address();
         let device_store = self.persistence_manager.get_device_arc().await;
         let device_guard = device_store.read().await;
@@ -747,7 +761,6 @@ impl Client {
         // Prune lazily — every call under a global Mutex is O(n) and serializes
         // retry receipts across sessions. Threshold tuned so the map can't grow
         // unbounded but the common case skips the scan.
-        let now = wacore::time::Instant::now();
         if history.len() > SESSION_RECREATE_HISTORY_PRUNE_THRESHOLD {
             history
                 .retain(|_, prev| now.saturating_duration_since(*prev) < RECREATE_SESSION_TIMEOUT);
@@ -2016,12 +2029,22 @@ mod tests {
             "throttled path must not re-stamp the history"
         );
 
-        // NB: "entry past the throttle window allows recreate" cannot be
-        // exercised here without faking the wall clock — wacore::time::Instant
-        // is std::time::Instant-backed and can't go back in time. The age
-        // check in should_recreate_session is load-bearing because lazy
-        // pruning leaves expired entries in the map for small deployments;
-        // dropping it would pin a peer forever.
+        // 5) Throttle entry past the window must allow a fresh recreate.
+        // Lazy pruning (size threshold) leaves expired entries in the map for
+        // small deployments, so the age check at the decision site is
+        // load-bearing. Pass a future `now` via the injectable-clock variant
+        // because subtracting a Duration from a young test runtime's Instant
+        // would saturate to zero (still "recent" relative to that runtime's
+        // own now), exercising the wrong branch.
+        let stamp_then = after_first.expect("first recreate stamped history");
+        let well_past = stamp_then + RECREATE_SESSION_TIMEOUT + std::time::Duration::from_secs(1);
+        assert!(
+            client
+                .should_recreate_session_at(3, &jid_with, well_past)
+                .await
+                .is_some_and(|r| r.contains("over an hour")),
+            "entry past the throttle window must allow a fresh recreate"
+        );
 
         // 4) no session → recreate regardless of retry count.
         assert!(
