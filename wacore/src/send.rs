@@ -2915,13 +2915,16 @@ mod tests {
         #[tokio::test]
         async fn dm_retry_emits_enc_directly_under_message_with_recipient() {
             let (mut ss, mut is, jid) = setup_session().await;
-            let to: Jid = "236395184570386@lid".parse().unwrap();
+            // Distinct values so a swapped-args regression (e.g. `recipient =
+            // to_jid`) fails the assertions below instead of silently passing.
+            let to: Jid = "559922223333:5@s.whatsapp.net".parse().unwrap();
+            let recipient: Jid = "236395184570386@lid".parse().unwrap();
             let requester: Jid = jid.to_string().parse().unwrap();
             let n = prepare_dm_retry_stanza(
                 &mut ss,
                 &mut is,
                 to.clone(),
-                Some(to.clone()),
+                Some(recipient.clone()),
                 requester,
                 &wa::Message::default(),
                 "dm-retry-format-1".into(),
@@ -2943,11 +2946,16 @@ mod tests {
                 n.get_optional_child("enc").is_some(),
                 "<enc> must be a direct child of <message>"
             );
-            // `recipient` attribute is forwarded from the retry receipt
-            // (mirrors WA Web's `f && (k.recipient = f)`).
-            assert!(
-                n.attrs().optional_string("recipient").is_some(),
-                "DM retry must carry the `recipient` attribute"
+            assert_eq!(
+                n.attrs().optional_string("to").unwrap().as_ref(),
+                to.to_string(),
+                "`to` should target the requesting device verbatim"
+            );
+            assert_eq!(
+                n.attrs().optional_string("recipient").unwrap().as_ref(),
+                recipient.to_string(),
+                "`recipient` should mirror the original message's recipient \
+                 (forwarded from the retry receipt's `recipient` attr)"
             );
         }
 

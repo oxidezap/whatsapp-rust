@@ -720,11 +720,23 @@ impl Client {
         let signal_address = jid.to_protocol_address();
         let device_store = self.persistence_manager.get_device_arc().await;
         let device_guard = device_store.read().await;
-        let has_session = self
+        // Whatsmeow returns `false` on `ContainsSession` errors so a transient
+        // backend read failure doesn't masquerade as "no session" and trigger
+        // an unnecessary delete + prekey fetch (`retry.go:161-163`).
+        let has_session = match self
             .signal_cache
             .has_session(&signal_address, &*device_guard.backend)
             .await
-            .unwrap_or(false);
+        {
+            Ok(present) => present,
+            Err(e) => {
+                warn!(
+                    "should_recreate_session: has_session failed for {}: {} — skipping recreate",
+                    signal_address, e
+                );
+                return None;
+            }
+        };
         drop(device_guard);
 
         let mut history = self
