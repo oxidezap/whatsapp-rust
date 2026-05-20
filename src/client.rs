@@ -3222,10 +3222,10 @@ impl Client {
     }
 
     pub(crate) async fn handle_stream_error(&self, node: &wacore_binary::NodeRef<'_>) {
-        // is_logged_in is cleared only inside fatal branches below. 429, 503,
-        // and unknown/code-less errors leave the session alive — clearing it
-        // unconditionally here would make is_fully_ready() flip and prekey
-        // uploads bail with "Connection lost" while the socket is still up.
+        // is_logged_in is cleared together with the disconnect below, never
+        // here: 429, 503, and unknown/code-less errors leave the session
+        // alive, and clearing it while the socket is up would flip
+        // is_fully_ready() and make prekey uploads bail with "Connection lost".
         let mut attrs = node.attrs();
         let code_cow = attrs.optional_string("code");
         let code = code_cow.as_deref().unwrap_or("");
@@ -3248,7 +3248,6 @@ impl Client {
                 "Got stream error indicating client was removed or replaced (conflict={}). Logging out.",
                 conflict_type
             );
-            self.is_logged_in.store(false, Ordering::Relaxed);
             self.expected_disconnect.store(true, Ordering::Relaxed);
             self.enable_auto_reconnect.store(false, Ordering::Relaxed);
 
@@ -3336,8 +3335,10 @@ impl Client {
 
         // Only tear down the connection for branches that explicitly opted in.
         // 429/503/unknown match whatsmeow: log and let the socket layer notice
-        // if the server actually closes the stream.
+        // if the server actually closes the stream. is_logged_in is cleared
+        // here so it flips exactly when (and only when) we disconnect.
         if should_disconnect {
+            self.is_logged_in.store(false, Ordering::Relaxed);
             let transport_opt = self.transport.lock().await.clone();
             if let Some(transport) = transport_opt {
                 self.runtime
@@ -5972,6 +5973,60 @@ mod tests {
         assert!(
             !ack.attrs.contains_key("recipient"),
             "ACK must NOT add `recipient` when the incoming stanza has none"
+        );
+    }
+
+    #[test]
+    fn test_encode_ack_bytes_roundtrip_recipient() {
+        // Exercises the real wire encoder (`encode_ack_bytes`), not just the
+        // `build_ack_node` test mirror: serialize, decode the bytes back, and
+        // assert the parsed ACK echoes `recipient` when present and omits it
+        // when absent. Guards against the two builders silently diverging.
+        let own_device_pn: Jid = "155500012345:48@s.whatsapp.net"
+            .parse()
+            .expect("own device PN JID should parse");
+
+        let with_recipient = NodeBuilder::new("message")
+            .attr("from", "166361967902821@lid")
+            .attr("id", "2A32F960553696093D99")
+            .attr("type", "text")
+            .attr("recipient", "146991363395800@lid")
+            .build();
+        let buf = encode_ack_bytes(&with_recipient.as_node_ref(), Some(&own_device_pn))
+            .expect("encode_ack_bytes should not error")
+            .expect("encode_ack_bytes should produce bytes");
+        // The Encoder prepends a leading format byte (see `marshal`); the
+        // decoder wants raw protocol bytes — same handling as `node_to_owned_ref`.
+        let decoded =
+            wacore_binary::marshal::unmarshal_ref(&buf[1..]).expect("encoded ack should decode");
+        assert_eq!(decoded.tag, "ack");
+        assert!(
+            decoded
+                .get_attr("class")
+                .is_some_and(|v| v.as_str() == "message"),
+            "decoded ack must have class=message"
+        );
+        assert!(
+            decoded
+                .get_attr("recipient")
+                .is_some_and(|v| v.as_str() == "146991363395800@lid"),
+            "encode_ack_bytes must echo `recipient` onto the wire"
+        );
+
+        let without_recipient = NodeBuilder::new("message")
+            .attr("from", "120363161500776365@g.us")
+            .attr("id", "A5791A5392EF60E3FB06")
+            .attr("type", "text")
+            .attr("participant", "181531758878822@lid")
+            .build();
+        let buf = encode_ack_bytes(&without_recipient.as_node_ref(), Some(&own_device_pn))
+            .expect("encode_ack_bytes should not error")
+            .expect("encode_ack_bytes should produce bytes");
+        let decoded =
+            wacore_binary::marshal::unmarshal_ref(&buf[1..]).expect("encoded ack should decode");
+        assert!(
+            decoded.get_attr("recipient").is_none(),
+            "encode_ack_bytes must not synthesise `recipient` when absent"
         );
     }
 
