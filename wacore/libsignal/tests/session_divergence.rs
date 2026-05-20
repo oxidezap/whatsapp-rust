@@ -1,18 +1,8 @@
-//! Reproduces the prod deadlock where:
-//! * Alice (bot) keeps failing BadMac on inbound Whisper msgs from Bob
-//!   (Android primary), even after Alice has 5+ archived previous sessions.
-//! * Bob never switches to pkmsg in response to Alice's retry receipts;
-//!   his outbound chain stays on the same ratchet pub key (`574b6be3...`
-//!   in the logs) with counter climbing past 940.
-//!
-//! Each `#[test]` here exercises one hypothesis about how Alice's local
-//! session could end up unable to decrypt despite Bob's encryption being
-//! deterministic from a shared root key. The one that fails is the
-//! reproduction — the matching fix has to land in libsignal/session
-//! handling so this file stays green.
-//!
-//! Async I/O is driven through `futures::executor::block_on` to match the
-//! benchmark setup (this crate doesn't depend on tokio).
+//! Hypotheses about how Alice's local session could end up unable to
+//! decrypt despite Bob's encryption being deterministic from a shared
+//! root key. Used to chase a deadlock where failed-MAC attempts kept
+//! advancing the receiver chain past the peer's actual position.
+//! Async I/O uses `futures::executor::block_on` (no tokio in this crate).
 #![allow(clippy::too_many_lines)]
 
 use async_trait::async_trait;
@@ -573,25 +563,10 @@ fn pkmsg_reset_does_not_fix_peer_outbound_if_delivered_to_wrong_store_key() {
     assert_eq!(&plaintext[..], b"new chain active");
 }
 
-/// CRITICAL: a failed-MAC decryption attempt must NOT advance Alice's
-/// receiver-chain state.
-///
-/// In the prod log the candidate sessions for `236395184570386@lid.0`
-/// all show the SAME `574b6be3...` chain at index 846 — six freshly
-/// rebuilt sessions, each with a different `alice_base_key`, none of
-/// which could ever have produced index 846 by successful decrypt
-/// (all their MACs failed). The only way the index reaches 846 across
-/// six independent sessions is if every failed attempt commits the
-/// chain step regardless of MAC verdict. From there the 94-step jump
-/// to counter 940 derives keys against the wrong chain root and the
-/// deadlock is permanent.
-///
-/// This test pins the contract: Bob sends N junk-ciphertext msgs that
-/// claim to be on his ratchet but carry random MACs. Each should fail
-/// without touching Alice's saved chain key for that ratchet. After
-/// the bombardment Alice's chain index for the ratchet must be the
-/// same as it was before — otherwise a real Bob msg later in the same
-/// chain will derive against the wrong starting point.
+/// A failed-MAC decryption attempt must not advance Alice's receiver
+/// chain — otherwise repeated junk ciphertexts walk the chain past
+/// the peer's position and recovery becomes impossible. Bombards with
+/// tampered ciphertexts and asserts the chain index is unchanged.
 #[test]
 fn failed_mac_must_not_advance_receiver_chain() {
     use wacore_libsignal::protocol::SignalMessage;
@@ -660,9 +635,8 @@ fn failed_mac_must_not_advance_receiver_chain() {
         assert_eq!(
             now, index_before,
             "round {tamper_round}: failed-MAC attempt advanced chain \
-             from {index_before} to {now}. Once this happens a real \
-             msg later in the chain will derive keys from the wrong \
-             starting point — that's the prod deadlock."
+             from {index_before} to {now}; next msg will derive keys \
+             against the wrong starting point."
         );
     }
 }

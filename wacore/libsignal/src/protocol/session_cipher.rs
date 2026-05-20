@@ -783,27 +783,48 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     let their_ephemeral = ciphertext.sender_ratchet_key();
     let counter = ciphertext.counter();
 
-    // Transactional decrypt: `get_or_create_chain_key` (DH may add a
-    // new receiver chain + rotate root/sender key) and
-    // `get_or_create_message_key` (saves skipped keys + advances the
-    // receiver chain index past `counter`) both mutate `state`. If we
-    // committed those mutations and then MAC failed we'd leave the
-    // chain ratcheted past a message we never actually decrypted —
-    // the next legit msg derives keys from the wrong starting point
-    // and BadMac becomes permanent. This is the prod deadlock for
-    // `236395184570386@lid.0` (chain pinned at index 846 across six
-    // archived sessions, counter 940+ from peer, none decryptable).
-    //
-    // Work on a scratch copy and only commit if MAC verifies. Clone
-    // cost is bounded — SessionState wraps a `SessionStructure`
-    // protobuf with at most a handful of chains plus their bounded
-    // skipped-key buffers.
-    let mut scratch = state.clone();
+    // Transactional decrypt — roll back chain advance / new-chain DH
+    // step on any failure so the next msg derives from an
+    // uncorrupted ratchet. See `SessionState::decrypt_snapshot`.
+    let snapshot = state.decrypt_snapshot();
+    let result = decrypt_with_pending_state(
+        current_or_previous,
+        state,
+        ciphertext,
+        original_message_type,
+        remote_address,
+        csprng,
+        their_ephemeral,
+        counter,
+    );
+    match result {
+        Ok(ptext) => {
+            drop(snapshot);
+            state.clear_unacknowledged_pre_key_message();
+            Ok(ptext)
+        }
+        Err(e) => {
+            state.restore_decrypt_snapshot(snapshot);
+            Err(e)
+        }
+    }
+}
 
-    let chain_key = get_or_create_chain_key(&mut scratch, their_ephemeral, remote_address, csprng)?;
+#[allow(clippy::too_many_arguments)]
+fn decrypt_with_pending_state<R: Rng + CryptoRng>(
+    current_or_previous: CurrentOrPrevious,
+    state: &mut SessionState,
+    ciphertext: &SignalMessage,
+    original_message_type: CiphertextMessageType,
+    remote_address: &ProtocolAddress,
+    csprng: &mut R,
+    their_ephemeral: &PublicKey,
+    counter: u32,
+) -> Result<Vec<u8>> {
+    let chain_key = get_or_create_chain_key(state, their_ephemeral, remote_address, csprng)?;
 
     let message_key_gen = get_or_create_message_key(
-        &mut scratch,
+        state,
         their_ephemeral,
         remote_address,
         original_message_type,
@@ -814,13 +835,13 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     let message_keys = message_key_gen.generate_keys();
 
     let their_identity_key =
-        scratch
+        state
             .remote_identity_key()?
             .ok_or(SignalProtocolError::InvalidSessionStructure(
                 "cannot decrypt without remote identity key",
             ))?;
 
-    let local_identity_key = scratch.local_identity_key()?;
+    let local_identity_key = state.local_identity_key()?;
 
     let mac_valid = ciphertext.verify_mac(
         &their_identity_key,
@@ -845,11 +866,10 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
             local_id_fingerprint,
             mac_key_fingerprint
         );
-        // Drop scratch — `state` is untouched.
         return Err(SignalProtocolError::BadMac(original_message_type));
     }
 
-    let ptext = DECRYPTION_BUFFER.with(|buffer| {
+    DECRYPTION_BUFFER.with(|buffer| {
         let mut buf_wrapper = buffer.borrow_mut();
         let buf = buf_wrapper.get_buffer();
         match aes_256_cbc_decrypt_into(
@@ -878,14 +898,7 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
                 ))
             }
         }
-    })?;
-
-    // MAC + plaintext both verified — commit the scratch mutations
-    // (chain advance, saved skipped keys, optional DH ratchet step).
-    scratch.clear_unacknowledged_pre_key_message();
-    *state = scratch;
-
-    Ok(ptext)
+    })
 }
 
 fn get_or_create_chain_key<R: Rng + CryptoRng>(

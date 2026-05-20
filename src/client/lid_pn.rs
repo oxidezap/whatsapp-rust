@@ -865,16 +865,12 @@ mod tests {
             .expect("serialize session record")
     }
 
-    /// Reproduces the prod deadlock for `236395184570386@lid.0`:
-    /// the bot has a working PN-namespace session (real Double Ratchet
-    /// state established with the peer's outbound chain) AND a separate
-    /// LID-namespace session that was created later by a fresh
-    /// `process_prekey_bundle` (no link to the peer's actual chain).
-    ///
-    /// Before this scenario was understood, the migration's "both
-    /// exist" branch deleted PN and kept LID — which discards the only
-    /// session that can decrypt the peer's ongoing msgs and pins us
-    /// to the broken one forever. Reg-id tags identify which side wins.
+    /// Both PN and LID slots hold a session for the same peer; the
+    /// PN one is the working Double Ratchet state, the LID one was
+    /// built freshly by `process_prekey_bundle` and has no link to
+    /// the peer's outbound chain. Migration must keep the PN blob —
+    /// silently dropping it leaves the linked device pinned to the
+    /// fresh stub forever. Reg-id tags identify which side won.
     #[tokio::test]
     async fn migration_preserves_working_session_when_both_namespaces_present() {
         use wacore::libsignal::protocol::SessionRecord;

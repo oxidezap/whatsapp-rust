@@ -71,9 +71,47 @@ pub struct SessionState {
     session: SessionStructure,
 }
 
+/// Snapshot of the subset of `SessionState` that the decrypt path
+/// can mutate before MAC verification. Captures only those fields so
+/// the rollback on `BadMac` doesn't have to deep-clone `local_identity`,
+/// `remote_identity`, `alice_base_key`, etc. — none of which change
+/// during decrypt.
+///
+/// Held opaque; restore via `SessionState::restore_decrypt_snapshot`.
+pub struct DecryptSnapshot {
+    receiver_chains: Vec<session_structure::Chain>,
+    root_key: Option<::prost::alloc::vec::Vec<u8>>,
+    previous_counter: Option<u32>,
+    sender_chain: Option<session_structure::Chain>,
+}
+
 impl SessionState {
     pub fn from_session_structure(session: SessionStructure) -> Self {
         Self { session }
+    }
+
+    /// Capture the mutable-during-decrypt fields so MAC failure can
+    /// roll back without cloning the whole `SessionState`. Avoids
+    /// deep-copying the static parts of the protobuf on every decrypt
+    /// (identities, base key, version, registration ids, etc.).
+    pub fn decrypt_snapshot(&self) -> DecryptSnapshot {
+        DecryptSnapshot {
+            receiver_chains: self.session.receiver_chains.clone(),
+            root_key: self.session.root_key.clone(),
+            previous_counter: self.session.previous_counter,
+            sender_chain: self.session.sender_chain.clone(),
+        }
+    }
+
+    /// Restore the fields captured by [`Self::decrypt_snapshot`]. Pair
+    /// with `decrypt_snapshot` on the MAC-fail path; leaves the
+    /// non-mutated fields (identities, alice_base_key, version, etc.)
+    /// untouched since they were never modified.
+    pub fn restore_decrypt_snapshot(&mut self, snap: DecryptSnapshot) {
+        self.session.receiver_chains = snap.receiver_chains;
+        self.session.root_key = snap.root_key;
+        self.session.previous_counter = snap.previous_counter;
+        self.session.sender_chain = snap.sender_chain;
     }
 
     pub fn new(

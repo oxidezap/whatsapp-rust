@@ -2421,16 +2421,16 @@ mod tests {
 
         // Cross-namespace shape: receipt `from` is LID, `recipient` is PN.
         let node = NodeBuilder::new("receipt")
-            .attr("recipient", "5511999999999@s.whatsapp.net")
+            .attr("recipient", "5500000000123@s.whatsapp.net")
             .build();
-        let receipt = make_test_receipt("236395184570386:5@lid");
+        let receipt = make_test_receipt("100000000000456:5@lid");
         let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
 
         let recipient = info
             .recipient
             .as_ref()
             .expect("recipient must be populated from the node attr");
-        assert_eq!(recipient.user, "5511999999999");
+        assert_eq!(recipient.user, "5500000000123");
         assert!(recipient.is_pn(), "recipient namespace must be PN");
         assert_ne!(
             recipient.user, info.chat.user,

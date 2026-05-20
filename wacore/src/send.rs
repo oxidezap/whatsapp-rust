@@ -2941,7 +2941,7 @@ mod tests {
             // Distinct values so a swapped-args regression (e.g. `recipient =
             // to_jid`) fails the assertions below instead of silently passing.
             let to: Jid = "559922223333:5@s.whatsapp.net".parse().unwrap();
-            let recipient: Jid = "236395184570386@lid".parse().unwrap();
+            let recipient: Jid = "100000000000456@lid".parse().unwrap();
             let requester: Jid = jid.to_string().parse().unwrap();
             let n = prepare_dm_retry_stanza(
                 &mut ss,
@@ -3208,21 +3208,14 @@ mod tests {
             assert!(n.attrs().optional_string("edit").is_none());
         }
 
-        // --- Peer stanza (PDO/AppStateSync) shape -------------------------
-        // The "finally worked" fix: a `<message category="peer">` carrying
-        // a pkmsg must also include `<meta appdata="default"/>` and a
-        // `<device-identity>` element. Without those the primary phone
-        // ack's the stanza but its Signal layer rejects the pkmsg, so its
-        // outbound chain stays on the diverged ratchet (prod's
-        // `574b6be3…`) and the linked device's inbound side never
-        // recovers — exactly the deadlock this PR was originally
-        // chasing. Whatsmeow's `preparePeerMessageNode` builds the same
-        // three-child layout.
+        // Peer pkmsg layout: `[<meta appdata="default"/>, <enc>, <device-identity>]`.
+        // Without `<device-identity>` the phone XMPP-acks but its Signal
+        // layer skips session promotion. Mirrors whatsmeow's
+        // `preparePeerMessageNode`.
 
         fn pkmsg_account_proto() -> wa::AdvSignedDeviceIdentity {
-            // Realistic-shaped placeholder for the linked device's
-            // identity proof — content opaque to the assertions; we only
-            // verify that the element carries non-empty bytes.
+            // Opaque placeholder bytes — the assertions only check that
+            // the element carries non-empty content.
             wa::AdvSignedDeviceIdentity {
                 details: Some(vec![0u8; 32]),
                 account_signature_key: Some(vec![0u8; 32]),
