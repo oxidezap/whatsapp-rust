@@ -2406,6 +2406,48 @@ mod tests {
         assert!(info.requester.is_lid());
     }
 
+    /// `info.recipient` must come from the receipt's `recipient` attribute,
+    /// not derived from `info.chat`. Pre-fix, the DM resend used
+    /// `info.chat.clone()` for the stanza's `recipient` — fine on the primary
+    /// namespace but wrong whenever `take_recent_message` hit `alt_chat` (the
+    /// original was sent under PN while the receipt arrived under LID, or
+    /// vice-versa). WA Web's `WAWebHandleRetryRequest` forwards the receipt
+    /// attr verbatim (`f && (k.recipient = f)`), so the resend's `recipient`
+    /// matches the original outbound's namespace regardless of how the
+    /// receipt's `from` was addressed.
+    #[test]
+    fn resolve_retry_chat_info_forwards_recipient_attribute_verbatim() {
+        use wacore_binary::builder::NodeBuilder;
+
+        // Cross-namespace shape: receipt `from` is LID, `recipient` is PN.
+        let node = NodeBuilder::new("receipt")
+            .attr("recipient", "5511999999999@s.whatsapp.net")
+            .build();
+        let receipt = make_test_receipt("236395184570386:5@lid");
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        let recipient = info
+            .recipient
+            .as_ref()
+            .expect("recipient must be populated from the node attr");
+        assert_eq!(recipient.user, "5511999999999");
+        assert!(recipient.is_pn(), "recipient namespace must be PN");
+        assert_ne!(
+            recipient.user, info.chat.user,
+            "recipient must come from the node attr, not info.chat"
+        );
+
+        // Inverse: absent attr → None (drops `recipient` from the resend
+        // stanza, mirroring WA Web's `f && (k.recipient = f)`).
+        let node_no_recipient = NodeBuilder::new("receipt").build();
+        let info_no_recipient =
+            resolve_retry_chat_info(&receipt, &node_no_recipient.as_node_ref(), None, None);
+        assert!(
+            info_no_recipient.recipient.is_none(),
+            "missing `recipient` attr must propagate as None"
+        );
+    }
+
     #[test]
     fn resolve_retry_chat_info_dm_bare() {
         use wacore_binary::builder::NodeBuilder;
