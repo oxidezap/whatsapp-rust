@@ -748,8 +748,12 @@ impl Client {
         // the SignalProtocolStoreAdapter's per-session locks (prevents ratchet counter races).
         let signal_address = sender_encryption_jid.to_protocol_address();
 
+        // `session_guard` is held across the entire batch but dropped around
+        // calls into `try_pn_to_lid_migration_decrypt` because that function's
+        // migration loop re-enters this same mutex (non-reentrant).
         let session_mutex = self.session_lock_for(signal_address.as_str()).await;
-        let _session_guard = session_mutex.lock().await;
+        let mut session_guard: Option<async_lock::MutexGuardArc<()>> =
+            Some(session_mutex.lock_arc().await);
 
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -990,6 +994,8 @@ impl Client {
                                             enc_type,
                                             padding_version,
                                             info,
+                                            &session_mutex,
+                                            &mut session_guard,
                                         )
                                         .await
                                     {
@@ -1056,6 +1062,8 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 info,
+                                &session_mutex,
+                                &mut session_guard,
                             )
                             .await
                         {
@@ -1075,13 +1083,29 @@ impl Client {
                         e,
                         SignalProtocolError::BadMac(_) | SignalProtocolError::InvalidMessage(_, _)
                     ) {
+                        // whatsmeow migrates PN sessions before decrypt; a fresh
+                        // LID record can otherwise shadow the sender's PN ratchet.
+                        if self
+                            .try_pn_to_lid_migration_decrypt(
+                                sender_encryption_jid,
+                                &signal_address,
+                                &parsed_message,
+                                &mut adapter,
+                                &mut rng,
+                                enc_type,
+                                padding_version,
+                                info,
+                                &session_mutex,
+                                &mut session_guard,
+                            )
+                            .await
+                        {
+                            any_success = true;
+                            continue;
+                        }
+
                         // WAWebMsgProcessingDecryptionHandler classifies both as
-                        // SignalRetryable -> sendRetryReceipt only, no session ops.
-                        // When the sender resends as pkmsg, process_prekey_bundle
-                        // calls promote_state on the existing record, archiving
-                        // current into previous_sessions[0]. That archived state
-                        // is the only fallback for in-flight messages still on
-                        // the old ratchet (see decrypt_message_with_record).
+                        // SignalRetryable -> sendRetryReceipt only, with no delete.
                         let (reason, label) = if matches!(e, SignalProtocolError::BadMac(_)) {
                             (RetryReason::BadMac, "BadMac")
                         } else {
@@ -1114,6 +1138,8 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 info,
+                                &session_mutex,
+                                &mut session_guard,
                             )
                             .await
                         {
@@ -1398,6 +1424,12 @@ impl Client {
 
     /// Attempt PN→LID session migration and retry decryption.
     /// Returns true if decryption succeeded after migration.
+    ///
+    /// Manages the per-address session lock around the migration loop:
+    /// drops the caller's guard (migration re-enters that mutex and
+    /// async_lock is non-reentrant), then reacquires it for the retry
+    /// decrypt and replaces the caller's `session_guard` on the way out
+    /// so the next payload in the batch stays serialized.
     #[allow(clippy::too_many_arguments)]
     async fn try_pn_to_lid_migration_decrypt(
         self: &Arc<Self>,
@@ -1409,6 +1441,8 @@ impl Client {
         enc_type: &str,
         padding_version: u8,
         info: &Arc<MessageInfo>,
+        session_mutex: &Arc<async_lock::Mutex<()>>,
+        session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
     ) -> bool {
         use wacore::libsignal::protocol::{UsePQRatchet, message_decrypt};
 
@@ -1420,10 +1454,14 @@ impl Client {
             return false;
         };
 
+        // Release the address lock so the migration loop can acquire it for
+        // the matching device without re-entering.
+        *session_guard = None;
         self.migrate_signal_sessions_on_lid_discovery(&pn, &sender_jid.user)
             .await;
-
-        // Migration now goes through signal_cache, so no manual reload needed
+        // Re-acquire for the retry decrypt and hand the guard back to the
+        // caller for subsequent payloads in the batch.
+        *session_guard = Some(session_mutex.lock_arc().await);
 
         match message_decrypt(
             parsed_message,
@@ -2204,7 +2242,7 @@ mod tests {
         IdentityKeyStore as SigIdentityKeyStore, SignalProtocolError,
     };
 
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct MemSessionStore(HashMap<ProtocolAddress, SessionRecord>);
 
     #[async_trait]
@@ -2228,6 +2266,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct MemIdentityStore {
         kp: IdentityKeyPair,
         reg_id: u32,
@@ -2270,6 +2309,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct AlicePeer {
         jid: Jid,
         address: ProtocolAddress,
@@ -2437,6 +2477,74 @@ mod tests {
             .await
             .expect("has_session");
         (success, dups, dispatched, still)
+    }
+
+    #[tokio::test]
+    async fn test_badmac_migrates_pn_session_when_lid_shadow_exists() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+
+        let client = crate::test_utils::create_test_client_with_name("badmac_lid_shadow").await;
+        let alice_pn: Jid = "15550001001@s.whatsapp.net".parse().expect("alice pn");
+        let alice_lid: Jid = "100000000000002@lid".parse().expect("alice lid");
+        let entry = LidPnEntry::new(
+            alice_lid.user.to_string(),
+            alice_pn.user.to_string(),
+            LearningSource::PeerLidMessage,
+        );
+        client.lid_pn_cache.add(&entry).await;
+
+        let (bundle_v1, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let alice_pn_str = alice_pn.to_string();
+        let mut alice_old = AlicePeer::new(&alice_pn_str).await;
+        alice_old.install_bob_session(&bob_addr, &bundle_v1).await;
+        let pkmsg_v1 = alice_old.encrypt(&bob_addr, b"pn establish").await;
+        let (pn_success, _, _, pn_still) =
+            submit_and_check_session(&client, &alice_pn, &pkmsg_v1).await;
+        assert!(pn_success, "PN-keyed session should establish");
+        assert!(
+            pn_still,
+            "PN-keyed session should be present before migration"
+        );
+
+        if let Some(record) = alice_old.sessions.0.get_mut(&bob_addr)
+            && let Some(state) = record.session_state_mut()
+        {
+            state.clear_unacknowledged_pre_key_message();
+        }
+
+        let mut alice_fresh = alice_old.clone();
+        alice_fresh.jid = alice_lid.clone();
+        alice_fresh.address = alice_lid.to_protocol_address();
+        alice_fresh.sessions = MemSessionStore::default();
+
+        let (bundle_v2, _) = bobs_prekey_bundle(&client).await;
+        alice_fresh.install_bob_session(&bob_addr, &bundle_v2).await;
+        let pkmsg_v2 = alice_fresh.encrypt(&bob_addr, b"lid shadow").await;
+        let (lid_success, _, _, lid_still) =
+            submit_and_check_session(&client, &alice_lid, &pkmsg_v2).await;
+        assert!(lid_success, "LID-keyed shadow session should establish");
+        assert!(lid_still, "LID-keyed shadow session should exist");
+
+        let old_pn_msg = alice_old.encrypt(&bob_addr, b"old pn ratchet").await;
+        assert!(matches!(old_pn_msg, CiphertextMessage::SignalMessage(_)));
+        let (success, duplicates, dispatched, lid_after) =
+            submit_and_check_session(&client, &alice_lid, &old_pn_msg).await;
+        assert!(success, "BadMac path should recover by migrating PN to LID");
+        assert!(!duplicates, "message should decrypt, not dedupe");
+        assert!(
+            !dispatched,
+            "migration recovery must not emit retry failure"
+        );
+        assert!(lid_after, "migrated LID session should remain");
+
+        let backend = client.persistence_manager.backend();
+        let pn_after = client
+            .signal_cache
+            .has_session(&alice_pn.to_protocol_address(), &*backend)
+            .await
+            .expect("has_session");
+        assert!(!pn_after, "PN session should be consumed by migration");
     }
 
     /// Smoking-gun regression: a `BadMac` on the inbound path must NOT delete

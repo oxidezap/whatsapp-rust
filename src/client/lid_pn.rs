@@ -19,6 +19,12 @@ use wacore_binary::Jid;
 use super::Client;
 use crate::lid_pn_cache::{LearningSource, LidPnEntry};
 
+/// Exclusive upper bound for the device-id range we iterate when migrating
+/// PN→LID. WhatsApp's protocol caps companion devices well below this, but
+/// the conservative bound covers paired devices learned via offline syncs
+/// without unbounded looping.
+const MIGRATION_DEVICE_RANGE: u16 = 100;
+
 /// Backend `LidPnMappingEntry` → in-memory `LidPnEntry`.
 fn mapping_to_entry(m: LidPnMappingEntry) -> LidPnEntry {
     LidPnEntry::with_timestamp(
@@ -136,10 +142,21 @@ impl Client {
         if mappings.is_empty() {
             return;
         }
+        // Dedup by phone_number, last lid wins. Otherwise the same phone
+        // appearing twice in one batch yields is_new=true for the first
+        // (lid_A) and is_new=false for the second (lid_B), so signal
+        // migration runs for lid_A while the persisted mapping ends up
+        // pointing at lid_B — migration done against the wrong LID.
         let cap = mappings.len();
-        let mut entries: Vec<LidPnEntry> = Vec::with_capacity(cap);
-        let mut is_new_flags: Vec<bool> = Vec::with_capacity(cap);
+        let mut deduped: std::collections::HashMap<String, String> =
+            std::collections::HashMap::with_capacity(cap);
         for (lid, phone_number) in mappings {
+            deduped.insert(phone_number, lid);
+        }
+
+        let mut entries: Vec<LidPnEntry> = Vec::with_capacity(deduped.len());
+        let mut is_new_flags: Vec<bool> = Vec::with_capacity(deduped.len());
+        for (phone_number, lid) in deduped {
             let is_new = self
                 .lid_pn_cache
                 .get_current_lid(&phone_number)
@@ -348,71 +365,98 @@ impl Client {
     /// All reads/writes go through `signal_cache` to avoid reading stale data
     /// from the backend when the cache has unflushed mutations (e.g., after
     /// SKDM encryption ratcheted the session).
+    /// Read-modify-write of PN and LID Signal session/identity slots must
+    /// hold the same per-address locks that encrypt/decrypt take, otherwise
+    /// concurrent message_encrypt on LID can clobber the migrated session.
+    ///
+    /// Callers must NOT hold `session_lock_for(<lid_addr>)` for any device
+    /// in [0, 100) — `async_lock::Mutex` is not reentrant. The decrypt path
+    /// drops its address lock around the call (`try_pn_to_lid_migration_decrypt`).
     pub(crate) async fn migrate_signal_sessions_on_lid_discovery(&self, pn: &str, lid: &str) {
         use log::{info, warn};
         use wacore::types::jid::JidExt;
 
         let backend = self.persistence_manager.backend();
 
-        for device_id in 0..=99u16 {
-            let pn_jid = Jid::pn_device(pn.to_string(), device_id);
-            let lid_jid = Jid::lid_device(lid.to_string(), device_id);
+        for device_id in 0..MIGRATION_DEVICE_RANGE {
+            // `&str` → `CompactString` is inline for ≤24-byte user parts
+            // (all PN/LID identifiers fit), so no String intermediate.
+            let pn_jid = Jid::pn_device(pn, device_id);
+            let lid_jid = Jid::lid_device(lid, device_id);
 
             let pn_proto = pn_jid.to_protocol_address();
             let lid_proto = lid_jid.to_protocol_address();
 
-            // Migrate session: take from cache (authoritative), write to cache
+            // Acquire both per-address locks in stable lexicographic order to
+            // avoid deadlock against concurrent paths that legitimately hold
+            // only one side. (Callers never hold either lock.)
+            let pn_lock = self.session_lock_for(pn_proto.as_str()).await;
+            let lid_lock = self.session_lock_for(lid_proto.as_str()).await;
+            let (_first_guard, _second_guard) = if pn_proto.as_str() <= lid_proto.as_str() {
+                let pn_g = pn_lock.lock_arc().await;
+                let lid_g = lid_lock.lock_arc().await;
+                (pn_g, lid_g)
+            } else {
+                let lid_g = lid_lock.lock_arc().await;
+                let pn_g = pn_lock.lock_arc().await;
+                (lid_g, pn_g)
+            };
+
+            // PN wins on conflict — mirrors whatsmeow's `MigratePNToLID`
+            // (`ON CONFLICT DO UPDATE SET session=excluded.session`).
             if let Ok(Some(session)) = self
                 .signal_cache
                 .get_session(&pn_proto, backend.as_ref())
                 .await
             {
-                match self
-                    .signal_cache
-                    .has_session(&lid_proto, backend.as_ref())
-                    .await
-                {
-                    Ok(true) => {
-                        self.signal_cache.delete_session(&pn_proto).await;
-                        info!("Deleted stale PN session {} (LID exists)", pn_proto);
-                    }
-                    Ok(false) => {
-                        self.signal_cache.put_session(&lid_proto, session).await;
-                        self.signal_cache.delete_session(&pn_proto).await;
-                        info!("Migrated session {} -> {}", pn_proto, lid_proto);
-                    }
-                    Err(e) => {
-                        // Restore the taken PN session to avoid losing it
-                        self.signal_cache.put_session(&pn_proto, session).await;
-                        log::warn!(
-                            "Skipping session migration {} -> {}: {e}",
-                            pn_proto,
-                            lid_proto
-                        );
-                    }
-                }
+                self.signal_cache.put_session(&lid_proto, session).await;
+                self.signal_cache.delete_session(&pn_proto).await;
+                info!(
+                    "Migrated session {} -> {} (PN wins on conflict)",
+                    pn_proto, lid_proto
+                );
             }
 
-            // Migrate identity: same cache-first pattern
+            // Identity uses LID-wins (the inverse of session). For the same
+            // physical device the identity_key is stable across PN/LID, so
+            // either policy yields the same bytes in the steady state. The
+            // asymmetry only matters if the peer re-paired between our PN
+            // and LID identity captures — in that case the fresher LID
+            // identity is on the namespace we're migrating *to*, and PN's
+            // stale value should not clobber it.
+            //
+            // Match the LID lookup result explicitly so a transient read
+            // failure isn't collapsed with `Ok(None)` and used as license
+            // to overwrite a potentially-valid LID identity.
             if let Ok(Some(identity_data)) = self
                 .signal_cache
                 .get_identity(&pn_proto, backend.as_ref())
                 .await
             {
-                if self
+                match self
                     .signal_cache
                     .get_identity(&lid_proto, backend.as_ref())
                     .await
-                    .ok()
-                    .flatten()
-                    .is_none()
                 {
-                    self.signal_cache
-                        .put_identity(&lid_proto, &identity_data)
-                        .await;
-                    info!("Migrated identity {} -> {}", pn_proto, lid_proto);
+                    Ok(None) => {
+                        self.signal_cache
+                            .put_identity(&lid_proto, &identity_data)
+                            .await;
+                        self.signal_cache.delete_identity(&pn_proto).await;
+                        info!("Migrated identity {} -> {}", pn_proto, lid_proto);
+                    }
+                    Ok(Some(_)) => {
+                        // LID-wins: existing LID identity preserved; drop the PN copy.
+                        self.signal_cache.delete_identity(&pn_proto).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Skipping identity migration {} -> {}: \
+                             failed to read LID identity: {e:?}",
+                            pn_proto, lid_proto
+                        );
+                    }
                 }
-                self.signal_cache.delete_identity(&pn_proto).await;
             }
         }
 
@@ -844,6 +888,247 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "offline batch must not persist to DB"
+        );
+    }
+
+    /// Duplicate phone_numbers in a single batch must collapse to one
+    /// (lid, phone) → migration entry, and that entry must use the FINAL
+    /// lid for the phone. Otherwise migration runs against the stale lid
+    /// while the persisted mapping resolves to the fresh one.
+    #[tokio::test]
+    async fn test_learn_lid_pn_mappings_batch_dedups_duplicate_phones() {
+        use wacore_binary::Jid;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5511900000007";
+        let lid_stale = "200000000007777";
+        let lid_fresh = "200000000007999";
+
+        client
+            .learn_lid_pn_mappings_batch(
+                vec![
+                    (lid_stale.to_string(), pn.to_string()),
+                    (lid_fresh.to_string(), pn.to_string()),
+                ],
+                LearningSource::Other,
+                true, // offline → no spawned persist, no migration races
+            )
+            .await;
+
+        // Final cache state must reflect the LAST mapping for this phone.
+        let resolved = client.resolve_encryption_jid(&Jid::pn(pn)).await;
+        assert_eq!(
+            resolved.user, lid_fresh,
+            "dedup must keep the last lid for a repeated phone_number"
+        );
+    }
+
+    /// Produce a SessionRecord blob with a distinctive remote_registration_id
+    /// so we can tell which side of a migration won by parsing the surviving
+    /// session, not by raw-byte comparison.
+    fn tagged_session_blob(remote_regid: u32) -> Vec<u8> {
+        use wacore::libsignal::protocol::{SessionRecord, SessionState};
+        use waproto::whatsapp::SessionStructure;
+
+        let state = SessionState::from_session_structure(SessionStructure {
+            session_version: Some(3),
+            local_identity_public: None,
+            remote_identity_public: None,
+            root_key: None,
+            previous_counter: Some(0),
+            sender_chain: None,
+            receiver_chains: vec![],
+            pending_pre_key: None,
+            remote_registration_id: Some(remote_regid),
+            local_registration_id: Some(0),
+            alice_base_key: Some(vec![]),
+            needs_refresh: None,
+            pending_key_exchange: None,
+        });
+        SessionRecord::new(state)
+            .serialize()
+            .expect("serialize session record")
+    }
+
+    /// Both PN and LID slots hold a session for the same peer; the
+    /// PN one is the working Double Ratchet state, the LID one was
+    /// built freshly by `process_prekey_bundle` and has no link to
+    /// the peer's outbound chain. Migration must keep the PN blob —
+    /// silently dropping it leaves the linked device pinned to the
+    /// fresh stub forever. Reg-id tags identify which side won.
+    #[tokio::test]
+    async fn migration_preserves_working_session_when_both_namespaces_present() {
+        use wacore::libsignal::protocol::SessionRecord;
+        use wacore::types::jid::JidExt as _;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000000000";
+        let lid = "111111111111111";
+
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+
+        let pn_addr = Jid::pn_device(pn.to_string(), 0).to_protocol_address();
+        let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
+
+        // The working session — what Bob's outbound chain is actually
+        // ratcheted against — lives in the PN slot. Tag it with a
+        // distinctive registration id so post-migration we can prove
+        // the surviving session is the SAME blob.
+        const WORKING_REGID: u32 = 0xDEAD_BEEF;
+        const FRESH_REGID: u32 = 0x0BAD_F00D;
+
+        let backend = client.persistence_manager.backend();
+
+        // Seed both slots through signal_cache so the cache holds Present
+        // entries when migrate runs. Raw backend writes alone leave the
+        // cache cold and migrate's `get_session` then races with whatever
+        // populated Absent markers for unknown peers during test bring-up.
+        client
+            .signal_cache
+            .put_session(
+                &pn_addr,
+                SessionRecord::deserialize(&tagged_session_blob(WORKING_REGID))
+                    .expect("seed PN blob deserializes"),
+            )
+            .await;
+        client
+            .signal_cache
+            .put_session(
+                &lid_addr,
+                SessionRecord::deserialize(&tagged_session_blob(FRESH_REGID))
+                    .expect("seed LID blob deserializes"),
+            )
+            .await;
+        client.signal_cache.flush(backend.as_ref()).await.unwrap();
+
+        client
+            .migrate_signal_sessions_on_lid_discovery(pn, lid)
+            .await;
+
+        // PN must be drained — future loads route to LID once the
+        // mapping is known.
+        assert!(
+            backend
+                .get_session(pn_addr.as_str())
+                .await
+                .unwrap()
+                .is_none(),
+            "PN address must be cleared post-migration"
+        );
+
+        let surviving_bytes = backend
+            .get_session(lid_addr.as_str())
+            .await
+            .unwrap()
+            .expect("LID slot must have a session after migration");
+        let record = SessionRecord::deserialize(&surviving_bytes)
+            .expect("surviving session blob must parse");
+        let surviving_regid = record
+            .remote_registration_id()
+            .expect("surviving session must expose its remote reg id");
+
+        assert_eq!(
+            surviving_regid, WORKING_REGID,
+            "LID slot held the FRESH (regid={:#x}) blob — that's the prod \
+             deadlock: the working PN session ({:#x}) got discarded by the \
+             'both exist' branch, leaving us pinned to a session that has no \
+             link to the peer's outbound chain.",
+            surviving_regid, WORKING_REGID
+        );
+    }
+
+    /// Migration must hold the same per-address session locks that
+    /// encrypt/decrypt take. Otherwise a concurrent `message_encrypt`
+    /// on the LID slot can clobber the just-migrated session (or read
+    /// mid-update state). Externally hold the LID lock, kick off
+    /// migration, and assert it blocks until the lock is released.
+    #[tokio::test]
+    async fn migration_blocks_on_per_address_session_lock() {
+        use std::time::Duration;
+        use wacore::types::jid::JidExt as _;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000000000";
+        let lid = "111111111111111";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+
+        let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
+        let lid_lock = client.session_lock_for(lid_addr.as_str()).await;
+        let held = lid_lock.lock().await;
+
+        let migrate_client = client.clone();
+        let pn_s = pn.to_string();
+        let lid_s = lid.to_string();
+        let mut handle = tokio::spawn(async move {
+            migrate_client
+                .migrate_signal_sessions_on_lid_discovery(&pn_s, &lid_s)
+                .await;
+        });
+
+        let blocked = tokio::time::timeout(Duration::from_millis(200), &mut handle).await;
+        assert!(
+            blocked.is_err(),
+            "migration must block while another holder owns the LID address \
+             session lock — otherwise concurrent encrypt/decrypt races"
+        );
+
+        // Release the lock; migration should now complete so the spawned task
+        // doesn't outlive the test (and contaminate parallel test state).
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("migration must complete once the lock is released")
+            .expect("migration task must not panic");
+    }
+
+    /// Regression guard for the decrypt-path deadlock: `decrypt_message`
+    /// holds `session_lock_for(<lid_addr>)` while invoking
+    /// `try_pn_to_lid_migration_decrypt`, whose migration loop re-enters
+    /// that same mutex. The fix is to drop the guard around the call.
+    /// This test exercises the exact drop → migrate → reacquire dance the
+    /// production code does, asserting it never deadlocks.
+    #[tokio::test]
+    async fn migration_lock_dance_completes_when_caller_drops_guard() {
+        use std::time::Duration;
+        use wacore::types::jid::JidExt as _;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000000000";
+        let lid = "111111111111111";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+
+        let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
+        let session_mutex = client.session_lock_for(lid_addr.as_str()).await;
+        let mut session_guard: Option<async_lock::MutexGuardArc<()>> =
+            Some(session_mutex.lock_arc().await);
+
+        // Exactly mirrors try_pn_to_lid_migration_decrypt: drop, migrate,
+        // reacquire. If the migration's per-device lock loop ever re-enters
+        // a held guard, this hangs and the timeout fires.
+        let dance = async {
+            session_guard = None;
+            client
+                .migrate_signal_sessions_on_lid_discovery(pn, lid)
+                .await;
+            session_guard = Some(session_mutex.lock_arc().await);
+        };
+        tokio::time::timeout(Duration::from_secs(5), dance)
+            .await
+            .expect("drop → migrate → reacquire must not deadlock");
+
+        assert!(
+            session_guard.is_some(),
+            "guard must be re-held after the dance so the next batch payload \
+             stays serialized on the address lock"
         );
     }
 }

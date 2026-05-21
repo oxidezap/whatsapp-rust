@@ -313,6 +313,9 @@ fn establish_session(sender: &mut User, receiver: &User) {
 }
 
 /// Establish bidirectional session by sending one message in each direction.
+/// The return trip from b→a is required to clear a's `pending_pre_key`,
+/// otherwise a's next outbound is still pkmsg and `prepare_peer_stanza`
+/// without an `AdvSignedDeviceIdentity` would fail the pre-flight check.
 fn establish_bidirectional(a: &mut User, b: &mut User) {
     establish_session(a, b);
     futures::executor::block_on(async {
@@ -330,6 +333,26 @@ fn establish_bidirectional(a: &mut User, b: &mut User) {
             &mut b.identity,
             &mut b.prekeys,
             &b.signed_prekeys,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .unwrap();
+
+        // b→a round trip clears a's pending_pre_key so subsequent sends from
+        // a are plain `msg`, not pkmsg.
+        let ct_back = message_encrypt(b"ack", &a.address, &mut b.sessions, &mut b.identity)
+            .await
+            .unwrap();
+        let ct_back_msg =
+            CiphertextMessage::SignalMessage(SignalMessage::try_from(ct_back.serialize()).unwrap());
+        message_decrypt(
+            &ct_back_msg,
+            &b.address,
+            &mut a.sessions,
+            &mut a.identity,
+            &mut a.prekeys,
+            &a.signed_prekeys,
             &mut rng,
             UsePQRatchet::No,
         )
@@ -670,6 +693,7 @@ fn bench_dm_send(mut d: DmSendData) {
         &signal_addr,
         &d.msg,
         "b-001".into(),
+        None,
     ))
     .unwrap();
     black_box(marshal(&node).unwrap());

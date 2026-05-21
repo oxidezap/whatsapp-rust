@@ -259,6 +259,14 @@ impl std::ops::Add<std::time::Duration> for Instant {
     }
 }
 
+impl std::ops::Sub<std::time::Duration> for Instant {
+    type Output = Instant;
+    fn sub(self, rhs: std::time::Duration) -> Self {
+        let rhs_nanos: u64 = rhs.as_nanos().min(u64::MAX as u128) as u64;
+        Self(self.0.saturating_sub(rhs_nanos))
+    }
+}
+
 impl std::ops::Sub<Instant> for Instant {
     type Output = std::time::Duration;
     fn sub(self, rhs: Instant) -> std::time::Duration {

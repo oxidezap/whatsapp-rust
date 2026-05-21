@@ -1014,6 +1014,7 @@ impl Client {
 
             let mut store_adapter = self.signal_adapter().await;
 
+            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
             wacore::send::prepare_peer_stanza(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
@@ -1021,6 +1022,7 @@ impl Client {
                 &signal_addr,
                 message,
                 request_id,
+                device_snapshot.account.as_ref(),
             )
             .await?
         } else if to.is_group() {

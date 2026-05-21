@@ -10,7 +10,7 @@ use crate::reporting_token::{
 use crate::runtime::{AbortHandle, Runtime};
 use crate::types::jid::JidExt;
 use crate::types::jid::make_sender_key_name;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use prost::Message as ProtoMessage;
 use rand::{CryptoRng, Rng};
@@ -958,6 +958,48 @@ pub async fn prepare_dm_stanza<
     })
 }
 
+/// Returns true if `message_encrypt` on `signal_address` would produce
+/// a pkmsg (no session yet, or session with un-acked pre-key still
+/// pending). Used before `message_encrypt` to fail-fast when `account`
+/// is None — pkmsg without `<device-identity>` reproduces the linked
+/// device deadlock.
+///
+/// `SessionStore::load_session` is take-semantics in production
+/// (`SessionAdapter` → `SignalStoreCache::get_session` marks the slot
+/// `CheckedOut`); the loaded record is put back via `store_session`
+/// so the subsequent `message_encrypt` finds the slot Present.
+async fn pkmsg_would_be_emitted<S>(
+    session_store: &mut S,
+    signal_address: &ProtocolAddress,
+) -> Result<bool>
+where
+    S: crate::libsignal::protocol::SessionStore,
+{
+    let loaded = session_store.load_session(signal_address).await?;
+    // Conservative read: treat any failure to interrogate the session as
+    // "would be pkmsg" so the caller bails. Silently treating Err as false
+    // would let message_encrypt run with a corrupt session and potentially
+    // burn the sender chain.
+    let needs_pkmsg = match &loaded {
+        None => true,
+        Some(record) => match record.session_state() {
+            None => true,
+            Some(state) => match state.unacknowledged_pre_key_message_items() {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(_) => true,
+            },
+        },
+    };
+    if let Some(record) = loaded {
+        session_store
+            .store_session(signal_address, record)
+            .await
+            .map_err(|e| anyhow!("restoring checked-out session after pre-flight: {e}"))?;
+    }
+    Ok(needs_pkmsg)
+}
+
 pub async fn prepare_peer_stanza<S, I>(
     session_store: &mut S,
     identity_store: &mut I,
@@ -965,6 +1007,7 @@ pub async fn prepare_peer_stanza<S, I>(
     signal_address: &ProtocolAddress,
     message: &wa::Message,
     request_id: String,
+    account: Option<&wa::AdvSignedDeviceIdentity>,
 ) -> Result<Node>
 where
     S: crate::libsignal::protocol::SessionStore,
@@ -972,10 +1015,17 @@ where
 {
     let plaintext = MessageUtils::encode_and_pad(message);
 
+    if account.is_none() && pkmsg_would_be_emitted(session_store, signal_address).await? {
+        bail!(
+            "peer pkmsg requires <device-identity> (account is None); \
+             refusing before message_encrypt to avoid advancing the sender chain"
+        );
+    }
+
     let encrypted_message =
         message_encrypt(&plaintext, signal_address, session_store, identity_store).await?;
 
-    let (enc_type, _, serialized_bytes) = extract_ciphertext(encrypted_message)
+    let (enc_type, is_prekey, serialized_bytes) = extract_ciphertext(encrypted_message)
         .ok_or_else(|| anyhow!("Unexpected peer encryption message type"))?;
 
     let enc_node = NodeBuilder::new("enc")
@@ -983,25 +1033,45 @@ where
         .bytes(serialized_bytes)
         .build();
 
+    let meta_node = NodeBuilder::new("meta").attr("appdata", "default").build();
+
+    let mut children = vec![meta_node, enc_node];
+    if is_prekey {
+        // Defense in depth: pre-flight should have caught this, but a corrupt
+        // session that triggers a fresh pkmsg mid-call would slip past.
+        let account = account.ok_or_else(|| {
+            anyhow!("peer pkmsg without <device-identity> (unreachable via pre-flight)")
+        })?;
+        children.push(
+            NodeBuilder::new("device-identity")
+                .bytes(account.encode_to_vec())
+                .build(),
+        );
+    }
+
     let stanza = NodeBuilder::new("message")
         .attr("to", transport_jid)
         .attr("id", request_id)
         .attr("type", stanza::MSG_TYPE_TEXT)
         .attr("category", "peer")
-        .children([enc_node])
+        .children(children)
         .build();
 
     Ok(stanza)
 }
 
-/// Pairwise-encrypted retry stanza for a single DM recipient device.
-/// WA Web retries target only the failing device, not a full DM fanout.
+/// Mirrors `WAWebSendMsgCreateDeviceStanza.createUserDeviceMsgStanza`.
+/// `<enc>` goes directly under `<message>`; the fanout wrapper
+/// (`<participants><to>`) is server-rejected with 479 on retries.
+/// `recipient_jid` is propagated verbatim from the retry receipt
+/// (`f && (k.recipient = f)` in `WAWebHandleRetryRequest`); pass `None`
+/// when the incoming receipt didn't carry it.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_dm_retry_stanza<S, I>(
     session_store: &mut S,
     identity_store: &mut I,
     to_jid: Jid,
-    requester_jid: Jid,
+    recipient_jid: Option<Jid>,
     encryption_jid: Jid,
     message: &wa::Message,
     message_id: String,
@@ -1016,12 +1086,20 @@ where
     let plaintext = MessageUtils::encode_and_pad(message);
     let signal_address = encryption_jid.to_protocol_address();
 
+    if account.is_none() && pkmsg_would_be_emitted(session_store, &signal_address).await? {
+        bail!(
+            "DM retry pkmsg requires <device-identity> (account is None); \
+             refusing before message_encrypt to avoid advancing the sender chain"
+        );
+    }
+
     let encrypted =
         message_encrypt(&plaintext, &signal_address, session_store, identity_store).await?;
 
     let (enc_type, is_prekey, serialized) = extract_ciphertext(encrypted)
         .ok_or_else(|| anyhow!("Unexpected encryption message type for DM retry"))?;
 
+    let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
     let mut enc_builder = NodeBuilder::new("enc")
         .attr("v", stanza::ENC_VERSION)
         .attr("type", enc_type)
@@ -1029,20 +1107,18 @@ where
     if let Some(mt) = media_type_from_message(message) {
         enc_builder = enc_builder.attr("mediatype", mt);
     }
+    if hide_decrypt_fail {
+        enc_builder = enc_builder.attr("decrypt-fail", "hide");
+    }
     let enc_node = enc_builder.bytes(serialized).build();
 
-    let participant_node = NodeBuilder::new("to")
-        .attr("jid", requester_jid)
-        .children([enc_node])
-        .build();
-
-    let mut children = vec![
-        NodeBuilder::new("participants")
-            .children([participant_node])
-            .build(),
-    ];
-
-    if is_prekey && let Some(acc) = account {
+    let mut children = vec![enc_node];
+    if is_prekey {
+        // Defense in depth: pre-flight should have caught this, but a corrupt
+        // session that triggers a fresh pkmsg mid-call would slip past.
+        let acc = account.ok_or_else(|| {
+            anyhow!("DM retry pkmsg without <device-identity> (unreachable via pre-flight)")
+        })?;
         children.push(
             NodeBuilder::new("device-identity")
                 .bytes(acc.encode_to_vec())
@@ -1054,6 +1130,9 @@ where
         .attr("to", to_jid)
         .attr("id", message_id)
         .attr("type", stanza_type_from_message(message));
+    if let Some(r) = recipient_jid {
+        stanza_builder = stanza_builder.attr("recipient", r);
+    }
 
     // Without `edit`, the resend looks like a normal message and the client never
     // applies the revoke/edit.
@@ -1090,6 +1169,13 @@ where
     let plaintext = MessageUtils::encode_and_pad(message);
     let signal_address = encryption_jid.to_protocol_address();
 
+    if account.is_none() && pkmsg_would_be_emitted(session_store, &signal_address).await? {
+        bail!(
+            "group retry pkmsg requires <device-identity> (account is None); \
+             refusing before message_encrypt to avoid advancing the sender chain"
+        );
+    }
+
     let encrypted =
         message_encrypt(&plaintext, &signal_address, session_store, identity_store).await?;
 
@@ -1108,7 +1194,12 @@ where
 
     let mut children = vec![enc_node];
 
-    if is_prekey && let Some(acc) = account {
+    if is_prekey {
+        // Defense in depth: pre-flight should have caught this, but a corrupt
+        // session that triggers a fresh pkmsg mid-call would slip past.
+        let acc = account.ok_or_else(|| {
+            anyhow!("group retry pkmsg without <device-identity> (unreachable via pre-flight)")
+        })?;
         children.push(
             NodeBuilder::new("device-identity")
                 .bytes(acc.encode_to_vec())
@@ -2858,10 +2949,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn pkmsg_no_account() {
+        async fn group_retry_pkmsg_with_account_emits_device_identity() {
             let (mut ss, mut is, jid) = setup_session().await;
             let group: Jid = "120363098765432100@g.us".parse().unwrap();
             let p: Jid = jid.to_string().parse().unwrap();
+            let account = pkmsg_account_proto();
             let n = prepare_group_retry_stanza(
                 &mut ss,
                 &mut is,
@@ -2871,7 +2963,7 @@ mod tests {
                 &wa::Message::default(),
                 "3EB0ABC".into(),
                 1,
-                None,
+                Some(&account),
                 AddressingMode::Pn,
                 None,
             )
@@ -2904,26 +2996,130 @@ mod tests {
             );
             assert_eq!(ea.optional_string("count").unwrap().as_ref(), "1");
             assert!(matches!(&enc.content, Some(NodeContent::Bytes(_))));
-            assert!(n.get_optional_child("device-identity").is_none());
+            assert!(
+                n.get_optional_child("device-identity").is_some(),
+                "pkmsg group retry with account must include <device-identity>"
+            );
+        }
+
+        /// Symmetric to peer/dm pre-flights: refuse group retry pkmsg when
+        /// account is missing rather than silently dropping device-identity.
+        #[tokio::test]
+        async fn group_retry_pkmsg_preflight_errors_when_account_missing() {
+            let (mut ss, mut is, jid) = setup_session().await;
+            let group: Jid = "120363098765432100@g.us".parse().unwrap();
+            let p: Jid = jid.to_string().parse().unwrap();
+
+            let before = ss
+                .load_session(&p.to_protocol_address())
+                .await
+                .unwrap()
+                .expect("pre-condition: session present")
+                .serialize()
+                .expect("serialize before");
+
+            let result = prepare_group_retry_stanza(
+                &mut ss,
+                &mut is,
+                group,
+                p.clone(),
+                p.clone(),
+                &wa::Message::default(),
+                "grp-retry-no-account".into(),
+                1,
+                None,
+                AddressingMode::Pn,
+                None,
+            )
+            .await;
+            let err = result.expect_err("group retry pkmsg must reject missing account");
+            assert!(
+                err.to_string().contains("device-identity"),
+                "error must name <device-identity>; got: {err}"
+            );
+
+            let after = ss
+                .load_session(&p.to_protocol_address())
+                .await
+                .unwrap()
+                .expect("session still present")
+                .serialize()
+                .expect("serialize after");
+            assert_eq!(
+                before, after,
+                "group retry pre-flight must leave the session byte-identical"
+            );
+        }
+
+        /// Pins the WAWebSendMsgCreateDeviceStanza retry shape: `<enc>`
+        /// directly under `<message>` plus a `recipient` attribute.
+        /// Pre-fix this regressed to the fanout shape and the server
+        /// rejected every retry with 479.
+        #[tokio::test]
+        async fn dm_retry_emits_enc_directly_under_message_with_recipient() {
+            let (mut ss, mut is, jid) = setup_session().await;
+            // Distinct values so a swapped-args regression (e.g. `recipient =
+            // to_jid`) fails the assertions below instead of silently passing.
+            let to: Jid = "559922223333:5@s.whatsapp.net".parse().unwrap();
+            let recipient: Jid = "100000000000456@lid".parse().unwrap();
+            let requester: Jid = jid.to_string().parse().unwrap();
+            let account = pkmsg_account_proto();
+            let n = prepare_dm_retry_stanza(
+                &mut ss,
+                &mut is,
+                to.clone(),
+                Some(recipient.clone()),
+                requester,
+                &wa::Message::default(),
+                "dm-retry-format-1".into(),
+                1,
+                Some(&account),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(n.tag, "message");
+            // <enc> is a direct child — no <participants> wrapper.
+            assert!(
+                n.get_optional_child("participants").is_none(),
+                "DM retry must not wrap <enc> in <participants> \
+                 (matches WAWebSendMsgCreateDeviceStanza)"
+            );
+            assert!(
+                n.get_optional_child("enc").is_some(),
+                "<enc> must be a direct child of <message>"
+            );
+            assert_eq!(
+                n.attrs().optional_string("to").unwrap().as_ref(),
+                to.to_string(),
+                "`to` should target the requesting device verbatim"
+            );
+            assert_eq!(
+                n.attrs().optional_string("recipient").unwrap().as_ref(),
+                recipient.to_string(),
+                "`recipient` should mirror the original message's recipient \
+                 (forwarded from the retry receipt's `recipient` attr)"
+            );
         }
 
         #[tokio::test]
         async fn dm_retry_pkmsg_targets_single_device() {
             let (mut ss, mut is, jid) = setup_session().await;
             let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
-            let requester: Jid = jid.to_string().parse().unwrap();
-            let encryption = requester.clone();
+            let encryption = jid.clone();
+            let account = pkmsg_account_proto();
 
             let n = prepare_dm_retry_stanza(
                 &mut ss,
                 &mut is,
                 to.clone(),
-                requester.clone(),
+                Some(to.clone()),
                 encryption,
                 &wa::Message::default(),
                 "dm-retry-1".into(),
                 1,
-                None,
+                Some(&account),
                 None,
             )
             .await
@@ -2935,6 +3131,10 @@ mod tests {
                 attrs.optional_string("to").unwrap().as_ref(),
                 to.to_string()
             );
+            assert_eq!(
+                attrs.optional_string("recipient").unwrap().as_ref(),
+                to.to_string()
+            );
             assert_eq!(attrs.optional_string("id").unwrap().as_ref(), "dm-retry-1");
             assert_eq!(
                 attrs.optional_string("type").unwrap().as_ref(),
@@ -2943,29 +3143,25 @@ mod tests {
             assert!(attrs.optional_string("participant").is_none());
             assert!(attrs.optional_string("addressing_mode").is_none());
 
-            let participants = n.get_optional_child("participants").unwrap();
-            let targets = participants.children().unwrap();
-            assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].tag, "to");
-            assert_eq!(
-                targets[0].attrs().optional_string("jid").unwrap().as_ref(),
-                requester.to_string()
-            );
-
-            let enc = targets[0].get_optional_child("enc").unwrap();
+            // `<enc>` is a direct child of `<message>` (no `<participants>` wrapper).
+            assert!(n.get_optional_child("participants").is_none());
+            let enc = n.get_optional_child("enc").unwrap();
             let mut enc_attrs = enc.attrs();
             assert_eq!(
                 enc_attrs.optional_string("type").unwrap().as_ref(),
                 stanza::ENC_TYPE_PKMSG
             );
             assert_eq!(enc_attrs.optional_string("count").unwrap().as_ref(), "1");
-            assert!(n.get_optional_child("device-identity").is_none());
+            assert!(
+                n.get_optional_child("device-identity").is_some(),
+                "pkmsg DM retry with account must include <device-identity>"
+            );
         }
 
         #[tokio::test]
         async fn dm_retry_pkmsg_with_account_has_device_identity() {
             let (mut ss, mut is, jid) = setup_session().await;
-            let requester: Jid = jid.to_string().parse().unwrap();
+            let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
             let acc = wa::AdvSignedDeviceIdentity {
                 details: Some(b"t".to_vec()),
                 ..Default::default()
@@ -2974,9 +3170,9 @@ mod tests {
             let n = prepare_dm_retry_stanza(
                 &mut ss,
                 &mut is,
-                "559922223333@s.whatsapp.net".parse().unwrap(),
-                requester.clone(),
-                requester,
+                to.clone(),
+                Some(to),
+                jid,
                 &wa::Message::default(),
                 "dm-retry-2".into(),
                 2,
@@ -2986,10 +3182,7 @@ mod tests {
             .await
             .unwrap();
 
-            let participants = n.get_optional_child("participants").unwrap();
-            let enc = participants.children().unwrap()[0]
-                .get_optional_child("enc")
-                .unwrap();
+            let enc = n.get_optional_child("enc").unwrap();
             assert_eq!(
                 enc.attrs().optional_string("type").unwrap().as_ref(),
                 stanza::ENC_TYPE_PKMSG
@@ -3078,6 +3271,7 @@ mod tests {
             let (mut ss, mut is, jid) = setup_session().await;
             let group: Jid = "120363098765432100@g.us".parse().unwrap();
             let p: Jid = jid.to_string().parse().unwrap();
+            let account = pkmsg_account_proto();
             let n = prepare_group_retry_stanza(
                 &mut ss,
                 &mut is,
@@ -3087,7 +3281,7 @@ mod tests {
                 &wa::Message::default(),
                 "revoke-1".into(),
                 1,
-                None,
+                Some(&account),
                 AddressingMode::Lid,
                 Some(crate::types::message::EditAttribute::AdminRevoke),
             )
@@ -3100,17 +3294,17 @@ mod tests {
         async fn dm_retry_preserves_edit_attribute() {
             let (mut ss, mut is, jid) = setup_session().await;
             let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
-            let requester: Jid = jid.to_string().parse().unwrap();
+            let account = pkmsg_account_proto();
             let n = prepare_dm_retry_stanza(
                 &mut ss,
                 &mut is,
-                to,
-                requester.clone(),
-                requester,
+                to.clone(),
+                Some(to),
+                jid,
                 &wa::Message::default(),
                 "edit-1".into(),
                 1,
-                None,
+                Some(&account),
                 Some(crate::types::message::EditAttribute::MessageEdit),
             )
             .await
@@ -3123,6 +3317,7 @@ mod tests {
             let (mut ss, mut is, jid) = setup_session().await;
             let group: Jid = "120363098765432100@g.us".parse().unwrap();
             let p: Jid = jid.to_string().parse().unwrap();
+            let account = pkmsg_account_proto();
             let n = prepare_group_retry_stanza(
                 &mut ss,
                 &mut is,
@@ -3132,13 +3327,359 @@ mod tests {
                 &wa::Message::default(),
                 "plain-1".into(),
                 1,
-                None,
+                Some(&account),
                 AddressingMode::Lid,
                 None,
             )
             .await
             .unwrap();
             assert!(n.attrs().optional_string("edit").is_none());
+        }
+
+        // Peer pkmsg layout: `[<meta appdata="default"/>, <enc>, <device-identity>]`.
+        // Without `<device-identity>` the phone XMPP-acks but its Signal
+        // layer skips session promotion. Mirrors whatsmeow's
+        // `preparePeerMessageNode`.
+
+        fn pkmsg_account_proto() -> wa::AdvSignedDeviceIdentity {
+            // Opaque placeholder bytes — the assertions only check that
+            // the element carries non-empty content.
+            wa::AdvSignedDeviceIdentity {
+                details: Some(vec![0u8; 32]),
+                account_signature_key: Some(vec![0u8; 32]),
+                account_signature: Some(vec![0u8; 64]),
+                device_signature: Some(vec![0u8; 64]),
+            }
+        }
+
+        async fn build_peer_stanza(
+            account: Option<&wa::AdvSignedDeviceIdentity>,
+        ) -> wacore_binary::Node {
+            let (mut ss, mut is, jid) = setup_session().await;
+            let addr = jid.to_protocol_address();
+            prepare_peer_stanza(
+                &mut ss,
+                &mut is,
+                jid.clone(),
+                &addr,
+                &wa::Message::default(),
+                "peer-test-1".into(),
+                account,
+            )
+            .await
+            .expect("peer stanza builds")
+        }
+
+        #[tokio::test]
+        async fn peer_pkmsg_includes_meta_and_device_identity() {
+            let account = pkmsg_account_proto();
+            let n = build_peer_stanza(Some(&account)).await;
+
+            assert_eq!(n.tag, "message");
+            assert_eq!(
+                n.attrs().optional_string("category").unwrap().as_ref(),
+                "peer"
+            );
+
+            let children = n.children().expect("peer message has children");
+            let tags: Vec<&str> = children.iter().map(|c| c.tag.as_ref()).collect();
+            // Layout matches whatsmeow's preparePeerMessageNode for pkmsg:
+            // [<meta>, <enc>, <device-identity>].
+            assert_eq!(
+                tags,
+                vec!["meta", "enc", "device-identity"],
+                "peer pkmsg children order/identity must match whatsmeow"
+            );
+
+            let meta = n.get_optional_child("meta").expect("meta present");
+            assert_eq!(
+                meta.attrs().optional_string("appdata").unwrap().as_ref(),
+                "default",
+                "<meta appdata=\"default\"/> is what the phone uses to route the peer payload"
+            );
+
+            let enc = n.get_optional_child("enc").expect("enc present");
+            assert_eq!(
+                enc.attrs().optional_string("type").unwrap().as_ref(),
+                "pkmsg",
+                "fresh session must produce pkmsg, not msg"
+            );
+
+            let device_identity = n
+                .get_optional_child("device-identity")
+                .expect("device-identity present");
+            match &device_identity.content {
+                Some(NodeContent::Bytes(b)) => assert!(
+                    !b.is_empty(),
+                    "device-identity content must be the proto-encoded \
+                     AdvSignedDeviceIdentity, not empty"
+                ),
+                other => panic!("device-identity must carry bytes, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn peer_pkmsg_errors_when_account_missing_without_ratchet_advance() {
+            // Pkmsg without <device-identity> would reproduce the deadlock —
+            // refuse AND prove the session is byte-identical after the failed
+            // call so the next retry has the same ratchet position.
+            let (mut ss, mut is, jid) = setup_session().await;
+            let addr = jid.to_protocol_address();
+
+            let before = ss
+                .load_session(&addr)
+                .await
+                .unwrap()
+                .expect("pre-condition: session loaded")
+                .serialize()
+                .expect("serialize before");
+
+            let result = prepare_peer_stanza(
+                &mut ss,
+                &mut is,
+                jid.clone(),
+                &addr,
+                &wa::Message::default(),
+                "peer-test-no-account".into(),
+                None,
+            )
+            .await;
+            let err = result.expect_err("pkmsg path must reject missing account");
+            assert!(
+                err.to_string().contains("device-identity"),
+                "error must name the missing element; got: {err}"
+            );
+
+            let after = ss
+                .load_session(&addr)
+                .await
+                .unwrap()
+                .expect("session still present after failed call")
+                .serialize()
+                .expect("serialize after");
+            assert_eq!(
+                before, after,
+                "session record must be byte-identical after a failed prepare — \
+                 any difference means a ratchet step was committed for a stanza we couldn't ship"
+            );
+        }
+
+        /// Pre-flight check: when no session exists and account is None,
+        /// `prepare_peer_stanza` must refuse before `message_encrypt` runs,
+        /// otherwise the sender chain is persisted for a stanza we cannot ship
+        /// (CodeRabbit-flagged ratchet-burn-on-fail-fast).
+        #[tokio::test]
+        async fn peer_pkmsg_preflight_no_ratchet_burn_without_session() {
+            let jid: Jid = "559911112222@s.whatsapp.net".parse().unwrap();
+            let addr = jid.to_protocol_address();
+            let mut ss = MemSessionStore::new();
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut is = MemIdentityStore {
+                pair: IdentityKeyPair::generate(&mut rng),
+                reg_id: 42,
+                known: HashMap::new(),
+            };
+
+            assert!(
+                !ss.has_session(&addr).await.unwrap(),
+                "precondition: store has no session for this address"
+            );
+
+            let result = prepare_peer_stanza(
+                &mut ss,
+                &mut is,
+                jid.clone(),
+                &addr,
+                &wa::Message::default(),
+                "peer-preflight-1".into(),
+                None,
+            )
+            .await;
+            let err = result.expect_err("must refuse before message_encrypt");
+            assert!(
+                err.to_string().contains("device-identity"),
+                "error must name <device-identity>; got: {err}"
+            );
+            assert!(
+                !ss.has_session(&addr).await.unwrap(),
+                "pre-flight must NOT advance/persist a session — the ratchet \
+                 must remain unburned for the retry attempt"
+            );
+        }
+
+        /// Symmetric to peer_pkmsg_preflight: prepare_dm_retry_stanza must
+        /// also refuse to ship pkmsg without <device-identity>, otherwise
+        /// message_encrypt would advance the sender chain for a stanza the
+        /// peer's Signal layer cannot promote.
+        #[tokio::test]
+        async fn dm_retry_pkmsg_preflight_errors_when_account_missing() {
+            let (mut ss, mut is, jid) = setup_session().await;
+            let addr = jid.to_protocol_address();
+
+            let before = ss
+                .load_session(&addr)
+                .await
+                .unwrap()
+                .expect("pre-condition: session present")
+                .serialize()
+                .expect("serialize before");
+
+            let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
+            let result = prepare_dm_retry_stanza(
+                &mut ss,
+                &mut is,
+                to.clone(),
+                Some(to),
+                jid.clone(),
+                &wa::Message::default(),
+                "dm-retry-no-account".into(),
+                1,
+                None,
+                None,
+            )
+            .await;
+            let err = result.expect_err("DM retry pkmsg path must reject missing account");
+            assert!(
+                err.to_string().contains("device-identity"),
+                "error must name <device-identity>; got: {err}"
+            );
+
+            let after = ss
+                .load_session(&addr)
+                .await
+                .unwrap()
+                .expect("session still present")
+                .serialize()
+                .expect("serialize after");
+            assert_eq!(
+                before, after,
+                "DM retry pre-flight must leave the session byte-identical"
+            );
+        }
+
+        /// Production's SessionAdapter::load_session has TAKE semantics
+        /// (SignalStoreCache marks the slot CheckedOut until store_session
+        /// puts the record back). If the pre-flight only loads without
+        /// restoring, the slot stays stranded and message_encrypt sees no
+        /// session. The mock here mirrors that contract via interior
+        /// mutability (Mutex) on the &self load_session.
+        #[tokio::test]
+        async fn preflight_restores_session_with_take_store_semantics() {
+            use std::collections::{HashMap, HashSet};
+            use std::sync::Mutex;
+
+            struct TakeStore {
+                inner: Mutex<TakeInner>,
+            }
+            struct TakeInner {
+                present: HashMap<ProtocolAddress, Vec<u8>>,
+                taken: HashSet<ProtocolAddress>,
+            }
+            impl TakeStore {
+                fn from(ss: &MemSessionStore) -> Self {
+                    Self {
+                        inner: Mutex::new(TakeInner {
+                            present: ss.0.clone(),
+                            taken: HashSet::new(),
+                        }),
+                    }
+                }
+                fn is_present(&self, addr: &ProtocolAddress) -> bool {
+                    let g = self.inner.lock().unwrap();
+                    g.present.contains_key(addr) && !g.taken.contains(addr)
+                }
+            }
+            #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+            #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+            impl SessionStore for TakeStore {
+                async fn load_session(
+                    &self,
+                    a: &ProtocolAddress,
+                ) -> crate::libsignal::protocol::error::Result<
+                    Option<crate::libsignal::protocol::SessionRecord>,
+                > {
+                    let mut g = self.inner.lock().unwrap();
+                    if g.taken.contains(a) {
+                        return Ok(None);
+                    }
+                    let rec = g.present.get(a).and_then(|b| {
+                        crate::libsignal::protocol::SessionRecord::deserialize(b).ok()
+                    });
+                    if rec.is_some() {
+                        g.taken.insert(a.clone());
+                    }
+                    Ok(rec)
+                }
+                async fn has_session(
+                    &self,
+                    a: &ProtocolAddress,
+                ) -> crate::libsignal::protocol::error::Result<bool> {
+                    let g = self.inner.lock().unwrap();
+                    Ok(g.present.contains_key(a) && !g.taken.contains(a))
+                }
+                async fn store_session(
+                    &mut self,
+                    a: &ProtocolAddress,
+                    r: crate::libsignal::protocol::SessionRecord,
+                ) -> crate::libsignal::protocol::error::Result<()> {
+                    let mut g = self.inner.lock().unwrap();
+                    g.present.insert(a.clone(), r.serialize()?);
+                    g.taken.remove(a);
+                    Ok(())
+                }
+            }
+
+            let (mem_ss, mut is, jid) = setup_session().await;
+            let mut ss = TakeStore::from(&mem_ss);
+            let addr = jid.to_protocol_address();
+
+            // setup_session leaves pending_pre_key set, so account=None
+            // would bail. Use Some(account) — pre-flight still runs
+            // load+restore because it's gated on account.is_none() at the
+            // call site; switch to account=None and we want the assertion
+            // to verify that the BAIL path also restores the slot.
+            assert!(
+                ss.is_present(&addr),
+                "precondition: session is Present before pre-flight"
+            );
+
+            // Drive the bail path: account=None + session has pending_pre_key
+            // → pre-flight bails. Even on bail, the loaded record must be
+            // put back so a retry with Some(account) doesn't see a stranded slot.
+            let bail = prepare_peer_stanza(
+                &mut ss,
+                &mut is,
+                jid.clone(),
+                &addr,
+                &wa::Message::default(),
+                "preflight-take-bail".into(),
+                None,
+            )
+            .await;
+            bail.expect_err("must bail with account=None on a pending-pkmsg session");
+            assert!(
+                ss.is_present(&addr),
+                "pre-flight bail path must still restore the checked-out session"
+            );
+
+            // And the pass path: with Some(account), the pre-flight still
+            // does load+restore, then message_encrypt runs successfully.
+            let account = pkmsg_account_proto();
+            let ok = prepare_peer_stanza(
+                &mut ss,
+                &mut is,
+                jid.clone(),
+                &addr,
+                &wa::Message::default(),
+                "preflight-take-pass".into(),
+                Some(&account),
+            )
+            .await;
+            ok.expect("peer stanza builds with Some(account)");
+            assert!(
+                ss.is_present(&addr),
+                "session must be Present after a successful encrypt+store"
+            );
         }
     }
 
