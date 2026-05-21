@@ -3267,13 +3267,11 @@ impl Client {
                     info!(
                         "Got 515 stream error, server is closing stream (expected after pairing). Will auto-reconnect."
                     );
-                    self.is_logged_in.store(false, Ordering::Relaxed);
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     should_disconnect = true;
                 }
                 "516" => {
                     info!("Got 516 stream error (device removed). Logging out.");
-                    self.is_logged_in.store(false, Ordering::Relaxed);
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::LoggedOut(
@@ -3286,7 +3284,6 @@ impl Client {
                 }
                 "401" => {
                     info!("Got 401 stream error (unauthorized). Logging out.");
-                    self.is_logged_in.store(false, Ordering::Relaxed);
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::LoggedOut(
@@ -3299,7 +3296,6 @@ impl Client {
                 }
                 "409" => {
                     info!("Got 409 stream error (conflict). Another session replaced this one.");
-                    self.is_logged_in.store(false, Ordering::Relaxed);
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core
@@ -3317,11 +3313,11 @@ impl Client {
                     info!("Got 503 service unavailable, will auto-reconnect.");
                 }
                 _ => {
-                    // Mirror whatsmeow's default: log + dispatch event, but keep the
-                    // connection alive. The server wraps per-stanza notifications in
-                    // <stream:error> without a code attribute (e.g. <ack/> for malformed
-                    // routing). Proactively disconnecting on those causes reconnect storms
-                    // under load — whatsmeow lets the noise socket detect a real teardown.
+                    // Server wraps per-stanza routing failures in <stream:error> without a
+                    // code (e.g. <ack/>): treat as informational so we don't trigger reconnect
+                    // storms. is_logged_in stays true on purpose — whatsmeow clears it eagerly,
+                    // but here is_fully_ready() gates prekey uploads and we want them to keep
+                    // working while the socket is still alive.
                     error!("Unknown stream error: {}", DisplayableNodeRef(node));
                     self.core.event_bus.dispatch(Event::StreamError(
                         crate::types::events::StreamError {
@@ -3333,10 +3329,9 @@ impl Client {
             }
         }
 
-        // Only tear down the connection for branches that explicitly opted in.
-        // 429/503/unknown match whatsmeow: log and let the socket layer notice
-        // if the server actually closes the stream. is_logged_in is cleared
-        // here so it flips exactly when (and only when) we disconnect.
+        // Single is_logged_in clear + transport disconnect for every opt-in branch
+        // (515/516/401/409 and conflict). 429/503/unknown fall through so the
+        // socket layer notices a real teardown without us forcing one.
         if should_disconnect {
             self.is_logged_in.store(false, Ordering::Relaxed);
             let transport_opt = self.transport.lock().await.clone();
