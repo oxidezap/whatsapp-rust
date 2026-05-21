@@ -2043,7 +2043,7 @@ mod tests {
             "throttled path must not re-stamp the history"
         );
 
-        // 5) Throttle entry past the window must allow a fresh recreate.
+        // 4) Throttle entry past the window must allow a fresh recreate.
         // Lazy pruning (size threshold) leaves expired entries in the map for
         // small deployments, so the age check at the decision site is
         // load-bearing. Pass a future `now` via the injectable-clock variant
@@ -2060,7 +2060,7 @@ mod tests {
             "entry past the throttle window must allow a fresh recreate"
         );
 
-        // 4) no session → recreate regardless of retry count.
+        // 5) no session → recreate regardless of retry count.
         assert!(
             client
                 .should_recreate_session(0, &jid_without)

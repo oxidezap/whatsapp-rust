@@ -576,14 +576,14 @@ fn failed_mac_must_not_advance_receiver_chain() {
     }
 
     // Snapshot Alice's chain index for Bob's current sender ratchet.
-    /// Sum of receiver chain indices across all of Alice's chains for
-    /// Bob's address. We sum (rather than read one specific chain)
-    /// because after X3DH the session has the signed-prekey ratchet at
-    /// index 0 that stays unused, and after Bob's first send Alice
-    /// adds a second chain for Bob's actual sender ratchet. The
-    /// invariant the test wants is "no advance on MAC failure" — sum
-    /// captures it without depending on which chain is at which
-    /// vec position.
+    // Sum of receiver chain indices across all of Alice's chains for
+    // Bob's address. We sum (rather than read one specific chain)
+    // because after X3DH the session has the signed-prekey ratchet at
+    // index 0 that stays unused, and after Bob's first send Alice
+    // adds a second chain for Bob's actual sender ratchet. The
+    // invariant the test wants is "no advance on MAC failure" — sum
+    // captures it without depending on which chain is at which
+    // vec position.
     fn alice_chain_total(alice: &Peer, bob: &Peer) -> u32 {
         let Some(rec) = alice.session_store.0.get(&bob.address) else {
             return 0;
