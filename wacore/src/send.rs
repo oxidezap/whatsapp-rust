@@ -1169,6 +1169,13 @@ where
     let plaintext = MessageUtils::encode_and_pad(message);
     let signal_address = encryption_jid.to_protocol_address();
 
+    if account.is_none() && pkmsg_would_be_emitted(session_store, &signal_address).await? {
+        bail!(
+            "group retry pkmsg requires <device-identity> (account is None); \
+             refusing before message_encrypt to avoid advancing the sender chain"
+        );
+    }
+
     let encrypted =
         message_encrypt(&plaintext, &signal_address, session_store, identity_store).await?;
 
@@ -1187,7 +1194,12 @@ where
 
     let mut children = vec![enc_node];
 
-    if is_prekey && let Some(acc) = account {
+    if is_prekey {
+        // Defense in depth: pre-flight should have caught this, but a corrupt
+        // session that triggers a fresh pkmsg mid-call would slip past.
+        let acc = account.ok_or_else(|| {
+            anyhow!("group retry pkmsg without <device-identity> (unreachable via pre-flight)")
+        })?;
         children.push(
             NodeBuilder::new("device-identity")
                 .bytes(acc.encode_to_vec())
@@ -2937,10 +2949,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn pkmsg_no_account() {
+        async fn group_retry_pkmsg_with_account_emits_device_identity() {
             let (mut ss, mut is, jid) = setup_session().await;
             let group: Jid = "120363098765432100@g.us".parse().unwrap();
             let p: Jid = jid.to_string().parse().unwrap();
+            let account = pkmsg_account_proto();
             let n = prepare_group_retry_stanza(
                 &mut ss,
                 &mut is,
@@ -2950,7 +2963,7 @@ mod tests {
                 &wa::Message::default(),
                 "3EB0ABC".into(),
                 1,
-                None,
+                Some(&account),
                 AddressingMode::Pn,
                 None,
             )
@@ -2983,7 +2996,59 @@ mod tests {
             );
             assert_eq!(ea.optional_string("count").unwrap().as_ref(), "1");
             assert!(matches!(&enc.content, Some(NodeContent::Bytes(_))));
-            assert!(n.get_optional_child("device-identity").is_none());
+            assert!(
+                n.get_optional_child("device-identity").is_some(),
+                "pkmsg group retry with account must include <device-identity>"
+            );
+        }
+
+        /// Symmetric to peer/dm pre-flights: refuse group retry pkmsg when
+        /// account is missing rather than silently dropping device-identity.
+        #[tokio::test]
+        async fn group_retry_pkmsg_preflight_errors_when_account_missing() {
+            let (mut ss, mut is, jid) = setup_session().await;
+            let group: Jid = "120363098765432100@g.us".parse().unwrap();
+            let p: Jid = jid.to_string().parse().unwrap();
+
+            let before = ss
+                .load_session(&p.to_protocol_address())
+                .await
+                .unwrap()
+                .expect("pre-condition: session present")
+                .serialize()
+                .expect("serialize before");
+
+            let result = prepare_group_retry_stanza(
+                &mut ss,
+                &mut is,
+                group,
+                p.clone(),
+                p.clone(),
+                &wa::Message::default(),
+                "grp-retry-no-account".into(),
+                1,
+                None,
+                AddressingMode::Pn,
+                None,
+            )
+            .await;
+            let err = result.expect_err("group retry pkmsg must reject missing account");
+            assert!(
+                err.to_string().contains("device-identity"),
+                "error must name <device-identity>; got: {err}"
+            );
+
+            let after = ss
+                .load_session(&p.to_protocol_address())
+                .await
+                .unwrap()
+                .expect("session still present")
+                .serialize()
+                .expect("serialize after");
+            assert_eq!(
+                before, after,
+                "group retry pre-flight must leave the session byte-identical"
+            );
         }
 
         /// Pins the WAWebSendMsgCreateDeviceStanza retry shape: `<enc>`
@@ -3206,6 +3271,7 @@ mod tests {
             let (mut ss, mut is, jid) = setup_session().await;
             let group: Jid = "120363098765432100@g.us".parse().unwrap();
             let p: Jid = jid.to_string().parse().unwrap();
+            let account = pkmsg_account_proto();
             let n = prepare_group_retry_stanza(
                 &mut ss,
                 &mut is,
@@ -3215,7 +3281,7 @@ mod tests {
                 &wa::Message::default(),
                 "revoke-1".into(),
                 1,
-                None,
+                Some(&account),
                 AddressingMode::Lid,
                 Some(crate::types::message::EditAttribute::AdminRevoke),
             )
@@ -3251,6 +3317,7 @@ mod tests {
             let (mut ss, mut is, jid) = setup_session().await;
             let group: Jid = "120363098765432100@g.us".parse().unwrap();
             let p: Jid = jid.to_string().parse().unwrap();
+            let account = pkmsg_account_proto();
             let n = prepare_group_retry_stanza(
                 &mut ss,
                 &mut is,
@@ -3260,7 +3327,7 @@ mod tests {
                 &wa::Message::default(),
                 "plain-1".into(),
                 1,
-                None,
+                Some(&account),
                 AddressingMode::Lid,
                 None,
             )
