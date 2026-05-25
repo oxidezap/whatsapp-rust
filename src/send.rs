@@ -1497,19 +1497,10 @@ impl Client {
             should_send_new_tc_token_with,
         };
 
-        // Skip for own JID — no need to send privacy token to ourselves
+        // Skip only for status broadcast; even same-account DMs (companion→primary
+        // phone) require TC tokens — the `is_self` user-equality check was too
+        // broad and blocked issuance when the bot's LID matched the admin's chat LID.
         let snapshot = self.persistence_manager.get_device_snapshot().await;
-        let is_self = snapshot
-            .pn
-            .as_ref()
-            .is_some_and(|pn| pn.is_same_user_as(to))
-            || snapshot
-                .lid
-                .as_ref()
-                .is_some_and(|lid| lid.is_same_user_as(to));
-        if is_self {
-            return (false, None);
-        }
 
         // Bots and status broadcast don't participate in the privacy token system
         if to.is_bot() || to.is_status_broadcast() {
@@ -1549,10 +1540,13 @@ impl Client {
             &tc_config,
         );
 
-        // AB prop gates stanza inclusion only (not issuance scheduling)
+        // AB prop gates stanza inclusion only (not issuance scheduling).
+        // Default true: ab_props is in-memory only and starts empty on fresh
+        // start (delta fetch returns 0 props). Defaulting to false would mean
+        // we never attach tokens when the cache is cold, causing perpetual 463.
         let token_send_enabled = self
             .ab_props
-            .is_enabled_or(config_codes::PRIVACY_TOKEN_ON_ALL_1_ON_1_MESSAGES, false)
+            .is_enabled_or(config_codes::PRIVACY_TOKEN_ON_ALL_1_ON_1_MESSAGES, true)
             .await;
 
         if token_send_enabled {
