@@ -753,7 +753,34 @@ impl Client {
                         return;
                     }
                 };
-                if let Some(server) = ack.get().get_attr("phash").map(|v| v.as_str())
+                let ack_node = ack.get();
+
+                // ACK 400 on a DM: the server rejected the entire stanza. Fresh
+                // pkmsg for own device 0 was tried and still got 400, confirming
+                // device 0 is not a valid server-side participant (not a session
+                // staleness issue). Clear device-0 sessions and cache so the slot
+                // is clean for future attempts; do NOT retry here — a blind retry
+                // with device 0 still in the fanout loops forever. The device-0
+                // exclusion filter in send_message_impl handles delivery.
+                if ack_node
+                    .get_attr("error")
+                    .is_some_and(|v| v.as_str() == "400")
+                    && !jid.is_group()
+                    && !jid.is_status_broadcast()
+                {
+                    log::warn!(
+                        "ACK 400 for DM to {jid} (msg {message_id}); \
+                         own device 0 is not a valid participant — clearing sessions and cache"
+                    );
+                    let snapshot = client.persistence_manager.get_device_snapshot().await;
+                    if let Some(ref pn) = snapshot.pn {
+                        client.delete_sessions_for_devices(&pn.user, &[0]).await;
+                        client.invalidate_device_cache(&pn.user).await;
+                    }
+                    return;
+                }
+
+                if let Some(server) = ack_node.get_attr("phash").map(|v| v.as_str())
                     && server != our_phash
                 {
                     log::warn!(
@@ -1244,6 +1271,7 @@ impl Client {
             // WAWebSendUserMsgJob reads local device table only on the send
             // path; WAWebDBDeviceListFanout excludes hosted devices.
             let recipient_bare = self.resolve_encryption_jid(&to).await.to_non_ad();
+            let recipient_is_lid = recipient_bare.is_lid();
 
             // Local registry first; network warm only on miss to avoid
             // unnecessary LID-migration side effects from get_user_devices
@@ -1296,6 +1324,33 @@ impl Client {
                     || own_lid.is_some_and(|lid| j.is_same_user_as(lid) && j.device == lid.device);
                 !is_sender
             });
+
+            // Exclude own device 0 from every DM fanout. Device 0 (primary
+            // phone) receives sent messages via the sync protocol, not direct
+            // E2E; including it causes ACK 400 regardless of whether the
+            // recipient is self or another user.
+            all_dm_jids.retain(|j| {
+                let is_own_device_0 = j.device == 0
+                    && (j.is_same_user_as(own_jid)
+                        || own_lid.is_some_and(|lid| j.is_same_user_as(lid)));
+                !is_own_device_0
+            });
+
+            // When the recipient is LID-addressed, own devices from own_cached
+            // arrive as PN JIDs (628xxx@s.whatsapp.net). Including a PN
+            // participant in a LID stanza causes ACK 400 — the server requires
+            // consistent namespace. Convert remaining own PN devices to their
+            // LID equivalents so the stanza is uniformly LID-addressed.
+            if recipient_is_lid {
+                let lid = own_lid.ok_or_else(|| {
+                    anyhow!("Cannot send a LID-addressed DM before the device LID is known")
+                })?;
+                for j in all_dm_jids.iter_mut() {
+                    if j.is_pn() && j.is_same_user_as(own_jid) {
+                        *j = Jid::lid_device(lid.user.clone(), j.device);
+                    }
+                }
+            }
 
             // Same-namespace dedup only; cross-namespace overlap is avoided
             // upstream via `is_self_dm_recipient`.
