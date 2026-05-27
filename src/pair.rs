@@ -263,6 +263,17 @@ async fn handle_pair_success<'a>(
                 )))
                 .await;
 
+            // Force prekey re-upload on the next connect. Pairing regenerates
+            // local key material but, without this reset, `upload_pre_keys_at_login`
+            // observes `server_has_prekeys=true` (set by a previous pairing) and
+            // returns early. The server keeps the stale bundle, peers fetching it
+            // get prekeys diverged from local state, and sessions established
+            // against the old bundle BadMac forever.
+            client
+                .persistence_manager
+                .modify_device(|d| d.server_has_prekeys = false)
+                .await;
+
             // Add the own LID-PN mapping to the cache so that when sending DMs to self,
             // we can find the existing LID-based session instead of creating a new PN-based one.
             // This is critical for self-messaging to work correctly.
