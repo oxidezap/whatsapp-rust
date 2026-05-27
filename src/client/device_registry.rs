@@ -253,7 +253,7 @@ impl Client {
     ///
     /// Removes all device registry cache entries (all LID/PN aliases) so the
     /// next lookup falls through to the database or network.
-    pub async fn invalidate_device_cache(&self, user: &str) {
+    pub(crate) async fn invalidate_device_cache(&self, user: &str) {
         let lookup = self.resolve_lookup_keys(user).await;
 
         for key in lookup.all_keys() {
@@ -363,7 +363,7 @@ impl Client {
     /// Delete Signal sessions for specific device IDs under both LID and PN
     /// addresses, then flush. Shared by `clear_device_record` and
     /// `patch_device_remove`.
-    pub(crate) async fn delete_sessions_for_devices(&self, user: &str, device_ids: &[u16]) {
+    async fn delete_sessions_for_devices(&self, user: &str, device_ids: &[u16]) {
         let lookup = self.resolve_lookup_keys(user).await;
         let servers = [wacore_binary::Server::Lid, wacore_binary::Server::Pn];
         for server in servers {

@@ -753,34 +753,7 @@ impl Client {
                         return;
                     }
                 };
-                let ack_node = ack.get();
-
-                // ACK 400 on a DM: the server rejected the entire stanza. Fresh
-                // pkmsg for own device 0 was tried and still got 400, confirming
-                // device 0 is not a valid server-side participant (not a session
-                // staleness issue). Clear device-0 sessions and cache so the slot
-                // is clean for future attempts; do NOT retry here — a blind retry
-                // with device 0 still in the fanout loops forever. The device-0
-                // exclusion filter in send_message_impl handles delivery.
-                if ack_node
-                    .get_attr("error")
-                    .is_some_and(|v| v.as_str() == "400")
-                    && !jid.is_group()
-                    && !jid.is_status_broadcast()
-                {
-                    log::warn!(
-                        "ACK 400 for DM to {jid} (msg {message_id}); \
-                         own device 0 is not a valid participant — clearing sessions and cache"
-                    );
-                    let snapshot = client.persistence_manager.get_device_snapshot().await;
-                    if let Some(ref pn) = snapshot.pn {
-                        client.delete_sessions_for_devices(&pn.user, &[0]).await;
-                        client.invalidate_device_cache(&pn.user).await;
-                    }
-                    return;
-                }
-
-                if let Some(server) = ack_node.get_attr("phash").map(|v| v.as_str())
+                if let Some(server) = ack.get().get_attr("phash").map(|v| v.as_str())
                     && server != our_phash
                 {
                     log::warn!(
@@ -1325,22 +1298,10 @@ impl Client {
                 !is_sender
             });
 
-            // Exclude own device 0 from every DM fanout. Device 0 (primary
-            // phone) receives sent messages via the sync protocol, not direct
-            // E2E; including it causes ACK 400 regardless of whether the
-            // recipient is self or another user.
-            all_dm_jids.retain(|j| {
-                let is_own_device_0 = j.device == 0
-                    && (j.is_same_user_as(own_jid)
-                        || own_lid.is_some_and(|lid| j.is_same_user_as(lid)));
-                !is_own_device_0
-            });
-
-            // When the recipient is LID-addressed, own devices from own_cached
-            // arrive as PN JIDs (628xxx@s.whatsapp.net). Including a PN
-            // participant in a LID stanza causes ACK 400 — the server requires
-            // consistent namespace. Convert remaining own PN devices to their
-            // LID equivalents so the stanza is uniformly LID-addressed.
+            // own_cached is keyed by the bot's PN, so own devices come back
+            // PN-addressed. The server rejects a stanza that mixes PN and LID
+            // participants, so align own devices to LID for a LID recipient
+            // (whatsmeow switches ownID to LID before fanout).
             if recipient_is_lid {
                 let lid = own_lid.ok_or_else(|| {
                     anyhow!("Cannot send a LID-addressed DM before the device LID is known")
@@ -1497,10 +1458,19 @@ impl Client {
             should_send_new_tc_token_with,
         };
 
-        // Skip only for status broadcast; even same-account DMs (companion→primary
-        // phone) require TC tokens — the `is_self` user-equality check was too
-        // broad and blocked issuance when the bot's LID matched the admin's chat LID.
+        // Skip for own JID — no need to send privacy token to ourselves
         let snapshot = self.persistence_manager.get_device_snapshot().await;
+        let is_self = snapshot
+            .pn
+            .as_ref()
+            .is_some_and(|pn| pn.is_same_user_as(to))
+            || snapshot
+                .lid
+                .as_ref()
+                .is_some_and(|lid| lid.is_same_user_as(to));
+        if is_self {
+            return (false, None);
+        }
 
         // Bots and status broadcast don't participate in the privacy token system
         if to.is_bot() || to.is_status_broadcast() {
@@ -1540,13 +1510,10 @@ impl Client {
             &tc_config,
         );
 
-        // AB prop gates stanza inclusion only (not issuance scheduling).
-        // Default true: ab_props is in-memory only and starts empty on fresh
-        // start (delta fetch returns 0 props). Defaulting to false would mean
-        // we never attach tokens when the cache is cold, causing perpetual 463.
+        // AB prop gates stanza inclusion only (not issuance scheduling)
         let token_send_enabled = self
             .ab_props
-            .is_enabled_or(config_codes::PRIVACY_TOKEN_ON_ALL_1_ON_1_MESSAGES, true)
+            .is_enabled_or(config_codes::PRIVACY_TOKEN_ON_ALL_1_ON_1_MESSAGES, false)
             .await;
 
         if token_send_enabled {
