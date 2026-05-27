@@ -74,10 +74,10 @@ pub use features::{
     MexError, MexErrorExtensions, MexRequest, MexResponse, Newsletter, NewsletterMessage,
     NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount, NewsletterRole,
     NewsletterState, NewsletterVerification, ParticipantChangeResponse, ParticipantType,
-    PictureType, Presence, PresenceError, PresenceStatus, Profile, ProfilePicture,
-    SetProfilePictureResponse, Signal, Status, StatusPrivacySetting, StatusSendOptions,
-    SyncActionMessageRange, TcToken, UnlinkSubgroupsResult, UserInfo, group_type, message_key,
-    message_range,
+    PictureType, Presence, PresenceError, PresenceStatus, Profile, ProfilePicture, SecretEncKind,
+    SecretEncrypted, SetProfilePictureResponse, Signal, Status, StatusPrivacySetting,
+    StatusSendOptions, SyncActionMessageRange, TcToken, UnlinkSubgroupsResult, UserInfo,
+    group_type, message_key, message_range,
 };
 
 pub mod bot;

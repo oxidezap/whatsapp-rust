@@ -82,39 +82,16 @@ pub fn decrypt_with_fallback(
     fallback_original_sender: Option<&Jid>,
     fallback_editor: Option<&Jid>,
 ) -> Result<wa::Message> {
-    let primary_orig = original_sender_jid.to_non_ad().to_string();
-    let primary_editor = editor_jid.to_non_ad().to_string();
-    let primary = MessageEditContext {
-        original_msg_id,
-        original_sender_jid: &primary_orig,
-        editor_jid: &primary_editor,
-    };
-
-    let fb_orig = fallback_original_sender.map(|j| j.to_non_ad().to_string());
-    let fb_editor = fallback_editor.map(|j| j.to_non_ad().to_string());
-    let fb_orig_resolved = fb_orig.as_deref().unwrap_or(primary.original_sender_jid);
-    let fb_editor_resolved = fb_editor.as_deref().unwrap_or(primary.editor_jid);
-    // Skip the retry when the fallback would key the HKDF identically to
-    // primary — covers both "no fallback supplied" and "fallback normalises
-    // to the same JIDs". Avoids a guaranteed-failing duplicate decrypt.
-    let fallback_ctx = if fb_orig_resolved == primary.original_sender_jid
-        && fb_editor_resolved == primary.editor_jid
-    {
-        None
-    } else {
-        Some(MessageEditContext {
-            original_msg_id,
-            original_sender_jid: fb_orig_resolved,
-            editor_jid: fb_editor_resolved,
-        })
-    };
-
-    message_edit::decrypt_message_edit_with_fallback(
+    decrypt_secret_encrypted_with_fallback(
         enc_payload,
         enc_iv,
         message_secret,
-        &primary,
-        fallback_ctx.as_ref(),
+        SecretEncKind::MessageEdit,
+        original_msg_id,
+        original_sender_jid,
+        editor_jid,
+        fallback_original_sender,
+        fallback_editor,
     )
 }
 
