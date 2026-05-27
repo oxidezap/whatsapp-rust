@@ -294,6 +294,13 @@ impl Client {
     /// 6. Transient/corruption signals (backend batch-load error, prekey record with
     ///    no pub key): logs and skips — re-upload won't help and next cycle will retry.
     pub(crate) async fn validate_digest_key(&self) -> Result<(), anyhow::Error> {
+        // Acquire the prekey upload lock for the entire validation pass so any
+        // upload triggered by a divergence signal can't race with
+        // `upload_pre_keys_at_login`, `handle_prekey_low`, or `refresh_pre_keys`,
+        // which all use the same lock to serialize access to `next_pre_key_id`
+        // and the storage backend.
+        let _guard = self.prekey_upload_lock.lock().await;
+
         let response = match self.execute(DigestKeyBundleSpec::new()).await {
             Ok(resp) => resp,
             Err(crate::request::IqError::ServerError { code: 404, .. }) => {
