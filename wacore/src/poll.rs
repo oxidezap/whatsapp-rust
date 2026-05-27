@@ -143,28 +143,20 @@ pub fn decrypt_poll_vote(
     Ok(vote_msg.selected_options)
 }
 
-/// Addressing pair fed into the poll-vote HKDF + AAD. JIDs must be in the
-/// form they were sent/received under (AD suffix already stripped); the caller
-/// owns any LID↔PN normalisation. See [`decrypt_poll_vote_with_fallback`].
+/// Creator + voter JIDs (non-AD) that key the poll-vote HKDF and AAD.
 #[derive(Debug, Clone, Copy)]
 pub struct PollVoteAddressing<'a> {
     pub poll_creator_jid: &'a str,
     pub voter_jid: &'a str,
 }
 
-/// Decrypt a poll vote, retrying once under an alternate addressing pair.
+/// Decrypt a poll vote, retrying once under the alternate addressing.
 ///
-/// Mirrors WA Web's `WAWebAddonEncryption.decryptAddOn`, which opens the
-/// AES-GCM payload across addressing modes (LID pair, then PN pair) because
-/// both the poll creator and voter JIDs feed the HKDF info buffer and the AAD
-/// (`WAUseCaseSecret.createUseCaseSecret`): a vote authored under one namespace
-/// only decrypts with the same namespace. As WhatsApp migrates contacts to
-/// LID, a vote can be received under one addressing but the parent poll learned
-/// under the other, so a single attempt silently fails.
-///
-/// `primary` is the as-received pair; `fallback` is the swapped pair with
-/// *both* JIDs converted together, matching WA Web's homogeneous LID/PN
-/// attempts (it never mixes one LID with one PN).
+/// The creator and voter JIDs key the derivation, so a vote authored under LID
+/// only opens under LID. As contacts migrate to LID a vote can arrive in a
+/// different namespace than the parent poll was learned in, so `fallback`
+/// retries with both JIDs swapped together (never mixed), matching WA Web
+/// `WAWebAddonEncryption.decryptAddOn`.
 pub fn decrypt_poll_vote_with_fallback(
     enc_payload: &[u8],
     iv: &[u8],
