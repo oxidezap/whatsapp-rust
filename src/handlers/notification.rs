@@ -268,14 +268,16 @@ async fn handle_prekey_low(client: &Arc<Client>) {
 /// Queries server for key bundle digest, validates SHA-1 hash locally,
 /// re-uploads if mismatch or missing.
 ///
-/// Acquires `prekey_upload_lock` to serialize with the count-based upload path,
-/// preventing concurrent uploads that could race on prekey ID allocation.
+/// `validate_digest_key` owns `prekey_upload_lock` acquisition internally, so
+/// any upload it triggers stays serialized with `upload_pre_keys_at_login`,
+/// `handle_prekey_low`, and `refresh_pre_keys` without this caller needing to
+/// (and indeed, holding it here would deadlock — `async_lock::Mutex` is not
+/// reentrant).
 fn handle_digest_key(client: &Arc<Client>) {
     let client_clone = client.clone();
     client
         .runtime
         .spawn(Box::pin(async move {
-            let _guard = client_clone.prekey_upload_lock.lock().await;
             if let Err(e) = client_clone.validate_digest_key().await {
                 warn!("Digest key validation failed: {:?}", e);
             }
