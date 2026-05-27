@@ -240,6 +240,36 @@ impl Client {
         }
     }
 
+    /// Ask the phone to re-upload a history-sync blob whose download failed,
+    /// by sending a `<receipt type="server-error" category="peer">` with the
+    /// blob's `media_key`.
+    ///
+    /// WA Web (`WAWebHandleHistorySyncNotification`) sends this on a non-network
+    /// download failure; the encrypted payload is the same `ServerErrorReceipt`
+    /// used for media retries. Exposed for consumers that detect an undownloadable
+    /// or unwanted history-sync chunk and want the phone to re-send it.
+    pub async fn send_history_sync_server_error_receipt(
+        &self,
+        message_id: &str,
+        media_key: &[u8],
+    ) -> Result<(), anyhow::Error> {
+        let own_jid = self
+            .get_pn()
+            .await
+            .ok_or(crate::client::ClientError::NotLoggedIn)?
+            .to_non_ad();
+        let (ciphertext, iv) =
+            wacore::media_retry::encrypt_media_retry_receipt(media_key, message_id)?;
+        let node = wacore::media_retry::build_history_sync_server_error_receipt(
+            &own_jid,
+            message_id,
+            &ciphertext,
+            &iv,
+        );
+        self.send_node(node).await?;
+        Ok(())
+    }
+
     /// Store a tctoken candidate extracted during history sync streaming.
     async fn store_tc_token_candidate(&self, candidate: TcTokenCandidate) {
         let jid: wacore_binary::Jid = match candidate.id.parse() {

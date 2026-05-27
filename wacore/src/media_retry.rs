@@ -152,6 +152,34 @@ pub fn build_media_retry_receipt(
         .build()
 }
 
+/// Build the `<receipt type="server-error" category="peer">` node that asks the
+/// phone to re-upload a history-sync blob whose download failed.
+///
+/// WA Web: `WAWebSendHistSyncServerErrorReceiptJob`. Differs from the media
+/// retry receipt: it carries `category="peer"`, targets our own JID, and omits
+/// the `<rmr>` child. The encrypted payload reuses [`encrypt_media_retry_receipt`].
+pub fn build_history_sync_server_error_receipt(
+    own_jid: &Jid,
+    msg_id: &str,
+    ciphertext: &[u8],
+    iv: &[u8],
+) -> Node {
+    let encrypt_node = NodeBuilder::new("encrypt")
+        .children([
+            NodeBuilder::new("enc_p").bytes(ciphertext.to_vec()).build(),
+            NodeBuilder::new("enc_iv").bytes(iv.to_vec()).build(),
+        ])
+        .build();
+
+    NodeBuilder::new("receipt")
+        .attr("type", "server-error")
+        .attr("to", own_jid)
+        .attr("id", msg_id)
+        .attr("category", "peer")
+        .children([encrypt_node])
+        .build()
+}
+
 /// Parse a `<notification type="mediaretry">` node into a `MediaRetryResult`.
 ///
 /// The node may contain:
@@ -305,5 +333,34 @@ mod tests {
 
         let rmr = node.get_optional_child_by_tag(&["rmr"]).unwrap();
         assert!(rmr.attrs().optional_string("participant").is_some());
+    }
+
+    #[test]
+    fn build_history_sync_receipt_structure() {
+        let own_jid = Jid::pn("1234567890");
+        let (ciphertext, iv) = encrypt_media_retry_receipt(&[2u8; 32], "HS1").unwrap();
+
+        let node = build_history_sync_server_error_receipt(&own_jid, "HS1", &ciphertext, &iv);
+
+        assert_eq!(node.tag.as_ref(), "receipt");
+        assert_eq!(
+            node.attrs().optional_string("type").unwrap().as_ref(),
+            "server-error"
+        );
+        assert_eq!(
+            node.attrs().optional_string("category").unwrap().as_ref(),
+            "peer"
+        );
+        assert_eq!(node.attrs().optional_string("id").unwrap().as_ref(), "HS1");
+        assert_eq!(
+            node.attrs().optional_string("to").unwrap().as_ref(),
+            own_jid.to_string()
+        );
+
+        let encrypt = node.get_optional_child_by_tag(&["encrypt"]).unwrap();
+        assert!(encrypt.get_optional_child_by_tag(&["enc_p"]).is_some());
+        assert!(encrypt.get_optional_child_by_tag(&["enc_iv"]).is_some());
+        // The history-sync variant carries no <rmr> child.
+        assert!(node.get_optional_child_by_tag(&["rmr"]).is_none());
     }
 }
