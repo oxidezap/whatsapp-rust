@@ -266,7 +266,7 @@ async fn handle_prekey_low(client: &Arc<Client>) {
 ///
 /// Matches WA Web's `WAWebHandleDigestKey`:
 /// Queries server for key bundle digest, validates SHA-1 hash locally,
-/// re-uploads if mismatch or missing.
+/// re-uploads only when the server has no record (404).
 ///
 /// `validate_digest_key` owns `prekey_upload_lock` acquisition internally, so
 /// any upload it triggers stays serialized with `upload_pre_keys_at_login`,

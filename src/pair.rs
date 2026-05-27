@@ -263,12 +263,10 @@ async fn handle_pair_success<'a>(
                 )))
                 .await;
 
-            // Force prekey re-upload on the next connect. Pairing regenerates
-            // local key material but, without this reset, `upload_pre_keys_at_login`
-            // observes `server_has_prekeys=true` (set by a previous pairing) and
-            // returns early. The server keeps the stale bundle, peers fetching it
-            // get prekeys diverged from local state, and sessions established
-            // against the old bundle BadMac forever.
+            // A prior pairing's `server_has_prekeys=true` would make
+            // `upload_pre_keys_at_login` skip and leave the server bundle stale.
+            // Reset it so the next connect re-uploads, matching WA Web where a
+            // freshly registered device always uploads its prekeys.
             client
                 .persistence_manager
                 .modify_device(|d| d.server_has_prekeys = false)

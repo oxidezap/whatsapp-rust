@@ -278,27 +278,20 @@ impl Client {
         self.upload_pre_keys_with_retry(true).await
     }
 
-    /// Validate server key bundle digest, re-uploading on any divergence signal.
+    /// Validate server key bundle digest, re-uploading only when the server has no record.
     ///
-    /// Mostly mirrors WA Web's `WAWebDigestKeyJob.digestKey()`:
+    /// Matches WA Web's `WAWebDigestKeyJob.digestKey()`:
     /// 1. Queries server for key bundle digest (identity + signed prekey + prekey IDs + SHA-1 hash)
     /// 2. If server returns 404 (no record): triggers `upload_pre_keys_with_retry()`
     /// 3. If server returns 406/503/other error: logs and does nothing
     /// 4. On success: loads local keys and computes SHA-1 over the same material
-    /// 5. **Divergence signals (regId mismatch, missing local prekey, hash mismatch):**
-    ///    forces `upload_pre_keys_with_retry(true)`. This diverges from WA Web, which
-    ///    swallows these silently — WA Web's localStorage is stable enough to make the
-    ///    divergence rare, while Rust clients with SQLite backends hit it after restores,
-    ///    re-pairs, or partial backups, leaving peers permanently unable to establish
-    ///    sessions because the server bundle points to material the bot no longer has.
-    /// 6. Transient/corruption signals (backend batch-load error, prekey record with
-    ///    no pub key): logs and skips — re-upload won't help and next cycle will retry.
+    /// 5. If validation fails (regId mismatch, missing prekey, hash mismatch): logs warning,
+    ///    does NOT re-upload — WA Web catches all `validateLocalKeyBundle` exceptions without
+    ///    re-uploading; the normal `RotateKeyJob` will eventually refresh keys
     pub(crate) async fn validate_digest_key(&self) -> Result<(), anyhow::Error> {
-        // Acquire the prekey upload lock for the entire validation pass so any
-        // upload triggered by a divergence signal can't race with
-        // `upload_pre_keys_at_login`, `handle_prekey_low`, or `refresh_pre_keys`,
-        // which all use the same lock to serialize access to `next_pre_key_id`
-        // and the storage backend.
+        // Hold the lock across the whole pass so the 404 re-upload can't race with
+        // `upload_pre_keys_at_login`, `handle_prekey_low`, or `refresh_pre_keys` on
+        // `next_pre_key_id` allocation.
         let _guard = self.prekey_upload_lock.lock().await;
 
         let response = match self.execute(DigestKeyBundleSpec::new()).await {
@@ -328,25 +321,17 @@ impl Client {
             }
         };
 
-        // WA Web's validateLocalKeyBundle catches ALL exceptions without re-uploading.
-        // We diverge here: for the divergence signals (regId mismatch, hash mismatch,
-        // missing local prekey), force a fresh upload. WA Web can rely on browser
-        // localStorage stability; Rust clients hit divergence more often (SQLite
-        // restores, re-pairs, partial backups), and the "log + skip" behavior leaves
-        // peers permanently unable to establish sessions because the bundle they
-        // fetch from the server points to material the bot no longer has.
-        //
-        // Transient/corruption cases (batch-load failure, prekey record with no pub
-        // key) still log + skip — re-uploading won't help and the next digest cycle
-        // will retry.
+        // WA Web's validateLocalKeyBundle validates but catches ALL exceptions without
+        // re-uploading. The catch block in digestKey() sets a=false for any throw from y(),
+        // meaning only 404 triggers re-upload. We match that: log warnings, return Ok(()).
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
         if response.reg_id != device_snapshot.registration_id {
             log::warn!(
-                "digestKey: registration ID mismatch (server={}, local={}), forcing re-upload",
+                "digestKey: registration ID mismatch (server={}, local={}), skipping",
                 response.reg_id,
                 device_snapshot.registration_id
             );
-            return self.upload_pre_keys_with_retry(true).await;
+            return Ok(());
         }
 
         // Compute local SHA-1 digest over the same material as WA Web's validateLocalKeyBundle:
@@ -378,21 +363,18 @@ impl Client {
 
         if loaded_map.len() < unique_requested.len() {
             log::warn!(
-                "digestKey: missing {} local prekeys, forcing re-upload",
+                "digestKey: missing {} local prekeys, skipping",
                 unique_requested.len() - loaded_map.len()
             );
-            return self.upload_pre_keys_with_retry(true).await;
+            return Ok(());
         }
 
         // Extract public keys directly from stored protobuf bytes without full decode
         let mut prekey_pubkeys = Vec::with_capacity(response.prekey_ids.len());
         for prekey_id in &response.prekey_ids {
             let Some(record_bytes) = loaded_map.get(prekey_id) else {
-                log::warn!(
-                    "digestKey: missing local prekey {}, forcing re-upload",
-                    prekey_id
-                );
-                return self.upload_pre_keys_with_retry(true).await;
+                log::warn!("digestKey: missing local prekey {}, skipping", prekey_id);
+                return Ok(());
             };
             match wacore::prekeys::extract_prekey_public_key(record_bytes) {
                 Some(pk) => prekey_pubkeys.push(pk),
@@ -415,11 +397,11 @@ impl Client {
 
         if local_hash.as_slice() != response.hash.as_slice() {
             log::warn!(
-                "digestKey: hash mismatch (server={}, local={}), forcing re-upload",
+                "digestKey: hash mismatch (server={}, local={}), skipping",
                 hex::encode(&response.hash),
                 hex::encode(local_hash)
             );
-            return self.upload_pre_keys_with_retry(true).await;
+            return Ok(());
         }
 
         log::debug!("digestKey: key bundle validation successful");
