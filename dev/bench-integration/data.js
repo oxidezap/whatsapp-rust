@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779893279530,
+  "lastUpdate": 1779894312824,
   "repoUrl": "https://github.com/oxidezap/whatsapp-rust",
   "entries": {
     "whatsapp-rust integration benchmarks": [
@@ -8777,6 +8777,120 @@ window.BENCHMARK_DATA = {
           {
             "name": "integration::reconnect::wall_ms",
             "value": 8,
+            "unit": "milliseconds"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jlucaso@hotmail.com",
+            "name": "João Lucas",
+            "username": "jlucaso1"
+          },
+          "committer": {
+            "email": "jlucaso@hotmail.com",
+            "name": "João Lucas",
+            "username": "jlucaso1"
+          },
+          "distinct": true,
+          "id": "89bba0a208cc36e5141874fc1c47cccc020e07e2",
+          "message": "chore(deps): bulk-update dependencies via cargo update\n\nSupersedes the open Dependabot PRs in one commit:\n- serde_json 1.0.149 -> 1.0.150 (#640)\n- log 0.4.29 -> 0.4.30 (#639)\n- cbc 0.2.0 -> 0.2.1 (#638)\n- http 1.4.0 -> 1.4.1 (#637)\n- libsqlite3-sys 0.36 -> 0.37 (#622)\n\nAlso pulls compatible transitive bumps (aes-gcm rc.4, aes, cipher,\ncrypto-common, diesel 2.3.9, wasm-bindgen, winnow, etc.). libsqlite3-sys\nand http manifest pins bumped to match. clippy --all-targets -D warnings\nand the non-e2e test suite pass.",
+          "timestamp": "2026-05-27T12:01:20-03:00",
+          "tree_id": "3d9a78f6f5e8468195ac2665e91840633ea52435",
+          "url": "https://github.com/oxidezap/whatsapp-rust/commit/89bba0a208cc36e5141874fc1c47cccc020e07e2"
+        },
+        "date": 1779894311136,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "integration::connect_to_ready::alloc_count",
+            "value": 13107,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::connect_to_ready::alloc_bytes",
+            "value": 3800179,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::connect_to_ready::wall_ms",
+            "value": 344,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_message::alloc_count",
+            "value": 1119,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_message::alloc_bytes",
+            "value": 184428,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_message::wall_ms",
+            "value": 0,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_message_x20_amortized::alloc_count",
+            "value": 449,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_message_x20_amortized::alloc_bytes",
+            "value": 107329,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_message_x20_amortized::wall_ms",
+            "value": 0,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_and_receive_message::alloc_count",
+            "value": 3320,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_and_receive_message::alloc_bytes",
+            "value": 552603,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_and_receive_message::wall_ms",
+            "value": 0,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_and_receive_x20_amortized::alloc_count",
+            "value": 496,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_and_receive_x20_amortized::alloc_bytes",
+            "value": 126314,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_and_receive_x20_amortized::wall_ms",
+            "value": 41,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::reconnect::alloc_count",
+            "value": 991,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::reconnect::alloc_bytes",
+            "value": 217384,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::reconnect::wall_ms",
+            "value": 7,
             "unit": "milliseconds"
           }
         ]
