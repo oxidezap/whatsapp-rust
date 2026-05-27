@@ -1382,10 +1382,22 @@ impl Client {
             .await;
         }
 
+        // app_state_sync_key_share is a self-only protocol message (app-state
+        // sync keys shared between our own devices). A peer could otherwise
+        // inject keys and forge app-state mutations, so honour it only from
+        // self. WA Web `WAWebKeyManagementHandleKeyShareApi` gates on
+        // `isMeAccountNonLid(from)`; whatsmeow on `info.IsFromMe`.
         if let Some(protocol_msg) = &msg.protocol_message
             && let Some(keys) = &protocol_msg.app_state_sync_key_share
         {
-            self.handle_app_state_sync_key_share(keys).await;
+            if info.source.is_from_me {
+                self.handle_app_state_sync_key_share(keys).await;
+            } else {
+                warn!(
+                    "[msg:{}] Dropping app_state_sync_key_share from non-self sender {}",
+                    info.id, info.source.sender
+                );
+            }
         }
 
         // PDO responses come from our own account (is_from_me) via device 0 (primary phone)
@@ -1402,9 +1414,20 @@ impl Client {
             .as_mut()
             .and_then(|pm| pm.history_sync_notification.take());
 
+        // history_sync_notification is self-only (our phone drives history sync).
+        // A spoofed one from a peer would force a download of attacker-controlled
+        // history, so honour it only from self. WA Web
+        // `WAWebHandleHistorySyncNotification` gates on `isMePrimaryNonLid`.
         if let Some(history_sync) = history_sync_taken {
-            self.handle_history_sync(info.id.clone(), history_sync)
-                .await;
+            if info.source.is_from_me {
+                self.handle_history_sync(info.id.clone(), history_sync)
+                    .await;
+            } else {
+                warn!(
+                    "[msg:{}] Dropping history_sync_notification from non-self sender {}",
+                    info.id, info.source.sender
+                );
+            }
         }
 
         // Skip dispatch for messages that only carry sender key distribution
@@ -6704,6 +6727,76 @@ mod tests {
         assert!(
             !transport.sent().is_empty(),
             "spawn_nack must produce at least one outbound frame on the wire"
+        );
+    }
+
+    /// Security regression: a self-only `app_state_sync_key_share` protocol
+    /// message must be honoured only when it originates from our own account.
+    /// A spoofed one from a peer must be dropped (otherwise a peer could inject
+    /// app-state sync keys). Mirrors WA Web `WAWebKeyManagementHandleKeyShareApi`
+    /// and whatsmeow's `handleProtocolMessage` self gate.
+    #[tokio::test]
+    async fn app_state_sync_key_share_honored_only_from_self() {
+        use wacore::messages::MessageUtils;
+
+        let client = crate::test_utils::create_test_client().await;
+        ensure_bob_paired(&client).await;
+
+        let key_id = vec![1u8, 2, 3, 4, 5, 6];
+        let share = wa::Message {
+            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+                app_state_sync_key_share: Some(wa::message::AppStateSyncKeyShare {
+                    keys: vec![wa::message::AppStateSyncKey {
+                        key_id: Some(wa::message::AppStateSyncKeyId {
+                            key_id: Some(key_id.clone()),
+                        }),
+                        key_data: Some(wa::message::AppStateSyncKeyData {
+                            key_data: Some(vec![7u8; 32]),
+                            fingerprint: Some(wa::message::AppStateSyncKeyFingerprint {
+                                raw_id: Some(1),
+                                current_index: Some(0),
+                                device_indexes: vec![0],
+                            }),
+                            timestamp: Some(123),
+                        }),
+                    }],
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let padded = MessageUtils::encode_and_pad(&share);
+        let backend = client.persistence_manager.backend();
+
+        // Non-self sender: the key share must be dropped.
+        let mut info =
+            create_test_message_info("5510000@s.whatsapp.net", "AKS1", "5510000@s.whatsapp.net");
+        info.source.is_from_me = false;
+        client
+            .clone()
+            .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+            .await
+            .unwrap();
+        assert!(
+            backend.get_sync_key(&key_id).await.unwrap().is_none(),
+            "app-state sync key from a non-self sender must not be stored"
+        );
+
+        // Self sender: the key share is honoured and stored.
+        let mut info = create_test_message_info(
+            "9000000000000@s.whatsapp.net",
+            "AKS2",
+            "9000000000000@s.whatsapp.net",
+        );
+        info.source.is_from_me = true;
+        client
+            .clone()
+            .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+            .await
+            .unwrap();
+        assert!(
+            backend.get_sync_key(&key_id).await.unwrap().is_some(),
+            "app-state sync key from self must be stored"
         );
     }
 }
