@@ -143,6 +143,62 @@ pub fn decrypt_poll_vote(
     Ok(vote_msg.selected_options)
 }
 
+/// Addressing pair fed into the poll-vote HKDF + AAD. JIDs must be in the
+/// form they were sent/received under (AD suffix already stripped); the caller
+/// owns any LID↔PN normalisation. See [`decrypt_poll_vote_with_fallback`].
+#[derive(Debug, Clone, Copy)]
+pub struct PollVoteAddressing<'a> {
+    pub poll_creator_jid: &'a str,
+    pub voter_jid: &'a str,
+}
+
+/// Decrypt a poll vote, retrying once under an alternate addressing pair.
+///
+/// Mirrors WA Web's `WAWebAddonEncryption.decryptAddOn`, which opens the
+/// AES-GCM payload across addressing modes (LID pair, then PN pair) because
+/// both the poll creator and voter JIDs feed the HKDF info buffer and the AAD
+/// (`WAUseCaseSecret.createUseCaseSecret`): a vote authored under one namespace
+/// only decrypts with the same namespace. As WhatsApp migrates contacts to
+/// LID, a vote can be received under one addressing but the parent poll learned
+/// under the other, so a single attempt silently fails.
+///
+/// `primary` is the as-received pair; `fallback` is the swapped pair with
+/// *both* JIDs converted together, matching WA Web's homogeneous LID/PN
+/// attempts (it never mixes one LID with one PN).
+pub fn decrypt_poll_vote_with_fallback(
+    enc_payload: &[u8],
+    iv: &[u8],
+    message_secret: &[u8],
+    stanza_id: &str,
+    primary: PollVoteAddressing<'_>,
+    fallback: Option<PollVoteAddressing<'_>>,
+) -> Result<Vec<Vec<u8>>> {
+    match decrypt_poll_vote_with_secret(
+        enc_payload,
+        iv,
+        message_secret,
+        stanza_id,
+        primary.poll_creator_jid,
+        primary.voter_jid,
+    ) {
+        Ok(v) => Ok(v),
+        Err(primary_err) => match fallback {
+            Some(fb) => decrypt_poll_vote_with_secret(
+                enc_payload,
+                iv,
+                message_secret,
+                stanza_id,
+                fb.poll_creator_jid,
+                fb.voter_jid,
+            )
+            .map_err(|fb_err| {
+                anyhow!("poll vote decrypt failed: primary={primary_err}; fallback={fb_err}")
+            }),
+            None => Err(primary_err),
+        },
+    }
+}
+
 /// Decrypt a poll vote given the poll's `messageSecret` directly. Preferred
 /// over the legacy two-step path that splits derive+decrypt.
 pub fn decrypt_poll_vote_with_secret(
@@ -234,6 +290,138 @@ mod tests {
                 "id",
                 "c@s.whatsapp.net",
                 "wrong@s.whatsapp.net"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fallback_recovers_across_addressing() {
+        // Vote encrypted under the PN pair (creator + voter both PN)...
+        let secret = [0x33u8; 32];
+        let stanza_id = "3EB0FALLBACK";
+        let creator_pn = "5511999999999@s.whatsapp.net";
+        let voter_pn = "5511888888888@s.whatsapp.net";
+        let (enc, iv) = encrypt_poll_vote_with_secret(
+            &[compute_option_hash("Yes").to_vec()],
+            &secret,
+            stanza_id,
+            creator_pn,
+            voter_pn,
+        )
+        .unwrap();
+
+        // ...consumer first guesses the LID pair (primary), which fails, then
+        // recovers via the PN fallback. Mirrors WA Web's homogeneous retry.
+        let creator_lid = "111111111111111@lid";
+        let voter_lid = "222222222222222@lid";
+        let out = decrypt_poll_vote_with_fallback(
+            &enc,
+            &iv,
+            &secret,
+            stanza_id,
+            PollVoteAddressing {
+                poll_creator_jid: creator_lid,
+                voter_jid: voter_lid,
+            },
+            Some(PollVoteAddressing {
+                poll_creator_jid: creator_pn,
+                voter_jid: voter_pn,
+            }),
+        )
+        .unwrap();
+        assert_eq!(out, vec![compute_option_hash("Yes").to_vec()]);
+    }
+
+    #[test]
+    fn fallback_primary_succeeds_without_using_fallback() {
+        let secret = [0x44u8; 32];
+        let stanza_id = "id";
+        let creator = "c@s.whatsapp.net";
+        let voter = "v@s.whatsapp.net";
+        let (enc, iv) = encrypt_poll_vote_with_secret(
+            &[compute_option_hash("A").to_vec()],
+            &secret,
+            stanza_id,
+            creator,
+            voter,
+        )
+        .unwrap();
+
+        // Primary matches; a deliberately-wrong fallback must never be reached.
+        let out = decrypt_poll_vote_with_fallback(
+            &enc,
+            &iv,
+            &secret,
+            stanza_id,
+            PollVoteAddressing {
+                poll_creator_jid: creator,
+                voter_jid: voter,
+            },
+            Some(PollVoteAddressing {
+                poll_creator_jid: "wrong@lid",
+                voter_jid: "wrong@lid",
+            }),
+        )
+        .unwrap();
+        assert_eq!(out, vec![compute_option_hash("A").to_vec()]);
+    }
+
+    #[test]
+    fn fallback_combined_error_when_both_fail() {
+        let secret = [0x55u8; 32];
+        let stanza_id = "id";
+        let (enc, iv) = encrypt_poll_vote_with_secret(
+            &[compute_option_hash("A").to_vec()],
+            &secret,
+            stanza_id,
+            "c@s.whatsapp.net",
+            "v@s.whatsapp.net",
+        )
+        .unwrap();
+
+        let err = decrypt_poll_vote_with_fallback(
+            &enc,
+            &iv,
+            &secret,
+            stanza_id,
+            PollVoteAddressing {
+                poll_creator_jid: "x@lid",
+                voter_jid: "y@lid",
+            },
+            Some(PollVoteAddressing {
+                poll_creator_jid: "x@s.whatsapp.net",
+                voter_jid: "y@s.whatsapp.net",
+            }),
+        )
+        .unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("primary="), "got: {s}");
+        assert!(s.contains("fallback="), "got: {s}");
+    }
+
+    #[test]
+    fn fallback_none_propagates_primary_error() {
+        let secret = [0x66u8; 32];
+        let (enc, iv) = encrypt_poll_vote_with_secret(
+            &[compute_option_hash("A").to_vec()],
+            &secret,
+            "id",
+            "c@s.whatsapp.net",
+            "v@s.whatsapp.net",
+        )
+        .unwrap();
+        assert!(
+            decrypt_poll_vote_with_fallback(
+                &enc,
+                &iv,
+                &secret,
+                "id",
+                PollVoteAddressing {
+                    poll_creator_jid: "wrong@lid",
+                    voter_jid: "wrong@lid",
+                },
+                None,
             )
             .is_err()
         );
