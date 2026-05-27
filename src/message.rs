@@ -73,6 +73,16 @@ pub(crate) struct ClassifiedMessage {
 /// WhatsApp Web logs metrics when retry count exceeds this value.
 const HIGH_RETRY_COUNT_THRESHOLD: u8 = 3;
 
+/// `decrypt-fail="hide"` failures are expected (addon/fan-out), so log them at
+/// DEBUG to avoid WARN spam. Mode never changes control flow: retry + ack still
+/// fire (WA Web retries regardless of `hide`).
+fn decrypt_fail_log_level(mode: crate::types::events::DecryptFailMode) -> log::Level {
+    match mode {
+        crate::types::events::DecryptFailMode::Hide => log::Level::Debug,
+        crate::types::events::DecryptFailMode::Show => log::Level::Warn,
+    }
+}
+
 pub(crate) use wacore::protocol::retry::RetryReason;
 
 impl Client {
@@ -88,16 +98,36 @@ impl Client {
                 msg.get_base_message().get_ephemeral_expiration();
         }
 
-        // Tracked so `disconnect()` can flush in-flight receipts (issue #571).
-        let client_clone = self.clone();
-        let info_for_receipt = Arc::clone(&info);
-        self.outbound_flush.spawn(&*self.runtime, async move {
-            client_clone.send_delivery_receipt(&info_for_receipt).await;
-        });
+        self.ack_received_message(&info);
 
         self.core
             .event_bus
             .dispatch(Event::Message(Arc::new(msg), info));
+    }
+
+    /// Acknowledge a received message so the server drops it from the offline
+    /// queue: a delivery receipt when applicable, else a transport ack for
+    /// own-account fan-out (its receipt is suppressed but the stanza still needs
+    /// clearing; the ack carries the correct to=from). status is acked by the
+    /// `should_ack` gate, newsletters/empty ids need nothing here.
+    fn ack_received_message(self: &Arc<Self>, info: &Arc<MessageInfo>) {
+        if info.id.is_empty() || info.source.chat.is_newsletter() {
+            return;
+        }
+        if Self::should_send_delivery_receipt(info) {
+            self.spawn_delivery_receipt(info);
+        } else if !info.source.chat.is_status_broadcast() {
+            self.spawn_message_ack(info);
+        }
+    }
+
+    /// Spawn a delivery receipt, tracked so `disconnect()` can flush it (issue #571).
+    fn spawn_delivery_receipt(self: &Arc<Self>, info: &Arc<MessageInfo>) {
+        let client = self.clone();
+        let info = Arc::clone(info);
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            client.send_delivery_receipt(&info).await;
+        });
     }
 
     /// Handles a newsletter plaintext message.
@@ -180,8 +210,17 @@ impl Client {
         was_fresh
     }
 
-    /// Dispatch an undecryptable event (once per msg id, matching WA Web's
-    /// DB-level placeholder uniqueness) and spawn a retry receipt.
+    /// Dispatch an undecryptable event, then send the retry receipt and the
+    /// transport ack in one ordered, flushed task.
+    ///
+    /// The retry asks the sender to re-encrypt; the ack clears the stanza from
+    /// the server's offline queue (the retry alone does not). Both run in a
+    /// single `outbound_flush` task so `disconnect()` flushes them together and
+    /// the retry always goes out before the ack: if only one makes it, it is the
+    /// retry, so the message is never cleared without a resend request. status is
+    /// also acked here (flushed) rather than relying on the detached `should_ack`
+    /// gate, which can be dropped mid-flush on disconnect; the server dedups the
+    /// resulting duplicate ack.
     ///
     /// Returns `true` to be assigned to `dispatched_undecryptable` flag.
     async fn handle_decrypt_failure(
@@ -197,7 +236,16 @@ impl Client {
             decrypt_fail_mode,
         )
         .await;
-        self.spawn_retry_receipt(info, reason);
+        let client = Arc::clone(self);
+        let info = Arc::clone(info);
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            // Only ack once the resend request is actually out; otherwise leave
+            // the stanza queued so the server redelivers and we retry.
+            let resend_sent = client.run_retry_receipt(&info, reason).await;
+            if resend_sent {
+                client.send_transport_ack(&info).await;
+            }
+        });
         true
     }
 
@@ -265,66 +313,79 @@ impl Client {
     /// # Arguments
     /// * `info` - The message info for the failed message
     /// * `reason` - The retry reason code (matches WhatsApp Web's RetryReason enum)
+    #[cfg(test)]
     fn spawn_retry_receipt(self: &Arc<Self>, info: &Arc<MessageInfo>, reason: RetryReason) {
         let client = Arc::clone(self);
         let info = Arc::clone(info);
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            client.run_retry_receipt(&info, reason).await;
+        });
+    }
 
-        self.runtime.spawn(Box::pin(async move {
-            let cache_key = client
-                .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
-                .await;
+    /// Increment the retry count and send the retry receipt (or, at the cap, a
+    /// last-resort PDO). Awaitable so it can be ordered before the transport ack.
+    ///
+    /// Returns whether the caller should send the ack: `false` when we intended
+    /// to retry but the send failed (so the stanza stays queued for another try),
+    /// `true` when the resend went out or we deliberately gave up at the cap.
+    async fn run_retry_receipt(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        reason: RetryReason,
+    ) -> bool {
+        let cache_key = self
+            .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+            .await;
 
-            // Atomically increment retry count and check if we should continue
-            let Some(retry_count) = client.increment_retry_count(&cache_key, reason).await else {
-                // Max retries reached
-                log::info!(
-                    "Max retries ({}) reached for message {} from {} [{:?}]. Sending immediate PDO request.",
-                    MAX_DECRYPT_RETRIES,
-                    info.id,
-                    info.source.sender,
-                    reason
+        let Some(retry_count) = self.increment_retry_count(&cache_key, reason).await else {
+            log::info!(
+                "Max retries ({}) reached for message {} from {} [{:?}]. Sending immediate PDO request.",
+                MAX_DECRYPT_RETRIES,
+                info.id,
+                info.source.sender,
+                reason
+            );
+            // Capped: give up and clear the backlog regardless of PDO outcome.
+            self.run_pdo_request(info).await;
+            return true;
+        };
+
+        if retry_count > HIGH_RETRY_COUNT_THRESHOLD {
+            log::warn!(
+                "High retry count ({}) for message {} from {} [{:?}]",
+                retry_count,
+                info.id,
+                info.source.sender,
+                reason
+            );
+        }
+
+        let retry_sent = match self.send_retry_receipt(info, retry_count, reason).await {
+            Ok(()) => {
+                debug!(
+                    "Sent retry receipt #{} for message {} from {} [{:?}]",
+                    retry_count, info.id, info.source.sender, reason
                 );
-                // Send PDO request immediately (no delay) as last resort
-                client.spawn_pdo_request_with_options(&info, true);
-                return;
-            };
-
-            // Log warning for high retry counts (like WhatsApp Web's MessageHighRetryCount)
-            if retry_count > HIGH_RETRY_COUNT_THRESHOLD {
-                log::warn!(
-                    "High retry count ({}) for message {} from {} [{:?}]",
+                true
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to send retry receipt #{} for message {} [{:?}]: {:?}",
                     retry_count,
                     info.id,
-                    info.source.sender,
-                    reason
+                    reason,
+                    e
                 );
+                false
             }
+        };
 
-            // Send the retry receipt with the actual retry count and reason
-            match client.send_retry_receipt(&info, retry_count, reason).await {
-                Ok(()) => {
-                    debug!(
-                        "Sent retry receipt #{} for message {} from {} [{:?}]",
-                        retry_count, info.id, info.source.sender, reason
-                    );
-                }
-                Err(e) => {
-                    log::error!(
-                        "Failed to send retry receipt #{} for message {} [{:?}]: {:?}",
-                        retry_count,
-                        info.id,
-                        reason,
-                        e
-                    );
-                }
-            }
-
-            // Only spawn PDO on the FIRST retry to avoid duplicate requests.
-            // The PDO cache also provides deduplication, but this reduces unnecessary work.
-            if retry_count == 1 {
-                client.spawn_pdo_request(&info);
-            }
-        })).detach();
+        // First retry only, to avoid duplicate PDO requests. Awaited so it runs
+        // before the caller's ack; the retry receipt already landed first.
+        if retry_count == 1 {
+            self.run_pdo_request(info).await;
+        }
+        retry_sent
     }
 
     pub(crate) async fn handle_incoming_message(self: Arc<Self>, node: Arc<OwnedNodeRef>) {
@@ -414,8 +475,10 @@ impl Client {
                 info.id,
                 unavailable_type
             );
-            // Ack is handled by the framework; PDO asks the primary phone to relay the message
-            self.spawn_pdo_request_with_options(&info, true);
+            // PDO is the only recovery here (no retry receipt), so run it before
+            // the transport ack in one flush task: the ack must not clear the
+            // offline queue before the PDO request goes out. status is acked by
+            // the should_ack gate. Mirrors whatsmeow's request-then-ack.
             self.dispatch_undecryptable_event(
                 Arc::clone(&info),
                 true,
@@ -423,6 +486,17 @@ impl Client {
                 crate::types::events::DecryptFailMode::Show,
             )
             .await;
+            let client = Arc::clone(self);
+            let info2 = Arc::clone(&info);
+            let skip_ack = info.source.chat.is_status_broadcast();
+            self.outbound_flush.spawn(&*self.runtime, async move {
+                // Only ack once the PDO request is out (or skipped as ancient);
+                // a transient send failure leaves it queued for redelivery.
+                let pdo_sent = client.run_pdo_request(&info2).await;
+                if !skip_ack && pdo_sent {
+                    client.send_transport_ack(&info2).await;
+                }
+            });
             return None;
         }
 
@@ -679,9 +753,11 @@ impl Client {
                             info.source.sender
                         );
                     } else {
-                        warn!(
+                        log::log!(
+                            decrypt_fail_log_level(decrypt_fail_mode),
                             "Skipping skmsg decryption for message {} from {} because pkmsg failed to decrypt.",
-                            info.id, info.source.sender
+                            info.id,
+                            info.source.sender
                         );
                         if !session_dispatched_undecryptable {
                             self.dispatch_undecryptable_event(
@@ -708,9 +784,11 @@ impl Client {
             && !session_payloads.is_empty()
         {
             // Edge case: message with only msg/pkmsg that failed to decrypt, no skmsg
-            warn!(
+            log::log!(
+                decrypt_fail_log_level(decrypt_fail_mode),
                 "Message {} from {} failed to decrypt and has no group content. Dispatching UndecryptableMessage event.",
-                info.id, info.source.sender
+                info.id,
+                info.source.sender
             );
             // Dispatch UndecryptableMessage event for messages that failed to decrypt
             // (This should not cause double-dispatching since process_session_enc_batch
@@ -723,6 +801,17 @@ impl Client {
             )
             .await;
             // Do NOT send delivery receipt - transport ack is sufficient
+        } else if session_had_duplicates
+            && !session_decrypted_successfully
+            && !session_dispatched_undecryptable
+            && !info.source.chat.is_status_broadcast()
+        {
+            // Duplicate (already-processed) with no group content: ack it so the
+            // server drops it from the offline queue (whatsmeow/WA Web treat
+            // old-counter like success). status is acked by the should_ack gate
+            // (a status SKDM pkmsg can reach here), so skip it to avoid a
+            // redundant receipt.
+            self.ack_received_message(&info);
         }
 
         // Flush cached Signal state to DB (matches WA Web's flushBufferToDiskIfNotMemOnlyMode)
@@ -1111,7 +1200,8 @@ impl Client {
                         } else {
                             (RetryReason::InvalidMessage, "InvalidMessage")
                         };
-                        log::warn!(
+                        log::log!(
+                            decrypt_fail_log_level(decrypt_fail_mode),
                             "[msg:{}] Decryption failed for {} message from {} due to {label}. \
                              Sending retry receipt.",
                             info.id,
@@ -1260,7 +1350,12 @@ impl Client {
                         iteration,
                         counter
                     );
-                    // This is expected when messages are redelivered, just continue silently
+                    // Redelivered duplicate: ack it so the server drops it from the
+                    // offline queue. status is already acked by the should_ack gate,
+                    // so skip it to avoid a redundant receipt.
+                    if !info.source.chat.is_status_broadcast() {
+                        self.ack_received_message(info);
+                    }
                 }
                 Err(SignalProtocolError::NoSenderKeyState(msg)) => {
                     if info.is_expired_status() {
@@ -1302,13 +1397,27 @@ impl Client {
                         continue;
                     }
 
-                    log::error!(
+                    log::log!(
+                        decrypt_fail_log_level(decrypt_fail_mode),
                         "Group batch decrypt failed [msg:{}] for group {} sender {}: {:?}",
                         info.id,
                         sender_key_name.group_id(),
                         sender_key_name.sender_id(),
                         e
                     );
+                    // Always surface the failure to consumers; nack only non-status
+                    // (status is acked by the should_ack gate) so the server drops
+                    // it from the offline queue.
+                    self.dispatch_undecryptable_event(
+                        Arc::clone(info),
+                        false,
+                        crate::types::events::UnavailableType::Unknown,
+                        decrypt_fail_mode,
+                    )
+                    .await;
+                    if !info.source.chat.is_status_broadcast() {
+                        self.spawn_nack(info, NackReason::UnhandledError, None);
+                    }
                 }
             }
         }
@@ -6397,7 +6506,7 @@ mod tests {
 
         assert_eq!(info.source.chat.server, wacore_binary::Server::Broadcast);
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
@@ -6414,7 +6523,7 @@ mod tests {
 
         assert_eq!(info.source.chat.server, wacore_binary::Server::Broadcast);
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
@@ -6430,7 +6539,7 @@ mod tests {
 
         assert_ne!(info.source.chat.server, wacore_binary::Server::Broadcast);
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
@@ -6446,7 +6555,7 @@ mod tests {
         info.source.is_from_me = true;
         let info = Arc::new(info);
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
@@ -6465,7 +6574,7 @@ mod tests {
 
         let cache_key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         assert!(
@@ -6491,7 +6600,7 @@ mod tests {
 
         let cache_key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         assert!(
@@ -6728,6 +6837,423 @@ mod tests {
             !transport.sent().is_empty(),
             "spawn_nack must produce at least one outbound frame on the wire"
         );
+    }
+
+    #[test]
+    fn test_decrypt_fail_log_level_gated_on_hide() {
+        use crate::types::events::DecryptFailMode;
+        assert_eq!(
+            decrypt_fail_log_level(DecryptFailMode::Hide),
+            log::Level::Debug
+        );
+        assert_eq!(
+            decrypt_fail_log_level(DecryptFailMode::Show),
+            log::Level::Warn
+        );
+    }
+
+    /// Decrypt one captured noise frame (zero-key, counter-based, empty AAD) to
+    /// its marshalled node bytes; strips the 3-byte frame header.
+    fn decode_frame(index: usize, frame: &[u8]) -> Option<Vec<u8>> {
+        use wacore::handshake::NoiseCipher;
+        if frame.len() <= 3 {
+            return None;
+        }
+        let cipher = NoiseCipher::new(&[0u8; 32]).expect("32-byte key");
+        let mut buf = frame[3..].to_vec();
+        cipher
+            .decrypt_in_place_with_counter(index as u32, &mut buf)
+            .ok()?;
+        (!buf.is_empty()).then_some(buf)
+    }
+
+    /// First `<ack class="message">` on the wire as `(to, recipient)`.
+    fn find_message_ack(frames: &[bytes::Bytes]) -> Option<(String, Option<String>)> {
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "ack"
+                && node
+                    .get_attr("class")
+                    .is_some_and(|v| v.as_str() == "message")
+                && let Some(to) = node.get_attr("to")
+            {
+                let recipient = node.get_attr("recipient").map(|v| v.as_str().to_string());
+                return Some((to.as_str().to_string(), recipient));
+            }
+        }
+        None
+    }
+
+    /// Count delivery `<receipt>` (anything but type="retry") on the wire for `id`.
+    fn delivery_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize {
+        let mut count = 0;
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "receipt"
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && node
+                    .get_attr("type")
+                    .as_ref()
+                    .map(|v| v.as_str())
+                    .as_deref()
+                    != Some("retry")
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// A stanza that fails to decrypt must emit a transport `<ack class="message">`
+    /// (else the server replays it on every reconnect forever), addressed to the
+    /// original `from` echoing `recipient`. Uses `Hide` (the production reactions
+    /// carried `decrypt-fail="hide"`) to also guard that hide does not suppress
+    /// the ack. BadMac so the retry carries no keys (no device account needed).
+    #[tokio::test]
+    async fn decrypt_failure_emits_transport_ack() {
+        let (client, transport) = capturing_client("decrypt_fail_ack").await;
+
+        let sender: Jid = "236395184570386@lid".parse().expect("sender JID");
+        let recipient: Jid = "156535032389744@lid".parse().expect("recipient JID");
+        let info = Arc::new(MessageInfo {
+            id: "AC055553E56A2C12DE592DAD6353C477".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: sender.clone(),
+                chat: recipient.clone(),
+                recipient: Some(recipient.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::BadMac,
+                crate::types::events::DecryptFailMode::Hide,
+            )
+            .await;
+
+        // retry + ack are detached spawns; poll the wire until the ack appears.
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, recipient_attr) = found.expect(
+            "decrypt failure must emit a transport <ack class=message> \
+             (else the server redelivers the stanza forever)",
+        );
+        assert_eq!(
+            to, "236395184570386@lid",
+            "ack `to` must be the original `from` (own LID), not the chat"
+        );
+        assert_eq!(
+            recipient_attr.as_deref(),
+            Some("156535032389744@lid"),
+            "ack must echo `recipient` for own-account fan-out"
+        );
+    }
+
+    /// If the resend request fails to send, the stanza must NOT be acked, so the
+    /// server keeps it queued for another try. Here NoSession needs keys, which
+    /// need a device account this harness lacks, so send_retry_receipt errors.
+    #[tokio::test]
+    async fn decrypt_failure_does_not_ack_when_retry_send_fails() {
+        let (client, transport) = capturing_client("retry_fail_no_ack").await;
+        let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
+        let info = Arc::new(MessageInfo {
+            id: "NOACK1".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: sender.clone(),
+                chat: sender.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::NoSession,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            find_message_ack(&transport.sent()).is_none(),
+            "must not ack when the resend request failed to send"
+        );
+    }
+
+    /// The retry receipt must be sent before the transport ack (one ordered
+    /// flushed task), so a disconnect mid-flush can never clear the stanza from
+    /// the offline queue without the sender having received a resend request.
+    #[tokio::test]
+    async fn decrypt_failure_sends_retry_before_ack() {
+        let (client, transport) = capturing_client("retry_before_ack").await;
+        let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
+        let info = Arc::new(MessageInfo {
+            id: "RBA1".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: sender.clone(),
+                chat: sender.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        // BadMac (not NoSession) so the retry receipt carries no keys and needs
+        // no device account in this harness.
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::BadMac,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+
+        let find = |tag: &str, retry: bool| -> Option<usize> {
+            let frames = transport.sent();
+            for (i, frame) in frames.iter().enumerate() {
+                let Some(buf) = decode_frame(i, frame) else {
+                    continue;
+                };
+                let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                    continue;
+                };
+                let is_retry = node.get_attr("type").is_some_and(|v| v.as_str() == "retry");
+                if node.tag.as_ref() == tag && is_retry == retry {
+                    return Some(i);
+                }
+            }
+            None
+        };
+
+        let mut retry_idx = None;
+        let mut ack_idx = None;
+        for _ in 0..80 {
+            retry_idx = find("receipt", true);
+            ack_idx = find("ack", false);
+            if retry_idx.is_some() && ack_idx.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let retry_idx = retry_idx.expect("retry receipt must be sent");
+        let ack_idx = ack_idx.expect("transport ack must be sent");
+        assert!(
+            retry_idx < ack_idx,
+            "retry receipt (frame {retry_idx}) must be sent before the ack (frame {ack_idx})"
+        );
+    }
+
+    /// status@broadcast is already acked by the `should_ack` gate post-dispatch,
+    /// so the decrypt-failure path must NOT emit a second transport ack
+    /// (whatsmeow/WA Web send exactly one per message). The retry receipt still
+    /// goes out.
+    #[tokio::test]
+    async fn status_broadcast_decrypt_failure_acks_to_chat() {
+        let (client, transport) = capturing_client("status_fail_ack").await;
+        let info = Arc::new(MessageInfo {
+            id: "STATUSMSGID".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "236395184570386@lid".parse().expect("sender"),
+                chat: "status@broadcast".parse().expect("status chat"),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::BadMac,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+
+        // status failures are acked from the flushed task (not just the detached
+        // should_ack gate), so the ack survives a disconnect mid-flush.
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, _) = found.expect("status failure must emit a flushed transport ack");
+        assert_eq!(
+            to, "status@broadcast",
+            "status ack `to` must be the status chat"
+        );
+    }
+
+    /// Run a single session ciphertext through the full classify->process path.
+    async fn process_session_ct(
+        client: &Arc<Client>,
+        sender: &Jid,
+        id: &str,
+        ct: &wacore::libsignal::protocol::CiphertextMessage,
+    ) {
+        use wacore::libsignal::protocol::CiphertextMessage;
+        let (enc_type, bytes) = match ct {
+            CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
+            CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
+            _ => panic!("unexpected ciphertext type"),
+        };
+        let enc = NodeBuilder::new("enc")
+            .attr("type", enc_type)
+            .bytes(bytes)
+            .build();
+        let enc_ref = enc.as_node_ref();
+        let payload = EncPayload::from_node_ref(&enc_ref).unwrap();
+        let info = Arc::new(MessageInfo {
+            id: id.to_string(),
+            source: crate::types::message::MessageSource {
+                sender: sender.clone(),
+                chat: sender.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client
+            .clone()
+            .process_classified_message(ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads: vec![payload],
+                group_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+            })
+            .await;
+    }
+
+    /// Regression for the offline-backlog disconnect: an already-processed
+    /// (duplicate) message must get its own delivery receipt, else the server
+    /// replays it every reconnect until it force-closes the stream. Pre-fix only
+    /// the first (success) delivery was acked; the duplicate was skipped silently.
+    #[tokio::test]
+    async fn duplicate_message_is_acked_with_delivery_receipt() {
+        let (client, transport) = capturing_client("dup_receipt").await;
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("5511888887777@s.whatsapp.net").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        // Establish the session, then mark Alice's prekey acked so her next message
+        // is a plain SignalMessage. Re-submitting it is a clean duplicate.
+        let establish = alice.encrypt(&bob_addr, b"establish").await;
+        process_session_ct(&client, &alice.jid, "EST", &establish).await;
+        if let Some(record) = alice.sessions.0.get_mut(&bob_addr)
+            && let Some(state) = record.session_state_mut()
+        {
+            state.clear_unacknowledged_pre_key_message();
+        }
+
+        // A real (padded) Message so the success path also emits its receipt.
+        let plaintext = wacore::messages::MessageUtils::encode_and_pad(&wa::Message {
+            conversation: Some("hi".to_string()),
+            ..Default::default()
+        });
+        let msg = alice.encrypt(&bob_addr, &plaintext).await;
+        process_session_ct(&client, &alice.jid, "DUP", &msg).await; // success
+        process_session_ct(&client, &alice.jid, "DUP", &msg).await; // duplicate
+
+        let mut count = 0;
+        for _ in 0..80 {
+            count = delivery_receipts_for(&transport.sent(), "DUP");
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            count, 2,
+            "duplicate must get its own delivery receipt (pre-fix: only the first send was acked)"
+        );
+    }
+
+    /// Own-account fan-out (is_from_me, non-peer) has its delivery receipt
+    /// suppressed by `should_send_delivery_receipt`, so it must instead get a
+    /// transport ack (to = own LID) or the server replays it forever.
+    #[tokio::test]
+    async fn own_account_message_acked_via_transport_ack() {
+        let (client, transport) = capturing_client("own_ack").await;
+        let own = Arc::new(MessageInfo {
+            id: "OWN1".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "236395184570386@lid".parse().expect("sender"),
+                chat: "156535032389744@lid".parse().expect("chat"),
+                recipient: Some("156535032389744@lid".parse().expect("recipient")),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&own);
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, _) = found.expect("own-account message must get a transport ack");
+        assert_eq!(
+            to, "236395184570386@lid",
+            "ack must be addressed to the own LID"
+        );
+        assert_eq!(
+            delivery_receipts_for(&transport.sent(), "OWN1"),
+            0,
+            "own non-peer must NOT get a delivery receipt (it's suppressed)"
+        );
+    }
+
+    /// An `<unavailable>` message (no `<enc>`) must be transport-acked so the
+    /// server stops replaying it (DM/group aren't covered by the should_ack gate).
+    #[tokio::test]
+    async fn unavailable_message_is_transport_acked() {
+        let (client, transport) = capturing_client("unavail_ack").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "UNAVAIL1")
+            .attr("type", "text")
+            .children([NodeBuilder::new("unavailable")
+                .attr("type", "view_once")
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(classified.is_none(), "unavailable path returns None");
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, _) = found.expect("unavailable message must get a transport ack");
+        assert_eq!(to, "5511777776666@s.whatsapp.net");
     }
 
     /// Security regression: a self-only `app_state_sync_key_share` protocol

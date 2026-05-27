@@ -19,7 +19,6 @@ use crate::types::message::MessageInfo;
 use log::{debug, info, warn};
 use prost::Message;
 use std::sync::Arc;
-use std::time::Duration;
 use wacore::types::message::{
     ChatMessageId, EditAttribute, MessageCategory, MessageSource, MsgMetaInfo,
 };
@@ -452,83 +451,37 @@ impl Client {
         })
     }
 
-    /// Spawns a PDO request for a message that failed to decrypt.
-    /// This is called alongside the retry receipt to increase chances of recovery.
+    /// Age-gated PDO send, awaitable so it can run before a transport ack inside
+    /// one flush task (when PDO is the sole recovery, e.g. `<unavailable>`).
+    /// `fromMe` is NOT excluded: own-device fan-out that fails to decrypt has PDO
+    /// as its only recovery (WAWebNonMessageDataRequestPlaceholderMessageResendUtils).
     ///
-    /// When `immediate` is true, the PDO request is sent without delay.
-    /// This is used when we've exhausted retry attempts and need immediate PDO recovery.
-    pub(crate) fn spawn_pdo_request_with_options(
-        self: &Arc<Self>,
-        info: &Arc<MessageInfo>,
-        immediate: bool,
-    ) {
-        // `fromMe` is NOT excluded here: when the user's other devices send a
-        // message and the fanout copy to this client fails to decrypt, PDO is
-        // the only recovery path. Matches WAWebNonMessageDataRequestPlaceholderMessageResendUtils.
-
-        // Avoid asking the phone to re-deliver ancient messages during offline
-        // sync or long reconnect tails. Matches the
-        // `placeholder_message_resend_maximum_days_limit` AB prop (default 14d)
-        // enforced by WAWebNonMessageDataRequestPlaceholderMessageResendUtils.
-        // Compare in seconds to stay bit-for-bit with WA Web's `age_s > i`
-        // check — `num_days()` truncates and would let 14d1h through.
-        const PDO_MAX_AGE: chrono::Duration = chrono::Duration::days(14);
-        let age = wacore::time::now_utc().signed_duration_since(info.timestamp);
-        if age > PDO_MAX_AGE {
+    /// Returns `false` only on a transient send failure: the caller must then
+    /// NOT ack, so the stanza stays in the offline queue for another attempt.
+    /// Age-skip counts as a deliberate give-up (`true`), so ancient stanzas are
+    /// still cleared.
+    pub(crate) async fn run_pdo_request(self: &Arc<Self>, info: &Arc<MessageInfo>) -> bool {
+        // Skip ancient messages (14d, matching the AB prop), compared in seconds
+        // like WA Web's `age_s > i`. Uses the wacore time primitive (mockable).
+        const PDO_MAX_AGE_SECS: i64 = 14 * 24 * 60 * 60;
+        let age_secs = wacore::time::now_secs() - info.timestamp.timestamp();
+        if age_secs > PDO_MAX_AGE_SECS {
             debug!(
-                "PDO request skipped for message {} (age {}s exceeds {}s limit)",
+                "PDO request skipped for message {} (age {age_secs}s exceeds {PDO_MAX_AGE_SECS}s limit)",
                 info.id,
-                age.num_seconds(),
-                PDO_MAX_AGE.num_seconds(),
             );
-            return;
+            return true;
         }
-
-        let client_clone = Arc::clone(self);
-        let info_clone = Arc::clone(info);
-        // Per-connection: on disconnect/reconnect the signal fires and we bail
-        // before inserting into `pdo_pending_requests`, preventing a 30s TTL
-        // strand on an entry that can no longer receive its response.
-        let shutdown = self.connection_shutdown_signal();
-
-        self.runtime
-            .spawn(Box::pin(async move {
-                use futures::FutureExt;
-
-                if !immediate {
-                    // Delay lets the retry receipt land before we pile PDO on top.
-                    futures::select! {
-                        _ = client_clone
-                            .runtime
-                            .sleep(Duration::from_millis(500))
-                            .fuse() => {}
-                        _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => {
-                            return;
-                        }
-                    }
-                }
-
-                if shutdown.is_fired() {
-                    return;
-                }
-
-                if let Err(e) = client_clone
-                    .send_pdo_placeholder_resend_request(&info_clone)
-                    .await
-                {
-                    warn!(
-                        "Failed to send PDO request for message {} from {}: {:?}",
-                        info_clone.id, info_clone.source.sender, e
-                    );
-                }
-            }))
-            .detach();
-    }
-
-    /// Spawns a PDO request for a message that failed to decrypt.
-    /// This is called alongside the retry receipt to increase chances of recovery.
-    pub(crate) fn spawn_pdo_request(self: &Arc<Self>, info: &Arc<MessageInfo>) {
-        self.spawn_pdo_request_with_options(info, false);
+        match self.send_pdo_placeholder_resend_request(info).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    "Failed to send PDO request for message {} from {}: {:?}",
+                    info.id, info.source.sender, e
+                );
+                false
+            }
+        }
     }
 }
 

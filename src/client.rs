@@ -312,6 +312,10 @@ pub struct Client {
     /// TOCTOU races where `try_lock()` fails due to contention, not disconnection.
     is_connected: Arc<AtomicBool>,
 
+    /// whatsmeow's `sendActiveReceipts`: 0 = inactive (default), 1 = active
+    /// (presence available), 2 = forced. When 0, delivery receipts use `type="inactive"`.
+    send_active_receipts: AtomicU32,
+
     /// Per-process counter of consecutive Noise IK handshake failures, scoped
     /// to the lifetime of this `Client`. Mirrors `K` in WA Web's
     /// `WAWebOpenChatSocket` (`ChatSocket.js`): on the first failure within a
@@ -771,6 +775,7 @@ impl Client {
             is_connecting: Arc::new(AtomicBool::new(false)),
             is_running: Arc::new(AtomicBool::new(false)),
             is_connected: Arc::new(AtomicBool::new(false)),
+            send_active_receipts: AtomicU32::new(0),
             ik_handshake_failures: Arc::new(AtomicU32::new(0)),
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
@@ -1415,6 +1420,11 @@ impl Client {
         // is_connected==true with a cleared socket. send_node() independently
         // checks the socket, but this ordering avoids a confusing state window.
         self.is_connected.store(false, Ordering::Release);
+        // Presence doesn't survive reconnects: demote presence-driven active
+        // receipts (1 -> 0), leaving a forced value (2) untouched.
+        let _ =
+            self.send_active_receipts
+                .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
         // Drop per-chat lanes so workers exit via channel close.
         self.chat_lanes.invalidate_all();
         // Clear pending retries so stale keys from detached scopeguard
@@ -1943,6 +1953,38 @@ impl Client {
             }
         };
         self.send_raw_bytes(buf).await
+    }
+
+    /// Send a transport ack so the server stops replaying a stanza from the
+    /// offline queue. Awaitable so callers can order it after a retry receipt
+    /// in a single flushed task.
+    pub(crate) async fn send_transport_ack(&self, info: &crate::types::message::MessageInfo) {
+        let source = message_ack_source_node(info);
+        let own_pn = self.get_pn().await;
+        match encode_ack_bytes(&source.as_node_ref(), own_pn.as_ref()) {
+            Ok(Some(buf)) => {
+                if let Err(e) = self.send_raw_bytes(buf).await
+                    && !e.is_transport_unavailable()
+                {
+                    log::warn!("Failed to send transport ack for undecryptable message: {e:?}");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!("Failed to encode transport ack: {e}"),
+        }
+    }
+
+    /// Spawn [`Self::send_transport_ack`], tracked via `outbound_flush` so
+    /// `disconnect()` flushes it (issue #571), same as delivery receipts.
+    pub(crate) fn spawn_message_ack(
+        self: &Arc<Self>,
+        info: &Arc<crate::types::message::MessageInfo>,
+    ) {
+        let client = Arc::clone(self);
+        let info = Arc::clone(info);
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            client.send_transport_ack(&info).await;
+        });
     }
 
     pub async fn set_passive(&self, passive: bool) -> Result<(), crate::request::IqError> {
@@ -3338,7 +3380,24 @@ impl Client {
                     // but here is_fully_ready() gates prekey uploads and we want them to keep
                     // working while the socket is still alive. Severity is warn!, not error!,
                     // because the connection is intentionally preserved.
-                    warn!("Unknown stream error: {}", DisplayableNodeRef(node));
+                    // WA Web (StreamError.js) knows <stream:error><ack/> (type "ack");
+                    // name it instead of "Unknown". Root cause is usually an un-acked
+                    // offline stanza; the server's <xmlstreamend/> drives the reconnect.
+                    if let Some(ack) = node.get_optional_child("ack") {
+                        let id = ack
+                            .get_attr("id")
+                            .map(|v| v.as_str().to_string())
+                            .unwrap_or_default();
+                        let class = ack
+                            .get_attr("class")
+                            .map(|v| v.as_str().to_string())
+                            .unwrap_or_default();
+                        warn!(
+                            "Stream error: server rejected ack (class={class:?}, id={id}); reconnect will follow on stream end"
+                        );
+                    } else {
+                        warn!("Unknown stream error: {}", DisplayableNodeRef(node));
+                    }
                     self.core.event_bus.dispatch(Event::StreamError(
                         crate::types::events::StreamError {
                             code: code.to_string(),
@@ -3454,6 +3513,32 @@ impl Client {
 
     pub fn is_connected(&self) -> bool {
         self.is_connected.load(Ordering::Acquire)
+    }
+
+    /// Whether delivery receipts should be sent active (rendered as ticks) vs
+    /// `type="inactive"`. Mirrors whatsmeow's `sendActiveReceipts != 0`.
+    pub(crate) fn receipts_are_active(&self) -> bool {
+        self.send_active_receipts.load(Ordering::Acquire) != 0
+    }
+
+    /// Force active delivery receipts even when offline (whatsmeow's
+    /// `SetForceActiveDeliveryReceipts`); off restores the default.
+    pub fn set_force_active_delivery_receipts(&self, active: bool) {
+        self.send_active_receipts
+            .store(if active { 2 } else { 0 }, Ordering::Release);
+    }
+
+    /// CAS so a forced value (2) is preserved (whatsmeow's `CompareAndSwap`).
+    pub(crate) fn mark_receipts_active_on_presence(&self) {
+        let _ =
+            self.send_active_receipts
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    pub(crate) fn mark_receipts_inactive_on_presence(&self) {
+        let _ =
+            self.send_active_receipts
+                .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
     }
 
     pub fn is_logged_in(&self) -> bool {
@@ -4033,6 +4118,29 @@ fn encode_ack_bytes(
     let mut encoder = Encoder::new_vec(&mut buf)?;
     encoder.write_node(&ack)?;
     Ok(Some(buf))
+}
+
+/// Minimal `<message>` stanza carrying the attrs `encode_ack_bytes` needs,
+/// reconstructed after the node tree has been dropped. The original `from`
+/// is the group for group/broadcast stanzas and the sender otherwise (sender
+/// keeps the device qualifier; `chat` is device-stripped for DMs). Mirrors
+/// whatsmeow's `sendAck` (`to`=from, copy recipient/participant).
+fn message_ack_source_node(info: &crate::types::message::MessageInfo) -> Node {
+    let from = if info.source.is_group {
+        &info.source.chat
+    } else {
+        &info.source.sender
+    };
+    let mut builder = NodeBuilder::new("message")
+        .attr("id", &info.id)
+        .attr("from", from);
+    if let Some(recipient) = &info.source.recipient {
+        builder = builder.attr("recipient", recipient);
+    }
+    if info.source.is_group {
+        builder = builder.attr("participant", &info.source.sender);
+    }
+    builder.build()
 }
 
 /// Build an ack Node (used in tests for structure verification).
@@ -5370,6 +5478,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_receipt_activity_state_machine() {
+        let client = create_offline_sync_test_client().await;
+        assert!(
+            !client.receipts_are_active(),
+            "default is inactive (background companion)"
+        );
+        client.mark_receipts_active_on_presence();
+        assert!(client.receipts_are_active(), "presence available -> active");
+        client.mark_receipts_inactive_on_presence();
+        assert!(
+            !client.receipts_are_active(),
+            "presence unavailable -> inactive"
+        );
+        client.set_force_active_delivery_receipts(true);
+        assert!(client.receipts_are_active(), "forced active");
+        client.mark_receipts_inactive_on_presence();
+        assert!(
+            client.receipts_are_active(),
+            "forced (2) survives a presence-unavailable CAS(1,0)"
+        );
+        client.set_force_active_delivery_receipts(false);
+        assert!(!client.receipts_are_active());
+
+        // Teardown resets presence-driven active (so it doesn't leak across
+        // reconnects) but preserves a forced value.
+        client.mark_receipts_active_on_presence();
+        client.cleanup_connection_state().await;
+        assert!(
+            !client.receipts_are_active(),
+            "teardown resets presence-driven active"
+        );
+        client.set_force_active_delivery_receipts(true);
+        client.cleanup_connection_state().await;
+        assert!(
+            client.receipts_are_active(),
+            "teardown preserves forced active"
+        );
+    }
+
+    #[tokio::test]
     async fn test_ib_thread_metadata_does_not_end_sync() {
         let client = create_offline_sync_test_client().await;
         client
@@ -6042,6 +6190,166 @@ mod tests {
         assert!(
             decoded.get_attr("recipient").is_none(),
             "encode_ack_bytes must not synthesise `recipient` when absent"
+        );
+    }
+
+    /// Own-account fan-out ack must address back to the original `from` (own
+    /// LID) echoing `recipient`, not to the chat. Guards against regressing to
+    /// the chat-addressed `build_nack_node` style.
+    #[test]
+    fn test_message_ack_source_node_own_device_addressing() {
+        use crate::types::message::{MessageInfo, MessageSource};
+        // Own-account branch: sender == `from` (device-qualified), chat is the
+        // device-stripped recipient. `to` must come from sender, not chat.
+        let info = MessageInfo {
+            id: "AC055553E56A2C12DE592DAD6353C477".to_string(),
+            source: MessageSource {
+                sender: "236395184570386@lid".parse().expect("sender"),
+                chat: "156535032389744@lid".parse().expect("chat"),
+                recipient: Some("156535032389744@lid".parse().expect("recipient")),
+                is_group: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let own_device_pn: Jid = "559984726662:95@s.whatsapp.net"
+            .parse()
+            .expect("own device PN JID should parse");
+
+        let source = message_ack_source_node(&info);
+        let built = build_ack_node(&source.as_node_ref(), Some(&own_device_pn))
+            .expect("message ack should be buildable");
+
+        assert!(built.attrs.get("class").is_some_and(|v| v == "message"));
+        assert!(
+            built
+                .attrs
+                .get("to")
+                .is_some_and(|v| v == "236395184570386@lid"),
+            "ack `to` must be the original `from` (own LID), not the chat"
+        );
+        assert!(
+            built
+                .attrs
+                .get("recipient")
+                .is_some_and(|v| v == "156535032389744@lid"),
+            "ack must echo `recipient` so the server can route/clear it"
+        );
+        assert!(
+            !built.attrs.contains_key("type"),
+            "message-class acks never carry a `type`"
+        );
+    }
+
+    /// Common incoming DM from another user: `to` is the device-qualified
+    /// sender, with no `recipient`/`participant` synthesised.
+    #[test]
+    fn test_message_ack_source_node_incoming_dm_addressing() {
+        use crate::types::message::{MessageInfo, MessageSource};
+        let info = MessageInfo {
+            id: "MSGID".to_string(),
+            source: MessageSource {
+                sender: "5511999998888:3@s.whatsapp.net".parse().expect("sender"),
+                chat: "5511999998888@s.whatsapp.net".parse().expect("chat"),
+                is_group: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let own_device_pn: Jid = "559984726662:95@s.whatsapp.net"
+            .parse()
+            .expect("own device PN JID should parse");
+
+        let source = message_ack_source_node(&info);
+        let built = build_ack_node(&source.as_node_ref(), Some(&own_device_pn))
+            .expect("dm ack should be buildable");
+
+        assert!(
+            built
+                .attrs
+                .get("to")
+                .is_some_and(|v| v == "5511999998888:3@s.whatsapp.net"),
+            "ack `to` must be the device-qualified sender (the original `from`)"
+        );
+        assert!(!built.attrs.contains_key("recipient"));
+        assert!(!built.attrs.contains_key("participant"));
+    }
+
+    /// status@broadcast (is_group=true in the parser) addresses the ack to the
+    /// status chat, with the sender as participant, not to the sender.
+    #[test]
+    fn test_message_ack_source_node_status_addressing() {
+        use crate::types::message::{MessageInfo, MessageSource};
+        let info = MessageInfo {
+            id: "STATUSMSG".to_string(),
+            source: MessageSource {
+                chat: "status@broadcast".parse().expect("status chat"),
+                sender: "181531758878822@lid".parse().expect("participant"),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let own_device_pn: Jid = "559984726662:95@s.whatsapp.net"
+            .parse()
+            .expect("own device PN JID should parse");
+
+        let source = message_ack_source_node(&info);
+        let built = build_ack_node(&source.as_node_ref(), Some(&own_device_pn))
+            .expect("status ack should be buildable");
+
+        assert!(
+            built
+                .attrs
+                .get("to")
+                .is_some_and(|v| v == "status@broadcast"),
+            "status ack `to` must be the status chat, not the sender"
+        );
+        assert!(
+            built
+                .attrs
+                .get("participant")
+                .is_some_and(|v| v == "181531758878822@lid"),
+            "status ack must preserve the sending participant"
+        );
+    }
+
+    /// Group failure ack: `to` is the group, `participant` is preserved.
+    #[test]
+    fn test_message_ack_source_node_group_addressing() {
+        use crate::types::message::{MessageInfo, MessageSource};
+        // Group branch: chat == group `from`, sender == participant.
+        let info = MessageInfo {
+            id: "GROUPMSGID".to_string(),
+            source: MessageSource {
+                chat: "120363011111111111@g.us".parse().expect("group"),
+                sender: "181531758878822@lid".parse().expect("participant"),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let own_device_pn: Jid = "559984726662:95@s.whatsapp.net"
+            .parse()
+            .expect("own device PN JID should parse");
+
+        let source = message_ack_source_node(&info);
+        let built = build_ack_node(&source.as_node_ref(), Some(&own_device_pn))
+            .expect("group message ack should be buildable");
+
+        assert!(
+            built
+                .attrs
+                .get("to")
+                .is_some_and(|v| v == "120363011111111111@g.us"),
+            "group ack `to` must be the group JID"
+        );
+        assert!(
+            built
+                .attrs
+                .get("participant")
+                .is_some_and(|v| v == "181531758878822@lid"),
+            "group ack must preserve the sending `participant`"
         );
     }
 
