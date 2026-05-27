@@ -38,7 +38,7 @@ pub use groups::{
 
 pub use media_reupload::{MediaRetryResult, MediaReupload, MediaReuploadRequest};
 
-pub use message_edit::EncryptedEdit;
+pub use message_edit::{EncryptedEdit, SecretEncKind, SecretEncrypted};
 
 pub use mex::{Mex, MexError, MexErrorExtensions, MexGraphQLError, MexRequest, MexResponse};
 

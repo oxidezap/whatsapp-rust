@@ -70,6 +70,40 @@ pub fn encrypt_message_edit(
     encrypt_addon(&plaintext, message_secret, &ctx.as_addon_ctx())
 }
 
+/// Decrypt any `secret_encrypted_message` envelope to its inner `Message`.
+///
+/// All `SecretEncType` envelope variants (`EVENT_EDIT`, `MESSAGE_EDIT`,
+/// `POLL_EDIT`, `POLL_ADD_OPTION`) share the same shape: they decrypt to a full
+/// `Message` proto with an empty AAD (per `WAWebAddonEncryption`'s function `g`),
+/// differing only in the use-case secret fed into the HKDF — which is exactly
+/// what `modification_type` selects. Mirrors whatsmeow's
+/// `DecryptSecretEncryptedMessage` dispatch.
+///
+/// `iv` must be exactly 12 bytes (matches WA Web's `u.length !== 12` check).
+pub fn decrypt_secret_encrypted(
+    enc_payload: &[u8],
+    iv: &[u8],
+    message_secret: &[u8],
+    modification_type: ModificationType,
+    ctx: &MessageEditContext<'_>,
+) -> Result<waproto::whatsapp::Message> {
+    if iv.len() != IV_SIZE {
+        return Err(anyhow!(
+            "Invalid secret-encrypted IV length: expected {IV_SIZE}, got {}",
+            iv.len()
+        ));
+    }
+    let addon = AddonContext {
+        stanza_id: ctx.original_msg_id,
+        parent_msg_original_sender: ctx.original_sender_jid,
+        modification_sender: ctx.editor_jid,
+        modification_type,
+    };
+    let plaintext = decrypt_addon(enc_payload, iv, message_secret, &addon)?;
+    waproto::whatsapp::Message::decode(&plaintext[..])
+        .map_err(|e| anyhow!("Failed to decode inner secret-encrypted Message: {e}"))
+}
+
 /// Decrypt a `secret_encrypted_message` MESSAGE_EDIT envelope.
 ///
 /// Returns the inner `Message` whose `protocolMessage.editedMessage` carries
@@ -83,26 +117,49 @@ pub fn decrypt_message_edit(
     message_secret: &[u8],
     ctx: &MessageEditContext<'_>,
 ) -> Result<waproto::whatsapp::Message> {
-    if iv.len() != IV_SIZE {
-        return Err(anyhow!(
-            "Invalid edit IV length: expected {IV_SIZE}, got {}",
-            iv.len()
-        ));
-    }
-    let plaintext = decrypt_addon(enc_payload, iv, message_secret, &ctx.as_addon_ctx())?;
-    let msg = waproto::whatsapp::Message::decode(&plaintext[..])
-        .map_err(|e| anyhow!("Failed to decode inner edit Message: {e}"))?;
-    Ok(msg)
+    decrypt_secret_encrypted(
+        enc_payload,
+        iv,
+        message_secret,
+        ModificationType::MessageEdit,
+        ctx,
+    )
 }
 
-/// Try decryption with up to two JID combinations, mirroring WA Web's
-/// `decryptAddOn` resilience for cross-addressing edits.
+/// Decrypt a secret-encrypted envelope, retrying once under an alternate
+/// addressing, mirroring WA Web's `decryptAddOn` LID/PN resilience.
 ///
-/// The pair `(originals, alternates)` is the (as-received, normalised)
-/// combination — caller decides which is which. Returns the first success.
-///
-/// WA Web tries 3 attempts (LID→LID, PN→PN, originals) but two are enough
-/// in practice when the caller already knows the canonical pair.
+/// `primary` is the as-received JID pair; `fallback` is the swapped pair.
+/// Returns the first success. WA Web tries 3 attempts (LID→LID, PN→PN,
+/// originals) but two suffice when the caller already knows the canonical pair.
+pub fn decrypt_secret_encrypted_with_fallback(
+    enc_payload: &[u8],
+    iv: &[u8],
+    message_secret: &[u8],
+    modification_type: ModificationType,
+    primary: &MessageEditContext<'_>,
+    fallback: Option<&MessageEditContext<'_>>,
+) -> Result<waproto::whatsapp::Message> {
+    match decrypt_secret_encrypted(enc_payload, iv, message_secret, modification_type, primary) {
+        Ok(m) => Ok(m),
+        Err(primary_err) => match fallback {
+            Some(fb) => decrypt_secret_encrypted(
+                enc_payload,
+                iv,
+                message_secret,
+                modification_type,
+                fb,
+            )
+            .map_err(|fb_err| {
+                anyhow!("secret-encrypted decrypt failed: primary={primary_err}; fallback={fb_err}")
+            }),
+            None => Err(primary_err),
+        },
+    }
+}
+
+/// MESSAGE_EDIT-specialised wrapper over
+/// [`decrypt_secret_encrypted_with_fallback`].
 pub fn decrypt_message_edit_with_fallback(
     enc_payload: &[u8],
     iv: &[u8],
@@ -110,17 +167,14 @@ pub fn decrypt_message_edit_with_fallback(
     primary: &MessageEditContext<'_>,
     fallback: Option<&MessageEditContext<'_>>,
 ) -> Result<waproto::whatsapp::Message> {
-    match decrypt_message_edit(enc_payload, iv, message_secret, primary) {
-        Ok(m) => Ok(m),
-        Err(primary_err) => match fallback {
-            Some(fb) => {
-                decrypt_message_edit(enc_payload, iv, message_secret, fb).map_err(|fb_err| {
-                    anyhow!("edit decrypt failed: primary={primary_err}; fallback={fb_err}")
-                })
-            }
-            None => Err(primary_err),
-        },
-    }
+    decrypt_secret_encrypted_with_fallback(
+        enc_payload,
+        iv,
+        message_secret,
+        ModificationType::MessageEdit,
+        primary,
+        fallback,
+    )
 }
 
 #[cfg(test)]
@@ -230,6 +284,41 @@ mod tests {
         // WA Web enforces 12-byte IV; we surface a typed error here.
         assert!(decrypt_message_edit(&enc, &[0u8; 11], &[0x07u8; 32], &ctx).is_err());
         assert!(decrypt_message_edit(&enc, &[0u8; 16], &[0x07u8; 32], &ctx).is_err());
+    }
+
+    #[test]
+    fn general_decrypt_roundtrips_non_edit_use_case() {
+        use crate::secret_enc_addon::{AddonContext, ModificationType, encrypt_addon};
+        use prost::Message as _;
+
+        // A POLL_EDIT envelope: same shape as MESSAGE_EDIT, different use-case.
+        let secret = [0x71u8; 32];
+        let ctx = MessageEditContext {
+            original_msg_id: "POLLID",
+            original_sender_jid: "creator@s.whatsapp.net",
+            editor_jid: "editor@s.whatsapp.net",
+        };
+        let inner = wa::Message {
+            conversation: Some("poll edited".to_string()),
+            ..Default::default()
+        };
+        let (enc, iv) = encrypt_addon(
+            &inner.encode_to_vec(),
+            &secret,
+            &AddonContext {
+                stanza_id: ctx.original_msg_id,
+                parent_msg_original_sender: ctx.original_sender_jid,
+                modification_sender: ctx.editor_jid,
+                modification_type: ModificationType::PollEdit,
+            },
+        )
+        .unwrap();
+
+        // Correct use-case decrypts; the MESSAGE_EDIT wrapper (wrong use-case) fails.
+        let out =
+            decrypt_secret_encrypted(&enc, &iv, &secret, ModificationType::PollEdit, &ctx).unwrap();
+        assert_eq!(out.conversation.as_deref(), Some("poll edited"));
+        assert!(decrypt_message_edit(&enc, &iv, &secret, &ctx).is_err());
     }
 
     #[test]
