@@ -10,8 +10,9 @@ impl MessageUtils {
     fn random_pad_len() -> u8 {
         use rand::RngExt;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let v = rng.random::<u8>() & 0x0F;
-        if v == 0 { 0x0F } else { v }
+        // Uniform 1..=16, matching WA Web / whatsmeow (rand%16 + 1). The prior
+        // `& 0x0F` with a 0->15 remap skewed toward 15 and never produced 16.
+        (rng.random::<u8>() & 0x0F) + 1
     }
 
     pub fn pad_message_v2(mut plaintext: Vec<u8>) -> Vec<u8> {
@@ -585,5 +586,22 @@ mod parse_message_info_tests {
             .expect("LID-addressed status broadcast must expose participant_pn as sender_alt");
         assert_eq!(alt.user, pn_user);
         assert_eq!(alt.server, wacore_binary::Server::Pn);
+    }
+
+    #[test]
+    fn random_pad_len_is_uniform_1_to_16() {
+        // WA Web / whatsmeow pad with rand%16 + 1; the value must always land
+        // in 1..=16 (never 0, never >16). The old `& 0x0F` 0->15 remap could
+        // never produce 16; assert 16 is reachable over many samples.
+        let mut saw_16 = false;
+        for _ in 0..5_000 {
+            let p = super::MessageUtils::random_pad_len();
+            assert!((1..=16).contains(&p), "pad len {p} out of 1..=16");
+            saw_16 |= p == 16;
+        }
+        assert!(
+            saw_16,
+            "pad len 16 must be reachable (was unreachable before)"
+        );
     }
 }
