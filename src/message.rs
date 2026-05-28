@@ -88,7 +88,7 @@ pub(crate) use wacore::protocol::retry::RetryReason;
 
 impl Client {
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.
-    fn dispatch_parsed_message(self: &Arc<Self>, msg: wa::Message, info: &Arc<MessageInfo>) {
+    async fn dispatch_parsed_message(self: &Arc<Self>, msg: wa::Message, info: &Arc<MessageInfo>) {
         use wacore::proto_helpers::MessageExt;
 
         let mut info = Arc::clone(info);
@@ -99,7 +99,11 @@ impl Client {
                 msg.get_base_message().get_ephemeral_expiration();
         }
 
-        self.maybe_capture_inbound_msg_secret(&msg, &info);
+        // Awaited (not spawned) so the messageSecret is durably stored before
+        // this chat's worker dequeues the next stanza. A bot reply queued right
+        // behind its own fanout (offline replay) would otherwise race the write
+        // and hit MissingMessageSecret.
+        self.maybe_capture_inbound_msg_secret(&msg, &info).await;
         self.ack_received_message(&info);
 
         self.core
@@ -137,7 +141,7 @@ impl Client {
     /// future `<enc type="msmsg">` referencing this id can decrypt.
     /// Mirrors WA Web `processRenderableMessages`:
     /// `$ && (P || N || w || A) && !isForwarded → addMsmsgMsgSecretToCache`.
-    pub(crate) fn maybe_capture_inbound_msg_secret(
+    pub(crate) async fn maybe_capture_inbound_msg_secret(
         self: &Arc<Self>,
         msg: &wa::Message,
         info: &Arc<MessageInfo>,
@@ -165,19 +169,11 @@ impl Client {
         if msg.is_forwarded() {
             return;
         }
-        // Stack-copy the 32-byte array into the spawned future; Arc<MessageInfo>
-        // is a refcount bump. No heap alloc for the secret.
-        let secret: [u8; SECRET_LEN] = *secret_arr;
-        let client = Arc::clone(self);
-        let info = Arc::clone(info);
-        self.outbound_flush.spawn(&*self.runtime, async move {
-            let Some(sender) = client.dm_sender_identity_for(&info.source.chat).await else {
-                return;
-            };
-            client
-                .persist_outbound_msg_secret(&info.source.chat, &sender, &info.id, &secret)
-                .await;
-        });
+        let Some(sender) = self.dm_sender_identity_for(&info.source.chat).await else {
+            return;
+        };
+        self.persist_outbound_msg_secret(&info.source.chat, &sender, &info.id, secret_arr)
+            .await;
     }
 
     /// Decrypt and dispatch a `<enc type="msmsg">` bot reply. Looks up the
@@ -379,7 +375,7 @@ impl Client {
             }
         };
 
-        self.dispatch_parsed_message(msg, info);
+        self.dispatch_parsed_message(msg, info).await;
     }
 
     /// Resolve `target_sender` for a msmsg stanza: echo from `<meta>` when
@@ -454,7 +450,7 @@ impl Client {
                         info.id,
                         info.source.chat
                     );
-                    self.dispatch_parsed_message(msg, info);
+                    self.dispatch_parsed_message(msg, info).await;
                 }
                 Err(e) => {
                     log::warn!(
@@ -1893,7 +1889,7 @@ impl Client {
                 info.id
             );
         } else {
-            self.dispatch_parsed_message(msg, info);
+            self.dispatch_parsed_message(msg, info).await;
         }
         Ok(())
     }
@@ -8621,7 +8617,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        client.maybe_capture_inbound_msg_secret(&msg, &info);
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
 
         let mut got = None;
         for _ in 0..40 {
@@ -8660,7 +8656,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        client.maybe_capture_inbound_msg_secret(&msg, &info);
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
 
         for _ in 0..16 {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -8722,7 +8718,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        client.maybe_capture_inbound_msg_secret(&msg, &info);
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
 
         let mut got = None;
         for _ in 0..40 {
@@ -8779,7 +8775,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        client.maybe_capture_inbound_msg_secret(&msg, &info);
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
 
         for _ in 0..16 {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -8814,7 +8810,7 @@ mod tests {
             conversation: Some("hi".into()),
             ..Default::default()
         };
-        client.maybe_capture_inbound_msg_secret(&msg, &info);
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
 
         for _ in 0..16 {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -9066,8 +9062,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        client.maybe_capture_inbound_msg_secret(&fanout_msg, &fanout_info);
-        // Let the spawned persist task land.
+        client
+            .maybe_capture_inbound_msg_secret(&fanout_msg, &fanout_info)
+            .await;
+        // Write is awaited inline now, so the secret is already durable here.
         for _ in 0..40 {
             if client
                 .persistence_manager

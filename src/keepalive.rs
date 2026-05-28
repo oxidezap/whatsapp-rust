@@ -118,6 +118,15 @@ impl Client {
                         return;
                     }
 
+                    // Periodic DB retention (~every 12 ticks ≈ 5 min). Driven by
+                    // the interval tick itself, BEFORE the idle-ping early-return,
+                    // so busy connections (which skip the ping) still prune.
+                    cleanup_counter += 1;
+                    if cleanup_counter >= 12 {
+                        cleanup_counter = 0;
+                        self.spawn_retention_cleanup(sent_msg_ttl);
+                    }
+
                     let last_recv = self.last_data_received_ms.load(Ordering::Relaxed);
 
                     // WA Web: maybeScheduleHealthCheck — only send ping when idle.
@@ -147,45 +156,6 @@ impl Client {
                                 debug!(target: "Client/Keepalive", "Keepalive restored after {error_count} failure(s).");
                             }
                             error_count = 0;
-
-                            // Periodic DB cleanup (~every 12 ticks ≈ 5 min). The
-                            // tick gate is independent of any single TTL; each
-                            // retention setting gates its own delete so they can
-                            // be enabled/disabled separately.
-                            cleanup_counter += 1;
-                            if cleanup_counter >= 12 {
-                                cleanup_counter = 0;
-                                let now = wacore::time::now_secs();
-                                if sent_msg_ttl > 0 {
-                                    let backend = self.persistence_manager.backend();
-                                    let cutoff = now - sent_msg_ttl as i64;
-                                    self.runtime.spawn(Box::pin(async move {
-                                        if let Err(e) = backend.delete_expired_sent_messages(cutoff).await {
-                                            log::debug!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
-                                        }
-                                    })).detach();
-                                }
-                                // msg_secrets retention: disabled by default
-                                // (matches whatsmeow + WA Web). Caller can opt in
-                                // via CacheConfig.msg_secret_ttl_secs.
-                                let secret_ttl = self.cache_config.msg_secret_ttl_secs;
-                                if secret_ttl > 0 {
-                                    let backend = self.persistence_manager.backend();
-                                    let secret_cutoff = now - secret_ttl as i64;
-                                    self.runtime.spawn(Box::pin(async move {
-                                        if let Err(e) = backend
-                                            .delete_expired_msg_secrets(secret_cutoff)
-                                            .await
-                                        {
-                                            log::debug!(
-                                                target: "Client/Keepalive",
-                                                "msg_secrets cleanup error: {e}"
-                                            );
-                                        }
-                                    }))
-                                    .detach();
-                                }
-                            }
                         }
                         KeepaliveResult::FatalFailure => {
                             debug!(target: "Client/Keepalive", "Fatal keepalive failure, exiting loop.");
@@ -221,6 +191,42 @@ impl Client {
                     return;
                 }
             }
+        }
+    }
+
+    /// Fire-and-forget DB retention sweeps. Each TTL gates its own delete so
+    /// they enable/disable independently. `0` disables a sweep. TTLs are
+    /// converted with a checked cast (absurd values clamp instead of wrapping
+    /// the cutoff negative).
+    fn spawn_retention_cleanup(&self, sent_msg_ttl: u64) {
+        let now = wacore::time::now_secs();
+        let cutoff_for = |ttl: u64| now.saturating_sub(i64::try_from(ttl).unwrap_or(i64::MAX));
+
+        if sent_msg_ttl > 0 {
+            let backend = self.persistence_manager.backend();
+            let cutoff = cutoff_for(sent_msg_ttl);
+            self.runtime
+                .spawn(Box::pin(async move {
+                    if let Err(e) = backend.delete_expired_sent_messages(cutoff).await {
+                        log::debug!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
+                    }
+                }))
+                .detach();
+        }
+
+        // msg_secrets retention: disabled by default (matches whatsmeow + WA
+        // Web). Caller opts in via CacheConfig.msg_secret_ttl_secs.
+        let secret_ttl = self.cache_config.msg_secret_ttl_secs;
+        if secret_ttl > 0 {
+            let backend = self.persistence_manager.backend();
+            let cutoff = cutoff_for(secret_ttl);
+            self.runtime
+                .spawn(Box::pin(async move {
+                    if let Err(e) = backend.delete_expired_msg_secrets(cutoff).await {
+                        log::debug!(target: "Client/Keepalive", "msg_secrets cleanup error: {e}");
+                    }
+                }))
+                .detach();
         }
     }
 }
