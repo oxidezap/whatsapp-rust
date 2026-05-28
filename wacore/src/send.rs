@@ -918,13 +918,12 @@ pub async fn prepare_dm_stanza<
         includes_prekey_message = includes_prekey_message || result.includes_prekey_message;
     }
 
-    // If every per-device encrypt failed, shipping an empty <participants>
-    // stanza would silently drop the message. WA Web's encryptAndSendUserMsg
-    // rejects with "encryption fail for all devices"; mirror that so the
-    // caller's error path fires instead of a false success.
-    if participant_nodes.is_empty() && total_devices > 0 {
+    // All per-device encrypts failed: an empty <participants> would silently
+    // drop the message. WA Web's encryptAndSendUserMsg rejects here too.
+    let attempted_devices = recipient_devices.len() + own_other_devices.len();
+    if participant_nodes.is_empty() && attempted_devices > 0 {
         return Err(anyhow!(
-            "encryption failed for all {total_devices} recipient device(s)"
+            "encryption failed for all {attempted_devices} recipient device(s)"
         ));
     }
 
