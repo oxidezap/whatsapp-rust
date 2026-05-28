@@ -209,15 +209,17 @@ pub fn media_type_from_message(msg: &wa::Message) -> Option<&'static str> {
 
 /// Canonical rule for `decrypt-fail="hide"` on outgoing `<enc>` nodes.
 /// Shared by DM fanout, group SKDM and group SKMSG so the three paths can't drift.
-/// `AdminRevoke` is excluded because the server drops revoke stanzas carrying the
-/// hide attribute.
+/// Both revoke kinds are excluded: WA Web never hides REVOKE, and the server
+/// drops revoke stanzas carrying the hide attribute.
 pub fn should_hide_decrypt_fail_for_send(
     edit: Option<&crate::types::message::EditAttribute>,
     msg: &wa::Message,
 ) -> bool {
+    use crate::types::message::EditAttribute;
     edit.is_some_and(|e| {
-        *e != crate::types::message::EditAttribute::Empty
-            && *e != crate::types::message::EditAttribute::AdminRevoke
+        *e != EditAttribute::Empty
+            && *e != EditAttribute::AdminRevoke
+            && *e != EditAttribute::SenderRevoke
     }) || should_hide_decrypt_fail(msg)
 }
 
@@ -3761,6 +3763,55 @@ mod tests {
                 ..Default::default()
             };
             assert!(should_hide_decrypt_fail(&msg));
+        }
+    }
+
+    mod decrypt_fail_for_send {
+        use super::*;
+        use crate::types::message::EditAttribute;
+
+        fn plain() -> wa::Message {
+            wa::Message {
+                conversation: Some("hi".into()),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn sender_revoke_is_not_hidden() {
+            assert!(!should_hide_decrypt_fail_for_send(
+                Some(&EditAttribute::SenderRevoke),
+                &plain()
+            ));
+        }
+
+        #[test]
+        fn admin_revoke_is_not_hidden() {
+            assert!(!should_hide_decrypt_fail_for_send(
+                Some(&EditAttribute::AdminRevoke),
+                &plain()
+            ));
+        }
+
+        #[test]
+        fn message_edit_is_hidden() {
+            assert!(should_hide_decrypt_fail_for_send(
+                Some(&EditAttribute::MessageEdit),
+                &plain()
+            ));
+        }
+
+        #[test]
+        fn revoke_does_not_block_content_based_hide() {
+            // A reaction still hides on its own merits even under a revoke edit.
+            let msg = wa::Message {
+                reaction_message: Some(Default::default()),
+                ..Default::default()
+            };
+            assert!(should_hide_decrypt_fail_for_send(
+                Some(&EditAttribute::SenderRevoke),
+                &msg
+            ));
         }
     }
 
