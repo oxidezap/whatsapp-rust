@@ -155,11 +155,24 @@ impl EditAttribute {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BotEditType {
     First,
     Inner,
     Last,
+}
+
+impl BotEditType {
+    /// Parse the wire string from the `<bot edit="…">` attribute.
+    /// Matches whatsmeow's `types.EditType*` constants.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "first" => Some(Self::First),
+            "inner" => Some(Self::Inner),
+            "last" => Some(Self::Last),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,6 +186,10 @@ pub struct MsgBotInfo {
 pub struct MsgMetaInfo {
     pub target_id: Option<MessageId>,
     pub target_sender: Option<Jid>,
+    /// `<meta target_chat_jid="…">` — present when the bot reply addresses a
+    /// chat distinct from the stanza-level `from` (used for msmsg secret
+    /// lookup; see WA Web `decryptMsmsgBotMessage`).
+    pub target_chat: Option<Jid>,
     pub deprecated_lid_session: Option<bool>,
     pub thread_message_id: Option<MessageId>,
     pub thread_message_sender_jid: Option<Jid>,

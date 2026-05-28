@@ -130,6 +130,148 @@ impl Client {
         });
     }
 
+    /// Decrypt and dispatch a `<enc type="msmsg">` bot reply. Looks up the
+    /// outbound `messageSecret` we persisted at send time and runs the
+    /// dual-HKDF + AES-GCM open from [`wacore::bot_message`]. Failures
+    /// (missing secret, GCM tag fail, malformed proto) nack with code 495.
+    pub(crate) async fn handle_msmsg_payload(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        payload: EncPayload,
+    ) {
+        use prost::Message as _;
+        use wa::MessageSecretMessage;
+        use wacore::bot_message::{BotMessageContext, decrypt_bot_message};
+        use wacore::protocol::nack::NackReason;
+
+        let ms_msg = match MessageSecretMessage::decode(&*payload.ciphertext) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!(
+                    "[msg:{}] failed to decode MessageSecretMessage: {e:?}",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::ParsingError, None);
+                return;
+            }
+        };
+        let (Some(enc_iv), Some(enc_payload)) =
+            (ms_msg.enc_iv.as_deref(), ms_msg.enc_payload.as_deref())
+        else {
+            log::warn!(
+                "[msg:{}] MessageSecretMessage missing enc_iv/enc_payload",
+                info.id
+            );
+            self.spawn_nack(info, NackReason::ParsingError, None);
+            return;
+        };
+
+        // Target sender (us): meta echoes our LID/PN. Falls back to our LID
+        // when sender is on the bot server, our PN otherwise (whatsmeow
+        // `decryptBotMessage`).
+        let target_sender = match self.resolve_msmsg_target_sender(info).await {
+            Some(j) => j,
+            None => {
+                log::warn!("[msg:{}] msmsg: no target_sender resolvable", info.id);
+                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                return;
+            }
+        };
+
+        // Chat scope for the secret lookup: prefer <meta target_chat_jid>;
+        // fall back to the stanza's chat (matches WA Web `decryptMsmsgBotMessage`).
+        let chat_for_lookup = info
+            .meta_info
+            .target_chat
+            .as_ref()
+            .unwrap_or(&info.source.chat)
+            .to_non_ad()
+            .to_string();
+        let target_sender_str = target_sender.to_non_ad().to_string();
+
+        // The id used for the SECRET LOOKUP is `meta.target_id` (our outbound
+        // id); the id used as HKDF input is the bot reply id (or
+        // `bot_info.edit_target_id` when the bot is editing a prior reply).
+        let target_id = match info.meta_info.target_id.as_deref() {
+            Some(id) => id,
+            None => {
+                log::warn!(
+                    "[msg:{}] msmsg: <meta> missing target_id; cannot look up secret",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                return;
+            }
+        };
+
+        let secret = match self
+            .persistence_manager
+            .backend()
+            .get_msg_secret(&chat_for_lookup, &target_sender_str, target_id)
+            .await
+        {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                log::warn!(
+                    "[msg:{}] msmsg: no message_secret stored for target_id={target_id}",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                return;
+            }
+            Err(e) => {
+                log::warn!(
+                    "[msg:{}] backend error reading message_secret: {e:?}",
+                    info.id
+                );
+                return;
+            }
+        };
+
+        let bot_user_jid = info.source.sender.to_non_ad().to_string();
+        let ctx = BotMessageContext {
+            msg_id: info.id.as_str(),
+            target_sender_user_jid: &target_sender_str,
+            bot_user_jid: &bot_user_jid,
+        };
+
+        let plaintext = match decrypt_bot_message(&secret, enc_iv, enc_payload, &ctx) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[msg:{}] msmsg AES-GCM open failed: {e:?}", info.id);
+                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                return;
+            }
+        };
+
+        let msg = match wa::Message::decode(plaintext.as_slice()) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!(
+                    "[msg:{}] msmsg plaintext is not a Message proto: {e:?}",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::ParsingError, None);
+                return;
+            }
+        };
+
+        self.dispatch_parsed_message(msg, info);
+    }
+
+    /// Resolve `target_sender` for a msmsg stanza: echo from `<meta>` when
+    /// present, else fall back to our LID (sender on bot server) or PN.
+    async fn resolve_msmsg_target_sender(&self, info: &Arc<MessageInfo>) -> Option<Jid> {
+        if let Some(ts) = info.meta_info.target_sender.as_ref() {
+            return Some(ts.clone());
+        }
+        if info.source.sender.server == wacore_binary::Server::Bot {
+            self.get_lid().await
+        } else {
+            self.get_pn().await
+        }
+    }
+
     /// Handles a newsletter plaintext message.
     /// Newsletters are not E2E encrypted and use the <plaintext> tag directly.
     async fn handle_newsletter_message(
@@ -567,7 +709,7 @@ impl Client {
             }
 
             // `had_unknown_enc` means "produced no usable payload": either the
-            // type is unrecognized (msmsg) or it's known but the body is empty.
+            // type is unrecognized or it's known but the body is empty.
             // Either way the stanza needs the fallback ack or the server replays.
             if EncType::from_wire(enc_type.as_ref()).is_none() {
                 log::warn!("Enc node has unknown type: {enc_type}");
@@ -583,6 +725,18 @@ impl Client {
                     continue;
                 }
             };
+
+            if payload.enc_type.is_bot_secret() {
+                // msmsg has its own decrypt pipeline (HKDF over the stored
+                // outbound messageSecret), is dispatched off-thread, and is
+                // mutually exclusive with the session/group decrypt batches.
+                let client = Arc::clone(self);
+                let info_arc = Arc::clone(&info);
+                self.outbound_flush.spawn(&*self.runtime, async move {
+                    client.handle_msmsg_payload(&info_arc, payload).await;
+                });
+                continue;
+            }
 
             if payload.enc_type.is_session() {
                 session_payloads.push(payload);
@@ -7567,5 +7721,285 @@ mod tests {
             backend.get_sync_key(&key_id).await.unwrap().is_some(),
             "app-state sync key from self must be stored"
         );
+    }
+
+    // ---- msmsg inbound dispatch -----------------------------------------
+
+    fn find_message_nack_error(frames: &[bytes::Bytes], id: &str) -> Option<u32> {
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "ack"
+                && node
+                    .get_attr("class")
+                    .is_some_and(|v| v.as_str() == "message")
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && let Some(err) = node.get_attr("error")
+                && let Ok(code) = err.as_str().parse::<u32>()
+            {
+                return Some(code);
+            }
+        }
+        None
+    }
+
+    fn encode_message_secret_message(iv: &[u8], payload: &[u8]) -> Vec<u8> {
+        use prost::Message as _;
+        let ms = wa::MessageSecretMessage {
+            version: Some(1),
+            enc_iv: Some(iv.to_vec()),
+            enc_payload: Some(payload.to_vec()),
+        };
+        let mut out = Vec::with_capacity(ms.encoded_len());
+        ms.encode(&mut out).expect("encode MessageSecretMessage");
+        out
+    }
+
+    async fn collect_event<F>(
+        client: &Arc<Client>,
+        collector: Arc<crate::test_utils::TestEventCollector>,
+        pred: F,
+        timeout_ms: u64,
+    ) -> Option<Arc<wacore::types::events::Event>>
+    where
+        F: Fn(&wacore::types::events::Event) -> bool,
+    {
+        let _ = client;
+        let mut waited = 0u64;
+        while waited <= timeout_ms {
+            for ev in collector.events() {
+                if pred(&ev) {
+                    return Some(ev);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            waited += 25;
+        }
+        None
+    }
+
+    /// Round-trip: store an outbound messageSecret, build a fake bot reply
+    /// whose payload we encrypt with the symmetric helper, route it through
+    /// classify, and assert the decrypted `wa::Message` lands on the bus.
+    #[tokio::test]
+    async fn msmsg_decrypts_when_secret_is_stored() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_ok").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let bot_jid = "867051314767696@bot";
+        let outbound_id = "OUTBOUND_1";
+        let bot_reply_id = "BOT_REPLY_1";
+        let secret = [0x42u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let plaintext_msg = wa::Message {
+            conversation: Some("hi from bot".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", bot_jid)
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.classify_incoming_message(&owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("hi from bot"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "msmsg decryption + dispatch must surface Event::Message"
+        );
+    }
+
+    /// No secret stored for `target_id` → nack `error=495`, no Message event.
+    #[tokio::test]
+    async fn msmsg_without_stored_secret_nacks_495() {
+        let (client, transport) = capturing_client("msmsg_nosecret").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let bot_reply_id = "BOT_REPLY_NS";
+        let outbound_id = "OUTBOUND_NS";
+        let our_pn = "5511000000001@s.whatsapp.net";
+
+        let ms_msg_proto = encode_message_secret_message(&[0u8; 12], &[0u8; 32]);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.classify_incoming_message(&owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), bot_reply_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            code,
+            Some(495),
+            "missing messageSecret must nack with code 495"
+        );
+        assert!(
+            collector
+                .events()
+                .iter()
+                .all(|e| !matches!(e.as_ref(), wacore::types::events::Event::Message(_, info) if info.id == bot_reply_id)),
+            "no Message event must be dispatched when decryption failed"
+        );
+    }
+
+    /// Tampered ciphertext → GCM tag fails → nack 495.
+    #[tokio::test]
+    async fn msmsg_with_bad_tag_nacks_495() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, transport) = capturing_client("msmsg_bad_tag").await;
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_BAD";
+        let bot_reply_id = "BOT_REPLY_BAD";
+        let secret = [0x77u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (mut cipher, iv) = encrypt_bot_message(b"hello", &secret, &ctx).unwrap();
+        let last = cipher.len() - 1;
+        cipher[last] ^= 0x01;
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.classify_incoming_message(&owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), bot_reply_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(code, Some(495));
+    }
+
+    /// `<meta>` without `target_id` → cannot identify the parent message,
+    /// nack 495 and no dispatch.
+    #[tokio::test]
+    async fn msmsg_without_meta_target_id_nacks_495() {
+        let (client, transport) = capturing_client("msmsg_no_target").await;
+        let bot_reply_id = "BOT_REPLY_NT";
+        let ms_msg_proto = encode_message_secret_message(&[0u8; 12], &[0u8; 32]);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .attr("v", "2")
+                .bytes(ms_msg_proto)
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        client.classify_incoming_message(&owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), bot_reply_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(code, Some(495));
     }
 }

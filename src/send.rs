@@ -990,7 +990,7 @@ impl Client {
             None => self.generate_message_id().await,
         };
         // `request_id` is moved into the branch-specific stanza builders below;
-        // keep a copy for the post-send messageSecret put (Phase 2 of msmsg).
+        // keep a copy for the post-send messageSecret persistence.
         let outbound_secret_id: Option<String> = message
             .message_context_info
             .as_ref()
@@ -3398,7 +3398,7 @@ mod tests {
         }
     }
 
-    // ---- Phase 2: outbound messageSecret capture ------------------------
+    // ---- outbound messageSecret capture ---------------------------------
 
     use crate::store::commands::DeviceCommand;
     use std::sync::Arc;
