@@ -237,7 +237,7 @@ impl Client {
             .unwrap_or(&info.source.chat)
             .to_non_ad()
             .to_string();
-        let target_sender_str = target_sender.to_non_ad().to_string();
+        let target_sender_str = target_sender.to_non_ad_string();
 
         // The id used for the SECRET LOOKUP is `meta.target_id` (our outbound
         // id); the id used as HKDF input is the bot reply id (or
@@ -297,7 +297,7 @@ impl Client {
             }
         };
 
-        let bot_user_jid = info.source.sender.to_non_ad().to_string();
+        let bot_user_jid = info.source.sender.to_non_ad_string();
         // WA Web `decryptMsmsgBotMessage` dispatches on `isFbidBot()`:
         //   * fbid path pre-resolves to `edit_target_id` for INNER/LAST edits,
         //     `externalId` (info.id) otherwise. Single AES-GCM attempt.

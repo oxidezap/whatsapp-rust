@@ -3992,7 +3992,7 @@ impl Client {
                 .attrs([
                     ("id", id),
                     ("type", type_str.to_string()),
-                    ("to", own_jid.to_non_ad().to_string()),
+                    ("to", own_jid.to_non_ad_string()),
                 ])
                 .build();
 

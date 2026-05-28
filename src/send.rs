@@ -858,7 +858,7 @@ impl Client {
                 }
                 // The protocolMessageKey.participant should match the original message's key exactly
                 // Do NOT convert LID to PN - pass through unchanged like WhatsApp Web does
-                let participant_str = original_sender.to_non_ad().to_string();
+                let participant_str = original_sender.to_non_ad_string();
                 log::debug!(
                     "Admin revoke: using participant {} for MessageKey",
                     participant_str
@@ -1481,8 +1481,8 @@ impl Client {
         msg_id: &str,
         secret: &[u8; wacore::reporting_token::MESSAGE_SECRET_SIZE],
     ) {
-        let chat_str = chat.to_non_ad().to_string();
-        let sender_str = sender.to_non_ad().to_string();
+        let chat_str = chat.to_non_ad_string();
+        let sender_str = sender.to_non_ad_string();
         if let Err(e) = self
             .persistence_manager
             .backend()
@@ -1737,7 +1737,7 @@ impl Client {
         use wacore::iq::tctoken::{IssuePrivacyTokensSpec, is_sender_tc_token_expired};
 
         // Dedup via session_locks — bare JID won't collide with protocol addresses ("user:device")
-        let bare = sender.to_non_ad().to_string();
+        let bare = sender.to_non_ad_string();
         let mutex = self.session_lock_for(&bare).await;
         let Some(_guard) = mutex.try_lock() else {
             return;
@@ -2069,7 +2069,7 @@ mod tests {
             ),
             RevokeType::Admin { original_sender } => (
                 false,
-                Some(original_sender.to_non_ad().to_string()),
+                Some(original_sender.to_non_ad_string()),
                 crate::types::message::EditAttribute::AdminRevoke,
             ),
         };
@@ -2109,7 +2109,7 @@ mod tests {
             ),
             RevokeType::Admin { original_sender } => (
                 false,
-                Some(original_sender.to_non_ad().to_string()),
+                Some(original_sender.to_non_ad_string()),
                 crate::types::message::EditAttribute::AdminRevoke,
             ),
         };
@@ -2310,7 +2310,7 @@ mod tests {
         // This was a bug that caused error 479 - the participant field must
         // preserve the original JID format exactly (with device stripped).
         let lid_sender = Jid::from_str("236395184570386:22@lid").unwrap();
-        let participant_str = lid_sender.to_non_ad().to_string();
+        let participant_str = lid_sender.to_non_ad_string();
 
         // Must preserve @lid suffix, device number stripped
         assert_eq!(participant_str, "236395184570386@lid");
@@ -3512,7 +3512,7 @@ mod tests {
             client
                 .dm_sender_identity_for(&bot_chat)
                 .await
-                .map(|j| j.to_non_ad().to_string()),
+                .map(|j| j.to_non_ad_string()),
             Some("999888777666555@lid".to_string()),
             "bot chats must resolve to our LID"
         );
@@ -3520,7 +3520,7 @@ mod tests {
             client
                 .dm_sender_identity_for(&pn_chat)
                 .await
-                .map(|j| j.to_non_ad().to_string()),
+                .map(|j| j.to_non_ad_string()),
             Some("5511000000001@s.whatsapp.net".to_string()),
             "PN chats must resolve to our PN"
         );
@@ -3530,7 +3530,7 @@ mod tests {
             client
                 .dm_sender_identity_for(&lid_chat)
                 .await
-                .map(|j| j.to_non_ad().to_string()),
+                .map(|j| j.to_non_ad_string()),
             Some("5511000000001@s.whatsapp.net".to_string()),
         );
     }

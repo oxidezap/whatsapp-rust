@@ -54,8 +54,8 @@ pub fn decrypt(
     original_sender_jid: &Jid,
     editor_jid: &Jid,
 ) -> Result<wa::Message> {
-    let primary_orig = original_sender_jid.to_non_ad().to_string();
-    let primary_editor = editor_jid.to_non_ad().to_string();
+    let primary_orig = original_sender_jid.to_non_ad_string();
+    let primary_editor = editor_jid.to_non_ad_string();
     let primary = MessageEditContext {
         original_msg_id,
         original_sender_jid: &primary_orig,
@@ -291,8 +291,8 @@ pub fn decrypt_secret_encrypted(
     original_sender_jid: &Jid,
     modification_sender_jid: &Jid,
 ) -> Result<wa::Message> {
-    let orig = original_sender_jid.to_non_ad().to_string();
-    let sender = modification_sender_jid.to_non_ad().to_string();
+    let orig = original_sender_jid.to_non_ad_string();
+    let sender = modification_sender_jid.to_non_ad_string();
     let ctx = MessageEditContext {
         original_msg_id,
         original_sender_jid: &orig,
@@ -321,16 +321,16 @@ pub fn decrypt_secret_encrypted_with_fallback(
     fallback_original_sender: Option<&Jid>,
     fallback_modification_sender: Option<&Jid>,
 ) -> Result<wa::Message> {
-    let orig = original_sender_jid.to_non_ad().to_string();
-    let sender = modification_sender_jid.to_non_ad().to_string();
+    let orig = original_sender_jid.to_non_ad_string();
+    let sender = modification_sender_jid.to_non_ad_string();
     let primary = MessageEditContext {
         original_msg_id,
         original_sender_jid: &orig,
         editor_jid: &sender,
     };
 
-    let fb_orig = fallback_original_sender.map(|j| j.to_non_ad().to_string());
-    let fb_sender = fallback_modification_sender.map(|j| j.to_non_ad().to_string());
+    let fb_orig = fallback_original_sender.map(|j| j.to_non_ad_string());
+    let fb_sender = fallback_modification_sender.map(|j| j.to_non_ad_string());
     let fb_orig_resolved = fb_orig.as_deref().unwrap_or(primary.original_sender_jid);
     let fb_sender_resolved = fb_sender.as_deref().unwrap_or(primary.editor_jid);
     let fallback_ctx = if fb_orig_resolved == primary.original_sender_jid

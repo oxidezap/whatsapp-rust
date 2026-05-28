@@ -527,6 +527,15 @@ impl Jid {
         }
     }
 
+    /// Canonical non-AD string form (`user@server`, device + agent stripped)
+    /// in a single allocation. Equivalent to `to_non_ad().to_string()` but
+    /// skips the throwaway intermediate `Jid` and its `CompactString` clone.
+    pub fn to_non_ad_string(&self) -> String {
+        let mut buf = String::with_capacity(self.user.len() + 1 + self.server.as_str().len());
+        push_jid_to_string(&self.user, self.server, 0, 0, &mut buf);
+        buf
+    }
+
     /// Check if this JID matches the user or their LID.
     /// Useful for checking if a participant is "us" in group messages.
     #[inline]
@@ -1282,6 +1291,30 @@ mod tests {
         let status = Jid::status_broadcast();
         let status_non_ad = status.to_non_ad();
         assert_eq!(status_non_ad.to_string(), "status@broadcast");
+    }
+
+    #[test]
+    fn test_to_non_ad_string_matches_to_non_ad_to_string() {
+        // to_non_ad_string() must be byte-identical to to_non_ad().to_string()
+        // across PN/LID/bot/group/status, with and without device + agent.
+        for s in [
+            "1234567890:33@s.whatsapp.net",
+            "1234567890@s.whatsapp.net",
+            "100000012345678:25@lid",
+            "100000012345678@lid",
+            "867051314767696:0@bot",
+            "867051314767696@bot",
+            "120363021033254949@g.us",
+            "status@broadcast",
+            "12-34@g.us",
+        ] {
+            let jid: Jid = s.parse().expect("parse");
+            assert_eq!(
+                jid.to_non_ad_string(),
+                jid.to_non_ad().to_string(),
+                "mismatch for {s}"
+            );
+        }
     }
 
     #[test]

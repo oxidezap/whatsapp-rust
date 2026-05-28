@@ -124,7 +124,7 @@ impl<'a> Polls<'a> {
             .resolve_voter_jid(poll_creator_jid, &my_base, poll_msg_id)
             .await;
         let voter_jid_str = voter_jid.to_string();
-        let creator_jid_str = poll_creator_jid.to_non_ad().to_string();
+        let creator_jid_str = poll_creator_jid.to_non_ad_string();
 
         let selected_hashes: Vec<Vec<u8>> = option_names
             .iter()
@@ -232,7 +232,7 @@ impl<'a> Polls<'a> {
         self.client
             .swap_pn_lid_namespace(jid)
             .await
-            .map(|j| j.to_non_ad().to_string())
+            .map(|j| j.to_non_ad_string())
     }
 
     /// Fallback pair only when both JIDs have a counterpart, keeping it
