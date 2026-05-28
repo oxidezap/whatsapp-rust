@@ -23,11 +23,19 @@ fn build_delivery_receipt_node(
     info: &crate::types::message::MessageInfo,
     active: bool,
 ) -> wacore_binary::Node {
+    let is_status = info.source.chat.is_status_broadcast();
+    // Mirror whatsmeow `buildBaseReceipt` / WA Web `JID(extractJidFromJidWithType)`:
+    // echo `from` verbatim so the device survives. `chat` strips it via to_non_ad,
+    // which the LID server rejects for multi-device DMs.
+    let to = if info.source.is_group || is_status {
+        &info.source.chat
+    } else {
+        &info.source.sender
+    };
     let mut builder = NodeBuilder::new("receipt")
         .attr("id", &info.id)
-        .attr("to", &info.source.chat);
+        .attr("to", to);
 
-    let is_status = info.source.chat.is_status_broadcast();
     if info.category == MessageCategory::Peer {
         builder = builder.attr("type", "peer_msg");
     } else if !active && !is_status {
@@ -477,6 +485,138 @@ mod tests {
     fn should_send_delivery_receipt_allows_status_broadcast() {
         let info = info_with("status@broadcast", "12345@s.whatsapp.net", false);
         assert!(Client::should_send_delivery_receipt(&info));
+    }
+
+    /// Regression: LID DM with explicit device must echo the device in `to`
+    /// (matches whatsmeow buildBaseReceipt + WA Web JID encoding). Stripping
+    /// the device caused <stream:error><ack/> for multi-device LID senders.
+    #[test]
+    fn delivery_receipt_for_lid_dm_preserves_device_in_to() {
+        let info = MessageInfo {
+            id: "LID_DEV_RECEIPT".to_string(),
+            source: MessageSource {
+                // chat is the non-AD form (matches parse_message_info's
+                // chat = from.to_non_ad()).
+                chat: "156535032389744@lid".parse().expect("chat"),
+                // sender preserves device (matches parse_message_info's
+                // sender = from.clone()).
+                sender: "156535032389744:7@lid".parse().expect("sender"),
+                is_from_me: false,
+                is_group: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let node = build_delivery_receipt_node(&info, true);
+        assert_eq!(
+            node.attrs.get("to").map(|v| v.as_str()).as_deref(),
+            Some("156535032389744:7@lid"),
+            "LID DM receipt must preserve the device or the server rejects the ack"
+        );
+        assert!(node.attrs.get("participant").is_none());
+    }
+
+    /// LID DM without device stays as-is (no-op for the common case).
+    #[test]
+    fn delivery_receipt_for_lid_dm_no_device_unchanged() {
+        let info = MessageInfo {
+            id: "LID_NO_DEV".to_string(),
+            source: MessageSource {
+                chat: "185323896221943@lid".parse().expect("chat"),
+                sender: "185323896221943@lid".parse().expect("sender"),
+                is_from_me: false,
+                is_group: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let node = build_delivery_receipt_node(&info, true);
+        assert_eq!(
+            node.attrs.get("to").map(|v| v.as_str()).as_deref(),
+            Some("185323896221943@lid")
+        );
+    }
+
+    /// Group: `to` must remain the group JID, participant carries the device.
+    #[test]
+    fn delivery_receipt_for_group_to_is_group_not_sender() {
+        let info = MessageInfo {
+            id: "GRP_RECEIPT".to_string(),
+            source: MessageSource {
+                chat: "120363021033254949@g.us".parse().expect("group"),
+                sender: "156535032389744:7@lid".parse().expect("sender"),
+                is_from_me: false,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let node = build_delivery_receipt_node(&info, true);
+        assert_eq!(
+            node.attrs.get("to").map(|v| v.as_str()).as_deref(),
+            Some("120363021033254949@g.us")
+        );
+        assert_eq!(
+            node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
+            Some("156535032389744:7@lid")
+        );
+    }
+
+    /// peer_msg: `to` echoes from (us with device), no participant.
+    #[test]
+    fn delivery_receipt_for_peer_dm_to_preserves_device() {
+        let mut info = MessageInfo {
+            id: "PEER_DEV".to_string(),
+            source: MessageSource {
+                chat: "9999999999@lid".parse().expect("chat"),
+                sender: "9999999999:3@lid".parse().expect("sender"),
+                is_from_me: true,
+                is_group: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        info.category = MessageCategory::Peer;
+        let node = build_delivery_receipt_node(&info, true);
+        assert_eq!(
+            node.attrs.get("to").map(|v| v.as_str()).as_deref(),
+            Some("9999999999:3@lid")
+        );
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("peer_msg")
+        );
+        assert!(node.attrs.get("participant").is_none());
+    }
+
+    /// status@broadcast: `to` must stay status@broadcast (chat), participant
+    /// carries the original sender device.
+    #[test]
+    fn delivery_receipt_for_status_to_is_status_not_sender() {
+        let info = MessageInfo {
+            id: "STATUS_RECEIPT".to_string(),
+            source: MessageSource {
+                chat: "status@broadcast".parse().expect("status"),
+                sender: "156535032389744:7@lid".parse().expect("sender"),
+                is_from_me: false,
+                is_group: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let node = build_delivery_receipt_node(&info, true);
+        assert_eq!(
+            node.attrs.get("to").map(|v| v.as_str()).as_deref(),
+            Some("status@broadcast")
+        );
+        assert_eq!(
+            node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
+            Some("156535032389744:7@lid")
+        );
+        assert_eq!(
+            node.attrs.get("context").map(|v| v.as_str()).as_deref(),
+            Some("status")
+        );
     }
 
     #[test]
