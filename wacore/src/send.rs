@@ -3800,7 +3800,7 @@ mod tests {
         #[test]
         fn album_is_text() {
             let msg = wa::Message {
-                album_message: Some(Box::new(Default::default())),
+                album_message: Some(Box::default()),
                 ..Default::default()
             };
             assert_eq!(stanza_type_from_message(&msg), stanza::MSG_TYPE_TEXT);
