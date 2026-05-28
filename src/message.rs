@@ -566,8 +566,9 @@ impl Client {
                 continue;
             }
 
-            // Distinguish unknown type (msmsg etc., needs fallback ack) from
-            // known-but-empty (malformed; existing flow handles it).
+            // `had_unknown_enc` means "produced no usable payload": either the
+            // type is unrecognized (msmsg) or it's known but the body is empty.
+            // Either way the stanza needs the fallback ack or the server replays.
             if EncType::from_wire(enc_type.as_ref()).is_none() {
                 log::warn!("Enc node has unknown type: {enc_type}");
                 had_unknown_enc = true;
@@ -578,6 +579,7 @@ impl Client {
                 Some(p) => p,
                 None => {
                     log::warn!("Enc node {enc_type} has no content");
+                    had_unknown_enc = true;
                     continue;
                 }
             };
@@ -7351,9 +7353,9 @@ mod tests {
         );
     }
 
-    /// Known type with empty content is malformed; not our fallback's job.
+    /// Known type with empty content still has no usable payload; ack it.
     #[tokio::test]
-    async fn known_enc_type_with_empty_content_skips_fallback_ack() {
+    async fn known_enc_type_with_empty_content_is_transport_acked() {
         let (client, transport) = capturing_client("known_empty").await;
         let node = NodeBuilder::new("message")
             .attr("from", "5511777776666@s.whatsapp.net")
@@ -7362,18 +7364,19 @@ mod tests {
             .children([NodeBuilder::new("enc").attr("type", "pkmsg").build()])
             .build();
         let owned = node_to_arc(node);
-        let _ = client.classify_incoming_message(&owned).await;
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(classified.is_none());
 
-        for _ in 0..16 {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            if find_message_ack(&transport.sent()).is_some() {
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
                 break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        assert!(
-            find_message_ack(&transport.sent()).is_none(),
-            "known-but-empty enc must not trigger the unknown-enc fallback ack"
-        );
+        let (to, _) = found.expect("known-but-empty enc must emit a transport ack");
+        assert_eq!(to, "5511777776666@s.whatsapp.net");
     }
 
     /// status is covered by should_ack; the fallback must not double-ack it.
