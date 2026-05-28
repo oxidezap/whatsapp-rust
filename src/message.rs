@@ -296,7 +296,19 @@ impl Client {
             {
                 Ok(Some(s)) => s,
                 Ok(None) => {
-                    log::warn!(
+                    // For a group bot invocation initiated by our PRIMARY
+                    // device, the messageSecret lives in the bot-addressed copy
+                    // the primary sent directly to the bot — it is NOT mirrored
+                    // to companions in the group skmsg. So a companion
+                    // legitimately never holds the secret; this miss is expected
+                    // and benign (we nack 495 and the server stops replaying).
+                    // A miss in a 1:1 bot chat is unexpected and worth a warn.
+                    log::log!(
+                        if info.source.is_group {
+                            log::Level::Debug
+                        } else {
+                            log::Level::Warn
+                        },
                         "[msg:{}] msmsg: no message_secret stored for target_id={target_id} (primary or alternate)",
                         info.id
                     );
