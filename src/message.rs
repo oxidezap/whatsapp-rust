@@ -120,6 +120,16 @@ impl Client {
         if info.id.is_empty() || info.source.chat.is_newsletter() {
             return;
         }
+        // WA Web `sendAggregateReceipts`: for a DELIVERY where the chat is NOT
+        // a bot but the author IS a bot (a bot reply inside a group), it emits
+        // a bare `<ack class="message">` via `sendBotInvokeResponseAcks`, not a
+        // `<receipt>`. A 1:1 bot chat keeps the normal receipt (chat.isBot() →
+        // the branch's `v` is false). Our transport ack is that bare
+        // `<ack class="message">` (group form carries `participant`).
+        if info.source.chat.server != wacore_binary::Server::Bot && info.source.sender.is_bot() {
+            self.spawn_message_ack(info);
+            return;
+        }
         if Self::should_send_delivery_receipt(info) {
             self.spawn_delivery_receipt(info);
         } else if !info.source.chat.is_status_broadcast() {
@@ -169,8 +179,22 @@ impl Client {
         if msg.is_forwarded() {
             return;
         }
-        let Some(sender) = self.dm_sender_identity_for(&info.source.chat).await else {
-            return;
+        // Key the secret under whoever AUTHORED the prompt, because the bot
+        // reply's `<meta target_sender_jid>` echoes that author at GET time:
+        //  * our own prompt (is_from_me): the bot echoes our LID for bot chats
+        //    / our addressing identity for groups — resolve via
+        //    dm_sender_identity_for.
+        //  * another group participant's prompt: the reply echoes THEM, so key
+        //    under their sender JID directly (mirrors WA Web's msgKey, which
+        //    keys the cache by the message author / participant).
+        // alternate_msg_secret_lookup bridges any LID↔PN family skew at GET.
+        let sender = if info.source.is_from_me {
+            match self.dm_sender_identity_for(&info.source.chat).await {
+                Some(j) => j,
+                None => return,
+            }
+        } else {
+            info.source.sender.clone()
         };
         self.persist_outbound_msg_secret(&info.source.chat, &sender, &info.id, secret_arr)
             .await;
@@ -8791,6 +8815,128 @@ mod tests {
             .await
             .unwrap();
         assert!(got.is_none(), "forwarded messages must not seed the cache");
+    }
+
+    /// Group flow: another participant invokes the bot, their decrypted prompt
+    /// carries the secret. We must key it under THE PARTICIPANT (the future
+    /// reply's `<meta target_sender_jid>`), not our own identity.
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_keys_under_other_participant() {
+        let (client, _transport) = capturing_client("capture_participant").await;
+        let participant = "5599111112222:7@s.whatsapp.net";
+        let info = Arc::new(MessageInfo {
+            id: "GRP_OTHER".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: participant.parse().unwrap(),
+                is_from_me: false,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("@MetaAI question".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    mentioned_jid: vec!["867051314767696@bot".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0x5A; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        // Keyed under the participant (non-AD), NOT under our own PN/LID.
+        let under_participant = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "120363021033254949@g.us",
+                "5599111112222@s.whatsapp.net",
+                "GRP_OTHER",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            under_participant.as_deref(),
+            Some(&[0x5Au8; 32][..]),
+            "another participant's prompt must key under their sender JID"
+        );
+    }
+
+    /// WA Web `sendAggregateReceipts`: a bot reply in a GROUP (chat not bot,
+    /// author is bot) must ack with a bare `<ack class="message">`
+    /// (sendBotInvokeResponseAcks), NOT a `<receipt>`.
+    #[tokio::test]
+    async fn bot_reply_in_group_acks_with_bare_ack_not_receipt() {
+        let (client, transport) = capturing_client("bot_group_ack").await;
+        let info = Arc::new(MessageInfo {
+            id: "BOT_GRP_ACK".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "867051314767696@bot".parse().unwrap(),
+                is_from_me: false,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&info);
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            found.is_some(),
+            "group bot reply must emit a bare <ack class=\"message\">"
+        );
+        assert_eq!(
+            delivery_receipts_for(&transport.sent(), "BOT_GRP_ACK"),
+            0,
+            "group bot reply must NOT emit a <receipt>"
+        );
+    }
+
+    /// Regression: a 1:1 bot chat (chat IS the bot) keeps the normal delivery
+    /// `<receipt>` — WA Web's `v` gate is false when chat.isBot().
+    #[tokio::test]
+    async fn bot_dm_reply_keeps_delivery_receipt() {
+        let (client, transport) = capturing_client("bot_dm_receipt").await;
+        let info = Arc::new(MessageInfo {
+            id: "BOT_DM_RCPT".into(),
+            source: crate::types::message::MessageSource {
+                chat: "867051314767696@bot".parse().unwrap(),
+                sender: "867051314767696@bot".parse().unwrap(),
+                is_from_me: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&info);
+
+        let mut count = 0;
+        for _ in 0..80 {
+            count = delivery_receipts_for(&transport.sent(), "BOT_DM_RCPT");
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            count, 1,
+            "1:1 bot chat must keep the normal delivery receipt"
+        );
     }
 
     #[tokio::test]
