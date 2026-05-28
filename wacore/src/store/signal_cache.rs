@@ -54,6 +54,9 @@ pub struct SignalStoreCache {
     sender_keys: Mutex<SenderKeyStoreState>,
     /// Avoids per-flush Vec allocation on the hot path (called after every message).
     flush_encode_buf: Mutex<Vec<u8>>,
+    /// Per-(group, sender) locks serializing each sender-key chain advance.
+    /// Coordination only (like the client session locks): never time-evicted.
+    sender_key_locks: Mutex<HashMap<Arc<str>, Arc<Mutex<()>>>>,
     max_entries: usize,
 }
 
@@ -267,6 +270,7 @@ impl SignalStoreCache {
             identities: Mutex::new(ByteStoreState::new()),
             sender_keys: Mutex::new(SenderKeyStoreState::new()),
             flush_encode_buf: Mutex::new(Vec::with_capacity(4096)),
+            sender_key_locks: Mutex::new(HashMap::new()),
             max_entries,
         }
     }
@@ -471,6 +475,22 @@ impl SignalStoreCache {
         state.evict_if_needed(self.max_entries);
     }
 
+    /// Shared lock for the `name` chain. Same name returns the same lock so a
+    /// concurrent encrypt can't read a chain iteration another is advancing.
+    pub async fn sender_key_lock(&self, name: &SenderKeyName) -> Arc<Mutex<()>> {
+        let mut map = self.sender_key_locks.lock().await;
+        if let Some(lock) = map.get(name.cache_key()) {
+            return lock.clone();
+        }
+        // Drop idle locks (held only by the map) once the map grows large.
+        if map.len() >= self.max_entries {
+            map.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        let lock = Arc::new(Mutex::new(()));
+        map.insert(Arc::from(name.cache_key()), lock.clone());
+        lock
+    }
+
     pub async fn delete_sender_key(&self, cache_key: &str) {
         let mut state = self.sender_keys.lock().await;
         state.delete(cache_key);
@@ -598,5 +618,40 @@ impl SignalStoreCache {
         self.sessions.lock().await.clear();
         self.identities.lock().await.clear();
         self.sender_keys.lock().await.clear();
+    }
+}
+
+#[cfg(test)]
+mod sender_key_lock_tests {
+    use super::*;
+    use crate::libsignal::store::sender_key_name::SenderKeyName;
+
+    #[tokio::test]
+    async fn same_name_shares_one_lock() {
+        let cache = SignalStoreCache::new();
+        let a = SenderKeyName::from_parts("g1@g.us", "u1@s.whatsapp.net:0");
+        let b = SenderKeyName::from_parts("g2@g.us", "u1@s.whatsapp.net:0");
+
+        let l1 = cache.sender_key_lock(&a).await;
+        let l2 = cache.sender_key_lock(&a).await;
+        let l3 = cache.sender_key_lock(&b).await;
+
+        assert!(Arc::ptr_eq(&l1, &l2), "same name must share one lock");
+        assert!(!Arc::ptr_eq(&l1, &l3), "different names must not share");
+    }
+
+    #[tokio::test]
+    async fn same_name_lock_is_mutually_exclusive() {
+        let cache = SignalStoreCache::new();
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+        let lock = cache.sender_key_lock(&name).await;
+
+        let guard = lock.lock().await;
+        assert!(
+            lock.try_lock().is_none(),
+            "held lock must block a second acquire"
+        );
+        drop(guard);
+        assert!(lock.try_lock().is_some(), "released lock must reacquire");
     }
 }

@@ -3,6 +3,7 @@ use crate::libsignal::protocol::{
     CiphertextMessage, ProtocolAddress, SENDERKEY_MESSAGE_CURRENT_VERSION, SenderKeyMessage,
     SenderKeyStore, SignalProtocolError, UsePQRatchet, message_encrypt, process_prekey_bundle,
 };
+use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::messages::MessageUtils;
 use crate::reporting_token::{
     build_reporting_node, generate_reporting_token, prepare_message_with_context,
@@ -270,10 +271,12 @@ pub fn should_hide_decrypt_fail(msg: &wa::Message) -> bool {
         })
 }
 
+/// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
+/// across the surrounding SKDM creation + this encrypt, so a concurrent send
+/// can't split the key between the SKDM and the skmsg.
 pub async fn encrypt_group_message<S, R>(
     sender_key_store: &mut S,
-    group_jid: &Jid,
-    sender_address: &ProtocolAddress,
+    sender_key_name: &SenderKeyName,
     plaintext: &[u8],
     csprng: &mut R,
 ) -> Result<SenderKeyMessage>
@@ -281,7 +284,6 @@ where
     S: SenderKeyStore + ?Sized,
     R: Rng + CryptoRng,
 {
-    let sender_key_name = make_sender_key_name(group_jid, sender_address);
     log::debug!(
         "Attempting to load sender key for group {} sender {}",
         sender_key_name.group_id(),
@@ -289,7 +291,7 @@ where
     );
 
     let mut record = sender_key_store
-        .load_sender_key(&sender_key_name)
+        .load_sender_key(sender_key_name)
         .await?
         .ok_or_else(|| {
             SignalProtocolError::NoSenderKeyState(format!(
@@ -334,7 +336,7 @@ where
     sender_key_state.set_sender_chain_key(sender_chain_key.next()?);
 
     sender_key_store
-        .store_sender_key(&sender_key_name, record)
+        .store_sender_key(sender_key_name, record)
         .await?;
 
     Ok(skm)
@@ -1324,7 +1326,15 @@ pub async fn prepare_group_stanza<
     let mut phash_for_stanza: Option<String> = None;
     let mut skdm_encrypted_devices: Vec<Jid> = Vec::new();
 
-    let sender_address = own_sending_jid.to_protocol_address();
+    // Build the chain name once and hold its lock across SKDM creation + the
+    // skmsg encrypt, so concurrent same-(group, sender) sends can't split the
+    // key between the SKDM and the skmsg (nor reuse a chain iteration).
+    let sender_key_name = make_sender_key_name(&to_jid, &own_sending_jid.to_protocol_address());
+    let chain_lock = stores
+        .sender_key_store
+        .sender_key_lock(&sender_key_name)
+        .await;
+    let _chain_guard = chain_lock.lock().await;
 
     // Determine if we need to distribute SKDM and to which devices
     let distribution_list: Option<Vec<Jid>> = if let Some(target_devices) = skdm_target_devices {
@@ -1457,8 +1467,7 @@ pub async fn prepare_group_stanza<
         }
         let axolotl_skdm_bytes = create_sender_key_distribution_message_for_group(
             stores.sender_key_store,
-            &to_jid,
-            &sender_address,
+            &sender_key_name,
         )
         .await?;
 
@@ -1526,8 +1535,7 @@ pub async fn prepare_group_stanza<
     let plaintext = MessageUtils::encode_and_pad(&message_for_encryption);
     let skmsg = encrypt_group_message(
         stores.sender_key_store,
-        &to_jid,
-        &sender_address,
+        &sender_key_name,
         &plaintext,
         &mut rand::make_rng::<rand::rngs::StdRng>(),
     )
@@ -1635,16 +1643,16 @@ pub(crate) fn collect_stale_device_users(
     user_set.into_iter().collect()
 }
 
+/// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
+/// across this creation + the matching skmsg encrypt (see `encrypt_group_message`).
 pub async fn create_sender_key_distribution_message_for_group(
     store: &mut (dyn SenderKeyStore + Send + Sync),
-    group_jid: &Jid,
-    sender_address: &ProtocolAddress,
+    sender_key_name: &SenderKeyName,
 ) -> Result<Vec<u8>> {
-    let sender_key_name = make_sender_key_name(group_jid, sender_address);
     let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
     let skdm = crate::libsignal::protocol::create_sender_key_distribution_message(
-        &sender_key_name,
+        sender_key_name,
         store,
         &mut rng,
     )

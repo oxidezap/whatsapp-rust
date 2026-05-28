@@ -269,4 +269,11 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
             .await
             .map_err(signal_err("backend"))
     }
+
+    async fn sender_key_lock(
+        &self,
+        sender_key_name: &SenderKeyName,
+    ) -> std::sync::Arc<async_lock::Mutex<()>> {
+        self.0.cache.sender_key_lock(sender_key_name).await
+    }
 }

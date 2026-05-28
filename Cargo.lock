@@ -2215,6 +2215,7 @@ version = "0.6.0"
 dependencies = [
  "aes",
  "arrayref",
+ "async-lock",
  "async-trait",
  "bytes",
  "cbc",

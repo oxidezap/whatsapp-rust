@@ -1037,10 +1037,8 @@ impl Client {
             )
             .await?
         } else if to.is_group() {
-            // Group messages: no client-level lock needed. The encrypt fan-out
-            // inside prepare_group_stanza touches a different Signal session
-            // per recipient device, so concurrent group sends to the same
-            // chat don't race on shared state.
+            // No send-level lock: encrypt_group_message serializes the
+            // sender-key chain advance per (group, sender) at the cipher.
             let mut group_info = self.groups().query_info(&to).await?;
 
             let mut device_snapshot = self.persistence_manager.get_device_snapshot().await;
