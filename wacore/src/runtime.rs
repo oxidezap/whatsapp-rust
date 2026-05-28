@@ -59,6 +59,20 @@ pub trait Runtime: Send + Sync + 'static {
     }
 }
 
+/// Bound for futures a [`Runtime`] can spawn: `Send + 'static` on native
+/// (work-stealing executors move tasks across threads), just `'static` on wasm
+/// (single-threaded). Generic spawn helpers carry this one bound so they stay
+/// correct on both targets instead of hardcoding `Send`.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait Spawnable: Send + 'static {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + 'static> Spawnable for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait Spawnable: 'static {}
+#[cfg(target_arch = "wasm32")]
+impl<T: 'static> Spawnable for T {}
+
 /// Handle returned by [`Runtime::spawn`]. Aborts the spawned task when dropped.
 ///
 /// Uses `std::sync::Mutex` internally so that the handle is `Send + Sync`,

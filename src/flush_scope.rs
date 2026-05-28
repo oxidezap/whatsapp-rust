@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use wacore::runtime::Runtime;
+use wacore::runtime::{Runtime, Spawnable};
 
 pub struct FlushScope {
     count: AtomicUsize,
@@ -43,9 +43,11 @@ impl FlushScope {
     /// Spawn a tracked task. The counter decrements on completion OR if the
     /// future is dropped (e.g. aborted, or dropped before its first poll), so
     /// `flush` can never deadlock waiting on a cancelled task.
+    // `Spawnable` (not a hardcoded `Send`) so this compiles on wasm, where the
+    // single-threaded runtime accepts !Send futures (see `wacore::runtime`).
     pub fn spawn<F>(self: &Arc<Self>, rt: &dyn Runtime, fut: F)
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future<Output = ()> + Spawnable,
     {
         {
             let closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
