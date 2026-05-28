@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779908408543,
+  "lastUpdate": 1779929835975,
   "repoUrl": "https://github.com/oxidezap/whatsapp-rust",
   "entries": {
     "whatsapp-rust integration benchmarks": [
@@ -9456,6 +9456,120 @@ window.BENCHMARK_DATA = {
           {
             "name": "integration::reconnect::alloc_bytes",
             "value": 264250,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::reconnect::wall_ms",
+            "value": 8,
+            "unit": "milliseconds"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "55464917+jlucaso1@users.noreply.github.com",
+            "name": "João Lucas",
+            "username": "jlucaso1"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ebb9faf39874f124c5dae059531d18b67717c56e",
+          "message": "fix(offline): drain offline queue by acking duplicate and undecryptable messages (#647)",
+          "timestamp": "2026-05-27T21:55:27-03:00",
+          "tree_id": "3855a7e4d19d53ab27f4817817cb8cfd9dbb9e03",
+          "url": "https://github.com/oxidezap/whatsapp-rust/commit/ebb9faf39874f124c5dae059531d18b67717c56e"
+        },
+        "date": 1779929835125,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "integration::connect_to_ready::alloc_count",
+            "value": 13074,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::connect_to_ready::alloc_bytes",
+            "value": 3801165,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::connect_to_ready::wall_ms",
+            "value": 357,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_message::alloc_count",
+            "value": 1396,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_message::alloc_bytes",
+            "value": 218471,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_message::wall_ms",
+            "value": 0,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_message_x20_amortized::alloc_count",
+            "value": 405,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_message_x20_amortized::alloc_bytes",
+            "value": 96853,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_message_x20_amortized::wall_ms",
+            "value": 0,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_and_receive_message::alloc_count",
+            "value": 4368,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_and_receive_message::alloc_bytes",
+            "value": 712100,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_and_receive_message::wall_ms",
+            "value": 0,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_and_receive_x20_amortized::alloc_count",
+            "value": 434,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_and_receive_x20_amortized::alloc_bytes",
+            "value": 117234,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_and_receive_x20_amortized::wall_ms",
+            "value": 43,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::reconnect::alloc_count",
+            "value": 1260,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::reconnect::alloc_bytes",
+            "value": 265544,
             "unit": "bytes"
           },
           {
