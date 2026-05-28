@@ -137,6 +137,10 @@ impl TestClient {
         let mut bot = builder.build().await?;
 
         let client = bot.client();
+        // with_push_name pre-seeds the name in DB, so the setting_pushName
+        // mutation arrives with `old == new` and skips the auto set_available.
+        // Force active so delivery receipts don't go out as type="inactive".
+        client.set_force_active_delivery_receipts(true);
         client.register_handler(event_handler);
 
         // The mock server no longer auto-pairs (legacy timer is off by

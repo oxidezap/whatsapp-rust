@@ -566,14 +566,18 @@ impl Client {
                 continue;
             }
 
-            // Zero-copy: slice_bytes returns a Bytes sub-view into the
-            // node's backing buffer without memcpy.
-            // from_owned_node returns None for unknown enc types or missing content.
+            // Distinguish unknown type (msmsg etc., needs fallback ack) from
+            // known-but-empty (malformed; existing flow handles it).
+            if EncType::from_wire(enc_type.as_ref()).is_none() {
+                log::warn!("Enc node has unknown type: {enc_type}");
+                had_unknown_enc = true;
+                continue;
+            }
+
             let payload = match EncPayload::from_owned_node(node, enc_node) {
                 Some(p) => p,
                 None => {
-                    log::warn!("Enc node has no content or unknown type: {enc_type}");
-                    had_unknown_enc = true;
+                    log::warn!("Enc node {enc_type} has no content");
                     continue;
                 }
             };
@@ -602,10 +606,10 @@ impl Client {
             );
         }
 
-        // Stanzas whose enc nodes are all unrecognized (e.g. msmsg from the Meta
-        // AI bot) would otherwise leave the offline queue without any ack,
-        // causing the server to replay them until <stream:error>. Custom
-        // handlers ack on their own; status is acked by the should_ack gate.
+        // Unknown-only stanzas (e.g. msmsg from the Meta AI bot) would loop in
+        // the offline queue until <stream:error>. Custom handlers ack on their
+        // own; status is covered by should_ack. Ack from `nr` so `recipient`
+        // survives (parse_message_info drops it on non-self branches).
         if session_payloads.is_empty()
             && group_payloads.is_empty()
             && had_unknown_enc
@@ -616,7 +620,7 @@ impl Client {
                 info.id
             );
             if !info.source.chat.is_status_broadcast() {
-                self.spawn_message_ack(&info);
+                self.spawn_node_transport_ack(nr).await;
             }
             return None;
         }
@@ -7280,10 +7284,7 @@ mod tests {
         assert_eq!(to, "5511777776666@s.whatsapp.net");
     }
 
-    /// Stanzas with only unrecognized enc types (e.g. msmsg from the Meta AI
-    /// bot) used to silently fall through with no ack, so the server replayed
-    /// them on every reconnect until <stream:error>. Classify must now emit a
-    /// transport ack to drop the stanza from the offline queue.
+    /// Unknown-only stanzas (e.g. msmsg) must be acked or they loop the queue.
     #[tokio::test]
     async fn unknown_only_enc_is_transport_acked() {
         let (client, transport) = capturing_client("msmsg_ack").await;
@@ -7315,8 +7316,67 @@ mod tests {
         assert_eq!(to, "5511777776666@s.whatsapp.net");
     }
 
-    /// status@broadcast is already acked by the `should_ack` gate; the fallback
-    /// path must skip it to avoid a duplicate transport ack.
+    /// `recipient` must be echoed verbatim or the server replies <stream:error>.
+    #[tokio::test]
+    async fn unknown_only_enc_ack_preserves_recipient() {
+        let (client, transport) = capturing_client("msmsg_recipient").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "236395184570386@lid")
+            .attr("recipient", "156535032389744@lid")
+            .attr("id", "MSMSG_LID")
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .bytes(vec![0u8; 8])
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(classified.is_none());
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, recipient) = found.expect("unknown-only enc must emit a transport ack");
+        assert_eq!(to, "236395184570386@lid");
+        assert_eq!(
+            recipient.as_deref(),
+            Some("156535032389744@lid"),
+            "ack must echo the incoming `recipient` attr or the server replies with <stream:error><ack/>"
+        );
+    }
+
+    /// Known type with empty content is malformed; not our fallback's job.
+    #[tokio::test]
+    async fn known_enc_type_with_empty_content_skips_fallback_ack() {
+        let (client, transport) = capturing_client("known_empty").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "EMPTY1")
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc").attr("type", "pkmsg").build()])
+            .build();
+        let owned = node_to_arc(node);
+        let _ = client.classify_incoming_message(&owned).await;
+
+        for _ in 0..16 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            if find_message_ack(&transport.sent()).is_some() {
+                break;
+            }
+        }
+        assert!(
+            find_message_ack(&transport.sent()).is_none(),
+            "known-but-empty enc must not trigger the unknown-enc fallback ack"
+        );
+    }
+
+    /// status is covered by should_ack; the fallback must not double-ack it.
     #[tokio::test]
     async fn unknown_only_enc_on_status_skips_fallback_ack() {
         let (client, transport) = capturing_client("msmsg_status_skip").await;
@@ -7347,9 +7407,7 @@ mod tests {
         );
     }
 
-    /// A recognized enc alongside an unknown one must still flow through the
-    /// normal process path; the fallback must not short-circuit and prevent
-    /// decryption of the recognized payload.
+    /// One recognized enc + one unknown must still go through the normal path.
     #[tokio::test]
     async fn mixed_recognized_and_unknown_enc_still_classifies() {
         let (client, _transport) = capturing_client("msmsg_mixed").await;
@@ -7377,9 +7435,7 @@ mod tests {
         assert!(classified.group_payloads.is_empty());
     }
 
-    /// When a custom handler claims the unknown enc type, the fallback must NOT
-    /// fire (the handler is responsible for its own ack; firing both could send
-    /// two acks for the same stanza).
+    /// A custom handler owns its ack; the fallback must not double-ack.
     #[tokio::test]
     async fn custom_handler_only_skips_fallback_ack() {
         use crate::types::enc_handler::EncHandler;

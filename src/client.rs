@@ -1987,6 +1987,32 @@ impl Client {
         });
     }
 
+    /// Tracked ack encoded from the original node. Use when the stanza carries
+    /// `recipient` (LID-routed/hosted-companion/peer) since `MessageInfo`
+    /// drops it on non-self branches and the server needs it for routing.
+    pub(crate) async fn spawn_node_transport_ack(
+        self: &Arc<Self>,
+        node: &wacore_binary::NodeRef<'_>,
+    ) {
+        let own_pn = self.get_pn().await;
+        let buf = match encode_ack_bytes(node, own_pn.as_ref()) {
+            Ok(Some(b)) => b,
+            Ok(None) => return,
+            Err(e) => {
+                log::warn!("Failed to encode node transport ack: {e}");
+                return;
+            }
+        };
+        let client = Arc::clone(self);
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            if let Err(e) = client.send_raw_bytes(buf).await
+                && !e.is_transport_unavailable()
+            {
+                log::warn!("Failed to send node transport ack: {e:?}");
+            }
+        });
+    }
+
     pub async fn set_passive(&self, passive: bool) -> Result<(), crate::request::IqError> {
         use wacore::iq::passive::PassiveModeSpec;
         self.execute(PassiveModeSpec::new(passive)).await
