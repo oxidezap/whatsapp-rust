@@ -98,7 +98,9 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
         match SecretEncType::try_from(sec.secret_enc_type.unwrap_or(0)) {
             Ok(SecretEncType::EventEdit) => return stanza::MSG_TYPE_EVENT,
             Ok(SecretEncType::MessageEdit) => return stanza::MSG_TYPE_TEXT,
-            Ok(SecretEncType::PollEdit) => return stanza::MSG_TYPE_POLL,
+            Ok(SecretEncType::PollEdit | SecretEncType::PollAddOption) => {
+                return stanza::MSG_TYPE_POLL;
+            }
             _ => {}
         }
     }
@@ -122,6 +124,7 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
         || msg.newsletter_admin_invite_message.is_some()
         || msg.newsletter_follower_invite_message_v2.is_some()
         || msg.message_history_notice.is_some()
+        || msg.album_message.is_some()
     {
         return stanza::MSG_TYPE_TEXT;
     }
@@ -3761,6 +3764,46 @@ mod tests {
                 ..Default::default()
             };
             assert!(should_hide_decrypt_fail(&msg));
+        }
+    }
+
+    mod stanza_type {
+        use super::*;
+        use wa::message::secret_encrypted_message::SecretEncType;
+
+        fn secret(enc: SecretEncType) -> wa::Message {
+            wa::Message {
+                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(enc as i32),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn poll_add_option_edit_is_poll() {
+            assert_eq!(
+                stanza_type_from_message(&secret(SecretEncType::PollAddOption)),
+                stanza::MSG_TYPE_POLL
+            );
+        }
+
+        #[test]
+        fn poll_edit_is_poll() {
+            assert_eq!(
+                stanza_type_from_message(&secret(SecretEncType::PollEdit)),
+                stanza::MSG_TYPE_POLL
+            );
+        }
+
+        #[test]
+        fn album_is_text() {
+            let msg = wa::Message {
+                album_message: Some(Box::new(Default::default())),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&msg), stanza::MSG_TYPE_TEXT);
         }
     }
 
