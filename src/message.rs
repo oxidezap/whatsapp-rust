@@ -196,6 +196,11 @@ impl Client {
         } else {
             info.source.sender.clone()
         };
+        log::debug!(
+            "[msg:{}] cached bot messageSecret under sender={}",
+            info.id,
+            sender.to_non_ad_string()
+        );
         self.persist_outbound_msg_secret(&info.source.chat, &sender, &info.id, secret_arr)
             .await;
     }
@@ -399,6 +404,11 @@ impl Client {
             }
         };
 
+        log::info!(
+            "[msg:{}] Successfully decrypted msmsg bot reply from {}",
+            info.id,
+            info.source.sender
+        );
         self.dispatch_parsed_message(msg, info).await;
     }
 
