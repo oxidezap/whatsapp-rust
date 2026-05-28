@@ -17,16 +17,23 @@ use wacore_binary::OwnedNodeRef;
 /// `(t.isGroup() || t.isBroadcast()) && r ? DEVICE_JID(r) : DROP_ATTR`, so
 /// status broadcasts (isBroadcast = true) also carry the original poster's
 /// JID. Without it the server can't map the ack back to the status owner.
-fn build_delivery_receipt_node(info: &crate::types::message::MessageInfo) -> wacore_binary::Node {
+/// `active=false` sends `type="inactive"` (not rendered as ticks), matching
+/// whatsmeow's background companion. Peer/status keep their own type/context.
+fn build_delivery_receipt_node(
+    info: &crate::types::message::MessageInfo,
+    active: bool,
+) -> wacore_binary::Node {
     let mut builder = NodeBuilder::new("receipt")
         .attr("id", &info.id)
         .attr("to", &info.source.chat);
 
+    let is_status = info.source.chat.is_status_broadcast();
     if info.category == MessageCategory::Peer {
         builder = builder.attr("type", "peer_msg");
+    } else if !active && !is_status {
+        builder = builder.attr("type", "inactive");
     }
 
-    let is_status = info.source.chat.is_status_broadcast();
     if info.source.is_group || is_status {
         builder = builder.attr("participant", &info.source.sender);
     }
@@ -76,7 +83,7 @@ fn build_nack_node(
 }
 
 impl Client {
-    fn should_send_delivery_receipt(info: &crate::types::message::MessageInfo) -> bool {
+    pub(crate) fn should_send_delivery_receipt(info: &crate::types::message::MessageInfo) -> bool {
         if info.id.is_empty() || info.source.chat.is_newsletter() {
             return false;
         }
@@ -257,7 +264,7 @@ impl Client {
             return;
         }
 
-        let receipt_node = build_delivery_receipt_node(info);
+        let receipt_node = build_delivery_receipt_node(info, self.receipts_are_active());
 
         debug!(target: "Client/Receipt", "Sending {} receipt for message {} to {}",
             if info.category == MessageCategory::Peer { "peer_msg" } else { "delivery" },
@@ -397,7 +404,7 @@ mod tests {
         // `Send/DeliveryReceiptJob.js`. Status broadcasts must carry BOTH so
         // the server can map the ack back to the status owner.
         let info = info_with("status@broadcast", "12345@s.whatsapp.net", false);
-        let node = build_delivery_receipt_node(&info);
+        let node = build_delivery_receipt_node(&info, true);
         assert_eq!(node.tag, "receipt");
         assert_eq!(
             node.attrs.get("context").map(|v| v.as_str()).as_deref(),
@@ -412,10 +419,43 @@ mod tests {
     #[test]
     fn delivery_receipt_for_dm_has_no_context_no_participant() {
         let info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
-        let node = build_delivery_receipt_node(&info);
+        let node = build_delivery_receipt_node(&info, true);
         assert!(node.attrs.get("context").is_none());
         assert!(node.attrs.get("participant").is_none());
         assert!(node.attrs.get("type").is_none());
+    }
+
+    #[test]
+    fn delivery_receipt_is_inactive_when_not_active() {
+        let info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        let inactive = build_delivery_receipt_node(&info, false);
+        assert_eq!(
+            inactive.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("inactive"),
+            "a passive companion sends inactive delivery receipts"
+        );
+        let active = build_delivery_receipt_node(&info, true);
+        assert!(active.attrs.get("type").is_none());
+    }
+
+    #[test]
+    fn status_and_peer_receipts_ignore_inactive() {
+        let status = info_with("status@broadcast", "12345@s.whatsapp.net", false);
+        let node = build_delivery_receipt_node(&status, false);
+        // status keeps context, never type=inactive
+        assert!(node.attrs.get("type").is_none());
+        assert_eq!(
+            node.attrs.get("context").map(|v| v.as_str()).as_deref(),
+            Some("status")
+        );
+
+        let mut peer = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
+        peer.category = MessageCategory::Peer;
+        let node = build_delivery_receipt_node(&peer, false);
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("peer_msg")
+        );
     }
 
     #[test]
@@ -425,7 +465,7 @@ mod tests {
             "15551234567@s.whatsapp.net",
             true,
         );
-        let node = build_delivery_receipt_node(&info);
+        let node = build_delivery_receipt_node(&info, true);
         assert_eq!(
             node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
             Some("15551234567@s.whatsapp.net")
@@ -445,7 +485,7 @@ mod tests {
         // participant, no context. Matches WA Web's DROP_ATTR gating.
         let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
         info.category = MessageCategory::Peer;
-        let node = build_delivery_receipt_node(&info);
+        let node = build_delivery_receipt_node(&info, true);
         assert_eq!(
             node.attrs.get("type").map(|v| v.as_str()).as_deref(),
             Some("peer_msg")
@@ -461,7 +501,7 @@ mod tests {
         // status owner from it regardless of the peer_msg type.
         let mut info = info_with("status@broadcast", "12345@s.whatsapp.net", false);
         info.category = MessageCategory::Peer;
-        let node = build_delivery_receipt_node(&info);
+        let node = build_delivery_receipt_node(&info, true);
         assert_eq!(
             node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
             Some("12345@s.whatsapp.net")

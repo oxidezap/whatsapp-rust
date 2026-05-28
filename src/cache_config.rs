@@ -170,7 +170,8 @@ pub struct CacheConfig {
     /// Default: capacity 0 (disabled — DB-only, matching WA Web).
     /// Set capacity > 0 to enable a fast in-memory cache in front of the DB.
     pub recent_messages: CacheEntryConfig,
-    /// Message retry counts (time_to_live). Default: 5m TTL, 500 entries.
+    /// Message retry counts (time_to_live). Default: 1h TTL, 500 entries.
+    /// Long enough that the MAX_DECRYPT_RETRIES cap survives spaced redeliveries.
     pub message_retry_counts: CacheEntryConfig,
     /// Dedup key for `UndecryptableMessage` dispatch so a server resend of
     /// the same id does not surface a second notification. Default: 5m TTL,
@@ -247,7 +248,9 @@ impl Default for CacheConfig {
             device_registry_cache: CacheEntryConfig::new(one_hour, 1_000),
             lid_pn_cache: CacheEntryConfig::new(None, u64::MAX),
             recent_messages: CacheEntryConfig::new(five_min, 0),
-            message_retry_counts: CacheEntryConfig::new(five_min, 500),
+            // 1h so the MAX_DECRYPT_RETRIES cap survives spaced redeliveries; a
+            // 5m TTL expired between reconnects so the count never reached the cap.
+            message_retry_counts: CacheEntryConfig::new(one_hour, 500),
             undecryptable_dispatched: CacheEntryConfig::new(five_min, 1_000),
             pdo_pending_requests: CacheEntryConfig::new(Some(Duration::from_secs(30)), 200),
             sender_key_devices_cache: CacheEntryConfig::new(one_hour, 500),
