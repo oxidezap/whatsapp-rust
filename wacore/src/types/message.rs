@@ -298,24 +298,22 @@ mod tests {
 
     #[test]
     fn test_decrypt_fail_hide_logic_for_edits() {
-        // Documents the logic used in prepare_group_stanza (wacore/src/send.rs).
-        // The decrypt-fail="hide" attribute is added for edited messages to hide
-        // failed decryption attempts. However, admin revokes should NOT have it
-        // because WhatsApp Web doesn't include it, and the server rejects it.
+        // Exercise the real rule; both revoke kinds are excluded (WA Web never
+        // hides REVOKE and the server drops revokes carrying the attribute).
+        let plain = waproto::whatsapp::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        let hide =
+            |e: EditAttribute| crate::send::should_hide_decrypt_fail_for_send(Some(&e), &plain);
 
-        fn should_add_decrypt_fail_hide(edit: &EditAttribute) -> bool {
-            *edit != EditAttribute::Empty && *edit != EditAttribute::AdminRevoke
-        }
+        assert!(hide(EditAttribute::MessageEdit));
+        assert!(hide(EditAttribute::PinInChat));
+        assert!(hide(EditAttribute::AdminEdit));
 
-        // Should add decrypt-fail="hide"
-        assert!(should_add_decrypt_fail_hide(&EditAttribute::MessageEdit));
-        assert!(should_add_decrypt_fail_hide(&EditAttribute::PinInChat));
-        assert!(should_add_decrypt_fail_hide(&EditAttribute::AdminEdit));
-        assert!(should_add_decrypt_fail_hide(&EditAttribute::SenderRevoke));
-
-        // Should NOT add decrypt-fail="hide"
-        assert!(!should_add_decrypt_fail_hide(&EditAttribute::Empty));
-        assert!(!should_add_decrypt_fail_hide(&EditAttribute::AdminRevoke));
+        assert!(!hide(EditAttribute::SenderRevoke));
+        assert!(!hide(EditAttribute::Empty));
+        assert!(!hide(EditAttribute::AdminRevoke));
     }
 
     #[test]
