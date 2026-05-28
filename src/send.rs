@@ -989,6 +989,13 @@ impl Client {
             Some(id) => id,
             None => self.generate_message_id().await,
         };
+        // `request_id` is moved into the branch-specific stanza builders below;
+        // keep a copy for the post-send messageSecret put (Phase 2 of msmsg).
+        let outbound_secret_id: Option<String> = message
+            .message_context_info
+            .as_ref()
+            .filter(|mci| mci.message_secret.is_some())
+            .map(|_| request_id.clone());
 
         // SKDM update data — only populated for group sends, deferred until after send_node().
         // This matches WhatsApp Web which only calls markHasSenderKey() after server ACK.
@@ -1391,6 +1398,11 @@ impl Client {
             return Err(e.into());
         }
 
+        if let Some(msg_id) = outbound_secret_id {
+            self.persist_outbound_msg_secret(&tc_issue_target, &msg_id, message)
+                .await;
+        }
+
         if let Some((rx, phash, msg_id)) = ack {
             // Group sends also invalidate group cache on mismatch — server's
             // participant set diverged, the next send needs a fresh query.
@@ -1436,6 +1448,33 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    /// Persist `MessageContextInfo.message_secret` keyed by (chat, ownPN, id)
+    /// so future addon replies (msmsg bot, polls, edits) decrypt against it.
+    /// Mirrors whatsmeow `cli.Store.MsgSecrets.PutMessageSecret` (send.go) and
+    /// WA Web's `messageSecret` field on the DB message row.
+    async fn persist_outbound_msg_secret(&self, chat: &Jid, msg_id: &str, message: &wa::Message) {
+        let Some(secret) = message
+            .message_context_info
+            .as_ref()
+            .and_then(|mci| mci.message_secret.as_deref())
+        else {
+            return;
+        };
+        let Some(own_pn) = self.get_pn().await else {
+            return;
+        };
+        let chat_str = chat.to_non_ad().to_string();
+        let sender_str = own_pn.to_non_ad().to_string();
+        if let Err(e) = self
+            .persistence_manager
+            .backend()
+            .put_msg_secret(&chat_str, &sender_str, msg_id, secret)
+            .await
+        {
+            log::warn!("Failed to persist outbound messageSecret for {msg_id}: {e:?}");
+        }
     }
 
     /// Look up and include a privacy token in outgoing 1:1 message stanza nodes.
@@ -3357,5 +3396,124 @@ mod tests {
                 "100000012345678@lid.0"
             );
         }
+    }
+
+    // ---- Phase 2: outbound messageSecret capture ------------------------
+
+    use crate::store::commands::DeviceCommand;
+    use std::sync::Arc;
+
+    async fn seed_pn(client: &Arc<Client>, pn: &str) {
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(pn.parse().expect("pn"))))
+            .await;
+    }
+
+    fn msg_with_secret(secret: [u8; 32]) -> wa::Message {
+        wa::Message {
+            conversation: Some("hi".into()),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(secret.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_outbound_msg_secret_writes_under_chat_pn_id() {
+        let client = crate::test_utils::create_test_client_with_name("secret_chat_pn_id").await;
+        seed_pn(&client, "5511000000001:0@s.whatsapp.net").await;
+        let chat: Jid = "5511777776666@s.whatsapp.net".parse().unwrap();
+        let secret = [0x55u8; 32];
+        client
+            .persist_outbound_msg_secret(&chat, "MID_1", &msg_with_secret(secret))
+            .await;
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "5511777776666@s.whatsapp.net",
+                "5511000000001@s.whatsapp.net",
+                "MID_1",
+            )
+            .await
+            .expect("get");
+        assert_eq!(got.as_deref(), Some(&secret[..]));
+    }
+
+    #[tokio::test]
+    async fn persist_outbound_msg_secret_skips_when_secret_absent() {
+        let client = crate::test_utils::create_test_client_with_name("secret_skip_absent").await;
+        seed_pn(&client, "5511000000001:0@s.whatsapp.net").await;
+        let chat: Jid = "5511777776666@s.whatsapp.net".parse().unwrap();
+        let no_secret = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        client
+            .persist_outbound_msg_secret(&chat, "MID_2", &no_secret)
+            .await;
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(
+                    "5511777776666@s.whatsapp.net",
+                    "5511000000001@s.whatsapp.net",
+                    "MID_2",
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "no secret in MessageContextInfo => nothing persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_outbound_msg_secret_skips_when_pn_missing() {
+        // No seed_pn: get_pn() returns None.
+        let client = crate::test_utils::create_test_client_with_name("secret_skip_pn").await;
+        let chat: Jid = "5511777776666@s.whatsapp.net".parse().unwrap();
+        client
+            .persist_outbound_msg_secret(&chat, "MID_3", &msg_with_secret([1u8; 32]))
+            .await;
+        // The backend is empty -- impossible to verify "no write" without a
+        // probe; verify the helper didn't panic and there's still no entry
+        // under a guessed sender form.
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_msg_secret("5511777776666@s.whatsapp.net", "", "MID_3",)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_outbound_msg_secret_strips_chat_device_in_key() {
+        // Pre-fix bug-shape regression: if chat is supplied with a device,
+        // it must still be stored under the non-AD form so the inbound
+        // lookup (which uses the chat from <meta target_chat_jid>) hits.
+        let client = crate::test_utils::create_test_client_with_name("secret_chat_strip").await;
+        seed_pn(&client, "5511000000001:0@s.whatsapp.net").await;
+        let chat_with_dev: Jid = "5511777776666:7@s.whatsapp.net".parse().unwrap();
+        client
+            .persist_outbound_msg_secret(&chat_with_dev, "MID_4", &msg_with_secret([2u8; 32]))
+            .await;
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "5511777776666@s.whatsapp.net",
+                "5511000000001@s.whatsapp.net",
+                "MID_4",
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some(&[2u8; 32][..]));
     }
 }
