@@ -240,10 +240,13 @@ pub fn should_hide_decrypt_fail(msg: &wa::Message) -> bool {
             .as_ref()
             .is_some_and(|p| p.vote.is_some())
         || msg.message_history_notice.is_some()
+        || msg.conditional_reveal_message.is_some()
         || msg.secret_encrypted_message.as_ref().is_some_and(|s| {
             matches!(
                 SecretEncType::try_from(s.secret_enc_type.unwrap_or(0)),
-                Ok(SecretEncType::EventEdit | SecretEncType::PollEdit)
+                Ok(SecretEncType::EventEdit
+                    | SecretEncType::PollEdit
+                    | SecretEncType::PollAddOption)
             )
         })
         || msg
@@ -3758,6 +3761,28 @@ mod tests {
                         ..Default::default()
                     })),
                 })),
+                ..Default::default()
+            };
+            assert!(should_hide_decrypt_fail(&msg));
+        }
+
+        #[test]
+        fn conditional_reveal() {
+            let msg = wa::Message {
+                conditional_reveal_message: Some(Default::default()),
+                ..Default::default()
+            };
+            assert!(should_hide_decrypt_fail(&msg));
+        }
+
+        #[test]
+        fn poll_add_option_edit() {
+            use wa::message::secret_encrypted_message::SecretEncType;
+            let msg = wa::Message {
+                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(SecretEncType::PollAddOption as i32),
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
             assert!(should_hide_decrypt_fail(&msg));
