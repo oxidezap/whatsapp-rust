@@ -148,26 +148,30 @@ impl Client {
                             }
                             error_count = 0;
 
-                            // Periodic cleanup of expired sent messages (~every 12 ticks ≈ 5 min)
+                            // Periodic DB cleanup (~every 12 ticks ≈ 5 min). The
+                            // tick gate is independent of any single TTL; each
+                            // retention setting gates its own delete so they can
+                            // be enabled/disabled separately.
                             cleanup_counter += 1;
-                            if sent_msg_ttl > 0 && cleanup_counter >= 12 {
+                            if cleanup_counter >= 12 {
                                 cleanup_counter = 0;
-                                let backend = self.persistence_manager.backend();
-                                let cutoff = wacore::time::now_secs()
-                                    - sent_msg_ttl as i64;
-                                self.runtime.spawn(Box::pin(async move {
-                                    if let Err(e) = backend.delete_expired_sent_messages(cutoff).await {
-                                        log::debug!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
-                                    }
-                                })).detach();
+                                let now = wacore::time::now_secs();
+                                if sent_msg_ttl > 0 {
+                                    let backend = self.persistence_manager.backend();
+                                    let cutoff = now - sent_msg_ttl as i64;
+                                    self.runtime.spawn(Box::pin(async move {
+                                        if let Err(e) = backend.delete_expired_sent_messages(cutoff).await {
+                                            log::debug!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
+                                        }
+                                    })).detach();
+                                }
                                 // msg_secrets retention: disabled by default
-                                // (matches whatsmeow + WA Web). Caller can
-                                // opt in via CacheConfig.msg_secret_ttl_secs.
+                                // (matches whatsmeow + WA Web). Caller can opt in
+                                // via CacheConfig.msg_secret_ttl_secs.
                                 let secret_ttl = self.cache_config.msg_secret_ttl_secs;
                                 if secret_ttl > 0 {
                                     let backend = self.persistence_manager.backend();
-                                    let secret_cutoff =
-                                        wacore::time::now_secs() - secret_ttl as i64;
+                                    let secret_cutoff = now - secret_ttl as i64;
                                     self.runtime.spawn(Box::pin(async move {
                                         if let Err(e) = backend
                                             .delete_expired_msg_secrets(secret_cutoff)
