@@ -8333,6 +8333,92 @@ mod tests {
         );
     }
 
+    /// Inverse of the `falls_back_to_info_id` test: primary is `info.id`
+    /// (edit_type isn't INNER/LAST so the fbid pre-resolve picks the stanza
+    /// id), but the bot encrypted under `edit_target_id`. The fallback must
+    /// rescue.
+    #[tokio::test]
+    async fn msmsg_falls_back_to_edit_target_when_primary_uses_info_id() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_fb_to_edit").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_INV";
+        let stanza_id = "REPLY_INV";
+        let edit_target_id = "EDIT_INV";
+        let secret = [0xBEu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let plaintext_msg = wa::Message {
+            conversation: Some("inverse fallback".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        // Encrypt under edit_target_id even though edit=first → primary
+        // will pick info.id (stanza id), fail, and the fallback should try
+        // edit_target_id and succeed (WA Web regular bot path `f()`).
+        let ctx = BotMessageContext {
+            msg_id: edit_target_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot")
+                    .attr("edit", "first")
+                    .attr("edit_target_id", edit_target_id)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == stanza_id
+                        && msg.conversation.as_deref() == Some("inverse fallback"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "primary attempt with info.id must fall back to edit_target_id (WA Web f())"
+        );
+    }
+
     /// Mirror scenario: no `<bot edit>`, so the parser doesn't populate
     /// `edit_target_id`. Primary uses `info.id`; with no fallback id
     /// available, a deliberately-wrong-key payload must nack 495 (no second
@@ -8422,9 +8508,13 @@ mod tests {
         let our_lid = "999888777666555@lid";
         let secret = [0x71u8; 32];
 
-        // Real outbound path puts the secret using LID for bot chats.
+        // Real outbound path: caller resolves the bot identity to our LID.
+        let sender_identity = client
+            .dm_sender_identity_for(&bot_chat)
+            .await
+            .expect("LID seeded");
         client
-            .persist_outbound_msg_secret(&bot_chat, outbound_id, &secret)
+            .persist_outbound_msg_secret(&bot_chat, &sender_identity, outbound_id, &secret)
             .await;
 
         // Inbound msmsg payload encrypted under the same (msg_id, target, bot)

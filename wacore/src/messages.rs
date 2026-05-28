@@ -308,30 +308,21 @@ pub fn parse_message_info(
         );
     }
 
-    // <bot edit="..."> child — only present for bot replies. Captures the
-    // edit-chain target id so msmsg decryption can use it as the HKDF
-    // message id (WA Web `decryptMsmsgFbidBotMessage`).
+    // <bot edit="..."> child. Mirror WA Web `f()`: read `edit_target_id`
+    // unconditionally so the msmsg regular-bot fallback path can consume it
+    // regardless of edit_type. fbid (`h()`) only uses it for INNER/LAST,
+    // but parsing it always is a strict superset.
     let bot_info = node.get_optional_child("bot").map(|bot_node| {
         let mut ba = bot_node.attrs();
-        let edit_type = ba
-            .optional_string("edit")
-            .and_then(|s| crate::types::message::BotEditType::from_wire(s.as_ref()));
-        let (edit_target_id, edit_sender_timestamp_ms) = match edit_type {
-            Some(
-                crate::types::message::BotEditType::Inner
-                | crate::types::message::BotEditType::Last,
-            ) => (
-                ba.optional_string("edit_target_id").map(|s| s.into_owned()),
-                ba.optional_u64("sender_timestamp_ms")
-                    .and_then(|ms| i64::try_from(ms).ok())
-                    .and_then(crate::time::from_millis),
-            ),
-            _ => (None, None),
-        };
         crate::types::message::MsgBotInfo {
-            edit_type,
-            edit_target_id,
-            edit_sender_timestamp_ms,
+            edit_type: ba
+                .optional_string("edit")
+                .and_then(|s| crate::types::message::BotEditType::from_wire(s.as_ref())),
+            edit_target_id: ba.optional_string("edit_target_id").map(|s| s.into_owned()),
+            edit_sender_timestamp_ms: ba
+                .optional_u64("sender_timestamp_ms")
+                .and_then(|ms| i64::try_from(ms).ok())
+                .and_then(crate::time::from_millis),
         }
     });
 

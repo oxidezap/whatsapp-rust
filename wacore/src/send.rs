@@ -1247,6 +1247,11 @@ pub struct PreparedGroupStanza {
     /// Generated `MessageContextInfo.message_secret`; populated when the
     /// reporting token was produced for this send.
     pub message_secret: Option<[u8; crate::reporting_token::MESSAGE_SECRET_SIZE]>,
+    /// The identity we addressed this group send under (LID for LID-mode
+    /// groups, PN for PN-mode). Used to key the persisted `messageSecret`
+    /// so msmsg bot replies referencing this msg_id hit the same row that
+    /// `<meta target_sender_jid>` echoes back at lookup time.
+    pub sender_identity: Jid,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1577,6 +1582,7 @@ pub async fn prepare_group_stanza<
         skdm_devices: skdm_encrypted_devices,
         stale_device_users: stale_users,
         message_secret: reporting_result.map(|r| r.message_secret),
+        sender_identity: own_sending_jid,
     })
 }
 

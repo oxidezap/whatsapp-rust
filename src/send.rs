@@ -995,6 +995,11 @@ impl Client {
         // so it's threaded back out via PreparedStanza.message_secret below).
         let outbound_id_clone = request_id.clone();
         let mut outbound_msg_secret: Option<[u8; 32]> = None;
+        // Group prepares pick LID or PN based on group addressing_mode;
+        // capture it so the persisted secret keys match what
+        // `<meta target_sender_jid>` echoes back. For DMs we resolve from
+        // chat.server (LID for bot, PN otherwise) after send_node succeeds.
+        let mut outbound_group_sender_identity: Option<Jid> = None;
 
         // SKDM update data — only populated for group sends, deferred until after send_node().
         // This matches WhatsApp Web which only calls markHasSenderKey() after server ACK.
@@ -1148,6 +1153,7 @@ impl Client {
                         stale_users: prepared.stale_device_users,
                     });
                     outbound_msg_secret = prepared.message_secret;
+                    outbound_group_sender_identity = Some(prepared.sender_identity);
                     prepared.node
                 }
                 Err(e) => {
@@ -1193,6 +1199,7 @@ impl Client {
                             stale_users: retry_prepared.stale_device_users,
                         });
                         outbound_msg_secret = retry_prepared.message_secret;
+                        outbound_group_sender_identity = Some(retry_prepared.sender_identity);
                         retry_prepared.node
                     } else {
                         return Err(e);
@@ -1401,8 +1408,19 @@ impl Client {
         }
 
         if let Some(secret) = outbound_msg_secret.as_ref() {
-            self.persist_outbound_msg_secret(&tc_issue_target, &outbound_id_clone, secret)
+            let sender = match outbound_group_sender_identity {
+                Some(s) => Some(s),
+                None => self.dm_sender_identity_for(&tc_issue_target).await,
+            };
+            if let Some(sender) = sender {
+                self.persist_outbound_msg_secret(
+                    &tc_issue_target,
+                    &sender,
+                    &outbound_id_clone,
+                    secret,
+                )
                 .await;
+            }
         }
 
         if let Some((rx, phash, msg_id)) = ack {
@@ -1453,27 +1471,16 @@ impl Client {
     }
 
     /// Persist a generated `MessageContextInfo.message_secret` keyed by
-    /// `(chat_non_ad, own_identity_non_ad, msg_id)`. The identity is our LID
-    /// for bot chats and our PN otherwise — same choice WA Web's
-    /// `decryptMsmsgBotMessage` makes for `targetSenderJid`, which is what
-    /// `handle_msmsg_payload` echoes back at lookup time.
+    /// `(chat_non_ad, sender_non_ad, msg_id)`. The sender identity must
+    /// match what `<meta target_sender_jid>` echoes back at GET time —
+    /// LID for bot chats and LID-mode groups, PN otherwise.
     pub(crate) async fn persist_outbound_msg_secret(
         &self,
         chat: &Jid,
+        sender: &Jid,
         msg_id: &str,
         secret: &[u8],
     ) {
-        let sender = if chat.server == wacore_binary::Server::Bot {
-            match self.get_lid().await {
-                Some(j) => j,
-                None => return,
-            }
-        } else {
-            match self.get_pn().await {
-                Some(j) => j,
-                None => return,
-            }
-        };
         let chat_str = chat.to_non_ad().to_string();
         let sender_str = sender.to_non_ad().to_string();
         if let Err(e) = self
@@ -1483,6 +1490,17 @@ impl Client {
             .await
         {
             log::warn!("Failed to persist outbound messageSecret for {msg_id}: {e:?}");
+        }
+    }
+
+    /// Decide the identity (LID vs PN) under which an outbound DM's
+    /// `messageSecret` should be persisted. Group sends should use
+    /// `PreparedGroupStanza.sender_identity` directly instead of this.
+    pub(crate) async fn dm_sender_identity_for(&self, to: &Jid) -> Option<Jid> {
+        if to.server == wacore_binary::Server::Bot {
+            self.get_lid().await
+        } else {
+            self.get_pn().await
         }
     }
 
@@ -3419,14 +3437,26 @@ mod tests {
             .await;
     }
 
+    async fn seed_pn_and_lid(client: &Arc<Client>, pn: &str, lid: &str) {
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(pn.parse().expect("pn"))))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(lid.parse().expect("lid"))))
+            .await;
+    }
+
     #[tokio::test]
-    async fn persist_outbound_msg_secret_writes_under_chat_pn_id() {
-        let client = crate::test_utils::create_test_client_with_name("secret_chat_pn_id").await;
+    async fn persist_outbound_msg_secret_writes_under_chat_sender_id() {
+        let client = crate::test_utils::create_test_client_with_name("secret_chat_id").await;
         seed_pn(&client, "5511000000001:0@s.whatsapp.net").await;
         let chat: Jid = "5511777776666@s.whatsapp.net".parse().unwrap();
+        let sender: Jid = "5511000000001:0@s.whatsapp.net".parse().unwrap();
         let secret = [0x55u8; 32];
         client
-            .persist_outbound_msg_secret(&chat, "MID_1", &secret)
+            .persist_outbound_msg_secret(&chat, &sender, "MID_1", &secret)
             .await;
         let got = client
             .persistence_manager
@@ -3442,31 +3472,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_outbound_msg_secret_skips_when_pn_missing() {
-        // No seed_pn: get_pn() returns None → no write.
-        let client = crate::test_utils::create_test_client_with_name("secret_skip_pn").await;
-        let chat: Jid = "5511777776666@s.whatsapp.net".parse().unwrap();
-        client
-            .persist_outbound_msg_secret(&chat, "MID_3", &[1u8; 32])
-            .await;
-        assert!(
-            client
-                .persistence_manager
-                .backend()
-                .get_msg_secret("5511777776666@s.whatsapp.net", "", "MID_3")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn persist_outbound_msg_secret_strips_chat_device_in_key() {
-        let client = crate::test_utils::create_test_client_with_name("secret_chat_strip").await;
-        seed_pn(&client, "5511000000001:0@s.whatsapp.net").await;
+    async fn persist_outbound_msg_secret_strips_devices_in_key() {
+        let client = crate::test_utils::create_test_client_with_name("secret_strip").await;
         let chat_with_dev: Jid = "5511777776666:7@s.whatsapp.net".parse().unwrap();
+        let sender_with_dev: Jid = "5511000000001:3@s.whatsapp.net".parse().unwrap();
         client
-            .persist_outbound_msg_secret(&chat_with_dev, "MID_4", &[2u8; 32])
+            .persist_outbound_msg_secret(&chat_with_dev, &sender_with_dev, "MID_4", &[2u8; 32])
             .await;
         let got = client
             .persistence_manager
@@ -3478,25 +3489,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(got.as_deref(), Some(&[2u8; 32][..]));
+        assert_eq!(
+            got.as_deref(),
+            Some(&[2u8; 32][..]),
+            "chat and sender must be stored non-AD"
+        );
     }
 
-    async fn seed_pn_and_lid(client: &Arc<Client>, pn: &str, lid: &str) {
-        client
-            .persistence_manager
-            .process_command(DeviceCommand::SetId(Some(pn.parse().expect("pn"))))
-            .await;
-        client
-            .persistence_manager
-            .process_command(DeviceCommand::SetLid(Some(lid.parse().expect("lid"))))
-            .await;
-    }
-
-    /// Bot chats: PUT must use our LID (matches WA Web fbid path, which
-    /// echoes our LID back as `<meta target_sender_jid>` at GET time).
     #[tokio::test]
-    async fn persist_outbound_msg_secret_uses_lid_for_bot_chats() {
-        let client = crate::test_utils::create_test_client_with_name("secret_bot_lid").await;
+    async fn dm_sender_identity_picks_lid_for_bot_else_pn() {
+        let client = crate::test_utils::create_test_client_with_name("dm_id_pick").await;
         seed_pn_and_lid(
             &client,
             "5511000000001:0@s.whatsapp.net",
@@ -3504,34 +3506,82 @@ mod tests {
         )
         .await;
         let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
-        let secret = [0x9Cu8; 32];
-        client
-            .persist_outbound_msg_secret(&bot_chat, "MID_BOT", &secret)
-            .await;
-        let got_under_lid = client
-            .persistence_manager
-            .backend()
-            .get_msg_secret("867051314767696@bot", "999888777666555@lid", "MID_BOT")
-            .await
-            .unwrap();
+        let pn_chat: Jid = "5511777776666@s.whatsapp.net".parse().unwrap();
+        let lid_chat: Jid = "111222333444555@lid".parse().unwrap();
         assert_eq!(
-            got_under_lid.as_deref(),
-            Some(&secret[..]),
-            "bot chats must store under our LID so the inbound msmsg lookup hits"
+            client
+                .dm_sender_identity_for(&bot_chat)
+                .await
+                .map(|j| j.to_non_ad().to_string()),
+            Some("999888777666555@lid".to_string()),
+            "bot chats must resolve to our LID"
         );
-        let got_under_pn = client
+        assert_eq!(
+            client
+                .dm_sender_identity_for(&pn_chat)
+                .await
+                .map(|j| j.to_non_ad().to_string()),
+            Some("5511000000001@s.whatsapp.net".to_string()),
+            "PN chats must resolve to our PN"
+        );
+        // LID-DM is presently routed under PN; flagged as a follow-up only
+        // because production hasn't surfaced it. Documented behaviour.
+        assert_eq!(
+            client
+                .dm_sender_identity_for(&lid_chat)
+                .await
+                .map(|j| j.to_non_ad().to_string()),
+            Some("5511000000001@s.whatsapp.net".to_string()),
+        );
+    }
+
+    /// Regression for Codex P2 (LID-mode group bot replies): the persisted
+    /// sender must match whatever `prepare_group_stanza` picked for the
+    /// group's addressing_mode, surfaced via `PreparedGroupStanza.sender_identity`.
+    #[tokio::test]
+    async fn persist_uses_group_sender_identity_for_lid_mode_groups() {
+        let client = crate::test_utils::create_test_client_with_name("secret_lid_group").await;
+        seed_pn_and_lid(
+            &client,
+            "5511000000001:0@s.whatsapp.net",
+            "999888777666555:0@lid",
+        )
+        .await;
+        // Simulate a LID-mode group: addressing identity is our LID, not PN.
+        let group_chat: Jid = "120363021033254949@g.us".parse().unwrap();
+        let lid_sender: Jid = "999888777666555:0@lid".parse().unwrap();
+        let secret = [0x4Du8; 32];
+        client
+            .persist_outbound_msg_secret(&group_chat, &lid_sender, "GROUP_MID", &secret)
+            .await;
+        let got = client
             .persistence_manager
             .backend()
             .get_msg_secret(
-                "867051314767696@bot",
+                "120363021033254949@g.us",
+                "999888777666555@lid",
+                "GROUP_MID",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(&secret[..]),
+            "LID-mode group secrets must key under our LID, not PN"
+        );
+        let under_pn = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "120363021033254949@g.us",
                 "5511000000001@s.whatsapp.net",
-                "MID_BOT",
+                "GROUP_MID",
             )
             .await
             .unwrap();
         assert!(
-            got_under_pn.is_none(),
-            "bot chats must NOT store under our PN"
+            under_pn.is_none(),
+            "LID-mode group must NOT key under our PN"
         );
     }
 
