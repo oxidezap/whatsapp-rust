@@ -130,6 +130,7 @@ impl TestClient {
             .with_runtime(whatsapp_rust::TokioRuntime)
             .with_version((2, 3000, 0));
 
+        let push_name_pre_seeded = push_name.is_some();
         if let Some(name) = push_name {
             builder = builder.with_push_name(name);
         }
@@ -137,6 +138,10 @@ impl TestClient {
         let mut bot = builder.build().await?;
 
         let client = bot.client();
+        // with_push_name pre-seeds the name so the setting_pushName mutation has old==new (skipping auto set_available), so force active to keep delivery receipts from being type="inactive".
+        if push_name_pre_seeded {
+            client.set_force_active_delivery_receipts(true);
+        }
         client.register_handler(event_handler);
 
         // The mock server no longer auto-pairs (legacy timer is off by

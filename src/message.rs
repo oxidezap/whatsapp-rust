@@ -504,6 +504,8 @@ impl Client {
         let mut group_payloads = Vec::with_capacity(all_enc_nodes.len());
         let mut max_sender_retry_count: u8 = 0;
         let mut has_hide_fail = false;
+        let mut had_unknown_enc = false;
+        let mut had_custom_handler = false;
 
         for enc_node in &all_enc_nodes {
             // Parse sender retry count (WA Web: e.maybeAttrInt("count") ?? 0)
@@ -528,6 +530,7 @@ impl Client {
                 Some(t) => t,
                 None => {
                     log::warn!("Enc node missing 'type' attribute, skipping");
+                    had_unknown_enc = true;
                     continue;
                 }
             };
@@ -559,16 +562,24 @@ impl Client {
                         }
                     }))
                     .detach();
+                had_custom_handler = true;
                 continue;
             }
 
-            // Zero-copy: slice_bytes returns a Bytes sub-view into the
-            // node's backing buffer without memcpy.
-            // from_owned_node returns None for unknown enc types or missing content.
+            // `had_unknown_enc` means "produced no usable payload": either the
+            // type is unrecognized (msmsg) or it's known but the body is empty.
+            // Either way the stanza needs the fallback ack or the server replays.
+            if EncType::from_wire(enc_type.as_ref()).is_none() {
+                log::warn!("Enc node has unknown type: {enc_type}");
+                had_unknown_enc = true;
+                continue;
+            }
+
             let payload = match EncPayload::from_owned_node(node, enc_node) {
                 Some(p) => p,
                 None => {
-                    log::warn!("Enc node has no content or unknown type: {enc_type}");
+                    log::warn!("Enc node {enc_type} has no content");
+                    had_unknown_enc = true;
                     continue;
                 }
             };
@@ -595,6 +606,25 @@ impl Client {
                 info.id,
                 info.source.sender
             );
+        }
+
+        // Unknown-only stanzas (e.g. msmsg from the Meta AI bot) would loop in
+        // the offline queue until <stream:error>. Custom handlers ack on their
+        // own; status is covered by should_ack. Ack from `nr` so `recipient`
+        // survives (parse_message_info drops it on non-self branches).
+        if session_payloads.is_empty()
+            && group_payloads.is_empty()
+            && had_unknown_enc
+            && !had_custom_handler
+        {
+            log::info!(
+                "[msg:{}] All enc payloads unrecognized; transport-acking to drop from offline queue",
+                info.id
+            );
+            if !info.source.chat.is_status_broadcast() {
+                self.spawn_node_transport_ack(nr).await;
+            }
+            return None;
         }
 
         Some(ClassifiedMessage {
@@ -7254,6 +7284,219 @@ mod tests {
         }
         let (to, _) = found.expect("unavailable message must get a transport ack");
         assert_eq!(to, "5511777776666@s.whatsapp.net");
+    }
+
+    /// Unknown-only stanzas (e.g. msmsg) must be acked or they loop the queue.
+    #[tokio::test]
+    async fn unknown_only_enc_is_transport_acked() {
+        let (client, transport) = capturing_client("msmsg_ack").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "MSMSG1")
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .bytes(vec![0u8; 8])
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(
+            classified.is_none(),
+            "unknown-only enc must short-circuit before the process phase"
+        );
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, _) = found.expect("unknown-only enc must emit a transport ack");
+        assert_eq!(to, "5511777776666@s.whatsapp.net");
+    }
+
+    /// `recipient` must be echoed verbatim or the server replies <stream:error>.
+    #[tokio::test]
+    async fn unknown_only_enc_ack_preserves_recipient() {
+        let (client, transport) = capturing_client("msmsg_recipient").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "236395184570386@lid")
+            .attr("recipient", "156535032389744@lid")
+            .attr("id", "MSMSG_LID")
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .bytes(vec![0u8; 8])
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(classified.is_none());
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, recipient) = found.expect("unknown-only enc must emit a transport ack");
+        assert_eq!(to, "236395184570386@lid");
+        assert_eq!(
+            recipient.as_deref(),
+            Some("156535032389744@lid"),
+            "ack must echo the incoming `recipient` attr or the server replies with <stream:error><ack/>"
+        );
+    }
+
+    /// Known type with empty content still has no usable payload; ack it.
+    #[tokio::test]
+    async fn known_enc_type_with_empty_content_is_transport_acked() {
+        let (client, transport) = capturing_client("known_empty").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "EMPTY1")
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc").attr("type", "pkmsg").build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(classified.is_none());
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, _) = found.expect("known-but-empty enc must emit a transport ack");
+        assert_eq!(to, "5511777776666@s.whatsapp.net");
+    }
+
+    /// status is covered by should_ack; the fallback must not double-ack it.
+    #[tokio::test]
+    async fn unknown_only_enc_on_status_skips_fallback_ack() {
+        let (client, transport) = capturing_client("msmsg_status_skip").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "status@broadcast")
+            .attr("id", "MSMSG_STATUS")
+            .attr("type", "text")
+            .attr("participant", "5511777776666@s.whatsapp.net")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .bytes(vec![0u8; 8])
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(classified.is_none());
+
+        // Give any rogue spawned task time to land on the wire.
+        for _ in 0..16 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            if find_message_ack(&transport.sent()).is_some() {
+                break;
+            }
+        }
+        assert!(
+            find_message_ack(&transport.sent()).is_none(),
+            "status@broadcast must not get a fallback transport ack from classify"
+        );
+    }
+
+    /// One recognized enc + one unknown must still go through the normal path.
+    #[tokio::test]
+    async fn mixed_recognized_and_unknown_enc_still_classifies() {
+        let (client, _transport) = capturing_client("msmsg_mixed").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "MIXED1")
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("enc")
+                    .attr("type", "pkmsg")
+                    .bytes(vec![0u8; 8])
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .bytes(vec![0u8; 8])
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client
+            .classify_incoming_message(&owned)
+            .await
+            .expect("mixed enc must produce a ClassifiedMessage");
+        assert_eq!(classified.session_payloads.len(), 1);
+        assert!(classified.group_payloads.is_empty());
+    }
+
+    /// A custom handler owns its ack; the fallback must not double-ack.
+    #[tokio::test]
+    async fn custom_handler_only_skips_fallback_ack() {
+        use crate::types::enc_handler::EncHandler;
+        use async_lock::Mutex as AsyncMutex;
+
+        #[derive(Default)]
+        struct NoopHandler {
+            calls: Arc<AsyncMutex<usize>>,
+        }
+        #[async_trait::async_trait]
+        impl EncHandler for NoopHandler {
+            async fn handle(
+                &self,
+                _client: Arc<Client>,
+                _enc_node: &wacore_binary::Node,
+                _info: &crate::types::message::MessageInfo,
+            ) -> anyhow::Result<()> {
+                *self.calls.lock().await += 1;
+                Ok(())
+            }
+        }
+
+        let (client, transport) = capturing_client("msmsg_custom").await;
+        let calls = Arc::new(AsyncMutex::new(0usize));
+        let handler = Arc::new(NoopHandler {
+            calls: Arc::clone(&calls),
+        });
+        client
+            .custom_enc_handlers
+            .write()
+            .await
+            .insert("msmsg".to_string(), handler as Arc<dyn EncHandler>);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "CUSTOM1")
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .bytes(vec![0u8; 8])
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(
+            classified.is_some(),
+            "custom-handled enc must not be short-circuited by the fallback guard"
+        );
+
+        // Let the detached handler + any rogue spawned task run.
+        for _ in 0..16 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            find_message_ack(&transport.sent()).is_none(),
+            "custom-handled enc must not get a fallback transport ack from classify"
+        );
+        assert_eq!(*calls.lock().await, 1, "custom handler must be invoked");
     }
 
     /// Security regression: a self-only `app_state_sync_key_share` protocol
