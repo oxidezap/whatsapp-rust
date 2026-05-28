@@ -158,22 +158,44 @@ impl Client {
     ) {
         use wacore::proto_helpers::MessageExt;
         const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
-        let Some(secret_bytes) = msg
+
+        let secret_opt = msg
             .message_context_info
             .as_ref()
-            .and_then(|mci| mci.message_secret.as_deref())
-        else {
+            .and_then(|mci| mci.message_secret.as_deref());
+        let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
+        let mentions_bot = msg.mentions_any_bot();
+
+        // TEMP diagnostic (PR #650 group flow): log every capture-gate input so
+        // a prod repro pins down why a group bot invocation isn't cached.
+        log::info!(
+            "[msg:{}] msmsg-capture gate: has_secret={} secret_len={} is_from_me={} is_group={} chat={} sender={} chat_is_bot={} mentions_bot={} forwarded={} mentioned_jids={:?}",
+            info.id,
+            secret_opt.is_some(),
+            secret_opt.map(|s| s.len()).unwrap_or(0),
+            info.source.is_from_me,
+            info.source.is_group,
+            info.source.chat,
+            info.source.sender,
+            chat_is_bot,
+            mentions_bot,
+            msg.is_forwarded(),
+            msg.get_base_message()
+                .extended_text_message
+                .as_ref()
+                .and_then(|e| e.context_info.as_ref())
+                .map(|c| c.mentioned_jid.clone())
+                .unwrap_or_default()
+        );
+
+        let Some(secret_bytes) = secret_opt else {
             return;
         };
         let Ok(secret_arr) = <&[u8; SECRET_LEN]>::try_from(secret_bytes) else {
             return;
         };
         // Match WA Web `processRenderableMessages`: `$ && (P || N) && !forwarded`.
-        // `P` = chat is bot; `N` = a mentioned JID is a bot (covers groups
-        // where the user invokes @Meta AI). The `w`/`A` group-bot-participant
-        // gates are flagged behind WA Web feature flags and skipped here.
-        let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
-        if !chat_is_bot && !msg.mentions_any_bot() {
+        if !chat_is_bot && !mentions_bot {
             return;
         }
         if msg.is_forwarded() {
