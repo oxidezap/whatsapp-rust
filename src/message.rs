@@ -160,7 +160,6 @@ impl Client {
         const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
 
         let mci = msg.message_context_info.as_ref();
-        let secret_opt = mci.and_then(|m| m.message_secret.as_deref());
         let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
         let mentions_bot = msg.mentions_any_bot();
         // `MessageContextInfo.bot_metadata` is the bot-invocation envelope WA
@@ -168,29 +167,7 @@ impl Client {
         // even when no JID is mentioned, covering WA Web's `w`/`A` gates.
         let has_bot_metadata = mci.is_some_and(|m| m.bot_metadata.is_some());
 
-        // TEMP diagnostic (PR #650 group flow): log every capture-gate input so
-        // a prod repro pins down why a group bot invocation isn't cached.
-        log::info!(
-            "[msg:{}] msmsg-capture gate: has_secret={} is_from_me={} is_group={} chat={} sender={} chat_is_bot={} mentions_bot={} has_bot_metadata={} forwarded={} mentioned_jids={:?}",
-            info.id,
-            secret_opt.is_some(),
-            info.source.is_from_me,
-            info.source.is_group,
-            info.source.chat,
-            info.source.sender,
-            chat_is_bot,
-            mentions_bot,
-            has_bot_metadata,
-            msg.is_forwarded(),
-            msg.get_base_message()
-                .extended_text_message
-                .as_ref()
-                .and_then(|e| e.context_info.as_ref())
-                .map(|c| c.mentioned_jid.clone())
-                .unwrap_or_default()
-        );
-
-        let Some(secret_bytes) = secret_opt else {
+        let Some(secret_bytes) = mci.and_then(|m| m.message_secret.as_deref()) else {
             return;
         };
         let Ok(secret_arr) = <&[u8; SECRET_LEN]>::try_from(secret_bytes) else {
