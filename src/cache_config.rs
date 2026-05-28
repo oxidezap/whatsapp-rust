@@ -229,6 +229,7 @@ impl std::fmt::Debug for CacheConfig {
             .field("session_locks_capacity", &self.session_locks_capacity)
             .field("chat_lanes_capacity", &self.chat_lanes_capacity)
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
+            .field("msg_secret_ttl_secs", &self.msg_secret_ttl_secs)
             .field(
                 "cache_stores.group_cache",
                 &self.cache_stores.group_cache.is_some(),

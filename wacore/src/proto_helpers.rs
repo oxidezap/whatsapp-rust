@@ -419,9 +419,14 @@ impl MessageExt for wa::Message {
         let Some(ctx) = find_context_info_ref!(base) else {
             return false;
         };
+        // Use the canonical `Jid::is_bot()` contract — it covers both the
+        // `@bot` server and the legacy PN-form Meta bot (e.g. `1313555…`),
+        // matching WA Web's `jid.isBot()`. The list is short and this only
+        // runs on the group-mention path (chat isn't already a bot).
         ctx.mentioned_jid
             .iter()
-            .any(|s| s.split('@').nth(1) == Some("bot"))
+            .filter_map(|s| Jid::from_str(s).ok())
+            .any(|jid| jid.is_bot())
     }
 }
 
@@ -1971,6 +1976,24 @@ mod tests {
                         "5511999998888@s.whatsapp.net".into(),
                         "867051314767696@bot".into(),
                     ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_true_for_legacy_pn_form_bot() {
+        // `Jid::is_bot()` also matches the legacy PN-form Meta bot; the old
+        // `@bot`-only string split would have missed this.
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("@MetaAI".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    mentioned_jid: vec!["13135550002@s.whatsapp.net".into()],
                     ..Default::default()
                 })),
                 ..Default::default()
