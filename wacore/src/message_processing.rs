@@ -21,6 +21,9 @@ pub enum EncType {
     Message,
     /// Sender-key message (`"skmsg"`) — group encryption.
     SenderKey,
+    /// Message-secret bot reply (`"msmsg"`) — Meta AI / fbid bot envelope
+    /// decrypted via [`crate::bot_message::decrypt_bot_message`].
+    MessageSecret,
 }
 
 impl EncType {
@@ -30,6 +33,7 @@ impl EncType {
             "pkmsg" => Some(Self::PreKeyMessage),
             "msg" => Some(Self::Message),
             "skmsg" => Some(Self::SenderKey),
+            "msmsg" => Some(Self::MessageSecret),
             _ => None,
         }
     }
@@ -40,12 +44,20 @@ impl EncType {
             Self::PreKeyMessage => "pkmsg",
             Self::Message => "msg",
             Self::SenderKey => "skmsg",
+            Self::MessageSecret => "msmsg",
         }
     }
 
     /// Whether this is a 1:1 session-based encryption type (pkmsg or msg).
+    /// msmsg is neither session- nor group-based; it has its own dispatch path.
     pub fn is_session(&self) -> bool {
         matches!(self, Self::PreKeyMessage | Self::Message)
+    }
+
+    /// True for the bot-secret envelope (`msmsg`). Mutually exclusive with
+    /// session/group classification.
+    pub fn is_bot_secret(&self) -> bool {
+        matches!(self, Self::MessageSecret)
     }
 }
 
@@ -69,6 +81,9 @@ pub struct CategorizedEncNodes<'a> {
     pub session_enc: Vec<EncNodeInfo<'a>>,
     /// Group enc nodes (skmsg) — require prior SKDM from session nodes.
     pub group_enc: Vec<EncNodeInfo<'a>>,
+    /// Bot-secret enc nodes (msmsg) — decrypted via the per-message
+    /// `messageSecret` persisted at outbound send.
+    pub bot_enc: Vec<EncNodeInfo<'a>>,
     /// Maximum sender retry count across all enc nodes.
     pub max_retry_count: u8,
     /// Whether decryption failures should be hidden (edited messages).
@@ -95,6 +110,7 @@ const MAX_DECRYPT_RETRIES: u8 = 5;
 pub fn categorize_enc_nodes<'a>(enc_nodes: &[&'a Node]) -> CategorizedEncNodes<'a> {
     let mut session_enc = Vec::with_capacity(enc_nodes.len());
     let mut group_enc = Vec::with_capacity(enc_nodes.len());
+    let mut bot_enc = Vec::with_capacity(enc_nodes.len());
     let mut unknown_enc_types = Vec::new();
     let mut max_retry_count: u8 = 0;
     let mut has_hide_fail = false;
@@ -153,6 +169,14 @@ pub fn categorize_enc_nodes<'a>(enc_nodes: &[&'a Node]) -> CategorizedEncNodes<'
                     retry_count,
                 });
             }
+            Some(EncType::MessageSecret) => {
+                bot_enc.push(EncNodeInfo {
+                    ciphertext,
+                    enc_type: EncType::MessageSecret,
+                    padding_version,
+                    retry_count,
+                });
+            }
             None => {
                 unknown_enc_types.push(enc_type_str.to_string());
             }
@@ -176,6 +200,7 @@ pub fn categorize_enc_nodes<'a>(enc_nodes: &[&'a Node]) -> CategorizedEncNodes<'
     CategorizedEncNodes {
         session_enc,
         group_enc,
+        bot_enc,
         max_retry_count,
         decrypt_fail_mode,
         unknown_enc_types,
@@ -307,9 +332,45 @@ mod tests {
         let result = categorize_enc_nodes(&[]);
         assert!(result.session_enc.is_empty());
         assert!(result.group_enc.is_empty());
+        assert!(result.bot_enc.is_empty());
         assert_eq!(result.max_retry_count, 0);
         assert_eq!(result.decrypt_fail_mode, DecryptFailMode::Show);
         assert!(!result.has_ordering_violation);
+    }
+
+    #[test]
+    fn test_categorize_msmsg_goes_into_bot_bucket() {
+        let msmsg = make_enc_node("msmsg", b"bot_cipher");
+        let nodes: Vec<&Node> = vec![&msmsg];
+
+        let result = categorize_enc_nodes(&nodes);
+        assert!(result.session_enc.is_empty());
+        assert!(result.group_enc.is_empty());
+        assert_eq!(result.bot_enc.len(), 1);
+        assert_eq!(result.bot_enc[0].enc_type, EncType::MessageSecret);
+        assert_eq!(result.bot_enc[0].ciphertext, b"bot_cipher");
+        assert!(result.unknown_enc_types.is_empty());
+    }
+
+    #[test]
+    fn test_enc_type_msmsg_round_trip() {
+        assert_eq!(
+            EncType::from_wire("msmsg"),
+            Some(EncType::MessageSecret),
+            "msmsg must parse"
+        );
+        assert_eq!(EncType::MessageSecret.as_wire_str(), "msmsg");
+        assert!(
+            !EncType::MessageSecret.is_session(),
+            "msmsg is NOT a Signal session type"
+        );
+        assert!(
+            EncType::MessageSecret.is_bot_secret(),
+            "msmsg IS the bot-secret envelope"
+        );
+        for t in [EncType::PreKeyMessage, EncType::Message, EncType::SenderKey] {
+            assert!(!t.is_bot_secret(), "{t:?} must not be a bot-secret type");
+        }
     }
 
     #[test]

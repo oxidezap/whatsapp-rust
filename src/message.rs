@@ -7295,7 +7295,7 @@ mod tests {
             .attr("id", "MSMSG1")
             .attr("type", "text")
             .children([NodeBuilder::new("enc")
-                .attr("type", "msmsg")
+                .attr("type", "frskmsg")
                 .bytes(vec![0u8; 8])
                 .build()])
             .build();
@@ -7328,7 +7328,7 @@ mod tests {
             .attr("id", "MSMSG_LID")
             .attr("type", "text")
             .children([NodeBuilder::new("enc")
-                .attr("type", "msmsg")
+                .attr("type", "frskmsg")
                 .bytes(vec![0u8; 8])
                 .build()])
             .build();
@@ -7389,7 +7389,7 @@ mod tests {
             .attr("type", "text")
             .attr("participant", "5511777776666@s.whatsapp.net")
             .children([NodeBuilder::new("enc")
-                .attr("type", "msmsg")
+                .attr("type", "frskmsg")
                 .bytes(vec![0u8; 8])
                 .build()])
             .build();
@@ -7424,7 +7424,7 @@ mod tests {
                     .bytes(vec![0u8; 8])
                     .build(),
                 NodeBuilder::new("enc")
-                    .attr("type", "msmsg")
+                    .attr("type", "frskmsg")
                     .bytes(vec![0u8; 8])
                     .build(),
             ])
@@ -7470,14 +7470,14 @@ mod tests {
             .custom_enc_handlers
             .write()
             .await
-            .insert("msmsg".to_string(), handler as Arc<dyn EncHandler>);
+            .insert("frskmsg".to_string(), handler as Arc<dyn EncHandler>);
 
         let node = NodeBuilder::new("message")
             .attr("from", "5511777776666@s.whatsapp.net")
             .attr("id", "CUSTOM1")
             .attr("type", "text")
             .children([NodeBuilder::new("enc")
-                .attr("type", "msmsg")
+                .attr("type", "frskmsg")
                 .bytes(vec![0u8; 8])
                 .build()])
             .build();

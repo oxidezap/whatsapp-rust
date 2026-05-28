@@ -85,6 +85,11 @@ impl<'a> Signal<'a> {
             EncType::SenderKey => {
                 return Err(anyhow!("use decrypt_group_message for sender-key messages"));
             }
+            EncType::MessageSecret => {
+                return Err(anyhow!(
+                    "msmsg envelopes are not Signal messages; use the bot_message path"
+                ));
+            }
         };
 
         let encryption_jid = self.client.resolve_encryption_jid(jid).await;
