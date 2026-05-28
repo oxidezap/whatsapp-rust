@@ -159,26 +159,28 @@ impl Client {
         use wacore::proto_helpers::MessageExt;
         const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
 
-        let secret_opt = msg
-            .message_context_info
-            .as_ref()
-            .and_then(|mci| mci.message_secret.as_deref());
+        let mci = msg.message_context_info.as_ref();
+        let secret_opt = mci.and_then(|m| m.message_secret.as_deref());
         let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
         let mentions_bot = msg.mentions_any_bot();
+        // `MessageContextInfo.bot_metadata` is the bot-invocation envelope WA
+        // Web reads; it's present on bot prompts (incl. our own group prompt)
+        // even when no JID is mentioned, covering WA Web's `w`/`A` gates.
+        let has_bot_metadata = mci.is_some_and(|m| m.bot_metadata.is_some());
 
         // TEMP diagnostic (PR #650 group flow): log every capture-gate input so
         // a prod repro pins down why a group bot invocation isn't cached.
         log::info!(
-            "[msg:{}] msmsg-capture gate: has_secret={} secret_len={} is_from_me={} is_group={} chat={} sender={} chat_is_bot={} mentions_bot={} forwarded={} mentioned_jids={:?}",
+            "[msg:{}] msmsg-capture gate: has_secret={} is_from_me={} is_group={} chat={} sender={} chat_is_bot={} mentions_bot={} has_bot_metadata={} forwarded={} mentioned_jids={:?}",
             info.id,
             secret_opt.is_some(),
-            secret_opt.map(|s| s.len()).unwrap_or(0),
             info.source.is_from_me,
             info.source.is_group,
             info.source.chat,
             info.source.sender,
             chat_is_bot,
             mentions_bot,
+            has_bot_metadata,
             msg.is_forwarded(),
             msg.get_base_message()
                 .extended_text_message
@@ -194,23 +196,25 @@ impl Client {
         let Ok(secret_arr) = <&[u8; SECRET_LEN]>::try_from(secret_bytes) else {
             return;
         };
-        // Match WA Web `processRenderableMessages`: `$ && (P || N) && !forwarded`.
-        if !chat_is_bot && !mentions_bot {
+        // WA Web `processRenderableMessages`: `$ && (P || N || w || A) && !fwd`.
+        // P=chat is bot, N=mentions a bot, w/A=bot group participant (we proxy
+        // those via bot_metadata presence, the bot-invocation envelope).
+        if !chat_is_bot && !mentions_bot && !has_bot_metadata {
             return;
         }
         if msg.is_forwarded() {
             return;
         }
-        // Key the secret under whoever AUTHORED the prompt, because the bot
-        // reply's `<meta target_sender_jid>` echoes that author at GET time:
-        //  * our own prompt (is_from_me): the bot echoes our LID for bot chats
-        //    / our addressing identity for groups — resolve via
-        //    dm_sender_identity_for.
-        //  * another group participant's prompt: the reply echoes THEM, so key
-        //    under their sender JID directly (mirrors WA Web's msgKey, which
-        //    keys the cache by the message author / participant).
-        // alternate_msg_secret_lookup bridges any LID↔PN family skew at GET.
-        let sender = if info.source.is_from_me {
+        // Key the secret under the identity the bot reply will echo in
+        // `<meta target_sender_jid>` at GET time:
+        //  * bot DM: `info.source.sender` is our PN device JID, but the reply
+        //    echoes our LID — resolve via dm_sender_identity_for.
+        //  * group / regular: `info.source.sender` is already the author's
+        //    addressing identity (our LID in a LID group, the other
+        //    participant's JID for their prompt) — exactly what the reply
+        //    echoes. Use it directly.
+        // alternate_msg_secret_lookup still bridges any residual LID↔PN skew.
+        let sender = if chat_is_bot {
             match self.dm_sender_identity_for(&info.source.chat).await {
                 Some(j) => j,
                 None => return,
@@ -8859,6 +8863,67 @@ mod tests {
             .await
             .unwrap();
         assert!(got.is_none(), "forwarded messages must not seed the cache");
+    }
+
+    /// Our own group bot prompt carries the secret but NO mentioned_jid
+    /// (observed in prod: `mentions_bot=false mentioned_jids=[]`). The bot
+    /// invocation is signalled by `message_context_info.bot_metadata`, which
+    /// must let the capture fire (WA Web's `w`/`A` group-participant gate).
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_via_bot_metadata_without_mention() {
+        let (client, _transport) = capturing_client("capture_bot_meta").await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+        let info = Arc::new(MessageInfo {
+            id: "GRP_OWN_BOT".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "236395184570386:0@lid".parse().unwrap(),
+                is_from_me: true,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("continue".into()),
+                // No mention at all — just bot_metadata signals the invocation.
+                ..Default::default()
+            })),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0x7B; 32]),
+                bot_metadata: Some(wa::BotMetadata {
+                    persona_id: Some("867051314767696".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        // Group (non-bot chat) → keyed under info.source.sender (our LID in a
+        // LID group), which is what the bot reply's target_sender_jid echoes.
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "120363021033254949@g.us",
+                "236395184570386@lid",
+                "GRP_OWN_BOT",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(&[0x7Bu8; 32][..]),
+            "bot_metadata presence must let our own group prompt cache without a mention"
+        );
     }
 
     /// Group flow: another participant invokes the bot, their decrypted prompt
