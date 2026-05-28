@@ -815,6 +815,10 @@ pub struct PreparedDmStanza {
     /// wire (WA Web only sends phash for groups). Used by the caller to
     /// compare against the server's ACK phash for device-list drift detection.
     pub phash: Option<String>,
+    /// `MessageContextInfo.message_secret` generated for this stanza so the
+    /// caller can persist it for later addon (msmsg/poll/edit) decryption.
+    /// `None` when the message had no reporting token (no secret was used).
+    pub message_secret: Option<[u8; crate::reporting_token::MESSAGE_SECRET_SIZE]>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -955,6 +959,7 @@ pub async fn prepare_dm_stanza<
     Ok(PreparedDmStanza {
         node: stanza,
         phash,
+        message_secret: reporting_result.map(|r| r.message_secret),
     })
 }
 
@@ -1239,6 +1244,9 @@ pub struct PreparedGroupStanza {
     /// devices returned 406 (unregistered) during SKDM prekey fetch.
     /// Empty when no 406 occurred.
     pub stale_device_users: Vec<String>,
+    /// Generated `MessageContextInfo.message_secret`; populated when the
+    /// reporting token was produced for this send.
+    pub message_secret: Option<[u8; crate::reporting_token::MESSAGE_SECRET_SIZE]>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1568,6 +1576,7 @@ pub async fn prepare_group_stanza<
         node: stanza,
         skdm_devices: skdm_encrypted_devices,
         stale_device_users: stale_users,
+        message_secret: reporting_result.map(|r| r.message_secret),
     })
 }
 

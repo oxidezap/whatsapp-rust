@@ -332,6 +332,19 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         agent_byte
     };
 
+    // Only the 4 AD-capable servers round-trip via AD_JID. For everyone else
+    // (bot/group/broadcast/newsletter/call/interop/msgr/legacy) the decoder
+    // would map domain_type back to Pn, dropping the real server. Force
+    // JID_PAIR encoding instead, which preserves the server string verbatim.
+    // Matches whatsmeow `writeJID` and WA Web `WAWap.De` (`WapJid.create`).
+    let device = match server {
+        jid::DEFAULT_USER_SERVER
+        | jid::HIDDEN_USER_SERVER
+        | jid::HOSTED_SERVER
+        | jid::HOSTED_LID_SERVER => device,
+        _ => None,
+    };
+
     Some(ParsedJidMeta {
         user_end,
         server_start,
@@ -1530,6 +1543,58 @@ mod tests {
             ),
         }
 
+        Ok(())
+    }
+
+    /// Regression: AD_JID only round-trips for the 4 servers whose domain_type
+    /// the decoder maps back (Pn/Lid/Hosted/HostedLid). Anything else
+    /// (bot/group/broadcast/newsletter/...) must go through JID_PAIR so the
+    /// server string survives. Matches whatsmeow `writeJID` and WA Web
+    /// `WAWap.De` (`WapJid.create` for non-AD-capable servers).
+    #[test]
+    fn test_bot_jid_with_device_round_trips_via_jid_pair() -> TestResult {
+        use crate::decoder::Decoder;
+
+        for value in [
+            "867051314767696@bot",
+            "867051314767696:0@bot",
+            "120363021033254949@g.us",
+            "12345@broadcast",
+            "12345@newsletter",
+        ] {
+            let node = NodeBuilder::new("msg").attr("from", value).build();
+
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_node(&node)?;
+
+            // AD_JID (0xF7) must NOT appear for any of these — they use JID_PAIR
+            // (0xF8) or raw bytes.
+            assert!(
+                !buffer.contains(&token::AD_JID),
+                "AD_JID must not be emitted for {value} (would lose the server)"
+            );
+
+            let decoded = Decoder::new(&buffer[1..]).read_node_ref()?.to_owned();
+            let from_attr = decoded
+                .attrs
+                .get("from")
+                .expect("from attr must survive the round-trip");
+            let got = from_attr.to_string();
+            // device :0 is equivalent to no device for these servers; either
+            // form is acceptable as long as the server is preserved.
+            let expected_user_server = value.split(':').next().unwrap_or(value);
+            let expected_server = value.split('@').nth(1).unwrap();
+            assert!(
+                got.ends_with(&format!("@{expected_server}")),
+                "round-trip lost the server for {value}: got {got}",
+            );
+            assert!(
+                got.starts_with(expected_user_server.split('@').next().unwrap())
+                    || got.starts_with(value.split('@').next().unwrap()),
+                "round-trip lost the user for {value}: got {got}",
+            );
+        }
         Ok(())
     }
 }

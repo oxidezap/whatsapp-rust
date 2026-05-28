@@ -2513,44 +2513,43 @@ impl MsgSecretStore for SqliteStore {
         msg_id: &str,
         secret: &[u8],
     ) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
-        let chat = chat.to_string();
-        let sender = sender.to_string();
-        let msg_id = msg_id.to_string();
-        let secret = secret.to_vec();
+        let chat: Arc<str> = Arc::from(chat);
+        let sender: Arc<str> = Arc::from(sender);
+        let msg_id: Arc<str> = Arc::from(msg_id);
+        let secret: Arc<[u8]> = Arc::from(secret);
         let now = wacore::time::now_secs();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            diesel::insert_into(msg_secrets::table)
-                .values((
-                    msg_secrets::chat.eq(&chat),
-                    msg_secrets::sender.eq(&sender),
-                    msg_secrets::msg_id.eq(&msg_id),
-                    msg_secrets::secret.eq(&secret),
-                    msg_secrets::device_id.eq(device_id),
-                    msg_secrets::created_at.eq(now),
-                ))
-                .on_conflict((
-                    msg_secrets::chat,
-                    msg_secrets::sender,
-                    msg_secrets::msg_id,
-                    msg_secrets::device_id,
-                ))
-                .do_update()
-                .set((
-                    msg_secrets::secret.eq(&secret),
-                    msg_secrets::created_at.eq(now),
-                ))
-                .execute(&mut conn)
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(())
+        self.with_retry("put_msg_secret", || {
+            let chat = Arc::clone(&chat);
+            let sender = Arc::clone(&sender);
+            let msg_id = Arc::clone(&msg_id);
+            let secret = Arc::clone(&secret);
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::insert_into(msg_secrets::table)
+                    .values((
+                        msg_secrets::chat.eq(chat.as_ref()),
+                        msg_secrets::sender.eq(sender.as_ref()),
+                        msg_secrets::msg_id.eq(msg_id.as_ref()),
+                        msg_secrets::secret.eq(secret.as_ref()),
+                        msg_secrets::device_id.eq(device_id),
+                        msg_secrets::created_at.eq(now),
+                    ))
+                    .on_conflict((
+                        msg_secrets::chat,
+                        msg_secrets::sender,
+                        msg_secrets::msg_id,
+                        msg_secrets::device_id,
+                    ))
+                    .do_update()
+                    .set((
+                        msg_secrets::secret.eq(secret.as_ref()),
+                        msg_secrets::created_at.eq(now),
+                    ))
+                    .execute(conn)?;
+                Ok(())
+            })
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn get_msg_secret(
@@ -3254,33 +3253,46 @@ mod tests {
         }
     }
 
-    /// Different `device_id` rows must not collide on the same logical key.
-    /// (Defends multi-account isolation in the same DB file.)
+    /// Multi-account isolation: same DB, different device_id rows must not
+    /// collide on the same logical key.
     #[tokio::test]
     async fn msg_secret_isolated_per_device_id() {
-        let store_a = create_test_store().await;
-        let mut store_b = create_test_store().await;
-        // Force store_b onto a different device_id while sharing memory? not
-        // applicable here since each create_test_store gets its own in-mem DB.
-        // Instead, simulate a second device by directly mutating device_id on
-        // a clone-equivalent store would need fresh API. Skip cross-DB; instead
-        // assert the column is filtered: write with one device_id, read with
-        // another should miss.
-        store_b.device_id = store_a.device_id + 1;
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let shared_url = format!(
+            "file:memdb_msgsecret_iso_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            id
+        );
+        let store_a = SqliteStore::new_for_device(&shared_url, 1)
+            .await
+            .expect("store_a");
+        let store_b = SqliteStore::new_for_device(&shared_url, 2)
+            .await
+            .expect("store_b");
+
         store_a
             .put_msg_secret("c", "s", "M", &[7u8; 32])
             .await
             .unwrap();
-        // Same DB? They're not -- they're separate in-mem DBs, so this test
-        // really only covers "different DBs are independent". Drop it down
-        // to that meaning rather than over-promise.
         assert!(
             store_b
                 .get_msg_secret("c", "s", "M")
                 .await
                 .unwrap()
                 .is_none(),
-            "isolated in-memory DBs must not share secrets"
+            "same DB, different device_id must not see each other's secrets"
+        );
+        assert_eq!(
+            store_a
+                .get_msg_secret("c", "s", "M")
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![7u8; 32],
+            "device_a still sees its own write"
         );
     }
 }

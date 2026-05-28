@@ -155,23 +155,20 @@ impl EditAttribute {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
 pub enum BotEditType {
+    #[wire = "first"]
     First,
+    #[wire = "inner"]
     Inner,
+    #[wire = "last"]
     Last,
 }
 
 impl BotEditType {
     /// Parse the wire string from the `<bot edit="…">` attribute.
-    /// Matches whatsmeow's `types.EditType*` constants.
     pub fn from_wire(s: &str) -> Option<Self> {
-        match s {
-            "first" => Some(Self::First),
-            "inner" => Some(Self::Inner),
-            "last" => Some(Self::Last),
-            _ => None,
-        }
+        Self::try_from(s).ok()
     }
 }
 

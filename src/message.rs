@@ -65,6 +65,7 @@ pub(crate) struct ClassifiedMessage {
     pub sender_encryption_jid: Jid,
     pub session_payloads: Vec<EncPayload>,
     pub group_payloads: Vec<EncPayload>,
+    pub bot_payloads: Vec<EncPayload>,
     pub max_sender_retry_count: u8,
     pub decrypt_fail_mode: crate::types::events::DecryptFailMode,
 }
@@ -221,9 +222,10 @@ impl Client {
             }
             Err(e) => {
                 log::warn!(
-                    "[msg:{}] backend error reading message_secret: {e:?}",
+                    "[msg:{}] backend error reading message_secret ({e:?}); nack 495 so the server stops replaying",
                     info.id
                 );
+                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                 return;
             }
         };
@@ -661,6 +663,7 @@ impl Client {
 
         let mut session_payloads = Vec::with_capacity(all_enc_nodes.len());
         let mut group_payloads = Vec::with_capacity(all_enc_nodes.len());
+        let mut bot_payloads = Vec::with_capacity(all_enc_nodes.len());
         let mut max_sender_retry_count: u8 = 0;
         let mut has_hide_fail = false;
         let mut had_unknown_enc = false;
@@ -744,18 +747,8 @@ impl Client {
             };
 
             if payload.enc_type.is_bot_secret() {
-                // msmsg has its own decrypt pipeline (HKDF over the stored
-                // outbound messageSecret), is dispatched off-thread, and is
-                // mutually exclusive with the session/group decrypt batches.
-                let client = Arc::clone(self);
-                let info_arc = Arc::clone(&info);
-                self.outbound_flush.spawn(&*self.runtime, async move {
-                    client.handle_msmsg_payload(&info_arc, payload).await;
-                });
-                continue;
-            }
-
-            if payload.enc_type.is_session() {
+                bot_payloads.push(payload);
+            } else if payload.enc_type.is_session() {
                 session_payloads.push(payload);
             } else {
                 group_payloads.push(payload);
@@ -803,6 +796,7 @@ impl Client {
             sender_encryption_jid,
             session_payloads,
             group_payloads,
+            bot_payloads,
             max_sender_retry_count,
             decrypt_fail_mode: if has_hide_fail {
                 crate::types::events::DecryptFailMode::Hide
@@ -819,6 +813,7 @@ impl Client {
             sender_encryption_jid,
             session_payloads,
             group_payloads,
+            bot_payloads,
             max_sender_retry_count,
             decrypt_fail_mode,
         } = msg;
@@ -1013,6 +1008,13 @@ impl Client {
             // (a status SKDM pkmsg can reach here), so skip it to avoid a
             // redundant receipt.
             self.ack_received_message(&info);
+        }
+
+        // Bot-secret (msmsg) payloads run inline here so they're serialised
+        // with the session/group decrypt batches under the same global
+        // permit + per-chat enqueue lock acquired upstream.
+        for payload in bot_payloads {
+            self.handle_msmsg_payload(&info, payload).await;
         }
 
         // Flush cached Signal state to DB (matches WA Web's flushBufferToDiskIfNotMemOnlyMode)
@@ -7338,6 +7340,7 @@ mod tests {
                 sender_encryption_jid: sender.clone(),
                 session_payloads: vec![payload],
                 group_payloads: vec![],
+                bot_payloads: vec![],
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
             })
@@ -7858,7 +7861,7 @@ mod tests {
             ])
             .build();
         let owned = node_to_arc(node);
-        client.classify_incoming_message(&owned).await;
+        client.clone().handle_incoming_message(owned).await;
 
         let got = collect_event(
             &client,
@@ -7906,7 +7909,7 @@ mod tests {
             ])
             .build();
         let owned = node_to_arc(node);
-        client.classify_incoming_message(&owned).await;
+        client.clone().handle_incoming_message(owned).await;
 
         let mut code = None;
         for _ in 0..80 {
@@ -7976,7 +7979,7 @@ mod tests {
             ])
             .build();
         let owned = node_to_arc(node);
-        client.classify_incoming_message(&owned).await;
+        client.clone().handle_incoming_message(owned).await;
 
         let mut code = None;
         for _ in 0..80 {
@@ -8056,7 +8059,7 @@ mod tests {
             ])
             .build();
         let owned = node_to_arc(node);
-        client.classify_incoming_message(&owned).await;
+        client.clone().handle_incoming_message(owned).await;
 
         let got = collect_event(
             &client,
@@ -8122,7 +8125,7 @@ mod tests {
             ])
             .build();
         let owned = node_to_arc(node);
-        client.classify_incoming_message(&owned).await;
+        client.clone().handle_incoming_message(owned).await;
 
         let mut code = None;
         for _ in 0..80 {
@@ -8197,7 +8200,7 @@ mod tests {
             ])
             .build();
         let owned = node_to_arc(node);
-        client.classify_incoming_message(&owned).await;
+        client.clone().handle_incoming_message(owned).await;
 
         let got = collect_event(
             &client,
@@ -8207,6 +8210,169 @@ mod tests {
         )
         .await;
         assert!(got.is_some(), "edit=first must keep info.id as HKDF msg_id");
+    }
+
+    /// Coherence: the identity `persist_outbound_msg_secret` writes under
+    /// (LID for bot chats) must match what `handle_msmsg_payload` reads via
+    /// `<meta target_sender_jid>`. End-to-end without bypassing the helper.
+    #[tokio::test]
+    async fn msmsg_outbound_put_and_inbound_get_match_for_lid_bot() {
+        use crate::store::commands::DeviceCommand;
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+
+        let (client, _transport) = capturing_client("msmsg_lid_match").await;
+        // Seed both PN (already seeded by capturing_client) and LID.
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
+        let outbound_id = "OUT_LID";
+        let bot_reply_id = "REPLY_LID";
+        let our_lid = "999888777666555@lid";
+        let secret = [0x71u8; 32];
+
+        // Real outbound path puts the secret using LID for bot chats.
+        client
+            .persist_outbound_msg_secret(&bot_chat, outbound_id, &secret)
+            .await;
+
+        // Inbound msmsg payload encrypted under the same (msg_id, target, bot)
+        // tuple the meta will declare on the wire.
+        let plaintext_msg = wa::Message {
+            conversation: Some("lid coherent".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_lid,
+            bot_user_jid: "867051314767696@bot",
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_lid)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("lid coherent"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "outbound PUT and inbound GET must converge on LID for bot chats"
+        );
+    }
+
+    /// Regression for the AD_JID encoder bug: a `from="USER:0@bot"` stanza must
+    /// survive the marshal/unmarshal round-trip with `server=Bot`, so the
+    /// secret lookup keys hit and the reply decrypts.
+    #[tokio::test]
+    async fn msmsg_with_bot_device_suffix_round_trips() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_bot_device").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_DEV";
+        let bot_reply_id = "BOT_REPLY_DEV";
+        let secret = [0x33u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let plaintext_msg = wa::Message {
+            conversation: Some("with device".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696:0@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("with device"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "msmsg with `:0@bot` from must round-trip (encoder must not strip the bot server)"
+        );
     }
 
     /// `<meta>` without `target_id` → cannot identify the parent message,
@@ -8227,7 +8393,7 @@ mod tests {
                 .build()])
             .build();
         let owned = node_to_arc(node);
-        client.classify_incoming_message(&owned).await;
+        client.clone().handle_incoming_message(owned).await;
 
         let mut code = None;
         for _ in 0..80 {
