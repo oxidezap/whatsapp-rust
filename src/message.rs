@@ -229,8 +229,25 @@ impl Client {
         };
 
         let bot_user_jid = info.source.sender.to_non_ad().to_string();
+        // Bot edit chain: when `<bot edit="inner|last">`, swap in
+        // `edit_target_id` as the HKDF msg_id so this reply decrypts under
+        // the same key as the message it edits.
+        let hkdf_msg_id = info
+            .bot_info
+            .as_ref()
+            .filter(|bi| {
+                matches!(
+                    bi.edit_type,
+                    Some(
+                        crate::types::message::BotEditType::Inner
+                            | crate::types::message::BotEditType::Last
+                    )
+                )
+            })
+            .and_then(|bi| bi.edit_target_id.as_deref())
+            .unwrap_or(info.id.as_str());
         let ctx = BotMessageContext {
-            msg_id: info.id.as_str(),
+            msg_id: hkdf_msg_id,
             target_sender_user_jid: &target_sender_str,
             bot_user_jid: &bot_user_jid,
         };
@@ -7970,6 +7987,226 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert_eq!(code, Some(495));
+    }
+
+    /// Bot edit chain: when `<bot edit="inner">` is set, the HKDF msg_id used
+    /// for the per-message key swaps to `edit_target_id` so the edited reply
+    /// decrypts under the same key as the original (whatsmeow / WA Web
+    /// `decryptMsmsgFbidBotMessage`).
+    #[tokio::test]
+    async fn msmsg_bot_edit_uses_edit_target_id_for_hkdf() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_edit").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_EDIT";
+        let original_reply_id = "BOT_REPLY_FIRST";
+        let edit_reply_id = "BOT_REPLY_EDIT";
+        let secret = [0xAAu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt as if it's the ORIGINAL reply (msg_id = original_reply_id).
+        let plaintext_msg = wa::Message {
+            conversation: Some("edited content".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: original_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        // Inbound stanza has id=edit_reply_id but <bot edit="inner" edit_target_id=original>
+        // so the HKDF must derive against original_reply_id.
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", edit_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot")
+                    .attr("edit", "inner")
+                    .attr("edit_target_id", original_reply_id)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.classify_incoming_message(&owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == edit_reply_id
+                        && msg.conversation.as_deref() == Some("edited content"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "bot edit must use edit_target_id for HKDF msg_id"
+        );
+    }
+
+    /// Same setup as the edit test but WITHOUT `<bot edit>`: the HKDF must
+    /// fall back to `info.id`, and ciphertext encrypted with the edit-target
+    /// id must fail to decrypt.
+    #[tokio::test]
+    async fn msmsg_without_bot_edit_does_not_swap_msg_id() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, transport) = capturing_client("msmsg_noedit").await;
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_NOEDIT";
+        let stanza_id = "BOT_REPLY_NOEDIT";
+        let other_id = "OTHER_ID";
+        let secret = [0xBBu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt with `other_id` to simulate the wrong key derivation if the
+        // edit branch were taken without `<bot edit>`.
+        let ctx = BotMessageContext {
+            msg_id: other_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(b"x", &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.classify_incoming_message(&owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), stanza_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            code,
+            Some(495),
+            "without <bot edit>, HKDF must use stanza id (not OTHER_ID) → tag fails"
+        );
+    }
+
+    /// `<bot edit="first">` is NOT one of {INNER, LAST}, so the HKDF msg_id
+    /// must remain `info.id`.
+    #[tokio::test]
+    async fn msmsg_bot_edit_first_keeps_info_id() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_first").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_FIRST";
+        let stanza_id = "BOT_REPLY_FIRST";
+        let secret = [0xCCu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt with stanza_id; "first" edit must NOT swap.
+        let plaintext_msg = wa::Message {
+            conversation: Some("first reply".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use prost::Message as _;
+            let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
+            plaintext_msg.encode(&mut v).unwrap();
+            v
+        };
+        let ctx = BotMessageContext {
+            msg_id: stanza_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot").attr("edit", "first").build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.classify_incoming_message(&owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| matches!(e, wacore::types::events::Event::Message(_, info) if info.id == stanza_id),
+            1500,
+        )
+        .await;
+        assert!(got.is_some(), "edit=first must keep info.id as HKDF msg_id");
     }
 
     /// `<meta>` without `target_id` → cannot identify the parent message,
