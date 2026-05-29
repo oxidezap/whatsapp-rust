@@ -433,8 +433,7 @@ pub struct Client {
     /// base-key collision — sessions that diverged without either trigger
     /// stay stuck. This map throttles the fallback so a noisy peer can't
     /// loop us through prekey fetches.
-    pub(crate) session_recreate_history:
-        Arc<std::sync::Mutex<HashMap<wacore_binary::jid::Jid, wacore::time::Instant>>>,
+    pub(crate) session_recreate_history: Cache<wacore_binary::jid::Jid, wacore::time::Instant>,
 
     /// Dispatch-once gate for `UndecryptableMessage`: a server resend of a
     /// failed id re-enters the failure path and would otherwise fire a
@@ -835,7 +834,7 @@ impl Client {
 
             recent_retry_reasons: cache_config.message_retry_counts.build_with_ttl(),
 
-            session_recreate_history: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            session_recreate_history: cache_config.session_recreate_history.build_with_ttl(),
 
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
 

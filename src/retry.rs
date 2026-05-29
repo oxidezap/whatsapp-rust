@@ -86,10 +86,6 @@ const MIN_RETRY_FOR_BASE_KEY_CHECK: u8 = 2;
 /// whatsmeow's `recreateSessionTimeout` (`retry.go:156`).
 const RECREATE_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Prune `session_recreate_history` only when it crosses this size, to avoid
-/// paying O(n) under a global Mutex on every retry receipt.
-const SESSION_RECREATE_HISTORY_PRUNE_THRESHOLD: usize = 256;
-
 /// Separated chat and requester JIDs for retry receipt handling.
 /// Mirrors WAWebHandleRetryRequest `getActualChatInfo` + `getTargetChat`.
 struct RetryChatInfo {
@@ -767,21 +763,10 @@ impl Client {
         };
         drop(device_guard);
 
-        let mut history = self
-            .session_recreate_history
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-
-        // Prune lazily — every call under a global Mutex is O(n) and serializes
-        // retry receipts across sessions. Threshold tuned so the map can't grow
-        // unbounded but the common case skips the scan.
-        if history.len() > SESSION_RECREATE_HISTORY_PRUNE_THRESHOLD {
-            history
-                .retain(|_, prev| now.saturating_duration_since(*prev) < RECREATE_SESSION_TIMEOUT);
-        }
+        let history = &self.session_recreate_history;
 
         if !has_session {
-            history.insert(jid.clone(), now);
+            history.insert(jid.clone(), now).await;
             return Some("we don't have a Signal session with them");
         }
 
@@ -789,16 +774,14 @@ impl Client {
             return None;
         }
 
-        // Check age explicitly — lazy pruning may leave an expired entry in
-        // the map. Without this check a peer would stay pinned to its first
-        // recreate forever in low-traffic deployments.
-        if let Some(prev) = history.get(jid)
-            && now.saturating_duration_since(*prev) < RECREATE_SESSION_TIMEOUT
+        // Throttle: skip if this peer was recreated within the timeout.
+        if let Some(prev) = history.get(jid).await
+            && now.saturating_duration_since(prev) < RECREATE_SESSION_TIMEOUT
         {
             return None;
         }
 
-        history.insert(jid.clone(), now);
+        history.insert(jid.clone(), now).await;
         Some("retry count > 1 and over an hour since last recreation")
     }
 
@@ -2003,9 +1986,8 @@ mod tests {
         assert!(
             client
                 .session_recreate_history
-                .lock()
-                .unwrap()
                 .get(&jid_with)
+                .await
                 .is_none(),
             "no-op path must not stamp the history"
         );
@@ -2018,12 +2000,7 @@ mod tests {
                 .is_some_and(|r| r.contains("retry count > 1")),
             "retry≥2 with cold history should recreate"
         );
-        let after_first = client
-            .session_recreate_history
-            .lock()
-            .unwrap()
-            .get(&jid_with)
-            .copied();
+        let after_first = client.session_recreate_history.get(&jid_with).await;
         assert!(after_first.is_some(), "first recreate must stamp history");
 
         // 3) session present + retry≥2 + recent history → throttled.
@@ -2032,24 +2009,14 @@ mod tests {
             "retry≥2 within {}s should be throttled",
             RECREATE_SESSION_TIMEOUT.as_secs()
         );
-        let after_second = client
-            .session_recreate_history
-            .lock()
-            .unwrap()
-            .get(&jid_with)
-            .copied();
+        let after_second = client.session_recreate_history.get(&jid_with).await;
         assert_eq!(
             after_first, after_second,
             "throttled path must not re-stamp the history"
         );
 
-        // 4) Throttle entry past the window must allow a fresh recreate.
-        // Lazy pruning (size threshold) leaves expired entries in the map for
-        // small deployments, so the age check at the decision site is
-        // load-bearing. Pass a future `now` via the injectable-clock variant
-        // because subtracting a Duration from a young test runtime's Instant
-        // would saturate to zero (still "recent" relative to that runtime's
-        // own now), exercising the wrong branch.
+        // 4) Past the throttle window → fresh recreate. Use a future `now`
+        // (subtracting from a young runtime's Instant would saturate to zero).
         let stamp_then = after_first.expect("first recreate stamped history");
         let well_past = stamp_then + RECREATE_SESSION_TIMEOUT + std::time::Duration::from_secs(1);
         assert!(

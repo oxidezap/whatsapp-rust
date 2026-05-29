@@ -182,6 +182,9 @@ pub struct CacheConfig {
     /// Sender key device tracking cache (time_to_idle). Default: 1h TTI, 500 entries.
     /// Caches per-group SKDM distribution state to avoid DB reads on every group send.
     pub sender_key_devices_cache: CacheEntryConfig,
+    /// Session-recreate throttle history (time_to_live). Default: 1h TTL, 256
+    /// entries. Replaces a global `Mutex<HashMap>` scanned O(n) per retry receipt.
+    pub session_recreate_history: CacheEntryConfig,
 
     // --- Coordination caches (capacity-only, no TTL) ---
     /// Per-device Signal session lock capacity. Default: 10000.
@@ -226,6 +229,7 @@ impl std::fmt::Debug for CacheConfig {
             .field("undecryptable_dispatched", &self.undecryptable_dispatched)
             .field("pdo_pending_requests", &self.pdo_pending_requests)
             .field("sender_key_devices_cache", &self.sender_key_devices_cache)
+            .field("session_recreate_history", &self.session_recreate_history)
             .field("session_locks_capacity", &self.session_locks_capacity)
             .field("chat_lanes_capacity", &self.chat_lanes_capacity)
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
@@ -262,6 +266,7 @@ impl Default for CacheConfig {
             undecryptable_dispatched: CacheEntryConfig::new(five_min, 1_000),
             pdo_pending_requests: CacheEntryConfig::new(Some(Duration::from_secs(30)), 200),
             sender_key_devices_cache: CacheEntryConfig::new(one_hour, 500),
+            session_recreate_history: CacheEntryConfig::new(one_hour, 256),
             // Coordination caches hold live mutexes/senders; capacity eviction
             // while a reference is held creates a second lock for the same key,
             // breaking serialization. Size generously to avoid eviction pressure.
