@@ -109,9 +109,12 @@ pub fn collect_simple_message_ids(
 /// own-account fanouts (`isMeAccount(author)`). For all other own messages,
 /// receipts are skipped.
 ///
-/// NOTE: the authoritative copy used by the message-dispatch hot path is
+/// NOTE: the message-dispatch hot path uses
 /// `crate::client::Client::should_send_delivery_receipt` (in the
-/// `whatsapp-rust` crate). Keep the two in sync.
+/// `whatsapp-rust` crate), which is authoritative and intentionally diverges
+/// here (it also sends `<receipt context="status">` for status broadcasts,
+/// which this copy still skips). The self-fanout rule is shared via
+/// [`MessageSource::is_self_fanout`].
 pub fn should_send_delivery_receipt(info: &MessageInfo) -> bool {
     if info.id.is_empty()
         || info.source.chat.user == STATUS_BROADCAST_USER
@@ -120,14 +123,11 @@ pub fn should_send_delivery_receipt(info: &MessageInfo) -> bool {
         return false;
     }
 
-    // status & newsletter already returned false above, so a self-fanout here
-    // is necessarily a non-group DM to a user/bot.
-    let is_self_fanout =
-        info.source.is_from_me && info.source.recipient.is_some() && !info.source.is_group;
-
     // WA Web sends type="peer_msg" for self-synced (category="peer") and
     // type="sender" for own-account fanouts. Other own messages are skipped.
-    info.category == MessageCategory::Peer || !info.source.is_from_me || is_self_fanout
+    info.category == MessageCategory::Peer
+        || !info.source.is_from_me
+        || info.source.is_self_fanout()
 }
 
 #[cfg(test)]

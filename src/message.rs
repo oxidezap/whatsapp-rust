@@ -112,10 +112,9 @@ impl Client {
     }
 
     /// Acknowledge a received message so the server drops it from the offline
-    /// queue: a delivery receipt when applicable, else a transport ack for
-    /// own-account fan-out (its receipt is suppressed but the stanza still needs
-    /// clearing; the ack carries the correct to=from). status is acked by the
-    /// `should_ack` gate, newsletters/empty ids need nothing here.
+    /// queue: a delivery receipt when applicable (incl. the `type="sender"`
+    /// receipt for own-account self-fanouts), else a transport ack. status is
+    /// acked by the `should_ack` gate, newsletters/empty ids need nothing here.
     fn ack_received_message(self: &Arc<Self>, info: &Arc<MessageInfo>) {
         if info.id.is_empty() || info.source.chat.is_newsletter() {
             return;
@@ -584,6 +583,14 @@ impl Client {
         let client = Arc::clone(self);
         let info = Arc::clone(info);
         self.outbound_flush.spawn(&*self.runtime, async move {
+            // A self-fanout is our own message; retrying it to ourselves is
+            // futile and the server's offline queue ignores a bare transport
+            // ack, so it would replay forever. Clear it with the sender receipt
+            // instead (same stanza the success/duplicate paths now emit).
+            if info.source.is_self_fanout() {
+                client.send_delivery_receipt(&info).await;
+                return;
+            }
             // Only ack once the resend request is actually out; otherwise leave
             // the stanza queued so the server redelivers and we retry.
             let resend_sent = client.run_retry_receipt(&info, reason).await;
@@ -7381,6 +7388,72 @@ mod tests {
         );
     }
 
+    /// Regression for the bot self-fanout loop on the DECRYPT-FAILURE path
+    /// (BadMac/NoSession): a self-fanout we cannot decrypt must be cleared with
+    /// a `<receipt type="sender">`, NOT a bare transport `<ack>` (ignored by the
+    /// server) nor a retry-to-self (futile). Once stuck in the loop the local
+    /// counter advances past the duplicate state, so this BadMac path is what
+    /// actually fires for an already-affected account.
+    #[tokio::test]
+    async fn self_fanout_decrypt_failure_acked_via_sender_receipt() {
+        let (client, transport) = capturing_client("self_fanout_badmac").await;
+        let info = Arc::new(MessageInfo {
+            id: "AC00000000000000000000000000BEEF".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "100000000000001@lid".parse().expect("sender"),
+                chat: "200000000000002@bot".parse().expect("chat"),
+                recipient: Some("200000000000002@bot".parse().expect("recipient")),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::BadMac,
+                crate::types::events::DecryptFailMode::Hide,
+            )
+            .await;
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(r) = find_receipt(&transport.sent(), "AC00000000000000000000000000BEEF") {
+                found = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, typ, recipient) = found
+            .expect("self-fanout decrypt failure must emit a sender <receipt> to drain the queue");
+        assert_eq!(to, "100000000000001@lid");
+        assert_eq!(typ.as_deref(), Some("sender"));
+        assert_eq!(recipient.as_deref(), Some("200000000000002@bot"));
+
+        let sent = transport.sent();
+        assert!(
+            find_message_ack(&sent).is_none(),
+            "must not emit the bare <ack> the server ignores"
+        );
+        let mut saw_retry = false;
+        for (i, frame) in sent.iter().enumerate() {
+            if let Some(buf) = decode_frame(i, frame)
+                && let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..])
+                && node.tag.as_ref() == "receipt"
+                && node.get_attr("type").is_some_and(|v| {
+                    v.as_str() == crate::types::presence::ReceiptType::Retry.as_wire_str()
+                })
+            {
+                saw_retry = true;
+            }
+        }
+        assert!(
+            !saw_retry,
+            "must not retry our own undecryptable fanout to ourselves"
+        );
+    }
+
     /// If the resend request fails to send, the stanza must NOT be acked, so the
     /// server keeps it queued for another try. Here NoSession needs keys, which
     /// need a device account this harness lacks, so send_retry_receipt errors.
@@ -7635,7 +7708,7 @@ mod tests {
         let (to, typ, recipient) = found.expect("own self-fanout must get a sender <receipt>");
         assert_eq!(
             to, "100000000000001@lid",
-            "receipt `to` must echo the own LID with its device"
+            "receipt `to` must echo the own LID (the fanout sender)"
         );
         assert_eq!(
             typ.as_deref(),

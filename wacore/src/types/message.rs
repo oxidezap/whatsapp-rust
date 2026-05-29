@@ -56,6 +56,21 @@ impl MessageSource {
     pub fn is_incoming_broadcast(&self) -> bool {
         (!self.is_from_me || self.broadcast_list_owner.is_some()) && self.chat.is_broadcast_list()
     }
+
+    /// Our own outgoing DM to a user or bot, echoed back to this device
+    /// (`is_from_me` with a `recipient`). The server's offline queue only
+    /// releases these on a `<receipt type="sender">`, so they must not be
+    /// cleared with a bare transport ack. Group/status/newsletter threads are
+    /// excluded (`chat` is checked too, since the own-from parser derives
+    /// `chat` from `recipient` and leaves `is_group` defaulted).
+    pub fn is_self_fanout(&self) -> bool {
+        self.is_from_me
+            && self.recipient.is_some()
+            && !self.is_group
+            && !self.chat.is_group()
+            && !self.chat.is_status_broadcast()
+            && !self.chat.is_newsletter()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

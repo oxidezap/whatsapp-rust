@@ -30,11 +30,10 @@ fn build_delivery_receipt_node(
     active: bool,
 ) -> wacore_binary::Node {
     let is_status = info.source.chat.is_status_broadcast();
-    let is_self_fanout = info.source.is_from_me
-        && info.source.recipient.is_some()
-        && !info.source.is_group
-        && !is_status
-        && !info.source.chat.is_newsletter();
+    // A peer-synced message takes `type="peer_msg"` and carries NO recipient
+    // (WA Web `!l` guard), so the sender-receipt shape applies only off the
+    // peer path.
+    let sender_receipt = info.source.is_self_fanout() && info.category != MessageCategory::Peer;
     // Mirror whatsmeow `buildBaseReceipt` / WA Web `JID(extractJidFromJidWithType)`:
     // echo `from` verbatim so the device survives. `chat` strips it via to_non_ad,
     // which the LID server rejects for multi-device DMs.
@@ -48,15 +47,15 @@ fn build_delivery_receipt_node(
         .attr("to", to);
 
     if info.category == MessageCategory::Peer {
-        builder = builder.attr("type", "peer_msg");
-    } else if is_self_fanout {
-        builder = builder.attr("type", "sender");
+        builder = builder.attr("type", ReceiptType::PeerMsg.as_wire_str());
+    } else if sender_receipt {
+        builder = builder.attr("type", ReceiptType::Sender.as_wire_str());
     } else if !active && !is_status {
-        builder = builder.attr("type", "inactive");
+        builder = builder.attr("type", ReceiptType::Inactive.as_wire_str());
     }
 
     // Device-stripped recipient (WA Web `USER_JID`) so the server can route it.
-    if is_self_fanout && let Some(recipient) = &info.source.recipient {
+    if sender_receipt && let Some(recipient) = &info.source.recipient {
         builder = builder.attr("recipient", recipient.to_non_ad());
     }
 
@@ -128,11 +127,9 @@ impl Client {
         // sender receipt to drain the offline queue; without it the server
         // replays it until a ~50min GC closes the stream. A recipient-less own
         // message (self-note) stays skipped. See `build_delivery_receipt_node`.
-        let is_self_fanout = info.source.is_from_me
-            && info.source.recipient.is_some()
-            && !info.source.is_group
-            && !info.source.chat.is_status_broadcast();
-        info.category == MessageCategory::Peer || !info.source.is_from_me || is_self_fanout
+        info.category == MessageCategory::Peer
+            || !info.source.is_from_me
+            || info.source.is_self_fanout()
     }
 
     pub(crate) async fn handle_receipt(self: &Arc<Self>, node: Arc<OwnedNodeRef>) {
@@ -301,9 +298,15 @@ impl Client {
 
         let receipt_node = build_delivery_receipt_node(info, self.receipts_are_active());
 
+        let receipt_kind = if info.category == MessageCategory::Peer {
+            ReceiptType::PeerMsg
+        } else if info.source.is_self_fanout() {
+            ReceiptType::Sender
+        } else {
+            ReceiptType::Delivered
+        };
         debug!(target: "Client/Receipt", "Sending {} receipt for message {} to {}",
-            if info.category == MessageCategory::Peer { "peer_msg" } else { "delivery" },
-            info.id, info.source.sender);
+            receipt_kind.as_wire_str(), info.id, info.source.sender);
 
         if let Err(e) = self.send_node(receipt_node).await
             && !matches!(e, crate::client::ClientError::NotConnected)
@@ -517,6 +520,63 @@ mod tests {
             node.attrs.get("recipient").map(|v| v.as_str()).as_deref(),
             Some("300000000000003@lid"),
             "recipient device must be stripped (USER_JID semantics)"
+        );
+    }
+
+    #[test]
+    fn peer_self_fanout_is_peer_msg_without_recipient() {
+        // A peer-synced message that also looks like a self-fanout (is_from_me +
+        // recipient) must keep `type="peer_msg"` and carry NO recipient (WA Web
+        // `!l` guard), never `type="sender"`.
+        let info = MessageInfo {
+            id: "PEER_FANOUT".to_string(),
+            source: MessageSource {
+                sender: "100000000000001@lid".parse().expect("sender"),
+                chat: "300000000000003@lid".parse().expect("chat"),
+                recipient: Some("300000000000003@lid".parse().expect("recipient")),
+                is_from_me: true,
+                is_group: false,
+                ..Default::default()
+            },
+            category: MessageCategory::Peer,
+            ..Default::default()
+        };
+        let node = build_delivery_receipt_node(&info, true);
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("peer_msg")
+        );
+        assert!(
+            node.attrs.get("recipient").is_none(),
+            "a peer_msg receipt must not carry a recipient"
+        );
+    }
+
+    #[test]
+    fn self_fanout_is_sender_even_when_inactive() {
+        // type=sender takes precedence over the inactive (passive companion)
+        // branch: a self-fanout is always acknowledged as sender.
+        let info = MessageInfo {
+            id: "FANOUT_INACTIVE".to_string(),
+            source: MessageSource {
+                sender: "100000000000001@lid".parse().expect("sender"),
+                chat: "200000000000002@bot".parse().expect("chat"),
+                recipient: Some("200000000000002@bot".parse().expect("recipient")),
+                is_from_me: true,
+                is_group: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let node = build_delivery_receipt_node(&info, false);
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("sender"),
+            "self-fanout must stay type=sender, not become inactive"
+        );
+        assert_eq!(
+            node.attrs.get("recipient").map(|v| v.as_str()).as_deref(),
+            Some("200000000000002@bot")
         );
     }
 

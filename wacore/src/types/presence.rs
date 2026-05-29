@@ -65,6 +65,26 @@ impl ReceiptType {
             other => Self::Other(other.to_string()),
         }
     }
+
+    /// Canonical wire `type` value. Inverse of [`Self::parse`] (`Delivered`
+    /// maps to `"delivery"`, though it is sent as a dropped attr in practice).
+    pub fn as_wire_str(&self) -> &str {
+        match self {
+            Self::Delivered => "delivery",
+            Self::Sender => "sender",
+            Self::Retry => "retry",
+            Self::EncRekeyRetry => "enc_rekey_retry",
+            Self::Read => "read",
+            Self::ReadSelf => "read-self",
+            Self::Played => "played",
+            Self::PlayedSelf => "played-self",
+            Self::ServerError => "server-error",
+            Self::Inactive => "inactive",
+            Self::PeerMsg => "peer_msg",
+            Self::HistorySync => "hist_sync",
+            Self::Other(s) => s,
+        }
+    }
 }
 
 impl From<String> for ReceiptType {
