@@ -43,7 +43,9 @@ impl HashState {
     where
         F: FnMut(&[u8], usize) -> anyhow::Result<Option<Vec<u8>>>,
     {
-        let mut added: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
+        // Borrow the MAC tails directly out of `mutations` instead of copying each
+        // 32-byte slice; mirrors the already-optimized `update_hash_from_records`.
+        let mut added: Vec<&[u8]> = Vec::with_capacity(mutations.len());
         let mut removed: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
         let mut result = HashUpdateResult::default();
 
@@ -55,7 +57,7 @@ impl HashState {
                 && let Some(blob) = &value.blob
                 && blob.len() >= 32
             {
-                added.push(blob[blob.len() - 32..].to_vec());
+                added.push(&blob[blob.len() - 32..]);
             }
             let index_mac_opt = mutation
                 .record
@@ -79,7 +81,11 @@ impl HashState {
             }
         }
 
-        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &removed, &added);
+        // Two uniform-typed calls: subtract the owned previous MACs, then add the
+        // borrowed tails. A single mixed `Vec<u8>` + `&[u8]` call trips up deref
+        // coercion inference. Net effect is identical (subtract removed, add added).
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &removed, &[] as &[Vec<u8>]);
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &[] as &[&[u8]], &added);
         (result, Ok(()))
     }
 

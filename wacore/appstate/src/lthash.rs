@@ -38,9 +38,14 @@ impl LTHash {
     }
 
     fn multiple_op<T: AsRef<[u8]>>(&self, base: &mut [u8], input: &[T], subtract: bool) {
+        // One stack buffer reused across every operand: the per-operand heap `Vec`
+        // from HKDF was pure churn during app-state sync. `hkdf_size` is a u8, so
+        // 256 bytes always covers it.
+        let mut derived = [0u8; u8::MAX as usize + 1];
+        let derived = &mut derived[..self.hkdf_size as usize];
         for item in input {
-            let derived = hkdf_sha256(item.as_ref(), None, self.hkdf_info, self.hkdf_size);
-            perform_pointwise_with_overflow(base, &derived, subtract);
+            hkdf_sha256_into(item.as_ref(), None, self.hkdf_info, derived);
+            perform_pointwise_with_overflow(base, derived, subtract);
         }
     }
 }
@@ -116,11 +121,9 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
     }
 }
 
-fn hkdf_sha256(key: &[u8], salt: Option<&[u8]>, info: &[u8], length: u8) -> Vec<u8> {
+fn hkdf_sha256_into(key: &[u8], salt: Option<&[u8]>, info: &[u8], out: &mut [u8]) {
     let hk = Hkdf::<Sha256>::new(salt, key);
-    let mut okm = vec![0u8; length as usize];
-    hk.expand(info, &mut okm).expect("hkdf expand");
-    okm
+    hk.expand(info, out).expect("hkdf expand");
 }
 
 #[cfg(test)]
