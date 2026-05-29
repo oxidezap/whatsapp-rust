@@ -48,8 +48,12 @@ pub enum ReceiptType {
 }
 
 impl ReceiptType {
-    pub fn parse(s: &str) -> Self {
-        match s {
+    /// Single source of truth for the wire-string -> known-variant mapping
+    /// (the inverse of [`Self::as_wire_str`]). Returns `None` for an
+    /// unrecognized value so callers can decide how to build `Other` (clone vs
+    /// move) without duplicating the match.
+    fn from_known(s: &str) -> Option<Self> {
+        Some(match s {
             "" | "delivery" => Self::Delivered,
             "sender" => Self::Sender,
             "retry" => Self::Retry,
@@ -62,8 +66,12 @@ impl ReceiptType {
             "inactive" => Self::Inactive,
             "peer_msg" => Self::PeerMsg,
             "hist_sync" => Self::HistorySync,
-            other => Self::Other(other.to_string()),
-        }
+            _ => return None,
+        })
+    }
+
+    pub fn parse(s: &str) -> Self {
+        Self::from_known(s).unwrap_or_else(|| Self::Other(s.to_string()))
     }
 
     /// Canonical wire `type` value. Inverse of [`Self::parse`] (`Delivered`
@@ -89,20 +97,10 @@ impl ReceiptType {
 
 impl From<String> for ReceiptType {
     fn from(s: String) -> Self {
-        match s.as_str() {
-            "" | "delivery" => Self::Delivered,
-            "sender" => Self::Sender,
-            "retry" => Self::Retry,
-            "enc_rekey_retry" => Self::EncRekeyRetry,
-            "read" => Self::Read,
-            "read-self" => Self::ReadSelf,
-            "played" => Self::Played,
-            "played-self" => Self::PlayedSelf,
-            "server-error" => Self::ServerError,
-            "inactive" => Self::Inactive,
-            "peer_msg" => Self::PeerMsg,
-            "hist_sync" => Self::HistorySync,
-            _ => Self::Other(s),
+        // Reuse the owned `s` for the `Other` fallback (no extra allocation).
+        match Self::from_known(&s) {
+            Some(known) => known,
+            None => Self::Other(s),
         }
     }
 }
