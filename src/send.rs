@@ -1256,7 +1256,7 @@ impl Client {
             // DM fanout: all known recipient devices + own companions.
             // WAWebSendUserMsgJob reads local device table only on the send
             // path; WAWebDBDeviceListFanout excludes hosted devices.
-            let recipient_bare = self.resolve_encryption_jid(&to).await.to_non_ad();
+            let recipient_bare = self.resolve_encryption_jid(&to).await.into_non_ad();
             let recipient_is_lid = recipient_bare.is_lid();
 
             // Local registry first; network warm only on miss to avoid
@@ -1919,7 +1919,7 @@ impl Client {
             jid.to_non_ad()
         };
         // Issuance targets bare account JIDs, not device-scoped ones
-        resolved.to_non_ad()
+        resolved.into_non_ad()
     }
 }
 
