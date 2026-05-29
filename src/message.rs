@@ -7278,6 +7278,30 @@ mod tests {
         None
     }
 
+    /// First `<receipt>` on the wire for `id` as `(to, type, recipient)`.
+    fn find_receipt(
+        frames: &[bytes::Bytes],
+        id: &str,
+    ) -> Option<(String, Option<String>, Option<String>)> {
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "receipt"
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && let Some(to) = node.get_attr("to")
+            {
+                let typ = node.get_attr("type").map(|v| v.as_str().to_string());
+                let recipient = node.get_attr("recipient").map(|v| v.as_str().to_string());
+                return Some((to.as_str().to_string(), typ, recipient));
+            }
+        }
+        None
+    }
+
     /// Count delivery `<receipt>` (anything but type="retry") on the wire for `id`.
     fn delivery_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize {
         let mut count = 0;
@@ -7578,18 +7602,21 @@ mod tests {
         );
     }
 
-    /// Own-account fan-out (is_from_me, non-peer) has its delivery receipt
-    /// suppressed by `should_send_delivery_receipt`, so it must instead get a
-    /// transport ack (to = own LID) or the server replays it forever.
+    /// Own-account self-fanout (is_from_me, non-peer, carries a `recipient`):
+    /// our own outgoing message echoed back to this device. WA Web
+    /// (`isMeAccount(author) => SENDER`) and whatsmeow (`IsFromMe => "sender"`)
+    /// clear it with a `<receipt type="sender" recipient=...>`, NOT a bare
+    /// transport `<ack>`. The server's offline queue ignores the bare ack and
+    /// replays the stanza forever (the ~50min disconnect loop).
     #[tokio::test]
-    async fn own_account_message_acked_via_transport_ack() {
+    async fn own_self_fanout_acked_via_sender_receipt() {
         let (client, transport) = capturing_client("own_ack").await;
         let own = Arc::new(MessageInfo {
             id: "OWN1".to_string(),
             source: crate::types::message::MessageSource {
-                sender: "236395184570386@lid".parse().expect("sender"),
-                chat: "156535032389744@lid".parse().expect("chat"),
-                recipient: Some("156535032389744@lid".parse().expect("recipient")),
+                sender: "100000000000001@lid".parse().expect("sender"),
+                chat: "300000000000003@lid".parse().expect("chat"),
+                recipient: Some("300000000000003@lid".parse().expect("recipient")),
                 is_from_me: true,
                 ..Default::default()
             },
@@ -7599,21 +7626,77 @@ mod tests {
 
         let mut found = None;
         for _ in 0..80 {
-            if let Some(a) = find_message_ack(&transport.sent()) {
-                found = Some(a);
+            if let Some(r) = find_receipt(&transport.sent(), "OWN1") {
+                found = Some(r);
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        let (to, _) = found.expect("own-account message must get a transport ack");
+        let (to, typ, recipient) = found.expect("own self-fanout must get a sender <receipt>");
         assert_eq!(
-            to, "236395184570386@lid",
-            "ack must be addressed to the own LID"
+            to, "100000000000001@lid",
+            "receipt `to` must echo the own LID with its device"
         );
         assert_eq!(
-            delivery_receipts_for(&transport.sent(), "OWN1"),
-            0,
-            "own non-peer must NOT get a delivery receipt (it's suppressed)"
+            typ.as_deref(),
+            Some("sender"),
+            "own self-fanout receipt must be type=sender"
+        );
+        assert_eq!(
+            recipient.as_deref(),
+            Some("300000000000003@lid"),
+            "receipt must echo the fanout recipient"
+        );
+        assert!(
+            find_message_ack(&transport.sent()).is_none(),
+            "self-fanout must NOT also emit a bare transport <ack> (the server rejects it)"
+        );
+    }
+
+    /// Regression for the bot self-fanout disconnect loop: our own message to a
+    /// `@bot` recipient, echoed back as a duplicate/undecryptable stanza, must
+    /// be cleared with a `<receipt type="sender" recipient=@bot>`. Pre-fix it
+    /// got a bare `<ack class="message">` which the server ignored, replaying
+    /// the stanza every reconnect until a ~50min `<stream:error><ack/>` GC
+    /// force-closed the connection (the exact production symptom).
+    #[tokio::test]
+    async fn bot_self_fanout_acked_via_sender_receipt() {
+        let (client, transport) = capturing_client("bot_self_fanout").await;
+        let own = Arc::new(MessageInfo {
+            id: "AC00000000000000000000000000BEEF".to_string(),
+            source: crate::types::message::MessageSource {
+                // from = our own LID (the server fans our outgoing bot prompt
+                // back to this device); chat = the bot (recipient.to_non_ad).
+                sender: "100000000000001@lid".parse().expect("sender"),
+                chat: "200000000000002@bot".parse().expect("chat"),
+                recipient: Some("200000000000002@bot".parse().expect("recipient")),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&own);
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(r) = find_receipt(&transport.sent(), "AC00000000000000000000000000BEEF") {
+                found = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, typ, recipient) =
+            found.expect("bot self-fanout must get a sender <receipt> to drain the offline queue");
+        assert_eq!(to, "100000000000001@lid", "receipt `to` is the own LID");
+        assert_eq!(typ.as_deref(), Some("sender"));
+        assert_eq!(
+            recipient.as_deref(),
+            Some("200000000000002@bot"),
+            "receipt must route to the bot recipient"
+        );
+        assert!(
+            find_message_ack(&transport.sent()).is_none(),
+            "the bare <ack> that triggered <stream:error><ack/> must no longer be emitted"
         );
     }
 

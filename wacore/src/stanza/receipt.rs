@@ -101,10 +101,17 @@ pub fn collect_simple_message_ids(
 /// - Messages with an empty ID
 /// - Status broadcasts (`status@broadcast`)
 /// - Newsletter messages
-/// - Own outgoing messages (unless category is `"peer"`, i.e., self-synced)
+/// - Own outgoing messages, EXCEPT category `"peer"` (self-synced) and
+///   self-fanouts (`is_from_me` with a `recipient`), which need a
+///   `<receipt type="sender">`.
 ///
-/// WA Web sends `type="peer_msg"` delivery receipts for self-synced messages
-/// (category="peer"). For all other messages, receipts are skipped for our own.
+/// WA Web sends `type="peer_msg"` for self-synced and `type="sender"` for
+/// own-account fanouts (`isMeAccount(author)`). For all other own messages,
+/// receipts are skipped.
+///
+/// NOTE: the authoritative copy used by the message-dispatch hot path is
+/// `crate::client::Client::should_send_delivery_receipt` (in the
+/// `whatsapp-rust` crate). Keep the two in sync.
 pub fn should_send_delivery_receipt(info: &MessageInfo) -> bool {
     if info.id.is_empty()
         || info.source.chat.user == STATUS_BROADCAST_USER
@@ -113,11 +120,14 @@ pub fn should_send_delivery_receipt(info: &MessageInfo) -> bool {
         return false;
     }
 
-    // WA Web sends type="peer_msg" delivery receipts for self-synced
-    // messages (category="peer").  These tell the primary phone that
-    // this companion device received the message.
-    // For all other messages, skip receipts for our own messages.
-    info.category == MessageCategory::Peer || !info.source.is_from_me
+    // status & newsletter already returned false above, so a self-fanout here
+    // is necessarily a non-group DM to a user/bot.
+    let is_self_fanout =
+        info.source.is_from_me && info.source.recipient.is_some() && !info.source.is_group;
+
+    // WA Web sends type="peer_msg" for self-synced (category="peer") and
+    // type="sender" for own-account fanouts. Other own messages are skipped.
+    info.category == MessageCategory::Peer || !info.source.is_from_me || is_self_fanout
 }
 
 #[cfg(test)]
@@ -197,6 +207,25 @@ mod tests {
                 ..Default::default()
             },
             category: MessageCategory::Peer,
+            ..Default::default()
+        };
+        assert!(should_send_delivery_receipt(&info));
+    }
+
+    #[test]
+    fn allow_self_fanout_with_recipient() {
+        // Own outgoing message echoed back (is_from_me + recipient): needs a
+        // sender receipt. A recipient-less own message (skip_own_non_peer_*)
+        // stays skipped. Mirrors the hot-path copy in the whatsapp-rust crate.
+        let info = MessageInfo {
+            id: "FANOUT1".to_string(),
+            source: MessageSource {
+                chat: "200000000000002@bot".parse().unwrap(),
+                sender: "100000000000001@lid".parse().unwrap(),
+                recipient: Some("200000000000002@bot".parse().unwrap()),
+                is_from_me: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert!(should_send_delivery_receipt(&info));

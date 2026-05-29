@@ -19,11 +19,22 @@ use wacore_binary::OwnedNodeRef;
 /// JID. Without it the server can't map the ack back to the status owner.
 /// `active=false` sends `type="inactive"` (not rendered as ticks), matching
 /// whatsmeow's background companion. Peer/status keep their own type/context.
+///
+/// Self-fanout (`is_from_me` + a `recipient`) gets `type="sender"` + the
+/// `recipient`, matching WA Web (`isMeAccount` author => SENDER) and whatsmeow.
+/// The server's offline queue only drops a self-fanout on this sender receipt;
+/// a bare transport `<ack>` is ignored and the stanza is replayed until a
+/// ~50min GC closes the stream.
 fn build_delivery_receipt_node(
     info: &crate::types::message::MessageInfo,
     active: bool,
 ) -> wacore_binary::Node {
     let is_status = info.source.chat.is_status_broadcast();
+    let is_self_fanout = info.source.is_from_me
+        && info.source.recipient.is_some()
+        && !info.source.is_group
+        && !is_status
+        && !info.source.chat.is_newsletter();
     // Mirror whatsmeow `buildBaseReceipt` / WA Web `JID(extractJidFromJidWithType)`:
     // echo `from` verbatim so the device survives. `chat` strips it via to_non_ad,
     // which the LID server rejects for multi-device DMs.
@@ -38,8 +49,15 @@ fn build_delivery_receipt_node(
 
     if info.category == MessageCategory::Peer {
         builder = builder.attr("type", "peer_msg");
+    } else if is_self_fanout {
+        builder = builder.attr("type", "sender");
     } else if !active && !is_status {
         builder = builder.attr("type", "inactive");
+    }
+
+    // Device-stripped recipient (WA Web `USER_JID`) so the server can route it.
+    if is_self_fanout && let Some(recipient) = &info.source.recipient {
+        builder = builder.attr("recipient", recipient.to_non_ad());
     }
 
     if info.source.is_group || is_status {
@@ -105,7 +123,16 @@ impl Client {
         // (`Send/DeliveryReceiptJob.js` + `Handle/MsgSendReceipt.js` —
         // `C = y && isStatusStanzaReceiveEnabled() ? "status" : void 0`).
         // The context attribute is added in send_delivery_receipt below.
-        info.category == MessageCategory::Peer || !info.source.is_from_me
+        //
+        // Self-fanout (own message echoed back, carrying a `recipient`) needs a
+        // sender receipt to drain the offline queue; without it the server
+        // replays it until a ~50min GC closes the stream. A recipient-less own
+        // message (self-note) stays skipped. See `build_delivery_receipt_node`.
+        let is_self_fanout = info.source.is_from_me
+            && info.source.recipient.is_some()
+            && !info.source.is_group
+            && !info.source.chat.is_status_broadcast();
+        info.category == MessageCategory::Peer || !info.source.is_from_me || is_self_fanout
     }
 
     pub(crate) async fn handle_receipt(self: &Arc<Self>, node: Arc<OwnedNodeRef>) {
@@ -431,6 +458,66 @@ mod tests {
         assert!(node.attrs.get("context").is_none());
         assert!(node.attrs.get("participant").is_none());
         assert!(node.attrs.get("type").is_none());
+    }
+
+    #[test]
+    fn delivery_receipt_for_self_fanout_to_bot_is_sender_with_recipient() {
+        // Own prompt to a @bot, echoed back: <receipt type="sender" to=ourLID
+        // recipient=@bot>, `to` preserving the sender's device. Mirrors WA Web
+        // DeliveryReceiptJob (SENDER + USER_JID(recipient)) and whatsmeow.
+        let info = MessageInfo {
+            id: "FANOUT_BOT".to_string(),
+            source: MessageSource {
+                sender: "100000000000001:11@lid".parse().expect("sender"),
+                chat: "200000000000002@bot".parse().expect("chat"),
+                recipient: Some("200000000000002@bot".parse().expect("recipient")),
+                is_from_me: true,
+                is_group: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let node = build_delivery_receipt_node(&info, true);
+        assert_eq!(node.tag, "receipt");
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("sender")
+        );
+        assert_eq!(
+            node.attrs.get("to").map(|v| v.as_str()).as_deref(),
+            Some("100000000000001:11@lid"),
+            "`to` must preserve the own device or the LID server rejects it"
+        );
+        assert_eq!(
+            node.attrs.get("recipient").map(|v| v.as_str()).as_deref(),
+            Some("200000000000002@bot")
+        );
+        assert!(node.attrs.get("participant").is_none());
+        assert!(node.attrs.get("context").is_none());
+    }
+
+    #[test]
+    fn delivery_receipt_for_self_fanout_strips_recipient_device() {
+        // WA Web's `USER_JID` strips the device from `recipient`; a fanout to a
+        // multi-device user echoes the non-AD recipient.
+        let info = MessageInfo {
+            id: "FANOUT_DEV".to_string(),
+            source: MessageSource {
+                sender: "100000000000001:5@lid".parse().expect("sender"),
+                chat: "300000000000003@lid".parse().expect("chat"),
+                recipient: Some("300000000000003:7@lid".parse().expect("recipient")),
+                is_from_me: true,
+                is_group: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let node = build_delivery_receipt_node(&info, true);
+        assert_eq!(
+            node.attrs.get("recipient").map(|v| v.as_str()).as_deref(),
+            Some("300000000000003@lid"),
+            "recipient device must be stripped (USER_JID semantics)"
+        );
     }
 
     #[test]
@@ -785,11 +872,49 @@ mod tests {
 
     #[test]
     fn should_send_delivery_receipt_skips_own_dm() {
-        // Self-sent DM with category=Regular: no receipt (we don't ack our own
-        // messages). Peer-category self-sync messages are handled below.
+        // Self-sent message with NO `recipient` (a self-note where from==to):
+        // not a fanout, so no receipt. Peer-category self-sync and self-fanouts
+        // (which carry a `recipient`) are handled by the cases below.
         let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
         info.source.is_from_me = true;
+        assert!(info.source.recipient.is_none());
         assert!(!Client::should_send_delivery_receipt(&info));
+    }
+
+    #[test]
+    fn should_send_delivery_receipt_allows_self_fanout_to_user() {
+        // Own outgoing DM to another user, echoed back to this device
+        // (is_from_me + recipient). WA Web emits a `<receipt type="sender">`.
+        let mut info = info_with("300000000000003@lid", "100000000000001@lid", false);
+        info.source.is_from_me = true;
+        info.source.recipient = Some("300000000000003@lid".parse().expect("recipient"));
+        assert!(Client::should_send_delivery_receipt(&info));
+    }
+
+    #[test]
+    fn should_send_delivery_receipt_allows_self_fanout_to_bot() {
+        // The reported disconnect-loop case: our own prompt to a @bot, echoed
+        // back. Must get a sender receipt or the server replays it forever.
+        let mut info = info_with("200000000000002@bot", "100000000000001@lid", false);
+        info.source.is_from_me = true;
+        info.source.recipient = Some("200000000000002@bot".parse().expect("recipient"));
+        assert!(Client::should_send_delivery_receipt(&info));
+    }
+
+    #[test]
+    fn should_send_delivery_receipt_skips_own_status_and_group_fanout() {
+        // Regression guard: the self-fanout allowance must NOT leak into our own
+        // status broadcasts or group messages (WA Web does not send a DM-style
+        // sender receipt there).
+        let mut own_status = info_with("status@broadcast", "100000000000001@lid", false);
+        own_status.source.is_from_me = true;
+        own_status.source.recipient = Some("100000000000001@lid".parse().expect("recipient"));
+        assert!(!Client::should_send_delivery_receipt(&own_status));
+
+        let mut own_group = info_with("120363021033254949@g.us", "100000000000001@lid", true);
+        own_group.source.is_from_me = true;
+        own_group.source.recipient = Some("100000000000001@lid".parse().expect("recipient"));
+        assert!(!Client::should_send_delivery_receipt(&own_group));
     }
 
     #[test]
