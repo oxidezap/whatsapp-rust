@@ -232,6 +232,39 @@ mod tests {
     }
 
     #[test]
+    fn skip_own_status_and_group_even_with_recipient() {
+        // Negative parity with Client::should_send_delivery_receipt: the
+        // self-fanout allowance must NOT leak into own status broadcasts or
+        // group messages, even when a recipient is present.
+        let own_status = MessageInfo {
+            id: "OWN_STATUS".to_string(),
+            source: MessageSource {
+                chat: "status@broadcast".parse().unwrap(),
+                sender: "100000000000001@lid".parse().unwrap(),
+                recipient: Some("100000000000001@lid".parse().unwrap()),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!should_send_delivery_receipt(&own_status));
+
+        let own_group = MessageInfo {
+            id: "OWN_GROUP".to_string(),
+            source: MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "100000000000001@lid".parse().unwrap(),
+                recipient: Some("100000000000001@lid".parse().unwrap()),
+                is_from_me: true,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!should_send_delivery_receipt(&own_group));
+    }
+
+    #[test]
     fn allow_incoming_dm() {
         let info = MessageInfo {
             id: "DM1".to_string(),

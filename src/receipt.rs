@@ -298,10 +298,14 @@ impl Client {
 
         let receipt_node = build_delivery_receipt_node(info, self.receipts_are_active());
 
+        // Mirror build_delivery_receipt_node's type selection so the log is
+        // accurate (a passive companion emits `inactive`, not `delivery`).
         let receipt_kind = if info.category == MessageCategory::Peer {
             ReceiptType::PeerMsg
         } else if info.source.is_self_fanout() {
             ReceiptType::Sender
+        } else if !self.receipts_are_active() && !info.source.chat.is_status_broadcast() {
+            ReceiptType::Inactive
         } else {
             ReceiptType::Delivered
         };

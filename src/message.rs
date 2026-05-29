@@ -7773,6 +7773,46 @@ mod tests {
         );
     }
 
+    /// When WE are the bot author (own DM, sender on the `@bot` server, to a
+    /// user), WA Web's `MsgSendReceipt` takes the `!chat.isBot() &&
+    /// author.isBot()` branch and emits a bot-invoke-response `<ack>`, NOT a
+    /// sender `<receipt>`. So the bot-author branch in ack_received_message must
+    /// keep running before the self-fanout receipt: this locks that ordering
+    /// against a regression that would wrongly route it to a sender receipt.
+    #[tokio::test]
+    async fn own_bot_author_dm_acks_not_sender_receipt() {
+        let (client, transport) = capturing_client("own_bot_author").await;
+        let own = Arc::new(MessageInfo {
+            id: "OWNBOT1".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "100000000000002@bot".parse().expect("sender"),
+                chat: "300000000000003@lid".parse().expect("chat"),
+                recipient: Some("300000000000003@lid".parse().expect("recipient")),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&own);
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            found.is_some(),
+            "own bot-author DM must emit a bare <ack class=message> (WA Web bot-invoke-response ack), not a receipt"
+        );
+        assert!(
+            find_receipt(&transport.sent(), "OWNBOT1").is_none(),
+            "must NOT route to a sender <receipt> (would diverge from WA Web's bot-invoke-response ack path)"
+        );
+    }
+
     /// An `<unavailable>` message (no `<enc>`) must be transport-acked so the
     /// server stops replaying it (DM/group aren't covered by the should_ack gate).
     #[tokio::test]
