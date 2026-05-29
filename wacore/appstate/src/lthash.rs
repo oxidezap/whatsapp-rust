@@ -38,9 +38,7 @@ impl LTHash {
     }
 
     fn multiple_op<T: AsRef<[u8]>>(&self, base: &mut [u8], input: &[T], subtract: bool) {
-        // One stack buffer reused across every operand: the per-operand heap `Vec`
-        // from HKDF was pure churn during app-state sync. `hkdf_size` is a u8, so
-        // 256 bytes always covers it.
+        // Reuse one stack buffer instead of a per-operand HKDF heap alloc.
         let mut derived = [0u8; u8::MAX as usize + 1];
         let derived = &mut derived[..self.hkdf_size as usize];
         for item in input {
