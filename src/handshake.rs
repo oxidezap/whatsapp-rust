@@ -365,7 +365,10 @@ async fn recv_frame(
                 continue;
             }
             Ok(Ok(TransportEvent::Connected)) => continue,
-            Ok(Ok(TransportEvent::Disconnected)) => return Err(HandshakeError::Disconnected),
+            Ok(Ok(TransportEvent::Disconnected(reason))) => {
+                debug!("Transport disconnected during handshake: {reason}");
+                return Err(HandshakeError::Disconnected);
+            }
             // Channel closed (no more producers) — distinct from a real timeout.
             Ok(Err(_)) => return Err(HandshakeError::StreamClosed),
             Err(_) => return Err(HandshakeError::Timeout),

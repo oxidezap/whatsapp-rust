@@ -7,6 +7,38 @@ use std::sync::Arc;
 /// Default WhatsApp Web websocket endpoint.
 pub const WHATSAPP_WEB_WS_URL: &str = "wss://web.whatsapp.com/ws/chat";
 
+/// Why the transport connection ended. Lets a benign server-initiated stream
+/// recycle (a clean Close frame) be told apart from an abrupt EOF or a real
+/// read error when diagnosing reconnect behavior.
+#[derive(Debug, Clone)]
+pub enum DisconnectReason {
+    /// The peer sent a WebSocket Close frame. `code` is the RFC 6455 close
+    /// code (1000 = normal closure); `reason` is the optional UTF-8 text.
+    ServerClose { code: Option<u16>, reason: String },
+    /// The stream ended (EOF) without a Close frame.
+    StreamEnded,
+    /// A transport-level read/IO error ended the connection.
+    ReadError(String),
+    /// The reason was not reported by this transport (e.g. local shutdown).
+    Unknown,
+}
+
+impl std::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ServerClose { code, reason } => match (code, reason.is_empty()) {
+                (Some(c), false) => write!(f, "server close frame (code {c}: {reason})"),
+                (Some(c), true) => write!(f, "server close frame (code {c})"),
+                (None, false) => write!(f, "server close frame ({reason})"),
+                (None, true) => write!(f, "server close frame (no code)"),
+            },
+            Self::StreamEnded => write!(f, "stream ended (EOF)"),
+            Self::ReadError(e) => write!(f, "read error: {e}"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
 /// An event produced by the transport layer.
 #[derive(Debug, Clone)]
 pub enum TransportEvent {
@@ -14,8 +46,8 @@ pub enum TransportEvent {
     Connected,
     /// Raw data has been received from the server.
     DataReceived(Bytes),
-    /// The connection was lost.
-    Disconnected,
+    /// The connection was lost, with the reason if the transport reported one.
+    Disconnected(DisconnectReason),
 }
 
 /// Represents an active network connection.

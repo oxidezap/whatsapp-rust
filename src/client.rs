@@ -1646,12 +1646,21 @@ impl Client {
                                     );
                                 }
                             },
-                            Ok(crate::transport::TransportEvent::Disconnected) | Err(_) => {
+                            Ok(crate::transport::TransportEvent::Disconnected(reason)) => {
                                 if !self.expected_disconnect.load(Ordering::Relaxed) {
-                                    debug!("Transport disconnected unexpectedly.");
-                                    return Err(anyhow::anyhow!("Transport disconnected unexpectedly"));
+                                    debug!("Transport disconnected unexpectedly: {reason}");
+                                    return Err(anyhow::anyhow!("Transport disconnected: {reason}"));
                                 } else {
-                                    debug!("Transport disconnected as expected.");
+                                    debug!("Transport disconnected as expected: {reason}");
+                                    return Ok(());
+                                }
+                            }
+                            // Event channel closed (no DisconnectReason available).
+                            Err(_) => {
+                                if !self.expected_disconnect.load(Ordering::Relaxed) {
+                                    debug!("Transport event channel closed unexpectedly.");
+                                    return Err(anyhow::anyhow!("Transport event channel closed"));
+                                } else {
                                     return Ok(());
                                 }
                             }

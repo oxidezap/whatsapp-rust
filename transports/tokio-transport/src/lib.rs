@@ -6,12 +6,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, error, trace, warn};
+use log::{debug, warn};
 use std::sync::{Arc, Once};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio_websockets::{ClientBuilder, Message, WebSocketStream};
-use wacore::net::{Transport, TransportEvent, TransportFactory, WHATSAPP_WEB_WS_URL};
+use wacore::net::{
+    DisconnectReason, Transport, TransportEvent, TransportFactory, WHATSAPP_WEB_WS_URL,
+};
 
 pub use tokio_websockets::Connector;
 
@@ -161,6 +163,11 @@ async fn read_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     tx: async_channel::Sender<TransportEvent>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    // Default covers the shutdown-initiated breaks (our own disconnect, where
+    // the client already knows the cause); the receive arms overwrite it with
+    // the real reason so a clean server recycle is distinguishable from an
+    // abrupt EOF or a read error in the logs.
+    let mut reason = DisconnectReason::Unknown;
     loop {
         tokio::select! {
             biased;
@@ -181,23 +188,35 @@ async fn read_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     }
                 }
                 Some(Ok(msg)) if msg.is_close() => {
-                    trace!("Received close frame");
+                    reason = match msg.as_close() {
+                        Some((code, text)) => DisconnectReason::ServerClose {
+                            code: Some(u16::from(code)),
+                            reason: text.to_owned(),
+                        },
+                        None => DisconnectReason::ServerClose {
+                            code: None,
+                            reason: String::new(),
+                        },
+                    };
+                    debug!("Received close frame: {reason}");
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong/text handled by tokio-websockets
                 Some(Err(e)) => {
-                    error!("WebSocket read error: {e}");
+                    reason = DisconnectReason::ReadError(e.to_string());
+                    warn!("WebSocket read error: {e}");
                     break;
                 }
                 None => {
-                    trace!("WebSocket stream ended");
+                    reason = DisconnectReason::StreamEnded;
+                    debug!("WebSocket stream ended");
                     break;
                 }
             },
         }
     }
 
-    let _ = tx.send(TransportEvent::Disconnected).await;
+    let _ = tx.send(TransportEvent::Disconnected(reason)).await;
 }
 
 /// Wraps an already-upgraded [`WebSocketStream`] into a [`Transport`] + event channel.
