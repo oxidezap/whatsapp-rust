@@ -410,19 +410,29 @@ impl Client {
 
         // Whatsmeow parity (`retry.go:284`). WA Web's regId/base-key check
         // doesn't catch silently-diverged sessions; this fallback does.
-        if nr.get_optional_child("keys").is_none()
-            && let Some(reason) = self
-                .should_recreate_session(retry_count, &resolved_jid)
-                .await
-        {
-            info!("Recreating session with {resolved_jid} for retry of {message_id}: {reason}");
+        if nr.get_optional_child("keys").is_none() {
+            // Hold the per-peer session lock across the throttle check+stamp AND
+            // the delete so the recreate decision is atomic per peer. The moka
+            // `session_recreate_history` get+insert is not atomic on its own,
+            // and retry receipts for different message_ids from the same peer
+            // dispatch concurrently (detached spawn in `handle_receipt`), so
+            // without this lock two of them could both pass the throttle and
+            // recreate. Mirrors whatsmeow holding `sessionRecreateHistoryLock`
+            // across its check+stamp (`retry.go:160`). This is the same per-peer
+            // lock the delete already used, so it adds no new lock.
             let signal_address = resolved_jid.to_protocol_address();
             let lock = self.session_lock_for(signal_address.as_str()).await;
-            let _guard = lock.lock().await;
-            self.signal_cache.delete_session(&signal_address).await;
-            drop(_guard);
-            self.flush_signal_cache_logged("should_recreate_session", Some(&message_id))
-                .await;
+            let guard = lock.lock().await;
+            if let Some(reason) = self
+                .should_recreate_session(retry_count, &resolved_jid)
+                .await
+            {
+                info!("Recreating session with {resolved_jid} for retry of {message_id}: {reason}");
+                self.signal_cache.delete_session(&signal_address).await;
+                drop(guard);
+                self.flush_signal_cache_logged("should_recreate_session", Some(&message_id))
+                    .await;
+            }
         }
 
         // Status broadcasts can't resend (requires explicit recipient list).
@@ -774,7 +784,12 @@ impl Client {
             return None;
         }
 
-        // Throttle: skip if this peer was recreated within the timeout.
+        // Throttle: skip if this peer was recreated within the timeout. This
+        // explicit age check against the injectable `now` is the authoritative,
+        // deterministic gate. moka's 1h TTL on `session_recreate_history` is
+        // only a real-wall-clock memory backstop (it evicts on moka's own clock,
+        // which tests don't advance and which the stored `now` doesn't drive).
+        // Do NOT drop this check as "redundant with the TTL".
         if let Some(prev) = history.get(jid).await
             && now.saturating_duration_since(prev) < RECREATE_SESSION_TIMEOUT
         {
@@ -2034,6 +2049,83 @@ mod tests {
                 .await
                 .is_some_and(|r| r.contains("don't have a Signal session")),
             "missing session should recreate"
+        );
+    }
+
+    /// The moka `session_recreate_history` is capacity-bounded (256), unlike the
+    /// old age-only prune which never evicted a still-recent entry. Under more
+    /// than that many distinct peers retrying within the window, moka can evict
+    /// a recent entry, costing at most one extra recreate for that peer
+    /// (bounded and self-healing: re-stamped on the next receipt), never the
+    /// unbounded prekey loop the throttle prevents. Documents that trade-off.
+    #[tokio::test]
+    async fn session_recreate_history_is_capacity_bounded() {
+        let client =
+            crate::test_utils::create_test_client_with_failing_http("session_recreate_history_cap")
+                .await;
+        let now = wacore::time::Instant::now();
+        let cap: u64 = 256;
+
+        // Insert well over the cap of distinct, all-recent peers.
+        for i in 0..(cap * 2) {
+            let jid = Jid::lid_device(format!("{}", 900_000_000_000_000u64 + i), 3);
+            client.session_recreate_history.insert(jid, now).await;
+        }
+        client.session_recreate_history.run_pending_tasks().await;
+
+        let count = client.session_recreate_history.entry_count();
+        assert!(
+            count <= cap,
+            "capacity must bound the throttle history (got {count}, cap {cap}); \
+             a still-recent entry can be evicted under heavy peer load"
+        );
+    }
+
+    /// Atomicity guard for the per-peer session lock the retry caller wraps
+    /// around the recreate check+stamp. moka's get+insert is not atomic, and
+    /// same-peer retries for different message_ids dispatch concurrently, so
+    /// without the lock both could observe a cold history and recreate. Holding
+    /// `session_lock_for` serializes the decision: exactly one recreate fires.
+    /// (Mirrors the caller's lock; the matrix test covers the sequential logic.)
+    #[tokio::test]
+    async fn concurrent_same_peer_recreate_check_is_serialized() {
+        let client =
+            crate::test_utils::create_test_client_with_failing_http("concurrent_recreate").await;
+        let jid = Jid::lid_device("999999999999993".to_string(), 3);
+
+        // Seed a session so the retry>=2 throttle branch is exercised (the
+        // no-session branch always stamps and would not show serialization).
+        let session_bytes = valid_serialized_session(8888, vec![0xCC; 32]);
+        client
+            .persistence_manager
+            .backend()
+            .put_session(jid.to_protocol_address().as_str(), &session_bytes)
+            .await
+            .unwrap();
+
+        let c1 = client.clone();
+        let j1 = jid.clone();
+        let task1 = async move {
+            let addr = j1.to_protocol_address();
+            let lock = c1.session_lock_for(addr.as_str()).await;
+            let _g = lock.lock().await;
+            c1.should_recreate_session(2, &j1).await.is_some()
+        };
+        let c2 = client.clone();
+        let j2 = jid.clone();
+        let task2 = async move {
+            let addr = j2.to_protocol_address();
+            let lock = c2.session_lock_for(addr.as_str()).await;
+            let _g = lock.lock().await;
+            c2.should_recreate_session(2, &j2).await.is_some()
+        };
+        let (a, b) = tokio::join!(task1, task2);
+
+        assert_eq!(
+            usize::from(a) + usize::from(b),
+            1,
+            "exactly one of two concurrent same-peer recreate checks may fire; \
+             the per-peer session lock serializes the non-atomic get+insert"
         );
     }
 
