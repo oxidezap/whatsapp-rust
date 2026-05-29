@@ -80,8 +80,6 @@ impl HashState {
             }
         }
 
-        // Split into two uniform-typed calls: a single mixed `Vec<u8>`/`&[u8]`
-        // call defeats deref-coercion inference. Effect is identical.
         WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &removed, &[] as &[Vec<u8>]);
         WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &[] as &[&[u8]], &added);
         (result, Ok(()))
