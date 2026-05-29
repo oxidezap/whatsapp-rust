@@ -125,7 +125,7 @@ impl Client {
         // `<receipt>`. A 1:1 bot chat keeps the normal receipt (chat.isBot() →
         // the branch's `v` is false). Our transport ack is that bare
         // `<ack class="message">` (group form carries `participant`).
-        if info.source.chat.server != wacore_binary::Server::Bot && info.source.sender.is_bot() {
+        if info.source.is_bot_authored_non_bot_chat() {
             self.spawn_message_ack(info);
             return;
         }
@@ -586,9 +586,14 @@ impl Client {
             // A self-fanout is our own message; retrying it to ourselves is
             // futile and the server's offline queue ignores a bare transport
             // ack, so it would replay forever. Clear it with the sender receipt
-            // instead (same stanza the success/duplicate paths now emit). Gate
-            // on the same delivery-receipt eligibility as the normal ack path.
-            if info.source.is_self_fanout() && Self::should_send_delivery_receipt(&info) {
+            // instead (same stanza the success/duplicate paths now emit). Mirror
+            // ack_received_message: a bot-authored message in a non-bot chat
+            // takes the bot-invoke-response bare ack (the retry path below), not
+            // the sender receipt. Gate on the same eligibility as the ack path.
+            if info.source.is_self_fanout()
+                && !info.source.is_bot_authored_non_bot_chat()
+                && Self::should_send_delivery_receipt(&info)
+            {
                 client.send_delivery_receipt(&info).await;
                 return;
             }
@@ -7453,6 +7458,47 @@ mod tests {
             !saw_retry,
             "must not retry our own undecryptable fanout to ourselves"
         );
+    }
+
+    /// Consistency with the success/duplicate path: a bot-authored own DM in a
+    /// non-bot chat (sender on `@bot`, user chat) must NOT take the sender
+    /// receipt on the decrypt-failure path either; it stays on the
+    /// bot-invoke-response bare-ack path (WA Web `!chat.isBot() &&
+    /// author.isBot()`), matching ack_received_message and the locked
+    /// own_bot_author_dm_acks_not_sender_receipt test.
+    #[tokio::test]
+    async fn bot_author_self_fanout_decrypt_failure_not_sender_receipt() {
+        let (client, transport) = capturing_client("bot_author_badmac").await;
+        let info = Arc::new(MessageInfo {
+            id: "OWNBOTFAIL1".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "100000000000002@bot".parse().expect("sender"),
+                chat: "300000000000003@lid".parse().expect("chat"),
+                recipient: Some("300000000000003@lid".parse().expect("recipient")),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::BadMac,
+                crate::types::events::DecryptFailMode::Hide,
+            )
+            .await;
+
+        // Settle: a bot-authored message must never produce a sender receipt on
+        // the failure path (it would diverge from WA Web's bot-invoke ack and
+        // contradict the success-path ordering).
+        for _ in 0..5 {
+            assert!(
+                find_receipt(&transport.sent(), "OWNBOTFAIL1").is_none(),
+                "bot-authored own DM must not be cleared with a sender <receipt> on decrypt failure"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     /// If the resend request fails to send, the stanza must NOT be acked, so the

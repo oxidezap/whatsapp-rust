@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wacore_binary::{Jid, JidExt, MessageId, MessageServerId};
+use wacore_binary::{Jid, JidExt, MessageId, MessageServerId, Server};
 use waproto::whatsapp as wa;
 
 use crate::WireEnum;
@@ -70,6 +70,16 @@ impl MessageSource {
             && !self.chat.is_group()
             && !self.chat.is_status_broadcast()
             && !self.chat.is_newsletter()
+    }
+
+    /// The author is a bot but the chat is not a bot chat (WA Web's
+    /// `h = !chat.isBot() && author.isBot()`). WA Web clears these with a
+    /// bot-invoke-response `<ack>` (`sendBotInvokeResponseAcks`), NOT a
+    /// `<receipt>`, so both the success/duplicate ack path and the
+    /// decrypt-failure path must route them to the bare ack, not the sender
+    /// receipt, even though such an own message is also an [`Self::is_self_fanout`].
+    pub fn is_bot_authored_non_bot_chat(&self) -> bool {
+        self.chat.server != Server::Bot && self.sender.is_bot()
     }
 }
 
