@@ -7489,9 +7489,25 @@ mod tests {
             )
             .await;
 
-        // Settle: a bot-authored message must never produce a sender receipt on
-        // the failure path (it would diverge from WA Web's bot-invoke ack and
-        // contradict the success-path ordering).
+        // Positive: the message IS cleared, via the bot-invoke-response bare
+        // <ack class="message"> (the retry-to-self is bot-skipped, so the
+        // transport ack follows), proving we took the ack path, not a no-op.
+        let mut found_ack = false;
+        for _ in 0..80 {
+            if find_message_ack(&transport.sent()).is_some() {
+                found_ack = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            found_ack,
+            "bot-authored own DM must still be transport-acked with a bare <ack class=message>"
+        );
+
+        // Negative settle: it must NEVER produce a sender receipt on the failure
+        // path (that would diverge from WA Web's bot-invoke ack and contradict
+        // the success-path ordering).
         for _ in 0..5 {
             assert!(
                 find_receipt(&transport.sent(), "OWNBOTFAIL1").is_none(),

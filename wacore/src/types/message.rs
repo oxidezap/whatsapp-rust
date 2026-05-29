@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wacore_binary::{Jid, JidExt, MessageId, MessageServerId, Server};
+use wacore_binary::{Jid, JidExt, MessageId, MessageServerId};
 use waproto::whatsapp as wa;
 
 use crate::WireEnum;
@@ -79,7 +79,7 @@ impl MessageSource {
     /// decrypt-failure path must route them to the bare ack, not the sender
     /// receipt, even though such an own message is also an [`Self::is_self_fanout`].
     pub fn is_bot_authored_non_bot_chat(&self) -> bool {
-        self.chat.server != Server::Bot && self.sender.is_bot()
+        !self.chat.is_bot() && self.sender.is_bot()
     }
 }
 
