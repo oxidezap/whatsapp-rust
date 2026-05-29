@@ -586,8 +586,9 @@ impl Client {
             // A self-fanout is our own message; retrying it to ourselves is
             // futile and the server's offline queue ignores a bare transport
             // ack, so it would replay forever. Clear it with the sender receipt
-            // instead (same stanza the success/duplicate paths now emit).
-            if info.source.is_self_fanout() {
+            // instead (same stanza the success/duplicate paths now emit). Gate
+            // on the same delivery-receipt eligibility as the normal ack path.
+            if info.source.is_self_fanout() && Self::should_send_delivery_receipt(&info) {
                 client.send_delivery_receipt(&info).await;
                 return;
             }
@@ -7738,9 +7739,11 @@ mod tests {
         let own = Arc::new(MessageInfo {
             id: "AC00000000000000000000000000BEEF".to_string(),
             source: crate::types::message::MessageSource {
-                // from = our own LID (the server fans our outgoing bot prompt
-                // back to this device); chat = the bot (recipient.to_non_ad).
-                sender: "100000000000001@lid".parse().expect("sender"),
+                // from = our own LID with its device (the server fans our
+                // outgoing bot prompt back to this device); chat = the bot
+                // (recipient.to_non_ad). The device on the sender must survive
+                // into the receipt `to`, or the LID server rejects it (#649).
+                sender: "100000000000001:11@lid".parse().expect("sender"),
                 chat: "200000000000002@bot".parse().expect("chat"),
                 recipient: Some("200000000000002@bot".parse().expect("recipient")),
                 is_from_me: true,
@@ -7760,7 +7763,10 @@ mod tests {
         }
         let (to, typ, recipient) =
             found.expect("bot self-fanout must get a sender <receipt> to drain the offline queue");
-        assert_eq!(to, "100000000000001@lid", "receipt `to` is the own LID");
+        assert_eq!(
+            to, "100000000000001:11@lid",
+            "receipt `to` must preserve the own LID device"
+        );
         assert_eq!(typ.as_deref(), Some("sender"));
         assert_eq!(
             recipient.as_deref(),
@@ -7807,10 +7813,17 @@ mod tests {
             found.is_some(),
             "own bot-author DM must emit a bare <ack class=message> (WA Web bot-invoke-response ack), not a receipt"
         );
-        assert!(
-            find_receipt(&transport.sent(), "OWNBOT1").is_none(),
-            "must NOT route to a sender <receipt> (would diverge from WA Web's bot-invoke-response ack path)"
-        );
+        // No current race (ack_received_message is synchronous and the
+        // bot-author branch returns before the receipt branch), but settle
+        // briefly so a future regression that spawned a receipt on a later tick
+        // can't slip past this negative assertion.
+        for _ in 0..5 {
+            assert!(
+                find_receipt(&transport.sent(), "OWNBOT1").is_none(),
+                "must NOT route to a sender <receipt> (would diverge from WA Web's bot-invoke-response ack path)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     /// An `<unavailable>` message (no `<enc>`) must be transport-acked so the

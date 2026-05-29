@@ -283,6 +283,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn is_self_fanout_matches_only_own_dm_with_recipient() {
+        let bot = MessageSource {
+            chat: "200000000000002@bot".parse().unwrap(),
+            sender: "100000000000001@lid".parse().unwrap(),
+            recipient: Some("200000000000002@bot".parse().unwrap()),
+            is_from_me: true,
+            ..Default::default()
+        };
+        assert!(bot.is_self_fanout(), "own prompt to a @bot");
+
+        let mut user = bot.clone();
+        user.chat = "300000000000003@lid".parse().unwrap();
+        user.recipient = Some("300000000000003@lid".parse().unwrap());
+        assert!(user.is_self_fanout(), "own DM to a user");
+
+        let mut incoming = bot.clone();
+        incoming.is_from_me = false;
+        assert!(!incoming.is_self_fanout(), "incoming is not a self-fanout");
+
+        let mut note = bot.clone();
+        note.recipient = None;
+        assert!(!note.is_self_fanout(), "recipient-less self-note");
+
+        // Load-bearing guard: the own-from parser leaves is_group=false and
+        // derives chat from recipient, so a group/status/newsletter self-echo
+        // must be excluded by the chat-based checks alone.
+        let mut group_chat = bot.clone();
+        group_chat.chat = "120363021033254949@g.us".parse().unwrap();
+        group_chat.recipient = Some("120363021033254949@g.us".parse().unwrap());
+        assert!(!group_chat.is_group);
+        assert!(
+            !group_chat.is_self_fanout(),
+            "group chat excluded by chat.is_group() even with is_group=false"
+        );
+
+        let mut group_flag = bot.clone();
+        group_flag.is_group = true;
+        assert!(!group_flag.is_self_fanout(), "is_group flag excludes");
+
+        let mut status = bot.clone();
+        status.chat = "status@broadcast".parse().unwrap();
+        assert!(!status.is_self_fanout(), "status broadcast excluded");
+
+        let mut newsletter = bot.clone();
+        newsletter.chat = "120363298765432100@newsletter".parse().unwrap();
+        assert!(!newsletter.is_self_fanout(), "newsletter excluded");
+    }
+
+    #[test]
     fn test_edit_attribute_parsing_and_serialization() {
         // Test all known edit attribute values
         let attrs = vec![

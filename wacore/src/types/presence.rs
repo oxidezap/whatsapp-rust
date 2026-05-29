@@ -128,4 +128,34 @@ mod tests {
             ReceiptType::EncRekeyRetry
         );
     }
+
+    #[test]
+    fn as_wire_str_round_trips_through_parse() {
+        // as_wire_str is the hand-maintained inverse of parse(); guard the
+        // hyphen/underscore variants against drift.
+        let variants = [
+            ReceiptType::Delivered,
+            ReceiptType::Sender,
+            ReceiptType::Retry,
+            ReceiptType::EncRekeyRetry,
+            ReceiptType::Read,
+            ReceiptType::ReadSelf,
+            ReceiptType::Played,
+            ReceiptType::PlayedSelf,
+            ReceiptType::ServerError,
+            ReceiptType::Inactive,
+            ReceiptType::PeerMsg,
+            ReceiptType::HistorySync,
+        ];
+        for v in variants {
+            assert_eq!(
+                ReceiptType::parse(v.as_wire_str()),
+                v,
+                "round-trip failed for {v:?} (wire={:?})",
+                v.as_wire_str()
+            );
+        }
+        let other = ReceiptType::Other("custom-type".to_string());
+        assert_eq!(other.as_wire_str(), "custom-type");
+    }
 }
