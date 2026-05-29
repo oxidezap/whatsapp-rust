@@ -692,18 +692,19 @@ where
 
     let make_encrypt_task = |idx: usize| {
         let device_jid = devices[idx].clone();
-        let encryption_jid = encryption_overrides[idx]
-            .clone()
-            .unwrap_or_else(|| device_jid.clone());
+        // The encryption JID is only needed to build the Signal address, so
+        // derive it here from a borrow rather than cloning the whole Jid into
+        // the task (device_jid is still cloned because it's returned).
+        let addr = encryption_overrides[idx]
+            .as_ref()
+            .unwrap_or(&devices[idx])
+            .to_protocol_address();
         let plaintext = plaintext_arc.clone();
         let mediatype = mediatype_owned.clone();
         let mut session_store = stores.session_store.clone();
         let mut identity_store = stores.identity_store.clone();
 
         spawn_oneshot(runtime, async move {
-            let mut addr = crate::types::jid::make_reusable_protocol_address();
-            encryption_jid.reset_protocol_address(&mut addr);
-
             match message_encrypt(&plaintext, &addr, &mut session_store, &mut identity_store).await
             {
                 Ok(encrypted_payload) => {
