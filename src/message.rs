@@ -394,6 +394,15 @@ impl Client {
                 secret_bytes,
             )
             .await;
+            if let Some(alternate_sender) = fallback_original_sender.as_ref() {
+                self.persist_msg_secret_bytes(
+                    &info.source.chat,
+                    alternate_sender,
+                    target_id,
+                    secret_bytes,
+                )
+                .await;
+            }
         }
 
         if env.kind != SecretEncKind::MessageEdit {
@@ -8754,6 +8763,127 @@ mod tests {
         assert!(
             got.is_some(),
             "group edit must decrypt when the stored secret is under PN"
+        );
+    }
+
+    #[tokio::test]
+    async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
+        use wacore::store::traits::LidPnMappingEntry;
+
+        let (client, _transport) = capturing_client("secret_edit_alt_refresh").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "120363021033254949@g.us";
+        let parent_id = "GROUP_PARENT_EDIT";
+        let sender_lid = "236395184570386@lid";
+        let sender_pn = "5511777776666@s.whatsapp.net";
+        let first_secret = [0x31u8; 32];
+        let second_secret = [0x32u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: "236395184570386".into(),
+                phone_number: "5511777776666".into(),
+                created_at: 0,
+                updated_at: 0,
+                learning_source: "test".into(),
+            })
+            .await
+            .unwrap();
+        for sender in [sender_lid, sender_pn] {
+            client
+                .persistence_manager
+                .backend()
+                .put_msg_secret(chat, sender, parent_id, &first_secret)
+                .await
+                .unwrap();
+        }
+
+        let first_info = Arc::new(MessageInfo {
+            id: "GROUP_EDIT_REFRESH_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: sender_lid.parse().unwrap(),
+                is_group: true,
+                addressing_mode: Some(wacore::types::message::AddressingMode::Lid),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let first_target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: Some(sender_lid.to_string()),
+        };
+        let first_msg = encrypted_message_edit(
+            first_target_key,
+            sender_lid,
+            sender_lid,
+            parent_id,
+            &first_secret,
+            "first",
+            Some(second_secret.to_vec()),
+        );
+        client.dispatch_parsed_message(first_msg, &first_info).await;
+
+        for sender in [sender_lid, sender_pn] {
+            let stored = client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(chat, sender, parent_id)
+                .await
+                .unwrap();
+            assert_eq!(stored.as_deref(), Some(&second_secret[..]));
+        }
+
+        let second_info = Arc::new(MessageInfo {
+            id: "GROUP_EDIT_REFRESH_2".into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: sender_pn.parse().unwrap(),
+                is_group: true,
+                addressing_mode: Some(wacore::types::message::AddressingMode::Pn),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let second_target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: Some(sender_pn.to_string()),
+        };
+        let second_msg = encrypted_message_edit(
+            second_target_key,
+            sender_pn,
+            sender_pn,
+            parent_id,
+            &second_secret,
+            "second",
+            None,
+        );
+        client
+            .dispatch_parsed_message(second_msg, &second_info)
+            .await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == "GROUP_EDIT_REFRESH_2"
+                        && legacy_edit_text(msg.as_ref()) == Some("second"))
+            },
+            500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "chained edit must use the refreshed alternate alias"
         );
     }
 

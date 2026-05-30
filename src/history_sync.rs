@@ -1,4 +1,5 @@
 use crate::types::events::{Event, LazyHistorySync};
+use bytes::Bytes;
 use prost::Message as ProtoMessage;
 use std::sync::Arc;
 use wacore::history_sync::{TcTokenCandidate, process_history_sync};
@@ -219,7 +220,7 @@ impl Client {
                 }
 
                 if let Some(decompressed) = sync_result.decompressed_bytes {
-                    self.store_history_sync_msg_secrets(decompressed.as_ref())
+                    self.store_history_sync_msg_secrets(decompressed.clone())
                         .await;
 
                     if !has_listeners {
@@ -249,52 +250,43 @@ impl Client {
         }
     }
 
-    async fn store_history_sync_msg_secrets(&self, raw_history_sync: &[u8]) -> usize {
-        let history = match wa::HistorySync::decode(raw_history_sync) {
-            Ok(history) => history,
-            Err(e) => {
-                log::warn!("Failed to decode HistorySync for messageSecret capture: {e:?}");
+    async fn store_history_sync_msg_secrets(&self, raw_history_sync: Bytes) -> usize {
+        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let own_pn = device_snapshot.pn.as_ref().map(|j| j.to_non_ad());
+        let own_lid = device_snapshot.lid.as_ref().map(|j| j.to_non_ad());
+
+        let (records_tx, records_rx) = futures::channel::oneshot::channel();
+        let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
+            let records =
+                extract_history_sync_msg_secret_records(raw_history_sync, own_pn, own_lid);
+            let _ = records_tx.send(records);
+        }));
+        self.runtime
+            .spawn(Box::pin(async move {
+                blocking_fut.await;
+            }))
+            .detach();
+
+        let records = match records_rx.await {
+            Ok(records) => records,
+            Err(_) => {
+                log::warn!("HistorySync messageSecret extraction task was cancelled");
                 return 0;
             }
         };
 
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
-        let own_pn = device_snapshot.pn.as_ref().map(|j| j.to_non_ad());
-        let own_lid = device_snapshot.lid.as_ref().map(|j| j.to_non_ad());
         let mut stored = 0usize;
-
-        for conversation in &history.conversations {
-            let Ok(chat) = conversation.id.parse::<Jid>() else {
-                continue;
-            };
-
-            for history_msg in &conversation.messages {
-                let Some(web_msg) = history_msg.message.as_ref() else {
-                    continue;
-                };
-                let Some(secret) = web_msg.message_secret.as_deref().or_else(|| {
-                    web_msg
-                        .message
-                        .as_ref()
-                        .and_then(|m| m.message_context_info.as_ref())
-                        .and_then(|mci| mci.message_secret.as_deref())
-                }) else {
-                    continue;
-                };
-                let Some(msg_id) = web_msg.key.id.as_deref() else {
-                    continue;
-                };
-
-                let senders =
-                    history_msg_secret_senders(&chat, web_msg, own_pn.as_ref(), own_lid.as_ref());
-                for sender in senders {
-                    if self
-                        .persist_msg_secret_bytes(&chat, &sender, msg_id, secret)
-                        .await
-                    {
-                        stored += 1;
-                    }
-                }
+        for record in records {
+            if self
+                .persist_msg_secret_bytes(
+                    &record.chat,
+                    &record.sender,
+                    &record.msg_id,
+                    &record.secret,
+                )
+                .await
+            {
+                stored += 1;
             }
         }
 
@@ -383,6 +375,65 @@ impl Client {
             );
         }
     }
+}
+
+struct HistoryMsgSecretRecord {
+    chat: Jid,
+    sender: Jid,
+    msg_id: String,
+    secret: Vec<u8>,
+}
+
+fn extract_history_sync_msg_secret_records(
+    raw_history_sync: Bytes,
+    own_pn: Option<Jid>,
+    own_lid: Option<Jid>,
+) -> Vec<HistoryMsgSecretRecord> {
+    let history = match wa::HistorySync::decode(raw_history_sync.as_ref()) {
+        Ok(history) => history,
+        Err(e) => {
+            log::warn!("Failed to decode HistorySync for messageSecret capture: {e:?}");
+            return Vec::new();
+        }
+    };
+
+    let mut records = Vec::new();
+    for conversation in &history.conversations {
+        let Ok(chat) = conversation.id.parse::<Jid>() else {
+            continue;
+        };
+
+        for history_msg in &conversation.messages {
+            let Some(web_msg) = history_msg.message.as_ref() else {
+                continue;
+            };
+            let Some(secret) = web_msg.message_secret.as_deref().or_else(|| {
+                web_msg
+                    .message
+                    .as_ref()
+                    .and_then(|m| m.message_context_info.as_ref())
+                    .and_then(|mci| mci.message_secret.as_deref())
+            }) else {
+                continue;
+            };
+            let Some(msg_id) = web_msg.key.id.as_deref() else {
+                continue;
+            };
+
+            let senders =
+                history_msg_secret_senders(&chat, web_msg, own_pn.as_ref(), own_lid.as_ref());
+            for sender in senders {
+                records.push(HistoryMsgSecretRecord {
+                    chat: chat.clone(),
+                    sender,
+                    msg_id: msg_id.to_string(),
+                    secret: secret.to_vec(),
+                });
+            }
+        }
+    }
+
+    records
 }
 
 fn history_msg_secret_senders(
