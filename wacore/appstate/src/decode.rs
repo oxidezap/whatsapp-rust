@@ -1,7 +1,7 @@
 use crate::AppStateError;
 use crate::hash::{generate_content_mac, validate_index_mac};
 use crate::keys::ExpandedAppStateKeys;
-use buffa::Message;
+use buffa::MessageView;
 use wacore_libsignal::crypto::aes_256_cbc_decrypt_into;
 use waproto::whatsapp as wa;
 
@@ -70,11 +70,11 @@ pub fn decode_record(
     aes_256_cbc_decrypt_into(ciphertext, &keys.value_encryption, iv, &mut plaintext)
         .map_err(|_| AppStateError::DecryptionFailed)?;
 
-    let action = wa::SyncActionData::decode_from_slice(plaintext.as_slice())
+    let action = wa::SyncActionDataView::decode_view(plaintext.as_slice())
         .map_err(|_| AppStateError::DecodeFailed)?;
 
     let mut index_list: Vec<String> = Vec::new();
-    if let Some(idx_bytes) = action.index.as_ref() {
+    if let Some(idx_bytes) = action.index {
         if validate_macs {
             let stored = record
                 .index
@@ -89,7 +89,7 @@ pub fn decode_record(
     }
 
     Ok(Mutation {
-        action_value: action.value.into_option(),
+        action_value: action.value.as_option().map(MessageView::to_owned_message),
         index_mac: record.index.blob.clone().unwrap_or_default(),
         value_mac: value_mac.to_vec(),
         index: index_list,
@@ -149,7 +149,7 @@ mod tests {
     use crate::hash::generate_content_mac;
     use crate::keys::expand_app_state_keys;
     use buffa::Message;
-    use wacore_libsignal::crypto::aes_256_cbc_encrypt_into;
+    use wacore_libsignal::crypto::{CryptographicMac, aes_256_cbc_encrypt_into};
 
     fn create_test_record(
         op: wa::syncd_mutation::SyncdOperation,
@@ -169,9 +169,20 @@ mod tests {
         let mut value_blob = value_with_iv;
         value_blob.extend_from_slice(&value_mac);
 
+        let index_blob = action_data
+            .index
+            .as_ref()
+            .map(|index| {
+                let mut mac = CryptographicMac::new("HmacSha256", &keys.index)
+                    .expect("HmacSha256 is a valid algorithm");
+                mac.update(index);
+                mac.finalize()
+            })
+            .unwrap_or_else(|| vec![1; 32]);
+
         wa::SyncdRecord {
             index: buffa::MessageField::some(wa::SyncdIndex {
-                blob: Some(vec![1; 32]),
+                blob: Some(index_blob),
             }),
             value: buffa::MessageField::some(wa::SyncdValue {
                 blob: Some(value_blob),
@@ -249,6 +260,67 @@ mod tests {
             true,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_decode_record_view_preserves_index_and_value_with_mac_validation() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+        let index = serde_json::to_vec(&vec!["regular", "chat", "15550000001@s.whatsapp.net"])
+            .expect("test index should serialize");
+
+        let action_data = wa::SyncActionData {
+            index: Some(index),
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                timestamp: Some(1234567890),
+                push_name_setting: buffa::MessageField::some(
+                    wa::sync_action_value::PushNameSetting {
+                        name: Some("Test User".to_string()),
+                    },
+                ),
+                ..Default::default()
+            }),
+            padding: Some(vec![0; 4]),
+            version: Some(1),
+        };
+
+        let record = create_test_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &keys,
+            &key_id,
+            &action_data,
+        );
+
+        let mutation = decode_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &record,
+            &keys,
+            &key_id,
+            true,
+        )
+        .expect("view-backed decode should preserve action data");
+
+        assert_eq!(
+            mutation.index,
+            vec!["regular", "chat", "15550000001@s.whatsapp.net"]
+        );
+        assert_eq!(
+            mutation.action_value.as_ref().and_then(|v| v.timestamp),
+            Some(1234567890)
+        );
+        assert_eq!(
+            mutation
+                .action_value
+                .as_ref()
+                .and_then(|v| v.push_name_setting.as_option())
+                .and_then(|p| p.name.as_deref()),
+            Some("Test User")
+        );
+        assert_eq!(
+            mutation.index_mac,
+            record.index.blob.clone().unwrap_or_default()
+        );
     }
 
     #[test]
