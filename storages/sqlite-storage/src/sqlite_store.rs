@@ -2563,18 +2563,27 @@ impl MsgSecretStore for SqliteStore {
         self.with_retry("put_msg_secrets", || {
             let entries = Arc::clone(&entries);
             Box::new(move |conn: &mut SqliteConnection| {
+                let records: Vec<_> = entries
+                    .iter()
+                    .map(|entry| {
+                        (
+                            msg_secrets::chat.eq(entry.chat.as_str()),
+                            msg_secrets::sender.eq(entry.sender.as_str()),
+                            msg_secrets::msg_id.eq(entry.msg_id.as_str()),
+                            msg_secrets::secret.eq(entry.secret.as_slice()),
+                            msg_secrets::device_id.eq(device_id),
+                            msg_secrets::created_at.eq(now),
+                        )
+                    })
+                    .collect();
+
+                const CHUNK_SIZE: usize = 100;
+
                 conn.immediate_transaction(|conn| {
                     let mut stored = 0usize;
-                    for entry in entries.iter() {
+                    for chunk in records.chunks(CHUNK_SIZE) {
                         stored += diesel::insert_into(msg_secrets::table)
-                            .values((
-                                msg_secrets::chat.eq(entry.chat.as_str()),
-                                msg_secrets::sender.eq(entry.sender.as_str()),
-                                msg_secrets::msg_id.eq(entry.msg_id.as_str()),
-                                msg_secrets::secret.eq(entry.secret.as_slice()),
-                                msg_secrets::device_id.eq(device_id),
-                                msg_secrets::created_at.eq(now),
-                            ))
+                            .values(chunk)
                             .on_conflict((
                                 msg_secrets::chat,
                                 msg_secrets::sender,
@@ -2583,8 +2592,8 @@ impl MsgSecretStore for SqliteStore {
                             ))
                             .do_update()
                             .set((
-                                msg_secrets::secret.eq(entry.secret.as_slice()),
-                                msg_secrets::created_at.eq(now),
+                                msg_secrets::secret.eq(excluded(msg_secrets::secret)),
+                                msg_secrets::created_at.eq(excluded(msg_secrets::created_at)),
                             ))
                             .execute(conn)?;
                     }
