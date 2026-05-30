@@ -3446,6 +3446,134 @@ mod tests {
             .await;
     }
 
+    fn peer_test_account_proto() -> wa::AdvSignedDeviceIdentity {
+        wa::AdvSignedDeviceIdentity {
+            details: Some(vec![0u8; 32]),
+            account_signature_key: Some(vec![0u8; 32]),
+            account_signature: Some(vec![0u8; 64]),
+            device_signature: Some(vec![0u8; 64]),
+        }
+    }
+
+    async fn seed_peer_send_state(client: &Arc<Client>, peer: &Jid) {
+        use wacore::libsignal::protocol::{
+            IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
+            process_prekey_bundle,
+        };
+
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetAccount(Some(peer_test_account_proto())))
+            .await;
+
+        let bundle =
+            tokio::task::spawn_blocking(|| -> Result<PreKeyBundle, SignalProtocolError> {
+                let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+                let receiver = IdentityKeyPair::generate(&mut rng);
+                let spk = KeyPair::generate(&mut rng);
+                let opk = KeyPair::generate(&mut rng);
+                let sig = receiver
+                    .private_key()
+                    .calculate_signature(&spk.public_key.serialize(), &mut rng)?;
+
+                PreKeyBundle::new(
+                    1,
+                    1u32.into(),
+                    Some((1u32.into(), opk.public_key)),
+                    1u32.into(),
+                    spk.public_key,
+                    sig.to_vec(),
+                    *receiver.identity_key(),
+                )
+            })
+            .await
+            .expect("prekey bundle task")
+            .expect("prekey bundle");
+
+        let mut adapter = client.signal_adapter().await;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        process_prekey_bundle(
+            &peer.to_protocol_address(),
+            &mut adapter.session_store,
+            &mut adapter.identity_store,
+            &bundle,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .expect("peer session");
+    }
+
+    fn pdo_request_message(request_type: wa::message::PeerDataOperationRequestType) -> wa::Message {
+        wa::Message {
+            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+                r#type: Some(
+                    wa::message::protocol_message::Type::PeerDataOperationRequestMessage as i32,
+                ),
+                peer_data_operation_request_message: Some(
+                    wa::message::PeerDataOperationRequestMessage {
+                        peer_data_operation_request_type: Some(request_type as i32),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_pdo_send_path_stamps_history_sync_options() {
+        let client = crate::test_utils::create_test_client_with_name("peer_pdo_attrs").await;
+        let peer: Jid = "100000000000001@s.whatsapp.net".parse().unwrap();
+        seed_peer_send_state(&client, &peer).await;
+
+        let request_id = "PDO_PEER_ATTRS_1";
+        let waiter = client
+            .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
+        let msg =
+            pdo_request_message(wa::message::PeerDataOperationRequestType::HistorySyncOnDemand);
+
+        let result = client
+            .send_message_impl(
+                peer,
+                &msg,
+                Some(request_id.to_string()),
+                true,
+                false,
+                None,
+                vec![],
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "test client has no socket; send should fail after stanza capture"
+        );
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("sent node should be captured")
+            .expect("sent node waiter should resolve");
+        assert_eq!(
+            node.attrs().optional_string("category").unwrap().as_ref(),
+            "peer"
+        );
+        assert_eq!(
+            node.attrs()
+                .optional_string("push_priority")
+                .unwrap()
+                .as_ref(),
+            "high_force"
+        );
+        assert_eq!(
+            node.attrs()
+                .optional_string("privacy_sensitive")
+                .unwrap()
+                .as_ref(),
+            "1"
+        );
+    }
+
     #[tokio::test]
     async fn persist_outbound_msg_secret_writes_under_chat_sender_id() {
         let client = crate::test_utils::create_test_client_with_name("secret_chat_id").await;

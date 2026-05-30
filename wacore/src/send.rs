@@ -11,6 +11,7 @@ use crate::reporting_token::{
 use crate::runtime::{AbortHandle, Runtime};
 use crate::types::jid::JidExt;
 use crate::types::jid::make_sender_key_name;
+use crate::types::message::PeerMessageOptions;
 use anyhow::{Result, anyhow, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 use prost::Message as ProtoMessage;
@@ -145,6 +146,29 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
         return stanza::MSG_TYPE_TEXT;
     }
     stanza::MSG_TYPE_MEDIA
+}
+
+pub fn peer_message_options_from_message(msg: &wa::Message) -> PeerMessageOptions {
+    use wa::message::PeerDataOperationRequestType as PdoType;
+
+    // WAWebSendNonMessageDataRequest's A/F helpers gate rollout flags we do
+    // not model; use the default-on wire shape for supported peer PDO flows.
+    let request_type = unwrap_message(msg)
+        .protocol_message
+        .as_deref()
+        .and_then(|pm| pm.peer_data_operation_request_message.as_ref())
+        .and_then(|pdo| pdo.peer_data_operation_request_type)
+        .and_then(|raw| PdoType::try_from(raw).ok());
+
+    match request_type {
+        Some(PdoType::HistorySyncOnDemand) => PeerMessageOptions::high_force_on_demand(),
+        Some(
+            PdoType::GenerateLinkPreview
+            | PdoType::PlaceholderMessageResend
+            | PdoType::CompanionCanonicalUserNonceFetch,
+        ) => PeerMessageOptions::high_force(),
+        _ => PeerMessageOptions::default(),
+    }
 }
 
 /// Matches WAWebBackendJobsCommon.mediaTypeFromProtobuf + encodeMaybeMediaType.
@@ -1025,6 +1049,7 @@ where
     Ok(needs_pkmsg)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_peer_stanza<S, I>(
     session_store: &mut S,
     identity_store: &mut I,
@@ -1033,6 +1058,35 @@ pub async fn prepare_peer_stanza<S, I>(
     message: &wa::Message,
     request_id: String,
     account: Option<&wa::AdvSignedDeviceIdentity>,
+) -> Result<Node>
+where
+    S: crate::libsignal::protocol::SessionStore,
+    I: crate::libsignal::protocol::IdentityKeyStore,
+{
+    let options = peer_message_options_from_message(message);
+    prepare_peer_stanza_with_options(
+        session_store,
+        identity_store,
+        transport_jid,
+        signal_address,
+        message,
+        request_id,
+        account,
+        options,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_peer_stanza_with_options<S, I>(
+    session_store: &mut S,
+    identity_store: &mut I,
+    transport_jid: Jid,
+    signal_address: &ProtocolAddress,
+    message: &wa::Message,
+    request_id: String,
+    account: Option<&wa::AdvSignedDeviceIdentity>,
+    options: PeerMessageOptions,
 ) -> Result<Node>
 where
     S: crate::libsignal::protocol::SessionStore,
@@ -1074,15 +1128,17 @@ where
         );
     }
 
-    let stanza = NodeBuilder::new("message")
+    let mut stanza_builder = NodeBuilder::new("message")
         .attr("to", transport_jid)
         .attr("id", request_id)
         .attr("type", stanza::MSG_TYPE_TEXT)
         .attr("category", "peer")
-        .children(children)
-        .build();
+        .attr("push_priority", options.push_priority().as_str());
+    if let Some(privacy_sensitive) = options.privacy_sensitive() {
+        stanza_builder = stanza_builder.attr("privacy_sensitive", privacy_sensitive.as_str());
+    }
 
-    Ok(stanza)
+    Ok(stanza_builder.children(children).build())
 }
 
 /// Mirrors `WAWebSendMsgCreateDeviceStanza.createUserDeviceMsgStanza`.
@@ -1892,6 +1948,112 @@ mod tests {
                 .find(|j| j.user.as_str() == "me")
                 .expect("own LID should be present");
             assert_eq!(me.device, 0, "own LID should be non-ad (device=0)");
+        }
+    }
+
+    mod peer_message_options {
+        use super::*;
+        use crate::types::message::{PrivacySensitiveType, PushPriority};
+
+        fn pdo_message_raw(request_type: i32) -> wa::Message {
+            wa::Message {
+                protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+                    r#type: Some(
+                        wa::message::protocol_message::Type::PeerDataOperationRequestMessage as i32,
+                    ),
+                    peer_data_operation_request_message: Some(
+                        wa::message::PeerDataOperationRequestMessage {
+                            peer_data_operation_request_type: Some(request_type),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+        }
+
+        fn pdo_message(request_type: wa::message::PeerDataOperationRequestType) -> wa::Message {
+            pdo_message_raw(request_type as i32)
+        }
+
+        #[test]
+        fn pdo_priority_map_matches_wa_web_non_message_requests() {
+            use wa::message::PeerDataOperationRequestType as PdoType;
+
+            let high_force_cases = [
+                (PdoType::GenerateLinkPreview, PushPriority::HighForce, None),
+                (
+                    PdoType::PlaceholderMessageResend,
+                    PushPriority::HighForce,
+                    None,
+                ),
+                (
+                    PdoType::HistorySyncOnDemand,
+                    PushPriority::HighForce,
+                    Some(PrivacySensitiveType::OnDemand),
+                ),
+                (
+                    PdoType::CompanionCanonicalUserNonceFetch,
+                    PushPriority::HighForce,
+                    None,
+                ),
+            ];
+
+            for (request_type, push_priority, privacy_sensitive) in high_force_cases {
+                let options = peer_message_options_from_message(&pdo_message(request_type));
+                assert_eq!(options.push_priority(), push_priority, "{request_type:?}");
+                assert_eq!(
+                    options.privacy_sensitive(),
+                    privacy_sensitive,
+                    "{request_type:?}"
+                );
+            }
+
+            let default_cases = [
+                PdoType::UploadSticker,
+                PdoType::SendRecentStickerBootstrap,
+                PdoType::WaffleLinkingNonceFetch,
+                PdoType::FullHistorySyncOnDemand,
+                PdoType::CompanionMetaNonceFetch,
+                PdoType::CompanionSyncdSnapshotFatalRecovery,
+                PdoType::HistorySyncChunkRetry,
+                PdoType::GalaxyFlowAction,
+                PdoType::BusinessBroadcastInsightsDeliveredTo,
+                PdoType::BusinessBroadcastInsightsRefresh,
+            ];
+
+            for request_type in default_cases {
+                let options = peer_message_options_from_message(&pdo_message(request_type));
+                assert_eq!(
+                    options.push_priority(),
+                    PushPriority::High,
+                    "{request_type:?}"
+                );
+                assert_eq!(options.privacy_sensitive(), None, "{request_type:?}");
+            }
+        }
+
+        #[test]
+        fn non_pdo_and_unknown_pdo_keep_peer_defaults() {
+            let app_state_key_request = wa::Message {
+                protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+                    r#type: Some(
+                        wa::message::protocol_message::Type::AppStateSyncKeyRequest as i32,
+                    ),
+                    app_state_sync_key_request: Some(wa::message::AppStateSyncKeyRequest {
+                        key_ids: Vec::new(),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+
+            for msg in [app_state_key_request, pdo_message_raw(99)] {
+                let options = peer_message_options_from_message(&msg);
+                assert_eq!(options.push_priority(), PushPriority::High);
+                assert_eq!(options.privacy_sensitive(), None);
+            }
         }
     }
 
@@ -3396,9 +3558,16 @@ mod tests {
         async fn build_peer_stanza(
             account: Option<&wa::AdvSignedDeviceIdentity>,
         ) -> wacore_binary::Node {
+            build_peer_stanza_with_options(account, PeerMessageOptions::default()).await
+        }
+
+        async fn build_peer_stanza_with_options(
+            account: Option<&wa::AdvSignedDeviceIdentity>,
+            options: PeerMessageOptions,
+        ) -> wacore_binary::Node {
             let (mut ss, mut is, jid) = setup_session().await;
             let addr = jid.to_protocol_address();
-            prepare_peer_stanza(
+            prepare_peer_stanza_with_options(
                 &mut ss,
                 &mut is,
                 jid.clone(),
@@ -3406,6 +3575,7 @@ mod tests {
                 &wa::Message::default(),
                 "peer-test-1".into(),
                 account,
+                options,
             )
             .await
             .expect("peer stanza builds")
@@ -3421,6 +3591,11 @@ mod tests {
                 n.attrs().optional_string("category").unwrap().as_ref(),
                 "peer"
             );
+            assert_eq!(
+                n.attrs().optional_string("push_priority").unwrap().as_ref(),
+                "high"
+            );
+            assert!(n.attrs().optional_string("privacy_sensitive").is_none());
 
             let children = n.children().expect("peer message has children");
             let tags: Vec<&str> = children.iter().map(|c| c.tag.as_ref()).collect();
@@ -3457,6 +3632,28 @@ mod tests {
                 ),
                 other => panic!("device-identity must carry bytes, got {other:?}"),
             }
+        }
+
+        #[tokio::test]
+        async fn peer_stanza_carries_high_force_and_privacy_attrs() {
+            let account = pkmsg_account_proto();
+            let n = build_peer_stanza_with_options(
+                Some(&account),
+                PeerMessageOptions::high_force_on_demand(),
+            )
+            .await;
+
+            assert_eq!(
+                n.attrs().optional_string("push_priority").unwrap().as_ref(),
+                "high_force"
+            );
+            assert_eq!(
+                n.attrs()
+                    .optional_string("privacy_sensitive")
+                    .unwrap()
+                    .as_ref(),
+                "1"
+            );
         }
 
         #[tokio::test]

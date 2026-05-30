@@ -39,6 +39,67 @@ pub enum MessageCategory {
     Other(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
+pub enum PushPriority {
+    #[wire = "high"]
+    High,
+    #[wire = "high_force"]
+    HighForce,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
+pub enum PrivacySensitiveType {
+    #[wire = "1"]
+    OnDemand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerMessageOptions {
+    push_priority: PushPriority,
+    privacy_sensitive: Option<PrivacySensitiveType>,
+}
+
+impl Default for PeerMessageOptions {
+    fn default() -> Self {
+        Self::high()
+    }
+}
+
+impl PeerMessageOptions {
+    const fn new(
+        push_priority: PushPriority,
+        privacy_sensitive: Option<PrivacySensitiveType>,
+    ) -> Self {
+        Self {
+            push_priority,
+            privacy_sensitive,
+        }
+    }
+
+    pub const fn high() -> Self {
+        Self::new(PushPriority::High, None)
+    }
+
+    pub const fn high_force() -> Self {
+        Self::new(PushPriority::HighForce, None)
+    }
+
+    pub const fn high_force_on_demand() -> Self {
+        Self::new(
+            PushPriority::HighForce,
+            Some(PrivacySensitiveType::OnDemand),
+        )
+    }
+
+    pub const fn push_priority(self) -> PushPriority {
+        self.push_priority
+    }
+
+    pub const fn privacy_sensitive(self) -> Option<PrivacySensitiveType> {
+        self.privacy_sensitive
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MessageSource {
     pub chat: Jid,
@@ -367,6 +428,31 @@ mod tests {
         assert_eq!(
             EditAttribute::Unknown("anything".to_string()).to_string_val(),
             "anything"
+        );
+    }
+
+    #[test]
+    fn peer_message_options_wire_values_match_stanza_attrs() {
+        // These literals are owned by the WireEnum attributes above; stanza
+        // builders consume the generated as_str() values directly.
+        assert_eq!(PushPriority::High.as_str(), "high");
+        assert_eq!(PushPriority::HighForce.as_str(), "high_force");
+        assert_eq!(PrivacySensitiveType::OnDemand.as_str(), "1");
+
+        let default = PeerMessageOptions::high();
+        assert_eq!(default, PeerMessageOptions::default());
+        assert_eq!(default.push_priority(), PushPriority::High);
+        assert_eq!(default.privacy_sensitive(), None);
+
+        let high_force = PeerMessageOptions::high_force();
+        assert_eq!(high_force.push_priority(), PushPriority::HighForce);
+        assert_eq!(high_force.privacy_sensitive(), None);
+
+        let on_demand = PeerMessageOptions::high_force_on_demand();
+        assert_eq!(on_demand.push_priority(), PushPriority::HighForce);
+        assert_eq!(
+            on_demand.privacy_sensitive(),
+            Some(PrivacySensitiveType::OnDemand)
         );
     }
 
