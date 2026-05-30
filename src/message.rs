@@ -76,12 +76,21 @@ struct SessionBatchOutcome {
     duplicate: bool,
     undecryptable: bool,
     dispatched: bool,
+    skdm_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MigrationDecryptOutcome {
     decrypted: bool,
+    duplicate: bool,
     dispatched: bool,
+    skdm_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PlaintextHandleOutcome {
+    dispatched: bool,
+    skdm_only: bool,
 }
 
 /// Retry count threshold for logging high retry warnings.
@@ -1109,6 +1118,7 @@ impl Client {
         let session_had_duplicates = session_outcome.duplicate;
         let session_dispatched_undecryptable = session_outcome.undecryptable;
         let session_dispatched = session_outcome.dispatched;
+        let session_skdm_only = session_outcome.skdm_only;
 
         log::debug!(
             "Starting PASS 2: Processing {} group content messages (skmsg)",
@@ -1221,10 +1231,12 @@ impl Client {
             // (a status SKDM pkmsg can reach here), so skip it to avoid a
             // redundant receipt.
             self.ack_received_message(&info);
-        } else if session_decrypted_successfully && !session_dispatched {
+        } else if session_decrypted_successfully && session_skdm_only && !session_dispatched {
             // SKDM-only session decrypts skip dispatch, so this stanza would
             // otherwise stay queued. WA Web and whatsmeow ack every decrypted
             // message; the ack shape still comes from the message source.
+            // Status is intentionally not filtered here, so its success receipt
+            // still follows the normal WA Web path.
             self.ack_received_message(&info);
         }
 
@@ -1371,7 +1383,6 @@ impl Client {
 
             match decrypt_res {
                 Ok(padded_plaintext) => {
-                    outcome.decrypted = true;
                     match self
                         .clone()
                         .handle_decrypted_plaintext(
@@ -1382,7 +1393,11 @@ impl Client {
                         )
                         .await
                     {
-                        Ok(dispatched) => outcome.dispatched |= dispatched,
+                        Ok(plaintext_outcome) => {
+                            outcome.decrypted = true;
+                            outcome.dispatched |= plaintext_outcome.dispatched;
+                            outcome.skdm_only |= plaintext_outcome.skdm_only;
+                        }
                         Err(e) => {
                             log::warn!(
                                 "[msg:{}] Failed processing plaintext from {}: {e:?}",
@@ -1460,7 +1475,6 @@ impl Client {
                                     info.id,
                                     address
                                 );
-                                outcome.decrypted = true;
                                 match self
                                     .clone()
                                     .handle_decrypted_plaintext(
@@ -1471,7 +1485,11 @@ impl Client {
                                     )
                                     .await
                                 {
-                                    Ok(dispatched) => outcome.dispatched |= dispatched,
+                                    Ok(plaintext_outcome) => {
+                                        outcome.decrypted = true;
+                                        outcome.dispatched |= plaintext_outcome.dispatched;
+                                        outcome.skdm_only |= plaintext_outcome.skdm_only;
+                                    }
                                     Err(e) => {
                                         log::warn!(
                                             "Failed processing plaintext after identity retry: {e:?}"
@@ -1512,9 +1530,11 @@ impl Client {
                                             &mut session_guard,
                                         )
                                         .await;
-                                    if migration_outcome.decrypted {
-                                        outcome.decrypted = true;
+                                    if migration_outcome.decrypted || migration_outcome.duplicate {
+                                        outcome.decrypted |= migration_outcome.decrypted;
+                                        outcome.duplicate |= migration_outcome.duplicate;
                                         outcome.dispatched |= migration_outcome.dispatched;
+                                        outcome.skdm_only |= migration_outcome.skdm_only;
                                     } else {
                                         log::debug!(
                                             "[msg:{}] InvalidPreKeyId after identity change for {}. \
@@ -1581,9 +1601,11 @@ impl Client {
                                 &mut session_guard,
                             )
                             .await;
-                        if migration_outcome.decrypted {
-                            outcome.decrypted = true;
+                        if migration_outcome.decrypted || migration_outcome.duplicate {
+                            outcome.decrypted |= migration_outcome.decrypted;
+                            outcome.duplicate |= migration_outcome.duplicate;
                             outcome.dispatched |= migration_outcome.dispatched;
+                            outcome.skdm_only |= migration_outcome.skdm_only;
                             continue;
                         }
 
@@ -1615,9 +1637,11 @@ impl Client {
                                 &mut session_guard,
                             )
                             .await;
-                        if migration_outcome.decrypted {
-                            outcome.decrypted = true;
+                        if migration_outcome.decrypted || migration_outcome.duplicate {
+                            outcome.decrypted |= migration_outcome.decrypted;
+                            outcome.duplicate |= migration_outcome.duplicate;
                             outcome.dispatched |= migration_outcome.dispatched;
+                            outcome.skdm_only |= migration_outcome.skdm_only;
                             continue;
                         }
 
@@ -1660,9 +1684,11 @@ impl Client {
                                 &mut session_guard,
                             )
                             .await;
-                        if migration_outcome.decrypted {
-                            outcome.decrypted = true;
+                        if migration_outcome.decrypted || migration_outcome.duplicate {
+                            outcome.decrypted |= migration_outcome.decrypted;
+                            outcome.duplicate |= migration_outcome.duplicate;
                             outcome.dispatched |= migration_outcome.dispatched;
+                            outcome.skdm_only |= migration_outcome.skdm_only;
                             continue;
                         }
 
@@ -1884,7 +1910,7 @@ impl Client {
         padded_plaintext: &[u8],
         padding_version: u8,
         info: &Arc<MessageInfo>,
-    ) -> Result<bool, anyhow::Error> {
+    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
         let original_msg = wacore::messages::decode_plaintext(padded_plaintext, padding_version)?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
@@ -1977,10 +2003,16 @@ impl Client {
                 "[msg:{}] Skipping event dispatch for sender key distribution message",
                 info.id
             );
-            Ok(false)
+            Ok(PlaintextHandleOutcome {
+                skdm_only: true,
+                ..Default::default()
+            })
         } else {
             self.dispatch_parsed_message(msg, info).await;
-            Ok(true)
+            Ok(PlaintextHandleOutcome {
+                dispatched: true,
+                ..Default::default()
+            })
         }
     }
 
@@ -2044,23 +2076,24 @@ impl Client {
                     info.id,
                     info.source.sender
                 );
-                let dispatched = match self
+                match self
                     .clone()
                     .handle_decrypted_plaintext(enc_type, &padded_plaintext, padding_version, info)
                     .await
                 {
-                    Ok(dispatched) => dispatched,
+                    Ok(plaintext_outcome) => MigrationDecryptOutcome {
+                        decrypted: true,
+                        dispatched: plaintext_outcome.dispatched,
+                        skdm_only: plaintext_outcome.skdm_only,
+                        ..Default::default()
+                    },
                     Err(e) => {
                         log::warn!(
                             "[msg:{}] Failed processing plaintext after migration: {e:?}",
                             info.id
                         );
-                        false
+                        MigrationDecryptOutcome::default()
                     }
-                };
-                MigrationDecryptOutcome {
-                    decrypted: true,
-                    dispatched,
                 }
             }
             Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
@@ -2069,8 +2102,8 @@ impl Client {
                     info.id
                 );
                 MigrationDecryptOutcome {
-                    decrypted: true,
-                    dispatched: false,
+                    duplicate: true,
+                    ..Default::default()
                 }
             }
             Err(retry_err) => {
@@ -2957,6 +2990,20 @@ mod tests {
                 .expect("encrypt")
         }
 
+        async fn encrypt_text(
+            &mut self,
+            bob_addr: &ProtocolAddress,
+            text: &str,
+        ) -> CiphertextMessage {
+            use wacore::messages::MessageUtils;
+
+            let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+                conversation: Some(text.to_string()),
+                ..Default::default()
+            });
+            self.encrypt(bob_addr, &plaintext).await
+        }
+
         async fn create_group_skdm(
             &mut self,
             group_jid: &Jid,
@@ -3134,7 +3181,7 @@ mod tests {
         let alice_pn_str = alice_pn.to_string();
         let mut alice_old = AlicePeer::new(&alice_pn_str).await;
         alice_old.install_bob_session(&bob_addr, &bundle_v1).await;
-        let pkmsg_v1 = alice_old.encrypt(&bob_addr, b"pn establish").await;
+        let pkmsg_v1 = alice_old.encrypt_text(&bob_addr, "pn establish").await;
         let (pn_success, _, _, pn_still) =
             submit_and_check_session(&client, &alice_pn, &pkmsg_v1).await;
         assert!(pn_success, "PN-keyed session should establish");
@@ -3156,13 +3203,13 @@ mod tests {
 
         let (bundle_v2, _) = bobs_prekey_bundle(&client).await;
         alice_fresh.install_bob_session(&bob_addr, &bundle_v2).await;
-        let pkmsg_v2 = alice_fresh.encrypt(&bob_addr, b"lid shadow").await;
+        let pkmsg_v2 = alice_fresh.encrypt_text(&bob_addr, "lid shadow").await;
         let (lid_success, _, _, lid_still) =
             submit_and_check_session(&client, &alice_lid, &pkmsg_v2).await;
         assert!(lid_success, "LID-keyed shadow session should establish");
         assert!(lid_still, "LID-keyed shadow session should exist");
 
-        let old_pn_msg = alice_old.encrypt(&bob_addr, b"old pn ratchet").await;
+        let old_pn_msg = alice_old.encrypt_text(&bob_addr, "old pn ratchet").await;
         assert!(matches!(old_pn_msg, CiphertextMessage::SignalMessage(_)));
         let (success, duplicates, dispatched, lid_after) =
             submit_and_check_session(&client, &alice_lid, &old_pn_msg).await;
@@ -3231,7 +3278,7 @@ mod tests {
                 .clone())
             .expect("own jid")
             .to_protocol_address();
-        let pkmsg = alice.encrypt(&bob_addr, b"hello").await;
+        let pkmsg = alice.encrypt_text(&bob_addr, "hello").await;
         let (s1, _, _, still1) = submit_and_check_session(&client, &alice.jid, &pkmsg).await;
         assert!(s1, "pkmsg should establish session and decrypt");
         assert!(still1, "session must exist after first message");
@@ -3257,7 +3304,7 @@ mod tests {
         // The format is `[version][protobuf body][8-byte MAC]`, so the last byte
         // is squarely inside the MAC region — parse succeeds, MAC verification
         // fails -> libsignal returns BadMac.
-        let msg2 = alice.encrypt(&bob_addr, b"world").await;
+        let msg2 = alice.encrypt_text(&bob_addr, "world").await;
         let mut bytes = match &msg2 {
             CiphertextMessage::SignalMessage(m) => m.serialized().to_vec(),
             other => panic!(
@@ -3391,7 +3438,7 @@ mod tests {
             .expect("own jid")
             .to_protocol_address();
         alice.install_bob_session(&bob_addr, &bundle_v1).await;
-        let pkmsg_v1 = alice.encrypt(&bob_addr, b"v1").await;
+        let pkmsg_v1 = alice.encrypt_text(&bob_addr, "v1").await;
         let (s1, _, _, _) = submit_and_check_session(&client, &alice.jid, &pkmsg_v1).await;
         assert!(s1);
 
@@ -3430,7 +3477,7 @@ mod tests {
 
         // Tampered SignalMessage → BadMac branch (with the fix this no longer
         // deletes Bob's session).
-        let msg = alice.encrypt(&bob_addr, b"stale").await;
+        let msg = alice.encrypt_text(&bob_addr, "stale").await;
         let mut bytes = match &msg {
             CiphertextMessage::SignalMessage(m) => m.serialized().to_vec(),
             other => panic!(
@@ -3482,7 +3529,7 @@ mod tests {
         let (bundle_v2, _) = bobs_prekey_bundle(&client).await;
         alice.sessions = MemSessionStore::default(); // forget Alice's v1 to force a fresh X3DH
         alice.install_bob_session(&bob_addr, &bundle_v2).await;
-        let pkmsg_v2 = alice.encrypt(&bob_addr, b"v2").await;
+        let pkmsg_v2 = alice.encrypt_text(&bob_addr, "v2").await;
         let (s2, _, _, still2) = submit_and_check_session(&client, &alice.jid, &pkmsg_v2).await;
         assert!(s2, "pkmsg_v2 should decrypt");
         assert!(still2);
@@ -7393,6 +7440,7 @@ mod tests {
                 && node
                     .get_attr("class")
                     .is_some_and(|v| v.as_str() == "message")
+                && node.get_attr("error").is_none()
                 && let Some(to) = node.get_attr("to")
             {
                 let recipient = node.get_attr("recipient").map(|v| v.as_str().to_string());
@@ -7432,6 +7480,7 @@ mod tests {
         typ: Option<String>,
         recipient: Option<String>,
         participant: Option<String>,
+        context: Option<String>,
     }
 
     fn find_receipt_details(frames: &[bytes::Bytes], id: &str) -> Option<SentReceipt> {
@@ -7451,6 +7500,7 @@ mod tests {
                     typ: node.get_attr("type").map(|v| v.as_str().to_string()),
                     recipient: node.get_attr("recipient").map(|v| v.as_str().to_string()),
                     participant: node.get_attr("participant").map(|v| v.as_str().to_string()),
+                    context: node.get_attr("context").map(|v| v.as_str().to_string()),
                 });
             }
         }
@@ -7476,6 +7526,7 @@ mod tests {
                 && node
                     .get_attr("class")
                     .is_some_and(|v| v.as_str() == "message")
+                && node.get_attr("error").is_none()
                 && node.get_attr("id").is_some_and(|v| v.as_str() == id)
                 && let Some(to) = node.get_attr("to")
             {
@@ -7527,6 +7578,7 @@ mod tests {
                 && node
                     .get_attr("class")
                     .is_some_and(|v| v.as_str() == "message")
+                && node.get_attr("error").is_none()
                 && node.get_attr("id").is_some_and(|v| v.as_str() == id)
             {
                 count += 1;
@@ -8099,6 +8151,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_plaintext_decode_error_is_not_acked_as_skdm_only() {
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("bad_plaintext_no_skdm_ack").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+        let recorder = Arc::new(EventRecorder::default());
+        client.register_handler(recorder.clone());
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450527@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575446@g.us".parse().expect("group");
+        let invalid_padded_plaintext = vec![0xff, 0x01];
+        let session_ct = alice.encrypt(&bob_addr, &invalid_padded_plaintext).await;
+        let id = "BAD_SESSION_PLAINTEXT";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![],
+        )
+        .await;
+
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            assert_eq!(
+                confirmations_for(&transport.sent(), id),
+                0,
+                "invalid plaintext must not be counted as a successful SKDM-only ack"
+            );
+        }
+        assert_eq!(
+            recorder.undecryptable().len(),
+            1,
+            "plaintext handler failures must stay on the undecryptable path"
+        );
+        assert_eq!(
+            message_events_for_id(&rx, id),
+            (0, 0),
+            "invalid plaintext must not surface Event::Message"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_content_group_message_acknowledged_once_without_fallback() {
+        use wacore::messages::MessageUtils;
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("session_content_group_ack").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450528@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575447@g.us".parse().expect("group");
+        let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            conversation: Some("session content".to_string()),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
+        let id = "SESSION_CONTENT_GROUP";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![],
+        )
+        .await;
+
+        assert_exactly_one_confirmation(&transport, id).await;
+        let sent = transport.sent();
+        assert_eq!(
+            delivery_receipts_for(&sent, id),
+            1,
+            "session content dispatch should own the only delivery receipt"
+        );
+        assert_eq!(
+            message_acks_for(&sent, id),
+            0,
+            "normal session content must not also use the SKDM-only transport ack"
+        );
+        assert_eq!(
+            message_texts_for_id(&rx, id),
+            vec!["session content".to_string()],
+            "normal session content must dispatch exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_skdm_only_session_uses_one_status_receipt() {
+        use wacore::messages::MessageUtils;
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("status_skdm_only_ack").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450529@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let status: Jid = "status@broadcast".parse().expect("status");
+        let skdm = alice.create_group_skdm(&status).await;
+        let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: Some(skdm),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
+        let id = "STATUS_SKDM_ONLY";
+        let info = group_message_info(id, &status, &alice.jid, false);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![],
+        )
+        .await;
+
+        assert_exactly_one_confirmation(&transport, id).await;
+        let sent = transport.sent();
+        assert_eq!(
+            delivery_receipts_for(&sent, id),
+            1,
+            "status SKDM-only success must still send the WA Web status receipt"
+        );
+        assert_eq!(
+            message_acks_for(&sent, id),
+            0,
+            "status success path should not use a transport ack"
+        );
+        let receipt = find_receipt_details(&sent, id).expect("status delivery receipt");
+        let sender_str = alice.jid.to_string();
+        assert_eq!(receipt.to, status.to_string());
+        assert_eq!(receipt.participant.as_deref(), Some(sender_str.as_str()));
+        assert_eq!(receipt.context.as_deref(), Some("status"));
+        assert_eq!(
+            message_events_for_id(&rx, id),
+            (0, 0),
+            "status SKDM-only messages must not surface Event::Message"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_message_ack_is_not_counted_as_positive_confirmation() {
+        let (client, transport) = capturing_client("error_ack_not_positive").await;
+        let id = "ERROR_ACK_NOT_POSITIVE";
+        let info = Arc::new(MessageInfo {
+            id: id.to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "146824178450530@lid".parse().expect("sender"),
+                chat: "120363408782575448@g.us".parse().expect("group"),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        client.spawn_nack(
+            &info,
+            wacore::protocol::nack::NackReason::ParsingError,
+            None,
+        );
+
+        let mut nack_code = None;
+        for _ in 0..80 {
+            nack_code = find_message_nack_error(&transport.sent(), id);
+            if nack_code.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(nack_code, Some(487));
+
+        let sent = transport.sent();
+        assert_eq!(
+            message_acks_for(&sent, id),
+            0,
+            "nacks carry class=message but must not count as positive transport acks"
+        );
+        assert_eq!(
+            confirmations_for(&sent, id),
+            0,
+            "nacks must not satisfy exactly-one positive confirmation assertions"
+        );
+        assert!(
+            find_message_ack_for(&sent, id).is_none(),
+            "error acks must be excluded from positive ack lookup"
+        );
+    }
+
+    #[tokio::test]
     async fn skdm_session_with_skmsg_sibling_acknowledged_once() {
         use wacore::messages::MessageUtils;
         use wacore::types::events::ChannelEventHandler;
@@ -8230,7 +8488,7 @@ mod tests {
 
         // Establish the session, then mark Alice's prekey acked so her next message
         // is a plain SignalMessage. Re-submitting it is a clean duplicate.
-        let establish = alice.encrypt(&bob_addr, b"establish").await;
+        let establish = alice.encrypt_text(&bob_addr, "establish").await;
         process_session_ct(&client, &alice.jid, "EST", &establish).await;
         if let Some(record) = alice.sessions.0.get_mut(&bob_addr)
             && let Some(state) = record.session_state_mut()
