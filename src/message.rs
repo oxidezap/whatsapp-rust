@@ -2232,6 +2232,28 @@ impl Client {
         padding_version: u8,
         info: &Arc<MessageInfo>,
     ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+        if let Some(skdm_only) = wacore::messages::sender_key_distribution_only_plaintext(
+            padded_plaintext,
+            padding_version,
+        )? {
+            log::debug!(
+                "[msg:{}] Skipping owned decode/event dispatch for sender key distribution message",
+                info.id
+            );
+            if let Some(axolotl_bytes) = skdm_only.axolotl_sender_key_distribution_message {
+                self.handle_sender_key_distribution_message(
+                    &info.source.chat,
+                    &info.source.sender,
+                    axolotl_bytes,
+                )
+                .await;
+            }
+            return Ok(PlaintextHandleOutcome {
+                skdm_only: true,
+                ..Default::default()
+            });
+        }
+
         let original_msg = wacore::messages::decode_plaintext(padded_plaintext, padding_version)?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",

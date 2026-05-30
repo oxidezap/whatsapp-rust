@@ -1,7 +1,7 @@
 use crate::libsignal::crypto::CryptographicHash;
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
-use buffa::Message as ProtoMessage;
+use buffa::{Message as ProtoMessage, MessageView};
 use waproto::whatsapp as wa;
 
 pub struct MessageUtils;
@@ -81,6 +81,60 @@ pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<
     let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
     wa::Message::decode_from_slice(plaintext_slice)
         .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
+}
+
+/// Use when borrowed fields are enough and a full owned message is avoidable.
+pub fn decode_plaintext_view(
+    padded_plaintext: &[u8],
+    padding_version: u8,
+) -> Result<wa::MessageView<'_>> {
+    let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
+    wa::MessageView::decode_view(plaintext_slice)
+        .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SenderKeyDistributionOnlyPlaintext<'a> {
+    pub axolotl_sender_key_distribution_message: Option<&'a [u8]>,
+}
+
+/// Conservative fast path for SKDM-only plaintexts before owned dispatch decode.
+pub fn sender_key_distribution_only_plaintext(
+    padded_plaintext: &[u8],
+    padding_version: u8,
+) -> Result<Option<SenderKeyDistributionOnlyPlaintext<'_>>> {
+    let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
+    if !has_only_sender_key_distribution_top_level_fields(plaintext_slice)? {
+        return Ok(None);
+    }
+
+    let view = wa::MessageView::decode_view(plaintext_slice)
+        .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))?;
+    let axolotl_sender_key_distribution_message = view
+        .sender_key_distribution_message
+        .as_option()
+        .and_then(|skdm| skdm.axolotl_sender_key_distribution_message);
+
+    Ok(Some(SenderKeyDistributionOnlyPlaintext {
+        axolotl_sender_key_distribution_message,
+    }))
+}
+
+fn has_only_sender_key_distribution_top_level_fields(
+    encoded: &[u8],
+) -> Result<bool, buffa::DecodeError> {
+    let mut cur = encoded;
+    let mut has_sender_key_distribution = false;
+    while !cur.is_empty() {
+        let tag = buffa::encoding::Tag::decode(&mut cur)?;
+        match tag.field_number() {
+            2 | 15 => has_sender_key_distribution = true,
+            35 => {}
+            _ => return Ok(false),
+        }
+        buffa::encoding::skip_field_depth(tag, &mut cur, buffa::RECURSION_LIMIT)?;
+    }
+    Ok(has_sender_key_distribution)
 }
 
 /// Unwrap a DeviceSentMessage wrapper, returning the inner message.
@@ -358,6 +412,85 @@ pub fn parse_message_info(
         bot_info,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod plaintext_view_tests {
+    use super::*;
+
+    fn padded(msg: &wa::Message) -> Vec<u8> {
+        MessageUtils::pad_message_v2(msg.encode_to_vec())
+    }
+
+    fn skdm(bytes: &[u8]) -> wa::message::SenderKeyDistributionMessage {
+        wa::message::SenderKeyDistributionMessage {
+            group_id: Some("120000000000000000@g.us".to_string()),
+            axolotl_sender_key_distribution_message: Some(bytes.to_vec()),
+        }
+    }
+
+    #[test]
+    fn decode_plaintext_view_borrows_message_fields() {
+        let msg = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        let padded = padded(&msg);
+
+        let view = decode_plaintext_view(&padded, 2).expect("view decode should succeed");
+
+        assert_eq!(view.conversation, Some("hello"));
+    }
+
+    #[test]
+    fn sender_key_distribution_only_plaintext_returns_borrowed_axolotl() {
+        let msg = wa::Message {
+            sender_key_distribution_message: buffa::MessageField::some(skdm(&[1, 2, 3])),
+            ..Default::default()
+        };
+        let padded = padded(&msg);
+
+        let found = sender_key_distribution_only_plaintext(&padded, 2)
+            .expect("view decode should succeed")
+            .expect("SKDM-only plaintext should be detected");
+
+        assert_eq!(
+            found.axolotl_sender_key_distribution_message,
+            Some(&[1, 2, 3][..])
+        );
+    }
+
+    #[test]
+    fn sender_key_distribution_only_plaintext_rejects_user_content() {
+        let msg = wa::Message {
+            conversation: Some("hello".to_string()),
+            sender_key_distribution_message: buffa::MessageField::some(skdm(&[1, 2, 3])),
+            ..Default::default()
+        };
+        let padded = padded(&msg);
+
+        let found =
+            sender_key_distribution_only_plaintext(&padded, 2).expect("view scan should succeed");
+
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn sender_key_distribution_only_plaintext_allows_fast_ratchet_only() {
+        let msg = wa::Message {
+            fast_ratchet_key_sender_key_distribution_message: buffa::MessageField::some(skdm(&[
+                4, 5, 6,
+            ])),
+            ..Default::default()
+        };
+        let padded = padded(&msg);
+
+        let found = sender_key_distribution_only_plaintext(&padded, 2)
+            .expect("view decode should succeed")
+            .expect("fast-ratchet SKDM-only plaintext should be detected");
+
+        assert_eq!(found.axolotl_sender_key_distribution_message, None);
+    }
 }
 
 #[cfg(test)]
