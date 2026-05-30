@@ -2396,6 +2396,7 @@ dependencies = [
  "chrono",
  "env_logger",
  "event-listener",
+ "flate2",
  "futures",
  "hex",
  "hkdf",

@@ -150,6 +150,7 @@ whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version 
 [dev-dependencies]
 aes = { workspace = true }
 cbc = { version = "0.2", features = ["alloc", "block-padding"] }
+flate2 = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

@@ -99,16 +99,18 @@ impl Client {
                 msg.get_base_message().get_ephemeral_expiration();
         }
 
-        // Awaited (not spawned) so the messageSecret is durably stored before
-        // this chat's worker dequeues the next stanza. A bot reply queued right
-        // behind its own fanout (offline replay) would otherwise race the write
-        // and hit MissingMessageSecret.
+        // Keep this ordered with dispatch; add-on messages can immediately
+        // reference the secret from the stanza just processed.
         self.maybe_capture_inbound_msg_secret(&msg, &info).await;
+        let dispatch_msg = self
+            .maybe_decrypt_secret_encrypted_message(&msg, &info)
+            .await
+            .unwrap_or(msg);
         self.ack_received_message(&info);
 
         self.core
             .event_bus
-            .dispatch(Event::Message(Arc::new(msg), info));
+            .dispatch(Event::Message(Arc::new(dispatch_msg), info));
     }
 
     /// Acknowledge a received message so the server drops it from the offline
@@ -145,66 +147,269 @@ impl Client {
         });
     }
 
-    /// Capture an embedded `MessageContextInfo.message_secret` from any
-    /// bot-targeted message (fanout from us OR reply from the bot) so a
-    /// future `<enc type="msmsg">` referencing this id can decrypt.
-    /// Mirrors WA Web `processRenderableMessages`:
-    /// `$ && (P || N || w || A) && !isForwarded → addMsmsgMsgSecretToCache`.
+    /// Capture embedded `MessageContextInfo.message_secret` for add-on
+    /// decrypts. Bot DMs keep the legacy LID key as a second entry.
     pub(crate) async fn maybe_capture_inbound_msg_secret(
         self: &Arc<Self>,
         msg: &wa::Message,
         info: &Arc<MessageInfo>,
     ) {
         use wacore::proto_helpers::MessageExt;
-        const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
 
         let mci = msg.message_context_info.as_ref();
-        let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
-        let mentions_bot = msg.mentions_any_bot();
-        // `MessageContextInfo.bot_metadata` is the bot-invocation envelope WA
-        // Web reads; it's present on bot prompts (incl. our own group prompt)
-        // even when no JID is mentioned, covering WA Web's `w`/`A` gates.
-        let has_bot_metadata = mci.is_some_and(|m| m.bot_metadata.is_some());
-
         let Some(secret_bytes) = mci.and_then(|m| m.message_secret.as_deref()) else {
             return;
         };
-        let Ok(secret_arr) = <&[u8; SECRET_LEN]>::try_from(secret_bytes) else {
-            return;
-        };
-        // WA Web `processRenderableMessages`: `$ && (P || N || w || A) && !fwd`.
-        // P=chat is bot, N=mentions a bot, w/A=bot group participant (we proxy
-        // those via bot_metadata presence, the bot-invocation envelope).
-        if !chat_is_bot && !mentions_bot && !has_bot_metadata {
-            return;
-        }
         if msg.is_forwarded() {
             return;
         }
-        // Key the secret under the identity the bot reply will echo in
-        // `<meta target_sender_jid>` at GET time:
-        //  * bot DM: `info.source.sender` is our PN device JID, but the reply
-        //    echoes our LID — resolve via dm_sender_identity_for.
-        //  * group / regular: `info.source.sender` is already the author's
-        //    addressing identity (our LID in a LID group, the other
-        //    participant's JID for their prompt) — exactly what the reply
-        //    echoes. Use it directly.
-        // alternate_msg_secret_lookup still bridges any residual LID↔PN skew.
-        let sender = if chat_is_bot {
-            match self.dm_sender_identity_for(&info.source.chat).await {
-                Some(j) => j,
-                None => return,
-            }
-        } else {
-            info.source.sender.clone()
+
+        self.persist_msg_secret_bytes(
+            &info.source.chat,
+            &info.source.sender,
+            &info.id,
+            secret_bytes,
+        )
+        .await;
+
+        let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
+        if chat_is_bot
+            && let Some(sender) = self.dm_sender_identity_for(&info.source.chat).await
+            && sender.to_non_ad() != info.source.sender.to_non_ad()
+        {
+            self.persist_msg_secret_bytes(&info.source.chat, &sender, &info.id, secret_bytes)
+                .await;
+        }
+    }
+
+    pub(crate) async fn persist_msg_secret_bytes(
+        &self,
+        chat: &Jid,
+        sender: &Jid,
+        msg_id: &str,
+        secret_bytes: &[u8],
+    ) -> bool {
+        const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
+
+        let Ok(secret) = <&[u8; SECRET_LEN]>::try_from(secret_bytes) else {
+            return false;
         };
-        log::debug!(
-            "[msg:{}] cached bot messageSecret under sender={}",
-            info.id,
-            sender.to_non_ad_string()
-        );
-        self.persist_outbound_msg_secret(&info.source.chat, &sender, &info.id, secret_arr)
+        let chat_str = chat.to_non_ad_string();
+        let sender_str = sender.to_non_ad_string();
+        match self
+            .persistence_manager
+            .backend()
+            .put_msg_secret(&chat_str, &sender_str, msg_id, secret)
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("[msg:{msg_id}] failed to persist messageSecret: {e:?}");
+                false
+            }
+        }
+    }
+
+    async fn own_jid_for_secret_encrypted(&self, info: &MessageInfo) -> Option<Jid> {
+        use wacore::types::message::AddressingMode;
+
+        if info.source.is_from_me {
+            return Some(info.source.sender.to_non_ad());
+        }
+
+        match info.source.addressing_mode {
+            Some(AddressingMode::Lid) => match self.get_lid().await {
+                Some(jid) => Some(jid),
+                None => self.get_pn().await,
+            },
+            Some(AddressingMode::Pn) => match self.get_pn().await {
+                Some(jid) => Some(jid),
+                None => self.get_lid().await,
+            },
+            None if info.source.sender.is_lid() || info.source.chat.is_lid() => {
+                match self.get_lid().await {
+                    Some(jid) => Some(jid),
+                    None => self.get_pn().await,
+                }
+            }
+            None => match self.get_pn().await {
+                Some(jid) => Some(jid),
+                None => self.get_lid().await,
+            },
+        }
+    }
+
+    async fn maybe_decrypt_secret_encrypted_message(
+        self: &Arc<Self>,
+        msg: &wa::Message,
+        info: &Arc<MessageInfo>,
+    ) -> Option<wa::Message> {
+        use crate::features::message_edit::{self, SecretEncKind};
+
+        let env = message_edit::extract_secret_encrypted(msg)?;
+        let target_id = env.target_id()?;
+
+        let my_jid = self.own_jid_for_secret_encrypted(info).await?;
+        let original_sender = match env.original_sender_jid(&my_jid) {
+            Ok(jid) => jid,
+            Err(_) => return None,
+        };
+
+        let backend = self.persistence_manager.backend();
+        let chat_for_lookup = info.source.chat.to_non_ad_string();
+        let original_sender_str = original_sender.to_non_ad_string();
+        let fallback_original_sender = self
+            .alternate_msg_secret_jid(&backend, &original_sender)
+            .await
+            .unwrap_or_default();
+
+        let primary = backend
+            .get_msg_secret(&chat_for_lookup, &original_sender_str, target_id)
             .await;
+        let secret = match primary {
+            Ok(Some(secret)) => secret,
+            Ok(None) => match self
+                .alternate_msg_secret_lookup(
+                    &backend,
+                    &chat_for_lookup,
+                    &original_sender,
+                    target_id,
+                )
+                .await
+            {
+                Ok(Some(secret)) => secret,
+                Ok(None) => return None,
+                Err(e) => {
+                    log::warn!(
+                        "[msg:{}] secret_encrypted_message alternate secret lookup failed: {e:?}",
+                        info.id
+                    );
+                    return None;
+                }
+            },
+            Err(e) => {
+                log::warn!(
+                    "[msg:{}] backend error reading secret_encrypted_message secret: {e:?}",
+                    info.id
+                );
+                return None;
+            }
+        };
+
+        let fallback_editor = match info.source.sender_alt.clone() {
+            Some(jid) => Some(jid),
+            None => self
+                .alternate_msg_secret_jid(&backend, &info.source.sender)
+                .await
+                .unwrap_or_default(),
+        };
+
+        let inner = match message_edit::decrypt_secret_encrypted(
+            env.enc_payload,
+            env.enc_iv,
+            &secret,
+            env.kind,
+            target_id,
+            &original_sender,
+            &info.source.sender,
+        ) {
+            Ok(inner) => inner,
+            Err(primary_err) => {
+                let mut last_err = primary_err;
+                let mut decrypted = None;
+
+                if let Some(fallback_original) = fallback_original_sender.as_ref() {
+                    match message_edit::decrypt_secret_encrypted(
+                        env.enc_payload,
+                        env.enc_iv,
+                        &secret,
+                        env.kind,
+                        target_id,
+                        fallback_original,
+                        &info.source.sender,
+                    ) {
+                        Ok(inner) => decrypted = Some(inner),
+                        Err(e) => last_err = e,
+                    }
+                }
+
+                if decrypted.is_none()
+                    && let Some(fallback_editor) = fallback_editor.as_ref()
+                {
+                    match message_edit::decrypt_secret_encrypted(
+                        env.enc_payload,
+                        env.enc_iv,
+                        &secret,
+                        env.kind,
+                        target_id,
+                        &original_sender,
+                        fallback_editor,
+                    ) {
+                        Ok(inner) => decrypted = Some(inner),
+                        Err(e) => last_err = e,
+                    }
+                }
+
+                if decrypted.is_none()
+                    && let (Some(fallback_original), Some(fallback_editor)) =
+                        (fallback_original_sender.as_ref(), fallback_editor.as_ref())
+                {
+                    match message_edit::decrypt_secret_encrypted(
+                        env.enc_payload,
+                        env.enc_iv,
+                        &secret,
+                        env.kind,
+                        target_id,
+                        fallback_original,
+                        fallback_editor,
+                    ) {
+                        Ok(inner) => decrypted = Some(inner),
+                        Err(e) => last_err = e,
+                    }
+                }
+
+                match decrypted {
+                    Some(inner) => inner,
+                    None => {
+                        log::warn!(
+                            "[msg:{}] secret_encrypted_message {:?} decrypt failed: {last_err:?}",
+                            info.id,
+                            env.kind
+                        );
+                        return None;
+                    }
+                }
+            }
+        };
+
+        if let Some(secret_bytes) = inner
+            .message_context_info
+            .as_ref()
+            .and_then(|m| m.message_secret.as_deref())
+        {
+            self.persist_msg_secret_bytes(
+                &info.source.chat,
+                &original_sender,
+                target_id,
+                secret_bytes,
+            )
+            .await;
+        }
+
+        if env.kind != SecretEncKind::MessageEdit {
+            return Some(inner);
+        }
+
+        match message_edit::rewrap_as_legacy_edit(inner) {
+            Some(rewrapped) => Some(rewrapped),
+            None => {
+                log::warn!(
+                    "[msg:{}] decrypted MESSAGE_EDIT missing protocol_message.edited_message",
+                    info.id
+                );
+                None
+            }
+        }
     }
 
     /// Decrypt and dispatch a `<enc type="msmsg">` bot reply. Looks up the
@@ -444,6 +649,25 @@ impl Client {
     /// `lid_pn_mapping` store and retry. Returns `Ok(None)` when no mapping
     /// is known or the alternate row is absent — the caller treats that as
     /// a terminal miss.
+    async fn alternate_msg_secret_jid(
+        &self,
+        backend: &Arc<dyn crate::store::traits::Backend>,
+        primary_sender: &Jid,
+    ) -> Result<Option<Jid>, crate::store::error::StoreError> {
+        let alternate = match primary_sender.server {
+            wacore_binary::Server::Lid => backend
+                .get_lid_mapping(&primary_sender.user)
+                .await?
+                .map(|m| Jid::new(m.phone_number, wacore_binary::Server::Pn)),
+            wacore_binary::Server::Pn => backend
+                .get_pn_mapping(&primary_sender.user)
+                .await?
+                .map(|m| Jid::new(m.lid, wacore_binary::Server::Lid)),
+            _ => None,
+        };
+        Ok(alternate)
+    }
+
     async fn alternate_msg_secret_lookup(
         &self,
         backend: &Arc<dyn crate::store::traits::Backend>,
@@ -451,24 +675,13 @@ impl Client {
         primary_sender: &Jid,
         target_id: &str,
     ) -> Result<Option<Vec<u8>>, crate::store::error::StoreError> {
-        let alternate_user = match primary_sender.server {
-            wacore_binary::Server::Lid => backend
-                .get_lid_mapping(&primary_sender.user)
-                .await?
-                .map(|m| (m.phone_number, wacore_binary::Server::Pn)),
-            wacore_binary::Server::Pn => backend
-                .get_pn_mapping(&primary_sender.user)
-                .await?
-                .map(|m| (m.lid, wacore_binary::Server::Lid)),
-            _ => None,
-        };
-        let Some((user, server)) = alternate_user else {
+        let Some(alternate) = self
+            .alternate_msg_secret_jid(backend, primary_sender)
+            .await?
+        else {
             return Ok(None);
         };
-        let mut alternate_str = String::with_capacity(user.len() + 1 + server.as_str().len());
-        alternate_str.push_str(&user);
-        alternate_str.push('@');
-        alternate_str.push_str(server.as_str());
+        let alternate_str = alternate.to_non_ad_string();
         backend
             .get_msg_secret(chat_for_lookup, &alternate_str, target_id)
             .await
@@ -8259,6 +8472,291 @@ mod tests {
         None
     }
 
+    fn legacy_edit_text(msg: &wa::Message) -> Option<&str> {
+        msg.protocol_message
+            .as_ref()
+            .and_then(|pm| pm.edited_message.as_ref())
+            .and_then(|edited| edited.conversation.as_deref())
+    }
+
+    fn inner_message_edit(text: &str, next_secret: Option<Vec<u8>>) -> wa::Message {
+        wa::Message {
+            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+                key: Some(wa::MessageKey {
+                    remote_jid: Some("5511777776666@s.whatsapp.net".to_string()),
+                    from_me: Some(false),
+                    id: Some("PARENT_EDIT".to_string()),
+                    participant: None,
+                }),
+                r#type: Some(wa::message::protocol_message::Type::MessageEdit as i32),
+                edited_message: Some(Box::new(wa::Message {
+                    conversation: Some(text.to_string()),
+                    ..Default::default()
+                })),
+                timestamp_ms: Some(1_770_000_000_000),
+                ..Default::default()
+            })),
+            message_context_info: next_secret.map(|secret| wa::MessageContextInfo {
+                message_secret: Some(secret),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn encrypted_message_edit(
+        target_key: wa::MessageKey,
+        original_sender: &str,
+        editor: &str,
+        parent_id: &str,
+        secret: &[u8],
+        text: &str,
+        next_secret: Option<Vec<u8>>,
+    ) -> wa::Message {
+        let ctx = wacore::message_edit::MessageEditContext {
+            original_msg_id: parent_id,
+            original_sender_jid: original_sender,
+            editor_jid: editor,
+        };
+        let (enc_payload, enc_iv) = wacore::message_edit::encrypt_message_edit(
+            &inner_message_edit(text, next_secret),
+            secret,
+            &ctx,
+        )
+        .expect("test edit encryption");
+
+        wa::Message {
+            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                target_message_key: Some(target_key),
+                enc_payload: Some(enc_payload),
+                enc_iv: Some(enc_iv.to_vec()),
+                secret_enc_type: Some(
+                    wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
+                ),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_encrypted_message_edit_dispatches_legacy_edit() {
+        let (client, _transport) = capturing_client("secret_edit_dispatch").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let parent_id = "PARENT_EDIT";
+        let edit_id = "EDIT_1";
+        let secret = [0x42u8; 32];
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, chat, parent_id, &secret)
+            .await
+            .unwrap();
+
+        let info = Arc::new(MessageInfo {
+            id: edit_id.into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: chat.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: None,
+        };
+        let msg =
+            encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
+
+        client.dispatch_parsed_message(msg, &info).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == edit_id
+                        && legacy_edit_text(msg.as_ref()) == Some("edited")
+                        && msg.secret_encrypted_message.is_none())
+            },
+            500,
+        )
+        .await;
+        assert!(got.is_some(), "encrypted edit must dispatch as legacy edit");
+    }
+
+    #[tokio::test]
+    async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
+        let (client, _transport) = capturing_client("secret_edit_chain").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let parent_id = "PARENT_EDIT";
+        let first_secret = [0x11u8; 32];
+        let second_secret = [0x22u8; 32];
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, chat, parent_id, &first_secret)
+            .await
+            .unwrap();
+
+        let target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: None,
+        };
+        let first_info = Arc::new(MessageInfo {
+            id: "EDIT_CHAIN_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: chat.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let first_msg = encrypted_message_edit(
+            target_key.clone(),
+            chat,
+            chat,
+            parent_id,
+            &first_secret,
+            "first",
+            Some(second_secret.to_vec()),
+        );
+        client.dispatch_parsed_message(first_msg, &first_info).await;
+
+        let stored = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(chat, chat, parent_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(&second_secret[..]));
+
+        let second_info = Arc::new(MessageInfo {
+            id: "EDIT_CHAIN_2".into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: chat.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let second_msg = encrypted_message_edit(
+            target_key,
+            chat,
+            chat,
+            parent_id,
+            &second_secret,
+            "second",
+            None,
+        );
+        client
+            .dispatch_parsed_message(second_msg, &second_info)
+            .await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == "EDIT_CHAIN_2"
+                        && legacy_edit_text(msg.as_ref()) == Some("second"))
+            },
+            500,
+        )
+        .await;
+        assert!(got.is_some(), "second edit must use the re-captured secret");
+    }
+
+    #[tokio::test]
+    async fn secret_encrypted_message_edit_uses_lid_pn_fallback_in_group() {
+        use wacore::store::traits::LidPnMappingEntry;
+
+        let (client, _transport) = capturing_client("secret_edit_alt_group").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "120363021033254949@g.us";
+        let parent_id = "GROUP_PARENT_EDIT";
+        let sender_lid = "236395184570386@lid";
+        let sender_pn = "5511777776666@s.whatsapp.net";
+        let secret = [0x77u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: "236395184570386".into(),
+                phone_number: "5511777776666".into(),
+                created_at: 0,
+                updated_at: 0,
+                learning_source: "test".into(),
+            })
+            .await
+            .unwrap();
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, sender_pn, parent_id, &secret)
+            .await
+            .unwrap();
+
+        let info = Arc::new(MessageInfo {
+            id: "GROUP_EDIT_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: sender_lid.parse().unwrap(),
+                is_group: true,
+                addressing_mode: Some(wacore::types::message::AddressingMode::Lid),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: Some(sender_lid.to_string()),
+        };
+        let msg = encrypted_message_edit(
+            target_key,
+            sender_pn,
+            sender_lid,
+            parent_id,
+            &secret,
+            "group edited",
+            None,
+        );
+
+        client.dispatch_parsed_message(msg, &info).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == "GROUP_EDIT_1"
+                        && legacy_edit_text(msg.as_ref()) == Some("group edited"))
+            },
+            500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "group edit must decrypt when the stored secret is under PN"
+        );
+    }
+
     /// Round-trip: store an outbound messageSecret, build a fake bot reply
     /// whose payload we encrypt with the symmetric helper, route it through
     /// classify, and assert the decrypted `wa::Message` lands on the bus.
@@ -8956,8 +9454,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maybe_capture_inbound_msg_secret_skips_non_bot_chats() {
-        let (client, _transport) = capturing_client("capture_skip_dm").await;
+    async fn maybe_capture_inbound_msg_secret_persists_for_non_bot_chats() {
+        let (client, _transport) = capturing_client("capture_regular_dm").await;
         let info = Arc::new(MessageInfo {
             id: "DM_1".into(),
             source: crate::types::message::MessageSource {
@@ -8978,9 +9476,6 @@ mod tests {
         };
         client.maybe_capture_inbound_msg_secret(&msg, &info).await;
 
-        for _ in 0..16 {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
         let got = client
             .persistence_manager
             .backend()
@@ -8991,10 +9486,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            got.is_none(),
-            "non-bot chats must not persist embedded msg_secrets"
-        );
+        assert_eq!(got.as_deref(), Some(&[0xCDu8; 32][..]));
     }
 
     /// Group invocation: user mentions @MetaAI in a group → chat is the

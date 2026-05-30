@@ -1,8 +1,10 @@
 use crate::types::events::{Event, LazyHistorySync};
+use prost::Message as ProtoMessage;
 use std::sync::Arc;
 use wacore::history_sync::{TcTokenCandidate, process_history_sync};
 use wacore::store::traits::TcTokenEntry;
-use waproto::whatsapp::message::HistorySyncNotification;
+use wacore_binary::{Jid, JidExt as _};
+use waproto::whatsapp::{self as wa, message::HistorySyncNotification};
 
 use crate::client::Client;
 
@@ -145,6 +147,7 @@ impl Client {
         };
 
         let has_listeners = self.core.event_bus.has_handlers();
+        let retain_history_blob = true;
 
         // Small blobs (PushName, Recent): decode inline to avoid spawn_blocking overhead.
         // Large blobs: use blocking thread to avoid stalling the async runtime.
@@ -153,7 +156,7 @@ impl Client {
             Some(process_history_sync(
                 compressed_data,
                 own_user.as_deref(),
-                has_listeners,
+                retain_history_blob,
                 compressed_size_hint,
             ))
         } else {
@@ -162,7 +165,7 @@ impl Client {
                 let result = process_history_sync(
                     compressed_data,
                     own_user.as_deref(),
-                    has_listeners,
+                    retain_history_blob,
                     compressed_size_hint,
                 );
                 let _ = result_tx.send(result);
@@ -215,8 +218,14 @@ impl Client {
                     self.store_tc_token_candidate(candidate).await;
                 }
 
-                // Dispatch a single event with the full decompressed blob
                 if let Some(decompressed) = sync_result.decompressed_bytes {
+                    self.store_history_sync_msg_secrets(decompressed.as_ref())
+                        .await;
+
+                    if !has_listeners {
+                        return;
+                    }
+
                     let lazy_hs = LazyHistorySync::new(
                         decompressed,
                         notification.sync_type().into(),
@@ -238,6 +247,58 @@ impl Client {
                 log::error!("History sync blocking task was cancelled");
             }
         }
+    }
+
+    async fn store_history_sync_msg_secrets(&self, raw_history_sync: &[u8]) -> usize {
+        let history = match wa::HistorySync::decode(raw_history_sync) {
+            Ok(history) => history,
+            Err(e) => {
+                log::warn!("Failed to decode HistorySync for messageSecret capture: {e:?}");
+                return 0;
+            }
+        };
+
+        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let own_pn = device_snapshot.pn.as_ref().map(|j| j.to_non_ad());
+        let own_lid = device_snapshot.lid.as_ref().map(|j| j.to_non_ad());
+        let mut stored = 0usize;
+
+        for conversation in &history.conversations {
+            let Ok(chat) = conversation.id.parse::<Jid>() else {
+                continue;
+            };
+
+            for history_msg in &conversation.messages {
+                let Some(web_msg) = history_msg.message.as_ref() else {
+                    continue;
+                };
+                let Some(secret) = web_msg.message_secret.as_deref().or_else(|| {
+                    web_msg
+                        .message
+                        .as_ref()
+                        .and_then(|m| m.message_context_info.as_ref())
+                        .and_then(|mci| mci.message_secret.as_deref())
+                }) else {
+                    continue;
+                };
+                let Some(msg_id) = web_msg.key.id.as_deref() else {
+                    continue;
+                };
+
+                let senders =
+                    history_msg_secret_senders(&chat, web_msg, own_pn.as_ref(), own_lid.as_ref());
+                for sender in senders {
+                    if self
+                        .persist_msg_secret_bytes(&chat, &sender, msg_id, secret)
+                        .await
+                    {
+                        stored += 1;
+                    }
+                }
+            }
+        }
+
+        stored
     }
 
     /// Ask the phone to re-upload a history-sync blob whose download failed,
@@ -321,5 +382,122 @@ impl Client {
                 candidate.tc_token_timestamp
             );
         }
+    }
+}
+
+fn history_msg_secret_senders(
+    chat: &Jid,
+    web_msg: &wa::WebMessageInfo,
+    own_pn: Option<&Jid>,
+    own_lid: Option<&Jid>,
+) -> Vec<Jid> {
+    let mut senders = Vec::with_capacity(2);
+
+    if web_msg.key.from_me == Some(true) {
+        if let Some(lid) = own_lid {
+            push_unique_sender(&mut senders, lid.to_non_ad());
+        }
+        if let Some(pn) = own_pn {
+            push_unique_sender(&mut senders, pn.to_non_ad());
+        }
+        return senders;
+    }
+
+    if chat.is_pn() || chat.is_lid() || chat.is_bot() {
+        senders.push(chat.to_non_ad());
+        return senders;
+    }
+
+    if let Some(raw_sender) = web_msg
+        .key
+        .participant
+        .as_deref()
+        .or(web_msg.participant.as_deref())
+        && let Ok(sender) = raw_sender.parse::<Jid>()
+    {
+        senders.push(sender.to_non_ad());
+    }
+
+    senders
+}
+
+fn push_unique_sender(senders: &mut Vec<Jid>, sender: Jid) {
+    if !senders.contains(&sender) {
+        senders.push(sender);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{Compression, write::ZlibEncoder};
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+
+    fn compress_history_sync(history_sync: &wa::HistorySync) -> Vec<u8> {
+        let raw = history_sync.encode_to_vec();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).expect("zlib write");
+        encoder.finish().expect("zlib finish")
+    }
+
+    #[tokio::test]
+    async fn process_history_sync_task_stores_message_secrets_without_handlers() {
+        let client = crate::test_utils::create_test_client_with_name("history_msg_secret").await;
+        client
+            .persistence_manager
+            .process_command(wacore::store::commands::DeviceCommand::SetId(Some(
+                "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+            )))
+            .await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let parent_id = "HIST_PARENT";
+        let secret = vec![0x44u8; 32];
+        let history_sync = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![wa::HistorySyncMsg {
+                    message: Some(wa::WebMessageInfo {
+                        key: wa::MessageKey {
+                            remote_jid: Some(chat.to_string()),
+                            from_me: Some(false),
+                            id: Some(parent_id.to_string()),
+                            participant: None,
+                        },
+                        message: Some(wa::Message {
+                            conversation: Some("historical".to_string()),
+                            ..Default::default()
+                        }),
+                        message_secret: Some(secret.clone()),
+                        ..Default::default()
+                    }),
+                    msg_order_id: Some(1),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let compressed = compress_history_sync(&history_sync);
+        let notification = HistorySyncNotification {
+            file_length: Some(compressed.len() as u64),
+            sync_type: Some(wa::message::HistorySyncType::InitialBootstrap as i32),
+            initial_hist_bootstrap_inline_payload: Some(compressed),
+            ..Default::default()
+        };
+
+        client
+            .process_history_sync_task("HIST_SYNC_SECRET".to_string(), notification)
+            .await;
+
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(chat, chat, parent_id)
+            .await
+            .unwrap();
+        assert_eq!(got, Some(secret));
     }
 }
