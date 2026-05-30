@@ -3,6 +3,7 @@ use crate::types::call::IncomingCall;
 use crate::types::message::MessageInfo;
 use crate::types::presence::{ChatPresence, ChatPresenceMedia, ReceiptType};
 use buffa::Message;
+use buffa::view::MessageView as _;
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -22,9 +23,8 @@ use waproto::whatsapp as wa;
 /// Cheap metadata (`sync_type`, `chunk_order`, `progress`) is available
 /// without decoding — useful for filtering events.
 ///
-/// Call [`get()`](Self::get) for full access to conversations, pushnames,
-/// global settings, past participants, call logs, and everything else in
-/// the `wa::HistorySync` proto.
+/// Call [`view()`](Self::view) for zero-copy full inspection, or
+/// [`get()`](Self::get) when you need the owned `wa::HistorySync` proto.
 pub struct LazyHistorySync {
     raw_bytes: Bytes,
     sync_type: i32,
@@ -107,6 +107,13 @@ impl LazyHistorySync {
                     .map(Box::new)
             })
             .as_deref()
+    }
+
+    /// Decode a zero-copy view over the raw bytes.
+    ///
+    /// This does not populate the owned decode cache used by [`get()`](Self::get).
+    pub fn view(&self) -> Result<wa::HistorySyncView<'_>, buffa::DecodeError> {
+        wa::HistorySyncView::decode_view(&self.raw_bytes[..])
     }
 
     /// Access the raw decompressed protobuf bytes for custom/partial decoding.
@@ -943,6 +950,31 @@ mod tests {
         let hs = lazy.get().expect("should decode");
         assert_eq!(hs.conversations.len(), 1);
         assert_eq!(hs.conversations[0].id, "chat@s.whatsapp.net");
+    }
+
+    #[test]
+    fn lazy_history_sync_view_decodes_without_materializing_owned() {
+        let bytes = make_history_sync_bytes(vec![wa::Conversation {
+            id: "view@s.whatsapp.net".to_string(),
+            ..Default::default()
+        }]);
+        let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
+
+        let view = lazy.view().expect("view should decode");
+        assert_eq!(view.conversations.len(), 1);
+        assert_eq!(view.conversations[0].id, "view@s.whatsapp.net");
+        assert!(lazy.parsed.get().is_none());
+
+        assert!(lazy.get().is_some());
+        assert!(lazy.parsed.get().is_some());
+    }
+
+    #[test]
+    fn lazy_history_sync_view_rejects_corrupt_bytes() {
+        let lazy = LazyHistorySync::new(Bytes::from_static(&[0xFF, 0xFF, 0xFF]), 0, None, None);
+
+        assert!(lazy.view().is_err());
+        assert!(lazy.parsed.get().is_none());
     }
 
     #[test]

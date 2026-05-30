@@ -343,11 +343,10 @@ impl Client {
             }
         };
 
-        if web_msg_info.message.is_unset() {
+        let Some(message) = web_msg_info.message.into_option() else {
             warn!("PDO response WebMessageInfo missing message content");
             return;
-        }
-        let message = web_msg_info.message.into_option().unwrap();
+        };
 
         {
             use wacore::proto_helpers::MessageExt;

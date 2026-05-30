@@ -254,7 +254,11 @@ impl PairUtils {
                 text: "internal-error",
                 source: e.into(),
             })?;
-        let key_index = identity_details.key_index.unwrap_or(0);
+        let key_index = identity_details.key_index.ok_or_else(|| PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: anyhow::anyhow!("ADVDeviceIdentity missing key_index"),
+        })?;
 
         // 5. Marshal the modified signed_identity to send back
         let self_signed_identity_bytes = signed_identity.encode_to_vec();
@@ -632,6 +636,15 @@ mod tests {
         adv_secret_for_hmac: &[u8; 32],
         is_hosted: bool,
     ) -> Vec<u8> {
+        build_pair_success_payload_with_key_index(state, adv_secret_for_hmac, is_hosted, Some(0))
+    }
+
+    fn build_pair_success_payload_with_key_index(
+        state: &DeviceState,
+        adv_secret_for_hmac: &[u8; 32],
+        is_hosted: bool,
+        key_index: Option<u32>,
+    ) -> Vec<u8> {
         use buffa::Message;
         use waproto::whatsapp as wa;
 
@@ -645,7 +658,7 @@ mod tests {
         let inner = wa::ADVDeviceIdentity {
             raw_id: Some(1),
             timestamp: Some(0),
-            key_index: Some(0),
+            key_index,
             account_type: Some(account_type),
             device_type: Some(account_type),
         }
@@ -701,6 +714,19 @@ mod tests {
             .expect_err("mismatched HMAC must abort pairing");
         assert_eq!(err.code, 401, "expected 401 unauthorized, got {}", err.code);
         assert_eq!(err.text, "hmac-mismatch");
+    }
+
+    #[test]
+    fn do_pair_crypto_rejects_missing_key_index() {
+        let state = dummy_device_state();
+        let payload =
+            build_pair_success_payload_with_key_index(&state, &state.adv_secret_key, false, None);
+
+        let err = PairUtils::do_pair_crypto(&state, &payload)
+            .expect_err("missing key_index should abort pairing");
+
+        assert_eq!(err.code, 500);
+        assert!(err.source.to_string().contains("missing key_index"));
     }
 
     #[test]

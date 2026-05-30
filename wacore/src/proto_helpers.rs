@@ -57,8 +57,10 @@ macro_rules! for_each_context_info_message {
 macro_rules! for_each_context_info_impl {
     ($msg:expr, $ctx:ident, $body:block, $($field:ident),+ $(,)?) => {
         $(
-            if let Some(m) = $msg.$field.as_option_mut() {
-                if let Some($ctx) = m.context_info.as_option_mut() $body
+            if let Some(m) = $msg.$field.as_option_mut()
+                && let Some($ctx) = m.context_info.as_option_mut()
+            {
+                $body
             }
         )+
     };
@@ -115,7 +117,7 @@ pub trait MessageExt {
     /// let context_info = wa::ContextInfo {
     ///     stanza_id: Some(message_id.clone()),
     ///     participant: Some(sender_jid.to_string()),
-    ///     quoted_message: Some(original_message.prepare_for_quote()),
+    ///     quoted_message: buffa::MessageField::from_box(original_message.prepare_for_quote()),
     ///     ..Default::default()
     /// };
     /// ```
@@ -141,7 +143,7 @@ pub trait MessageExt {
     /// let context = wa::ContextInfo {
     ///     stanza_id: Some("original-msg-id".to_string()),
     ///     participant: Some("sender@s.whatsapp.net".to_string()),
-    ///     quoted_message: Some(original_msg.prepare_for_quote()),
+    ///     quoted_message: buffa::MessageField::from_box(original_msg.prepare_for_quote()),
     ///     ..Default::default()
     /// };
     ///
@@ -346,14 +348,12 @@ impl MessageExt for wa::Message {
         macro_rules! check {
             ($($field:ident),+ $(,)?) => {
                 $(
-                    if let Some(m) = self.$field.as_option() {
-                        if let Some(ctx) = m.context_info.as_option() {
-                            if let Some(exp) = ctx.expiration {
-                                if exp > 0 {
-                                    return Some(exp);
-                                }
-                            }
-                        }
+                    if let Some(m) = self.$field.as_option()
+                        && let Some(ctx) = m.context_info.as_option()
+                        && let Some(exp) = ctx.expiration
+                        && exp > 0
+                    {
+                        return Some(exp);
                     }
                 )+
             };
@@ -455,10 +455,10 @@ pub(crate) fn strip_nested_context_info(msg: &mut wa::Message) {
     macro_rules! recurse_into_wrapper {
         ($($wrapper:ident),+ $(,)?) => {
             $(
-                if let Some(wrapper) = msg.$wrapper.as_option_mut() {
-                    if let Some(inner) = wrapper.message.as_option_mut() {
-                        strip_nested_context_info(inner);
-                    }
+                if let Some(wrapper) = msg.$wrapper.as_option_mut()
+                    && let Some(inner) = wrapper.message.as_option_mut()
+                {
+                    strip_nested_context_info(inner);
                 }
             )+
         };

@@ -415,29 +415,25 @@ impl SessionState {
         Ok(self.get_sender_chain_key()?.key().to_vec())
     }
 
-    pub fn set_sender_chain_key(&mut self, next_chain_key: &ChainKey) {
+    pub fn set_sender_chain_key(
+        &mut self,
+        next_chain_key: &ChainKey,
+    ) -> Result<(), InvalidSessionError> {
         use bytes::Bytes;
         let chain_key = session_structure::chain::ChainKey {
             index: Some(next_chain_key.index()),
             key: Some(Bytes::copy_from_slice(next_chain_key.key())),
         };
 
-        // Is it actually valid to call this function with sender_chain == None?
-
-        let new_chain = match self.session.sender_chain.take() {
-            None => session_structure::Chain {
-                sender_ratchet_key: Some(vec![]),
-                sender_ratchet_key_private: Some(vec![]),
-                chain_key: MessageField::some(chain_key),
-                message_keys: vec![],
-            },
-            Some(mut c) => {
-                c.chain_key = MessageField::some(chain_key);
-                c
-            }
-        };
+        let mut new_chain = self
+            .session
+            .sender_chain
+            .take()
+            .ok_or(InvalidSessionError("missing sender chain"))?;
+        new_chain.chain_key = MessageField::some(chain_key);
 
         self.session.sender_chain = MessageField::some(new_chain);
+        Ok(())
     }
 
     pub fn get_message_keys(
@@ -1010,6 +1006,25 @@ mod tests {
         state.set_sender_chain(&sender_keypair, &chain_key);
 
         state
+    }
+
+    #[test]
+    fn set_sender_chain_key_requires_existing_sender_chain() {
+        let mut csprng = rng();
+        let identity_keypair = KeyPair::generate(&mut csprng);
+        let their_identity = IdentityKey::new(identity_keypair.public_key);
+        let our_identity = IdentityKey::new(KeyPair::generate(&mut csprng).public_key);
+        let root_key = crate::protocol::ratchet::RootKey::new([0u8; 32]);
+        let base_key = KeyPair::generate(&mut csprng).public_key;
+        let mut state = SessionState::new(3, &our_identity, &their_identity, &root_key, &base_key);
+        let chain_key = crate::protocol::ratchet::ChainKey::new([1u8; 32], 0);
+
+        let err = state
+            .set_sender_chain_key(&chain_key)
+            .expect_err("missing sender chain should fail");
+
+        assert_eq!(err.to_string(), "missing sender chain");
+        assert!(!state.has_usable_sender_chain().unwrap());
     }
 
     /// Creates a SessionRecord with N previous sessions for testing.

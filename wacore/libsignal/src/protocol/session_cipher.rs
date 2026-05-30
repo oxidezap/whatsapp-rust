@@ -193,7 +193,7 @@ async fn message_encrypt_inner(
         .save_identity(remote_address, &their_identity_key)
         .await?;
 
-    session_state.set_sender_chain_key(&next_chain_key);
+    session_state.set_sender_chain_key(&next_chain_key)?;
 
     Ok(message)
 }

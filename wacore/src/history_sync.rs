@@ -1,6 +1,9 @@
 use bytes::Bytes;
 use thiserror::Error;
 use wacore_binary::zlib_pool::decompress_zlib_pooled;
+use waproto::whatsapp as wa;
+
+use buffa::view::MessageView as _;
 
 #[derive(Debug, Error)]
 pub enum HistorySyncError {
@@ -28,18 +31,11 @@ pub struct HistorySyncResult {
     pub decompressed_bytes: Option<Bytes>,
 }
 
-mod wire_type {
-    pub const VARINT: u32 = 0;
-    pub const FIXED64: u32 = 1;
-    pub const LENGTH_DELIMITED: u32 = 2;
-    pub const FIXED32: u32 = 5;
-}
-
 /// Decompress and process a history sync blob.
 ///
-/// **Memory strategy**: Decompresses the entire blob into a single `Bytes`
-/// buffer, then scans top-level fields and partially decodes only the
-/// conversation fields needed for internal caches.
+/// **Memory strategy**: Decompresses the entire blob into a single `Bytes`.
+/// Buffa views borrow from that buffer while extracting internal cache data,
+/// so strings and bytes are only cloned when they are persisted.
 ///
 /// After decompression, the compressed input is dropped immediately, so peak
 /// memory = max(compressed, decompressed) + small overhead, not both.
@@ -58,7 +54,6 @@ pub fn process_history_sync(
     drop(compressed_data);
 
     let buf = Bytes::from(decompressed);
-    let mut pos = 0;
     let mut result = HistorySyncResult {
         own_pushname: None,
         nct_salt: None,
@@ -68,190 +63,37 @@ pub fn process_history_sync(
         decompressed_bytes: if retain_blob { Some(buf.clone()) } else { None },
     };
 
-    while pos < buf.len() {
-        let (tag, bytes_read) = read_varint(&buf[pos..])?;
-        pos += bytes_read;
+    let view = wa::HistorySyncView::decode_view(&buf)?;
 
-        let field_number = (tag >> 3) as u32;
-        let wire_type_raw = (tag & 0x7) as u32;
+    for conversation in &view.conversations {
+        result.conversations_processed += 1;
+        let extracted = extract_conversation_fields(conversation);
+        if let Some(candidate) = extracted.tc_token_candidate {
+            result.tc_token_candidates.push(candidate);
+        }
+        result
+            .msg_secret_records
+            .extend(extracted.msg_secret_records);
+    }
 
-        match field_number {
-            // field 2 = conversations (repeated, length-delimited)
-            2 if wire_type_raw == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(&buf[pos..])?;
-                pos += vlen;
-                let end = checked_end(pos, len, buf.len(), "conversation")?;
-
-                result.conversations_processed += 1;
-                let extracted = extract_conversation_fields(&buf[pos..end]);
-                if let Some(candidate) = extracted.tc_token_candidate {
-                    result.tc_token_candidates.push(candidate);
-                }
-                result
-                    .msg_secret_records
-                    .extend(extracted.msg_secret_records);
-                pos = end;
-            }
-
-            // field 7 = pushnames (repeated, length-delimited).
-            // Uses `Option::is_some()` in the guard rather than an
-            // `if let` guard — the latter requires Rust 1.94+. The inner
-            // `if let` is the defensive complement: if the guard's
-            // invariant is ever weakened by a future refactor, we skip
-            // the arm body instead of panicking.
-            7 if own_user.is_some()
-                && result.own_pushname.is_none()
-                && wire_type_raw == wire_type::LENGTH_DELIMITED =>
+    if let Some(own) = own_user
+        && result.own_pushname.is_none()
+    {
+        for pushname in &view.pushnames {
+            if pushname.id == Some(own)
+                && let Some(name) = pushname.pushname
             {
-                let (len, vlen) = read_varint(&buf[pos..])?;
-                pos += vlen;
-                let end = checked_end(pos, len, buf.len(), "pushname")?;
-
-                if let Some(own) = own_user
-                    && let Some(name) = extract_own_pushname(&buf[pos..end], own)
-                {
-                    result.own_pushname = Some(name);
-                }
-                pos = end;
-            }
-
-            // field 19 = nctSalt (optional bytes, length-delimited)
-            // Delivered during initial pairing so cstoken is available immediately.
-            // Source: storeNctSaltFromHistorySync in WAWeb/History/MsgHandlerAction.js
-            19 if wire_type_raw == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(&buf[pos..])?;
-                pos += vlen;
-                let end = checked_end(pos, len, buf.len(), "nctSalt")?;
-
-                let salt = buf[pos..end].to_vec();
-                if !salt.is_empty() {
-                    result.nct_salt = Some(salt);
-                }
-                pos = end;
-            }
-
-            _ => {
-                pos = skip_field(wire_type_raw, &buf, pos)?;
+                result.own_pushname = Some(name.to_string());
+                break;
             }
         }
+    }
+
+    if let Some(salt) = view.nct_salt.filter(|salt| !salt.is_empty()) {
+        result.nct_salt = Some(salt.to_vec());
     }
 
     Ok(result)
-}
-
-/// Compute `pos + len` with overflow and bounds checking.
-#[inline]
-fn checked_end(
-    pos: usize,
-    len: u64,
-    buf_len: usize,
-    field: &str,
-) -> Result<usize, HistorySyncError> {
-    let len = usize::try_from(len).map_err(|_| {
-        HistorySyncError::MalformedProtobuf(format!("{field} length overflows usize: {len}"))
-    })?;
-    let end = pos.checked_add(len).ok_or_else(|| {
-        HistorySyncError::MalformedProtobuf(format!(
-            "{field} field overflows: pos={pos}, len={len}"
-        ))
-    })?;
-    if end > buf_len {
-        return Err(HistorySyncError::MalformedProtobuf(format!(
-            "{field} field overflows buffer: pos={pos}, len={len}, buf={buf_len}"
-        )));
-    }
-    Ok(end)
-}
-
-/// Read a protobuf varint from `data`, returning (value, bytes_consumed).
-#[inline]
-fn read_varint(data: &[u8]) -> Result<(u64, usize), HistorySyncError> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-    for (i, &byte) in data.iter().enumerate() {
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Ok((value, i + 1));
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(HistorySyncError::MalformedProtobuf(
-                "varint too long".into(),
-            ));
-        }
-    }
-    Err(HistorySyncError::MalformedProtobuf(
-        "unexpected end of data in varint".into(),
-    ))
-}
-
-/// Skip a protobuf field based on wire type, returning the new position.
-#[inline]
-fn skip_field(wire_type: u32, buf: &[u8], pos: usize) -> Result<usize, HistorySyncError> {
-    match wire_type {
-        wire_type::VARINT => {
-            let (_, vlen) = read_varint(&buf[pos..])?;
-            Ok(pos + vlen)
-        }
-        wire_type::FIXED64 => checked_end(pos, 8, buf.len(), "fixed64"),
-        wire_type::LENGTH_DELIMITED => {
-            let (len, vlen) = read_varint(&buf[pos..])?;
-            checked_end(pos + vlen, len, buf.len(), "length-delimited")
-        }
-        wire_type::FIXED32 => checked_end(pos, 4, buf.len(), "fixed32"),
-        _ => {
-            log::warn!("Unknown wire type {wire_type} in history sync, cannot skip");
-            Err(HistorySyncError::MalformedProtobuf(format!(
-                "unknown wire type {wire_type}"
-            )))
-        }
-    }
-}
-
-/// Manual pushname parser — Pushname proto has fields: id (tag 1) and pushname (tag 2).
-/// Checks id first and only allocates the pushname string if id matches `own_user`.
-fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
-    let mut pos = 0;
-    let mut id_match = false;
-    let mut pushname: Option<String> = None;
-
-    while pos < data.len() {
-        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
-        pos += bytes_read;
-        let field_number = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-
-        match field_number {
-            // id (tag 1, string)
-            1 if wt == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(data.get(pos..)?).ok()?;
-                pos += vlen;
-                let len = usize::try_from(len).ok()?;
-                let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
-                let id = std::str::from_utf8(data.get(pos..end)?).ok()?;
-                id_match = id == own_user;
-                if !id_match {
-                    return None; // wrong user, skip entirely
-                }
-                pos = end;
-            }
-            // pushname (tag 2, string)
-            2 if wt == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(data.get(pos..)?).ok()?;
-                pos += vlen;
-                let len = usize::try_from(len).ok()?;
-                let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
-                let name = std::str::from_utf8(data.get(pos..end)?).ok()?;
-                pushname = Some(name.to_string());
-                pos = end;
-            }
-            _ => {
-                pos = skip_field(wt, data, pos).ok()?;
-            }
-        }
-    }
-
-    if id_match { pushname } else { None }
 }
 
 struct ConversationExtraction {
@@ -270,38 +112,9 @@ pub struct HistoryMsgSecretRecord {
     pub secret: Vec<u8>,
 }
 
-struct ConversationInternalFields<'a> {
-    id: Option<String>,
-    messages: Vec<&'a [u8]>,
-    tc_token: Option<Vec<u8>>,
-    tc_token_timestamp: Option<u64>,
-    tc_token_sender_timestamp: Option<u64>,
-}
-
-struct WebMessageInfoInternalFields {
-    key: Option<MessageKeyInternalFields>,
-    participant: Option<String>,
-    message_secret: Option<Vec<u8>>,
-    message_context_secret: Option<Vec<u8>>,
-    message_is_forwarded: bool,
-}
-
-struct MessageKeyInternalFields {
-    from_me: Option<bool>,
-    id: Option<String>,
-    participant: Option<String>,
-}
-
-fn extract_conversation_fields(data: &[u8]) -> ConversationExtraction {
-    let Some(conv) = parse_conversation_internal_fields(data) else {
-        return ConversationExtraction {
-            tc_token_candidate: None,
-            msg_secret_records: Vec::new(),
-        };
-    };
-
-    let tc_token_candidate = extract_tc_token_fields(&conv);
-    let msg_secret_records = extract_msg_secret_records(&conv);
+fn extract_conversation_fields(conv: &wa::ConversationView<'_>) -> ConversationExtraction {
+    let tc_token_candidate = extract_tc_token_fields(conv);
+    let msg_secret_records = extract_msg_secret_records(conv);
 
     ConversationExtraction {
         tc_token_candidate,
@@ -309,54 +122,12 @@ fn extract_conversation_fields(data: &[u8]) -> ConversationExtraction {
     }
 }
 
-fn parse_conversation_internal_fields(data: &[u8]) -> Option<ConversationInternalFields<'_>> {
-    let mut pos = 0;
-    let mut conv = ConversationInternalFields {
-        id: None,
-        messages: Vec::new(),
-        tc_token: None,
-        tc_token_timestamp: None,
-        tc_token_sender_timestamp: None,
-    };
-
-    while pos < data.len() {
-        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
-        pos += bytes_read;
-        let field_number = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-
-        match field_number {
-            1 if wt == wire_type::LENGTH_DELIMITED => {
-                conv.id = Some(read_string(data, &mut pos)?.to_string());
-            }
-            2 if wt == wire_type::LENGTH_DELIMITED => {
-                conv.messages.push(read_length_delimited(data, &mut pos)?);
-            }
-            21 if wt == wire_type::LENGTH_DELIMITED => {
-                conv.tc_token = Some(read_length_delimited(data, &mut pos)?.to_vec());
-            }
-            22 if wt == wire_type::VARINT => {
-                let (val, vlen) = read_varint(data.get(pos..)?).ok()?;
-                pos += vlen;
-                conv.tc_token_timestamp = Some(val);
-            }
-            28 if wt == wire_type::VARINT => {
-                let (val, vlen) = read_varint(data.get(pos..)?).ok()?;
-                pos += vlen;
-                conv.tc_token_sender_timestamp = Some(val);
-            }
-            _ => {
-                pos = skip_field(wt, data, pos).ok()?;
-            }
-        }
-    }
-
-    Some(conv)
-}
-
 /// Returns `None` for groups, newsletters, bots, or conversations without tctokens.
-fn extract_tc_token_fields(conv: &ConversationInternalFields<'_>) -> Option<TcTokenCandidate> {
-    let id = conv.id.as_ref()?;
+fn extract_tc_token_fields(conv: &wa::ConversationView<'_>) -> Option<TcTokenCandidate> {
+    let id = conv.id;
+    if id.is_empty() {
+        return None;
+    }
 
     // Early-out for non-1:1 conversations
     if let Some(parts) = wacore_binary::jid::parse_jid_fast(id)
@@ -365,390 +136,189 @@ fn extract_tc_token_fields(conv: &ConversationInternalFields<'_>) -> Option<TcTo
         return None;
     }
 
-    let tc_token = conv.tc_token.as_ref().filter(|t| !t.is_empty())?.clone();
+    let tc_token = conv.tc_token.filter(|t| !t.is_empty())?.to_vec();
     let tc_token_timestamp = conv.tc_token_timestamp?;
 
     Some(TcTokenCandidate {
-        id: id.clone(),
+        id: id.to_string(),
         tc_token,
         tc_token_timestamp,
         tc_token_sender_timestamp: conv.tc_token_sender_timestamp,
     })
 }
 
-fn extract_msg_secret_records(
-    conv: &ConversationInternalFields<'_>,
-) -> Vec<HistoryMsgSecretRecord> {
+fn extract_msg_secret_records(conv: &wa::ConversationView<'_>) -> Vec<HistoryMsgSecretRecord> {
     let mut records = Vec::new();
-    let Some(chat_id) = conv.id.as_ref() else {
+    let chat_id = conv.id;
+    if chat_id.is_empty() {
         return records;
-    };
+    }
 
     for history_msg in &conv.messages {
-        let Some(web_msg) = parse_history_sync_msg_internal_fields(history_msg) else {
+        let Some(web_msg) = history_msg.message.as_option() else {
             continue;
         };
-        let Some(key) = web_msg.key.as_ref() else {
+        let Some(key) = web_msg.key.as_option() else {
             continue;
         };
-        let Some(msg_id) = key.id.as_ref() else {
+        let Some(msg_id) = key.id else {
             continue;
         };
-        if web_msg.message_is_forwarded {
+        if web_msg
+            .message
+            .as_option()
+            .is_some_and(message_is_forwarded)
+        {
             continue;
         }
-        let Some(secret) = web_msg
-            .message_secret
-            .as_ref()
-            .or(web_msg.message_context_secret.as_ref())
-        else {
+        let Some(secret) = web_msg.message_secret.or_else(|| {
+            web_msg
+                .message
+                .as_option()
+                .and_then(extract_message_context_secret)
+        }) else {
             continue;
         };
 
         records.push(HistoryMsgSecretRecord {
-            chat_id: chat_id.clone(),
+            chat_id: chat_id.to_string(),
             from_me: key.from_me == Some(true),
-            key_participant: key.participant.clone(),
-            web_msg_participant: web_msg.participant.clone(),
-            msg_id: msg_id.clone(),
-            secret: secret.clone(),
+            key_participant: key.participant.map(str::to_string),
+            web_msg_participant: web_msg.participant.map(str::to_string),
+            msg_id: msg_id.to_string(),
+            secret: secret.to_vec(),
         });
     }
 
     records
 }
 
-fn parse_history_sync_msg_internal_fields(data: &[u8]) -> Option<WebMessageInfoInternalFields> {
-    let mut pos = 0;
-    let mut web_msg = None;
-
-    while pos < data.len() {
-        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
-        pos += bytes_read;
-        let field_number = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-
-        match field_number {
-            1 if wt == wire_type::LENGTH_DELIMITED => {
-                web_msg =
-                    parse_web_message_info_internal_fields(read_length_delimited(data, &mut pos)?);
-            }
-            _ => pos = skip_field(wt, data, pos).ok()?,
-        }
-    }
-
-    web_msg
+fn extract_message_context_secret<'a>(message: &'a wa::MessageView<'a>) -> Option<&'a [u8]> {
+    message.message_context_info.as_option()?.message_secret
 }
 
-fn parse_web_message_info_internal_fields(data: &[u8]) -> Option<WebMessageInfoInternalFields> {
-    let mut pos = 0;
-    let mut web_msg = WebMessageInfoInternalFields {
-        key: None,
-        participant: None,
-        message_secret: None,
-        message_context_secret: None,
-        message_is_forwarded: false,
-    };
-
-    while pos < data.len() {
-        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
-        pos += bytes_read;
-        let field_number = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-
-        match field_number {
-            1 if wt == wire_type::LENGTH_DELIMITED => {
-                web_msg.key =
-                    parse_message_key_internal_fields(read_length_delimited(data, &mut pos)?);
-            }
-            2 if wt == wire_type::LENGTH_DELIMITED => {
-                let message = read_length_delimited(data, &mut pos)?;
-                web_msg.message_context_secret = extract_message_context_secret(message);
-                web_msg.message_is_forwarded = message_is_forwarded(message);
-            }
-            5 if wt == wire_type::LENGTH_DELIMITED => {
-                web_msg.participant = Some(read_string(data, &mut pos)?.to_string());
-            }
-            49 if wt == wire_type::LENGTH_DELIMITED => {
-                web_msg.message_secret = Some(read_length_delimited(data, &mut pos)?.to_vec());
-            }
-            _ => pos = skip_field(wt, data, pos).ok()?,
-        }
-    }
-
-    Some(web_msg)
+fn message_is_forwarded(message: &wa::MessageView<'_>) -> bool {
+    message_is_forwarded_at_depth(message, 0)
 }
 
-fn parse_message_key_internal_fields(data: &[u8]) -> Option<MessageKeyInternalFields> {
-    let mut pos = 0;
-    let mut key = MessageKeyInternalFields {
-        from_me: None,
-        id: None,
-        participant: None,
-    };
-
-    while pos < data.len() {
-        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
-        pos += bytes_read;
-        let field_number = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-
-        match field_number {
-            2 if wt == wire_type::VARINT => {
-                let (val, vlen) = read_varint(data.get(pos..)?).ok()?;
-                pos += vlen;
-                key.from_me = Some(val != 0);
-            }
-            3 if wt == wire_type::LENGTH_DELIMITED => {
-                key.id = Some(read_string(data, &mut pos)?.to_string());
-            }
-            4 if wt == wire_type::LENGTH_DELIMITED => {
-                key.participant = Some(read_string(data, &mut pos)?.to_string());
-            }
-            _ => pos = skip_field(wt, data, pos).ok()?,
-        }
-    }
-
-    Some(key)
-}
-
-fn extract_message_context_secret(data: &[u8]) -> Option<Vec<u8>> {
-    let mut pos = 0;
-
-    while pos < data.len() {
-        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
-        pos += bytes_read;
-        let field_number = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-
-        match field_number {
-            35 if wt == wire_type::LENGTH_DELIMITED => {
-                if let Some(secret) =
-                    extract_message_context_info_secret(read_length_delimited(data, &mut pos)?)
-                {
-                    return Some(secret);
-                }
-            }
-            _ => pos = skip_field(wt, data, pos).ok()?,
-        }
-    }
-
-    None
-}
-
-fn extract_message_context_info_secret(data: &[u8]) -> Option<Vec<u8>> {
-    let mut pos = 0;
-
-    while pos < data.len() {
-        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
-        pos += bytes_read;
-        let field_number = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-
-        match field_number {
-            3 if wt == wire_type::LENGTH_DELIMITED => {
-                return Some(read_length_delimited(data, &mut pos)?.to_vec());
-            }
-            _ => pos = skip_field(wt, data, pos).ok()?,
-        }
-    }
-
-    None
-}
-
-fn message_is_forwarded(data: &[u8]) -> bool {
-    message_is_forwarded_at_depth(data, 0)
-}
-
-fn message_is_forwarded_at_depth(data: &[u8], depth: usize) -> bool {
+fn message_is_forwarded_at_depth(message: &wa::MessageView<'_>, depth: usize) -> bool {
     if depth > 16 {
         return false;
     }
 
-    let mut pos = 0;
-    let mut current_forwarded = false;
-    let mut device_sent_inner = None;
-    let mut ephemeral_inner = None;
-    let mut view_once_inner = None;
-    let mut view_once_v2_inner = None;
-    let mut view_once_v2_extension_inner = None;
-    let mut document_with_caption_inner = None;
-    let mut edited_inner = None;
-    let mut group_mentioned_inner = None;
-    let mut bot_invoke_inner = None;
-    let mut poll_creation_option_image_inner = None;
-    let mut associated_child_inner = None;
-
-    while pos < data.len() {
-        let Some((tag, bytes_read)) = read_varint(data.get(pos..).unwrap_or_default()).ok() else {
-            return false;
-        };
-        pos += bytes_read;
-        let field_number = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-
-        if wt == wire_type::LENGTH_DELIMITED {
-            let Some(value) = read_length_delimited(data, &mut pos) else {
-                return false;
-            };
-            match field_number {
-                31 => device_sent_inner = extract_wrapper_message(value, 2),
-                37 => view_once_inner = extract_wrapper_message(value, 1),
-                40 => ephemeral_inner = extract_wrapper_message(value, 1),
-                53 => document_with_caption_inner = extract_wrapper_message(value, 1),
-                55 => view_once_v2_inner = extract_wrapper_message(value, 1),
-                58 => edited_inner = extract_wrapper_message(value, 1),
-                59 => view_once_v2_extension_inner = extract_wrapper_message(value, 1),
-                62 => group_mentioned_inner = extract_wrapper_message(value, 1),
-                67 => bot_invoke_inner = extract_wrapper_message(value, 1),
-                90 => poll_creation_option_image_inner = extract_wrapper_message(value, 1),
-                91 => associated_child_inner = extract_wrapper_message(value, 1),
-                field => {
-                    if let Some(context_tag) = context_info_field_tag(field)
-                        && context_info_carrier_is_forwarded(value, context_tag)
-                    {
-                        current_forwarded = true;
-                    }
-                }
-            }
-        } else {
-            let Ok(new_pos) = skip_field(wt, data, pos) else {
-                return false;
-            };
-            pos = new_pos;
-        }
-    }
-
-    if let Some(inner) = [
-        device_sent_inner,
-        ephemeral_inner,
-        view_once_inner,
-        view_once_v2_inner,
-        view_once_v2_extension_inner,
-        document_with_caption_inner,
-        edited_inner,
-        group_mentioned_inner,
-        bot_invoke_inner,
-        poll_creation_option_image_inner,
-        associated_child_inner,
-    ]
-    .into_iter()
-    .flatten()
-    .next()
-    {
+    if let Some(inner) = first_wrapped_message(message) {
         return message_is_forwarded_at_depth(inner, depth + 1);
     }
 
-    current_forwarded
+    message_context_is_forwarded(message)
 }
 
-fn extract_wrapper_message(data: &[u8], message_field: u32) -> Option<&[u8]> {
-    let mut pos = 0;
-
-    while pos < data.len() {
-        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
-        pos += bytes_read;
-        let field_number = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-
-        match field_number {
-            n if n == message_field && wt == wire_type::LENGTH_DELIMITED => {
-                return read_length_delimited(data, &mut pos);
-            }
-            _ => pos = skip_field(wt, data, pos).ok()?,
-        }
+fn first_wrapped_message<'a>(message: &'a wa::MessageView<'a>) -> Option<&'a wa::MessageView<'a>> {
+    if let Some(wrapper) = message.device_sent_message.as_option()
+        && let Some(inner) = wrapper.message.as_option()
+    {
+        return Some(inner);
     }
+
+    macro_rules! future_proof_inner {
+        ($($field:ident),* $(,)?) => {
+            $(
+                if let Some(wrapper) = message.$field.as_option()
+                    && let Some(inner) = wrapper.message.as_option()
+                {
+                    return Some(inner);
+                }
+            )*
+        };
+    }
+
+    future_proof_inner!(
+        ephemeral_message,
+        view_once_message,
+        view_once_message_v2,
+        view_once_message_v2_extension,
+        document_with_caption_message,
+        edited_message,
+        group_mentioned_message,
+        bot_invoke_message,
+        lottie_sticker_message,
+        event_cover_image,
+        status_mention_message,
+        poll_creation_option_image_message,
+        associated_child_message,
+        group_status_mention_message,
+        poll_creation_message_v4,
+        status_add_yours,
+        group_status_message,
+        limit_sharing_message,
+        bot_task_message,
+        question_message,
+        group_status_message_v2,
+        bot_forwarded_message,
+        question_reply_message,
+        newsletter_admin_profile_message,
+        newsletter_admin_profile_message_v2,
+        spoiler_message,
+    );
 
     None
 }
 
-fn context_info_field_tag(message_field: u32) -> Option<u32> {
-    match message_field {
-        75 => Some(1),
-        25 | 29 | 43 => Some(3),
-        39 => Some(4),
-        49 | 60 | 64 => Some(5),
-        78 => Some(6),
-        28 => Some(7),
-        36 | 42 => Some(8),
-        86 => Some(11),
-        45 | 48 => Some(15),
-        3 | 4 | 5 | 6 | 7 | 8 | 9 | 13 | 18 | 26 | 30 | 38 => Some(17),
-        _ => None,
-    }
-}
-
-fn context_info_carrier_is_forwarded(data: &[u8], context_tag: u32) -> bool {
-    let mut pos = 0;
-
-    while pos < data.len() {
-        let Some((tag, bytes_read)) = read_varint(data.get(pos..).unwrap_or_default()).ok() else {
-            return false;
+fn message_context_is_forwarded(message: &wa::MessageView<'_>) -> bool {
+    macro_rules! has_forwarded_context {
+        ($($field:ident),* $(,)?) => {
+            $(
+                if message.$field.as_option()
+                    .and_then(|message| message.context_info.as_option())
+                    .is_some_and(context_info_is_forwarded)
+                {
+                    return true;
+                }
+            )*
         };
-        pos += bytes_read;
-        let field_number = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-
-        if field_number == context_tag && wt == wire_type::LENGTH_DELIMITED {
-            let Some(context) = read_length_delimited(data, &mut pos) else {
-                return false;
-            };
-            if context_info_is_forwarded(context) {
-                return true;
-            }
-        } else {
-            let Ok(new_pos) = skip_field(wt, data, pos) else {
-                return false;
-            };
-            pos = new_pos;
-        }
     }
+
+    has_forwarded_context!(
+        event_message,
+        template_message,
+        template_button_reply_message,
+        buttons_response_message,
+        list_response_message,
+        poll_creation_message,
+        poll_creation_message_v2,
+        poll_creation_message_v3,
+        poll_creation_message_v5,
+        poll_creation_message_v6,
+        newsletter_admin_invite_message,
+        group_invite_message,
+        list_message,
+        buttons_message,
+        sticker_pack_message,
+        interactive_message,
+        interactive_response_message,
+        image_message,
+        contact_message,
+        location_message,
+        extended_text_message,
+        document_message,
+        audio_message,
+        video_message,
+        ptv_message,
+        contacts_array_message,
+        live_location_message,
+        sticker_message,
+        product_message,
+        order_message,
+        rich_response_message,
+        message_history_notice,
+        event_invite_message,
+    );
 
     false
 }
 
-fn context_info_is_forwarded(data: &[u8]) -> bool {
-    let mut pos = 0;
-
-    while pos < data.len() {
-        let Some((tag, bytes_read)) = read_varint(data.get(pos..).unwrap_or_default()).ok() else {
-            return false;
-        };
-        pos += bytes_read;
-        let field_number = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-
-        if field_number == 22 && wt == wire_type::VARINT {
-            let Ok((val, vlen)) = read_varint(data.get(pos..).unwrap_or_default()) else {
-                return false;
-            };
-            pos += vlen;
-            if val != 0 {
-                return true;
-            }
-        } else {
-            let Ok(new_pos) = skip_field(wt, data, pos) else {
-                return false;
-            };
-            pos = new_pos;
-        }
-    }
-
-    false
-}
-
-fn read_length_delimited<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
-    let (len, vlen) = read_varint(data.get(*pos..)?).ok()?;
-    *pos += vlen;
-    let len = usize::try_from(len).ok()?;
-    let end = (*pos).checked_add(len).filter(|&e| e <= data.len())?;
-    let value = data.get(*pos..end)?;
-    *pos = end;
-    Some(value)
-}
-
-fn read_string<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a str> {
-    std::str::from_utf8(read_length_delimited(data, pos)?).ok()
+fn context_info_is_forwarded(context: &wa::ContextInfoView<'_>) -> bool {
+    context.is_forwarded == Some(true)
 }
 
 /// Tctoken data extracted from a conversation during streaming.
