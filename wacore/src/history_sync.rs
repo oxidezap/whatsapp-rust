@@ -31,11 +31,18 @@ pub struct HistorySyncResult {
     pub decompressed_bytes: Option<Bytes>,
 }
 
+mod wire_type {
+    pub const VARINT: u32 = 0;
+    pub const FIXED64: u32 = 1;
+    pub const LENGTH_DELIMITED: u32 = 2;
+    pub const FIXED32: u32 = 5;
+}
+
 /// Decompress and process a history sync blob.
 ///
-/// **Memory strategy**: Decompresses the entire blob into a single `Bytes`.
-/// Buffa views borrow from that buffer while extracting internal cache data,
-/// so strings and bytes are only cloned when they are persisted.
+/// **Memory strategy**: Decompresses the entire blob into a single `Bytes`,
+/// then scans top-level fields and decodes each conversation as a Buffa view
+/// one at a time. Strings and bytes are cloned only when they are persisted.
 ///
 /// After decompression, the compressed input is dropped immediately, so peak
 /// memory = max(compressed, decompressed) + small overhead, not both.
@@ -54,6 +61,7 @@ pub fn process_history_sync(
     drop(compressed_data);
 
     let buf = Bytes::from(decompressed);
+    let mut pos = 0;
     let mut result = HistorySyncResult {
         own_pushname: None,
         nct_salt: None,
@@ -63,37 +71,144 @@ pub fn process_history_sync(
         decompressed_bytes: if retain_blob { Some(buf.clone()) } else { None },
     };
 
-    let view = wa::HistorySyncView::decode_view(&buf)?;
+    while pos < buf.len() {
+        let (tag, bytes_read) = read_varint(&buf[pos..])?;
+        pos += bytes_read;
 
-    for conversation in &view.conversations {
-        result.conversations_processed += 1;
-        let extracted = extract_conversation_fields(conversation);
-        if let Some(candidate) = extracted.tc_token_candidate {
-            result.tc_token_candidates.push(candidate);
-        }
-        result
-            .msg_secret_records
-            .extend(extracted.msg_secret_records);
-    }
+        let field_number = (tag >> 3) as u32;
+        let wire_type_raw = (tag & 0x7) as u32;
 
-    if let Some(own) = own_user
-        && result.own_pushname.is_none()
-    {
-        for pushname in &view.pushnames {
-            if pushname.id == Some(own)
-                && let Some(name) = pushname.pushname
+        match field_number {
+            2 if wire_type_raw == wire_type::LENGTH_DELIMITED => {
+                let (len, vlen) = read_varint(&buf[pos..])?;
+                pos += vlen;
+                let end = checked_end(pos, len, buf.len(), "conversation")?;
+
+                let conversation = wa::ConversationView::decode_view(&buf[pos..end])?;
+                result.conversations_processed += 1;
+                let extracted = extract_conversation_fields(&conversation);
+                if let Some(candidate) = extracted.tc_token_candidate {
+                    result.tc_token_candidates.push(candidate);
+                }
+                result
+                    .msg_secret_records
+                    .extend(extracted.msg_secret_records);
+                pos = end;
+            }
+            7 if own_user.is_some()
+                && result.own_pushname.is_none()
+                && wire_type_raw == wire_type::LENGTH_DELIMITED =>
             {
-                result.own_pushname = Some(name.to_string());
-                break;
+                let (len, vlen) = read_varint(&buf[pos..])?;
+                pos += vlen;
+                let end = checked_end(pos, len, buf.len(), "pushname")?;
+
+                if let Some(own) = own_user
+                    && let Some(name) = extract_own_pushname(&buf[pos..end], own)?
+                {
+                    result.own_pushname = Some(name);
+                }
+                pos = end;
+            }
+            19 if wire_type_raw == wire_type::LENGTH_DELIMITED => {
+                let (len, vlen) = read_varint(&buf[pos..])?;
+                pos += vlen;
+                let end = checked_end(pos, len, buf.len(), "nctSalt")?;
+
+                let salt = &buf[pos..end];
+                if !salt.is_empty() {
+                    result.nct_salt = Some(salt.to_vec());
+                }
+                pos = end;
+            }
+            _ => {
+                pos = skip_field(wire_type_raw, &buf, pos)?;
             }
         }
     }
 
-    if let Some(salt) = view.nct_salt.filter(|salt| !salt.is_empty()) {
-        result.nct_salt = Some(salt.to_vec());
-    }
-
     Ok(result)
+}
+
+#[inline]
+fn checked_end(
+    pos: usize,
+    len: u64,
+    buf_len: usize,
+    field: &str,
+) -> Result<usize, HistorySyncError> {
+    let len = usize::try_from(len).map_err(|_| {
+        HistorySyncError::MalformedProtobuf(format!("{field} length overflows usize: {len}"))
+    })?;
+    let end = pos.checked_add(len).ok_or_else(|| {
+        HistorySyncError::MalformedProtobuf(format!(
+            "{field} field overflows: pos={pos}, len={len}"
+        ))
+    })?;
+    if end > buf_len {
+        return Err(HistorySyncError::MalformedProtobuf(format!(
+            "{field} field overflows buffer: pos={pos}, len={len}, buf={buf_len}"
+        )));
+    }
+    Ok(end)
+}
+
+#[inline]
+fn read_varint(data: &[u8]) -> Result<(u64, usize), HistorySyncError> {
+    let mut value: u64 = 0;
+    let mut shift = 0u32;
+    for (i, &byte) in data.iter().enumerate() {
+        if i == 9 && (byte & 0xFE) != 0 {
+            return Err(HistorySyncError::MalformedProtobuf(
+                "varint overflows u64".into(),
+            ));
+        }
+        value |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok((value, i + 1));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(HistorySyncError::MalformedProtobuf(
+                "varint too long".into(),
+            ));
+        }
+    }
+    Err(HistorySyncError::MalformedProtobuf(
+        "unexpected end of data in varint".into(),
+    ))
+}
+
+#[inline]
+fn skip_field(wire_type: u32, buf: &[u8], pos: usize) -> Result<usize, HistorySyncError> {
+    match wire_type {
+        wire_type::VARINT => {
+            let (_, vlen) = read_varint(&buf[pos..])?;
+            Ok(pos + vlen)
+        }
+        wire_type::FIXED64 => checked_end(pos, 8, buf.len(), "fixed64"),
+        wire_type::LENGTH_DELIMITED => {
+            let (len, vlen) = read_varint(&buf[pos..])?;
+            checked_end(pos + vlen, len, buf.len(), "length-delimited")
+        }
+        wire_type::FIXED32 => checked_end(pos, 4, buf.len(), "fixed32"),
+        _ => {
+            log::warn!("Unknown wire type {wire_type} in history sync, cannot skip");
+            Err(HistorySyncError::MalformedProtobuf(format!(
+                "unknown wire type {wire_type}"
+            )))
+        }
+    }
+}
+
+fn extract_own_pushname(data: &[u8], own_user: &str) -> Result<Option<String>, buffa::DecodeError> {
+    let pushname = wa::PushnameView::decode_view(data)?;
+    if pushname.id == Some(own_user)
+        && let Some(name) = pushname.pushname
+    {
+        return Ok(Some(name.to_string()));
+    }
+    Ok(None)
 }
 
 struct ConversationExtraction {
@@ -393,6 +508,17 @@ mod tests {
 
         assert_eq!(result.nct_salt, Some(salt));
         assert_eq!(result.own_pushname.as_deref(), Some("TestUser"));
+    }
+
+    #[test]
+    fn read_varint_rejects_overflowing_tenth_byte() {
+        let overflowing = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
+
+        let err = read_varint(&overflowing).expect_err("10th byte above 0x01 must fail");
+
+        assert!(
+            matches!(err, HistorySyncError::MalformedProtobuf(msg) if msg == "varint overflows u64")
+        );
     }
 
     #[test]

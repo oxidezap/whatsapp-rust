@@ -109,20 +109,61 @@ fn main() -> std::io::Result<()> {
 
 fn ensure_proto_descriptor_hash() -> std::io::Result<()> {
     let proto = std::fs::read("src/whatsapp.proto")?;
-    let expected = std::fs::read_to_string("src/whatsapp.desc.sha256")?;
-    let expected = expected.split_whitespace().next().unwrap_or_default();
-    let actual = sha256_hex(&proto);
+    let desc = std::fs::read("src/whatsapp.desc")?;
+    let expected = read_expected_hashes("src/whatsapp.desc.sha256")?;
+    let actual_proto = sha256_hex(&proto);
+    let actual_desc = sha256_hex(&desc);
 
-    if actual != expected {
+    if actual_proto != expected.proto || actual_desc != expected.desc {
         return Err(std::io::Error::other(format!(
-            "waproto: src/whatsapp.proto does not match src/whatsapp.desc.sha256. \
+            "waproto: src/whatsapp.proto/src/whatsapp.desc do not match src/whatsapp.desc.sha256. \
              Run `scripts/regenerate-proto-desc.sh` to refresh the descriptor \
              and commit src/whatsapp.proto, src/whatsapp.desc, and \
-             src/whatsapp.desc.sha256. expected {expected}, got {actual}"
+             src/whatsapp.desc.sha256. expected proto {}, desc {}; got proto {}, desc {}",
+            expected.proto, expected.desc, actual_proto, actual_desc
         )));
     }
 
     Ok(())
+}
+
+struct ExpectedHashes {
+    proto: String,
+    desc: String,
+}
+
+fn read_expected_hashes(path: &str) -> std::io::Result<ExpectedHashes> {
+    let contents = std::fs::read_to_string(path)?;
+    let mut proto = None;
+    let mut desc = None;
+
+    for line in contents.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        match name {
+            "proto" => proto = Some(hash.to_owned()),
+            "desc" => desc = Some(hash.to_owned()),
+            _ => {}
+        }
+    }
+
+    let Some(proto) = proto else {
+        return Err(std::io::Error::other(format!(
+            "waproto: {path} missing `proto <sha256>` entry"
+        )));
+    };
+    let Some(desc) = desc else {
+        return Err(std::io::Error::other(format!(
+            "waproto: {path} missing `desc <sha256>` entry"
+        )));
+    };
+
+    Ok(ExpectedHashes { proto, desc })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

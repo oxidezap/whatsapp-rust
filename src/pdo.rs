@@ -16,7 +16,7 @@
 
 use crate::client::Client;
 use crate::types::message::MessageInfo;
-use buffa::Message;
+use buffa::MessageView;
 use log::{debug, info, warn};
 use std::sync::Arc;
 use wacore::types::message::{
@@ -292,18 +292,20 @@ impl Client {
             return;
         };
 
-        let web_msg_info =
-            match wa::WebMessageInfo::decode_from_slice(web_message_info_bytes.as_slice()) {
-                Ok(info) => info,
-                Err(e) => {
-                    warn!("Failed to decode WebMessageInfo from PDO response: {:?}", e);
-                    return;
-                }
-            };
+        let web_msg_info = match wa::WebMessageInfoView::decode_view(web_message_info_bytes) {
+            Ok(info) => info,
+            Err(e) => {
+                warn!("Failed to decode WebMessageInfo from PDO response: {:?}", e);
+                return;
+            }
+        };
 
-        let key = &web_msg_info.key;
-        let remote_jid_str = key.remote_jid.as_deref().unwrap_or("");
-        let msg_id = key.id.as_deref().unwrap_or("");
+        let Some(key) = web_msg_info.key.as_option() else {
+            warn!("PDO response WebMessageInfo missing key");
+            return;
+        };
+        let remote_jid_str = key.remote_jid.unwrap_or("");
+        let msg_id = key.id.unwrap_or("");
 
         let cache_key = match remote_jid_str.parse::<Jid>() {
             Ok(jid) => ChatMessageId::new(jid, msg_id.to_owned()),
@@ -331,7 +333,10 @@ impl Client {
         let mut message_info = if let Some(pending) = pending {
             pending.message_info
         } else {
-            match self.message_info_from_web_message_info(&web_msg_info).await {
+            match self
+                .message_info_from_web_message_info_view(&web_msg_info)
+                .await
+            {
                 Ok(info) => Arc::new(info),
                 Err(e) => {
                     warn!(
@@ -343,10 +348,11 @@ impl Client {
             }
         };
 
-        let Some(message) = web_msg_info.message.into_option() else {
+        let Some(message_view) = web_msg_info.message.as_option() else {
             warn!("PDO response WebMessageInfo missing message content");
             return;
         };
+        let message = message_view.to_owned_message();
 
         {
             use wacore::proto_helpers::MessageExt;
@@ -376,20 +382,60 @@ impl Client {
 
     /// Reconstructs a MessageInfo from a WebMessageInfo.
     /// This is used when we receive a PDO response but don't have the original pending request cached.
+    #[cfg(test)]
     async fn message_info_from_web_message_info(
         &self,
         web_msg: &wa::WebMessageInfo,
     ) -> Result<MessageInfo, anyhow::Error> {
-        let key = &web_msg.key;
+        let Some(key) = web_msg.key.as_option() else {
+            anyhow::bail!("WebMessageInfo missing key");
+        };
 
-        let remote_jid: Jid = key
-            .remote_jid
-            .as_ref()
+        self.message_info_from_web_message_parts(
+            key.remote_jid.as_deref(),
+            key.from_me,
+            key.id.as_deref(),
+            key.participant.as_deref(),
+            web_msg.message_timestamp,
+            web_msg.push_name.as_deref(),
+        )
+        .await
+    }
+
+    async fn message_info_from_web_message_info_view(
+        &self,
+        web_msg: &wa::WebMessageInfoView<'_>,
+    ) -> Result<MessageInfo, anyhow::Error> {
+        let Some(key) = web_msg.key.as_option() else {
+            anyhow::bail!("WebMessageInfo missing key");
+        };
+
+        self.message_info_from_web_message_parts(
+            key.remote_jid,
+            key.from_me,
+            key.id,
+            key.participant,
+            web_msg.message_timestamp,
+            web_msg.push_name,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn message_info_from_web_message_parts(
+        &self,
+        remote_jid: Option<&str>,
+        from_me: Option<bool>,
+        id: Option<&str>,
+        participant: Option<&str>,
+        message_timestamp: Option<u64>,
+        push_name: Option<&str>,
+    ) -> Result<MessageInfo, anyhow::Error> {
+        let remote_jid: Jid = remote_jid
             .ok_or_else(|| anyhow::anyhow!("MessageKey missing remoteJid"))?
             .parse()?;
-
         let is_group = remote_jid.is_group();
-        let is_from_me = key.from_me.unwrap_or(false);
+        let is_from_me = from_me.unwrap_or(false);
 
         // `key.participant` is the real author for any chat where the sender
         // differs from the remote_jid — groups AND broadcasts (including
@@ -397,7 +443,7 @@ impl Client {
         // `status@broadcast` as the sender and erase the author. Matches the
         // response-handler construction in WAWebNonMessageDataRequestHandlerPlaceholderResend
         // which maps participant to `author` for both broadcast branches.
-        let sender = if let Some(p) = key.participant.as_ref() {
+        let sender = if let Some(p) = participant {
             p.parse()?
         } else if is_from_me {
             self.persistence_manager
@@ -410,13 +456,12 @@ impl Client {
             remote_jid.clone()
         };
 
-        let timestamp = web_msg
-            .message_timestamp
+        let timestamp = message_timestamp
             .map(|ts| wacore::time::from_secs_or_now(ts as i64))
             .unwrap_or_else(wacore::time::now_utc);
 
         Ok(MessageInfo {
-            id: key.id.clone().unwrap_or_default(),
+            id: id.unwrap_or_default().to_owned(),
             server_id: 0,
             r#type: String::new(),
             source: MessageSource {
@@ -431,7 +476,7 @@ impl Client {
                 recipient: None,
             },
             timestamp,
-            push_name: web_msg.push_name.clone().unwrap_or_default(),
+            push_name: push_name.unwrap_or_default().to_owned(),
             category: MessageCategory::default(),
             multicast: false,
             media_type: String::new(),
@@ -623,6 +668,35 @@ mod tests {
 
         assert_eq!(info.source.chat.to_string(), peer);
         assert_eq!(info.source.sender.to_string(), peer);
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_from_web_message_info_view() {
+        use buffa::{Message as _, MessageView as _};
+        use waproto::whatsapp as wa;
+
+        let client = setup_reconstruct_client().await;
+        let author_jid = "203040904720543@lid";
+        let mut web_msg = make_web_msg(
+            "status@broadcast",
+            false,
+            "STATUS_PDO_VIEW_1",
+            Some(author_jid),
+        );
+        web_msg.push_name = Some("Recovered Sender".to_string());
+        web_msg.message_timestamp = Some(1_700_000_000);
+        let encoded = web_msg.encode_to_vec();
+        let view = wa::WebMessageInfoView::decode_view(&encoded).expect("view should decode");
+
+        let info = client
+            .message_info_from_web_message_info_view(&view)
+            .await
+            .unwrap();
+
+        assert_eq!(info.id, "STATUS_PDO_VIEW_1");
+        assert_eq!(info.source.chat.to_string(), "status@broadcast");
+        assert_eq!(info.source.sender.to_string(), author_jid);
+        assert_eq!(info.push_name, "Recovered Sender");
     }
 
     /// LID-migrated 1-on-1 responses carry `remote_jid` in LID form and no

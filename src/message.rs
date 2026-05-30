@@ -478,12 +478,11 @@ impl Client {
         info: &Arc<MessageInfo>,
         payload: EncPayload,
     ) {
-        use buffa::Message as _;
-        use wa::MessageSecretMessage;
+        use buffa::{Message as _, MessageView as _};
         use wacore::bot_message::{BotMessageContext, decrypt_bot_message};
         use wacore::protocol::nack::NackReason;
 
-        let ms_msg = match MessageSecretMessage::decode_from_slice(&payload.ciphertext) {
+        let ms_msg = match wa::MessageSecretMessageView::decode_view(&payload.ciphertext) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!(
@@ -494,9 +493,7 @@ impl Client {
                 return;
             }
         };
-        let (Some(enc_iv), Some(enc_payload)) =
-            (ms_msg.enc_iv.as_deref(), ms_msg.enc_payload.as_deref())
-        else {
+        let (Some(enc_iv), Some(enc_payload)) = (ms_msg.enc_iv, ms_msg.enc_payload) else {
             log::warn!(
                 "[msg:{}] MessageSecretMessage missing enc_iv/enc_payload",
                 info.id
@@ -9832,6 +9829,21 @@ mod tests {
             enc_payload: Some(payload.to_vec()),
         };
         ms.encode_to_vec()
+    }
+
+    #[test]
+    fn message_secret_message_view_borrows_payload_fields() {
+        use buffa::MessageView as _;
+
+        let iv = [7u8; 12];
+        let payload = [9u8; 64];
+        let encoded = encode_message_secret_message(&iv, &payload);
+
+        let view = wa::MessageSecretMessageView::decode_view(&encoded)
+            .expect("MessageSecretMessage view should decode");
+
+        assert_eq!(view.enc_iv, Some(&iv[..]));
+        assert_eq!(view.enc_payload, Some(&payload[..]));
     }
 
     async fn collect_event<F>(

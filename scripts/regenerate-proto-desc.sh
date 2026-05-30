@@ -27,11 +27,18 @@ protoc \
   -I"$includes" \
   "$proto"
 
-if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum "$proto" | awk '{print $1}' > "$hash"
-else
-  shasum -a 256 "$proto" | awk '{print $1}' > "$hash"
-fi
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+{
+  printf 'proto %s\n' "$(hash_file "$proto")"
+  printf 'desc %s\n' "$(hash_file "$desc")"
+} > "$hash"
 
 echo "regenerated: $desc"
 echo "regenerated: $hash"
