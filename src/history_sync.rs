@@ -1,11 +1,9 @@
 use crate::types::events::{Event, LazyHistorySync};
-use bytes::Bytes;
-use prost::Message as ProtoMessage;
 use std::sync::Arc;
-use wacore::history_sync::{TcTokenCandidate, process_history_sync};
+use wacore::history_sync::{HistoryMsgSecretRecord, TcTokenCandidate, process_history_sync};
 use wacore::store::traits::TcTokenEntry;
 use wacore_binary::{Jid, JidExt as _};
-use waproto::whatsapp::{self as wa, message::HistorySyncNotification};
+use waproto::whatsapp::message::HistorySyncNotification;
 
 use crate::client::Client;
 
@@ -219,10 +217,10 @@ impl Client {
                     self.store_tc_token_candidate(candidate).await;
                 }
 
-                if let Some(decompressed) = sync_result.decompressed_bytes {
-                    self.store_history_sync_msg_secrets(decompressed.clone())
-                        .await;
+                self.store_history_sync_msg_secrets(sync_result.msg_secret_records)
+                    .await;
 
+                if let Some(decompressed) = sync_result.decompressed_bytes {
                     if !has_listeners {
                         return;
                     }
@@ -250,43 +248,25 @@ impl Client {
         }
     }
 
-    async fn store_history_sync_msg_secrets(&self, raw_history_sync: Bytes) -> usize {
+    async fn store_history_sync_msg_secrets(&self, records: Vec<HistoryMsgSecretRecord>) -> usize {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
         let own_pn = device_snapshot.pn.as_ref().map(|j| j.to_non_ad());
         let own_lid = device_snapshot.lid.as_ref().map(|j| j.to_non_ad());
 
-        let (records_tx, records_rx) = futures::channel::oneshot::channel();
-        let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
-            let records =
-                extract_history_sync_msg_secret_records(raw_history_sync, own_pn, own_lid);
-            let _ = records_tx.send(records);
-        }));
-        self.runtime
-            .spawn(Box::pin(async move {
-                blocking_fut.await;
-            }))
-            .detach();
-
-        let records = match records_rx.await {
-            Ok(records) => records,
-            Err(_) => {
-                log::warn!("HistorySync messageSecret extraction task was cancelled");
-                return 0;
-            }
-        };
-
         let mut stored = 0usize;
         for record in records {
-            if self
-                .persist_msg_secret_bytes(
-                    &record.chat,
-                    &record.sender,
-                    &record.msg_id,
-                    &record.secret,
-                )
-                .await
-            {
-                stored += 1;
+            let Ok(chat) = record.chat_id.parse::<Jid>() else {
+                continue;
+            };
+            let senders =
+                history_msg_secret_senders(&chat, &record, own_pn.as_ref(), own_lid.as_ref());
+            for sender in senders {
+                if self
+                    .persist_msg_secret_bytes(&chat, &sender, &record.msg_id, &record.secret)
+                    .await
+                {
+                    stored += 1;
+                }
             }
         }
 
@@ -377,74 +357,15 @@ impl Client {
     }
 }
 
-struct HistoryMsgSecretRecord {
-    chat: Jid,
-    sender: Jid,
-    msg_id: String,
-    secret: Vec<u8>,
-}
-
-fn extract_history_sync_msg_secret_records(
-    raw_history_sync: Bytes,
-    own_pn: Option<Jid>,
-    own_lid: Option<Jid>,
-) -> Vec<HistoryMsgSecretRecord> {
-    let history = match wa::HistorySync::decode(raw_history_sync.as_ref()) {
-        Ok(history) => history,
-        Err(e) => {
-            log::warn!("Failed to decode HistorySync for messageSecret capture: {e:?}");
-            return Vec::new();
-        }
-    };
-
-    let mut records = Vec::new();
-    for conversation in &history.conversations {
-        let Ok(chat) = conversation.id.parse::<Jid>() else {
-            continue;
-        };
-
-        for history_msg in &conversation.messages {
-            let Some(web_msg) = history_msg.message.as_ref() else {
-                continue;
-            };
-            let Some(secret) = web_msg.message_secret.as_deref().or_else(|| {
-                web_msg
-                    .message
-                    .as_ref()
-                    .and_then(|m| m.message_context_info.as_ref())
-                    .and_then(|mci| mci.message_secret.as_deref())
-            }) else {
-                continue;
-            };
-            let Some(msg_id) = web_msg.key.id.as_deref() else {
-                continue;
-            };
-
-            let senders =
-                history_msg_secret_senders(&chat, web_msg, own_pn.as_ref(), own_lid.as_ref());
-            for sender in senders {
-                records.push(HistoryMsgSecretRecord {
-                    chat: chat.clone(),
-                    sender,
-                    msg_id: msg_id.to_string(),
-                    secret: secret.to_vec(),
-                });
-            }
-        }
-    }
-
-    records
-}
-
 fn history_msg_secret_senders(
     chat: &Jid,
-    web_msg: &wa::WebMessageInfo,
+    record: &HistoryMsgSecretRecord,
     own_pn: Option<&Jid>,
     own_lid: Option<&Jid>,
 ) -> Vec<Jid> {
     let mut senders = Vec::with_capacity(2);
 
-    if web_msg.key.from_me == Some(true) {
+    if record.from_me {
         if let Some(lid) = own_lid {
             push_unique_sender(&mut senders, lid.to_non_ad());
         }
@@ -459,11 +380,10 @@ fn history_msg_secret_senders(
         return senders;
     }
 
-    if let Some(raw_sender) = web_msg
-        .key
-        .participant
+    if let Some(raw_sender) = record
+        .key_participant
         .as_deref()
-        .or(web_msg.participant.as_deref())
+        .or(record.web_msg_participant.as_deref())
         && let Ok(sender) = raw_sender.parse::<Jid>()
     {
         senders.push(sender.to_non_ad());
@@ -482,8 +402,10 @@ fn push_unique_sender(senders: &mut Vec<Jid>, sender: Jid) {
 mod tests {
     use super::*;
     use flate2::{Compression, write::ZlibEncoder};
+    use prost::Message as ProtoMessage;
     use std::io::Write;
     use std::sync::atomic::Ordering;
+    use waproto::whatsapp as wa;
 
     fn compress_history_sync(history_sync: &wa::HistorySync) -> Vec<u8> {
         let raw = history_sync.encode_to_vec();

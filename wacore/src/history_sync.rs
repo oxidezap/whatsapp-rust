@@ -22,6 +22,7 @@ pub struct HistorySyncResult {
     pub conversations_processed: usize,
     /// Tctoken candidates extracted from 1:1 conversations during streaming.
     pub tc_token_candidates: Vec<TcTokenCandidate>,
+    pub msg_secret_records: Vec<HistoryMsgSecretRecord>,
     /// The full decompressed protobuf blob, only retained when event
     /// listeners exist. Wrapped in `LazyHistorySync` for on-demand decoding.
     pub decompressed_bytes: Option<Bytes>,
@@ -36,11 +37,9 @@ mod wire_type {
 
 /// Decompress and process a history sync blob.
 ///
-/// **Memory strategy**: Decompresses the entire blob into a single `Bytes` buffer,
-/// then extracts conversation fields as zero-copy `Bytes::slice()` sub-views.
-/// This trades a slightly higher peak (full decompressed blob in memory) for
-/// **zero per-conversation heap allocations** — each conversation is just an
-/// Arc refcount increment on the shared buffer.
+/// **Memory strategy**: Decompresses the entire blob into a single `Bytes`
+/// buffer, then scans top-level fields and partially decodes only the
+/// conversation fields needed for internal caches.
 ///
 /// After decompression, the compressed input is dropped immediately, so peak
 /// memory = max(compressed, decompressed) + small overhead, not both.
@@ -65,6 +64,7 @@ pub fn process_history_sync(
         nct_salt: None,
         conversations_processed: 0,
         tc_token_candidates: Vec::new(),
+        msg_secret_records: Vec::new(),
         decompressed_bytes: if retain_blob { Some(buf.clone()) } else { None },
     };
 
@@ -83,9 +83,13 @@ pub fn process_history_sync(
                 let end = checked_end(pos, len, buf.len(), "conversation")?;
 
                 result.conversations_processed += 1;
-                if let Some(candidate) = extract_tc_token_fields(&buf[pos..end]) {
+                let extracted = extract_conversation_fields(&buf[pos..end]);
+                if let Some(candidate) = extracted.tc_token_candidate {
                     result.tc_token_candidates.push(candidate);
                 }
+                result
+                    .msg_secret_records
+                    .extend(extracted.msg_secret_records);
                 pos = end;
             }
 
@@ -250,11 +254,14 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
     if id_match { pushname } else { None }
 }
 
-/// Prost partial decode — only tctoken fields, skips heavy `messages`.
+/// Prost partial decode for internal HistorySync fields we persist while
+/// streaming conversations.
 #[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct ConversationTcTokenFields {
+pub(crate) struct ConversationInternalFields {
     #[prost(string, required, tag = "1")]
     pub id: String,
+    #[prost(message, repeated, tag = "2")]
+    pub messages: Vec<HistorySyncMsgInternalFields>,
     #[prost(bytes = "vec", optional, tag = "21")]
     pub tc_token: Option<Vec<u8>>,
     #[prost(uint64, optional, tag = "22")]
@@ -263,14 +270,83 @@ pub(crate) struct ConversationTcTokenFields {
     pub tc_token_sender_timestamp: Option<u64>,
 }
 
-/// Extract tctoken candidate from a raw Conversation proto.
-/// Uses prost partial decode (only fields 1/21/22/28, skips messages).
-/// Returns `None` for groups, newsletters, bots, or conversations without tctokens.
-pub(crate) fn extract_tc_token_fields(data: &[u8]) -> Option<TcTokenCandidate> {
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct HistorySyncMsgInternalFields {
+    #[prost(message, optional, tag = "1")]
+    pub message: Option<WebMessageInfoInternalFields>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct WebMessageInfoInternalFields {
+    #[prost(message, optional, tag = "1")]
+    pub key: Option<MessageKeyInternalFields>,
+    #[prost(message, optional, tag = "2")]
+    pub message: Option<MessageInternalFields>,
+    #[prost(string, optional, tag = "5")]
+    pub participant: Option<String>,
+    #[prost(bytes = "vec", optional, tag = "49")]
+    pub message_secret: Option<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct MessageKeyInternalFields {
+    #[prost(bool, optional, tag = "2")]
+    pub from_me: Option<bool>,
+    #[prost(string, optional, tag = "3")]
+    pub id: Option<String>,
+    #[prost(string, optional, tag = "4")]
+    pub participant: Option<String>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct MessageInternalFields {
+    #[prost(message, optional, tag = "35")]
+    pub message_context_info: Option<MessageContextInfoInternalFields>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct MessageContextInfoInternalFields {
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub message_secret: Option<Vec<u8>>,
+}
+
+struct ConversationExtraction {
+    tc_token_candidate: Option<TcTokenCandidate>,
+    msg_secret_records: Vec<HistoryMsgSecretRecord>,
+}
+
+/// Message-secret data extracted from a conversation during streaming.
+#[derive(Debug)]
+pub struct HistoryMsgSecretRecord {
+    pub chat_id: String,
+    pub from_me: bool,
+    pub key_participant: Option<String>,
+    pub web_msg_participant: Option<String>,
+    pub msg_id: String,
+    pub secret: Vec<u8>,
+}
+
+fn extract_conversation_fields(data: &[u8]) -> ConversationExtraction {
     use prost::Message;
 
-    let conv = ConversationTcTokenFields::decode(data).ok()?;
+    let Ok(conv) = ConversationInternalFields::decode(data) else {
+        return ConversationExtraction {
+            tc_token_candidate: None,
+            msg_secret_records: Vec::new(),
+        };
+    };
 
+    let tc_token_candidate = extract_tc_token_fields(&conv);
+    let msg_secret_records = extract_msg_secret_records(&conv);
+
+    ConversationExtraction {
+        tc_token_candidate,
+        msg_secret_records,
+    }
+}
+
+/// Returns `None` for groups, newsletters, bots, or conversations without tctokens.
+fn extract_tc_token_fields(conv: &ConversationInternalFields) -> Option<TcTokenCandidate> {
     // Early-out for non-1:1 conversations
     if let Some(parts) = wacore_binary::jid::parse_jid_fast(&conv.id)
         && (parts.server == "g.us" || parts.server == "newsletter" || parts.server == "bot")
@@ -278,15 +354,51 @@ pub(crate) fn extract_tc_token_fields(data: &[u8]) -> Option<TcTokenCandidate> {
         return None;
     }
 
-    let tc_token = conv.tc_token.filter(|t| !t.is_empty())?;
+    let tc_token = conv.tc_token.as_ref().filter(|t| !t.is_empty())?.clone();
     let tc_token_timestamp = conv.tc_token_timestamp?;
 
     Some(TcTokenCandidate {
-        id: conv.id,
+        id: conv.id.clone(),
         tc_token,
         tc_token_timestamp,
         tc_token_sender_timestamp: conv.tc_token_sender_timestamp,
     })
+}
+
+fn extract_msg_secret_records(conv: &ConversationInternalFields) -> Vec<HistoryMsgSecretRecord> {
+    let mut records = Vec::new();
+
+    for history_msg in &conv.messages {
+        let Some(web_msg) = history_msg.message.as_ref() else {
+            continue;
+        };
+        let Some(key) = web_msg.key.as_ref() else {
+            continue;
+        };
+        let Some(msg_id) = key.id.as_ref() else {
+            continue;
+        };
+        let Some(secret) = web_msg.message_secret.as_ref().or_else(|| {
+            web_msg
+                .message
+                .as_ref()
+                .and_then(|m| m.message_context_info.as_ref())
+                .and_then(|mci| mci.message_secret.as_ref())
+        }) else {
+            continue;
+        };
+
+        records.push(HistoryMsgSecretRecord {
+            chat_id: conv.id.clone(),
+            from_me: key.from_me == Some(true),
+            key_participant: key.participant.clone(),
+            web_msg_participant: web_msg.participant.clone(),
+            msg_id: msg_id.clone(),
+            secret: secret.clone(),
+        });
+    }
+
+    records
 }
 
 /// Tctoken data extracted from a conversation during streaming.
@@ -361,5 +473,70 @@ mod tests {
 
         assert_eq!(result.nct_salt, Some(salt));
         assert_eq!(result.own_pushname.as_deref(), Some("TestUser"));
+    }
+
+    #[test]
+    fn test_message_secrets_extracted_from_history_sync() {
+        let chat = "5511777776666@s.whatsapp.net";
+        let participant = "5511888889999@s.whatsapp.net";
+        let top_level_secret = vec![0x44u8; 32];
+        let context_secret = vec![0x55u8; 32];
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![
+                    wa::HistorySyncMsg {
+                        message: Some(wa::WebMessageInfo {
+                            key: wa::MessageKey {
+                                remote_jid: Some(chat.to_string()),
+                                from_me: Some(false),
+                                id: Some("HIST_TOP_LEVEL".to_string()),
+                                participant: Some(participant.to_string()),
+                            },
+                            message_secret: Some(top_level_secret.clone()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    wa::HistorySyncMsg {
+                        message: Some(wa::WebMessageInfo {
+                            key: wa::MessageKey {
+                                remote_jid: Some(chat.to_string()),
+                                from_me: Some(true),
+                                id: Some("HIST_CONTEXT".to_string()),
+                                participant: None,
+                            },
+                            message: Some(wa::Message {
+                                message_context_info: Some(wa::MessageContextInfo {
+                                    message_secret: Some(context_secret.clone()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let compressed = encode_and_compress(&hs);
+        let result = process_history_sync(compressed, None, false, None).unwrap();
+
+        assert_eq!(result.msg_secret_records.len(), 2);
+        assert_eq!(result.msg_secret_records[0].chat_id, chat);
+        assert_eq!(result.msg_secret_records[0].msg_id, "HIST_TOP_LEVEL");
+        assert_eq!(
+            result.msg_secret_records[0].key_participant.as_deref(),
+            Some(participant)
+        );
+        assert_eq!(result.msg_secret_records[0].secret, top_level_secret);
+        assert_eq!(result.msg_secret_records[1].msg_id, "HIST_CONTEXT");
+        assert!(result.msg_secret_records[1].from_me);
+        assert_eq!(result.msg_secret_records[1].secret, context_secret);
     }
 }
