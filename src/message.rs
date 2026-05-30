@@ -70,6 +70,20 @@ pub(crate) struct ClassifiedMessage {
     pub decrypt_fail_mode: crate::types::events::DecryptFailMode,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SessionBatchOutcome {
+    decrypted: bool,
+    duplicate: bool,
+    undecryptable: bool,
+    dispatched: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MigrationDecryptOutcome {
+    decrypted: bool,
+    dispatched: bool,
+}
+
 /// Retry count threshold for logging high retry warnings.
 /// WhatsApp Web logs metrics when retry count exceeds this value.
 const HIGH_RETRY_COUNT_THRESHOLD: u8 = 3;
@@ -1072,11 +1086,7 @@ impl Client {
             || sender_encryption_jid.is_broadcast_list()
             || sender_encryption_jid.is_status_broadcast();
 
-        let (
-            session_decrypted_successfully,
-            session_had_duplicates,
-            session_dispatched_undecryptable,
-        ) = if !is_group_sender && !session_payloads.is_empty() {
+        let session_outcome = if !is_group_sender && !session_payloads.is_empty() {
             self.clone()
                 .process_session_enc_batch(
                     &session_payloads,
@@ -1093,8 +1103,12 @@ impl Client {
                     sender_encryption_jid
                 );
             }
-            (false, false, false)
+            SessionBatchOutcome::default()
         };
+        let session_decrypted_successfully = session_outcome.decrypted;
+        let session_had_duplicates = session_outcome.duplicate;
+        let session_dispatched_undecryptable = session_outcome.undecryptable;
+        let session_dispatched = session_outcome.dispatched;
 
         log::debug!(
             "Starting PASS 2: Processing {} group content messages (skmsg)",
@@ -1207,6 +1221,11 @@ impl Client {
             // (a status SKDM pkmsg can reach here), so skip it to avoid a
             // redundant receipt.
             self.ack_received_message(&info);
+        } else if session_decrypted_successfully && !session_dispatched {
+            // SKDM-only session decrypts skip dispatch, so this stanza would
+            // otherwise stay queued. WA Web and whatsmeow ack every decrypted
+            // message; the ack shape still comes from the message source.
+            self.ack_received_message(&info);
         }
 
         // Bot-secret (msmsg) payloads run inline here so they're serialised
@@ -1227,10 +1246,10 @@ impl Client {
         info: &Arc<MessageInfo>,
         sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
-    ) -> (bool, bool, bool) {
+    ) -> SessionBatchOutcome {
         use wacore::libsignal::protocol::CiphertextMessage;
         if payloads.is_empty() {
-            return (false, false, false);
+            return SessionBatchOutcome::default();
         }
 
         // Acquire a per-sender session lock to prevent race conditions when
@@ -1248,9 +1267,7 @@ impl Client {
 
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let mut any_success = false;
-        let mut any_duplicate = false;
-        let mut dispatched_undecryptable = false;
+        let mut outcome = SessionBatchOutcome::default();
 
         for payload in payloads {
             let ciphertext = &payload.ciphertext[..];
@@ -1273,7 +1290,7 @@ impl Client {
                         );
                         // |= so a later dedup'd return (false) can't clobber
                         // a true set by a prior iteration in this batch.
-                        dispatched_undecryptable |= self
+                        outcome.undecryptable |= self
                             .dispatch_undecryptable_event(
                                 Arc::clone(info),
                                 false,
@@ -1294,7 +1311,7 @@ impl Client {
                             info.id,
                             info.source.sender
                         );
-                        dispatched_undecryptable |= self
+                        outcome.undecryptable |= self
                             .dispatch_undecryptable_event(
                                 Arc::clone(info),
                                 false,
@@ -1354,8 +1371,8 @@ impl Client {
 
             match decrypt_res {
                 Ok(padded_plaintext) => {
-                    any_success = true;
-                    if let Err(e) = self
+                    outcome.decrypted = true;
+                    match self
                         .clone()
                         .handle_decrypted_plaintext(
                             enc_type,
@@ -1365,11 +1382,14 @@ impl Client {
                         )
                         .await
                     {
-                        log::warn!(
-                            "[msg:{}] Failed processing plaintext from {}: {e:?}",
-                            info.id,
-                            info.source.sender
-                        );
+                        Ok(dispatched) => outcome.dispatched |= dispatched,
+                        Err(e) => {
+                            log::warn!(
+                                "[msg:{}] Failed processing plaintext from {}: {e:?}",
+                                info.id,
+                                info.source.sender
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -1382,7 +1402,7 @@ impl Client {
                             counter
                         );
                         // Mark that we saw a duplicate so we can skip skmsg without showing error
-                        any_duplicate = true;
+                        outcome.duplicate = true;
                         continue;
                     }
                     // Handle UntrustedIdentity: This happens when a user re-installs WhatsApp or changes devices.
@@ -1440,8 +1460,8 @@ impl Client {
                                     info.id,
                                     address
                                 );
-                                any_success = true;
-                                if let Err(e) = self
+                                outcome.decrypted = true;
+                                match self
                                     .clone()
                                     .handle_decrypted_plaintext(
                                         enc_type,
@@ -1451,9 +1471,12 @@ impl Client {
                                     )
                                     .await
                                 {
-                                    log::warn!(
-                                        "Failed processing plaintext after identity retry: {e:?}"
-                                    );
+                                    Ok(dispatched) => outcome.dispatched |= dispatched,
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Failed processing plaintext after identity retry: {e:?}"
+                                        );
+                                    }
                                 }
                             }
                             Err(retry_err) => {
@@ -1471,11 +1494,11 @@ impl Client {
                                         chain,
                                         counter
                                     );
-                                    any_duplicate = true;
+                                    outcome.duplicate = true;
                                 } else if matches!(retry_err, SignalProtocolError::InvalidPreKeyId)
                                 {
                                     // Session may exist under PN address after identity change
-                                    if self
+                                    let migration_outcome = self
                                         .try_pn_to_lid_migration_decrypt(
                                             sender_encryption_jid,
                                             &signal_address,
@@ -1488,9 +1511,10 @@ impl Client {
                                             &session_mutex,
                                             &mut session_guard,
                                         )
-                                        .await
-                                    {
-                                        any_success = true;
+                                        .await;
+                                    if migration_outcome.decrypted {
+                                        outcome.decrypted = true;
+                                        outcome.dispatched |= migration_outcome.dispatched;
                                     } else {
                                         log::debug!(
                                             "[msg:{}] InvalidPreKeyId after identity change for {}. \
@@ -1498,7 +1522,7 @@ impl Client {
                                             info.id,
                                             address
                                         );
-                                        dispatched_undecryptable = self
+                                        outcome.undecryptable = self
                                             .handle_decrypt_failure(
                                                 info,
                                                 RetryReason::InvalidKeyId,
@@ -1515,7 +1539,7 @@ impl Client {
                                     );
                                     // Send retry receipt so the sender resends with a PreKeySignalMessage
                                     // to establish a new session with the new identity
-                                    dispatched_undecryptable = self
+                                    outcome.undecryptable = self
                                         .handle_decrypt_failure(
                                             info,
                                             RetryReason::InvalidKey,
@@ -1543,7 +1567,7 @@ impl Client {
                     }
                     // Try PN→LID session migration before sending retry receipt
                     if let SignalProtocolError::SessionNotFound(_) = e {
-                        if self
+                        let migration_outcome = self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1556,9 +1580,10 @@ impl Client {
                                 &session_mutex,
                                 &mut session_guard,
                             )
-                            .await
-                        {
-                            any_success = true;
+                            .await;
+                        if migration_outcome.decrypted {
+                            outcome.decrypted = true;
+                            outcome.dispatched |= migration_outcome.dispatched;
                             continue;
                         }
 
@@ -1566,7 +1591,7 @@ impl Client {
                             "[msg:{}] No session found for {} message from {}. Sending retry receipt to request session establishment.",
                             info.id, enc_type, info.source.sender
                         );
-                        dispatched_undecryptable = self
+                        outcome.undecryptable = self
                             .handle_decrypt_failure(info, RetryReason::NoSession, decrypt_fail_mode)
                             .await;
                         continue;
@@ -1576,7 +1601,7 @@ impl Client {
                     ) {
                         // whatsmeow migrates PN sessions before decrypt; a fresh
                         // LID record can otherwise shadow the sender's PN ratchet.
-                        if self
+                        let migration_outcome = self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1589,9 +1614,10 @@ impl Client {
                                 &session_mutex,
                                 &mut session_guard,
                             )
-                            .await
-                        {
-                            any_success = true;
+                            .await;
+                        if migration_outcome.decrypted {
+                            outcome.decrypted = true;
+                            outcome.dispatched |= migration_outcome.dispatched;
                             continue;
                         }
 
@@ -1611,7 +1637,7 @@ impl Client {
                             info.source.sender
                         );
 
-                        dispatched_undecryptable = self
+                        outcome.undecryptable = self
                             .handle_decrypt_failure(info, reason, decrypt_fail_mode)
                             .await;
                         continue;
@@ -1620,7 +1646,7 @@ impl Client {
                         // session exists under a PN address (legacy migration).
                         // Migrating lets Signal use the existing ratchet state
                         // instead of looking up the consumed one-time prekey.
-                        if self
+                        let migration_outcome = self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1633,9 +1659,10 @@ impl Client {
                                 &session_mutex,
                                 &mut session_guard,
                             )
-                            .await
-                        {
-                            any_success = true;
+                            .await;
+                        if migration_outcome.decrypted {
+                            outcome.decrypted = true;
+                            outcome.dispatched |= migration_outcome.dispatched;
                             continue;
                         }
 
@@ -1649,7 +1676,7 @@ impl Client {
                         );
 
                         // Send retry receipt with fresh prekeys
-                        dispatched_undecryptable = self
+                        outcome.undecryptable = self
                             .handle_decrypt_failure(
                                 info,
                                 RetryReason::InvalidKeyId,
@@ -1666,7 +1693,7 @@ impl Client {
                             info.source.sender,
                             e
                         );
-                        dispatched_undecryptable |= self
+                        outcome.undecryptable |= self
                             .dispatch_undecryptable_event(
                                 Arc::clone(info),
                                 false,
@@ -1680,7 +1707,7 @@ impl Client {
                 }
             }
         }
-        (any_success, any_duplicate, dispatched_undecryptable)
+        outcome
     }
 
     async fn process_group_enc_batch(
@@ -1857,7 +1884,7 @@ impl Client {
         padded_plaintext: &[u8],
         padding_version: u8,
         info: &Arc<MessageInfo>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<bool, anyhow::Error> {
         let original_msg = wacore::messages::decode_plaintext(padded_plaintext, padding_version)?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
@@ -1950,14 +1977,16 @@ impl Client {
                 "[msg:{}] Skipping event dispatch for sender key distribution message",
                 info.id
             );
+            Ok(false)
         } else {
             self.dispatch_parsed_message(msg, info).await;
+            Ok(true)
         }
-        Ok(())
     }
 
     /// Attempt PN→LID session migration and retry decryption.
-    /// Returns true if decryption succeeded after migration.
+    /// Returns whether decryption succeeded after migration and whether it
+    /// reached user dispatch.
     ///
     /// Manages the per-address session lock around the migration loop:
     /// drops the caller's guard (migration re-enters that mutex and
@@ -1977,15 +2006,15 @@ impl Client {
         info: &Arc<MessageInfo>,
         session_mutex: &Arc<async_lock::Mutex<()>>,
         session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
-    ) -> bool {
+    ) -> MigrationDecryptOutcome {
         use wacore::libsignal::protocol::{UsePQRatchet, message_decrypt};
 
         if !sender_jid.is_lid() {
-            return false;
+            return MigrationDecryptOutcome::default();
         }
 
         let Some(pn) = self.lid_pn_cache.get_phone_number(&sender_jid.user).await else {
-            return false;
+            return MigrationDecryptOutcome::default();
         };
 
         // Release the address lock so the migration loop can acquire it for
@@ -2015,31 +2044,41 @@ impl Client {
                     info.id,
                     info.source.sender
                 );
-                if let Err(e) = self
+                let dispatched = match self
                     .clone()
                     .handle_decrypted_plaintext(enc_type, &padded_plaintext, padding_version, info)
                     .await
                 {
-                    log::warn!(
-                        "[msg:{}] Failed processing plaintext after migration: {e:?}",
-                        info.id
-                    );
+                    Ok(dispatched) => dispatched,
+                    Err(e) => {
+                        log::warn!(
+                            "[msg:{}] Failed processing plaintext after migration: {e:?}",
+                            info.id
+                        );
+                        false
+                    }
+                };
+                MigrationDecryptOutcome {
+                    decrypted: true,
+                    dispatched,
                 }
-                true
             }
             Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
                 log::debug!(
                     "[msg:{}] Already processed (chain {chain}, counter {counter}) after migration",
                     info.id
                 );
-                true
+                MigrationDecryptOutcome {
+                    decrypted: true,
+                    dispatched: false,
+                }
             }
             Err(retry_err) => {
                 log::warn!(
                     "[msg:{}] Decryption still failed after PN→LID migration: {retry_err:?}",
                     info.id
                 );
-                false
+                MigrationDecryptOutcome::default()
             }
         }
     }
@@ -2632,8 +2671,7 @@ mod tests {
         let enc_node_ref = enc_node.as_node_ref();
         let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
 
-        // With SessionNotFound, should return (false, false, true) - no success, no dupe, dispatched event
-        let (success, had_duplicates, dispatched) = client
+        let outcome = client
             .process_session_enc_batch(
                 &payloads,
                 &info,
@@ -2643,8 +2681,8 @@ mod tests {
             .await;
 
         assert!(
-            !success && !had_duplicates && dispatched,
-            "process_session_enc_batch should return (false, false, true) when SessionNotFound occurs and dispatches event"
+            !outcome.decrypted && !outcome.duplicate && outcome.undecryptable,
+            "process_session_enc_batch should mark SessionNotFound as undecryptable without success or duplicate"
         );
     }
 
@@ -2721,7 +2759,7 @@ mod tests {
         let enc_node_ref = enc_node.as_node_ref();
         let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
 
-        let (success, had_duplicates, dispatched) = client
+        let outcome = client
             .clone()
             .process_session_enc_batch(
                 &payloads,
@@ -2733,9 +2771,9 @@ mod tests {
 
         // Should behave identically to SessionNotFound: failure, no dupe, event dispatched.
         assert!(
-            !success && !had_duplicates && dispatched,
+            !outcome.decrypted && !outcome.duplicate && outcome.undecryptable,
             "Empty session record should be treated as SessionNotFound: \
-             expected (false, false, true), got ({success}, {had_duplicates}, {dispatched})"
+             expected undecryptable without success or duplicate, got {outcome:?}"
         );
 
         // After the WA Web compliance fix (no delete on BadMac/InvalidMessage either),
@@ -2768,9 +2806,11 @@ mod tests {
     use std::collections::HashMap;
     use wacore::libsignal::protocol::{
         CiphertextMessage, Direction, IdentityChange, IdentityKey, IdentityKeyPair, KeyPair,
-        PreKeyBundle, PreKeyRecord, PreKeyStore as SigPreKeyStore, ProtocolAddress, SessionRecord,
+        PreKeyBundle, PreKeyRecord, PreKeyStore as SigPreKeyStore, ProtocolAddress, SenderKeyName,
+        SenderKeyRecord, SenderKeyStore as SigSenderKeyStore, SessionRecord,
         SessionStore as SigSessionStore, SignedPreKeyStore as SigSignedPreKeyStore, UsePQRatchet,
-        message_encrypt, process_prekey_bundle,
+        create_sender_key_distribution_message, group_encrypt, message_encrypt,
+        process_prekey_bundle,
     };
     use wacore::libsignal::protocol::{
         IdentityKeyStore as SigIdentityKeyStore, SignalProtocolError,
@@ -2843,12 +2883,35 @@ mod tests {
         }
     }
 
+    #[derive(Default, Clone)]
+    struct MemSenderKeyStore(HashMap<SenderKeyName, SenderKeyRecord>);
+
+    #[async_trait]
+    impl SigSenderKeyStore for MemSenderKeyStore {
+        async fn store_sender_key(
+            &mut self,
+            name: &SenderKeyName,
+            record: SenderKeyRecord,
+        ) -> Result<(), SignalProtocolError> {
+            self.0.insert(name.clone(), record);
+            Ok(())
+        }
+
+        async fn load_sender_key(
+            &self,
+            name: &SenderKeyName,
+        ) -> Result<Option<SenderKeyRecord>, SignalProtocolError> {
+            Ok(self.0.get(name).cloned())
+        }
+    }
+
     #[derive(Clone)]
     struct AlicePeer {
         jid: Jid,
         address: ProtocolAddress,
         identity: MemIdentityStore,
         sessions: MemSessionStore,
+        sender_keys: MemSenderKeyStore,
     }
 
     impl AlicePeer {
@@ -2866,6 +2929,7 @@ mod tests {
                     known: HashMap::new(),
                 },
                 sessions: MemSessionStore::default(),
+                sender_keys: MemSenderKeyStore::default(),
             }
         }
 
@@ -2891,6 +2955,39 @@ mod tests {
             message_encrypt(plaintext, bob_addr, &mut self.sessions, &mut self.identity)
                 .await
                 .expect("encrypt")
+        }
+
+        async fn create_group_skdm(
+            &mut self,
+            group_jid: &Jid,
+        ) -> wa::message::SenderKeyDistributionMessage {
+            let sender = self.jid.to_non_ad();
+            let sender_key_name = make_sender_key_name(group_jid, &sender.to_protocol_address());
+            let skdm = create_sender_key_distribution_message(
+                &sender_key_name,
+                &mut self.sender_keys,
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
+            .await
+            .expect("create sender key distribution");
+            wa::message::SenderKeyDistributionMessage {
+                group_id: Some(group_jid.to_string()),
+                axolotl_sender_key_distribution_message: Some(skdm.serialized().to_vec()),
+            }
+        }
+
+        async fn encrypt_group_message(&mut self, group_jid: &Jid, plaintext: &[u8]) -> Vec<u8> {
+            let sender = self.jid.to_non_ad();
+            let sender_key_name = make_sender_key_name(group_jid, &sender.to_protocol_address());
+            let sender_key_message = group_encrypt(
+                &mut self.sender_keys,
+                &sender_key_name,
+                plaintext,
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
+            .await
+            .expect("encrypt sender key message");
+            sender_key_message.serialized().to_vec()
         }
     }
 
@@ -2995,7 +3092,7 @@ mod tests {
             },
             ..Default::default()
         });
-        let (success, dups, dispatched) = client
+        let outcome = client
             .clone()
             .process_session_enc_batch(
                 &payloads,
@@ -3010,7 +3107,12 @@ mod tests {
             .has_session(&peer_jid.to_protocol_address(), &*backend)
             .await
             .expect("has_session");
-        (success, dups, dispatched, still)
+        (
+            outcome.decrypted,
+            outcome.duplicate,
+            outcome.undecryptable,
+            still,
+        )
     }
 
     #[tokio::test]
@@ -3181,7 +3283,7 @@ mod tests {
             ..Default::default()
         });
 
-        let (success, _, dispatched) = client
+        let outcome = client
             .clone()
             .process_session_enc_batch(
                 &payloads,
@@ -3190,8 +3292,11 @@ mod tests {
                 crate::types::events::DecryptFailMode::Show,
             )
             .await;
-        assert!(!success, "tampered MAC must not decrypt");
-        assert!(dispatched, "undecryptable event must be dispatched");
+        assert!(!outcome.decrypted, "tampered MAC must not decrypt");
+        assert!(
+            outcome.undecryptable,
+            "undecryptable event must be dispatched"
+        );
 
         // The fix asserts the session lives on so the eventual sender pkmsg
         // can archive it into previous_sessions[0].
@@ -3350,7 +3455,7 @@ mod tests {
             },
             ..Default::default()
         });
-        let (_, _, _) = client
+        let _outcome = client
             .clone()
             .process_session_enc_batch(
                 &payloads,
@@ -4331,7 +4436,7 @@ mod tests {
 
         // Call process_session_enc_batch
         // This should handle any errors gracefully without panicking
-        let (success, _had_duplicates, _dispatched) = client
+        let outcome = client
             .process_session_enc_batch(
                 &payloads,
                 &info,
@@ -4342,7 +4447,7 @@ mod tests {
 
         log::info!(
             "Test: process_session_enc_batch completed - success: {}",
-            success
+            outcome.decrypted
         );
 
         // The key is that this didn't panic - deletion uses full protocol address
@@ -4420,7 +4525,7 @@ mod tests {
 
         // Process the batch
         // Should handle all errors gracefully without stopping at first error
-        let (success, _had_duplicates, _dispatched) = client
+        let outcome = client
             .process_session_enc_batch(
                 &payloads,
                 &info,
@@ -4429,7 +4534,10 @@ mod tests {
             )
             .await;
 
-        log::info!("Test: Batch processing completed - success: {}", success);
+        log::info!(
+            "Test: Batch processing completed - success: {}",
+            outcome.decrypted
+        );
     }
 
     /// Test case: Error handling in group chat context
@@ -4492,7 +4600,7 @@ mod tests {
 
         // Process the message
         // Should handle errors gracefully in group context
-        let (success, _had_duplicates, _dispatched) = client
+        let outcome = client
             .process_session_enc_batch(
                 &payloads,
                 &info,
@@ -4501,7 +4609,10 @@ mod tests {
             )
             .await;
 
-        log::info!("Test: Group message processed - success: {}", success);
+        log::info!(
+            "Test: Group message processed - success: {}",
+            outcome.decrypted
+        );
     }
 
     /// Test case: DM message parsing for self-sent messages via LID
@@ -7181,13 +7292,13 @@ mod tests {
             padding_version: 2,
         };
 
-        let (any_success, any_duplicate, dispatched_undecryptable) = client
+        let outcome = client
             .process_session_enc_batch(&[bad_payload], &info, &sender_jid, DecryptFailMode::Show)
             .await;
 
-        assert!(!any_success);
-        assert!(!any_duplicate);
-        assert!(dispatched_undecryptable);
+        assert!(!outcome.decrypted);
+        assert!(!outcome.duplicate);
+        assert!(outcome.undecryptable);
 
         // spawn_nack is detached; give it a tick to flush through the
         // noise_socket sender_task to our CapturingMockTransport.
@@ -7223,11 +7334,11 @@ mod tests {
             padding_version: 2,
         };
 
-        let (_any_success, _any_duplicate, dispatched_undecryptable) = client
+        let outcome = client
             .process_session_enc_batch(&[bad_payload], &info, &sender_jid, DecryptFailMode::Show)
             .await;
 
-        assert!(dispatched_undecryptable);
+        assert!(outcome.undecryptable);
 
         for _ in 0..40 {
             if !transport.sent().is_empty() {
@@ -7315,6 +7426,69 @@ mod tests {
         None
     }
 
+    #[derive(Debug)]
+    struct SentReceipt {
+        to: String,
+        typ: Option<String>,
+        recipient: Option<String>,
+        participant: Option<String>,
+    }
+
+    fn find_receipt_details(frames: &[bytes::Bytes], id: &str) -> Option<SentReceipt> {
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "receipt"
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && let Some(to) = node.get_attr("to")
+            {
+                return Some(SentReceipt {
+                    to: to.as_str().to_string(),
+                    typ: node.get_attr("type").map(|v| v.as_str().to_string()),
+                    recipient: node.get_attr("recipient").map(|v| v.as_str().to_string()),
+                    participant: node.get_attr("participant").map(|v| v.as_str().to_string()),
+                });
+            }
+        }
+        None
+    }
+
+    #[derive(Debug)]
+    struct SentMessageAck {
+        to: String,
+        participant: Option<String>,
+        recipient: Option<String>,
+    }
+
+    fn find_message_ack_for(frames: &[bytes::Bytes], id: &str) -> Option<SentMessageAck> {
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "ack"
+                && node
+                    .get_attr("class")
+                    .is_some_and(|v| v.as_str() == "message")
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && let Some(to) = node.get_attr("to")
+            {
+                return Some(SentMessageAck {
+                    to: to.as_str().to_string(),
+                    participant: node.get_attr("participant").map(|v| v.as_str().to_string()),
+                    recipient: node.get_attr("recipient").map(|v| v.as_str().to_string()),
+                });
+            }
+        }
+        None
+    }
+
     /// Count delivery `<receipt>` (anything but type="retry") on the wire for `id`.
     fn delivery_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize {
         let mut count = 0;
@@ -7338,6 +7512,84 @@ mod tests {
             }
         }
         count
+    }
+
+    fn message_acks_for(frames: &[bytes::Bytes], id: &str) -> usize {
+        let mut count = 0;
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "ack"
+                && node
+                    .get_attr("class")
+                    .is_some_and(|v| v.as_str() == "message")
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn sender_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize {
+        let mut count = 0;
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "receipt"
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && node
+                    .get_attr("type")
+                    .is_some_and(|v| v.as_str() == "sender")
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn confirmations_for(frames: &[bytes::Bytes], id: &str) -> usize {
+        delivery_receipts_for(frames, id) + message_acks_for(frames, id)
+    }
+
+    async fn wait_for_confirmations(
+        transport: &crate::transport::mock::CapturingMockTransport,
+        id: &str,
+        expected: usize,
+    ) -> usize {
+        let mut count = 0;
+        for _ in 0..80 {
+            count = confirmations_for(&transport.sent(), id);
+            if count >= expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        count
+    }
+
+    async fn assert_exactly_one_confirmation(
+        transport: &crate::transport::mock::CapturingMockTransport,
+        id: &str,
+    ) {
+        let count = wait_for_confirmations(transport, id, 1).await;
+        assert_eq!(count, 1, "message {id} must be confirmed exactly once");
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            assert_eq!(
+                confirmations_for(&transport.sent(), id),
+                1,
+                "message {id} must not get a late second confirmation"
+            );
+        }
     }
 
     /// A stanza that fails to decrypt must emit a transport `<ack class="message">`
@@ -7691,6 +7943,277 @@ mod tests {
                 decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
             })
             .await;
+    }
+
+    fn enc_payload_from_ciphertext(ct: &CiphertextMessage) -> EncPayload {
+        let (enc_type, bytes) = match ct {
+            CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
+            CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
+            _ => panic!("unexpected ciphertext type"),
+        };
+        let enc = NodeBuilder::new("enc")
+            .attr("type", enc_type)
+            .bytes(bytes)
+            .build();
+        EncPayload::from_node_ref(&enc.as_node_ref()).expect("ciphertext payload")
+    }
+
+    fn skmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
+        let enc = NodeBuilder::new("enc")
+            .attr("type", "skmsg")
+            .bytes(bytes)
+            .build();
+        EncPayload::from_node_ref(&enc.as_node_ref()).expect("skmsg payload")
+    }
+
+    fn group_message_info(
+        id: &str,
+        group: &Jid,
+        sender: &Jid,
+        is_from_me: bool,
+    ) -> Arc<MessageInfo> {
+        Arc::new(MessageInfo {
+            id: id.to_string(),
+            source: crate::types::message::MessageSource {
+                sender: sender.clone(),
+                chat: group.clone(),
+                is_from_me,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    async fn process_group_classified(
+        client: &Arc<Client>,
+        info: Arc<MessageInfo>,
+        sender: &Jid,
+        session_payload: EncPayload,
+        group_payloads: Vec<EncPayload>,
+    ) {
+        client
+            .clone()
+            .process_classified_message(ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads: vec![session_payload],
+                group_payloads,
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+            })
+            .await;
+    }
+
+    fn message_events_for_id(rx: &async_channel::Receiver<Arc<Event>>, id: &str) -> (usize, usize) {
+        let mut count = 0;
+        let mut visible_content = 0;
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Message(msg, info) = event.as_ref()
+                && info.id == id
+            {
+                count += 1;
+                if msg.conversation.is_some() {
+                    visible_content += 1;
+                }
+            }
+        }
+        (count, visible_content)
+    }
+
+    fn message_texts_for_id(rx: &async_channel::Receiver<Arc<Event>>, id: &str) -> Vec<String> {
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Message(msg, info) = event.as_ref()
+                && info.id == id
+                && let Some(text) = &msg.conversation
+            {
+                texts.push(text.clone());
+            }
+        }
+        texts
+    }
+
+    #[tokio::test]
+    async fn skdm_only_group_session_acknowledged_once_without_message_event() {
+        use wacore::messages::MessageUtils;
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("skdm_only_group_ack").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450525@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575443@g.us".parse().expect("group");
+        let skdm = alice.create_group_skdm(&group).await;
+        let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: Some(skdm),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
+        let id = "SKDM_ONLY_SESSION";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![],
+        )
+        .await;
+
+        assert_exactly_one_confirmation(&transport, id).await;
+        assert_eq!(
+            delivery_receipts_for(&transport.sent(), id),
+            1,
+            "incoming group SKDM-only session message should drain via delivery receipt"
+        );
+        let sent = transport.sent();
+        let receipt = find_receipt_details(&sent, id).expect("delivery receipt");
+        let sender_str = alice.jid.to_string();
+        assert_eq!(receipt.to, group.to_string());
+        assert_eq!(receipt.participant.as_deref(), Some(sender_str.as_str()));
+        assert_eq!(receipt.recipient, None);
+        assert_ne!(
+            receipt.typ.as_deref(),
+            Some("sender"),
+            "incoming group SKDM-only must not be cleared as a sender receipt"
+        );
+        assert_eq!(
+            message_acks_for(&sent, id),
+            0,
+            "incoming group SKDM-only must not also emit a transport ack"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            message_events_for_id(&rx, id),
+            (0, 0),
+            "SKDM-only messages must not surface Event::Message"
+        );
+    }
+
+    #[tokio::test]
+    async fn skdm_session_with_skmsg_sibling_acknowledged_once() {
+        use wacore::messages::MessageUtils;
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("skdm_plus_skmsg_ack").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450526@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575444@g.us".parse().expect("group");
+        let skdm = alice.create_group_skdm(&group).await;
+        let skdm_plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: Some(skdm),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
+
+        let content_plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            conversation: Some("group content".to_string()),
+            ..Default::default()
+        });
+        let skmsg = alice
+            .encrypt_group_message(&group, &content_plaintext)
+            .await;
+        let id = "SKDM_WITH_SKMSG";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![skmsg_payload_from_bytes(skmsg)],
+        )
+        .await;
+
+        assert_exactly_one_confirmation(&transport, id).await;
+        assert_eq!(
+            delivery_receipts_for(&transport.sent(), id),
+            1,
+            "the skmsg content dispatch should own the only receipt"
+        );
+        let sent = transport.sent();
+        let receipt = find_receipt_details(&sent, id).expect("delivery receipt");
+        let sender_str = alice.jid.to_string();
+        assert_eq!(receipt.to, group.to_string());
+        assert_eq!(receipt.participant.as_deref(), Some(sender_str.as_str()));
+        assert_eq!(
+            message_acks_for(&sent, id),
+            0,
+            "SKDM+skmsg sibling must not get an extra transport ack"
+        );
+        assert_eq!(
+            message_texts_for_id(&rx, id),
+            vec!["group content".to_string()],
+            "only the skmsg content should dispatch a user message"
+        );
+    }
+
+    #[tokio::test]
+    async fn own_group_skdm_only_session_uses_transport_ack_once() {
+        use wacore::messages::MessageUtils;
+
+        let (client, transport) = capturing_client("own_group_skdm_ack").await;
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("999999999999999@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575445@g.us".parse().expect("group");
+        let skdm = alice.create_group_skdm(&group).await;
+        let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: Some(skdm),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
+        let id = "OWN_GROUP_SKDM_ONLY";
+        let info = group_message_info(id, &group, &alice.jid, true);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![],
+        )
+        .await;
+
+        assert_exactly_one_confirmation(&transport, id).await;
+        let sent = transport.sent();
+        assert_eq!(
+            message_acks_for(&sent, id),
+            1,
+            "own group SKDM-only session message should use transport ack"
+        );
+        let ack = find_message_ack_for(&sent, id).expect("transport ack");
+        let sender_str = alice.jid.to_string();
+        assert_eq!(ack.to, group.to_string());
+        assert_eq!(ack.participant.as_deref(), Some(sender_str.as_str()));
+        assert_eq!(ack.recipient, None);
+        assert_eq!(
+            delivery_receipts_for(&sent, id),
+            0,
+            "own group SKDM-only session message must not use a delivery receipt"
+        );
+        assert_eq!(
+            sender_receipts_for(&sent, id),
+            0,
+            "group self-fanout must not use type=sender receipt"
+        );
     }
 
     /// Regression for the offline-backlog disconnect: an already-processed
