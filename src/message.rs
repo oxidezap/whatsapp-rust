@@ -78,6 +78,7 @@ struct SessionBatchOutcome {
     dispatched: bool,
     skdm_only: bool,
     plaintext_failed: bool,
+    had_failure: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1139,6 +1140,7 @@ impl Client {
         let session_dispatched = session_outcome.dispatched;
         let session_skdm_only = session_outcome.skdm_only;
         let session_plaintext_failed = session_outcome.plaintext_failed;
+        let session_had_failure = session_outcome.had_failure;
 
         log::debug!(
             "Starting PASS 2: Processing {} group content messages (skmsg)",
@@ -1156,8 +1158,8 @@ impl Client {
         // to resend the entire message including SKDM.
         if !group_payloads.is_empty() {
             let should_process_skmsg = session_payloads.is_empty()
-                || session_decrypted_successfully
-                || session_had_duplicates;
+                || (!session_had_failure
+                    && (session_decrypted_successfully || session_had_duplicates));
 
             if should_process_skmsg {
                 match self
@@ -1256,8 +1258,10 @@ impl Client {
         } else if session_decrypted_successfully
             && session_skdm_only
             && !session_dispatched
+            && !session_had_failure
             && !session_plaintext_failed
             && !session_dispatched_undecryptable
+            && bot_payloads.is_empty()
         {
             // SKDM-only session decrypts skip dispatch, so this stanza would
             // otherwise stay queued. WA Web and whatsmeow ack every decrypted
@@ -1329,6 +1333,7 @@ impl Client {
                         );
                         // |= so a later dedup'd return (false) can't clobber
                         // a true set by a prior iteration in this batch.
+                        outcome.had_failure = true;
                         outcome.undecryptable |= self
                             .dispatch_undecryptable_event(
                                 Arc::clone(info),
@@ -1350,6 +1355,7 @@ impl Client {
                             info.id,
                             info.source.sender
                         );
+                        outcome.had_failure = true;
                         outcome.undecryptable |= self
                             .dispatch_undecryptable_event(
                                 Arc::clone(info),
@@ -1433,6 +1439,7 @@ impl Client {
                             );
                             outcome.decrypted = true;
                             outcome.plaintext_failed = true;
+                            outcome.had_failure = true;
                             outcome.undecryptable |=
                                 self.handle_plaintext_failure(info, decrypt_fail_mode).await;
                         }
@@ -1527,6 +1534,7 @@ impl Client {
                                         );
                                         outcome.decrypted = true;
                                         outcome.plaintext_failed = true;
+                                        outcome.had_failure = true;
                                         outcome.undecryptable |= self
                                             .handle_plaintext_failure(info, decrypt_fail_mode)
                                             .await;
@@ -1576,6 +1584,7 @@ impl Client {
                                         outcome.skdm_only |= migration_outcome.skdm_only;
                                         outcome.plaintext_failed |=
                                             migration_outcome.plaintext_failed;
+                                        outcome.had_failure |= migration_outcome.plaintext_failed;
                                         if migration_outcome.plaintext_failed {
                                             outcome.undecryptable |= self
                                                 .handle_plaintext_failure(info, decrypt_fail_mode)
@@ -1588,6 +1597,7 @@ impl Client {
                                             info.id,
                                             address
                                         );
+                                        outcome.had_failure = true;
                                         outcome.undecryptable = self
                                             .handle_decrypt_failure(
                                                 info,
@@ -1605,6 +1615,7 @@ impl Client {
                                     );
                                     // Send retry receipt so the sender resends with a PreKeySignalMessage
                                     // to establish a new session with the new identity
+                                    outcome.had_failure = true;
                                     outcome.undecryptable = self
                                         .handle_decrypt_failure(
                                             info,
@@ -1656,6 +1667,7 @@ impl Client {
                             outcome.dispatched |= migration_outcome.dispatched;
                             outcome.skdm_only |= migration_outcome.skdm_only;
                             outcome.plaintext_failed |= migration_outcome.plaintext_failed;
+                            outcome.had_failure |= migration_outcome.plaintext_failed;
                             if migration_outcome.plaintext_failed {
                                 outcome.undecryptable |=
                                     self.handle_plaintext_failure(info, decrypt_fail_mode).await;
@@ -1667,6 +1679,7 @@ impl Client {
                             "[msg:{}] No session found for {} message from {}. Sending retry receipt to request session establishment.",
                             info.id, enc_type, info.source.sender
                         );
+                        outcome.had_failure = true;
                         outcome.undecryptable = self
                             .handle_decrypt_failure(info, RetryReason::NoSession, decrypt_fail_mode)
                             .await;
@@ -1700,6 +1713,7 @@ impl Client {
                             outcome.dispatched |= migration_outcome.dispatched;
                             outcome.skdm_only |= migration_outcome.skdm_only;
                             outcome.plaintext_failed |= migration_outcome.plaintext_failed;
+                            outcome.had_failure |= migration_outcome.plaintext_failed;
                             if migration_outcome.plaintext_failed {
                                 outcome.undecryptable |=
                                     self.handle_plaintext_failure(info, decrypt_fail_mode).await;
@@ -1723,6 +1737,7 @@ impl Client {
                             info.source.sender
                         );
 
+                        outcome.had_failure = true;
                         outcome.undecryptable = self
                             .handle_decrypt_failure(info, reason, decrypt_fail_mode)
                             .await;
@@ -1755,6 +1770,7 @@ impl Client {
                             outcome.dispatched |= migration_outcome.dispatched;
                             outcome.skdm_only |= migration_outcome.skdm_only;
                             outcome.plaintext_failed |= migration_outcome.plaintext_failed;
+                            outcome.had_failure |= migration_outcome.plaintext_failed;
                             if migration_outcome.plaintext_failed {
                                 outcome.undecryptable |=
                                     self.handle_plaintext_failure(info, decrypt_fail_mode).await;
@@ -1772,6 +1788,7 @@ impl Client {
                         );
 
                         // Send retry receipt with fresh prekeys
+                        outcome.had_failure = true;
                         outcome.undecryptable = self
                             .handle_decrypt_failure(
                                 info,
@@ -1789,6 +1806,7 @@ impl Client {
                             info.source.sender,
                             e
                         );
+                        outcome.had_failure = true;
                         outcome.undecryptable |= self
                             .dispatch_undecryptable_event(
                                 Arc::clone(info),
@@ -6262,36 +6280,56 @@ mod tests {
     /// resend the entire message including SKDM.
     #[test]
     fn test_should_process_skmsg_logic_matches_wa_web() {
-        // Test cases: (chat_jid, session_empty, session_success, session_dupe, expected)
+        // Test cases: (chat_jid, session_empty, session_success, session_dupe, session_failed, expected)
         let test_cases = [
             // Status broadcast: same rules as all other chats (WA Web: canDecryptNext is uniform)
-            ("status@broadcast", false, false, false, false), // Fail: session failed → skip skmsg
-            ("status@broadcast", false, false, true, true),   // OK: duplicate
-            ("status@broadcast", false, true, false, true),   // OK: success
-            ("status@broadcast", true, false, false, true),   // OK: no session msgs
+            ("status@broadcast", false, false, false, false, false), // Fail: session failed → skip skmsg
+            ("status@broadcast", false, false, true, false, true),   // OK: duplicate
+            ("status@broadcast", false, true, false, false, true),   // OK: success
+            ("status@broadcast", false, true, false, true, false), // Fail: mixed success + failure
+            ("status@broadcast", true, false, false, false, true), // OK: no session msgs
             // Regular group
-            ("120363021033254949@g.us", false, false, false, false),
-            ("120363021033254949@g.us", false, false, true, true),
-            ("120363021033254949@g.us", false, true, false, true),
-            ("120363021033254949@g.us", true, false, false, true),
+            ("120363021033254949@g.us", false, false, false, false, false),
+            ("120363021033254949@g.us", false, false, true, false, true),
+            ("120363021033254949@g.us", false, true, false, false, true),
+            ("120363021033254949@g.us", false, true, false, true, false),
+            ("120363021033254949@g.us", true, false, false, false, true),
             // 1:1 chat
-            ("15551234567@s.whatsapp.net", false, false, false, false),
-            ("15551234567@s.whatsapp.net", true, false, false, true),
+            (
+                "15551234567@s.whatsapp.net",
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                "15551234567@s.whatsapp.net",
+                true,
+                false,
+                false,
+                false,
+                true,
+            ),
         ];
 
-        for (jid_str, session_empty, session_success, session_dupe, expected) in test_cases {
+        for (jid_str, session_empty, session_success, session_dupe, session_failed, expected) in
+            test_cases
+        {
             // Recreate the should_process_skmsg logic from handle_incoming_message
-            let should_process_skmsg = session_empty || session_success || session_dupe;
+            let should_process_skmsg =
+                session_empty || (!session_failed && (session_success || session_dupe));
 
             assert_eq!(
                 should_process_skmsg,
                 expected,
-                "For chat {} with session_empty={}, session_success={}, session_dupe={}: \
+                "For chat {} with session_empty={}, session_success={}, session_dupe={}, session_failed={}: \
                  expected should_process_skmsg={}, got {}",
                 jid_str,
                 session_empty,
                 session_success,
                 session_dupe,
+                session_failed,
                 expected,
                 should_process_skmsg
             );
@@ -8183,6 +8221,14 @@ mod tests {
         EncPayload::from_node_ref(&enc.as_node_ref()).expect("skmsg payload")
     }
 
+    fn msmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
+        let enc = NodeBuilder::new("enc")
+            .attr("type", "msmsg")
+            .bytes(bytes)
+            .build();
+        EncPayload::from_node_ref(&enc.as_node_ref()).expect("msmsg payload")
+    }
+
     fn group_message_info(
         id: &str,
         group: &Jid,
@@ -8226,6 +8272,25 @@ mod tests {
         session_payloads: Vec<EncPayload>,
         group_payloads: Vec<EncPayload>,
     ) {
+        process_group_classified_with_payloads(
+            client,
+            info,
+            sender,
+            session_payloads,
+            group_payloads,
+            vec![],
+        )
+        .await;
+    }
+
+    async fn process_group_classified_with_payloads(
+        client: &Arc<Client>,
+        info: Arc<MessageInfo>,
+        sender: &Jid,
+        session_payloads: Vec<EncPayload>,
+        group_payloads: Vec<EncPayload>,
+        bot_payloads: Vec<EncPayload>,
+    ) {
         client
             .clone()
             .process_classified_message(ClassifiedMessage {
@@ -8233,7 +8298,7 @@ mod tests {
                 sender_encryption_jid: sender.clone(),
                 session_payloads,
                 group_payloads,
-                bot_payloads: vec![],
+                bot_payloads,
                 max_sender_retry_count: 0,
                 decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
             })
@@ -8457,6 +8522,125 @@ mod tests {
             message_events_for_id(&rx, id),
             (0, 0),
             "mixed SKDM and bad plaintext must not dispatch user content"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_session_plaintext_skips_skmsg_sibling_after_nack() {
+        use wacore::messages::MessageUtils;
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("bad_session_skips_skmsg").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+        let recorder = Arc::new(EventRecorder::default());
+        client.register_handler(recorder.clone());
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450532@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575450@g.us".parse().expect("group");
+        let skdm = alice.create_group_skdm(&group).await;
+        let skdm_plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: Some(skdm),
+            ..Default::default()
+        });
+        let skdm_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
+        let bad_ct = alice.encrypt(&bob_addr, &[0xff, 0x01]).await;
+        let content_plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            conversation: Some("must not dispatch".to_string()),
+            ..Default::default()
+        });
+        let skmsg = alice
+            .encrypt_group_message(&group, &content_plaintext)
+            .await;
+        let id = "BAD_SESSION_WITH_SKMSG";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified_with_sessions(
+            &client,
+            info,
+            &alice.jid,
+            vec![
+                enc_payload_from_ciphertext(&skdm_ct),
+                enc_payload_from_ciphertext(&bad_ct),
+            ],
+            vec![skmsg_payload_from_bytes(skmsg)],
+        )
+        .await;
+
+        let mut nack_code = None;
+        for _ in 0..80 {
+            nack_code = find_message_nack_error(&transport.sent(), id);
+            if nack_code.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(nack_code, Some(491));
+        assert_eq!(
+            confirmations_for(&transport.sent(), id),
+            0,
+            "skmsg must not ack after a session InvalidProtobuf nack"
+        );
+        assert_eq!(
+            recorder.undecryptable().len(),
+            1,
+            "session plaintext failure should own the only user-visible failure"
+        );
+        assert_eq!(
+            message_texts_for_id(&rx, id),
+            Vec::<String>::new(),
+            "skmsg content must be skipped after session plaintext failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn skdm_only_session_with_msmsg_waits_for_bot_payload_response() {
+        use wacore::messages::MessageUtils;
+
+        let (client, transport) = capturing_client("skdm_msmsg_no_fallback_ack").await;
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450533@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575451@g.us".parse().expect("group");
+        let skdm = alice.create_group_skdm(&group).await;
+        let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: Some(skdm),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
+        let id = "SKDM_WITH_MSMSG";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified_with_payloads(
+            &client,
+            info,
+            &alice.jid,
+            vec![enc_payload_from_ciphertext(&session_ct)],
+            vec![],
+            vec![msmsg_payload_from_bytes(vec![0xff])],
+        )
+        .await;
+
+        let mut nack_code = None;
+        for _ in 0..80 {
+            nack_code = find_message_nack_error(&transport.sent(), id);
+            if nack_code.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(nack_code, Some(487));
+        assert_eq!(
+            confirmations_for(&transport.sent(), id),
+            0,
+            "SKDM-only fallback must not pre-ack a stanza with msmsg work"
         );
     }
 
