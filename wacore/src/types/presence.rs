@@ -48,8 +48,12 @@ pub enum ReceiptType {
 }
 
 impl ReceiptType {
-    pub fn parse(s: &str) -> Self {
-        match s {
+    /// Single source of truth for the wire-string -> known-variant mapping
+    /// (the inverse of [`Self::as_wire_str`]). Returns `None` for an
+    /// unrecognized value so callers can decide how to build `Other` (clone vs
+    /// move) without duplicating the match.
+    fn from_known(s: &str) -> Option<Self> {
+        Some(match s {
             "" | "delivery" => Self::Delivered,
             "sender" => Self::Sender,
             "retry" => Self::Retry,
@@ -62,27 +66,41 @@ impl ReceiptType {
             "inactive" => Self::Inactive,
             "peer_msg" => Self::PeerMsg,
             "hist_sync" => Self::HistorySync,
-            other => Self::Other(other.to_string()),
+            _ => return None,
+        })
+    }
+
+    pub fn parse(s: &str) -> Self {
+        Self::from_known(s).unwrap_or_else(|| Self::Other(s.to_string()))
+    }
+
+    /// Canonical wire `type` value. Inverse of [`Self::parse`] (`Delivered`
+    /// maps to `"delivery"`, though it is sent as a dropped attr in practice).
+    pub fn as_wire_str(&self) -> &str {
+        match self {
+            Self::Delivered => "delivery",
+            Self::Sender => "sender",
+            Self::Retry => "retry",
+            Self::EncRekeyRetry => "enc_rekey_retry",
+            Self::Read => "read",
+            Self::ReadSelf => "read-self",
+            Self::Played => "played",
+            Self::PlayedSelf => "played-self",
+            Self::ServerError => "server-error",
+            Self::Inactive => "inactive",
+            Self::PeerMsg => "peer_msg",
+            Self::HistorySync => "hist_sync",
+            Self::Other(s) => s,
         }
     }
 }
 
 impl From<String> for ReceiptType {
     fn from(s: String) -> Self {
-        match s.as_str() {
-            "" | "delivery" => Self::Delivered,
-            "sender" => Self::Sender,
-            "retry" => Self::Retry,
-            "enc_rekey_retry" => Self::EncRekeyRetry,
-            "read" => Self::Read,
-            "read-self" => Self::ReadSelf,
-            "played" => Self::Played,
-            "played-self" => Self::PlayedSelf,
-            "server-error" => Self::ServerError,
-            "inactive" => Self::Inactive,
-            "peer_msg" => Self::PeerMsg,
-            "hist_sync" => Self::HistorySync,
-            _ => Self::Other(s),
+        // Reuse the owned `s` for the `Other` fallback (no extra allocation).
+        match Self::from_known(&s) {
+            Some(known) => known,
+            None => Self::Other(s),
         }
     }
 }
@@ -107,5 +125,35 @@ mod tests {
             ReceiptType::from("enc_rekey_retry".to_string()),
             ReceiptType::EncRekeyRetry
         );
+    }
+
+    #[test]
+    fn as_wire_str_round_trips_through_parse() {
+        // as_wire_str is the hand-maintained inverse of parse(); guard the
+        // hyphen/underscore variants against drift.
+        let variants = [
+            ReceiptType::Delivered,
+            ReceiptType::Sender,
+            ReceiptType::Retry,
+            ReceiptType::EncRekeyRetry,
+            ReceiptType::Read,
+            ReceiptType::ReadSelf,
+            ReceiptType::Played,
+            ReceiptType::PlayedSelf,
+            ReceiptType::ServerError,
+            ReceiptType::Inactive,
+            ReceiptType::PeerMsg,
+            ReceiptType::HistorySync,
+        ];
+        for v in variants {
+            assert_eq!(
+                ReceiptType::parse(v.as_wire_str()),
+                v,
+                "round-trip failed for {v:?} (wire={:?})",
+                v.as_wire_str()
+            );
+        }
+        let other = ReceiptType::Other("custom-type".to_string());
+        assert_eq!(other.as_wire_str(), "custom-type");
     }
 }

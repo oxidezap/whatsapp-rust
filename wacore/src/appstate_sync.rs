@@ -40,7 +40,7 @@ fn lookup_app_state_key(
 pub enum AppStateSyncError {
     #[error("app state key not found: {0}")]
     KeyNotFound(String),
-    #[error("store error: {0}")]
+    #[error("store error")]
     Store(#[from] crate::store::error::StoreError),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -530,7 +530,6 @@ impl AppStateProcessor {
             snapshot_mac: Some(snapshot_mac),
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
-                ..Default::default()
             }),
             mutations,
             ..Default::default()

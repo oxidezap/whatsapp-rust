@@ -6,20 +6,33 @@ use log::{debug, error, info, warn};
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use wacore::companion_reg::companion_web_client_type_for_props;
 use wacore::libsignal::protocol::KeyPair;
 use wacore_binary::NodeRef;
 use wacore_binary::{Jid, SERVER_JID};
 use waproto::whatsapp as wa;
 
+pub use wacore::companion_reg::{CompanionWebClientType, NATIVE_CAMERA_DEEP_LINK_PREFIX};
 pub use wacore::pair::{DeviceState, PairCryptoError, PairUtils};
 
-pub fn make_qr_data(store: &crate::store::Device, ref_str: String) -> String {
+/// Auto-derives client type from `device_props`; see
+/// [`make_qr_data_with_client_type`] to override.
+pub fn make_qr_data(store: &crate::store::Device, ref_str: &str) -> String {
+    let client_type = companion_web_client_type_for_props(&store.device_props);
+    make_qr_data_with_client_type(store, ref_str, client_type)
+}
+
+pub fn make_qr_data_with_client_type(
+    store: &crate::store::Device,
+    ref_str: &str,
+    client_type: CompanionWebClientType,
+) -> String {
     let device_state = DeviceState {
         identity_key: store.identity_key.clone(),
         noise_key: store.noise_key.clone(),
         adv_secret_key: store.adv_secret_key,
     };
-    PairUtils::make_qr_data(&device_state, ref_str)
+    PairUtils::make_qr_data(&device_state, ref_str, client_type)
 }
 
 pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
@@ -49,12 +62,14 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                         noise_key: device_snapshot.noise_key.clone(),
                         adv_secret_key: device_snapshot.adv_secret_key,
                     };
+                    let client_type =
+                        companion_web_client_type_for_props(&device_snapshot.device_props);
 
                     for grandchild in child.get_children_by_tag("ref") {
                         if let Some(bytes) = grandchild.content_bytes()
                             && let Ok(r) = std::str::from_utf8(bytes)
                         {
-                            codes.push(PairUtils::make_qr_data(&device_state, r.to_string()));
+                            codes.push(PairUtils::make_qr_data(&device_state, r, client_type));
                         }
                     }
 
@@ -246,6 +261,15 @@ async fn handle_pair_success<'a>(
                 .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
                     lid.clone(),
                 )))
+                .await;
+
+            // A prior pairing's `server_has_prekeys=true` would make
+            // `upload_pre_keys_at_login` skip and leave the server bundle stale.
+            // Reset it so the next connect re-uploads, matching WA Web where a
+            // freshly registered device always uploads its prekeys.
+            client
+                .persistence_manager
+                .modify_device(|d| d.server_has_prekeys = false)
                 .await;
 
             // Add the own LID-PN mapping to the cache so that when sending DMs to self,

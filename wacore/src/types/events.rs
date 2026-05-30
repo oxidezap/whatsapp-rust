@@ -30,6 +30,9 @@ pub struct LazyHistorySync {
     sync_type: i32,
     chunk_order: Option<u32>,
     progress: Option<u32>,
+    /// Set on ON_DEMAND syncs so consumers can correlate the answer with their
+    /// outstanding `fetchMessageHistory` / `requestPlaceholderResend` request.
+    peer_data_request_session_id: Option<String>,
     parsed: OnceLock<Option<Box<wa::HistorySync>>>,
 }
 
@@ -40,6 +43,7 @@ impl Clone for LazyHistorySync {
             sync_type: self.sync_type,
             chunk_order: self.chunk_order,
             progress: self.progress,
+            peer_data_request_session_id: self.peer_data_request_session_id.clone(),
             parsed: OnceLock::new(), // don't deep-copy the decoded proto
         }
     }
@@ -57,8 +61,14 @@ impl LazyHistorySync {
             sync_type,
             chunk_order,
             progress,
+            peer_data_request_session_id: None,
             parsed: OnceLock::new(),
         }
+    }
+
+    pub fn with_peer_data_request_session_id(mut self, id: Option<String>) -> Self {
+        self.peer_data_request_session_id = id;
+        self
     }
 
     /// History sync type (e.g. InitialBootstrap, Recent, PushName).
@@ -75,6 +85,11 @@ impl LazyHistorySync {
     /// Sync progress (0-100).
     pub fn progress(&self) -> Option<u32> {
         self.progress
+    }
+
+    /// `None` for server-pushed syncs (e.g. `INITIAL_BOOTSTRAP`).
+    pub fn peer_data_request_session_id(&self) -> Option<&str> {
+        self.peer_data_request_session_id.as_deref()
     }
 
     /// Full decode of the history sync proto, cached via OnceLock.
@@ -106,6 +121,10 @@ impl fmt::Debug for LazyHistorySync {
             .field("sync_type", &self.sync_type)
             .field("chunk_order", &self.chunk_order)
             .field("progress", &self.progress)
+            .field(
+                "peer_data_request_session_id",
+                &self.peer_data_request_session_id,
+            )
             .field("raw_size", &self.raw_bytes.len())
             .field(
                 "parsed",
@@ -121,10 +140,14 @@ impl Serialize for LazyHistorySync {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("LazyHistorySync", 3)?;
+        let mut s = serializer.serialize_struct("LazyHistorySync", 4)?;
         s.serialize_field("sync_type", &self.sync_type)?;
         s.serialize_field("chunk_order", &self.chunk_order)?;
         s.serialize_field("progress", &self.progress)?;
+        s.serialize_field(
+            "peer_data_request_session_id",
+            &self.peer_data_request_session_id,
+        )?;
         s.end()
     }
 }
@@ -386,7 +409,7 @@ pub enum Event {
     QrScannedWithoutMultidevice(QrScannedWithoutMultidevice),
     ClientOutdated(ClientOutdated),
 
-    Message(Box<wa::Message>, Arc<MessageInfo>),
+    Message(Arc<wa::Message>, Arc<MessageInfo>),
     Receipt(Receipt),
     UndecryptableMessage(UndecryptableMessage),
     #[serde(skip)]
@@ -466,7 +489,7 @@ pub struct MexNotification {
 }
 
 impl Event {
-    pub fn as_message(&self) -> Option<(&wa::Message, &MessageInfo)> {
+    pub fn as_message(&self) -> Option<(&Arc<wa::Message>, &MessageInfo)> {
         if let Event::Message(msg, info) = self {
             Some((msg, &**info))
         } else {
@@ -749,8 +772,12 @@ pub struct ContactUpdated {
 /// Emitted from `<notification type="contacts"><modify old="..." new="..."
 /// old_lid="..." new_lid="..."/>`.
 ///
-/// WA Web creates two LID-PN mappings (`old_lid→old_jid`, `new_lid→new_jid`)
-/// and generates a system notification message in both old and new chats.
+/// The library updates the global LID-PN cache when both `old_lid` and
+/// `new_lid` are present, mirroring `WAWebDBCreateLidPnMappings`. No Signal
+/// session is wiped (WA Web `WAWebHandleContactNotification` also leaves
+/// sessions intact). Group participant updates arrive via separate
+/// `w:gp2` notifications, so per-group caches are not touched here.
+/// Consumers can subscribe and refresh their own caches if needed.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContactNumberChanged {
     /// Old phone number JID.
@@ -943,6 +970,22 @@ mod tests {
     }
 
     #[test]
+    fn lazy_history_sync_peer_data_request_session_id() {
+        let bytes = make_history_sync_bytes(vec![]);
+
+        let unset = LazyHistorySync::new(Bytes::from(bytes.clone()), 0, None, None);
+        assert_eq!(unset.peer_data_request_session_id(), None);
+
+        let set = LazyHistorySync::new(Bytes::from(bytes), 0, None, None)
+            .with_peer_data_request_session_id(Some("session-123".to_string()));
+        assert_eq!(set.peer_data_request_session_id(), Some("session-123"));
+
+        // Round-trip through Clone
+        let cloned = set.clone();
+        assert_eq!(cloned.peer_data_request_session_id(), Some("session-123"));
+    }
+
+    #[test]
     fn lazy_history_sync_raw_bytes() {
         let bytes = make_history_sync_bytes(vec![wa::Conversation {
             id: "raw@s.whatsapp.net".to_string(),
@@ -987,7 +1030,6 @@ mod tests {
                 }
                 .into(),
                 msg_order_id: Some(0),
-                ..Default::default()
             }],
             ..Default::default()
         };

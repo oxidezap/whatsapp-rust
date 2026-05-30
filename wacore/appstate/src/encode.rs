@@ -26,7 +26,6 @@ pub fn encode_record(
         value: buffa::MessageField::some(value.clone()),
         padding: Some(vec![]),
         version: Some(1),
-        ..Default::default()
     };
     let plaintext = action_data.encode_to_vec();
 
@@ -59,23 +58,18 @@ pub fn encode_record(
     let record = wa::SyncdRecord {
         index: buffa::MessageField::some(wa::SyncdIndex {
             blob: Some(index_mac),
-            ..Default::default()
         }),
         value: buffa::MessageField::some(wa::SyncdValue {
             blob: Some(value_blob),
-            ..Default::default()
         }),
         key_id: buffa::MessageField::some(wa::KeyId {
             id: Some(key_id.to_vec()),
-            ..Default::default()
         }),
-        ..Default::default()
     };
 
     let mutation = wa::SyncdMutation {
         operation: Some(operation),
         record: buffa::MessageField::some(record),
-        ..Default::default()
     };
 
     (mutation, value_mac)
@@ -98,7 +92,6 @@ mod tests {
         let value = wa::SyncActionValue {
             push_name_setting: buffa::MessageField::some(wa::sync_action_value::PushNameSetting {
                 name: Some("Test User".to_string()),
-                ..Default::default()
             }),
             timestamp: Some(1234567890),
             ..Default::default()

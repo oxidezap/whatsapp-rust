@@ -76,7 +76,6 @@ impl SenderMessageKey {
         sender_key_state_structure::SenderMessageKey {
             iteration: Some(self.iteration),
             seed: Some(Bytes::copy_from_slice(&self.seed)),
-            ..Default::default()
         }
     }
 }
@@ -163,7 +162,6 @@ impl SenderChainKey {
         sender_key_state_structure::SenderChainKey {
             iteration: Some(self.iteration),
             seed: Some(Bytes::copy_from_slice(&self.chain_key)),
-            ..Default::default()
         }
     }
 }
@@ -193,10 +191,8 @@ impl SenderKeyState {
                 public: Some(Bytes::copy_from_slice(&signature_key.serialize())),
                 private: signature_private_key
                     .map(|k| Bytes::copy_from_slice(k.serialize().as_ref())),
-                ..Default::default()
             }),
             sender_message_keys: vec![],
-            ..Default::default()
         };
 
         Self { state }
@@ -413,7 +409,6 @@ impl SenderKeyRecord {
 
         SenderKeyRecordStructure {
             sender_key_states: states,
-            ..Default::default()
         }
     }
 

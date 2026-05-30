@@ -50,6 +50,15 @@ pub struct TcTokenEntry {
     pub sender_timestamp: Option<i64>,
 }
 
+/// Message-secret write entry keyed by chat, sender, and message ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MsgSecretEntry {
+    pub chat: String,
+    pub sender: String,
+    pub msg_id: String,
+    pub secret: Vec<u8>,
+}
+
 /// Device information for registry tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -230,6 +239,10 @@ pub trait ProtocolStore: Send + Sync {
     /// Clear all sender key device tracking for a group (on sender key rotation).
     async fn clear_sender_key_devices(&self, group_jid: &str) -> Result<()>;
 
+    /// Delete specific `sender_key_devices` rows by device JID across all groups.
+    /// Mirrors WA Web's per-group `senderKey.delete(deviceJid)` cleanup.
+    async fn delete_sender_key_device_rows(&self, device_jids: &[&str]) -> Result<()>;
+
     /// Clear all sender key device tracking across ALL groups.
     /// Called on identity change (raw_id mismatch) to force SKDM redistribution.
     async fn clear_all_sender_key_devices(&self) -> Result<()>;
@@ -278,6 +291,17 @@ pub trait ProtocolStore: Send + Sync {
 
     /// Update the device list for a user (called after usync responses).
     async fn update_device_list(&self, record: DeviceListRecord) -> Result<()>;
+
+    /// Batched variant of `update_device_list`. Backends should override with
+    /// a single transaction; the default loops for correctness. Important on
+    /// usync of large groups, where the per-row commit + spawn_blocking
+    /// overhead dominates wall-clock time when called once per participant.
+    async fn update_device_lists(&self, records: Vec<DeviceListRecord>) -> Result<()> {
+        for record in records {
+            self.update_device_list(record).await?;
+        }
+        Ok(())
+    }
 
     /// Get all known devices for a user.
     async fn get_devices(&self, user: &str) -> Result<Option<DeviceListRecord>>;
@@ -345,10 +369,61 @@ pub trait DeviceStore: Send + Sync {
     }
 }
 
+/// Per-outbound-message secret storage for addon-style decryption.
+///
+/// Persists the 32-byte `MessageContextInfo.messageSecret` we send out so that
+/// later inbound replies (poll votes, reactions, msmsg bot responses, edits)
+/// referencing the original message ID can be decrypted. Mirrors WA Web's
+/// `WAWebMsmsgMsgSecretCache` + the `messageSecret` field on the DB message row.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait MsgSecretStore: Send + Sync {
+    /// Persist `secret` (typically 32 bytes) under the composite key.
+    /// `chat`, `sender`, and `msg_id` are JID strings / message ID strings;
+    /// callers should pass non-AD (no-device) form for the JIDs so lookups
+    /// match regardless of which device echo'd the stanza back.
+    async fn put_msg_secret(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+        secret: &[u8],
+    ) -> Result<()>;
+
+    /// Batched variant of `put_msg_secret`.
+    async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize> {
+        let mut stored = 0usize;
+        for entry in entries {
+            self.put_msg_secret(&entry.chat, &entry.sender, &entry.msg_id, &entry.secret)
+                .await?;
+            stored += 1;
+        }
+        Ok(stored)
+    }
+
+    /// Fetch the persisted secret; returns `None` if absent.
+    async fn get_msg_secret(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<Vec<u8>>>;
+
+    /// Delete rows whose `created_at` is older than `cutoff_timestamp`
+    /// (seconds since epoch). Returns the number of rows removed so the
+    /// keepalive cleanup can log/throttle.
+    async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32>;
+}
+
 /// Combined storage backend trait.
 ///
-/// Any type implementing all four domain traits automatically implements `Backend`.
-pub trait Backend: SignalStore + AppSyncStore + ProtocolStore + DeviceStore + Send + Sync {}
+/// Any type implementing all domain traits automatically implements `Backend`.
+pub trait Backend:
+    SignalStore + AppSyncStore + ProtocolStore + MsgSecretStore + DeviceStore + Send + Sync
+{
+}
 
-impl<T> Backend for T where T: SignalStore + AppSyncStore + ProtocolStore + DeviceStore + Send + Sync
-{}
+impl<T> Backend for T where
+    T: SignalStore + AppSyncStore + ProtocolStore + MsgSecretStore + DeviceStore + Send + Sync
+{
+}

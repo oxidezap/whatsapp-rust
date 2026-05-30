@@ -85,7 +85,6 @@ impl MessageKeyGenerator {
                     mac_key: Some(Bytes::copy_from_slice(keys.mac_key())),
                     iv: Some(Bytes::copy_from_slice(keys.iv())),
                     index: Some(keys.counter()),
-                    ..Default::default()
                 }
             }
         }

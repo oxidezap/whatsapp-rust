@@ -3,7 +3,7 @@ name: E2E Tests
 on:
   push:
     branches: [main]
-  pull_request_target:
+  pull_request:
     branches: [main]
   workflow_call:
 
@@ -19,6 +19,8 @@ env:
 jobs:
   e2e:
     name: E2E Tests
+    # Fork PRs get no secrets, so they can't pull the private mock-server image.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     services:
       mock-server:

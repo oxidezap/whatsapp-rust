@@ -7,20 +7,16 @@ fn make_record(key_id: &[u8], value_with_mac: Vec<u8>, index_mac: Vec<u8>) -> wa
     wa::SyncdRecord {
         index: wa::SyncdIndex {
             blob: Some(index_mac),
-            ..Default::default()
         }
         .into(),
         value: wa::SyncdValue {
             blob: Some(value_with_mac),
-            ..Default::default()
         }
         .into(),
         key_id: wa::KeyId {
             id: Some(key_id.to_vec()),
-            ..Default::default()
         }
         .into(),
-        ..Default::default()
     }
 }
 
@@ -69,12 +65,10 @@ fn snapshot_and_patch_mac_roundtrip() {
     let mutation1 = wa::SyncdMutation {
         operation: Some(wa::syncd_mutation::SyncdOperation::SET),
         record: make_record(key_id, value_blob1.clone(), index_mac1.clone()).into(),
-        ..Default::default()
     };
     let mutation2 = wa::SyncdMutation {
         operation: Some(wa::syncd_mutation::SyncdOperation::SET),
         record: make_record(key_id, value_blob2.clone(), index_mac2.clone()).into(),
-        ..Default::default()
     };
 
     let mutations = vec![mutation1.clone(), mutation2.clone()];
@@ -91,14 +85,12 @@ fn snapshot_and_patch_mac_roundtrip() {
     let patch = wa::SyncdPatch {
         version: wa::SyncdVersion {
             version: Some(state.version),
-            ..Default::default()
         }
         .into(),
         mutations: mutations.clone(),
         snapshot_mac: Some(snapshot_mac.clone()),
         key_id: wa::KeyId {
             id: Some(key_id.to_vec()),
-            ..Default::default()
         }
         .into(),
         ..Default::default()

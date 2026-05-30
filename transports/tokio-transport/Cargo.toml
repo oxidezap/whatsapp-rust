@@ -1,6 +1,6 @@
 [package]
 name = "whatsapp-rust-tokio-transport"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
@@ -18,7 +18,7 @@ async-channel = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 futures-util = { version = "0.3.31", default-features = false, features = ["sink", "alloc", "std"] }
-http = "1.4.0"
+http = "1.4.1"
 log = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
@@ -31,3 +31,6 @@ tokio-websockets = { version = "0.13.0", features = [
 ] }
 wacore = { workspace = true }
 webpki-roots = "1.0.4"
+
+[lints]
+workspace = true

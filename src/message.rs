@@ -16,6 +16,7 @@ use wacore::libsignal::protocol::{
     PublicKey as SignalPublicKey, SENDERKEY_MESSAGE_CURRENT_VERSION,
 };
 use wacore::message_processing::EncType;
+use wacore::protocol::nack::NackReason;
 use wacore::types::jid::{JidExt, make_sender_key_name};
 use wacore_binary::Jid;
 use wacore_binary::JidExt as _;
@@ -64,19 +65,78 @@ pub(crate) struct ClassifiedMessage {
     pub sender_encryption_jid: Jid,
     pub session_payloads: Vec<EncPayload>,
     pub group_payloads: Vec<EncPayload>,
+    pub bot_payloads: Vec<EncPayload>,
     pub max_sender_retry_count: u8,
     pub decrypt_fail_mode: crate::types::events::DecryptFailMode,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SessionBatchOutcome {
+    decrypted: bool,
+    duplicate: bool,
+    undecryptable: bool,
+    dispatched: bool,
+    skdm_only: bool,
+    plaintext_failed: bool,
+    had_failure: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MigrationDecryptOutcome {
+    decrypted: bool,
+    duplicate: bool,
+    dispatched: bool,
+    skdm_only: bool,
+    plaintext_failed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PlaintextHandleOutcome {
+    dispatched: bool,
+    skdm_only: bool,
+}
+
+fn should_process_skmsg_after_session(
+    session_payloads_empty: bool,
+    session_outcome: SessionBatchOutcome,
+) -> bool {
+    session_payloads_empty
+        || (!session_outcome.had_failure
+            && (session_outcome.decrypted || session_outcome.duplicate))
+}
+
+fn should_ack_skdm_only_session_fallback(
+    session_outcome: SessionBatchOutcome,
+    bot_payloads_empty: bool,
+) -> bool {
+    session_outcome.decrypted
+        && session_outcome.skdm_only
+        && !session_outcome.dispatched
+        && !session_outcome.had_failure
+        && !session_outcome.plaintext_failed
+        && !session_outcome.undecryptable
+        && bot_payloads_empty
 }
 
 /// Retry count threshold for logging high retry warnings.
 /// WhatsApp Web logs metrics when retry count exceeds this value.
 const HIGH_RETRY_COUNT_THRESHOLD: u8 = 3;
 
+/// `decrypt-fail="hide"` failures are expected (addon/fan-out), so log them at
+/// DEBUG to avoid WARN spam. Mode never changes control flow: retry + ack still
+/// fire (WA Web retries regardless of `hide`).
+fn decrypt_fail_log_level(mode: crate::types::events::DecryptFailMode) -> log::Level {
+    match mode {
+        crate::types::events::DecryptFailMode::Hide => log::Level::Debug,
+        crate::types::events::DecryptFailMode::Show => log::Level::Warn,
+    }
+}
+
 pub(crate) use wacore::protocol::retry::RetryReason;
 
 impl Client {
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.
-    fn dispatch_parsed_message(self: &Arc<Self>, msg: wa::Message, info: &Arc<MessageInfo>) {
+    async fn dispatch_parsed_message(self: &Arc<Self>, msg: wa::Message, info: &Arc<MessageInfo>) {
         use wacore::proto_helpers::MessageExt;
 
         let mut info = Arc::clone(info);
@@ -87,16 +147,601 @@ impl Client {
                 msg.get_base_message().get_ephemeral_expiration();
         }
 
-        // Tracked so `disconnect()` can flush in-flight receipts (issue #571).
-        let client_clone = self.clone();
-        let info_for_receipt = Arc::clone(&info);
-        self.outbound_flush.spawn(&*self.runtime, async move {
-            client_clone.send_delivery_receipt(&info_for_receipt).await;
-        });
+        // Keep this ordered with dispatch; add-on messages can immediately
+        // reference the secret from the stanza just processed.
+        self.maybe_capture_inbound_msg_secret(&msg, &info).await;
+        let dispatch_msg = self
+            .maybe_decrypt_secret_encrypted_message(&msg, &info)
+            .await
+            .unwrap_or(msg);
+        self.ack_received_message(&info);
 
         self.core
             .event_bus
-            .dispatch(Event::Message(Box::new(msg), info));
+            .dispatch(Event::Message(Arc::new(dispatch_msg), info));
+    }
+
+    /// Acknowledge a received message so the server drops it from the offline
+    /// queue: a delivery receipt when applicable (incl. the `type="sender"`
+    /// receipt for own-account self-fanouts), else a transport ack. status is
+    /// acked by the `should_ack` gate, newsletters/empty ids need nothing here.
+    fn ack_received_message(self: &Arc<Self>, info: &Arc<MessageInfo>) {
+        if info.id.is_empty() || info.source.chat.is_newsletter() {
+            return;
+        }
+        // WA Web `sendAggregateReceipts`: for a DELIVERY where the chat is NOT
+        // a bot but the author IS a bot (a bot reply inside a group), it emits
+        // a bare `<ack class="message">` via `sendBotInvokeResponseAcks`, not a
+        // `<receipt>`. A 1:1 bot chat keeps the normal receipt (chat.isBot() →
+        // the branch's `v` is false). Our transport ack is that bare
+        // `<ack class="message">` (group form carries `participant`).
+        if info.source.is_bot_authored_non_bot_chat() {
+            self.spawn_message_ack(info);
+            return;
+        }
+        if Self::should_send_delivery_receipt(info) {
+            self.spawn_delivery_receipt(info);
+        } else if !info.source.chat.is_status_broadcast() {
+            self.spawn_message_ack(info);
+        }
+    }
+
+    /// Spawn a delivery receipt, tracked so `disconnect()` can flush it (issue #571).
+    fn spawn_delivery_receipt(self: &Arc<Self>, info: &Arc<MessageInfo>) {
+        let client = self.clone();
+        let info = Arc::clone(info);
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            client.send_delivery_receipt(&info).await;
+        });
+    }
+
+    /// Capture embedded `MessageContextInfo.message_secret` for add-on
+    /// decrypts. Bot DMs keep the legacy LID key as a second entry.
+    pub(crate) async fn maybe_capture_inbound_msg_secret(
+        self: &Arc<Self>,
+        msg: &wa::Message,
+        info: &Arc<MessageInfo>,
+    ) {
+        use wacore::proto_helpers::MessageExt;
+
+        let mci = msg.message_context_info.as_option();
+        let Some(secret_bytes) = mci.and_then(|m| m.message_secret.as_deref()) else {
+            return;
+        };
+        if msg.is_forwarded() {
+            return;
+        }
+
+        self.persist_msg_secret_bytes(
+            &info.source.chat,
+            &info.source.sender,
+            &info.id,
+            secret_bytes,
+        )
+        .await;
+
+        let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
+        if chat_is_bot
+            && let Some(sender) = self.dm_sender_identity_for(&info.source.chat).await
+            && sender.to_non_ad() != info.source.sender.to_non_ad()
+        {
+            self.persist_msg_secret_bytes(&info.source.chat, &sender, &info.id, secret_bytes)
+                .await;
+        }
+    }
+
+    pub(crate) async fn persist_msg_secret_bytes(
+        &self,
+        chat: &Jid,
+        sender: &Jid,
+        msg_id: &str,
+        secret_bytes: &[u8],
+    ) -> bool {
+        const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
+
+        let Ok(secret) = <&[u8; SECRET_LEN]>::try_from(secret_bytes) else {
+            return false;
+        };
+        let chat_str = chat.to_non_ad_string();
+        let sender_str = sender.to_non_ad_string();
+        match self
+            .persistence_manager
+            .backend()
+            .put_msg_secret(&chat_str, &sender_str, msg_id, secret)
+            .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("[msg:{msg_id}] failed to persist messageSecret: {e:?}");
+                false
+            }
+        }
+    }
+
+    async fn own_jid_for_secret_encrypted(&self, info: &MessageInfo) -> Option<Jid> {
+        use wacore::types::message::AddressingMode;
+
+        if info.source.is_from_me {
+            return Some(info.source.sender.to_non_ad());
+        }
+
+        match info.source.addressing_mode {
+            Some(AddressingMode::Lid) => match self.get_lid().await {
+                Some(jid) => Some(jid),
+                None => self.get_pn().await,
+            },
+            Some(AddressingMode::Pn) => match self.get_pn().await {
+                Some(jid) => Some(jid),
+                None => self.get_lid().await,
+            },
+            None if info.source.sender.is_lid() || info.source.chat.is_lid() => {
+                match self.get_lid().await {
+                    Some(jid) => Some(jid),
+                    None => self.get_pn().await,
+                }
+            }
+            None => match self.get_pn().await {
+                Some(jid) => Some(jid),
+                None => self.get_lid().await,
+            },
+        }
+    }
+
+    async fn maybe_decrypt_secret_encrypted_message(
+        self: &Arc<Self>,
+        msg: &wa::Message,
+        info: &Arc<MessageInfo>,
+    ) -> Option<wa::Message> {
+        use crate::features::message_edit::{self, SecretEncKind};
+
+        let env = message_edit::extract_secret_encrypted(msg)?;
+        let target_id = env.target_id()?;
+
+        let my_jid = self.own_jid_for_secret_encrypted(info).await?;
+        let original_sender = match env.original_sender_jid(&my_jid) {
+            Ok(jid) => jid,
+            Err(_) => return None,
+        };
+
+        let backend = self.persistence_manager.backend();
+        let chat_for_lookup = info.source.chat.to_non_ad_string();
+        let original_sender_str = original_sender.to_non_ad_string();
+        let fallback_original_sender = self
+            .alternate_msg_secret_jid(&backend, &original_sender)
+            .await
+            .unwrap_or_default();
+
+        let primary = backend
+            .get_msg_secret(&chat_for_lookup, &original_sender_str, target_id)
+            .await;
+        let secret = match primary {
+            Ok(Some(secret)) => secret,
+            Ok(None) => match self
+                .alternate_msg_secret_lookup(
+                    &backend,
+                    &chat_for_lookup,
+                    &original_sender,
+                    target_id,
+                )
+                .await
+            {
+                Ok(Some(secret)) => secret,
+                Ok(None) => return None,
+                Err(e) => {
+                    log::warn!(
+                        "[msg:{}] secret_encrypted_message alternate secret lookup failed: {e:?}",
+                        info.id
+                    );
+                    return None;
+                }
+            },
+            Err(e) => {
+                log::warn!(
+                    "[msg:{}] backend error reading secret_encrypted_message secret: {e:?}",
+                    info.id
+                );
+                return None;
+            }
+        };
+
+        let fallback_editor = match info.source.sender_alt.clone() {
+            Some(jid) => Some(jid),
+            None => self
+                .alternate_msg_secret_jid(&backend, &info.source.sender)
+                .await
+                .unwrap_or_default(),
+        };
+
+        let inner = match message_edit::decrypt_secret_encrypted(
+            env.enc_payload,
+            env.enc_iv,
+            &secret,
+            env.kind,
+            target_id,
+            &original_sender,
+            &info.source.sender,
+        ) {
+            Ok(inner) => inner,
+            Err(primary_err) => {
+                let mut last_err = primary_err;
+                let mut decrypted = None;
+
+                if let Some(fallback_original) = fallback_original_sender.as_ref() {
+                    match message_edit::decrypt_secret_encrypted(
+                        env.enc_payload,
+                        env.enc_iv,
+                        &secret,
+                        env.kind,
+                        target_id,
+                        fallback_original,
+                        &info.source.sender,
+                    ) {
+                        Ok(inner) => decrypted = Some(inner),
+                        Err(e) => last_err = e,
+                    }
+                }
+
+                if decrypted.is_none()
+                    && let Some(fallback_editor) = fallback_editor.as_ref()
+                {
+                    match message_edit::decrypt_secret_encrypted(
+                        env.enc_payload,
+                        env.enc_iv,
+                        &secret,
+                        env.kind,
+                        target_id,
+                        &original_sender,
+                        fallback_editor,
+                    ) {
+                        Ok(inner) => decrypted = Some(inner),
+                        Err(e) => last_err = e,
+                    }
+                }
+
+                if decrypted.is_none()
+                    && let (Some(fallback_original), Some(fallback_editor)) =
+                        (fallback_original_sender.as_ref(), fallback_editor.as_ref())
+                {
+                    match message_edit::decrypt_secret_encrypted(
+                        env.enc_payload,
+                        env.enc_iv,
+                        &secret,
+                        env.kind,
+                        target_id,
+                        fallback_original,
+                        fallback_editor,
+                    ) {
+                        Ok(inner) => decrypted = Some(inner),
+                        Err(e) => last_err = e,
+                    }
+                }
+
+                match decrypted {
+                    Some(inner) => inner,
+                    None => {
+                        log::warn!(
+                            "[msg:{}] secret_encrypted_message {:?} decrypt failed: {last_err:?}",
+                            info.id,
+                            env.kind
+                        );
+                        return None;
+                    }
+                }
+            }
+        };
+
+        if let Some(secret_bytes) = inner
+            .message_context_info
+            .as_option()
+            .and_then(|m| m.message_secret.as_deref())
+        {
+            self.persist_msg_secret_bytes(
+                &info.source.chat,
+                &original_sender,
+                target_id,
+                secret_bytes,
+            )
+            .await;
+            if let Some(alternate_sender) = fallback_original_sender.as_ref() {
+                self.persist_msg_secret_bytes(
+                    &info.source.chat,
+                    alternate_sender,
+                    target_id,
+                    secret_bytes,
+                )
+                .await;
+            }
+        }
+
+        if env.kind != SecretEncKind::MessageEdit {
+            return Some(inner);
+        }
+
+        match message_edit::rewrap_as_legacy_edit(inner) {
+            Some(rewrapped) => Some(rewrapped),
+            None => {
+                log::warn!(
+                    "[msg:{}] decrypted MESSAGE_EDIT missing protocol_message.edited_message",
+                    info.id
+                );
+                None
+            }
+        }
+    }
+
+    /// Decrypt and dispatch a `<enc type="msmsg">` bot reply. Looks up the
+    /// outbound `messageSecret` we persisted at send time and runs the
+    /// dual-HKDF + AES-GCM open from [`wacore::bot_message`]. Failures
+    /// (missing secret, GCM tag fail, malformed proto) nack with code 495.
+    pub(crate) async fn handle_msmsg_payload(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        payload: EncPayload,
+    ) {
+        use buffa::Message as _;
+        use wa::MessageSecretMessage;
+        use wacore::bot_message::{BotMessageContext, decrypt_bot_message};
+        use wacore::protocol::nack::NackReason;
+
+        let ms_msg = match MessageSecretMessage::decode_from_slice(&payload.ciphertext) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!(
+                    "[msg:{}] failed to decode MessageSecretMessage: {e:?}",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::ParsingError, None);
+                return;
+            }
+        };
+        let (Some(enc_iv), Some(enc_payload)) =
+            (ms_msg.enc_iv.as_deref(), ms_msg.enc_payload.as_deref())
+        else {
+            log::warn!(
+                "[msg:{}] MessageSecretMessage missing enc_iv/enc_payload",
+                info.id
+            );
+            self.spawn_nack(info, NackReason::ParsingError, None);
+            return;
+        };
+
+        // Target sender (us): meta echoes our LID/PN. Falls back to our LID
+        // when sender is on the bot server, our PN otherwise (whatsmeow
+        // `decryptBotMessage`).
+        let target_sender = match self.resolve_msmsg_target_sender(info).await {
+            Some(j) => j,
+            None => {
+                log::warn!("[msg:{}] msmsg: no target_sender resolvable", info.id);
+                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                return;
+            }
+        };
+
+        // Chat scope for the secret lookup: prefer <meta target_chat_jid>;
+        // fall back to the stanza's chat (matches WA Web `decryptMsmsgBotMessage`).
+        let chat_for_lookup = info
+            .meta_info
+            .target_chat
+            .as_ref()
+            .unwrap_or(&info.source.chat)
+            .to_non_ad()
+            .to_string();
+        let target_sender_str = target_sender.to_non_ad_string();
+
+        // The id used for the SECRET LOOKUP is `meta.target_id` (our outbound
+        // id); the id used as HKDF input is the bot reply id (or
+        // `bot_info.edit_target_id` when the bot is editing a prior reply).
+        let target_id = match info.meta_info.target_id.as_deref() {
+            Some(id) => id,
+            None => {
+                log::warn!(
+                    "[msg:{}] msmsg: <meta> missing target_id; cannot look up secret",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                return;
+            }
+        };
+
+        // Mirror WA Web `C()` in `WAWebBotMessageSecret.js`: primary lookup
+        // plus an alternate (PN ↔ LID swap via lid_pn_mapping) so a row
+        // stored under one identity family is still found if `<meta
+        // target_sender_jid>` echoes the other. Covers LID migration windows
+        // and asymmetric outbound/inbound identities.
+        let backend = self.persistence_manager.backend();
+        let primary = backend
+            .get_msg_secret(&chat_for_lookup, &target_sender_str, target_id)
+            .await;
+        let secret = match primary {
+            Ok(Some(s)) => s,
+            Ok(None) => match self
+                .alternate_msg_secret_lookup(&backend, &chat_for_lookup, &target_sender, target_id)
+                .await
+            {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    // For a group bot invocation initiated by our PRIMARY
+                    // device, the messageSecret lives in the bot-addressed copy
+                    // the primary sent directly to the bot — it is NOT mirrored
+                    // to companions in the group skmsg. So a companion
+                    // legitimately never holds the secret; this miss is expected
+                    // and benign (we nack 495 and the server stops replaying).
+                    // A miss in a 1:1 bot chat is unexpected and worth a warn.
+                    log::log!(
+                        if info.source.is_group {
+                            log::Level::Debug
+                        } else {
+                            log::Level::Warn
+                        },
+                        "[msg:{}] msmsg: no message_secret stored for target_id={target_id} (primary or alternate)",
+                        info.id
+                    );
+                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                    return;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[msg:{}] msmsg: alternate lookup failed: {e:?}; nack 495",
+                        info.id
+                    );
+                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                    return;
+                }
+            },
+            Err(e) => {
+                log::warn!(
+                    "[msg:{}] backend error reading message_secret ({e:?}); nack 495 so the server stops replaying",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                return;
+            }
+        };
+
+        let bot_user_jid = info.source.sender.to_non_ad_string();
+        // WA Web `decryptMsmsgBotMessage` dispatches on `isFbidBot()`:
+        //   * fbid path pre-resolves to `edit_target_id` for INNER/LAST edits,
+        //     `externalId` (info.id) otherwise. Single AES-GCM attempt.
+        //   * regular path tries `externalId` first, falls back to
+        //     `edit_target_id` on AES-GCM failure.
+        // We don't have `isFbidBot()` detection; instead, we unify the two as
+        // try-then-fallback with the fbid-style id as primary. That's a strict
+        // superset: for INNER/LAST it usually succeeds on the first try (fbid
+        // outcome); for any other case primary is `info.id` so we mirror the
+        // regular path's first attempt. The fallback is only attempted if
+        // `bot_info.edit_target_id` is present.
+        let info_id = info.id.as_str();
+        let primary_msg_id = info
+            .bot_info
+            .as_ref()
+            .filter(|bi| {
+                matches!(
+                    bi.edit_type,
+                    Some(
+                        crate::types::message::BotEditType::Inner
+                            | crate::types::message::BotEditType::Last
+                    )
+                )
+            })
+            .and_then(|bi| bi.edit_target_id.as_deref())
+            .unwrap_or(info_id);
+        let fallback_msg_id = if primary_msg_id == info_id {
+            info.bot_info
+                .as_ref()
+                .and_then(|bi| bi.edit_target_id.as_deref())
+        } else {
+            Some(info_id)
+        }
+        .filter(|fb| *fb != primary_msg_id);
+
+        let attempt = |msg_id: &str| {
+            let ctx = BotMessageContext {
+                msg_id,
+                target_sender_user_jid: &target_sender_str,
+                bot_user_jid: &bot_user_jid,
+            };
+            decrypt_bot_message(&secret, enc_iv, enc_payload, &ctx)
+        };
+
+        let plaintext = match attempt(primary_msg_id) {
+            Ok(p) => p,
+            Err(primary_err) => match fallback_msg_id {
+                Some(fb) => match attempt(fb) {
+                    Ok(p) => p,
+                    Err(fallback_err) => {
+                        log::warn!(
+                            "[msg:{}] msmsg AES-GCM open failed both attempts (primary={primary_err:?}, fallback={fallback_err:?})",
+                            info.id
+                        );
+                        self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                        return;
+                    }
+                },
+                None => {
+                    log::warn!(
+                        "[msg:{}] msmsg AES-GCM open failed and no fallback msg_id: {primary_err:?}",
+                        info.id
+                    );
+                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                    return;
+                }
+            },
+        };
+
+        let msg = match wa::Message::decode_from_slice(plaintext.as_slice()) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!(
+                    "[msg:{}] msmsg plaintext is not a Message proto: {e:?}",
+                    info.id
+                );
+                self.spawn_nack(info, NackReason::ParsingError, None);
+                return;
+            }
+        };
+
+        log::info!(
+            "[msg:{}] Successfully decrypted msmsg bot reply from {}",
+            info.id,
+            info.source.sender
+        );
+        self.dispatch_parsed_message(msg, info).await;
+    }
+
+    /// Resolve `target_sender` for a msmsg stanza: echo from `<meta>` when
+    /// present, else fall back to our LID (sender on bot server) or PN.
+    async fn resolve_msmsg_target_sender(&self, info: &Arc<MessageInfo>) -> Option<Jid> {
+        if let Some(ts) = info.meta_info.target_sender.as_ref() {
+            return Some(ts.clone());
+        }
+        if info.source.sender.server == wacore_binary::Server::Bot {
+            self.get_lid().await
+        } else {
+            self.get_pn().await
+        }
+    }
+
+    /// Second-chance lookup with the alternate identity family. Mirrors
+    /// `WAWebLidMigrationUtils.getAlternateMsgKey`: swap PN ↔ LID via the
+    /// `lid_pn_mapping` store and retry. Returns `Ok(None)` when no mapping
+    /// is known or the alternate row is absent — the caller treats that as
+    /// a terminal miss.
+    async fn alternate_msg_secret_jid(
+        &self,
+        backend: &Arc<dyn crate::store::traits::Backend>,
+        primary_sender: &Jid,
+    ) -> Result<Option<Jid>, crate::store::error::StoreError> {
+        let alternate = match primary_sender.server {
+            wacore_binary::Server::Lid => backend
+                .get_lid_mapping(&primary_sender.user)
+                .await?
+                .map(|m| Jid::new(m.phone_number, wacore_binary::Server::Pn)),
+            wacore_binary::Server::Pn => backend
+                .get_pn_mapping(&primary_sender.user)
+                .await?
+                .map(|m| Jid::new(m.lid, wacore_binary::Server::Lid)),
+            _ => None,
+        };
+        Ok(alternate)
+    }
+
+    async fn alternate_msg_secret_lookup(
+        &self,
+        backend: &Arc<dyn crate::store::traits::Backend>,
+        chat_for_lookup: &str,
+        primary_sender: &Jid,
+        target_id: &str,
+    ) -> Result<Option<Vec<u8>>, crate::store::error::StoreError> {
+        let Some(alternate) = self
+            .alternate_msg_secret_jid(backend, primary_sender)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let alternate_str = alternate.to_non_ad_string();
+        backend
+            .get_msg_secret(chat_for_lookup, &alternate_str, target_id)
+            .await
     }
 
     /// Handles a newsletter plaintext message.
@@ -123,7 +768,7 @@ impl Client {
                         info.id,
                         info.source.chat
                     );
-                    self.dispatch_parsed_message(msg, info);
+                    self.dispatch_parsed_message(msg, info).await;
                 }
                 Err(e) => {
                     log::warn!(
@@ -179,8 +824,17 @@ impl Client {
         was_fresh
     }
 
-    /// Dispatch an undecryptable event (once per msg id, matching WA Web's
-    /// DB-level placeholder uniqueness) and spawn a retry receipt.
+    /// Dispatch an undecryptable event, then send the retry receipt and the
+    /// transport ack in one ordered, flushed task.
+    ///
+    /// The retry asks the sender to re-encrypt; the ack clears the stanza from
+    /// the server's offline queue (the retry alone does not). Both run in a
+    /// single `outbound_flush` task so `disconnect()` flushes them together and
+    /// the retry always goes out before the ack: if only one makes it, it is the
+    /// retry, so the message is never cleared without a resend request. status is
+    /// also acked here (flushed) rather than relying on the detached `should_ack`
+    /// gate, which can be dropped mid-flush on disconnect; the server dedups the
+    /// resulting duplicate ack.
     ///
     /// Returns `true` to be assigned to `dispatched_undecryptable` flag.
     async fn handle_decrypt_failure(
@@ -196,8 +850,48 @@ impl Client {
             decrypt_fail_mode,
         )
         .await;
-        self.spawn_retry_receipt(info, reason);
+        let client = Arc::clone(self);
+        let info = Arc::clone(info);
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            // A self-fanout is our own message; retrying it to ourselves is
+            // futile and the server's offline queue ignores a bare transport
+            // ack, so it would replay forever. Clear it with the sender receipt
+            // instead (same stanza the success/duplicate paths now emit). Mirror
+            // ack_received_message: a bot-authored message in a non-bot chat
+            // takes the bot-invoke-response bare ack (the retry path below), not
+            // the sender receipt. Gate on the same eligibility as the ack path.
+            if info.source.is_self_fanout()
+                && !info.source.is_bot_authored_non_bot_chat()
+                && Self::should_send_delivery_receipt(&info)
+            {
+                client.send_delivery_receipt(&info).await;
+                return;
+            }
+            // Only ack once the resend request is actually out; otherwise leave
+            // the stanza queued so the server redelivers and we retry.
+            let resend_sent = client.run_retry_receipt(&info, reason).await;
+            if resend_sent {
+                client.send_transport_ack(&info).await;
+            }
+        });
         true
+    }
+
+    async fn handle_plaintext_failure(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
+    ) -> bool {
+        let dispatched = self
+            .dispatch_undecryptable_event(
+                Arc::clone(info),
+                false,
+                crate::types::events::UnavailableType::Unknown,
+                decrypt_fail_mode,
+            )
+            .await;
+        self.spawn_nack(info, NackReason::InvalidProtobuf, None);
+        dispatched
     }
 
     /// Increments the retry count for a message and returns the new count.
@@ -207,21 +901,19 @@ impl Client {
     /// `spawn_retry_receipt` detaches. In practice, retries for the same
     /// message are rare and a double-send is benign (recipients deduplicate
     /// by message ID).
-    async fn increment_retry_count(&self, cache_key: &str) -> Option<u8> {
+    async fn increment_retry_count(&self, cache_key: &str, reason: RetryReason) -> Option<u8> {
         let cache_key = cache_key.to_owned();
         let current = self.message_retry_counts.get(&cache_key).await;
-        match current {
-            Some(count) if count >= MAX_DECRYPT_RETRIES => None,
-            Some(count) => {
-                let new_count = count + 1;
-                self.message_retry_counts.insert(cache_key, new_count).await;
-                Some(new_count)
-            }
-            None => {
-                self.message_retry_counts.insert(cache_key, 1_u8).await;
-                Some(1)
-            }
-        }
+        let new_count = match current {
+            Some(count) if count >= MAX_DECRYPT_RETRIES => return None,
+            Some(count) => count + 1,
+            None => 1,
+        };
+        self.message_retry_counts
+            .insert(cache_key.clone(), new_count)
+            .await;
+        self.recent_retry_reasons.insert(cache_key, reason).await;
+        Some(new_count)
     }
 
     /// Generate consistent cache key for retry logic.
@@ -266,66 +958,79 @@ impl Client {
     /// # Arguments
     /// * `info` - The message info for the failed message
     /// * `reason` - The retry reason code (matches WhatsApp Web's RetryReason enum)
+    #[cfg(test)]
     fn spawn_retry_receipt(self: &Arc<Self>, info: &Arc<MessageInfo>, reason: RetryReason) {
         let client = Arc::clone(self);
         let info = Arc::clone(info);
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            client.run_retry_receipt(&info, reason).await;
+        });
+    }
 
-        self.runtime.spawn(Box::pin(async move {
-            let cache_key = client
-                .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
-                .await;
+    /// Increment the retry count and send the retry receipt (or, at the cap, a
+    /// last-resort PDO). Awaitable so it can be ordered before the transport ack.
+    ///
+    /// Returns whether the caller should send the ack: `false` when we intended
+    /// to retry but the send failed (so the stanza stays queued for another try),
+    /// `true` when the resend went out or we deliberately gave up at the cap.
+    async fn run_retry_receipt(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+        reason: RetryReason,
+    ) -> bool {
+        let cache_key = self
+            .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+            .await;
 
-            // Atomically increment retry count and check if we should continue
-            let Some(retry_count) = client.increment_retry_count(&cache_key).await else {
-                // Max retries reached
-                log::info!(
-                    "Max retries ({}) reached for message {} from {} [{:?}]. Sending immediate PDO request.",
-                    MAX_DECRYPT_RETRIES,
-                    info.id,
-                    info.source.sender,
-                    reason
+        let Some(retry_count) = self.increment_retry_count(&cache_key, reason).await else {
+            log::info!(
+                "Max retries ({}) reached for message {} from {} [{:?}]. Sending immediate PDO request.",
+                MAX_DECRYPT_RETRIES,
+                info.id,
+                info.source.sender,
+                reason
+            );
+            // Capped: give up and clear the backlog regardless of PDO outcome.
+            self.run_pdo_request(info).await;
+            return true;
+        };
+
+        if retry_count > HIGH_RETRY_COUNT_THRESHOLD {
+            log::warn!(
+                "High retry count ({}) for message {} from {} [{:?}]",
+                retry_count,
+                info.id,
+                info.source.sender,
+                reason
+            );
+        }
+
+        let retry_sent = match self.send_retry_receipt(info, retry_count, reason).await {
+            Ok(()) => {
+                debug!(
+                    "Sent retry receipt #{} for message {} from {} [{:?}]",
+                    retry_count, info.id, info.source.sender, reason
                 );
-                // Send PDO request immediately (no delay) as last resort
-                client.spawn_pdo_request_with_options(&info, true);
-                return;
-            };
-
-            // Log warning for high retry counts (like WhatsApp Web's MessageHighRetryCount)
-            if retry_count > HIGH_RETRY_COUNT_THRESHOLD {
-                log::warn!(
-                    "High retry count ({}) for message {} from {} [{:?}]",
+                true
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to send retry receipt #{} for message {} [{:?}]: {:?}",
                     retry_count,
                     info.id,
-                    info.source.sender,
-                    reason
+                    reason,
+                    e
                 );
+                false
             }
+        };
 
-            // Send the retry receipt with the actual retry count and reason
-            match client.send_retry_receipt(&info, retry_count, reason).await {
-                Ok(()) => {
-                    debug!(
-                        "Sent retry receipt #{} for message {} from {} [{:?}]",
-                        retry_count, info.id, info.source.sender, reason
-                    );
-                }
-                Err(e) => {
-                    log::error!(
-                        "Failed to send retry receipt #{} for message {} [{:?}]: {:?}",
-                        retry_count,
-                        info.id,
-                        reason,
-                        e
-                    );
-                }
-            }
-
-            // Only spawn PDO on the FIRST retry to avoid duplicate requests.
-            // The PDO cache also provides deduplication, but this reduces unnecessary work.
-            if retry_count == 1 {
-                client.spawn_pdo_request(&info);
-            }
-        })).detach();
+        // First retry only, to avoid duplicate PDO requests. Awaited so it runs
+        // before the caller's ack; the retry receipt already landed first.
+        if retry_count == 1 {
+            self.run_pdo_request(info).await;
+        }
+        retry_sent
     }
 
     pub(crate) async fn handle_incoming_message(self: Arc<Self>, node: Arc<OwnedNodeRef>) {
@@ -402,7 +1107,9 @@ impl Client {
             return None;
         }
 
-        if let Some(unavailable) = unavailable_node {
+        if let Some(unavailable) = unavailable_node
+            && all_enc_nodes.is_empty()
+        {
             let unavailable_type = match unavailable.get_attr("type").map(|v| v.as_str()).as_deref()
             {
                 Some("view_once") => crate::types::events::UnavailableType::ViewOnce,
@@ -413,8 +1120,10 @@ impl Client {
                 info.id,
                 unavailable_type
             );
-            // Ack is handled by the framework; PDO asks the primary phone to relay the message
-            self.spawn_pdo_request_with_options(&info, true);
+            // PDO is the only recovery here (no retry receipt), so run it before
+            // the transport ack in one flush task: the ack must not clear the
+            // offline queue before the PDO request goes out. status is acked by
+            // the should_ack gate. Mirrors whatsmeow's request-then-ack.
             self.dispatch_undecryptable_event(
                 Arc::clone(&info),
                 true,
@@ -422,13 +1131,27 @@ impl Client {
                 crate::types::events::DecryptFailMode::Show,
             )
             .await;
+            let client = Arc::clone(self);
+            let info2 = Arc::clone(&info);
+            let skip_ack = info.source.chat.is_status_broadcast();
+            self.outbound_flush.spawn(&*self.runtime, async move {
+                // Only ack once the PDO request is out (or skipped as ancient);
+                // a transient send failure leaves it queued for redelivery.
+                let pdo_sent = client.run_pdo_request(&info2).await;
+                if !skip_ack && pdo_sent {
+                    client.send_transport_ack(&info2).await;
+                }
+            });
             return None;
         }
 
         let mut session_payloads = Vec::with_capacity(all_enc_nodes.len());
         let mut group_payloads = Vec::with_capacity(all_enc_nodes.len());
+        let mut bot_payloads = Vec::with_capacity(all_enc_nodes.len());
         let mut max_sender_retry_count: u8 = 0;
         let mut has_hide_fail = false;
+        let mut had_unknown_enc = false;
+        let mut had_custom_handler = false;
 
         for enc_node in &all_enc_nodes {
             // Parse sender retry count (WA Web: e.maybeAttrInt("count") ?? 0)
@@ -453,6 +1176,7 @@ impl Client {
                 Some(t) => t,
                 None => {
                     log::warn!("Enc node missing 'type' attribute, skipping");
+                    had_unknown_enc = true;
                     continue;
                 }
             };
@@ -484,21 +1208,31 @@ impl Client {
                         }
                     }))
                     .detach();
+                had_custom_handler = true;
                 continue;
             }
 
-            // Zero-copy: slice_bytes returns a Bytes sub-view into the
-            // node's backing buffer without memcpy.
-            // from_owned_node returns None for unknown enc types or missing content.
+            // `had_unknown_enc` means "produced no usable payload": either the
+            // type is unrecognized or it's known but the body is empty.
+            // Either way the stanza needs the fallback ack or the server replays.
+            if EncType::from_wire(enc_type.as_ref()).is_none() {
+                log::warn!("Enc node has unknown type: {enc_type}");
+                had_unknown_enc = true;
+                continue;
+            }
+
             let payload = match EncPayload::from_owned_node(node, enc_node) {
                 Some(p) => p,
                 None => {
-                    log::warn!("Enc node has no content or unknown type: {enc_type}");
+                    log::warn!("Enc node {enc_type} has no content");
+                    had_unknown_enc = true;
                     continue;
                 }
             };
 
-            if payload.enc_type.is_session() {
+            if payload.enc_type.is_bot_secret() {
+                bot_payloads.push(payload);
+            } else if payload.enc_type.is_session() {
                 session_payloads.push(payload);
             } else {
                 group_payloads.push(payload);
@@ -522,11 +1256,33 @@ impl Client {
             );
         }
 
+        // Unknown-only stanzas would loop in the offline queue until
+        // <stream:error>. Custom handlers ack on their own; status is covered
+        // by should_ack. Ack from `nr` so `recipient` survives. Skip when any
+        // bucket has usable payloads (including msmsg) so the regular dispatch
+        // path runs and the valid enc still decrypts.
+        if session_payloads.is_empty()
+            && group_payloads.is_empty()
+            && bot_payloads.is_empty()
+            && had_unknown_enc
+            && !had_custom_handler
+        {
+            log::info!(
+                "[msg:{}] All enc payloads unrecognized; transport-acking to drop from offline queue",
+                info.id
+            );
+            if !info.source.chat.is_status_broadcast() {
+                self.spawn_node_transport_ack(nr).await;
+            }
+            return None;
+        }
+
         Some(ClassifiedMessage {
             info,
             sender_encryption_jid,
             session_payloads,
             group_payloads,
+            bot_payloads,
             max_sender_retry_count,
             decrypt_fail_mode: if has_hide_fail {
                 crate::types::events::DecryptFailMode::Hide
@@ -543,6 +1299,7 @@ impl Client {
             sender_encryption_jid,
             session_payloads,
             group_payloads,
+            bot_payloads,
             max_sender_retry_count,
             decrypt_fail_mode,
         } = msg;
@@ -602,11 +1359,7 @@ impl Client {
             || sender_encryption_jid.is_broadcast_list()
             || sender_encryption_jid.is_status_broadcast();
 
-        let (
-            session_decrypted_successfully,
-            session_had_duplicates,
-            session_dispatched_undecryptable,
-        ) = if !is_group_sender && !session_payloads.is_empty() {
+        let session_outcome = if !is_group_sender && !session_payloads.is_empty() {
             self.clone()
                 .process_session_enc_batch(
                     &session_payloads,
@@ -623,8 +1376,11 @@ impl Client {
                     sender_encryption_jid
                 );
             }
-            (false, false, false)
+            SessionBatchOutcome::default()
         };
+        let session_decrypted_successfully = session_outcome.decrypted;
+        let session_had_duplicates = session_outcome.duplicate;
+        let session_dispatched_undecryptable = session_outcome.undecryptable;
 
         log::debug!(
             "Starting PASS 2: Processing {} group content messages (skmsg)",
@@ -641,9 +1397,8 @@ impl Client {
         // to avoid unnecessary retry receipts. The retry for the pkmsg will cause the sender
         // to resend the entire message including SKDM.
         if !group_payloads.is_empty() {
-            let should_process_skmsg = session_payloads.is_empty()
-                || session_decrypted_successfully
-                || session_had_duplicates;
+            let should_process_skmsg =
+                should_process_skmsg_after_session(session_payloads.is_empty(), session_outcome);
 
             if should_process_skmsg {
                 match self
@@ -678,9 +1433,11 @@ impl Client {
                             info.source.sender
                         );
                     } else {
-                        warn!(
+                        log::log!(
+                            decrypt_fail_log_level(decrypt_fail_mode),
                             "Skipping skmsg decryption for message {} from {} because pkmsg failed to decrypt.",
-                            info.id, info.source.sender
+                            info.id,
+                            info.source.sender
                         );
                         if !session_dispatched_undecryptable {
                             self.dispatch_undecryptable_event(
@@ -707,21 +1464,50 @@ impl Client {
             && !session_payloads.is_empty()
         {
             // Edge case: message with only msg/pkmsg that failed to decrypt, no skmsg
-            warn!(
+            log::log!(
+                decrypt_fail_log_level(decrypt_fail_mode),
                 "Message {} from {} failed to decrypt and has no group content. Dispatching UndecryptableMessage event.",
-                info.id, info.source.sender
+                info.id,
+                info.source.sender
             );
             // Dispatch UndecryptableMessage event for messages that failed to decrypt
             // (This should not cause double-dispatching since process_session_enc_batch
             // already returned dispatched_undecryptable=false for this case)
-            self.dispatch_undecryptable_event(
-                Arc::clone(&info),
-                false,
-                crate::types::events::UnavailableType::Unknown,
-                decrypt_fail_mode,
-            )
-            .await;
+            if !session_dispatched_undecryptable {
+                self.dispatch_undecryptable_event(
+                    Arc::clone(&info),
+                    false,
+                    crate::types::events::UnavailableType::Unknown,
+                    decrypt_fail_mode,
+                )
+                .await;
+            }
             // Do NOT send delivery receipt - transport ack is sufficient
+        } else if session_had_duplicates
+            && !session_decrypted_successfully
+            && !session_dispatched_undecryptable
+            && !info.source.chat.is_status_broadcast()
+        {
+            // Duplicate (already-processed) with no group content: ack it so the
+            // server drops it from the offline queue (whatsmeow/WA Web treat
+            // old-counter like success). status is acked by the should_ack gate
+            // (a status SKDM pkmsg can reach here), so skip it to avoid a
+            // redundant receipt.
+            self.ack_received_message(&info);
+        } else if should_ack_skdm_only_session_fallback(session_outcome, bot_payloads.is_empty()) {
+            // SKDM-only session decrypts skip dispatch, so this stanza would
+            // otherwise stay queued. WA Web and whatsmeow ack every decrypted
+            // message; the ack shape still comes from the message source.
+            // Status is intentionally not filtered here, so its success receipt
+            // still follows the normal WA Web path.
+            self.ack_received_message(&info);
+        }
+
+        // Bot-secret (msmsg) payloads run inline here so they're serialised
+        // with the session/group decrypt batches under the same global
+        // permit + per-chat enqueue lock acquired upstream.
+        for payload in bot_payloads {
+            self.handle_msmsg_payload(&info, payload).await;
         }
 
         // Flush cached Signal state to DB (matches WA Web's flushBufferToDiskIfNotMemOnlyMode)
@@ -735,10 +1521,10 @@ impl Client {
         info: &Arc<MessageInfo>,
         sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
-    ) -> (bool, bool, bool) {
+    ) -> SessionBatchOutcome {
         use wacore::libsignal::protocol::CiphertextMessage;
         if payloads.is_empty() {
-            return (false, false, false);
+            return SessionBatchOutcome::default();
         }
 
         // Acquire a per-sender session lock to prevent race conditions when
@@ -747,14 +1533,16 @@ impl Client {
         // the SignalProtocolStoreAdapter's per-session locks (prevents ratchet counter races).
         let signal_address = sender_encryption_jid.to_protocol_address();
 
+        // `session_guard` is held across the entire batch but dropped around
+        // calls into `try_pn_to_lid_migration_decrypt` because that function's
+        // migration loop re-enters this same mutex (non-reentrant).
         let session_mutex = self.session_lock_for(signal_address.as_str()).await;
-        let _session_guard = session_mutex.lock().await;
+        let mut session_guard: Option<async_lock::MutexGuardArc<()>> =
+            Some(session_mutex.lock_arc().await);
 
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let mut any_success = false;
-        let mut any_duplicate = false;
-        let mut dispatched_undecryptable = false;
+        let mut outcome = SessionBatchOutcome::default();
 
         for payload in payloads {
             let ciphertext = &payload.ciphertext[..];
@@ -762,11 +1550,31 @@ impl Client {
             let enc_type_str = enc_type.as_wire_str();
             let padding_version = payload.padding_version;
 
+            // WA Web `MsgSendReceipt.js` nacks PARSE_ERROR; without it the
+            // server retransmits the malformed stanza forever. Mirrors the
+            // `handle_decrypt_failure` shape (dispatch event + spawn wire I/O
+            // so the session lock isn't held across the send).
             let parsed_message = if enc_type == EncType::PreKeyMessage {
                 match PreKeySignalMessage::try_from(ciphertext) {
                     Ok(m) => CiphertextMessage::PreKeySignalMessage(m),
                     Err(e) => {
-                        log::error!("Failed to parse PreKeySignalMessage: {e:?}");
+                        log::error!(
+                            "[msg:{}] Failed to parse PreKeySignalMessage from {}: {e:?}. Sending nack.",
+                            info.id,
+                            info.source.sender
+                        );
+                        // |= so a later dedup'd return (false) can't clobber
+                        // a true set by a prior iteration in this batch.
+                        outcome.had_failure = true;
+                        outcome.undecryptable |= self
+                            .dispatch_undecryptable_event(
+                                Arc::clone(info),
+                                false,
+                                crate::types::events::UnavailableType::Unknown,
+                                decrypt_fail_mode,
+                            )
+                            .await;
+                        self.spawn_nack(info, NackReason::ParsingError, None);
                         continue;
                     }
                 }
@@ -774,7 +1582,21 @@ impl Client {
                 match SignalMessage::try_from(ciphertext) {
                     Ok(m) => CiphertextMessage::SignalMessage(m),
                     Err(e) => {
-                        log::error!("Failed to parse SignalMessage: {e:?}");
+                        log::error!(
+                            "[msg:{}] Failed to parse SignalMessage from {}: {e:?}. Sending nack.",
+                            info.id,
+                            info.source.sender
+                        );
+                        outcome.had_failure = true;
+                        outcome.undecryptable |= self
+                            .dispatch_undecryptable_event(
+                                Arc::clone(info),
+                                false,
+                                crate::types::events::UnavailableType::Unknown,
+                                decrypt_fail_mode,
+                            )
+                            .await;
+                        self.spawn_nack(info, NackReason::ParsingError, None);
                         continue;
                     }
                 }
@@ -826,8 +1648,7 @@ impl Client {
 
             match decrypt_res {
                 Ok(padded_plaintext) => {
-                    any_success = true;
-                    if let Err(e) = self
+                    match self
                         .clone()
                         .handle_decrypted_plaintext(
                             enc_type,
@@ -837,11 +1658,23 @@ impl Client {
                         )
                         .await
                     {
-                        log::warn!(
-                            "[msg:{}] Failed processing plaintext from {}: {e:?}",
-                            info.id,
-                            info.source.sender
-                        );
+                        Ok(plaintext_outcome) => {
+                            outcome.decrypted = true;
+                            outcome.dispatched |= plaintext_outcome.dispatched;
+                            outcome.skdm_only |= plaintext_outcome.skdm_only;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[msg:{}] Failed processing plaintext from {}: {e:?}",
+                                info.id,
+                                info.source.sender
+                            );
+                            outcome.decrypted = true;
+                            outcome.plaintext_failed = true;
+                            outcome.had_failure = true;
+                            outcome.undecryptable |=
+                                self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                        }
                     }
                 }
                 Err(e) => {
@@ -854,7 +1687,7 @@ impl Client {
                             counter
                         );
                         // Mark that we saw a duplicate so we can skip skmsg without showing error
-                        any_duplicate = true;
+                        outcome.duplicate = true;
                         continue;
                     }
                     // Handle UntrustedIdentity: This happens when a user re-installs WhatsApp or changes devices.
@@ -879,6 +1712,7 @@ impl Client {
                         // Device::is_trusted_identity reads from backend, not cache.
                         if let Err(e) = self.flush_signal_cache().await {
                             log::warn!("Failed to flush identity deletion for {}: {e:?}", address);
+                            outcome.had_failure = true;
                             continue;
                         }
                         log::info!(
@@ -912,8 +1746,7 @@ impl Client {
                                     info.id,
                                     address
                                 );
-                                any_success = true;
-                                if let Err(e) = self
+                                match self
                                     .clone()
                                     .handle_decrypted_plaintext(
                                         enc_type,
@@ -923,9 +1756,22 @@ impl Client {
                                     )
                                     .await
                                 {
-                                    log::warn!(
-                                        "Failed processing plaintext after identity retry: {e:?}"
-                                    );
+                                    Ok(plaintext_outcome) => {
+                                        outcome.decrypted = true;
+                                        outcome.dispatched |= plaintext_outcome.dispatched;
+                                        outcome.skdm_only |= plaintext_outcome.skdm_only;
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Failed processing plaintext after identity retry: {e:?}"
+                                        );
+                                        outcome.decrypted = true;
+                                        outcome.plaintext_failed = true;
+                                        outcome.had_failure = true;
+                                        outcome.undecryptable |= self
+                                            .handle_plaintext_failure(info, decrypt_fail_mode)
+                                            .await;
+                                    }
                                 }
                             }
                             Err(retry_err) => {
@@ -943,11 +1789,11 @@ impl Client {
                                         chain,
                                         counter
                                     );
-                                    any_duplicate = true;
+                                    outcome.duplicate = true;
                                 } else if matches!(retry_err, SignalProtocolError::InvalidPreKeyId)
                                 {
                                     // Session may exist under PN address after identity change
-                                    if self
+                                    let migration_outcome = self
                                         .try_pn_to_lid_migration_decrypt(
                                             sender_encryption_jid,
                                             &signal_address,
@@ -957,10 +1803,26 @@ impl Client {
                                             enc_type,
                                             padding_version,
                                             info,
+                                            &session_mutex,
+                                            &mut session_guard,
                                         )
-                                        .await
+                                        .await;
+                                    if migration_outcome.decrypted
+                                        || migration_outcome.duplicate
+                                        || migration_outcome.plaintext_failed
                                     {
-                                        any_success = true;
+                                        outcome.decrypted |= migration_outcome.decrypted;
+                                        outcome.duplicate |= migration_outcome.duplicate;
+                                        outcome.dispatched |= migration_outcome.dispatched;
+                                        outcome.skdm_only |= migration_outcome.skdm_only;
+                                        outcome.plaintext_failed |=
+                                            migration_outcome.plaintext_failed;
+                                        outcome.had_failure |= migration_outcome.plaintext_failed;
+                                        if migration_outcome.plaintext_failed {
+                                            outcome.undecryptable |= self
+                                                .handle_plaintext_failure(info, decrypt_fail_mode)
+                                                .await;
+                                        }
                                     } else {
                                         log::debug!(
                                             "[msg:{}] InvalidPreKeyId after identity change for {}. \
@@ -968,7 +1830,8 @@ impl Client {
                                             info.id,
                                             address
                                         );
-                                        dispatched_undecryptable = self
+                                        outcome.had_failure = true;
+                                        outcome.undecryptable = self
                                             .handle_decrypt_failure(
                                                 info,
                                                 RetryReason::InvalidKeyId,
@@ -985,7 +1848,8 @@ impl Client {
                                     );
                                     // Send retry receipt so the sender resends with a PreKeySignalMessage
                                     // to establish a new session with the new identity
-                                    dispatched_undecryptable = self
+                                    outcome.had_failure = true;
+                                    outcome.undecryptable = self
                                         .handle_decrypt_failure(
                                             info,
                                             RetryReason::InvalidKey,
@@ -1013,7 +1877,7 @@ impl Client {
                     }
                     // Try PN→LID session migration before sending retry receipt
                     if let SignalProtocolError::SessionNotFound(_) = e {
-                        if self
+                        let migration_outcome = self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1023,10 +1887,24 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 info,
+                                &session_mutex,
+                                &mut session_guard,
                             )
-                            .await
+                            .await;
+                        if migration_outcome.decrypted
+                            || migration_outcome.duplicate
+                            || migration_outcome.plaintext_failed
                         {
-                            any_success = true;
+                            outcome.decrypted |= migration_outcome.decrypted;
+                            outcome.duplicate |= migration_outcome.duplicate;
+                            outcome.dispatched |= migration_outcome.dispatched;
+                            outcome.skdm_only |= migration_outcome.skdm_only;
+                            outcome.plaintext_failed |= migration_outcome.plaintext_failed;
+                            outcome.had_failure |= migration_outcome.plaintext_failed;
+                            if migration_outcome.plaintext_failed {
+                                outcome.undecryptable |=
+                                    self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                            }
                             continue;
                         }
 
@@ -1034,7 +1912,8 @@ impl Client {
                             "[msg:{}] No session found for {} message from {}. Sending retry receipt to request session establishment.",
                             info.id, enc_type, info.source.sender
                         );
-                        dispatched_undecryptable = self
+                        outcome.had_failure = true;
+                        outcome.undecryptable = self
                             .handle_decrypt_failure(info, RetryReason::NoSession, decrypt_fail_mode)
                             .await;
                         continue;
@@ -1042,34 +1921,57 @@ impl Client {
                         e,
                         SignalProtocolError::BadMac(_) | SignalProtocolError::InvalidMessage(_, _)
                     ) {
-                        // BadMac: MAC verification specifically failed (WA Web error code 7).
-                        // InvalidMessage: session out of sync or other decryption failure (code 4).
-                        // In both cases we delete the stale session and request re-establishment.
+                        // whatsmeow migrates PN sessions before decrypt; a fresh
+                        // LID record can otherwise shadow the sender's PN ratchet.
+                        let migration_outcome = self
+                            .try_pn_to_lid_migration_decrypt(
+                                sender_encryption_jid,
+                                &signal_address,
+                                &parsed_message,
+                                &mut adapter,
+                                &mut rng,
+                                enc_type,
+                                padding_version,
+                                info,
+                                &session_mutex,
+                                &mut session_guard,
+                            )
+                            .await;
+                        if migration_outcome.decrypted
+                            || migration_outcome.duplicate
+                            || migration_outcome.plaintext_failed
+                        {
+                            outcome.decrypted |= migration_outcome.decrypted;
+                            outcome.duplicate |= migration_outcome.duplicate;
+                            outcome.dispatched |= migration_outcome.dispatched;
+                            outcome.skdm_only |= migration_outcome.skdm_only;
+                            outcome.plaintext_failed |= migration_outcome.plaintext_failed;
+                            outcome.had_failure |= migration_outcome.plaintext_failed;
+                            if migration_outcome.plaintext_failed {
+                                outcome.undecryptable |=
+                                    self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                            }
+                            continue;
+                        }
+
+                        // WAWebMsgProcessingDecryptionHandler classifies both as
+                        // SignalRetryable -> sendRetryReceipt only, with no delete.
                         let (reason, label) = if matches!(e, SignalProtocolError::BadMac(_)) {
                             (RetryReason::BadMac, "BadMac")
                         } else {
                             (RetryReason::InvalidMessage, "InvalidMessage")
                         };
-                        log::warn!(
+                        log::log!(
+                            decrypt_fail_log_level(decrypt_fail_mode),
                             "[msg:{}] Decryption failed for {} message from {} due to {label}. \
-                             Deleting stale session and sending retry receipt.",
+                             Sending retry receipt.",
                             info.id,
                             enc_type,
                             info.source.sender
                         );
 
-                        // Delete the stale session from the signal cache.
-                        // IMPORTANT: Must go through the cache, not directly to the backend!
-                        // Going to the backend directly leaves the stale session in the cache,
-                        // which causes retry messages to also fail (they'd load the stale session).
-                        self.signal_cache.delete_session(&signal_address).await;
-                        log::info!(
-                            "Deleted stale session for {} from cache to allow re-establishment",
-                            signal_address
-                        );
-
-                        // Send retry receipt so the sender resends with a PreKeySignalMessage
-                        dispatched_undecryptable = self
+                        outcome.had_failure = true;
+                        outcome.undecryptable = self
                             .handle_decrypt_failure(info, reason, decrypt_fail_mode)
                             .await;
                         continue;
@@ -1078,7 +1980,7 @@ impl Client {
                         // session exists under a PN address (legacy migration).
                         // Migrating lets Signal use the existing ratchet state
                         // instead of looking up the consumed one-time prekey.
-                        if self
+                        let migration_outcome = self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1088,10 +1990,24 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 info,
+                                &session_mutex,
+                                &mut session_guard,
                             )
-                            .await
+                            .await;
+                        if migration_outcome.decrypted
+                            || migration_outcome.duplicate
+                            || migration_outcome.plaintext_failed
                         {
-                            any_success = true;
+                            outcome.decrypted |= migration_outcome.decrypted;
+                            outcome.duplicate |= migration_outcome.duplicate;
+                            outcome.dispatched |= migration_outcome.dispatched;
+                            outcome.skdm_only |= migration_outcome.skdm_only;
+                            outcome.plaintext_failed |= migration_outcome.plaintext_failed;
+                            outcome.had_failure |= migration_outcome.plaintext_failed;
+                            if migration_outcome.plaintext_failed {
+                                outcome.undecryptable |=
+                                    self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                            }
                             continue;
                         }
 
@@ -1105,7 +2021,8 @@ impl Client {
                         );
 
                         // Send retry receipt with fresh prekeys
-                        dispatched_undecryptable = self
+                        outcome.had_failure = true;
+                        outcome.undecryptable = self
                             .handle_decrypt_failure(
                                 info,
                                 RetryReason::InvalidKeyId,
@@ -1114,20 +2031,30 @@ impl Client {
                             .await;
                         continue;
                     } else {
-                        // For other unexpected errors, just log them
+                        // Catch-all → WA Web's UnhandledError nack (500).
                         log::error!(
-                            "[msg:{}] Batch session decrypt failed (type: {}) from {}: {:?}",
+                            "[msg:{}] Batch session decrypt failed (type: {}) from {}: {:?}. Sending nack.",
                             info.id,
                             enc_type,
                             info.source.sender,
                             e
                         );
+                        outcome.had_failure = true;
+                        outcome.undecryptable |= self
+                            .dispatch_undecryptable_event(
+                                Arc::clone(info),
+                                false,
+                                crate::types::events::UnavailableType::Unknown,
+                                decrypt_fail_mode,
+                            )
+                            .await;
+                        self.spawn_nack(info, NackReason::UnhandledError, None);
                         continue;
                     }
                 }
             }
         }
-        (any_success, any_duplicate, dispatched_undecryptable)
+        outcome
     }
 
     async fn process_group_enc_batch(
@@ -1199,7 +2126,12 @@ impl Client {
                         iteration,
                         counter
                     );
-                    // This is expected when messages are redelivered, just continue silently
+                    // Redelivered duplicate: ack it so the server drops it from the
+                    // offline queue. status is already acked by the should_ack gate,
+                    // so skip it to avoid a redundant receipt.
+                    if !info.source.chat.is_status_broadcast() {
+                        self.ack_received_message(info);
+                    }
                 }
                 Err(SignalProtocolError::NoSenderKeyState(msg)) => {
                     if info.is_expired_status() {
@@ -1241,13 +2173,27 @@ impl Client {
                         continue;
                     }
 
-                    log::error!(
+                    log::log!(
+                        decrypt_fail_log_level(decrypt_fail_mode),
                         "Group batch decrypt failed [msg:{}] for group {} sender {}: {:?}",
                         info.id,
                         sender_key_name.group_id(),
                         sender_key_name.sender_id(),
                         e
                     );
+                    // Always surface the failure to consumers; nack only non-status
+                    // (status is acked by the should_ack gate) so the server drops
+                    // it from the offline queue.
+                    self.dispatch_undecryptable_event(
+                        Arc::clone(info),
+                        false,
+                        crate::types::events::UnavailableType::Unknown,
+                        decrypt_fail_mode,
+                    )
+                    .await;
+                    if !info.source.chat.is_status_broadcast() {
+                        self.spawn_nack(info, NackReason::UnhandledError, None);
+                    }
                 }
             }
         }
@@ -1285,7 +2231,7 @@ impl Client {
         padded_plaintext: &[u8],
         padding_version: u8,
         info: &Arc<MessageInfo>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
         let original_msg = wacore::messages::decode_plaintext(padded_plaintext, padding_version)?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
@@ -1321,11 +2267,23 @@ impl Client {
             .await;
         }
 
+        // app_state_sync_key_share is a self-only protocol message (app-state
+        // sync keys shared between our own devices). A peer could otherwise
+        // inject keys and forge app-state mutations, so honour it only from
+        // self. WA Web `WAWebKeyManagementHandleKeyShareApi` gates on
+        // `isMeAccountNonLid(from)`; whatsmeow on `info.IsFromMe`.
         if let Some(protocol_msg) = msg.protocol_message.as_option()
             && protocol_msg.app_state_sync_key_share.is_set()
         {
-            self.handle_app_state_sync_key_share(&protocol_msg.app_state_sync_key_share)
-                .await;
+            if info.source.is_from_me {
+                self.handle_app_state_sync_key_share(&protocol_msg.app_state_sync_key_share)
+                    .await;
+            } else {
+                warn!(
+                    "[msg:{}] Dropping app_state_sync_key_share from non-self sender {}",
+                    info.id, info.source.sender
+                );
+            }
         }
 
         // PDO responses come from our own account (is_from_me) via device 0 (primary phone)
@@ -1348,9 +2306,20 @@ impl Client {
             .as_option_mut()
             .and_then(|pm| pm.history_sync_notification.take());
 
+        // history_sync_notification is self-only (our phone drives history sync).
+        // A spoofed one from a peer would force a download of attacker-controlled
+        // history, so honour it only from self. WA Web
+        // `WAWebHandleHistorySyncNotification` gates on `isMePrimaryNonLid`.
         if let Some(history_sync) = history_sync_taken {
-            self.handle_history_sync(info.id.clone(), history_sync)
-                .await;
+            if info.source.is_from_me {
+                self.handle_history_sync(info.id.clone(), history_sync)
+                    .await;
+            } else {
+                warn!(
+                    "[msg:{}] Dropping history_sync_notification from non-self sender {}",
+                    info.id, info.source.sender
+                );
+            }
         }
 
         // Skip dispatch for messages that only carry sender key distribution
@@ -1362,14 +2331,28 @@ impl Client {
                 "[msg:{}] Skipping event dispatch for sender key distribution message",
                 info.id
             );
+            Ok(PlaintextHandleOutcome {
+                skdm_only: true,
+                ..Default::default()
+            })
         } else {
-            self.dispatch_parsed_message(msg, info);
+            self.dispatch_parsed_message(msg, info).await;
+            Ok(PlaintextHandleOutcome {
+                dispatched: true,
+                ..Default::default()
+            })
         }
-        Ok(())
     }
 
     /// Attempt PN→LID session migration and retry decryption.
-    /// Returns true if decryption succeeded after migration.
+    /// Returns whether decryption succeeded after migration and whether it
+    /// reached user dispatch.
+    ///
+    /// Manages the per-address session lock around the migration loop:
+    /// drops the caller's guard (migration re-enters that mutex and
+    /// async_lock is non-reentrant), then reacquires it for the retry
+    /// decrypt and replaces the caller's `session_guard` on the way out
+    /// so the next payload in the batch stays serialized.
     #[allow(clippy::too_many_arguments)]
     async fn try_pn_to_lid_migration_decrypt(
         self: &Arc<Self>,
@@ -1381,21 +2364,27 @@ impl Client {
         enc_type: &str,
         padding_version: u8,
         info: &Arc<MessageInfo>,
-    ) -> bool {
+        session_mutex: &Arc<async_lock::Mutex<()>>,
+        session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
+    ) -> MigrationDecryptOutcome {
         use wacore::libsignal::protocol::{UsePQRatchet, message_decrypt};
 
         if !sender_jid.is_lid() {
-            return false;
+            return MigrationDecryptOutcome::default();
         }
 
         let Some(pn) = self.lid_pn_cache.get_phone_number(&sender_jid.user).await else {
-            return false;
+            return MigrationDecryptOutcome::default();
         };
 
+        // Release the address lock so the migration loop can acquire it for
+        // the matching device without re-entering.
+        *session_guard = None;
         self.migrate_signal_sessions_on_lid_discovery(&pn, &sender_jid.user)
             .await;
-
-        // Migration now goes through signal_cache, so no manual reload needed
+        // Re-acquire for the retry decrypt and hand the guard back to the
+        // caller for subsequent payloads in the batch.
+        *session_guard = Some(session_mutex.lock_arc().await);
 
         match message_decrypt(
             parsed_message,
@@ -1415,31 +2404,46 @@ impl Client {
                     info.id,
                     info.source.sender
                 );
-                if let Err(e) = self
+                match self
                     .clone()
                     .handle_decrypted_plaintext(enc_type, &padded_plaintext, padding_version, info)
                     .await
                 {
-                    log::warn!(
-                        "[msg:{}] Failed processing plaintext after migration: {e:?}",
-                        info.id
-                    );
+                    Ok(plaintext_outcome) => MigrationDecryptOutcome {
+                        decrypted: true,
+                        dispatched: plaintext_outcome.dispatched,
+                        skdm_only: plaintext_outcome.skdm_only,
+                        ..Default::default()
+                    },
+                    Err(e) => {
+                        log::warn!(
+                            "[msg:{}] Failed processing plaintext after migration: {e:?}",
+                            info.id
+                        );
+                        MigrationDecryptOutcome {
+                            decrypted: true,
+                            plaintext_failed: true,
+                            ..Default::default()
+                        }
+                    }
                 }
-                true
             }
             Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
                 log::debug!(
                     "[msg:{}] Already processed (chain {chain}, counter {counter}) after migration",
                     info.id
                 );
-                true
+                MigrationDecryptOutcome {
+                    duplicate: true,
+                    ..Default::default()
+                }
             }
             Err(retry_err) => {
                 log::warn!(
                     "[msg:{}] Decryption still failed after PN→LID migration: {retry_err:?}",
                     info.id
                 );
-                false
+                MigrationDecryptOutcome::default()
             }
         }
     }
@@ -1450,9 +2454,9 @@ impl Client {
         alt: Option<&Jid>,
         is_offline: bool,
     ) {
-        let (lid_user, pn_user, source) = if sender.is_lid() {
+        let (lid_user, pn_user, source) = if sender.server.is_lid_family() {
             if let Some(alt_jid) = alt
-                && alt_jid.is_pn()
+                && alt_jid.server.is_pn_family()
             {
                 (
                     &sender.user,
@@ -1462,9 +2466,9 @@ impl Client {
             } else {
                 return;
             }
-        } else if sender.is_pn() {
+        } else if sender.server.is_pn_family() {
             if let Some(alt_jid) = alt
-                && alt_jid.is_lid()
+                && alt_jid.server.is_lid_family()
             {
                 (
                     &alt_jid.user,
@@ -1786,6 +2790,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_status_broadcast_cold_cache_resolves_to_lid() {
+        use wacore::types::jid::JidExt as _;
+        use wacore_binary::Server;
+
+        let backend = Arc::new(
+            SqliteStore::new("file:memdb_status_cold_cache?mode=memory&cache=shared")
+                .await
+                .expect("Failed to create test backend"),
+        );
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("test backend should initialize"),
+        );
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
+
+        let pn_user = "559980000001";
+        let lid_user = "100000012345678";
+
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(pn_user).await,
+            None,
+            "precondition: empty cache for {pn_user}"
+        );
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "status@broadcast")
+            .attr("id", "TEST_COLD_CACHE_ID")
+            .attr("participant", format!("{pn_user}@s.whatsapp.net").as_str())
+            .attr("participant_lid", format!("{lid_user}@lid").as_str())
+            .attr("t", "1777415965")
+            .attr("type", "media")
+            .build();
+
+        let info = client
+            .parse_message_info(&node.as_node_ref())
+            .await
+            .expect("parse_message_info must succeed");
+
+        // Fix #1: parser surfaces participant_lid via sender_alt.
+        let alt = info
+            .source
+            .sender_alt
+            .as_ref()
+            .expect("sender_alt must be populated from participant_lid");
+        assert_eq!(alt.user.as_str(), lid_user);
+        assert_eq!(alt.server, Server::Lid);
+        assert_eq!(info.source.sender.user.as_str(), pn_user);
+        assert_eq!(info.source.sender.server, Server::Pn);
+
+        client
+            .cache_lid_pn_from_message(
+                &info.source.sender,
+                info.source.sender_alt.as_ref(),
+                info.is_offline,
+            )
+            .await;
+
+        // Cache learned the mapping in both directions.
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(pn_user).await,
+            Some(lid_user.to_string()),
+            "PN→LID lookup must hit"
+        );
+        assert_eq!(
+            client.lid_pn_cache.get_phone_number(lid_user).await,
+            Some(pn_user.to_string()),
+            "LID→PN lookup must hit"
+        );
+
+        // Resolution upgrades to LID and Signal address is the LID form.
+        let resolved = client.resolve_encryption_jid(&info.source.sender).await;
+        assert_eq!(resolved.user.as_str(), lid_user);
+        assert_eq!(resolved.server, Server::Lid);
+        assert_eq!(resolved.device, info.source.sender.device);
+        assert_eq!(
+            resolved.to_protocol_address().to_string(),
+            format!("{lid_user}@lid.0"),
+            "Signal address must be @lid form, not @c.us"
+        );
+    }
+
+    /// Pins the hosted-family branch + the realistic non-zero device shape.
+    /// Production stanzas almost always have device != 0, and hosted variants
+    /// (`@hosted` / `@hosted.lid`) must flow through cache_lid_pn_from_message.
+    #[tokio::test]
+    async fn test_status_broadcast_hosted_family_with_device_id_resolves_to_hosted_lid() {
+        use wacore::types::jid::JidExt as _;
+        use wacore_binary::Server;
+
+        let backend = Arc::new(
+            SqliteStore::new("file:memdb_status_hosted_device?mode=memory&cache=shared")
+                .await
+                .expect("Failed to create test backend"),
+        );
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("test backend should initialize"),
+        );
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            mock_transport(),
+            mock_http_client(),
+            None,
+        )
+        .await;
+
+        let pn_user = "559980000001";
+        let lid_user = "100000012345678";
+        let device_id: u16 = 99;
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "status@broadcast")
+            .attr("id", "HOSTED_TEST_ID")
+            .attr(
+                "participant",
+                format!("{pn_user}:{device_id}@hosted").as_str(),
+            )
+            .attr(
+                "participant_lid",
+                format!("{lid_user}:{device_id}@hosted.lid").as_str(),
+            )
+            .attr("t", "1777415965")
+            .attr("type", "media")
+            .build();
+
+        let info = client
+            .parse_message_info(&node.as_node_ref())
+            .await
+            .expect("parse_message_info must succeed");
+
+        assert_eq!(info.source.sender.server, Server::Hosted);
+        assert_eq!(info.source.sender.device, device_id);
+        let alt = info
+            .source
+            .sender_alt
+            .as_ref()
+            .expect("sender_alt must be populated for hosted participant");
+        assert_eq!(alt.server, Server::HostedLid);
+        assert_eq!(alt.user.as_str(), lid_user);
+        assert_eq!(alt.device, device_id);
+
+        client
+            .cache_lid_pn_from_message(
+                &info.source.sender,
+                info.source.sender_alt.as_ref(),
+                info.is_offline,
+            )
+            .await;
+
+        // Hosted variant must reach the cache; without it, learn_lid_pn_mapping
+        // is skipped and the hosted-device fix is incomplete.
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(pn_user).await,
+            Some(lid_user.to_string()),
+            "PN→LID lookup must work for hosted family"
+        );
+        assert_eq!(
+            client.lid_pn_cache.get_phone_number(lid_user).await,
+            Some(pn_user.to_string()),
+        );
+
+        let resolved = client.resolve_encryption_jid(&info.source.sender).await;
+        assert_eq!(resolved.user.as_str(), lid_user);
+        assert_eq!(resolved.server, Server::HostedLid);
+        assert_eq!(
+            resolved.device, device_id,
+            "device id must be preserved through resolution"
+        );
+        assert_eq!(
+            resolved.to_protocol_address().to_string(),
+            format!("{lid_user}:{device_id}@hosted.lid.0"),
+            "Signal address must be the @hosted.lid form with device suffix"
+        );
+    }
+
+    #[tokio::test]
     async fn test_process_session_enc_batch_handles_session_not_found_gracefully() {
         use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SignalMessage};
 
@@ -1847,8 +3037,7 @@ mod tests {
         let enc_node_ref = enc_node.as_node_ref();
         let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
 
-        // With SessionNotFound, should return (false, false, true) - no success, no dupe, dispatched event
-        let (success, had_duplicates, dispatched) = client
+        let outcome = client
             .process_session_enc_batch(
                 &payloads,
                 &info,
@@ -1858,8 +3047,8 @@ mod tests {
             .await;
 
         assert!(
-            !success && !had_duplicates && dispatched,
-            "process_session_enc_batch should return (false, false, true) when SessionNotFound occurs and dispatches event"
+            !outcome.decrypted && !outcome.duplicate && outcome.undecryptable,
+            "process_session_enc_batch should mark SessionNotFound as undecryptable without success or duplicate"
         );
     }
 
@@ -1936,7 +3125,7 @@ mod tests {
         let enc_node_ref = enc_node.as_node_ref();
         let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
 
-        let (success, had_duplicates, dispatched) = client
+        let outcome = client
             .clone()
             .process_session_enc_batch(
                 &payloads,
@@ -1948,29 +3137,859 @@ mod tests {
 
         // Should behave identically to SessionNotFound: failure, no dupe, event dispatched.
         assert!(
-            !success && !had_duplicates && dispatched,
+            !outcome.decrypted && !outcome.duplicate && outcome.undecryptable,
             "Empty session record should be treated as SessionNotFound: \
-             expected (false, false, true), got ({success}, {had_duplicates}, {dispatched})"
+             expected undecryptable without success or duplicate, got {outcome:?}"
         );
 
-        // Verify we took the SessionNotFound path (error code 1 / NoSession) rather
-        // than the InvalidMessage path (error code 4). The key difference:
-        // - SessionNotFound does NOT delete the session from the cache
-        // - InvalidMessage/BadMac DOES delete it (via signal_cache.delete_session)
-        //
-        // If the session record is still present in the cache, we know the
-        // SessionNotFound branch ran, which sends RetryReason::NoSession (code 1)
-        // and triggers early key inclusion on retry #1 via should_include_keys().
+        // After the WA Web compliance fix (no delete on BadMac/InvalidMessage either),
+        // every inbound-decrypt failure preserves the session. This still pins
+        // that the empty-record path does not regress to a delete.
         let backend = client.persistence_manager.backend();
         let session_still_exists = client
             .signal_cache
             .has_session(&signal_address, &*backend)
             .await
             .expect("has_session should not fail");
+        assert!(session_still_exists);
+
+        // Discriminate from the BadMac / InvalidMessage arms (which also
+        // preserve the session post-fix): the empty-record path must end up
+        // in the SessionNotFound branch, which fires a retry receipt with
+        // `RetryReason::NoSession`. Anything else means the libsignal-side
+        // empty-record short-circuit regressed.
+        await_retry_receipt(&client, &info, 1, RetryReason::NoSession).await;
+    }
+
+    // ─── Fixtures for session-preservation tests ─────────────────────────────
+    //
+    // Mirrors the WAWebSignalProtocolStore tests in spirit: a synthetic peer
+    // holds its own Signal stores in memory so the test can drive X3DH end to
+    // end against the Client. Inlined (not exported from a helper crate)
+    // because these are message.rs-specific scenarios.
+
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use wacore::libsignal::protocol::{
+        CiphertextMessage, Direction, IdentityChange, IdentityKey, IdentityKeyPair, KeyPair,
+        PreKeyBundle, PreKeyRecord, PreKeyStore as SigPreKeyStore, ProtocolAddress, SenderKeyName,
+        SenderKeyRecord, SenderKeyStore as SigSenderKeyStore, SessionRecord,
+        SessionStore as SigSessionStore, SignedPreKeyStore as SigSignedPreKeyStore, UsePQRatchet,
+        create_sender_key_distribution_message, group_encrypt, message_encrypt,
+        process_prekey_bundle,
+    };
+    use wacore::libsignal::protocol::{
+        IdentityKeyStore as SigIdentityKeyStore, SignalProtocolError,
+    };
+
+    #[derive(Default, Clone)]
+    struct MemSessionStore(HashMap<ProtocolAddress, SessionRecord>);
+
+    #[async_trait]
+    impl SigSessionStore for MemSessionStore {
+        async fn load_session(
+            &self,
+            a: &ProtocolAddress,
+        ) -> Result<Option<SessionRecord>, SignalProtocolError> {
+            Ok(self.0.get(a).cloned())
+        }
+        async fn has_session(&self, a: &ProtocolAddress) -> Result<bool, SignalProtocolError> {
+            Ok(self.0.contains_key(a))
+        }
+        async fn store_session(
+            &mut self,
+            a: &ProtocolAddress,
+            r: SessionRecord,
+        ) -> Result<(), SignalProtocolError> {
+            self.0.insert(a.clone(), r);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct MemIdentityStore {
+        kp: IdentityKeyPair,
+        reg_id: u32,
+        known: HashMap<ProtocolAddress, IdentityKey>,
+    }
+
+    #[async_trait]
+    impl SigIdentityKeyStore for MemIdentityStore {
+        async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair, SignalProtocolError> {
+            Ok(self.kp.clone())
+        }
+        async fn get_local_registration_id(&self) -> Result<u32, SignalProtocolError> {
+            Ok(self.reg_id)
+        }
+        async fn save_identity(
+            &mut self,
+            a: &ProtocolAddress,
+            id: &IdentityKey,
+        ) -> Result<IdentityChange, SignalProtocolError> {
+            let prev = self.known.insert(a.clone(), *id);
+            Ok(match prev {
+                None => IdentityChange::NewOrUnchanged,
+                Some(p) if &p == id => IdentityChange::NewOrUnchanged,
+                _ => IdentityChange::ReplacedExisting,
+            })
+        }
+        async fn is_trusted_identity(
+            &self,
+            _: &ProtocolAddress,
+            _: &IdentityKey,
+            _: Direction,
+        ) -> Result<bool, SignalProtocolError> {
+            Ok(true)
+        }
+        async fn get_identity(
+            &self,
+            a: &ProtocolAddress,
+        ) -> Result<Option<IdentityKey>, SignalProtocolError> {
+            Ok(self.known.get(a).copied())
+        }
+    }
+
+    #[derive(Default, Clone)]
+    struct MemSenderKeyStore(HashMap<SenderKeyName, SenderKeyRecord>);
+
+    #[async_trait]
+    impl SigSenderKeyStore for MemSenderKeyStore {
+        async fn store_sender_key(
+            &mut self,
+            name: &SenderKeyName,
+            record: SenderKeyRecord,
+        ) -> Result<(), SignalProtocolError> {
+            self.0.insert(name.clone(), record);
+            Ok(())
+        }
+
+        async fn load_sender_key(
+            &self,
+            name: &SenderKeyName,
+        ) -> Result<Option<SenderKeyRecord>, SignalProtocolError> {
+            Ok(self.0.get(name).cloned())
+        }
+    }
+
+    #[derive(Clone)]
+    struct AlicePeer {
+        jid: Jid,
+        address: ProtocolAddress,
+        identity: MemIdentityStore,
+        sessions: MemSessionStore,
+        sender_keys: MemSenderKeyStore,
+    }
+
+    impl AlicePeer {
+        async fn new(jid_str: &str) -> Self {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let kp = IdentityKeyPair::generate(&mut rng);
+            let jid: Jid = jid_str.parse().expect("valid jid");
+            let address = jid.to_protocol_address();
+            Self {
+                jid,
+                address,
+                identity: MemIdentityStore {
+                    kp,
+                    reg_id: 12345,
+                    known: HashMap::new(),
+                },
+                sessions: MemSessionStore::default(),
+                sender_keys: MemSenderKeyStore::default(),
+            }
+        }
+
+        async fn install_bob_session(&mut self, bob_addr: &ProtocolAddress, bundle: &PreKeyBundle) {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            process_prekey_bundle(
+                bob_addr,
+                &mut self.sessions,
+                &mut self.identity,
+                bundle,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("process bob bundle");
+        }
+
+        async fn encrypt(
+            &mut self,
+            bob_addr: &ProtocolAddress,
+            plaintext: &[u8],
+        ) -> CiphertextMessage {
+            message_encrypt(plaintext, bob_addr, &mut self.sessions, &mut self.identity)
+                .await
+                .expect("encrypt")
+        }
+
+        async fn encrypt_text(
+            &mut self,
+            bob_addr: &ProtocolAddress,
+            text: &str,
+        ) -> CiphertextMessage {
+            use wacore::messages::MessageUtils;
+
+            let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+                conversation: Some(text.to_string()),
+                ..Default::default()
+            });
+            self.encrypt(bob_addr, &plaintext).await
+        }
+
+        async fn create_group_skdm(
+            &mut self,
+            group_jid: &Jid,
+        ) -> wa::message::SenderKeyDistributionMessage {
+            let sender = self.jid.to_non_ad();
+            let sender_key_name = make_sender_key_name(group_jid, &sender.to_protocol_address());
+            let skdm = create_sender_key_distribution_message(
+                &sender_key_name,
+                &mut self.sender_keys,
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
+            .await
+            .expect("create sender key distribution");
+            wa::message::SenderKeyDistributionMessage {
+                group_id: Some(group_jid.to_string()),
+                axolotl_sender_key_distribution_message: Some(skdm.serialized().to_vec()),
+            }
+        }
+
+        async fn encrypt_group_message(&mut self, group_jid: &Jid, plaintext: &[u8]) -> Vec<u8> {
+            let sender = self.jid.to_non_ad();
+            let sender_key_name = make_sender_key_name(group_jid, &sender.to_protocol_address());
+            let sender_key_message = group_encrypt(
+                &mut self.sender_keys,
+                &sender_key_name,
+                plaintext,
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
+            .await
+            .expect("encrypt sender key message");
+            sender_key_message.serialized().to_vec()
+        }
+    }
+
+    /// Ensure the test `Client` has an identity (`pn`/`lid`) provisioned —
+    /// `create_test_client_with_name` returns an unpaired client by default
+    /// so `device_snapshot.lid` / `.pn` are both `None`.
+    async fn ensure_bob_paired(client: &Arc<Client>) {
+        let snapshot = client.persistence_manager.get_device_snapshot().await;
+        if snapshot.lid.is_some() || snapshot.pn.is_some() {
+            return;
+        }
+        let pn: Jid = "9000000000000:1@s.whatsapp.net".parse().expect("pn");
+        let lid: Jid = "999999999999999:1@lid".parse().expect("lid");
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(pn)))
+            .await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(lid)))
+            .await;
+    }
+
+    /// Read Bob's currently provisioned identity / signed prekey from the test
+    /// client and build a `PreKeyBundle` that Alice can use to initialize
+    /// her side of the session. Mirrors how the real `RetryReceiptJob` ships
+    /// keys back to the sender — assembled through the same
+    /// `SignalProtocolStoreAdapter` traits production uses.
+    async fn bobs_prekey_bundle(client: &Arc<Client>) -> (PreKeyBundle, Jid) {
+        use wacore::libsignal::protocol::GenericSignedPreKey;
+        ensure_bob_paired(client).await;
+        let snapshot = client.persistence_manager.get_device_snapshot().await;
+        let identity_kp = snapshot.core.identity_key.clone();
+        let reg_id = snapshot.core.registration_id;
+
+        // Read/write prekeys through the same trait surface production uses
+        // (see signal_adapter.rs). Avoids reaching past `PersistenceManager`
+        // to mutate device storage directly.
+        let mut adapter = client.signal_adapter().await;
+        let spk_record = adapter
+            .signed_pre_key_store
+            .get_signed_pre_key(1.into())
+            .await
+            .expect("spk present");
+        let spk_pub = spk_record.public_key().expect("spk pub");
+        let spk_sig_vec = spk_record.signature().expect("spk sig");
+
+        // Provision a fresh one-time prekey for this test through the
+        // adapter's `PreKeyStore` impl.
+        let pk_id_u32: u32 = 9001;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let pk_pair = KeyPair::generate(&mut rng);
+        let pk_record = PreKeyRecord::new(pk_id_u32.into(), &pk_pair);
+        adapter
+            .pre_key_store
+            .save_pre_key(pk_id_u32.into(), &pk_record)
+            .await
+            .expect("save pk");
+
+        let own_device_jid: Jid = snapshot
+            .lid
+            .clone()
+            .or_else(|| snapshot.pn.clone())
+            .expect("own jid");
+        let bob_jid = own_device_jid.to_non_ad();
+        let bundle = PreKeyBundle::new(
+            reg_id,
+            u32::from(own_device_jid.device).into(),
+            Some((pk_id_u32.into(), pk_pair.public_key)),
+            1.into(),
+            spk_pub,
+            spk_sig_vec,
+            IdentityKey::new(identity_kp.public_key),
+        )
+        .expect("bundle");
+        (bundle, bob_jid)
+    }
+
+    /// Build an EncPayload-style stanza node and run `process_session_enc_batch`.
+    /// Returns whether the session for `peer_jid` still exists in the cache afterwards.
+    async fn submit_and_check_session(
+        client: &Arc<Client>,
+        peer_jid: &Jid,
+        ct: &CiphertextMessage,
+    ) -> (bool, bool, bool, bool) {
+        let (enc_type, bytes) = match ct {
+            CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
+            CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
+            _ => panic!("unexpected ciphertext type"),
+        };
+        let enc_node = NodeBuilder::new("enc")
+            .attr("type", enc_type)
+            .bytes(bytes)
+            .build();
+        let enc_ref = enc_node.as_node_ref();
+        let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+        let info = Arc::new(MessageInfo {
+            source: crate::types::message::MessageSource {
+                sender: peer_jid.clone(),
+                chat: peer_jid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let outcome = client
+            .clone()
+            .process_session_enc_batch(
+                &payloads,
+                &info,
+                peer_jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        let backend = client.persistence_manager.backend();
+        let still = client
+            .signal_cache
+            .has_session(&peer_jid.to_protocol_address(), &*backend)
+            .await
+            .expect("has_session");
+        (
+            outcome.decrypted,
+            outcome.duplicate,
+            outcome.undecryptable,
+            still,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_badmac_migrates_pn_session_when_lid_shadow_exists() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+
+        let client = crate::test_utils::create_test_client_with_name("badmac_lid_shadow").await;
+        let alice_pn: Jid = "15550001001@s.whatsapp.net".parse().expect("alice pn");
+        let alice_lid: Jid = "100000000000002@lid".parse().expect("alice lid");
+        let entry = LidPnEntry::new(
+            alice_lid.user.to_string(),
+            alice_pn.user.to_string(),
+            LearningSource::PeerLidMessage,
+        );
+        client.lid_pn_cache.add(&entry).await;
+
+        let (bundle_v1, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let alice_pn_str = alice_pn.to_string();
+        let mut alice_old = AlicePeer::new(&alice_pn_str).await;
+        alice_old.install_bob_session(&bob_addr, &bundle_v1).await;
+        let pkmsg_v1 = alice_old.encrypt_text(&bob_addr, "pn establish").await;
+        let (pn_success, _, _, pn_still) =
+            submit_and_check_session(&client, &alice_pn, &pkmsg_v1).await;
+        assert!(pn_success, "PN-keyed session should establish");
         assert!(
-            session_still_exists,
-            "Session should NOT have been deleted — SessionNotFound path preserves it. \
-             If deleted, the InvalidMessage path ran instead (wrong error code)."
+            pn_still,
+            "PN-keyed session should be present before migration"
+        );
+
+        if let Some(record) = alice_old.sessions.0.get_mut(&bob_addr)
+            && let Some(state) = record.session_state_mut()
+        {
+            state.clear_unacknowledged_pre_key_message();
+        }
+
+        let mut alice_fresh = alice_old.clone();
+        alice_fresh.jid = alice_lid.clone();
+        alice_fresh.address = alice_lid.to_protocol_address();
+        alice_fresh.sessions = MemSessionStore::default();
+
+        let (bundle_v2, _) = bobs_prekey_bundle(&client).await;
+        alice_fresh.install_bob_session(&bob_addr, &bundle_v2).await;
+        let pkmsg_v2 = alice_fresh.encrypt_text(&bob_addr, "lid shadow").await;
+        let (lid_success, _, _, lid_still) =
+            submit_and_check_session(&client, &alice_lid, &pkmsg_v2).await;
+        assert!(lid_success, "LID-keyed shadow session should establish");
+        assert!(lid_still, "LID-keyed shadow session should exist");
+
+        let old_pn_msg = alice_old.encrypt_text(&bob_addr, "old pn ratchet").await;
+        assert!(matches!(old_pn_msg, CiphertextMessage::SignalMessage(_)));
+        let (success, duplicates, dispatched, lid_after) =
+            submit_and_check_session(&client, &alice_lid, &old_pn_msg).await;
+        assert!(success, "BadMac path should recover by migrating PN to LID");
+        assert!(!duplicates, "message should decrypt, not dedupe");
+        assert!(
+            !dispatched,
+            "migration recovery must not emit retry failure"
+        );
+        assert!(lid_after, "migrated LID session should remain");
+
+        let backend = client.persistence_manager.backend();
+        let pn_after = client
+            .signal_cache
+            .has_session(&alice_pn.to_protocol_address(), &*backend)
+            .await
+            .expect("has_session");
+        assert!(!pn_after, "PN session should be consumed by migration");
+    }
+
+    #[tokio::test]
+    async fn migration_plaintext_failure_nacks_without_signal_retry() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+
+        let (client, transport) = capturing_client("migration_plaintext_nack").await;
+        let alice_pn: Jid = "15550001002@s.whatsapp.net".parse().expect("alice pn");
+        let alice_lid: Jid = "100000000000004@lid".parse().expect("alice lid");
+        let entry = LidPnEntry::new(
+            alice_lid.user.to_string(),
+            alice_pn.user.to_string(),
+            LearningSource::PeerLidMessage,
+        );
+        client.lid_pn_cache.add(&entry).await;
+
+        let (bundle_v1, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let alice_pn_str = alice_pn.to_string();
+        let mut alice_old = AlicePeer::new(&alice_pn_str).await;
+        alice_old.install_bob_session(&bob_addr, &bundle_v1).await;
+        let pkmsg_v1 = alice_old.encrypt_text(&bob_addr, "pn establish").await;
+        let (pn_success, _, _, _) = submit_and_check_session(&client, &alice_pn, &pkmsg_v1).await;
+        assert!(pn_success, "PN-keyed session should establish");
+
+        if let Some(record) = alice_old.sessions.0.get_mut(&bob_addr)
+            && let Some(state) = record.session_state_mut()
+        {
+            state.clear_unacknowledged_pre_key_message();
+        }
+
+        let mut alice_fresh = alice_old.clone();
+        alice_fresh.jid = alice_lid.clone();
+        alice_fresh.address = alice_lid.to_protocol_address();
+        alice_fresh.sessions = MemSessionStore::default();
+
+        let (bundle_v2, _) = bobs_prekey_bundle(&client).await;
+        alice_fresh.install_bob_session(&bob_addr, &bundle_v2).await;
+        let pkmsg_v2 = alice_fresh.encrypt_text(&bob_addr, "lid shadow").await;
+        let (lid_success, _, _, _) = submit_and_check_session(&client, &alice_lid, &pkmsg_v2).await;
+        assert!(lid_success, "LID-keyed shadow session should establish");
+
+        let bad_old_pn_msg = alice_old.encrypt(&bob_addr, &[0xff, 0x01]).await;
+        let payloads = vec![enc_payload_from_ciphertext(&bad_old_pn_msg)];
+        let info = Arc::new(MessageInfo {
+            id: "MIGRATION_BAD_PLAINTEXT".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: alice_lid.clone(),
+                chat: alice_lid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let outcome = client
+            .clone()
+            .process_session_enc_batch(
+                &payloads,
+                &info,
+                &alice_lid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+
+        assert!(
+            outcome.decrypted,
+            "Signal decrypt succeeded after migration"
+        );
+        assert!(outcome.plaintext_failed);
+        assert!(outcome.undecryptable);
+        assert!(outcome.had_failure);
+        assert!(!outcome.dispatched);
+        assert!(!outcome.skdm_only);
+
+        let mut nack_code = None;
+        for _ in 0..80 {
+            nack_code = find_message_nack_error(&transport.sent(), &info.id);
+            if nack_code.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(nack_code, Some(491));
+
+        let cache_key = client
+            .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+            .await;
+        assert_eq!(
+            client.message_retry_counts.get(&cache_key).await,
+            None,
+            "local protobuf failure after migration must not request Signal retry"
+        );
+    }
+
+    /// Smoking-gun regression: a `BadMac` on the inbound path must NOT delete
+    /// the session. Pre-fix, `src/message.rs:1100` called
+    /// `signal_cache.delete_session(...)` here — this test would fail with
+    /// `still=false`. WA Web's `RetryReceiptJob` keeps the session untouched
+    /// (see `docs/captured-js/WAWeb/Send/RetryReceiptJob.js`).
+    #[tokio::test]
+    async fn test_badmac_preserves_session() {
+        let client = crate::test_utils::create_test_client_with_name("badmac_preserves").await;
+        let mut alice = AlicePeer::new("1111111111111@s.whatsapp.net").await;
+        let alice_addr = alice.address.clone();
+
+        // X3DH: Alice consumes Bob's bundle to set up her outgoing session.
+        let (bob_bundle, _) = bobs_prekey_bundle(&client).await;
+        alice
+            .install_bob_session(
+                &client
+                    .persistence_manager
+                    .get_device_snapshot()
+                    .await
+                    .lid
+                    .clone()
+                    .or(client
+                        .persistence_manager
+                        .get_device_snapshot()
+                        .await
+                        .pn
+                        .clone())
+                    .expect("own jid")
+                    .to_protocol_address(),
+                &bob_bundle,
+            )
+            .await;
+
+        // First message: pkmsg lands on Bob and installs Bob's reciprocal session.
+        let bob_addr = client
+            .persistence_manager
+            .get_device_snapshot()
+            .await
+            .lid
+            .clone()
+            .or(client
+                .persistence_manager
+                .get_device_snapshot()
+                .await
+                .pn
+                .clone())
+            .expect("own jid")
+            .to_protocol_address();
+        let pkmsg = alice.encrypt_text(&bob_addr, "hello").await;
+        let (s1, _, _, still1) = submit_and_check_session(&client, &alice.jid, &pkmsg).await;
+        assert!(s1, "pkmsg should establish session and decrypt");
+        assert!(still1, "session must exist after first message");
+
+        // Force Alice's next encrypt to be a plain SignalMessage rather than a
+        // pkmsg by clearing her unacknowledged-pkmsg flag. Tampering the trailing
+        // bytes of a pkmsg breaks the outer protobuf parse (because reg_id /
+        // signed_pre_key_id varints are encoded *after* the embedded message
+        // field), which would short-circuit into the parse-error nack path
+        // before ever reaching the BadMac arm we want to exercise.
+        {
+            let record = alice
+                .sessions
+                .0
+                .get_mut(&bob_addr)
+                .expect("alice has a session for bob");
+            if let Some(state) = record.session_state_mut() {
+                state.clear_unacknowledged_pre_key_message();
+            }
+        }
+
+        // Second message: tamper the trailing MAC byte of a real SignalMessage.
+        // The format is `[version][protobuf body][8-byte MAC]`, so the last byte
+        // is squarely inside the MAC region — parse succeeds, MAC verification
+        // fails -> libsignal returns BadMac.
+        let msg2 = alice.encrypt_text(&bob_addr, "world").await;
+        let mut bytes = match &msg2 {
+            CiphertextMessage::SignalMessage(m) => m.serialized().to_vec(),
+            other => panic!(
+                "expected SignalMessage, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        };
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        let enc_node = NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .bytes(bytes)
+            .build();
+        let enc_ref = enc_node.as_node_ref();
+        let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+        let info = Arc::new(MessageInfo {
+            id: "BADMAC_TAMPER_MSG".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: alice.jid.clone(),
+                chat: alice.jid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let outcome = client
+            .clone()
+            .process_session_enc_batch(
+                &payloads,
+                &info,
+                &alice.jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        assert!(!outcome.decrypted, "tampered MAC must not decrypt");
+        assert!(
+            outcome.undecryptable,
+            "undecryptable event must be dispatched"
+        );
+
+        // The fix asserts the session lives on so the eventual sender pkmsg
+        // can archive it into previous_sessions[0].
+        let backend = client.persistence_manager.backend();
+        let still = client
+            .signal_cache
+            .has_session(&alice_addr, &*backend)
+            .await
+            .expect("has_session");
+        assert!(still, "BadMac must NOT delete the session (WA Web parity)");
+
+        // Discriminate from the parse-error path (which also preserves the
+        // session): the BadMac/InvalidMessage branch routes through
+        // `handle_decrypt_failure` -> `spawn_retry_receipt`, which bumps
+        // both caches with `RetryReason::BadMac`. Parse errors take the
+        // nack path instead and never touch either cache.
+        await_retry_receipt(&client, &info, 1, RetryReason::BadMac).await;
+    }
+
+    /// Poll for `message_retry_counts == expected_count` AND
+    /// `recent_retry_reasons == expected_reason` (or fail after a short
+    /// timeout). `spawn_retry_receipt` detaches the increment onto the
+    /// runtime, so both caches may lag the `process_session_enc_batch` return.
+    /// Reading both is what tells the BadMac arm apart from a parse-error
+    /// regression (which never bumps these caches).
+    async fn await_retry_receipt(
+        client: &Arc<Client>,
+        info: &MessageInfo,
+        expected_count: u8,
+        expected_reason: RetryReason,
+    ) {
+        let cache_key = client
+            .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+            .await;
+        for _ in 0..200 {
+            if let (Some(c), Some(r)) = (
+                client.message_retry_counts.get(&cache_key).await,
+                client.recent_retry_reasons.get(&cache_key).await,
+            ) && c == expected_count
+                && r == expected_reason
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let count = client.message_retry_counts.get(&cache_key).await;
+        let reason = client.recent_retry_reasons.get(&cache_key).await;
+        panic!(
+            "expected retry ({expected_count}, {expected_reason:?}) for {cache_key}, \
+             got ({count:?}, {reason:?})"
+        );
+    }
+
+    // NOTE: the `InvalidMessage` arm of the `matches!()` block in
+    // `process_session_enc_batch` is exercised by `test_badmac_preserves_session`
+    // too — libsignal returns `BadMac` whenever *any* candidate state derives a
+    // message key (which is what a random-ratchet `SignalMessage::new(...)`
+    // ends up doing as well), so a separate "InvalidMessage" regression test
+    // would be indistinguishable from the BadMac one. Reaching the
+    // `InvalidMessage` constructor specifically would require crafting a
+    // SignalMessage that *parses* but where no state derives any message
+    // key — empirically impractical without major libsignal-side scaffolding.
+
+    /// Integration test: reproduces the production loop observed in
+    /// `k8awqjsgww2lnkt89urp3de1-191402150615-...`. After a BadMac the bot
+    /// used to delete the session; when the sender then sent a fresh pkmsg
+    /// (post-retry-receipt), `process_prekey_bundle` ran on an empty record
+    /// and `previous_sessions[0]` stayed empty — any in-flight messages on
+    /// the OLD ratchet failed permanently. With the fix the old session
+    /// survives the BadMac, the pkmsg's `promote_state` archives it, and
+    /// the archived state lives in `previous_sessions[0]` exactly as WA Web
+    /// expects (see `libsignal/src/protocol/state/session.rs:751-768`).
+    #[tokio::test]
+    async fn test_prod_scenario_pkmsg_archives_old_session_after_badmac() {
+        let client = crate::test_utils::create_test_client_with_name("prod_archive").await;
+        let mut alice = AlicePeer::new("3333333333333@s.whatsapp.net").await;
+
+        // X3DH round 1 — Alice initiates with Bob's bundle, sends pkmsg.
+        let (bundle_v1, _) = bobs_prekey_bundle(&client).await;
+        let bob_addr = client
+            .persistence_manager
+            .get_device_snapshot()
+            .await
+            .lid
+            .clone()
+            .or(client
+                .persistence_manager
+                .get_device_snapshot()
+                .await
+                .pn
+                .clone())
+            .expect("own jid")
+            .to_protocol_address();
+        alice.install_bob_session(&bob_addr, &bundle_v1).await;
+        let pkmsg_v1 = alice.encrypt_text(&bob_addr, "v1").await;
+        let (s1, _, _, _) = submit_and_check_session(&client, &alice.jid, &pkmsg_v1).await;
+        assert!(s1);
+
+        // Snapshot Bob's session_v1 base key for later comparison. Use
+        // peek (non-destructive): `get_session` marks the cache entry as
+        // CheckedOut, which would prevent libsignal from re-loading the
+        // session in the BadMac path that follows.
+        let alice_addr = alice.address.clone();
+        let backend = client.persistence_manager.backend();
+        let v1_record = client
+            .signal_cache
+            .peek_session(&alice_addr, &*backend)
+            .await
+            .expect("peek_session")
+            .expect("v1 session present");
+        let v1_base_key = v1_record
+            .session_state()
+            .expect("v1 current state")
+            .sender_ratchet_key_for_logging()
+            .expect("v1 base key");
+
+        // Force Alice's next encrypt to be a plain SignalMessage so tampering
+        // the last byte lands inside the MAC region (see comment in
+        // `test_badmac_preserves_session` for why pkmsg cannot be tampered
+        // at the tail without breaking the outer protobuf parse).
+        {
+            let record = alice
+                .sessions
+                .0
+                .get_mut(&bob_addr)
+                .expect("alice has a session for bob");
+            if let Some(state) = record.session_state_mut() {
+                state.clear_unacknowledged_pre_key_message();
+            }
+        }
+
+        // Tampered SignalMessage → BadMac branch (with the fix this no longer
+        // deletes Bob's session).
+        let msg = alice.encrypt_text(&bob_addr, "stale").await;
+        let mut bytes = match &msg {
+            CiphertextMessage::SignalMessage(m) => m.serialized().to_vec(),
+            other => panic!(
+                "expected SignalMessage, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        };
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        let enc_node = NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .bytes(bytes)
+            .build();
+        let enc_ref = enc_node.as_node_ref();
+        let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+        let info = Arc::new(MessageInfo {
+            id: "PROD_LOOP_REPRO_STALE".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: alice.jid.clone(),
+                chat: alice.jid.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let _outcome = client
+            .clone()
+            .process_session_enc_batch(
+                &payloads,
+                &info,
+                &alice.jid,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        // Confirm the BadMac branch executed (parse-error path would skip
+        // both retry caches; another arm would record a different reason).
+        await_retry_receipt(&client, &info, 1, RetryReason::BadMac).await;
+        // Pre-fix: this assertion would have failed (session deleted).
+        let preserved = client
+            .signal_cache
+            .has_session(&alice_addr, &*backend)
+            .await
+            .expect("has_session");
+        assert!(preserved, "BadMac must preserve session");
+
+        // X3DH round 2 — Alice rebuilds her side from a fresh Bob bundle
+        // (simulates the bot re-issuing prekeys via a retry receipt) and
+        // sends another pkmsg. Bob's `process_prekey_bundle` must archive
+        // session_v1 into previous_sessions[0].
+        let (bundle_v2, _) = bobs_prekey_bundle(&client).await;
+        alice.sessions = MemSessionStore::default(); // forget Alice's v1 to force a fresh X3DH
+        alice.install_bob_session(&bob_addr, &bundle_v2).await;
+        let pkmsg_v2 = alice.encrypt_text(&bob_addr, "v2").await;
+        let (s2, _, _, still2) = submit_and_check_session(&client, &alice.jid, &pkmsg_v2).await;
+        assert!(s2, "pkmsg_v2 should decrypt");
+        assert!(still2);
+
+        let v2_record = client
+            .signal_cache
+            .peek_session(&alice_addr, &*backend)
+            .await
+            .expect("peek_session")
+            .expect("v2 session present");
+        let v2_base_key = v2_record
+            .session_state()
+            .expect("v2 current state")
+            .sender_ratchet_key_for_logging()
+            .expect("v2 base key");
+        assert_ne!(
+            v1_base_key, v2_base_key,
+            "current session must be the new v2"
+        );
+        assert_eq!(
+            v2_record.previous_session_count(),
+            1,
+            "session_v1 must be archived as previous_sessions[0]"
+        );
+        let archived_state = v2_record
+            .previous_session_states()
+            .next()
+            .expect("archived state")
+            .expect("archived state decodes");
+        let archived_base_key = archived_state
+            .sender_ratchet_key_for_logging()
+            .expect("archived base key");
+        assert_eq!(
+            archived_base_key, v1_base_key,
+            "archived previous_sessions[0] must be the original v1"
         );
     }
 
@@ -2045,7 +4064,7 @@ mod tests {
         );
 
         // Should not panic or retry loop - skmsg is skipped after msg failure
-        client.handle_incoming_message(message_node).await;
+        client.clone().handle_incoming_message(message_node).await;
     }
 
     /// Test case for reproducing sender key JID mismatch in LID group messages
@@ -2815,7 +4834,7 @@ mod tests {
         );
 
         // Should NOT skip skmsg - before the fix this would incorrectly skip
-        client.handle_incoming_message(message_node).await;
+        client.clone().handle_incoming_message(message_node).await;
     }
 
     /// Test case for UntrustedIdentity error handling and recovery
@@ -2889,7 +4908,7 @@ mod tests {
 
         // Call process_session_enc_batch
         // This should handle any errors gracefully without panicking
-        let (success, _had_duplicates, _dispatched) = client
+        let outcome = client
             .process_session_enc_batch(
                 &payloads,
                 &info,
@@ -2900,7 +4919,7 @@ mod tests {
 
         log::info!(
             "Test: process_session_enc_batch completed - success: {}",
-            success
+            outcome.decrypted
         );
 
         // The key is that this didn't panic - deletion uses full protocol address
@@ -2978,7 +4997,7 @@ mod tests {
 
         // Process the batch
         // Should handle all errors gracefully without stopping at first error
-        let (success, _had_duplicates, _dispatched) = client
+        let outcome = client
             .process_session_enc_batch(
                 &payloads,
                 &info,
@@ -2987,7 +5006,10 @@ mod tests {
             )
             .await;
 
-        log::info!("Test: Batch processing completed - success: {}", success);
+        log::info!(
+            "Test: Batch processing completed - success: {}",
+            outcome.decrypted
+        );
     }
 
     /// Test case: Error handling in group chat context
@@ -3050,7 +5072,7 @@ mod tests {
 
         // Process the message
         // Should handle errors gracefully in group context
-        let (success, _had_duplicates, _dispatched) = client
+        let outcome = client
             .process_session_enc_batch(
                 &payloads,
                 &info,
@@ -3059,7 +5081,10 @@ mod tests {
             )
             .await;
 
-        log::info!("Test: Group message processed - success: {}", success);
+        log::info!(
+            "Test: Group message processed - success: {}",
+            outcome.decrypted
+        );
     }
 
     /// Test case: DM message parsing for self-sent messages via LID
@@ -4024,6 +6049,10 @@ mod tests {
             ephemeral_expiration: None,
             is_offline: false,
             unavailable_request_id: None,
+            server_timestamp_us: None,
+            verified_level: None,
+            verified_name_serial: None,
+            peer_recipient_pn: None,
         }
     }
 
@@ -4069,7 +6098,9 @@ mod tests {
         let cache_key = "test_chat:msg123:sender456";
 
         // First increment should return 1
-        let count = client.increment_retry_count(cache_key).await;
+        let count = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
         assert_eq!(count, Some(1), "First retry should be count 1");
 
         // Verify it's stored in cache
@@ -4084,9 +6115,15 @@ mod tests {
         let cache_key = "test_chat:msg456:sender789";
 
         // Simulate multiple retries
-        let count1 = client.increment_retry_count(cache_key).await;
-        let count2 = client.increment_retry_count(cache_key).await;
-        let count3 = client.increment_retry_count(cache_key).await;
+        let count1 = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
+        let count2 = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
+        let count3 = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
 
         assert_eq!(count1, Some(1), "First retry should be 1");
         assert_eq!(count2, Some(2), "Second retry should be 2");
@@ -4101,12 +6138,16 @@ mod tests {
 
         // Exhaust all retries (MAX_DECRYPT_RETRIES = 5)
         for i in 1..=5 {
-            let count = client.increment_retry_count(cache_key).await;
+            let count = client
+                .increment_retry_count(cache_key, RetryReason::NoSession)
+                .await;
             assert_eq!(count, Some(i), "Retry {} should return {}", i, i);
         }
 
         // 6th attempt should return None (max reached)
-        let count_after_max = client.increment_retry_count(cache_key).await;
+        let count_after_max = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
         assert_eq!(
             count_after_max, None,
             "After max retries, should return None"
@@ -4126,14 +6167,26 @@ mod tests {
         let key3 = "chat2:msg1:sender2"; // Different chat and sender
 
         // Increment each independently
-        let _ = client.increment_retry_count(key1).await;
-        let _ = client.increment_retry_count(key1).await;
-        let _ = client.increment_retry_count(key1).await; // key1 = 3
+        let _ = client
+            .increment_retry_count(key1, RetryReason::NoSession)
+            .await;
+        let _ = client
+            .increment_retry_count(key1, RetryReason::NoSession)
+            .await;
+        let _ = client
+            .increment_retry_count(key1, RetryReason::NoSession)
+            .await; // key1 = 3
 
-        let _ = client.increment_retry_count(key2).await; // key2 = 1
+        let _ = client
+            .increment_retry_count(key2, RetryReason::NoSession)
+            .await; // key2 = 1
 
-        let _ = client.increment_retry_count(key3).await;
-        let _ = client.increment_retry_count(key3).await; // key3 = 2
+        let _ = client
+            .increment_retry_count(key3, RetryReason::NoSession)
+            .await;
+        let _ = client
+            .increment_retry_count(key3, RetryReason::NoSession)
+            .await; // key3 = 2
 
         // Verify each has independent counts
         assert_eq!(client.message_retry_counts.get(key1).await, Some(3));
@@ -4187,7 +6240,11 @@ mod tests {
         for _ in 0..10 {
             let client_clone = client.clone();
             let key = cache_key.to_string();
-            tasks.spawn(async move { client_clone.increment_retry_count(&key).await });
+            tasks.spawn(async move {
+                client_clone
+                    .increment_retry_count(&key, RetryReason::NoSession)
+                    .await
+            });
         }
 
         // Collect all results
@@ -4282,7 +6339,9 @@ mod tests {
         // We can verify entries are being stored and the cache is functional
         let cache_key = "expiry_test:msg:sender";
 
-        let count = client.increment_retry_count(cache_key).await;
+        let count = client
+            .increment_retry_count(cache_key, RetryReason::NoSession)
+            .await;
         assert_eq!(count, Some(1));
 
         // Entry should still exist immediately after
@@ -4402,12 +6461,20 @@ mod tests {
         let key2 = format!("{}:{}:{}", group, msg_id, sender2);
 
         // Increment for sender1 multiple times
-        client.increment_retry_count(&key1).await;
-        client.increment_retry_count(&key1).await;
-        client.increment_retry_count(&key1).await;
+        client
+            .increment_retry_count(&key1, RetryReason::NoSession)
+            .await;
+        client
+            .increment_retry_count(&key1, RetryReason::NoSession)
+            .await;
+        client
+            .increment_retry_count(&key1, RetryReason::NoSession)
+            .await;
 
         // Increment for sender2 once
-        client.increment_retry_count(&key2).await;
+        client
+            .increment_retry_count(&key2, RetryReason::NoSession)
+            .await;
 
         // Verify independent tracking
         assert_eq!(
@@ -4455,38 +6522,148 @@ mod tests {
     /// resend the entire message including SKDM.
     #[test]
     fn test_should_process_skmsg_logic_matches_wa_web() {
-        // Test cases: (chat_jid, session_empty, session_success, session_dupe, expected)
+        // Test cases: (chat_jid, session_empty, session_success, session_dupe, session_failed, expected)
         let test_cases = [
             // Status broadcast: same rules as all other chats (WA Web: canDecryptNext is uniform)
-            ("status@broadcast", false, false, false, false), // Fail: session failed → skip skmsg
-            ("status@broadcast", false, false, true, true),   // OK: duplicate
-            ("status@broadcast", false, true, false, true),   // OK: success
-            ("status@broadcast", true, false, false, true),   // OK: no session msgs
+            ("status@broadcast", false, false, false, false, false), // Fail: session failed → skip skmsg
+            ("status@broadcast", false, false, true, false, true),   // OK: duplicate
+            ("status@broadcast", false, true, false, false, true),   // OK: success
+            ("status@broadcast", false, true, false, true, false), // Fail: mixed success + failure
+            ("status@broadcast", true, false, false, false, true), // OK: no session msgs
             // Regular group
-            ("120363021033254949@g.us", false, false, false, false),
-            ("120363021033254949@g.us", false, false, true, true),
-            ("120363021033254949@g.us", false, true, false, true),
-            ("120363021033254949@g.us", true, false, false, true),
+            ("120363021033254949@g.us", false, false, false, false, false),
+            ("120363021033254949@g.us", false, false, true, false, true),
+            ("120363021033254949@g.us", false, true, false, false, true),
+            ("120363021033254949@g.us", false, true, false, true, false),
+            ("120363021033254949@g.us", true, false, false, false, true),
             // 1:1 chat
-            ("15551234567@s.whatsapp.net", false, false, false, false),
-            ("15551234567@s.whatsapp.net", true, false, false, true),
+            (
+                "15551234567@s.whatsapp.net",
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                "15551234567@s.whatsapp.net",
+                true,
+                false,
+                false,
+                false,
+                true,
+            ),
         ];
 
-        for (jid_str, session_empty, session_success, session_dupe, expected) in test_cases {
-            // Recreate the should_process_skmsg logic from handle_incoming_message
-            let should_process_skmsg = session_empty || session_success || session_dupe;
+        for (jid_str, session_empty, session_success, session_dupe, session_failed, expected) in
+            test_cases
+        {
+            let should_process_skmsg = should_process_skmsg_after_session(
+                session_empty,
+                SessionBatchOutcome {
+                    decrypted: session_success,
+                    duplicate: session_dupe,
+                    had_failure: session_failed,
+                    ..Default::default()
+                },
+            );
 
             assert_eq!(
                 should_process_skmsg,
                 expected,
-                "For chat {} with session_empty={}, session_success={}, session_dupe={}: \
+                "For chat {} with session_empty={}, session_success={}, session_dupe={}, session_failed={}: \
                  expected should_process_skmsg={}, got {}",
                 jid_str,
                 session_empty,
                 session_success,
                 session_dupe,
+                session_failed,
                 expected,
                 should_process_skmsg
+            );
+        }
+    }
+
+    #[test]
+    fn skdm_only_fallback_ack_decision_requires_clean_session_batch() {
+        let clean_skdm = SessionBatchOutcome {
+            decrypted: true,
+            skdm_only: true,
+            ..Default::default()
+        };
+        assert!(
+            should_ack_skdm_only_session_fallback(clean_skdm, true),
+            "a clean SKDM-only session batch needs the fallback ack"
+        );
+
+        let cases = [
+            (
+                SessionBatchOutcome {
+                    dispatched: true,
+                    ..clean_skdm
+                },
+                true,
+                "content dispatch already acked",
+            ),
+            (
+                SessionBatchOutcome {
+                    had_failure: true,
+                    ..clean_skdm
+                },
+                true,
+                "local session failure must block positive ack",
+            ),
+            (
+                SessionBatchOutcome {
+                    plaintext_failed: true,
+                    had_failure: true,
+                    ..clean_skdm
+                },
+                true,
+                "plaintext handler failure is not SKDM-only success",
+            ),
+            (
+                SessionBatchOutcome {
+                    undecryptable: true,
+                    had_failure: true,
+                    ..clean_skdm
+                },
+                true,
+                "failure event must not be paired with positive ack",
+            ),
+            (
+                SessionBatchOutcome {
+                    decrypted: false,
+                    ..clean_skdm
+                },
+                true,
+                "fallback only applies after Signal decrypt success",
+            ),
+            (
+                SessionBatchOutcome {
+                    skdm_only: false,
+                    ..clean_skdm
+                },
+                true,
+                "regular content must ack via dispatch",
+            ),
+            (
+                SessionBatchOutcome {
+                    duplicate: true,
+                    decrypted: false,
+                    skdm_only: false,
+                    ..Default::default()
+                },
+                true,
+                "duplicates use the duplicate branch",
+            ),
+            (clean_skdm, false, "msmsg work must own its response"),
+        ];
+
+        for (outcome, bot_payloads_empty, reason) in cases {
+            assert!(
+                !should_ack_skdm_only_session_fallback(outcome, bot_payloads_empty),
+                "{reason}: {outcome:?}"
             );
         }
     }
@@ -4616,7 +6793,6 @@ mod tests {
         let skdm = wa::message::SenderKeyDistributionMessage {
             group_id: Some("group".into()),
             axolotl_sender_key_distribution_message: Some(vec![1, 2, 3]),
-            ..Default::default()
         };
 
         // Empty message → false (no SKDM)
@@ -5247,6 +7423,55 @@ mod tests {
                 .cloned()
                 .collect()
         }
+
+        /// Count of `UndecryptableMessage` events marked as the "stub"
+        /// variant (`is_unavailable=true`, `UnavailableType::ViewOnce`) —
+        /// i.e. the branch that routes to PDO instead of falling through to
+        /// decrypt.
+        fn view_once_unavailable_count(&self) -> usize {
+            use crate::types::events::UnavailableType;
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &***e,
+                        Event::UndecryptableMessage(u)
+                            if u.is_unavailable
+                                && matches!(u.unavailable_type, UnavailableType::ViewOnce)
+                    )
+                })
+                .count()
+        }
+    }
+
+    fn build_unavailable_stanza(sender: &str, msg_id: &str, with_enc: bool) -> Arc<OwnedNodeRef> {
+        let t = wacore::time::now_secs().to_string();
+        let unavailable = NodeBuilder::new("unavailable")
+            .attr("type", "view_once")
+            .build();
+        let children = if with_enc {
+            vec![
+                unavailable,
+                NodeBuilder::new("enc")
+                    .attr("type", "msg")
+                    .attr("v", "2")
+                    .bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])
+                    .build(),
+            ]
+        } else {
+            vec![unavailable]
+        };
+        node_to_arc(
+            NodeBuilder::new("message")
+                .attr("from", sender)
+                .attr("id", msg_id)
+                .attr("t", &t)
+                .attr("type", "media")
+                .children(children)
+                .build(),
+        )
     }
 
     /// Locks the dispatch ordering: consumers must see the event before any
@@ -5375,7 +7600,7 @@ mod tests {
 
         assert_eq!(info.source.chat.server, wacore_binary::Server::Broadcast);
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
@@ -5392,7 +7617,7 @@ mod tests {
 
         assert_eq!(info.source.chat.server, wacore_binary::Server::Broadcast);
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
@@ -5408,7 +7633,7 @@ mod tests {
 
         assert_ne!(info.source.chat.server, wacore_binary::Server::Broadcast);
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
@@ -5424,7 +7649,7 @@ mod tests {
         info.source.is_from_me = true;
         let info = Arc::new(info);
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
@@ -5438,12 +7663,12 @@ mod tests {
 
         let mut info =
             create_test_message_info("85010891714716@lid", "ANCIENT_MSG_1", "85010891714716@lid");
-        info.timestamp = chrono::Utc::now() - chrono::Duration::days(30);
+        info.timestamp = wacore::time::now_utc() - chrono::Duration::days(30);
         let info = Arc::new(info);
 
         let cache_key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         assert!(
@@ -5464,17 +7689,61 @@ mod tests {
         let mut info =
             create_test_message_info("85010891714716@lid", "BOUNDARY_MSG_1", "85010891714716@lid");
         info.timestamp =
-            chrono::Utc::now() - chrono::Duration::days(14) - chrono::Duration::minutes(1);
+            wacore::time::now_utc() - chrono::Duration::days(14) - chrono::Duration::minutes(1);
         let info = Arc::new(info);
 
         let cache_key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
 
-        client.spawn_pdo_request_with_options(&info, true);
+        client.run_pdo_request(&info).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         assert!(
             client.pdo_pending_requests.get(&cache_key).await.is_none(),
             "14d+1m must be over the limit, matching WA Web's seconds-based check",
+        );
+    }
+
+    /// Server-trusted companions (Android-class `DeviceProps.PlatformType`)
+    /// receive `<unavailable>` as a marker alongside `<enc>`. The cipher
+    /// must still be decrypted — skipping would discard content the server
+    /// specifically released for this companion. Decrypt eventually fails
+    /// on the garbage payload, but via the normal decrypt-failure path,
+    /// not the `ViewOnce` short-circuit.
+    #[tokio::test]
+    async fn test_unavailable_with_enc_skips_unavailable_shortcut() {
+        let client = create_test_client_for_retry_with_id("unavailable_with_enc").await;
+        let recorder = Arc::new(EventRecorder::default());
+        client.register_handler(recorder.clone());
+
+        let node =
+            build_unavailable_stanza("5511777776666@s.whatsapp.net", "UNAV_WITH_ENC_1", true);
+        client.clone().handle_incoming_message(node).await;
+
+        assert_eq!(
+            recorder.view_once_unavailable_count(),
+            0,
+            "<unavailable> alongside <enc> must fall through to decrypt, \
+             not emit a ViewOnce UndecryptableMessage",
+        );
+    }
+
+    /// Untrusted companions (web-class `PlatformType`) get the bare stub —
+    /// `<unavailable>` without `<enc>`. That path must still emit a
+    /// `ViewOnce` `UndecryptableMessage` so consumers surface the failure
+    /// while the phone relays via PDO.
+    #[tokio::test]
+    async fn test_unavailable_without_enc_dispatches_view_once_event() {
+        let client = create_test_client_for_retry_with_id("unavailable_stub").await;
+        let recorder = Arc::new(EventRecorder::default());
+        client.register_handler(recorder.clone());
+
+        let node = build_unavailable_stanza("5511777776666@s.whatsapp.net", "UNAV_STUB_1", false);
+        client.clone().handle_incoming_message(node).await;
+
+        assert_eq!(
+            recorder.view_once_unavailable_count(),
+            1,
+            "bare <unavailable> stub must dispatch exactly one ViewOnce UndecryptableMessage",
         );
     }
 
@@ -5503,5 +7772,4023 @@ mod tests {
             &event.unavailable_type,
             &event.decrypt_fail_mode,
         );
+    }
+
+    /// Seed `device.pn` so `send_nack` clears its `get_pn()` guard.
+    async fn seed_test_pn(client: &Arc<Client>) {
+        use crate::store::commands::DeviceCommand;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(
+                "5511000000001:0@s.whatsapp.net"
+                    .parse()
+                    .expect("test PN should parse"),
+            )))
+            .await;
+    }
+
+    /// Build a Client wired to a CapturingMockTransport + a noise socket so
+    /// `send_node` reaches the wire. Returns the transport so the caller can
+    /// inspect captured frames.
+    async fn capturing_client(
+        test_id: &str,
+    ) -> (
+        Arc<Client>,
+        Arc<crate::transport::mock::CapturingMockTransport>,
+    ) {
+        use crate::socket::NoiseSocket;
+        use crate::store::SqliteStore;
+        use crate::store::persistence_manager::PersistenceManager;
+        use crate::transport::mock::CapturingMockTransportFactory;
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        use wacore::handshake::NoiseCipher;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique_id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let db_name = format!(
+            "file:memdb_capt_{}_{}_{}?mode=memory&cache=shared",
+            test_id,
+            unique_id,
+            std::process::id()
+        );
+
+        let backend = Arc::new(
+            SqliteStore::new(&db_name)
+                .await
+                .expect("test backend should initialize"),
+        );
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        let factory = CapturingMockTransportFactory::new();
+        let transport = factory.transport();
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(factory),
+            Arc::new(MockHttpClient),
+            None,
+        )
+        .await;
+
+        let key = [0u8; 32];
+        let write_key = NoiseCipher::new(&key).expect("32-byte key");
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        let noise_socket = NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            transport.clone() as Arc<dyn crate::transport::Transport>,
+            write_key,
+            read_key,
+        );
+        // send_node only needs noise_socket Some; is_connected is read by
+        // other layers but not on this path.
+        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        seed_test_pn(&client).await;
+        (client, transport)
+    }
+
+    /// Regression: a malformed pkmsg used to fall through silently. Now
+    /// it dispatches the consumer event AND emits a nack on the wire so
+    /// the server stops retransmitting.
+    #[tokio::test]
+    async fn pkmsg_parse_error_dispatches_parsing_error_nack() {
+        use crate::types::events::DecryptFailMode;
+        use wacore::message_processing::EncType;
+
+        let (client, transport) = capturing_client("pkmsg_parse_nack").await;
+        let info = Arc::new(create_test_message_info(
+            "5511999998888@s.whatsapp.net",
+            "REGRESSION_PKMSG_PARSE",
+            "5511777776666@s.whatsapp.net",
+        ));
+        let sender_jid: Jid = info.source.sender.clone();
+
+        // 1-byte ciphertext is a guaranteed parse failure.
+        let bad_payload = EncPayload {
+            ciphertext: bytes::Bytes::from_static(&[0xFF]),
+            enc_type: EncType::PreKeyMessage,
+            padding_version: 2,
+        };
+
+        let outcome = client
+            .process_session_enc_batch(&[bad_payload], &info, &sender_jid, DecryptFailMode::Show)
+            .await;
+
+        assert!(!outcome.decrypted);
+        assert!(!outcome.duplicate);
+        assert!(outcome.undecryptable);
+        assert!(outcome.had_failure);
+
+        // spawn_nack is detached; give it a tick to flush through the
+        // noise_socket sender_task to our CapturingMockTransport.
+        for _ in 0..40 {
+            if !transport.sent().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let sent = transport.sent();
+        assert!(
+            !sent.is_empty(),
+            "spawn_nack must produce at least one outbound frame on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_message_parse_error_dispatches_parsing_error_nack() {
+        use crate::types::events::DecryptFailMode;
+        use wacore::message_processing::EncType;
+
+        let (client, transport) = capturing_client("sig_parse_nack").await;
+        let info = Arc::new(create_test_message_info(
+            "5511999998888@s.whatsapp.net",
+            "REGRESSION_SIG_PARSE",
+            "5511777776666@s.whatsapp.net",
+        ));
+        let sender_jid: Jid = info.source.sender.clone();
+
+        let bad_payload = EncPayload {
+            ciphertext: bytes::Bytes::from_static(&[0xFF]),
+            enc_type: EncType::Message,
+            padding_version: 2,
+        };
+
+        let outcome = client
+            .process_session_enc_batch(&[bad_payload], &info, &sender_jid, DecryptFailMode::Show)
+            .await;
+
+        assert!(outcome.undecryptable);
+        assert!(outcome.had_failure);
+
+        for _ in 0..40 {
+            if !transport.sent().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !transport.sent().is_empty(),
+            "spawn_nack must produce at least one outbound frame on the wire"
+        );
+    }
+
+    #[test]
+    fn test_decrypt_fail_log_level_gated_on_hide() {
+        use crate::types::events::DecryptFailMode;
+        assert_eq!(
+            decrypt_fail_log_level(DecryptFailMode::Hide),
+            log::Level::Debug
+        );
+        assert_eq!(
+            decrypt_fail_log_level(DecryptFailMode::Show),
+            log::Level::Warn
+        );
+    }
+
+    /// Decrypt one captured noise frame (zero-key, counter-based, empty AAD) to
+    /// its marshalled node bytes; strips the 3-byte frame header.
+    fn decode_frame(index: usize, frame: &[u8]) -> Option<Vec<u8>> {
+        use wacore::handshake::NoiseCipher;
+        if frame.len() <= 3 {
+            return None;
+        }
+        let cipher = NoiseCipher::new(&[0u8; 32]).expect("32-byte key");
+        let mut buf = frame[3..].to_vec();
+        cipher
+            .decrypt_in_place_with_counter(index as u32, &mut buf)
+            .ok()?;
+        (!buf.is_empty()).then_some(buf)
+    }
+
+    /// First `<ack class="message">` on the wire as `(to, recipient)`.
+    fn find_message_ack(frames: &[bytes::Bytes]) -> Option<(String, Option<String>)> {
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "ack"
+                && node
+                    .get_attr("class")
+                    .is_some_and(|v| v.as_str() == "message")
+                && node.get_attr("error").is_none()
+                && let Some(to) = node.get_attr("to")
+            {
+                let recipient = node.get_attr("recipient").map(|v| v.as_str().to_string());
+                return Some((to.as_str().to_string(), recipient));
+            }
+        }
+        None
+    }
+
+    /// First `<receipt>` on the wire for `id` as `(to, type, recipient)`.
+    fn find_receipt(
+        frames: &[bytes::Bytes],
+        id: &str,
+    ) -> Option<(String, Option<String>, Option<String>)> {
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "receipt"
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && let Some(to) = node.get_attr("to")
+            {
+                let typ = node.get_attr("type").map(|v| v.as_str().to_string());
+                let recipient = node.get_attr("recipient").map(|v| v.as_str().to_string());
+                return Some((to.as_str().to_string(), typ, recipient));
+            }
+        }
+        None
+    }
+
+    #[derive(Debug)]
+    struct SentReceipt {
+        to: String,
+        typ: Option<String>,
+        recipient: Option<String>,
+        participant: Option<String>,
+        context: Option<String>,
+    }
+
+    fn find_receipt_details(frames: &[bytes::Bytes], id: &str) -> Option<SentReceipt> {
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "receipt"
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && let Some(to) = node.get_attr("to")
+            {
+                return Some(SentReceipt {
+                    to: to.as_str().to_string(),
+                    typ: node.get_attr("type").map(|v| v.as_str().to_string()),
+                    recipient: node.get_attr("recipient").map(|v| v.as_str().to_string()),
+                    participant: node.get_attr("participant").map(|v| v.as_str().to_string()),
+                    context: node.get_attr("context").map(|v| v.as_str().to_string()),
+                });
+            }
+        }
+        None
+    }
+
+    #[derive(Debug)]
+    struct SentMessageAck {
+        to: String,
+        participant: Option<String>,
+        recipient: Option<String>,
+    }
+
+    fn find_message_ack_for(frames: &[bytes::Bytes], id: &str) -> Option<SentMessageAck> {
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "ack"
+                && node
+                    .get_attr("class")
+                    .is_some_and(|v| v.as_str() == "message")
+                && node.get_attr("error").is_none()
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && let Some(to) = node.get_attr("to")
+            {
+                return Some(SentMessageAck {
+                    to: to.as_str().to_string(),
+                    participant: node.get_attr("participant").map(|v| v.as_str().to_string()),
+                    recipient: node.get_attr("recipient").map(|v| v.as_str().to_string()),
+                });
+            }
+        }
+        None
+    }
+
+    /// Count delivery `<receipt>` (anything but type="retry") on the wire for `id`.
+    fn delivery_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize {
+        let mut count = 0;
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "receipt"
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && node
+                    .get_attr("type")
+                    .as_ref()
+                    .map(|v| v.as_str())
+                    .as_deref()
+                    != Some("retry")
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn message_acks_for(frames: &[bytes::Bytes], id: &str) -> usize {
+        let mut count = 0;
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "ack"
+                && node
+                    .get_attr("class")
+                    .is_some_and(|v| v.as_str() == "message")
+                && node.get_attr("error").is_none()
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn sender_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize {
+        let mut count = 0;
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "receipt"
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && node
+                    .get_attr("type")
+                    .is_some_and(|v| v.as_str() == "sender")
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn confirmations_for(frames: &[bytes::Bytes], id: &str) -> usize {
+        delivery_receipts_for(frames, id) + message_acks_for(frames, id)
+    }
+
+    async fn wait_for_confirmations(
+        transport: &crate::transport::mock::CapturingMockTransport,
+        id: &str,
+        expected: usize,
+    ) -> usize {
+        let mut count = 0;
+        for _ in 0..80 {
+            count = confirmations_for(&transport.sent(), id);
+            if count >= expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        count
+    }
+
+    async fn assert_exactly_one_confirmation(
+        transport: &crate::transport::mock::CapturingMockTransport,
+        id: &str,
+    ) {
+        let count = wait_for_confirmations(transport, id, 1).await;
+        assert_eq!(count, 1, "message {id} must be confirmed exactly once");
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            assert_eq!(
+                confirmations_for(&transport.sent(), id),
+                1,
+                "message {id} must not get a late second confirmation"
+            );
+        }
+    }
+
+    /// A stanza that fails to decrypt must emit a transport `<ack class="message">`
+    /// (else the server replays it on every reconnect forever), addressed to the
+    /// original `from` echoing `recipient`. Uses `Hide` (the production reactions
+    /// carried `decrypt-fail="hide"`) to also guard that hide does not suppress
+    /// the ack. BadMac so the retry carries no keys (no device account needed).
+    #[tokio::test]
+    async fn decrypt_failure_emits_transport_ack() {
+        let (client, transport) = capturing_client("decrypt_fail_ack").await;
+
+        let sender: Jid = "236395184570386@lid".parse().expect("sender JID");
+        let recipient: Jid = "156535032389744@lid".parse().expect("recipient JID");
+        let info = Arc::new(MessageInfo {
+            id: "AC055553E56A2C12DE592DAD6353C477".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: sender.clone(),
+                chat: recipient.clone(),
+                recipient: Some(recipient.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::BadMac,
+                crate::types::events::DecryptFailMode::Hide,
+            )
+            .await;
+
+        // retry + ack are detached spawns; poll the wire until the ack appears.
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, recipient_attr) = found.expect(
+            "decrypt failure must emit a transport <ack class=message> \
+             (else the server redelivers the stanza forever)",
+        );
+        assert_eq!(
+            to, "236395184570386@lid",
+            "ack `to` must be the original `from` (own LID), not the chat"
+        );
+        assert_eq!(
+            recipient_attr.as_deref(),
+            Some("156535032389744@lid"),
+            "ack must echo `recipient` for own-account fan-out"
+        );
+    }
+
+    /// Regression for the bot self-fanout loop on the DECRYPT-FAILURE path
+    /// (BadMac/NoSession): a self-fanout we cannot decrypt must be cleared with
+    /// a `<receipt type="sender">`, NOT a bare transport `<ack>` (ignored by the
+    /// server) nor a retry-to-self (futile). Once stuck in the loop the local
+    /// counter advances past the duplicate state, so this BadMac path is what
+    /// actually fires for an already-affected account.
+    #[tokio::test]
+    async fn self_fanout_decrypt_failure_acked_via_sender_receipt() {
+        let (client, transport) = capturing_client("self_fanout_badmac").await;
+        let info = Arc::new(MessageInfo {
+            id: "AC00000000000000000000000000BEEF".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "100000000000001@lid".parse().expect("sender"),
+                chat: "200000000000002@bot".parse().expect("chat"),
+                recipient: Some("200000000000002@bot".parse().expect("recipient")),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::BadMac,
+                crate::types::events::DecryptFailMode::Hide,
+            )
+            .await;
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(r) = find_receipt(&transport.sent(), "AC00000000000000000000000000BEEF") {
+                found = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, typ, recipient) = found
+            .expect("self-fanout decrypt failure must emit a sender <receipt> to drain the queue");
+        assert_eq!(to, "100000000000001@lid");
+        assert_eq!(typ.as_deref(), Some("sender"));
+        assert_eq!(recipient.as_deref(), Some("200000000000002@bot"));
+
+        let sent = transport.sent();
+        assert!(
+            find_message_ack(&sent).is_none(),
+            "must not emit the bare <ack> the server ignores"
+        );
+        let mut saw_retry = false;
+        for (i, frame) in sent.iter().enumerate() {
+            if let Some(buf) = decode_frame(i, frame)
+                && let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..])
+                && node.tag.as_ref() == "receipt"
+                && node.get_attr("type").is_some_and(|v| {
+                    v.as_str() == crate::types::presence::ReceiptType::Retry.as_wire_str()
+                })
+            {
+                saw_retry = true;
+            }
+        }
+        assert!(
+            !saw_retry,
+            "must not retry our own undecryptable fanout to ourselves"
+        );
+    }
+
+    /// Consistency with the success/duplicate path: a bot-authored own DM in a
+    /// non-bot chat (sender on `@bot`, user chat) must NOT take the sender
+    /// receipt on the decrypt-failure path either; it stays on the
+    /// bot-invoke-response bare-ack path (WA Web `!chat.isBot() &&
+    /// author.isBot()`), matching ack_received_message and the locked
+    /// own_bot_author_dm_acks_not_sender_receipt test.
+    #[tokio::test]
+    async fn bot_author_self_fanout_decrypt_failure_not_sender_receipt() {
+        let (client, transport) = capturing_client("bot_author_badmac").await;
+        let info = Arc::new(MessageInfo {
+            id: "OWNBOTFAIL1".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "100000000000002@bot".parse().expect("sender"),
+                chat: "300000000000003@lid".parse().expect("chat"),
+                recipient: Some("300000000000003@lid".parse().expect("recipient")),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::BadMac,
+                crate::types::events::DecryptFailMode::Hide,
+            )
+            .await;
+
+        // Positive: the message IS cleared, via the bot-invoke-response bare
+        // <ack class="message"> (the retry-to-self is bot-skipped, so the
+        // transport ack follows), proving we took the ack path, not a no-op.
+        let mut found_ack = false;
+        for _ in 0..80 {
+            if find_message_ack(&transport.sent()).is_some() {
+                found_ack = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            found_ack,
+            "bot-authored own DM must still be transport-acked with a bare <ack class=message>"
+        );
+
+        // Negative settle: it must NEVER produce a sender receipt on the failure
+        // path (that would diverge from WA Web's bot-invoke ack and contradict
+        // the success-path ordering).
+        for _ in 0..5 {
+            assert!(
+                find_receipt(&transport.sent(), "OWNBOTFAIL1").is_none(),
+                "bot-authored own DM must not be cleared with a sender <receipt> on decrypt failure"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// If the resend request fails to send, the stanza must NOT be acked, so the
+    /// server keeps it queued for another try. Here NoSession needs keys, which
+    /// need a device account this harness lacks, so send_retry_receipt errors.
+    #[tokio::test]
+    async fn decrypt_failure_does_not_ack_when_retry_send_fails() {
+        let (client, transport) = capturing_client("retry_fail_no_ack").await;
+        let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
+        let info = Arc::new(MessageInfo {
+            id: "NOACK1".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: sender.clone(),
+                chat: sender.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::NoSession,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            find_message_ack(&transport.sent()).is_none(),
+            "must not ack when the resend request failed to send"
+        );
+    }
+
+    /// The retry receipt must be sent before the transport ack (one ordered
+    /// flushed task), so a disconnect mid-flush can never clear the stanza from
+    /// the offline queue without the sender having received a resend request.
+    #[tokio::test]
+    async fn decrypt_failure_sends_retry_before_ack() {
+        let (client, transport) = capturing_client("retry_before_ack").await;
+        let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
+        let info = Arc::new(MessageInfo {
+            id: "RBA1".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: sender.clone(),
+                chat: sender.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        // BadMac (not NoSession) so the retry receipt carries no keys and needs
+        // no device account in this harness.
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::BadMac,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+
+        let find = |tag: &str, retry: bool| -> Option<usize> {
+            let frames = transport.sent();
+            for (i, frame) in frames.iter().enumerate() {
+                let Some(buf) = decode_frame(i, frame) else {
+                    continue;
+                };
+                let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                    continue;
+                };
+                let is_retry = node.get_attr("type").is_some_and(|v| v.as_str() == "retry");
+                if node.tag.as_ref() == tag && is_retry == retry {
+                    return Some(i);
+                }
+            }
+            None
+        };
+
+        let mut retry_idx = None;
+        let mut ack_idx = None;
+        for _ in 0..80 {
+            retry_idx = find("receipt", true);
+            ack_idx = find("ack", false);
+            if retry_idx.is_some() && ack_idx.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let retry_idx = retry_idx.expect("retry receipt must be sent");
+        let ack_idx = ack_idx.expect("transport ack must be sent");
+        assert!(
+            retry_idx < ack_idx,
+            "retry receipt (frame {retry_idx}) must be sent before the ack (frame {ack_idx})"
+        );
+    }
+
+    /// status@broadcast is already acked by the `should_ack` gate post-dispatch,
+    /// so the decrypt-failure path must NOT emit a second transport ack
+    /// (whatsmeow/WA Web send exactly one per message). The retry receipt still
+    /// goes out.
+    #[tokio::test]
+    async fn status_broadcast_decrypt_failure_acks_to_chat() {
+        let (client, transport) = capturing_client("status_fail_ack").await;
+        let info = Arc::new(MessageInfo {
+            id: "STATUSMSGID".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "236395184570386@lid".parse().expect("sender"),
+                chat: "status@broadcast".parse().expect("status chat"),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        client
+            .handle_decrypt_failure(
+                &info,
+                RetryReason::BadMac,
+                crate::types::events::DecryptFailMode::Show,
+            )
+            .await;
+
+        // status failures are acked from the flushed task (not just the detached
+        // should_ack gate), so the ack survives a disconnect mid-flush.
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, _) = found.expect("status failure must emit a flushed transport ack");
+        assert_eq!(
+            to, "status@broadcast",
+            "status ack `to` must be the status chat"
+        );
+    }
+
+    /// Run a single session ciphertext through the full classify->process path.
+    async fn process_session_ct(
+        client: &Arc<Client>,
+        sender: &Jid,
+        id: &str,
+        ct: &wacore::libsignal::protocol::CiphertextMessage,
+    ) {
+        use wacore::libsignal::protocol::CiphertextMessage;
+        let (enc_type, bytes) = match ct {
+            CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
+            CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
+            _ => panic!("unexpected ciphertext type"),
+        };
+        let enc = NodeBuilder::new("enc")
+            .attr("type", enc_type)
+            .bytes(bytes)
+            .build();
+        let enc_ref = enc.as_node_ref();
+        let payload = EncPayload::from_node_ref(&enc_ref).unwrap();
+        let info = Arc::new(MessageInfo {
+            id: id.to_string(),
+            source: crate::types::message::MessageSource {
+                sender: sender.clone(),
+                chat: sender.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client
+            .clone()
+            .process_classified_message(ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads: vec![payload],
+                group_payloads: vec![],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+            })
+            .await;
+    }
+
+    fn enc_payload_from_ciphertext(ct: &CiphertextMessage) -> EncPayload {
+        let (enc_type, bytes) = match ct {
+            CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
+            CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
+            _ => panic!("unexpected ciphertext type"),
+        };
+        let enc = NodeBuilder::new("enc")
+            .attr("type", enc_type)
+            .bytes(bytes)
+            .build();
+        EncPayload::from_node_ref(&enc.as_node_ref()).expect("ciphertext payload")
+    }
+
+    fn skmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
+        let enc = NodeBuilder::new("enc")
+            .attr("type", "skmsg")
+            .bytes(bytes)
+            .build();
+        EncPayload::from_node_ref(&enc.as_node_ref()).expect("skmsg payload")
+    }
+
+    fn msmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
+        let enc = NodeBuilder::new("enc")
+            .attr("type", "msmsg")
+            .bytes(bytes)
+            .build();
+        EncPayload::from_node_ref(&enc.as_node_ref()).expect("msmsg payload")
+    }
+
+    fn group_message_info(
+        id: &str,
+        group: &Jid,
+        sender: &Jid,
+        is_from_me: bool,
+    ) -> Arc<MessageInfo> {
+        Arc::new(MessageInfo {
+            id: id.to_string(),
+            source: crate::types::message::MessageSource {
+                sender: sender.clone(),
+                chat: group.clone(),
+                is_from_me,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    async fn process_group_classified(
+        client: &Arc<Client>,
+        info: Arc<MessageInfo>,
+        sender: &Jid,
+        session_payload: EncPayload,
+        group_payloads: Vec<EncPayload>,
+    ) {
+        process_group_classified_with_sessions(
+            client,
+            info,
+            sender,
+            vec![session_payload],
+            group_payloads,
+        )
+        .await;
+    }
+
+    async fn process_group_classified_with_sessions(
+        client: &Arc<Client>,
+        info: Arc<MessageInfo>,
+        sender: &Jid,
+        session_payloads: Vec<EncPayload>,
+        group_payloads: Vec<EncPayload>,
+    ) {
+        process_group_classified_with_payloads(
+            client,
+            info,
+            sender,
+            session_payloads,
+            group_payloads,
+            vec![],
+        )
+        .await;
+    }
+
+    async fn process_group_classified_with_payloads(
+        client: &Arc<Client>,
+        info: Arc<MessageInfo>,
+        sender: &Jid,
+        session_payloads: Vec<EncPayload>,
+        group_payloads: Vec<EncPayload>,
+        bot_payloads: Vec<EncPayload>,
+    ) {
+        client
+            .clone()
+            .process_classified_message(ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads,
+                group_payloads,
+                bot_payloads,
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+            })
+            .await;
+    }
+
+    fn message_events_for_id(rx: &async_channel::Receiver<Arc<Event>>, id: &str) -> (usize, usize) {
+        let mut count = 0;
+        let mut visible_content = 0;
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Message(msg, info) = event.as_ref()
+                && info.id == id
+            {
+                count += 1;
+                if msg.conversation.is_some() {
+                    visible_content += 1;
+                }
+            }
+        }
+        (count, visible_content)
+    }
+
+    fn message_texts_for_id(rx: &async_channel::Receiver<Arc<Event>>, id: &str) -> Vec<String> {
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Message(msg, info) = event.as_ref()
+                && info.id == id
+                && let Some(text) = &msg.conversation
+            {
+                texts.push(text.clone());
+            }
+        }
+        texts
+    }
+
+    #[tokio::test]
+    async fn skdm_only_group_session_acknowledged_once_without_message_event() {
+        use wacore::messages::MessageUtils;
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("skdm_only_group_ack").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450525@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575443@g.us".parse().expect("group");
+        let skdm = alice.create_group_skdm(&group).await;
+        let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: buffa::MessageField::some(skdm),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
+        let id = "SKDM_ONLY_SESSION";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![],
+        )
+        .await;
+
+        assert_exactly_one_confirmation(&transport, id).await;
+        assert_eq!(
+            delivery_receipts_for(&transport.sent(), id),
+            1,
+            "incoming group SKDM-only session message should drain via delivery receipt"
+        );
+        let sent = transport.sent();
+        let receipt = find_receipt_details(&sent, id).expect("delivery receipt");
+        let sender_str = alice.jid.to_string();
+        assert_eq!(receipt.to, group.to_string());
+        assert_eq!(receipt.participant.as_deref(), Some(sender_str.as_str()));
+        assert_eq!(receipt.recipient, None);
+        assert_ne!(
+            receipt.typ.as_deref(),
+            Some("sender"),
+            "incoming group SKDM-only must not be cleared as a sender receipt"
+        );
+        assert_eq!(
+            message_acks_for(&sent, id),
+            0,
+            "incoming group SKDM-only must not also emit a transport ack"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            message_events_for_id(&rx, id),
+            (0, 0),
+            "SKDM-only messages must not surface Event::Message"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_plaintext_decode_error_is_not_acked_as_skdm_only() {
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("bad_plaintext_no_skdm_ack").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+        let recorder = Arc::new(EventRecorder::default());
+        client.register_handler(recorder.clone());
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450527@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575446@g.us".parse().expect("group");
+        let invalid_padded_plaintext = vec![0xff, 0x01];
+        let session_ct = alice.encrypt(&bob_addr, &invalid_padded_plaintext).await;
+        let id = "BAD_SESSION_PLAINTEXT";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![],
+        )
+        .await;
+
+        for _ in 0..5 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            assert_eq!(
+                confirmations_for(&transport.sent(), id),
+                0,
+                "invalid plaintext must not be counted as a successful SKDM-only ack"
+            );
+        }
+        assert_eq!(
+            recorder.undecryptable().len(),
+            1,
+            "plaintext handler failures must stay on the undecryptable path"
+        );
+        assert_eq!(
+            message_events_for_id(&rx, id),
+            (0, 0),
+            "invalid plaintext must not surface Event::Message"
+        );
+        let mut nack_code = None;
+        for _ in 0..80 {
+            nack_code = find_message_nack_error(&transport.sent(), id);
+            if nack_code.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            nack_code,
+            Some(491),
+            "invalid decrypted protobuf must be drained with InvalidProtobuf nack"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_skdm_and_bad_plaintext_session_is_nacked_not_positive_acked() {
+        use wacore::messages::MessageUtils;
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("mixed_skdm_bad_plaintext").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+        let recorder = Arc::new(EventRecorder::default());
+        client.register_handler(recorder.clone());
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450531@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575449@g.us".parse().expect("group");
+        let skdm = alice.create_group_skdm(&group).await;
+        let skdm_plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: buffa::MessageField::some(skdm),
+            ..Default::default()
+        });
+        let skdm_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
+        let bad_ct = alice.encrypt(&bob_addr, &[0xff, 0x01]).await;
+        let id = "SKDM_WITH_BAD_SESSION";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified_with_sessions(
+            &client,
+            info,
+            &alice.jid,
+            vec![
+                enc_payload_from_ciphertext(&skdm_ct),
+                enc_payload_from_ciphertext(&bad_ct),
+            ],
+            vec![],
+        )
+        .await;
+
+        let mut nack_code = None;
+        for _ in 0..80 {
+            nack_code = find_message_nack_error(&transport.sent(), id);
+            if nack_code.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(nack_code, Some(491));
+        assert_eq!(
+            confirmations_for(&transport.sent(), id),
+            0,
+            "SKDM-only fallback must not positive-ack a mixed malformed session batch"
+        );
+        assert_eq!(
+            recorder.undecryptable().len(),
+            1,
+            "the malformed sibling must still surface as undecryptable"
+        );
+        assert_eq!(
+            message_events_for_id(&rx, id),
+            (0, 0),
+            "mixed SKDM and bad plaintext must not dispatch user content"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_session_plaintext_skips_skmsg_sibling_after_nack() {
+        use wacore::messages::MessageUtils;
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("bad_session_skips_skmsg").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+        let recorder = Arc::new(EventRecorder::default());
+        client.register_handler(recorder.clone());
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450532@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575450@g.us".parse().expect("group");
+        let skdm = alice.create_group_skdm(&group).await;
+        let skdm_plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: buffa::MessageField::some(skdm),
+            ..Default::default()
+        });
+        let skdm_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
+        let bad_ct = alice.encrypt(&bob_addr, &[0xff, 0x01]).await;
+        let content_plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            conversation: Some("must not dispatch".to_string()),
+            ..Default::default()
+        });
+        let skmsg = alice
+            .encrypt_group_message(&group, &content_plaintext)
+            .await;
+        let id = "BAD_SESSION_WITH_SKMSG";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified_with_sessions(
+            &client,
+            info,
+            &alice.jid,
+            vec![
+                enc_payload_from_ciphertext(&skdm_ct),
+                enc_payload_from_ciphertext(&bad_ct),
+            ],
+            vec![skmsg_payload_from_bytes(skmsg)],
+        )
+        .await;
+
+        let mut nack_code = None;
+        for _ in 0..80 {
+            nack_code = find_message_nack_error(&transport.sent(), id);
+            if nack_code.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(nack_code, Some(491));
+        assert_eq!(
+            confirmations_for(&transport.sent(), id),
+            0,
+            "skmsg must not ack after a session InvalidProtobuf nack"
+        );
+        assert_eq!(
+            recorder.undecryptable().len(),
+            1,
+            "session plaintext failure should own the only user-visible failure"
+        );
+        assert_eq!(
+            message_texts_for_id(&rx, id),
+            Vec::<String>::new(),
+            "skmsg content must be skipped after session plaintext failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn skdm_only_session_with_msmsg_waits_for_bot_payload_response() {
+        use wacore::messages::MessageUtils;
+
+        let (client, transport) = capturing_client("skdm_msmsg_no_fallback_ack").await;
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450533@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575451@g.us".parse().expect("group");
+        let skdm = alice.create_group_skdm(&group).await;
+        let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: buffa::MessageField::some(skdm),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
+        let id = "SKDM_WITH_MSMSG";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified_with_payloads(
+            &client,
+            info,
+            &alice.jid,
+            vec![enc_payload_from_ciphertext(&session_ct)],
+            vec![],
+            vec![msmsg_payload_from_bytes(vec![0xff])],
+        )
+        .await;
+
+        let mut nack_code = None;
+        for _ in 0..80 {
+            nack_code = find_message_nack_error(&transport.sent(), id);
+            if nack_code.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(nack_code, Some(487));
+        assert_eq!(
+            confirmations_for(&transport.sent(), id),
+            0,
+            "SKDM-only fallback must not pre-ack a stanza with msmsg work"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_content_group_message_acknowledged_once_without_fallback() {
+        use wacore::messages::MessageUtils;
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("session_content_group_ack").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450528@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575447@g.us".parse().expect("group");
+        let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            conversation: Some("session content".to_string()),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
+        let id = "SESSION_CONTENT_GROUP";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![],
+        )
+        .await;
+
+        assert_exactly_one_confirmation(&transport, id).await;
+        let sent = transport.sent();
+        assert_eq!(
+            delivery_receipts_for(&sent, id),
+            1,
+            "session content dispatch should own the only delivery receipt"
+        );
+        assert_eq!(
+            message_acks_for(&sent, id),
+            0,
+            "normal session content must not also use the SKDM-only transport ack"
+        );
+        assert_eq!(
+            message_texts_for_id(&rx, id),
+            vec!["session content".to_string()],
+            "normal session content must dispatch exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_skdm_only_session_uses_one_status_receipt() {
+        use wacore::messages::MessageUtils;
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("status_skdm_only_ack").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450529@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let status: Jid = "status@broadcast".parse().expect("status");
+        let skdm = alice.create_group_skdm(&status).await;
+        let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: buffa::MessageField::some(skdm),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
+        let id = "STATUS_SKDM_ONLY";
+        let info = group_message_info(id, &status, &alice.jid, false);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![],
+        )
+        .await;
+
+        assert_exactly_one_confirmation(&transport, id).await;
+        let sent = transport.sent();
+        assert_eq!(
+            delivery_receipts_for(&sent, id),
+            1,
+            "status SKDM-only success must still send the WA Web status receipt"
+        );
+        assert_eq!(
+            message_acks_for(&sent, id),
+            0,
+            "status success path should not use a transport ack"
+        );
+        let receipt = find_receipt_details(&sent, id).expect("status delivery receipt");
+        let sender_str = alice.jid.to_string();
+        assert_eq!(receipt.to, status.to_string());
+        assert_eq!(receipt.participant.as_deref(), Some(sender_str.as_str()));
+        assert_eq!(receipt.context.as_deref(), Some("status"));
+        assert_eq!(
+            message_events_for_id(&rx, id),
+            (0, 0),
+            "status SKDM-only messages must not surface Event::Message"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_message_ack_is_not_counted_as_positive_confirmation() {
+        let (client, transport) = capturing_client("error_ack_not_positive").await;
+        let id = "ERROR_ACK_NOT_POSITIVE";
+        let info = Arc::new(MessageInfo {
+            id: id.to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "146824178450530@lid".parse().expect("sender"),
+                chat: "120363408782575448@g.us".parse().expect("group"),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        client.spawn_nack(
+            &info,
+            wacore::protocol::nack::NackReason::ParsingError,
+            None,
+        );
+
+        let mut nack_code = None;
+        for _ in 0..80 {
+            nack_code = find_message_nack_error(&transport.sent(), id);
+            if nack_code.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(nack_code, Some(487));
+
+        let sent = transport.sent();
+        assert_eq!(
+            message_acks_for(&sent, id),
+            0,
+            "nacks carry class=message but must not count as positive transport acks"
+        );
+        assert_eq!(
+            confirmations_for(&sent, id),
+            0,
+            "nacks must not satisfy exactly-one positive confirmation assertions"
+        );
+        assert!(
+            find_message_ack_for(&sent, id).is_none(),
+            "error acks must be excluded from positive ack lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn skdm_session_with_skmsg_sibling_acknowledged_once() {
+        use wacore::messages::MessageUtils;
+        use wacore::types::events::ChannelEventHandler;
+
+        let (client, transport) = capturing_client("skdm_plus_skmsg_ack").await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("146824178450526@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575444@g.us".parse().expect("group");
+        let skdm = alice.create_group_skdm(&group).await;
+        let skdm_plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: buffa::MessageField::some(skdm),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
+
+        let content_plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            conversation: Some("group content".to_string()),
+            ..Default::default()
+        });
+        let skmsg = alice
+            .encrypt_group_message(&group, &content_plaintext)
+            .await;
+        let id = "SKDM_WITH_SKMSG";
+        let info = group_message_info(id, &group, &alice.jid, false);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![skmsg_payload_from_bytes(skmsg)],
+        )
+        .await;
+
+        assert_exactly_one_confirmation(&transport, id).await;
+        assert_eq!(
+            delivery_receipts_for(&transport.sent(), id),
+            1,
+            "the skmsg content dispatch should own the only receipt"
+        );
+        let sent = transport.sent();
+        let receipt = find_receipt_details(&sent, id).expect("delivery receipt");
+        let sender_str = alice.jid.to_string();
+        assert_eq!(receipt.to, group.to_string());
+        assert_eq!(receipt.participant.as_deref(), Some(sender_str.as_str()));
+        assert_eq!(
+            message_acks_for(&sent, id),
+            0,
+            "SKDM+skmsg sibling must not get an extra transport ack"
+        );
+        assert_eq!(
+            message_texts_for_id(&rx, id),
+            vec!["group content".to_string()],
+            "only the skmsg content should dispatch a user message"
+        );
+    }
+
+    #[tokio::test]
+    async fn own_group_skdm_only_session_uses_transport_ack_once() {
+        use wacore::messages::MessageUtils;
+
+        let (client, transport) = capturing_client("own_group_skdm_ack").await;
+
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("999999999999999@lid").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        let group: Jid = "120363408782575445@g.us".parse().expect("group");
+        let skdm = alice.create_group_skdm(&group).await;
+        let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+            sender_key_distribution_message: buffa::MessageField::some(skdm),
+            ..Default::default()
+        });
+        let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
+        let id = "OWN_GROUP_SKDM_ONLY";
+        let info = group_message_info(id, &group, &alice.jid, true);
+
+        process_group_classified(
+            &client,
+            info,
+            &alice.jid,
+            enc_payload_from_ciphertext(&session_ct),
+            vec![],
+        )
+        .await;
+
+        assert_exactly_one_confirmation(&transport, id).await;
+        let sent = transport.sent();
+        assert_eq!(
+            message_acks_for(&sent, id),
+            1,
+            "own group SKDM-only session message should use transport ack"
+        );
+        let ack = find_message_ack_for(&sent, id).expect("transport ack");
+        let sender_str = alice.jid.to_string();
+        assert_eq!(ack.to, group.to_string());
+        assert_eq!(ack.participant.as_deref(), Some(sender_str.as_str()));
+        assert_eq!(ack.recipient, None);
+        assert_eq!(
+            delivery_receipts_for(&sent, id),
+            0,
+            "own group SKDM-only session message must not use a delivery receipt"
+        );
+        assert_eq!(
+            sender_receipts_for(&sent, id),
+            0,
+            "group self-fanout must not use type=sender receipt"
+        );
+    }
+
+    /// Regression for the offline-backlog disconnect: an already-processed
+    /// (duplicate) message must get its own delivery receipt, else the server
+    /// replays it every reconnect until it force-closes the stream. Pre-fix only
+    /// the first (success) delivery was acked; the duplicate was skipped silently.
+    #[tokio::test]
+    async fn duplicate_message_is_acked_with_delivery_receipt() {
+        let (client, transport) = capturing_client("dup_receipt").await;
+        let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+        let bob_addr = bob_jid.to_protocol_address();
+        let mut alice = AlicePeer::new("5511888887777@s.whatsapp.net").await;
+        alice.install_bob_session(&bob_addr, &bundle).await;
+
+        // Establish the session, then mark Alice's prekey acked so her next message
+        // is a plain SignalMessage. Re-submitting it is a clean duplicate.
+        let establish = alice.encrypt_text(&bob_addr, "establish").await;
+        process_session_ct(&client, &alice.jid, "EST", &establish).await;
+        if let Some(record) = alice.sessions.0.get_mut(&bob_addr)
+            && let Some(state) = record.session_state_mut()
+        {
+            state.clear_unacknowledged_pre_key_message();
+        }
+
+        // A real (padded) Message so the success path also emits its receipt.
+        let plaintext = wacore::messages::MessageUtils::encode_and_pad(&wa::Message {
+            conversation: Some("hi".to_string()),
+            ..Default::default()
+        });
+        let msg = alice.encrypt(&bob_addr, &plaintext).await;
+        process_session_ct(&client, &alice.jid, "DUP", &msg).await; // success
+        process_session_ct(&client, &alice.jid, "DUP", &msg).await; // duplicate
+
+        let mut count = 0;
+        for _ in 0..80 {
+            count = delivery_receipts_for(&transport.sent(), "DUP");
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            count, 2,
+            "duplicate must get its own delivery receipt (pre-fix: only the first send was acked)"
+        );
+    }
+
+    /// Own-account self-fanout (is_from_me, non-peer, carries a `recipient`):
+    /// our own outgoing message echoed back to this device. WA Web
+    /// (`isMeAccount(author) => SENDER`) and whatsmeow (`IsFromMe => "sender"`)
+    /// clear it with a `<receipt type="sender" recipient=...>`, NOT a bare
+    /// transport `<ack>`. The server's offline queue ignores the bare ack and
+    /// replays the stanza forever (the ~50min disconnect loop).
+    #[tokio::test]
+    async fn own_self_fanout_acked_via_sender_receipt() {
+        let (client, transport) = capturing_client("own_ack").await;
+        let own = Arc::new(MessageInfo {
+            id: "OWN1".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "100000000000001@lid".parse().expect("sender"),
+                chat: "300000000000003@lid".parse().expect("chat"),
+                recipient: Some("300000000000003@lid".parse().expect("recipient")),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&own);
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(r) = find_receipt(&transport.sent(), "OWN1") {
+                found = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, typ, recipient) = found.expect("own self-fanout must get a sender <receipt>");
+        assert_eq!(
+            to, "100000000000001@lid",
+            "receipt `to` must echo the own LID (the fanout sender)"
+        );
+        assert_eq!(
+            typ.as_deref(),
+            Some("sender"),
+            "own self-fanout receipt must be type=sender"
+        );
+        assert_eq!(
+            recipient.as_deref(),
+            Some("300000000000003@lid"),
+            "receipt must echo the fanout recipient"
+        );
+        assert!(
+            find_message_ack(&transport.sent()).is_none(),
+            "self-fanout must NOT also emit a bare transport <ack> (the server rejects it)"
+        );
+    }
+
+    /// Regression for the bot self-fanout disconnect loop: our own message to a
+    /// `@bot` recipient, echoed back as a duplicate/undecryptable stanza, must
+    /// be cleared with a `<receipt type="sender" recipient=@bot>`. Pre-fix it
+    /// got a bare `<ack class="message">` which the server ignored, replaying
+    /// the stanza every reconnect until a ~50min `<stream:error><ack/>` GC
+    /// force-closed the connection (the exact production symptom).
+    #[tokio::test]
+    async fn bot_self_fanout_acked_via_sender_receipt() {
+        let (client, transport) = capturing_client("bot_self_fanout").await;
+        let own = Arc::new(MessageInfo {
+            id: "AC00000000000000000000000000BEEF".to_string(),
+            source: crate::types::message::MessageSource {
+                // from = our own LID with its device (the server fans our
+                // outgoing bot prompt back to this device); chat = the bot
+                // (recipient.to_non_ad). The device on the sender must survive
+                // into the receipt `to`, or the LID server rejects it (#649).
+                sender: "100000000000001:11@lid".parse().expect("sender"),
+                chat: "200000000000002@bot".parse().expect("chat"),
+                recipient: Some("200000000000002@bot".parse().expect("recipient")),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&own);
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(r) = find_receipt(&transport.sent(), "AC00000000000000000000000000BEEF") {
+                found = Some(r);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, typ, recipient) =
+            found.expect("bot self-fanout must get a sender <receipt> to drain the offline queue");
+        assert_eq!(
+            to, "100000000000001:11@lid",
+            "receipt `to` must preserve the own LID device"
+        );
+        assert_eq!(typ.as_deref(), Some("sender"));
+        assert_eq!(
+            recipient.as_deref(),
+            Some("200000000000002@bot"),
+            "receipt must route to the bot recipient"
+        );
+        assert!(
+            find_message_ack(&transport.sent()).is_none(),
+            "the bare <ack> that triggered <stream:error><ack/> must no longer be emitted"
+        );
+    }
+
+    /// When WE are the bot author (own DM, sender on the `@bot` server, to a
+    /// user), WA Web's `MsgSendReceipt` takes the `!chat.isBot() &&
+    /// author.isBot()` branch and emits a bot-invoke-response `<ack>`, NOT a
+    /// sender `<receipt>`. So the bot-author branch in ack_received_message must
+    /// keep running before the self-fanout receipt: this locks that ordering
+    /// against a regression that would wrongly route it to a sender receipt.
+    #[tokio::test]
+    async fn own_bot_author_dm_acks_not_sender_receipt() {
+        let (client, transport) = capturing_client("own_bot_author").await;
+        let own = Arc::new(MessageInfo {
+            id: "OWNBOT1".to_string(),
+            source: crate::types::message::MessageSource {
+                sender: "100000000000002@bot".parse().expect("sender"),
+                chat: "300000000000003@lid".parse().expect("chat"),
+                recipient: Some("300000000000003@lid".parse().expect("recipient")),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&own);
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            found.is_some(),
+            "own bot-author DM must emit a bare <ack class=message> (WA Web bot-invoke-response ack), not a receipt"
+        );
+        // No current race (ack_received_message is synchronous and the
+        // bot-author branch returns before the receipt branch), but settle
+        // briefly so a future regression that spawned a receipt on a later tick
+        // can't slip past this negative assertion.
+        for _ in 0..5 {
+            assert!(
+                find_receipt(&transport.sent(), "OWNBOT1").is_none(),
+                "must NOT route to a sender <receipt> (would diverge from WA Web's bot-invoke-response ack path)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// An `<unavailable>` message (no `<enc>`) must be transport-acked so the
+    /// server stops replaying it (DM/group aren't covered by the should_ack gate).
+    #[tokio::test]
+    async fn unavailable_message_is_transport_acked() {
+        let (client, transport) = capturing_client("unavail_ack").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "UNAVAIL1")
+            .attr("type", "text")
+            .children([NodeBuilder::new("unavailable")
+                .attr("type", "view_once")
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(classified.is_none(), "unavailable path returns None");
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, _) = found.expect("unavailable message must get a transport ack");
+        assert_eq!(to, "5511777776666@s.whatsapp.net");
+    }
+
+    /// Unknown-only stanzas (e.g. msmsg) must be acked or they loop the queue.
+    #[tokio::test]
+    async fn unknown_only_enc_is_transport_acked() {
+        let (client, transport) = capturing_client("msmsg_ack").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "MSMSG1")
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "frskmsg")
+                .bytes(vec![0u8; 8])
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(
+            classified.is_none(),
+            "unknown-only enc must short-circuit before the process phase"
+        );
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, _) = found.expect("unknown-only enc must emit a transport ack");
+        assert_eq!(to, "5511777776666@s.whatsapp.net");
+    }
+
+    /// `recipient` must be echoed verbatim or the server replies <stream:error>.
+    #[tokio::test]
+    async fn unknown_only_enc_ack_preserves_recipient() {
+        let (client, transport) = capturing_client("msmsg_recipient").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "236395184570386@lid")
+            .attr("recipient", "156535032389744@lid")
+            .attr("id", "MSMSG_LID")
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "frskmsg")
+                .bytes(vec![0u8; 8])
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(classified.is_none());
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, recipient) = found.expect("unknown-only enc must emit a transport ack");
+        assert_eq!(to, "236395184570386@lid");
+        assert_eq!(
+            recipient.as_deref(),
+            Some("156535032389744@lid"),
+            "ack must echo the incoming `recipient` attr or the server replies with <stream:error><ack/>"
+        );
+    }
+
+    /// Known type with empty content still has no usable payload; ack it.
+    #[tokio::test]
+    async fn known_enc_type_with_empty_content_is_transport_acked() {
+        let (client, transport) = capturing_client("known_empty").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "EMPTY1")
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc").attr("type", "pkmsg").build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(classified.is_none());
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (to, _) = found.expect("known-but-empty enc must emit a transport ack");
+        assert_eq!(to, "5511777776666@s.whatsapp.net");
+    }
+
+    /// status is covered by should_ack; the fallback must not double-ack it.
+    #[tokio::test]
+    async fn unknown_only_enc_on_status_skips_fallback_ack() {
+        let (client, transport) = capturing_client("msmsg_status_skip").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "status@broadcast")
+            .attr("id", "MSMSG_STATUS")
+            .attr("type", "text")
+            .attr("participant", "5511777776666@s.whatsapp.net")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "frskmsg")
+                .bytes(vec![0u8; 8])
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(classified.is_none());
+
+        // Give any rogue spawned task time to land on the wire.
+        for _ in 0..16 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            if find_message_ack(&transport.sent()).is_some() {
+                break;
+            }
+        }
+        assert!(
+            find_message_ack(&transport.sent()).is_none(),
+            "status@broadcast must not get a fallback transport ack from classify"
+        );
+    }
+
+    /// One recognized enc + one unknown must still go through the normal path.
+    #[tokio::test]
+    async fn mixed_recognized_and_unknown_enc_still_classifies() {
+        let (client, _transport) = capturing_client("msmsg_mixed").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "MIXED1")
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("enc")
+                    .attr("type", "pkmsg")
+                    .bytes(vec![0u8; 8])
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "frskmsg")
+                    .bytes(vec![0u8; 8])
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client
+            .classify_incoming_message(&owned)
+            .await
+            .expect("mixed enc must produce a ClassifiedMessage");
+        assert_eq!(classified.session_payloads.len(), 1);
+        assert!(classified.group_payloads.is_empty());
+    }
+
+    /// A custom handler owns its ack; the fallback must not double-ack.
+    #[tokio::test]
+    async fn custom_handler_only_skips_fallback_ack() {
+        use crate::types::enc_handler::EncHandler;
+        use async_lock::Mutex as AsyncMutex;
+
+        #[derive(Default)]
+        struct NoopHandler {
+            calls: Arc<AsyncMutex<usize>>,
+        }
+        #[async_trait::async_trait]
+        impl EncHandler for NoopHandler {
+            async fn handle(
+                &self,
+                _client: Arc<Client>,
+                _enc_node: &wacore_binary::Node,
+                _info: &crate::types::message::MessageInfo,
+            ) -> anyhow::Result<()> {
+                *self.calls.lock().await += 1;
+                Ok(())
+            }
+        }
+
+        let (client, transport) = capturing_client("msmsg_custom").await;
+        let calls = Arc::new(AsyncMutex::new(0usize));
+        let handler = Arc::new(NoopHandler {
+            calls: Arc::clone(&calls),
+        });
+        client
+            .custom_enc_handlers
+            .write()
+            .await
+            .insert("frskmsg".to_string(), handler as Arc<dyn EncHandler>);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "CUSTOM1")
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "frskmsg")
+                .bytes(vec![0u8; 8])
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client.classify_incoming_message(&owned).await;
+        assert!(
+            classified.is_some(),
+            "custom-handled enc must not be short-circuited by the fallback guard"
+        );
+
+        // Let the detached handler + any rogue spawned task run.
+        for _ in 0..16 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            find_message_ack(&transport.sent()).is_none(),
+            "custom-handled enc must not get a fallback transport ack from classify"
+        );
+        assert_eq!(*calls.lock().await, 1, "custom handler must be invoked");
+    }
+
+    /// Security regression: a self-only `app_state_sync_key_share` protocol
+    /// message must be honoured only when it originates from our own account.
+    /// A spoofed one from a peer must be dropped (otherwise a peer could inject
+    /// app-state sync keys). Mirrors WA Web `WAWebKeyManagementHandleKeyShareApi`
+    /// and whatsmeow's `handleProtocolMessage` self gate.
+    #[tokio::test]
+    async fn app_state_sync_key_share_honored_only_from_self() {
+        use wacore::messages::MessageUtils;
+
+        let client = crate::test_utils::create_test_client().await;
+        ensure_bob_paired(&client).await;
+
+        let key_id = vec![1u8, 2, 3, 4, 5, 6];
+        let share = wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                app_state_sync_key_share: buffa::MessageField::some(
+                    wa::message::AppStateSyncKeyShare {
+                        keys: vec![wa::message::AppStateSyncKey {
+                            key_id: buffa::MessageField::some(wa::message::AppStateSyncKeyId {
+                                key_id: Some(key_id.clone()),
+                            }),
+                            key_data: buffa::MessageField::some(wa::message::AppStateSyncKeyData {
+                                key_data: Some(vec![7u8; 32]),
+                                fingerprint: buffa::MessageField::some(
+                                    wa::message::AppStateSyncKeyFingerprint {
+                                        raw_id: Some(1),
+                                        current_index: Some(0),
+                                        device_indexes: vec![0],
+                                    },
+                                ),
+                                timestamp: Some(123),
+                            }),
+                        }],
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let padded = MessageUtils::encode_and_pad(&share);
+        let backend = client.persistence_manager.backend();
+
+        // Non-self sender: the key share must be dropped.
+        let mut info =
+            create_test_message_info("5510000@s.whatsapp.net", "AKS1", "5510000@s.whatsapp.net");
+        info.source.is_from_me = false;
+        client
+            .clone()
+            .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+            .await
+            .unwrap();
+        assert!(
+            backend.get_sync_key(&key_id).await.unwrap().is_none(),
+            "app-state sync key from a non-self sender must not be stored"
+        );
+
+        // Self sender: the key share is honoured and stored.
+        let mut info = create_test_message_info(
+            "9000000000000@s.whatsapp.net",
+            "AKS2",
+            "9000000000000@s.whatsapp.net",
+        );
+        info.source.is_from_me = true;
+        client
+            .clone()
+            .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+            .await
+            .unwrap();
+        assert!(
+            backend.get_sync_key(&key_id).await.unwrap().is_some(),
+            "app-state sync key from self must be stored"
+        );
+    }
+
+    // ---- msmsg inbound dispatch -----------------------------------------
+
+    fn find_message_nack_error(frames: &[bytes::Bytes], id: &str) -> Option<u32> {
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(buf) = decode_frame(i, frame) else {
+                continue;
+            };
+            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+                continue;
+            };
+            if node.tag.as_ref() == "ack"
+                && node
+                    .get_attr("class")
+                    .is_some_and(|v| v.as_str() == "message")
+                && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+                && let Some(err) = node.get_attr("error")
+                && let Ok(code) = err.as_str().parse::<u32>()
+            {
+                return Some(code);
+            }
+        }
+        None
+    }
+
+    fn encode_message_secret_message(iv: &[u8], payload: &[u8]) -> Vec<u8> {
+        use buffa::Message as _;
+        let ms = wa::MessageSecretMessage {
+            version: Some(1),
+            enc_iv: Some(iv.to_vec()),
+            enc_payload: Some(payload.to_vec()),
+        };
+        ms.encode_to_vec()
+    }
+
+    async fn collect_event<F>(
+        client: &Arc<Client>,
+        collector: Arc<crate::test_utils::TestEventCollector>,
+        pred: F,
+        timeout_ms: u64,
+    ) -> Option<Arc<wacore::types::events::Event>>
+    where
+        F: Fn(&wacore::types::events::Event) -> bool,
+    {
+        let _ = client;
+        let mut waited = 0u64;
+        while waited <= timeout_ms {
+            for ev in collector.events() {
+                if pred(&ev) {
+                    return Some(ev);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            waited += 25;
+        }
+        None
+    }
+
+    fn legacy_edit_text(msg: &wa::Message) -> Option<&str> {
+        msg.protocol_message
+            .as_option()
+            .and_then(|pm| pm.edited_message.as_option())
+            .and_then(|edited| edited.conversation.as_deref())
+    }
+
+    fn inner_message_edit(text: &str, next_secret: Option<Vec<u8>>) -> wa::Message {
+        wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                key: buffa::MessageField::some(wa::MessageKey {
+                    remote_jid: Some("5511777776666@s.whatsapp.net".to_string()),
+                    from_me: Some(false),
+                    id: Some("PARENT_EDIT".to_string()),
+                    participant: None,
+                }),
+                r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                edited_message: buffa::MessageField::some(wa::Message {
+                    conversation: Some(text.to_string()),
+                    ..Default::default()
+                }),
+                timestamp_ms: Some(1_770_000_000_000),
+                ..Default::default()
+            }),
+            message_context_info: next_secret
+                .map(|secret| wa::MessageContextInfo {
+                    message_secret: Some(secret),
+                    ..Default::default()
+                })
+                .into(),
+            ..Default::default()
+        }
+    }
+
+    fn encrypted_message_edit(
+        target_key: wa::MessageKey,
+        original_sender: &str,
+        editor: &str,
+        parent_id: &str,
+        secret: &[u8],
+        text: &str,
+        next_secret: Option<Vec<u8>>,
+    ) -> wa::Message {
+        let ctx = wacore::message_edit::MessageEditContext {
+            original_msg_id: parent_id,
+            original_sender_jid: original_sender,
+            editor_jid: editor,
+        };
+        let (enc_payload, enc_iv) = wacore::message_edit::encrypt_message_edit(
+            &inner_message_edit(text, next_secret),
+            secret,
+            &ctx,
+        )
+        .expect("test edit encryption");
+
+        wa::Message {
+            secret_encrypted_message: buffa::MessageField::some(
+                wa::message::SecretEncryptedMessage {
+                    target_message_key: buffa::MessageField::some(target_key),
+                    enc_payload: Some(enc_payload),
+                    enc_iv: Some(enc_iv.to_vec()),
+                    secret_enc_type: Some(
+                        wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT,
+                    ),
+                    remote_key_id: None,
+                },
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_encrypted_message_edit_dispatches_legacy_edit() {
+        let (client, _transport) = capturing_client("secret_edit_dispatch").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let parent_id = "PARENT_EDIT";
+        let edit_id = "EDIT_1";
+        let secret = [0x42u8; 32];
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, chat, parent_id, &secret)
+            .await
+            .unwrap();
+
+        let info = Arc::new(MessageInfo {
+            id: edit_id.into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: chat.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: None,
+        };
+        let msg =
+            encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
+
+        client.dispatch_parsed_message(msg, &info).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == edit_id
+                        && legacy_edit_text(msg.as_ref()) == Some("edited")
+                        && msg.secret_encrypted_message.is_unset())
+            },
+            500,
+        )
+        .await;
+        assert!(got.is_some(), "encrypted edit must dispatch as legacy edit");
+    }
+
+    #[tokio::test]
+    async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
+        let (client, _transport) = capturing_client("secret_edit_chain").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let parent_id = "PARENT_EDIT";
+        let first_secret = [0x11u8; 32];
+        let second_secret = [0x22u8; 32];
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, chat, parent_id, &first_secret)
+            .await
+            .unwrap();
+
+        let target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: None,
+        };
+        let first_info = Arc::new(MessageInfo {
+            id: "EDIT_CHAIN_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: chat.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let first_msg = encrypted_message_edit(
+            target_key.clone(),
+            chat,
+            chat,
+            parent_id,
+            &first_secret,
+            "first",
+            Some(second_secret.to_vec()),
+        );
+        client.dispatch_parsed_message(first_msg, &first_info).await;
+
+        let stored = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(chat, chat, parent_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(&second_secret[..]));
+
+        let second_info = Arc::new(MessageInfo {
+            id: "EDIT_CHAIN_2".into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: chat.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let second_msg = encrypted_message_edit(
+            target_key,
+            chat,
+            chat,
+            parent_id,
+            &second_secret,
+            "second",
+            None,
+        );
+        client
+            .dispatch_parsed_message(second_msg, &second_info)
+            .await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == "EDIT_CHAIN_2"
+                        && legacy_edit_text(msg.as_ref()) == Some("second"))
+            },
+            500,
+        )
+        .await;
+        assert!(got.is_some(), "second edit must use the re-captured secret");
+    }
+
+    #[tokio::test]
+    async fn secret_encrypted_message_edit_uses_lid_pn_fallback_in_group() {
+        use wacore::store::traits::LidPnMappingEntry;
+
+        let (client, _transport) = capturing_client("secret_edit_alt_group").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "120363021033254949@g.us";
+        let parent_id = "GROUP_PARENT_EDIT";
+        let sender_lid = "236395184570386@lid";
+        let sender_pn = "5511777776666@s.whatsapp.net";
+        let secret = [0x77u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: "236395184570386".into(),
+                phone_number: "5511777776666".into(),
+                created_at: 0,
+                updated_at: 0,
+                learning_source: "test".into(),
+            })
+            .await
+            .unwrap();
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, sender_pn, parent_id, &secret)
+            .await
+            .unwrap();
+
+        let info = Arc::new(MessageInfo {
+            id: "GROUP_EDIT_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: sender_lid.parse().unwrap(),
+                is_group: true,
+                addressing_mode: Some(wacore::types::message::AddressingMode::Lid),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: Some(sender_lid.to_string()),
+        };
+        let msg = encrypted_message_edit(
+            target_key,
+            sender_pn,
+            sender_lid,
+            parent_id,
+            &secret,
+            "group edited",
+            None,
+        );
+
+        client.dispatch_parsed_message(msg, &info).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == "GROUP_EDIT_1"
+                        && legacy_edit_text(msg.as_ref()) == Some("group edited"))
+            },
+            500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "group edit must decrypt when the stored secret is under PN"
+        );
+    }
+
+    #[tokio::test]
+    async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
+        use wacore::store::traits::LidPnMappingEntry;
+
+        let (client, _transport) = capturing_client("secret_edit_alt_refresh").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "120363021033254949@g.us";
+        let parent_id = "GROUP_PARENT_EDIT";
+        let sender_lid = "236395184570386@lid";
+        let sender_pn = "5511777776666@s.whatsapp.net";
+        let first_secret = [0x31u8; 32];
+        let second_secret = [0x32u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: "236395184570386".into(),
+                phone_number: "5511777776666".into(),
+                created_at: 0,
+                updated_at: 0,
+                learning_source: "test".into(),
+            })
+            .await
+            .unwrap();
+        for sender in [sender_lid, sender_pn] {
+            client
+                .persistence_manager
+                .backend()
+                .put_msg_secret(chat, sender, parent_id, &first_secret)
+                .await
+                .unwrap();
+        }
+
+        let first_info = Arc::new(MessageInfo {
+            id: "GROUP_EDIT_REFRESH_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: sender_lid.parse().unwrap(),
+                is_group: true,
+                addressing_mode: Some(wacore::types::message::AddressingMode::Lid),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let first_target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: Some(sender_lid.to_string()),
+        };
+        let first_msg = encrypted_message_edit(
+            first_target_key,
+            sender_lid,
+            sender_lid,
+            parent_id,
+            &first_secret,
+            "first",
+            Some(second_secret.to_vec()),
+        );
+        client.dispatch_parsed_message(first_msg, &first_info).await;
+
+        for sender in [sender_lid, sender_pn] {
+            let stored = client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(chat, sender, parent_id)
+                .await
+                .unwrap();
+            assert_eq!(stored.as_deref(), Some(&second_secret[..]));
+        }
+
+        let second_info = Arc::new(MessageInfo {
+            id: "GROUP_EDIT_REFRESH_2".into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: sender_pn.parse().unwrap(),
+                is_group: true,
+                addressing_mode: Some(wacore::types::message::AddressingMode::Pn),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let second_target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: Some(sender_pn.to_string()),
+        };
+        let second_msg = encrypted_message_edit(
+            second_target_key,
+            sender_pn,
+            sender_pn,
+            parent_id,
+            &second_secret,
+            "second",
+            None,
+        );
+        client
+            .dispatch_parsed_message(second_msg, &second_info)
+            .await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == "GROUP_EDIT_REFRESH_2"
+                        && legacy_edit_text(msg.as_ref()) == Some("second"))
+            },
+            500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "chained edit must use the refreshed alternate alias"
+        );
+    }
+
+    /// Round-trip: store an outbound messageSecret, build a fake bot reply
+    /// whose payload we encrypt with the symmetric helper, route it through
+    /// classify, and assert the decrypted `wa::Message` lands on the bus.
+    #[tokio::test]
+    async fn msmsg_decrypts_when_secret_is_stored() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_ok").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let bot_jid = "867051314767696@bot";
+        let outbound_id = "OUTBOUND_1";
+        let bot_reply_id = "BOT_REPLY_1";
+        let secret = [0x42u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let plaintext_msg = wa::Message {
+            conversation: Some("hi from bot".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use buffa::Message as _;
+
+            plaintext_msg.encode_to_vec()
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", bot_jid)
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("hi from bot"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "msmsg decryption + dispatch must surface Event::Message"
+        );
+    }
+
+    /// No secret stored for `target_id` → nack `error=495`, no Message event.
+    #[tokio::test]
+    async fn msmsg_without_stored_secret_nacks_495() {
+        let (client, transport) = capturing_client("msmsg_nosecret").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let bot_reply_id = "BOT_REPLY_NS";
+        let outbound_id = "OUTBOUND_NS";
+        let our_pn = "5511000000001@s.whatsapp.net";
+
+        let ms_msg_proto = encode_message_secret_message(&[0u8; 12], &[0u8; 32]);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), bot_reply_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            code,
+            Some(495),
+            "missing messageSecret must nack with code 495"
+        );
+        assert!(
+            collector
+                .events()
+                .iter()
+                .all(|e| !matches!(e.as_ref(), wacore::types::events::Event::Message(_, info) if info.id == bot_reply_id)),
+            "no Message event must be dispatched when decryption failed"
+        );
+    }
+
+    /// Tampered ciphertext → GCM tag fails → nack 495.
+    #[tokio::test]
+    async fn msmsg_with_bad_tag_nacks_495() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, transport) = capturing_client("msmsg_bad_tag").await;
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_BAD";
+        let bot_reply_id = "BOT_REPLY_BAD";
+        let secret = [0x77u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (mut cipher, iv) = encrypt_bot_message(b"hello", &secret, &ctx).unwrap();
+        let last = cipher.len() - 1;
+        cipher[last] ^= 0x01;
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), bot_reply_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(code, Some(495));
+    }
+
+    /// Bot edit chain: when `<bot edit="inner">` is set, the HKDF msg_id used
+    /// for the per-message key swaps to `edit_target_id` so the edited reply
+    /// decrypts under the same key as the original (whatsmeow / WA Web
+    /// `decryptMsmsgFbidBotMessage`).
+    #[tokio::test]
+    async fn msmsg_bot_edit_uses_edit_target_id_for_hkdf() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_edit").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_EDIT";
+        let original_reply_id = "BOT_REPLY_FIRST";
+        let edit_reply_id = "BOT_REPLY_EDIT";
+        let secret = [0xAAu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt as if it's the ORIGINAL reply (msg_id = original_reply_id).
+        let plaintext_msg = wa::Message {
+            conversation: Some("edited content".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use buffa::Message as _;
+
+            plaintext_msg.encode_to_vec()
+        };
+        let ctx = BotMessageContext {
+            msg_id: original_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        // Inbound stanza has id=edit_reply_id but <bot edit="inner" edit_target_id=original>
+        // so the HKDF must derive against original_reply_id.
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", edit_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot")
+                    .attr("edit", "inner")
+                    .attr("edit_target_id", original_reply_id)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == edit_reply_id
+                        && msg.conversation.as_deref() == Some("edited content"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "bot edit must use edit_target_id for HKDF msg_id"
+        );
+    }
+
+    /// Same setup as the edit test but WITHOUT `<bot edit>`: the HKDF must
+    /// fall back to `info.id`, and ciphertext encrypted with the edit-target
+    /// id must fail to decrypt.
+    #[tokio::test]
+    async fn msmsg_without_bot_edit_does_not_swap_msg_id() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, transport) = capturing_client("msmsg_noedit").await;
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_NOEDIT";
+        let stanza_id = "BOT_REPLY_NOEDIT";
+        let other_id = "OTHER_ID";
+        let secret = [0xBBu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt with `other_id` to simulate the wrong key derivation if the
+        // edit branch were taken without `<bot edit>`.
+        let ctx = BotMessageContext {
+            msg_id: other_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(b"x", &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), stanza_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            code,
+            Some(495),
+            "without <bot edit>, HKDF must use stanza id (not OTHER_ID) → tag fails"
+        );
+    }
+
+    /// `<bot edit="first">` is NOT one of {INNER, LAST}, so the HKDF msg_id
+    /// must remain `info.id`.
+    #[tokio::test]
+    async fn msmsg_bot_edit_first_keeps_info_id() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_first").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_FIRST";
+        let stanza_id = "BOT_REPLY_FIRST";
+        let secret = [0xCCu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt with stanza_id; "first" edit must NOT swap.
+        let plaintext_msg = wa::Message {
+            conversation: Some("first reply".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use buffa::Message as _;
+
+            plaintext_msg.encode_to_vec()
+        };
+        let ctx = BotMessageContext {
+            msg_id: stanza_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot").attr("edit", "first").build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| matches!(e, wacore::types::events::Event::Message(_, info) if info.id == stanza_id),
+            1500,
+        )
+        .await;
+        assert!(got.is_some(), "edit=first must keep info.id as HKDF msg_id");
+    }
+
+    /// Regular bot path (`f()` in WA Web `BotMessageSecret.js`): when the
+    /// fbid pre-resolve picks the WRONG id (e.g. edit_target_id) but the
+    /// real ciphertext was minted under `info.id`, the fallback attempt
+    /// must succeed. Validates the try-then-fallback unification.
+    #[tokio::test]
+    async fn msmsg_falls_back_to_info_id_when_primary_uses_edit_target() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_fb_to_info").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_FB1";
+        let stanza_id = "REPLY_FB1";
+        let edit_target_id = "WRONG_EDIT_TARGET";
+        let secret = [0xDDu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt under `stanza_id` even though the stanza will declare
+        // edit=inner with edit_target_id (forces a primary-attempt mismatch).
+        let plaintext_msg = wa::Message {
+            conversation: Some("fallback ok".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use buffa::Message as _;
+
+            plaintext_msg.encode_to_vec()
+        };
+        let ctx = BotMessageContext {
+            msg_id: stanza_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot")
+                    .attr("edit", "inner")
+                    .attr("edit_target_id", edit_target_id)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == stanza_id
+                        && msg.conversation.as_deref() == Some("fallback ok"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "primary attempt with edit_target_id must fall back to info.id"
+        );
+    }
+
+    /// Inverse of the `falls_back_to_info_id` test: primary is `info.id`
+    /// (edit_type isn't INNER/LAST so the fbid pre-resolve picks the stanza
+    /// id), but the bot encrypted under `edit_target_id`. The fallback must
+    /// rescue.
+    #[tokio::test]
+    async fn msmsg_falls_back_to_edit_target_when_primary_uses_info_id() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_fb_to_edit").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_INV";
+        let stanza_id = "REPLY_INV";
+        let edit_target_id = "EDIT_INV";
+        let secret = [0xBEu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let plaintext_msg = wa::Message {
+            conversation: Some("inverse fallback".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use buffa::Message as _;
+
+            plaintext_msg.encode_to_vec()
+        };
+        // Encrypt under edit_target_id even though edit=first → primary
+        // will pick info.id (stanza id), fail, and the fallback should try
+        // edit_target_id and succeed (WA Web regular bot path `f()`).
+        let ctx = BotMessageContext {
+            msg_id: edit_target_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("bot")
+                    .attr("edit", "first")
+                    .attr("edit_target_id", edit_target_id)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == stanza_id
+                        && msg.conversation.as_deref() == Some("inverse fallback"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "primary attempt with info.id must fall back to edit_target_id (WA Web f())"
+        );
+    }
+
+    /// Mirror scenario: no `<bot edit>`, so the parser doesn't populate
+    /// `edit_target_id`. Primary uses `info.id`; with no fallback id
+    /// available, a deliberately-wrong-key payload must nack 495 (no second
+    /// attempt to silently mask the failure).
+    #[tokio::test]
+    async fn msmsg_no_fallback_when_no_edit_target_present() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, transport) = capturing_client("msmsg_nofb").await;
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_NOFB";
+        let stanza_id = "REPLY_NOFB";
+        let secret = [0xCCu8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Encrypt under a DIFFERENT id; no <bot> node so parser leaves
+        // edit_target_id = None and there's nothing to fall back to.
+        let ctx = BotMessageContext {
+            msg_id: "MISMATCHED_ID",
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(b"x", &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", stanza_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), stanza_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            code,
+            Some(495),
+            "no fallback id available → single AES-GCM failure must nack 495"
+        );
+    }
+
+    /// WA Web `processRenderableMessages` captures the embedded
+    /// `messageSecret` from any bot-targeted msg (fanout from us OR reply
+    /// from the bot). Verify the helper persists it under
+    /// (bot_chat, our_lid, info.id).
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_persists_for_bot_chats() {
+        use crate::store::commands::DeviceCommand;
+        let (client, _transport) = capturing_client("capture_bot").await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+
+        let info = Arc::new(MessageInfo {
+            id: "FANOUT_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: "867051314767696@bot".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            conversation: Some("hi bot".into()),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![0xAB; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        let mut got = None;
+        for _ in 0..40 {
+            got = client
+                .persistence_manager
+                .backend()
+                .get_msg_secret("867051314767696@bot", "999888777666555@lid", "FANOUT_1")
+                .await
+                .unwrap();
+            if got.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(got.as_deref(), Some(&[0xABu8; 32][..]));
+    }
+
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_persists_for_non_bot_chats() {
+        let (client, _transport) = capturing_client("capture_regular_dm").await;
+        let info = Arc::new(MessageInfo {
+            id: "DM_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: "5511777776666@s.whatsapp.net".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![0xCD; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "5511777776666@s.whatsapp.net",
+                "5511000000001@s.whatsapp.net",
+                "DM_1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some(&[0xCDu8; 32][..]));
+    }
+
+    /// Group invocation: user mentions @MetaAI in a group → chat is the
+    /// GROUP (not bot), but mentioned_jid contains the bot. WA Web's
+    /// `processRenderableMessages` keys off `N` (invokedBotWid derived from
+    /// `mentionedJidList.find(isBot)`); we must persist too.
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_persists_for_group_with_bot_mention() {
+        use crate::store::commands::DeviceCommand;
+        let (client, _transport) = capturing_client("capture_group_mention").await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+
+        let info = Arc::new(MessageInfo {
+            id: "GRP_MENTION".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("hey @MetaAI tell me a joke".into()),
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    mentioned_jid: vec!["867051314767696@bot".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![0xEE; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        let mut got = None;
+        for _ in 0..40 {
+            got = client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(
+                    "120363021033254949@g.us",
+                    "5511000000001@s.whatsapp.net",
+                    "GRP_MENTION",
+                )
+                .await
+                .unwrap();
+            if got.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            got.as_deref(),
+            Some(&[0xEEu8; 32][..]),
+            "group invocation via @bot mention must still cache the secret"
+        );
+    }
+
+    /// Forwarded message with a secret must NOT be cached — matches WA Web's
+    /// `x.isForwarded !== true` guard. A planted forward shouldn't poison
+    /// the cache.
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_skips_forwarded() {
+        let (client, _transport) = capturing_client("capture_skip_forwarded").await;
+        let info = Arc::new(MessageInfo {
+            id: "FWD_1".into(),
+            source: crate::types::message::MessageSource {
+                chat: "867051314767696@bot".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("forwarded".into()),
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    is_forwarded: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![0xFF; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        for _ in 0..16 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "867051314767696@bot",
+                "5511000000001@s.whatsapp.net",
+                "FWD_1",
+            )
+            .await
+            .unwrap();
+        assert!(got.is_none(), "forwarded messages must not seed the cache");
+    }
+
+    /// Our own group bot prompt carries the secret but NO mentioned_jid
+    /// (observed in prod: `mentions_bot=false mentioned_jids=[]`). The bot
+    /// invocation is signalled by `message_context_info.bot_metadata`, which
+    /// must let the capture fire (WA Web's `w`/`A` group-participant gate).
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_via_bot_metadata_without_mention() {
+        let (client, _transport) = capturing_client("capture_bot_meta").await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+        let info = Arc::new(MessageInfo {
+            id: "GRP_OWN_BOT".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "236395184570386:0@lid".parse().unwrap(),
+                is_from_me: true,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("continue".into()),
+                // No mention at all — just bot_metadata signals the invocation.
+                ..Default::default()
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![0x7B; 32]),
+                bot_metadata: buffa::MessageField::some(wa::BotMetadata {
+                    persona_id: Some("867051314767696".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        // Group (non-bot chat) → keyed under info.source.sender (our LID in a
+        // LID group), which is what the bot reply's target_sender_jid echoes.
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "120363021033254949@g.us",
+                "236395184570386@lid",
+                "GRP_OWN_BOT",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(&[0x7Bu8; 32][..]),
+            "bot_metadata presence must let our own group prompt cache without a mention"
+        );
+    }
+
+    /// Group flow: another participant invokes the bot, their decrypted prompt
+    /// carries the secret. We must key it under THE PARTICIPANT (the future
+    /// reply's `<meta target_sender_jid>`), not our own identity.
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_keys_under_other_participant() {
+        let (client, _transport) = capturing_client("capture_participant").await;
+        let participant = "5599111112222:7@s.whatsapp.net";
+        let info = Arc::new(MessageInfo {
+            id: "GRP_OTHER".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: participant.parse().unwrap(),
+                is_from_me: false,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("@MetaAI question".into()),
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    mentioned_jid: vec!["867051314767696@bot".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![0x5A; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        // Keyed under the participant (non-AD), NOT under our own PN/LID.
+        let under_participant = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "120363021033254949@g.us",
+                "5599111112222@s.whatsapp.net",
+                "GRP_OTHER",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            under_participant.as_deref(),
+            Some(&[0x5Au8; 32][..]),
+            "another participant's prompt must key under their sender JID"
+        );
+    }
+
+    /// WA Web `sendAggregateReceipts`: a bot reply in a GROUP (chat not bot,
+    /// author is bot) must ack with a bare `<ack class="message">`
+    /// (sendBotInvokeResponseAcks), NOT a `<receipt>`.
+    #[tokio::test]
+    async fn bot_reply_in_group_acks_with_bare_ack_not_receipt() {
+        let (client, transport) = capturing_client("bot_group_ack").await;
+        let info = Arc::new(MessageInfo {
+            id: "BOT_GRP_ACK".into(),
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "867051314767696@bot".parse().unwrap(),
+                is_from_me: false,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&info);
+
+        let mut found = None;
+        for _ in 0..80 {
+            if let Some(a) = find_message_ack(&transport.sent()) {
+                found = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            found.is_some(),
+            "group bot reply must emit a bare <ack class=\"message\">"
+        );
+        assert_eq!(
+            delivery_receipts_for(&transport.sent(), "BOT_GRP_ACK"),
+            0,
+            "group bot reply must NOT emit a <receipt>"
+        );
+    }
+
+    /// Regression: a 1:1 bot chat (chat IS the bot) keeps the normal delivery
+    /// `<receipt>` — WA Web's `v` gate is false when chat.isBot().
+    #[tokio::test]
+    async fn bot_dm_reply_keeps_delivery_receipt() {
+        let (client, transport) = capturing_client("bot_dm_receipt").await;
+        let info = Arc::new(MessageInfo {
+            id: "BOT_DM_RCPT".into(),
+            source: crate::types::message::MessageSource {
+                chat: "867051314767696@bot".parse().unwrap(),
+                sender: "867051314767696@bot".parse().unwrap(),
+                is_from_me: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        client.ack_received_message(&info);
+
+        let mut count = 0;
+        for _ in 0..80 {
+            count = delivery_receipts_for(&transport.sent(), "BOT_DM_RCPT");
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            count, 1,
+            "1:1 bot chat must keep the normal delivery receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_capture_inbound_msg_secret_skips_when_secret_absent() {
+        let (client, _transport) = capturing_client("capture_no_secret").await;
+        let info = Arc::new(MessageInfo {
+            id: "NO_SECRET".into(),
+            source: crate::types::message::MessageSource {
+                chat: "867051314767696@bot".parse().unwrap(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+
+        for _ in 0..16 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "867051314767696@bot",
+                "5511000000001@s.whatsapp.net",
+                "NO_SECRET",
+            )
+            .await
+            .unwrap();
+        assert!(got.is_none());
+    }
+
+    /// A stanza carrying BOTH a valid msmsg AND an unknown sibling enc must
+    /// still dispatch the msmsg — the unknown-only fallback ack must not
+    /// short-circuit when `bot_payloads` is non-empty.
+    #[tokio::test]
+    async fn mixed_msmsg_and_unknown_enc_still_decrypts_msmsg() {
+        use crate::store::commands::DeviceCommand;
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+
+        let (client, _transport) = capturing_client("msmsg_mixed_unknown").await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_lid = "999888777666555@lid";
+        let outbound_id = "OUT_MIX";
+        let bot_reply_id = "REPLY_MIX";
+        let secret = [0x55u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_lid, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let plaintext_msg = wa::Message {
+            conversation: Some("mixed ok".into()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use buffa::Message as _;
+
+            plaintext_msg.encode_to_vec()
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_lid,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        // Stanza has a valid msmsg PLUS an unrecognised "frskmsg" sibling.
+        // The fallback transport-ack must NOT fire (would drop the msmsg).
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_lid)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "frskmsg")
+                    .bytes(vec![0u8; 8])
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("mixed ok"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "msmsg sibling of an unknown enc must still decrypt and dispatch"
+        );
+    }
+
+    /// LID↔PN migration window: the secret was stored under our PN, but the
+    /// bot reply's `<meta target_sender_jid>` echoes our LID. The primary
+    /// lookup misses; `alternate_msg_secret_lookup` resolves PN via
+    /// `lid_pn_mapping` and hits. Mirrors WA Web `C()`'s `getAlternateMsgKey`.
+    #[tokio::test]
+    async fn msmsg_alternate_lookup_resolves_lid_to_stored_pn() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        use wacore::store::traits::LidPnMappingEntry;
+
+        let (client, _transport) = capturing_client("msmsg_alt_lookup").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_lid_user = "999888777666555";
+        let our_pn_user = "5511000000001";
+        let our_lid = "999888777666555@lid";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUT_ALT";
+        let bot_reply_id = "REPLY_ALT";
+        let secret = [0x3Cu8; 32];
+
+        // Seed the LID→PN mapping so the alternate lookup can swap.
+        client
+            .persistence_manager
+            .backend()
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: our_lid_user.into(),
+                phone_number: our_pn_user.into(),
+                created_at: 0,
+                updated_at: 0,
+                learning_source: "test".into(),
+            })
+            .await
+            .unwrap();
+        // Secret stored under PN (as if the outbound went out PN-addressed).
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        // Bot reply encrypts with target = our LID (what <meta> declares).
+        let plaintext_msg = wa::Message {
+            conversation: Some("alt ok".into()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use buffa::Message as _;
+
+            plaintext_msg.encode_to_vec()
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_lid,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_lid)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("alt ok"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "LID-declared reply must resolve the PN-stored secret via lid_pn_mapping"
+        );
+    }
+
+    /// End-to-end: phone fanout dispatches a wa::Message carrying the
+    /// outbound `messageSecret`; later the Meta AI bot replies via msmsg
+    /// referencing the same id. The captured secret must let the reply
+    /// decrypt and surface `Event::Message`.
+    #[tokio::test]
+    async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
+        use crate::store::commands::DeviceCommand;
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+
+        let (client, _transport) = capturing_client("fanout_to_msmsg").await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
+        let our_lid_str = "999888777666555@lid";
+        let outbound_id = "FANOUT_OUT";
+        let bot_reply_id = "BOT_REPLY_PHONE";
+        let secret = [0x99u8; 32];
+
+        // Step 1: simulate the fanout dispatch (what dispatch_parsed_message
+        // would call when the phone's outbound stanza is mirrored to us).
+        let fanout_info = Arc::new(MessageInfo {
+            id: outbound_id.into(),
+            source: crate::types::message::MessageSource {
+                chat: bot_chat.clone(),
+                sender: "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let fanout_msg = wa::Message {
+            conversation: Some("hi bot".into()),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(secret.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client
+            .maybe_capture_inbound_msg_secret(&fanout_msg, &fanout_info)
+            .await;
+        // Write is awaited inline now, so the secret is already durable here.
+        for _ in 0..40 {
+            if client
+                .persistence_manager
+                .backend()
+                .get_msg_secret("867051314767696@bot", our_lid_str, outbound_id)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Step 2: the bot reply arrives as <enc type="msmsg"> referencing
+        // outbound_id via <meta target_id>. With the secret captured above,
+        // it must decrypt cleanly.
+        let plaintext_msg = wa::Message {
+            conversation: Some("bot reply".into()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use buffa::Message as _;
+
+            plaintext_msg.encode_to_vec()
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_lid_str,
+            bot_user_jid: "867051314767696@bot",
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_lid_str)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("bot reply"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "secret captured from fanout must enable msmsg reply decryption"
+        );
+    }
+
+    /// Coherence: the identity `persist_outbound_msg_secret` writes under
+    /// (LID for bot chats) must match what `handle_msmsg_payload` reads via
+    /// `<meta target_sender_jid>`. End-to-end without bypassing the helper.
+    #[tokio::test]
+    async fn msmsg_outbound_put_and_inbound_get_match_for_lid_bot() {
+        use crate::store::commands::DeviceCommand;
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+
+        let (client, _transport) = capturing_client("msmsg_lid_match").await;
+        // Seed both PN (already seeded by capturing_client) and LID.
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
+        let outbound_id = "OUT_LID";
+        let bot_reply_id = "REPLY_LID";
+        let our_lid = "999888777666555@lid";
+        let secret = [0x71u8; 32];
+
+        // Real outbound path: caller resolves the bot identity to our LID.
+        let sender_identity = client
+            .dm_sender_identity_for(&bot_chat)
+            .await
+            .expect("LID seeded");
+        client
+            .persist_outbound_msg_secret(&bot_chat, &sender_identity, outbound_id, &secret)
+            .await;
+
+        // Inbound msmsg payload encrypted under the same (msg_id, target, bot)
+        // tuple the meta will declare on the wire.
+        let plaintext_msg = wa::Message {
+            conversation: Some("lid coherent".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use buffa::Message as _;
+
+            plaintext_msg.encode_to_vec()
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_lid,
+            bot_user_jid: "867051314767696@bot",
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_lid)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("lid coherent"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "outbound PUT and inbound GET must converge on LID for bot chats"
+        );
+    }
+
+    /// Regression for the AD_JID encoder bug: a `from="USER:0@bot"` stanza must
+    /// survive the marshal/unmarshal round-trip with `server=Bot`, so the
+    /// secret lookup keys hit and the reply decrypts.
+    #[tokio::test]
+    async fn msmsg_with_bot_device_suffix_round_trips() {
+        use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+        let (client, _transport) = capturing_client("msmsg_bot_device").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "867051314767696@bot";
+        let our_pn = "5511000000001@s.whatsapp.net";
+        let outbound_id = "OUTBOUND_DEV";
+        let bot_reply_id = "BOT_REPLY_DEV";
+        let secret = [0x33u8; 32];
+
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(chat, our_pn, outbound_id, &secret)
+            .await
+            .unwrap();
+
+        let plaintext_msg = wa::Message {
+            conversation: Some("with device".to_string()),
+            ..Default::default()
+        };
+        let pt_bytes = {
+            use buffa::Message as _;
+
+            plaintext_msg.encode_to_vec()
+        };
+        let ctx = BotMessageContext {
+            msg_id: bot_reply_id,
+            target_sender_user_jid: our_pn,
+            bot_user_jid: chat,
+        };
+        let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+        let ms_msg_proto = encode_message_secret_message(&iv, &cipher);
+
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696:0@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([
+                NodeBuilder::new("meta")
+                    .attr("target_id", outbound_id)
+                    .attr("target_sender_jid", our_pn)
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "msmsg")
+                    .attr("v", "2")
+                    .bytes(ms_msg_proto)
+                    .build(),
+            ])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == bot_reply_id
+                        && msg.conversation.as_deref() == Some("with device"))
+            },
+            1500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "msmsg with `:0@bot` from must round-trip (encoder must not strip the bot server)"
+        );
+    }
+
+    /// `<meta>` without `target_id` → cannot identify the parent message,
+    /// nack 495 and no dispatch.
+    #[tokio::test]
+    async fn msmsg_without_meta_target_id_nacks_495() {
+        let (client, transport) = capturing_client("msmsg_no_target").await;
+        let bot_reply_id = "BOT_REPLY_NT";
+        let ms_msg_proto = encode_message_secret_message(&[0u8; 12], &[0u8; 32]);
+        let node = NodeBuilder::new("message")
+            .attr("from", "867051314767696@bot")
+            .attr("id", bot_reply_id)
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .attr("v", "2")
+                .bytes(ms_msg_proto)
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        client.clone().handle_incoming_message(owned).await;
+
+        let mut code = None;
+        for _ in 0..80 {
+            if let Some(c) = find_message_nack_error(&transport.sent(), bot_reply_id) {
+                code = Some(c);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(code, Some(495));
     }
 }

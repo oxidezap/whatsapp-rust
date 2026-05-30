@@ -119,12 +119,12 @@ impl SignalMessage {
             counter: Some(counter),
             previous_counter: Some(previous_counter),
             ciphertext: Some(Vec::<u8>::from(ciphertext)),
-            ..Default::default()
         };
-        let mut serialized =
-            Vec::with_capacity(1 + message.compute_size() as usize + Self::MAC_LENGTH);
+        let mut size_cache = buffa::SizeCache::new();
+        let message_len = message.compute_size(&mut size_cache) as usize;
+        let mut serialized = Vec::with_capacity(1 + message_len + Self::MAC_LENGTH);
         serialized.push(((message_version & 0xF) << 4) | CIPHERTEXT_MESSAGE_CURRENT_VERSION);
-        message.write_to(&mut serialized);
+        message.write_to(&mut size_cache, &mut serialized);
         let mac = Self::compute_mac(
             sender_identity_key,
             receiver_identity_key,
@@ -309,11 +309,12 @@ impl PreKeySignalMessage {
             base_key: Some(base_key.serialize().to_vec()),
             identity_key: Some(identity_key.serialize().to_vec()),
             message: Some(Vec::from(message.as_ref())),
-            ..Default::default()
         };
-        let mut serialized = Vec::with_capacity(1 + proto_message.compute_size() as usize);
+        let mut size_cache = buffa::SizeCache::new();
+        let message_len = proto_message.compute_size(&mut size_cache) as usize;
+        let mut serialized = Vec::with_capacity(1 + message_len);
         serialized.push(((message_version & 0xF) << 4) | CIPHERTEXT_MESSAGE_CURRENT_VERSION);
-        proto_message.write_to(&mut serialized);
+        proto_message.write_to(&mut size_cache, &mut serialized);
         Ok(Self {
             message_version,
             registration_id,
@@ -467,16 +468,16 @@ impl SenderKeyMessage {
             id: Some(chain_id),
             iteration: Some(iteration),
             ciphertext: Some(ciphertext.into_vec()),
-            ..Default::default()
         };
 
         // Build serialized buffer directly: [version_byte || proto || signature]
         // Sign over [version_byte || proto], then append signature
         let shifted_version = (message_version << 4) | 3u8;
-        let proto_len = proto_message.compute_size() as usize;
+        let mut size_cache = buffa::SizeCache::new();
+        let proto_len = proto_message.compute_size(&mut size_cache) as usize;
         let mut serialized = Vec::with_capacity(1 + proto_len + Self::SIGNATURE_LEN);
         serialized.push(shifted_version);
-        proto_message.write_to(&mut serialized);
+        proto_message.write_to(&mut size_cache, &mut serialized);
 
         // Sign the data we've built so far (version + proto)
         let signature = signature_key
@@ -626,11 +627,12 @@ impl SenderKeyDistributionMessage {
             iteration: Some(iteration),
             chain_key: Some(chain_key.to_vec()),
             signing_key: Some(signing_key.serialize().to_vec()),
-            ..Default::default()
         };
-        let mut serialized = Vec::with_capacity(1 + proto_message.compute_size() as usize);
+        let mut size_cache = buffa::SizeCache::new();
+        let message_len = proto_message.compute_size(&mut size_cache) as usize;
+        let mut serialized = Vec::with_capacity(1 + message_len);
         serialized.push(((message_version & 0xF) << 4) | SENDERKEY_MESSAGE_CURRENT_VERSION);
-        proto_message.write_to(&mut serialized);
+        proto_message.write_to(&mut size_cache, &mut serialized);
 
         Ok(Self {
             message_version,
@@ -770,11 +772,9 @@ pub struct DecryptionErrorMessageProto {
     pub ratchet_key: Option<Vec<u8>>,
     pub timestamp: Option<u64>,
     pub device_id: Option<u32>,
-    __buffa_cached_size: buffa::__private::CachedSize,
 }
 
-#[allow(unsafe_code)]
-unsafe impl buffa::DefaultInstance for DecryptionErrorMessageProto {
+impl buffa::DefaultInstance for DecryptionErrorMessageProto {
     fn default_instance() -> &'static Self {
         static VALUE: buffa::__private::OnceBox<DecryptionErrorMessageProto> =
             buffa::__private::OnceBox::new();
@@ -783,7 +783,7 @@ unsafe impl buffa::DefaultInstance for DecryptionErrorMessageProto {
 }
 
 impl buffa::Message for DecryptionErrorMessageProto {
-    fn compute_size(&self) -> u32 {
+    fn compute_size(&self, _cache: &mut buffa::SizeCache) -> u32 {
         let mut size = 0u32;
         if let Some(ref v) = self.ratchet_key {
             size += 1 + buffa::types::bytes_encoded_len(v) as u32;
@@ -794,11 +794,10 @@ impl buffa::Message for DecryptionErrorMessageProto {
         if let Some(v) = self.device_id {
             size += 1 + buffa::types::uint32_encoded_len(v) as u32;
         }
-        self.__buffa_cached_size.set(size);
         size
     }
 
-    fn write_to(&self, buf: &mut impl buffa::bytes::BufMut) {
+    fn write_to(&self, _cache: &mut buffa::SizeCache, buf: &mut impl buffa::bytes::BufMut) {
         if let Some(ref v) = self.ratchet_key {
             buffa::encoding::Tag::new(1, buffa::encoding::WireType::LengthDelimited).encode(buf);
             buffa::types::encode_bytes(v, buf);
@@ -836,15 +835,10 @@ impl buffa::Message for DecryptionErrorMessageProto {
         Ok(())
     }
 
-    fn cached_size(&self) -> u32 {
-        self.__buffa_cached_size.get()
-    }
-
     fn clear(&mut self) {
         self.ratchet_key = None;
         self.timestamp = None;
         self.device_id = None;
-        self.__buffa_cached_size.set(0);
     }
 }
 
@@ -902,7 +896,6 @@ impl DecryptionErrorMessage {
             timestamp: Some(original_timestamp.epoch_millis()),
             ratchet_key: ratchet_key.map(|k| k.serialize().into()),
             device_id: Some(original_sender_device_id),
-            ..Default::default()
         };
         let serialized = proto_message.encode_to_vec();
 
@@ -956,5 +949,29 @@ impl TryFrom<&[u8]> for DecryptionErrorMessage {
             device_id,
             serialized: Box::from(value),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decryption_error_proto_uses_buffa_size_cache_encoding() {
+        let proto = DecryptionErrorMessageProto {
+            ratchet_key: Some(vec![1, 2, 3]),
+            timestamp: Some(150),
+            device_id: Some(7),
+        };
+
+        let bytes = proto.encode_to_vec();
+        assert_eq!(bytes, [0x0a, 3, 1, 2, 3, 0x10, 0x96, 0x01, 0x18, 7]);
+        assert_eq!(proto.encoded_len() as usize, bytes.len());
+
+        let decoded =
+            DecryptionErrorMessageProto::decode_from_slice(&bytes).expect("decode test proto");
+        assert_eq!(decoded.ratchet_key.as_deref(), Some(&[1, 2, 3][..]));
+        assert_eq!(decoded.timestamp, Some(150));
+        assert_eq!(decoded.device_id, Some(7));
     }
 }

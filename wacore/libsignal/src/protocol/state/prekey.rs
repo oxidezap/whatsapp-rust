@@ -37,7 +37,6 @@ impl PreKeyRecord {
                 id: Some(id.into()),
                 public_key: Some(public_key),
                 private_key: Some(private_key),
-                ..Default::default()
             },
         }
     }

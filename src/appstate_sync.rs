@@ -20,7 +20,7 @@ mod tests {
     use wacore::store::error::Result as StoreResult;
     use wacore::store::traits::{
         AppStateSyncKey, AppSyncStore, DeviceListRecord, DeviceStore, LidPnMappingEntry,
-        ProtocolStore, SignalStore,
+        MsgSecretStore, ProtocolStore, SignalStore,
     };
     use waproto::whatsapp as wa;
 
@@ -164,6 +164,9 @@ mod tests {
         async fn clear_all_sender_key_devices(&self) -> StoreResult<()> {
             Ok(())
         }
+        async fn delete_sender_key_device_rows(&self, _: &[&str]) -> StoreResult<()> {
+            Ok(())
+        }
         async fn get_lid_mapping(&self, _: &str) -> StoreResult<Option<LidPnMappingEntry>> {
             Ok(None)
         }
@@ -227,6 +230,33 @@ mod tests {
         }
     }
 
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl MsgSecretStore for MockBackend {
+        async fn put_msg_secret(
+            &self,
+            _chat: &str,
+            _sender: &str,
+            _msg_id: &str,
+            _secret: &[u8],
+        ) -> StoreResult<()> {
+            Ok(())
+        }
+
+        async fn get_msg_secret(
+            &self,
+            _chat: &str,
+            _sender: &str,
+            _msg_id: &str,
+        ) -> StoreResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        async fn delete_expired_msg_secrets(&self, _cutoff: i64) -> StoreResult<u32> {
+            Ok(0)
+        }
+    }
+
     // Implement DeviceStore - Device persistence
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -268,19 +298,14 @@ mod tests {
             record: buffa::MessageField::some(wa::SyncdRecord {
                 index: buffa::MessageField::some(wa::SyncdIndex {
                     blob: Some(index_mac.to_vec()),
-                    ..Default::default()
                 }),
                 value: buffa::MessageField::some(wa::SyncdValue {
                     blob: Some(value_blob),
-                    ..Default::default()
                 }),
                 key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id_bytes.to_vec()),
-                    ..Default::default()
                 }),
-                ..Default::default()
             }),
-            ..Default::default()
         }
     }
 
@@ -375,13 +400,9 @@ mod tests {
             has_more_patches: false,
             patches: vec![wa::SyncdPatch {
                 mutations: vec![overwrite_mutation.clone()],
-                version: buffa::MessageField::some(wa::SyncdVersion {
-                    version: Some(2),
-                    ..Default::default()
-                }),
+                version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
                 key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id_bytes),
-                    ..Default::default()
                 }),
                 ..Default::default()
             }],

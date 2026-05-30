@@ -36,10 +36,8 @@ pub fn message_range(
             .map(|(key, ts)| wa::sync_action_value::SyncActionMessage {
                 key: buffa::MessageField::some(key),
                 timestamp: Some(ts),
-                ..Default::default()
             })
             .collect(),
-        ..Default::default()
     }
 }
 
@@ -54,7 +52,6 @@ pub fn message_key(
         remote_jid: Some(remote_jid.to_string()),
         from_me: Some(from_me),
         participant: participant.map(|j| j.to_string()),
-        ..Default::default()
     }
 }
 
@@ -395,7 +392,6 @@ impl<'a> ChatActions<'a> {
                 wa::sync_action_value::MarkChatAsReadAction {
                     read: Some(read),
                     message_range: message_range.into(),
-                    ..Default::default()
                 },
             ),
             timestamp: Some(wacore::time::now_millis()),
@@ -418,7 +414,6 @@ impl<'a> ChatActions<'a> {
             delete_chat_action: buffa::MessageField::some(
                 wa::sync_action_value::DeleteChatAction {
                     message_range: message_range.into(),
-                    ..Default::default()
                 },
             ),
             timestamp: Some(wacore::time::now_millis()),
@@ -452,7 +447,6 @@ impl<'a> ChatActions<'a> {
                 wa::sync_action_value::DeleteMessageForMeAction {
                     delete_media: Some(delete_media),
                     message_timestamp,
-                    ..Default::default()
                 },
             ),
             timestamp: Some(wacore::time::now_millis()),
@@ -474,7 +468,6 @@ impl<'a> ChatActions<'a> {
                 wa::sync_action_value::ArchiveChatAction {
                     archived: Some(archived),
                     message_range: message_range.into(),
-                    ..Default::default()
                 },
             ),
             timestamp: Some(wacore::time::now_millis()),
@@ -489,7 +482,6 @@ impl<'a> ChatActions<'a> {
         let value = wa::SyncActionValue {
             pin_action: buffa::MessageField::some(wa::sync_action_value::PinAction {
                 pinned: Some(pinned),
-                ..Default::default()
             }),
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
@@ -537,7 +529,6 @@ impl<'a> ChatActions<'a> {
         let value = wa::SyncActionValue {
             star_action: buffa::MessageField::some(wa::sync_action_value::StarAction {
                 starred: Some(starred),
-                ..Default::default()
             }),
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()

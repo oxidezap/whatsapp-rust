@@ -50,6 +50,9 @@ thread_local! {
     static DECRYPTION_BUFFER: RefCell<CryptoBuffer> = RefCell::new(CryptoBuffer::new());
 }
 
+/// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
+/// across this call (and any paired SKDM creation) so the load/advance/store
+/// of the chain is atomic against concurrent encrypts.
 pub async fn group_encrypt<R: Rng + CryptoRng>(
     sender_key_store: &mut dyn SenderKeyStore,
     sender_key_name: &SenderKeyName,

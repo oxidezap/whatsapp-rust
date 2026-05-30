@@ -417,17 +417,13 @@ mod tests {
         wa::SyncdRecord {
             index: buffa::MessageField::some(wa::SyncdIndex {
                 blob: Some(index_mac.to_vec()),
-                ..Default::default()
             }),
             value: buffa::MessageField::some(wa::SyncdValue {
                 blob: Some(value_blob),
-                ..Default::default()
             }),
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.to_vec()),
-                ..Default::default()
             }),
-            ..Default::default()
         }
     }
 
@@ -447,14 +443,10 @@ mod tests {
         );
 
         let snapshot = wa::SyncdSnapshot {
-            version: buffa::MessageField::some(wa::SyncdVersion {
-                version: Some(1),
-                ..Default::default()
-            }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             records: vec![record],
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -493,18 +485,13 @@ mod tests {
         );
 
         let patch = wa::SyncdPatch {
-            version: buffa::MessageField::some(wa::SyncdVersion {
-                version: Some(2),
-                ..Default::default()
-            }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
             mutations: vec![wa::SyncdMutation {
                 operation: Some(wa::syncd_mutation::SyncdOperation::SET),
                 record: buffa::MessageField::some(record),
-                ..Default::default()
             }],
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -546,14 +533,10 @@ mod tests {
 
         // Process initial snapshot to get starting state
         let snapshot = wa::SyncdSnapshot {
-            version: buffa::MessageField::some(wa::SyncdVersion {
-                version: Some(1),
-                ..Default::default()
-            }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             records: vec![initial_record],
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -574,18 +557,13 @@ mod tests {
         );
 
         let patch = wa::SyncdPatch {
-            version: buffa::MessageField::some(wa::SyncdVersion {
-                version: Some(2),
-                ..Default::default()
-            }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
             mutations: vec![wa::SyncdMutation {
                 operation: Some(wa::syncd_mutation::SyncdOperation::SET),
                 record: buffa::MessageField::some(overwrite_record.clone()),
-                ..Default::default()
             }],
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -665,18 +643,13 @@ mod tests {
 
         // Patch claims version 3 (rollback: 3 < 5 + 1)
         let patch = wa::SyncdPatch {
-            version: buffa::MessageField::some(wa::SyncdVersion {
-                version: Some(3),
-                ..Default::default()
-            }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(3) }),
             mutations: vec![wa::SyncdMutation {
                 operation: Some(wa::syncd_mutation::SyncdOperation::SET),
                 record: buffa::MessageField::some(record),
-                ..Default::default()
             }],
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -724,18 +697,13 @@ mod tests {
 
         // Patch claims version 8 (gap: 8 != 5 + 1)
         let patch = wa::SyncdPatch {
-            version: buffa::MessageField::some(wa::SyncdVersion {
-                version: Some(8),
-                ..Default::default()
-            }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(8) }),
             mutations: vec![wa::SyncdMutation {
                 operation: Some(wa::syncd_mutation::SyncdOperation::SET),
                 record: buffa::MessageField::some(record),
-                ..Default::default()
             }],
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -782,18 +750,13 @@ mod tests {
 
         // Patch version 6 (exactly local + 1)
         let patch = wa::SyncdPatch {
-            version: buffa::MessageField::some(wa::SyncdVersion {
-                version: Some(6),
-                ..Default::default()
-            }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(6) }),
             mutations: vec![wa::SyncdMutation {
                 operation: Some(wa::syncd_mutation::SyncdOperation::SET),
                 record: buffa::MessageField::some(record),
-                ..Default::default()
             }],
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -829,18 +792,13 @@ mod tests {
 
         // Patch version 42 — should be accepted since no prior state
         let patch = wa::SyncdPatch {
-            version: buffa::MessageField::some(wa::SyncdVersion {
-                version: Some(42),
-                ..Default::default()
-            }),
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(42) }),
             mutations: vec![wa::SyncdMutation {
                 operation: Some(wa::syncd_mutation::SyncdOperation::SET),
                 record: buffa::MessageField::some(record),
-                ..Default::default()
             }],
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
-                ..Default::default()
             }),
             ..Default::default()
         };

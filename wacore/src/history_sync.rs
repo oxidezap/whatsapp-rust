@@ -22,6 +22,7 @@ pub struct HistorySyncResult {
     pub conversations_processed: usize,
     /// Tctoken candidates extracted from 1:1 conversations during streaming.
     pub tc_token_candidates: Vec<TcTokenCandidate>,
+    pub msg_secret_records: Vec<HistoryMsgSecretRecord>,
     /// The full decompressed protobuf blob, only retained when event
     /// listeners exist. Wrapped in `LazyHistorySync` for on-demand decoding.
     pub decompressed_bytes: Option<Bytes>,
@@ -36,11 +37,9 @@ mod wire_type {
 
 /// Decompress and process a history sync blob.
 ///
-/// **Memory strategy**: Decompresses the entire blob into a single `Bytes` buffer,
-/// then extracts conversation fields as zero-copy `Bytes::slice()` sub-views.
-/// This trades a slightly higher peak (full decompressed blob in memory) for
-/// **zero per-conversation heap allocations** — each conversation is just an
-/// Arc refcount increment on the shared buffer.
+/// **Memory strategy**: Decompresses the entire blob into a single `Bytes`
+/// buffer, then scans top-level fields and partially decodes only the
+/// conversation fields needed for internal caches.
 ///
 /// After decompression, the compressed input is dropped immediately, so peak
 /// memory = max(compressed, decompressed) + small overhead, not both.
@@ -65,6 +64,7 @@ pub fn process_history_sync(
         nct_salt: None,
         conversations_processed: 0,
         tc_token_candidates: Vec::new(),
+        msg_secret_records: Vec::new(),
         decompressed_bytes: if retain_blob { Some(buf.clone()) } else { None },
     };
 
@@ -83,14 +83,23 @@ pub fn process_history_sync(
                 let end = checked_end(pos, len, buf.len(), "conversation")?;
 
                 result.conversations_processed += 1;
-                if let Some(candidate) = extract_tc_token_fields(&buf[pos..end]) {
+                let extracted = extract_conversation_fields(&buf[pos..end]);
+                if let Some(candidate) = extracted.tc_token_candidate {
                     result.tc_token_candidates.push(candidate);
                 }
+                result
+                    .msg_secret_records
+                    .extend(extracted.msg_secret_records);
                 pos = end;
             }
 
-            // field 7 = pushnames (repeated, length-delimited)
-            7 if let Some(own) = own_user
+            // field 7 = pushnames (repeated, length-delimited).
+            // Uses `Option::is_some()` in the guard rather than an
+            // `if let` guard — the latter requires Rust 1.94+. The inner
+            // `if let` is the defensive complement: if the guard's
+            // invariant is ever weakened by a future refactor, we skip
+            // the arm body instead of panicking.
+            7 if own_user.is_some()
                 && result.own_pushname.is_none()
                 && wire_type_raw == wire_type::LENGTH_DELIMITED =>
             {
@@ -98,7 +107,9 @@ pub fn process_history_sync(
                 pos += vlen;
                 let end = checked_end(pos, len, buf.len(), "pushname")?;
 
-                if let Some(name) = extract_own_pushname(&buf[pos..end], own) {
+                if let Some(own) = own_user
+                    && let Some(name) = extract_own_pushname(&buf[pos..end], own)
+                {
                     result.own_pushname = Some(name);
                 }
                 pos = end;
@@ -243,15 +254,70 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
     if id_match { pushname } else { None }
 }
 
-/// Extract tctoken candidate from a raw Conversation proto.
-/// Manual partial decode (only fields 1/21/22/28, skips heavy messages).
-/// Returns `None` for groups, newsletters, bots, or conversations without tctokens.
-pub(crate) fn extract_tc_token_fields(data: &[u8]) -> Option<TcTokenCandidate> {
+struct ConversationExtraction {
+    tc_token_candidate: Option<TcTokenCandidate>,
+    msg_secret_records: Vec<HistoryMsgSecretRecord>,
+}
+
+/// Message-secret data extracted from a conversation during streaming.
+#[derive(Debug)]
+pub struct HistoryMsgSecretRecord {
+    pub chat_id: String,
+    pub from_me: bool,
+    pub key_participant: Option<String>,
+    pub web_msg_participant: Option<String>,
+    pub msg_id: String,
+    pub secret: Vec<u8>,
+}
+
+struct ConversationInternalFields<'a> {
+    id: Option<String>,
+    messages: Vec<&'a [u8]>,
+    tc_token: Option<Vec<u8>>,
+    tc_token_timestamp: Option<u64>,
+    tc_token_sender_timestamp: Option<u64>,
+}
+
+struct WebMessageInfoInternalFields {
+    key: Option<MessageKeyInternalFields>,
+    participant: Option<String>,
+    message_secret: Option<Vec<u8>>,
+    message_context_secret: Option<Vec<u8>>,
+    message_is_forwarded: bool,
+}
+
+struct MessageKeyInternalFields {
+    from_me: Option<bool>,
+    id: Option<String>,
+    participant: Option<String>,
+}
+
+fn extract_conversation_fields(data: &[u8]) -> ConversationExtraction {
+    let Some(conv) = parse_conversation_internal_fields(data) else {
+        return ConversationExtraction {
+            tc_token_candidate: None,
+            msg_secret_records: Vec::new(),
+        };
+    };
+
+    let tc_token_candidate = extract_tc_token_fields(&conv);
+    let msg_secret_records = extract_msg_secret_records(&conv);
+
+    ConversationExtraction {
+        tc_token_candidate,
+        msg_secret_records,
+    }
+}
+
+fn parse_conversation_internal_fields(data: &[u8]) -> Option<ConversationInternalFields<'_>> {
     let mut pos = 0;
-    let mut id: Option<String> = None;
-    let mut tc_token: Option<Vec<u8>> = None;
-    let mut tc_token_timestamp: Option<u64> = None;
-    let mut tc_token_sender_timestamp: Option<u64> = None;
+    let mut conv = ConversationInternalFields {
+        id: None,
+        messages: Vec::new(),
+        tc_token: None,
+        tc_token_timestamp: None,
+        tc_token_sender_timestamp: None,
+    };
 
     while pos < data.len() {
         let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
@@ -260,35 +326,24 @@ pub(crate) fn extract_tc_token_fields(data: &[u8]) -> Option<TcTokenCandidate> {
         let wt = (tag & 0x7) as u32;
 
         match field_number {
-            // id (tag 1, string)
             1 if wt == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(data.get(pos..)?).ok()?;
-                pos += vlen;
-                let len = usize::try_from(len).ok()?;
-                let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
-                id = Some(std::str::from_utf8(data.get(pos..end)?).ok()?.to_string());
-                pos = end;
+                conv.id = Some(read_string(data, &mut pos)?.to_string());
             }
-            // tc_token (tag 21, bytes)
+            2 if wt == wire_type::LENGTH_DELIMITED => {
+                conv.messages.push(read_length_delimited(data, &mut pos)?);
+            }
             21 if wt == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(data.get(pos..)?).ok()?;
-                pos += vlen;
-                let len = usize::try_from(len).ok()?;
-                let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
-                tc_token = Some(data[pos..end].to_vec());
-                pos = end;
+                conv.tc_token = Some(read_length_delimited(data, &mut pos)?.to_vec());
             }
-            // tc_token_timestamp (tag 22, uint64)
             22 if wt == wire_type::VARINT => {
                 let (val, vlen) = read_varint(data.get(pos..)?).ok()?;
                 pos += vlen;
-                tc_token_timestamp = Some(val);
+                conv.tc_token_timestamp = Some(val);
             }
-            // tc_token_sender_timestamp (tag 28, uint64)
             28 if wt == wire_type::VARINT => {
                 let (val, vlen) = read_varint(data.get(pos..)?).ok()?;
                 pos += vlen;
-                tc_token_sender_timestamp = Some(val);
+                conv.tc_token_sender_timestamp = Some(val);
             }
             _ => {
                 pos = skip_field(wt, data, pos).ok()?;
@@ -296,24 +351,404 @@ pub(crate) fn extract_tc_token_fields(data: &[u8]) -> Option<TcTokenCandidate> {
         }
     }
 
-    let id = id?;
+    Some(conv)
+}
+
+/// Returns `None` for groups, newsletters, bots, or conversations without tctokens.
+fn extract_tc_token_fields(conv: &ConversationInternalFields<'_>) -> Option<TcTokenCandidate> {
+    let id = conv.id.as_ref()?;
 
     // Early-out for non-1:1 conversations
-    if let Some(parts) = wacore_binary::jid::parse_jid_fast(&id)
+    if let Some(parts) = wacore_binary::jid::parse_jid_fast(id)
         && (parts.server == "g.us" || parts.server == "newsletter" || parts.server == "bot")
     {
         return None;
     }
 
-    let tc_token = tc_token.filter(|t| !t.is_empty())?;
-    let tc_token_timestamp = tc_token_timestamp?;
+    let tc_token = conv.tc_token.as_ref().filter(|t| !t.is_empty())?.clone();
+    let tc_token_timestamp = conv.tc_token_timestamp?;
 
     Some(TcTokenCandidate {
-        id,
+        id: id.clone(),
         tc_token,
         tc_token_timestamp,
-        tc_token_sender_timestamp,
+        tc_token_sender_timestamp: conv.tc_token_sender_timestamp,
     })
+}
+
+fn extract_msg_secret_records(
+    conv: &ConversationInternalFields<'_>,
+) -> Vec<HistoryMsgSecretRecord> {
+    let mut records = Vec::new();
+    let Some(chat_id) = conv.id.as_ref() else {
+        return records;
+    };
+
+    for history_msg in &conv.messages {
+        let Some(web_msg) = parse_history_sync_msg_internal_fields(history_msg) else {
+            continue;
+        };
+        let Some(key) = web_msg.key.as_ref() else {
+            continue;
+        };
+        let Some(msg_id) = key.id.as_ref() else {
+            continue;
+        };
+        if web_msg.message_is_forwarded {
+            continue;
+        }
+        let Some(secret) = web_msg
+            .message_secret
+            .as_ref()
+            .or(web_msg.message_context_secret.as_ref())
+        else {
+            continue;
+        };
+
+        records.push(HistoryMsgSecretRecord {
+            chat_id: chat_id.clone(),
+            from_me: key.from_me == Some(true),
+            key_participant: key.participant.clone(),
+            web_msg_participant: web_msg.participant.clone(),
+            msg_id: msg_id.clone(),
+            secret: secret.clone(),
+        });
+    }
+
+    records
+}
+
+fn parse_history_sync_msg_internal_fields(data: &[u8]) -> Option<WebMessageInfoInternalFields> {
+    let mut pos = 0;
+    let mut web_msg = None;
+
+    while pos < data.len() {
+        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
+        pos += bytes_read;
+        let field_number = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+
+        match field_number {
+            1 if wt == wire_type::LENGTH_DELIMITED => {
+                web_msg =
+                    parse_web_message_info_internal_fields(read_length_delimited(data, &mut pos)?);
+            }
+            _ => pos = skip_field(wt, data, pos).ok()?,
+        }
+    }
+
+    web_msg
+}
+
+fn parse_web_message_info_internal_fields(data: &[u8]) -> Option<WebMessageInfoInternalFields> {
+    let mut pos = 0;
+    let mut web_msg = WebMessageInfoInternalFields {
+        key: None,
+        participant: None,
+        message_secret: None,
+        message_context_secret: None,
+        message_is_forwarded: false,
+    };
+
+    while pos < data.len() {
+        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
+        pos += bytes_read;
+        let field_number = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+
+        match field_number {
+            1 if wt == wire_type::LENGTH_DELIMITED => {
+                web_msg.key =
+                    parse_message_key_internal_fields(read_length_delimited(data, &mut pos)?);
+            }
+            2 if wt == wire_type::LENGTH_DELIMITED => {
+                let message = read_length_delimited(data, &mut pos)?;
+                web_msg.message_context_secret = extract_message_context_secret(message);
+                web_msg.message_is_forwarded = message_is_forwarded(message);
+            }
+            5 if wt == wire_type::LENGTH_DELIMITED => {
+                web_msg.participant = Some(read_string(data, &mut pos)?.to_string());
+            }
+            49 if wt == wire_type::LENGTH_DELIMITED => {
+                web_msg.message_secret = Some(read_length_delimited(data, &mut pos)?.to_vec());
+            }
+            _ => pos = skip_field(wt, data, pos).ok()?,
+        }
+    }
+
+    Some(web_msg)
+}
+
+fn parse_message_key_internal_fields(data: &[u8]) -> Option<MessageKeyInternalFields> {
+    let mut pos = 0;
+    let mut key = MessageKeyInternalFields {
+        from_me: None,
+        id: None,
+        participant: None,
+    };
+
+    while pos < data.len() {
+        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
+        pos += bytes_read;
+        let field_number = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+
+        match field_number {
+            2 if wt == wire_type::VARINT => {
+                let (val, vlen) = read_varint(data.get(pos..)?).ok()?;
+                pos += vlen;
+                key.from_me = Some(val != 0);
+            }
+            3 if wt == wire_type::LENGTH_DELIMITED => {
+                key.id = Some(read_string(data, &mut pos)?.to_string());
+            }
+            4 if wt == wire_type::LENGTH_DELIMITED => {
+                key.participant = Some(read_string(data, &mut pos)?.to_string());
+            }
+            _ => pos = skip_field(wt, data, pos).ok()?,
+        }
+    }
+
+    Some(key)
+}
+
+fn extract_message_context_secret(data: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0;
+
+    while pos < data.len() {
+        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
+        pos += bytes_read;
+        let field_number = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+
+        match field_number {
+            35 if wt == wire_type::LENGTH_DELIMITED => {
+                if let Some(secret) =
+                    extract_message_context_info_secret(read_length_delimited(data, &mut pos)?)
+                {
+                    return Some(secret);
+                }
+            }
+            _ => pos = skip_field(wt, data, pos).ok()?,
+        }
+    }
+
+    None
+}
+
+fn extract_message_context_info_secret(data: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0;
+
+    while pos < data.len() {
+        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
+        pos += bytes_read;
+        let field_number = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+
+        match field_number {
+            3 if wt == wire_type::LENGTH_DELIMITED => {
+                return Some(read_length_delimited(data, &mut pos)?.to_vec());
+            }
+            _ => pos = skip_field(wt, data, pos).ok()?,
+        }
+    }
+
+    None
+}
+
+fn message_is_forwarded(data: &[u8]) -> bool {
+    message_is_forwarded_at_depth(data, 0)
+}
+
+fn message_is_forwarded_at_depth(data: &[u8], depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
+
+    let mut pos = 0;
+    let mut current_forwarded = false;
+    let mut device_sent_inner = None;
+    let mut ephemeral_inner = None;
+    let mut view_once_inner = None;
+    let mut view_once_v2_inner = None;
+    let mut view_once_v2_extension_inner = None;
+    let mut document_with_caption_inner = None;
+    let mut edited_inner = None;
+    let mut group_mentioned_inner = None;
+    let mut bot_invoke_inner = None;
+    let mut poll_creation_option_image_inner = None;
+    let mut associated_child_inner = None;
+
+    while pos < data.len() {
+        let Some((tag, bytes_read)) = read_varint(data.get(pos..).unwrap_or_default()).ok() else {
+            return false;
+        };
+        pos += bytes_read;
+        let field_number = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+
+        if wt == wire_type::LENGTH_DELIMITED {
+            let Some(value) = read_length_delimited(data, &mut pos) else {
+                return false;
+            };
+            match field_number {
+                31 => device_sent_inner = extract_wrapper_message(value, 2),
+                37 => view_once_inner = extract_wrapper_message(value, 1),
+                40 => ephemeral_inner = extract_wrapper_message(value, 1),
+                53 => document_with_caption_inner = extract_wrapper_message(value, 1),
+                55 => view_once_v2_inner = extract_wrapper_message(value, 1),
+                58 => edited_inner = extract_wrapper_message(value, 1),
+                59 => view_once_v2_extension_inner = extract_wrapper_message(value, 1),
+                62 => group_mentioned_inner = extract_wrapper_message(value, 1),
+                67 => bot_invoke_inner = extract_wrapper_message(value, 1),
+                90 => poll_creation_option_image_inner = extract_wrapper_message(value, 1),
+                91 => associated_child_inner = extract_wrapper_message(value, 1),
+                field => {
+                    if let Some(context_tag) = context_info_field_tag(field)
+                        && context_info_carrier_is_forwarded(value, context_tag)
+                    {
+                        current_forwarded = true;
+                    }
+                }
+            }
+        } else {
+            let Ok(new_pos) = skip_field(wt, data, pos) else {
+                return false;
+            };
+            pos = new_pos;
+        }
+    }
+
+    if let Some(inner) = [
+        device_sent_inner,
+        ephemeral_inner,
+        view_once_inner,
+        view_once_v2_inner,
+        view_once_v2_extension_inner,
+        document_with_caption_inner,
+        edited_inner,
+        group_mentioned_inner,
+        bot_invoke_inner,
+        poll_creation_option_image_inner,
+        associated_child_inner,
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    {
+        return message_is_forwarded_at_depth(inner, depth + 1);
+    }
+
+    current_forwarded
+}
+
+fn extract_wrapper_message(data: &[u8], message_field: u32) -> Option<&[u8]> {
+    let mut pos = 0;
+
+    while pos < data.len() {
+        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
+        pos += bytes_read;
+        let field_number = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+
+        match field_number {
+            n if n == message_field && wt == wire_type::LENGTH_DELIMITED => {
+                return read_length_delimited(data, &mut pos);
+            }
+            _ => pos = skip_field(wt, data, pos).ok()?,
+        }
+    }
+
+    None
+}
+
+fn context_info_field_tag(message_field: u32) -> Option<u32> {
+    match message_field {
+        75 => Some(1),
+        25 | 29 | 43 => Some(3),
+        39 => Some(4),
+        49 | 60 | 64 => Some(5),
+        78 => Some(6),
+        28 => Some(7),
+        36 | 42 => Some(8),
+        86 => Some(11),
+        45 | 48 => Some(15),
+        3 | 4 | 5 | 6 | 7 | 8 | 9 | 13 | 18 | 26 | 30 | 38 => Some(17),
+        _ => None,
+    }
+}
+
+fn context_info_carrier_is_forwarded(data: &[u8], context_tag: u32) -> bool {
+    let mut pos = 0;
+
+    while pos < data.len() {
+        let Some((tag, bytes_read)) = read_varint(data.get(pos..).unwrap_or_default()).ok() else {
+            return false;
+        };
+        pos += bytes_read;
+        let field_number = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+
+        if field_number == context_tag && wt == wire_type::LENGTH_DELIMITED {
+            let Some(context) = read_length_delimited(data, &mut pos) else {
+                return false;
+            };
+            if context_info_is_forwarded(context) {
+                return true;
+            }
+        } else {
+            let Ok(new_pos) = skip_field(wt, data, pos) else {
+                return false;
+            };
+            pos = new_pos;
+        }
+    }
+
+    false
+}
+
+fn context_info_is_forwarded(data: &[u8]) -> bool {
+    let mut pos = 0;
+
+    while pos < data.len() {
+        let Some((tag, bytes_read)) = read_varint(data.get(pos..).unwrap_or_default()).ok() else {
+            return false;
+        };
+        pos += bytes_read;
+        let field_number = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+
+        if field_number == 22 && wt == wire_type::VARINT {
+            let Ok((val, vlen)) = read_varint(data.get(pos..).unwrap_or_default()) else {
+                return false;
+            };
+            pos += vlen;
+            if val != 0 {
+                return true;
+            }
+        } else {
+            let Ok(new_pos) = skip_field(wt, data, pos) else {
+                return false;
+            };
+            pos = new_pos;
+        }
+    }
+
+    false
+}
+
+fn read_length_delimited<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let (len, vlen) = read_varint(data.get(*pos..)?).ok()?;
+    *pos += vlen;
+    let len = usize::try_from(len).ok()?;
+    let end = (*pos).checked_add(len).filter(|&e| e <= data.len())?;
+    let value = data.get(*pos..end)?;
+    *pos = end;
+    Some(value)
+}
+
+fn read_string<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a str> {
+    std::str::from_utf8(read_length_delimited(data, pos)?).ok()
 }
 
 /// Tctoken data extracted from a conversation during streaming.
@@ -379,7 +814,6 @@ mod tests {
             pushnames: vec![wa::Pushname {
                 id: Some("0000000000".into()),
                 pushname: Some("TestUser".into()),
-                ..Default::default()
             }],
             ..Default::default()
         };
@@ -389,5 +823,190 @@ mod tests {
 
         assert_eq!(result.nct_salt, Some(salt));
         assert_eq!(result.own_pushname.as_deref(), Some("TestUser"));
+    }
+
+    #[test]
+    fn test_message_secrets_extracted_from_history_sync() {
+        let chat = "5511777776666@s.whatsapp.net";
+        let participant = "5511888889999@s.whatsapp.net";
+        let top_level_secret = vec![0x44u8; 32];
+        let context_secret = vec![0x55u8; 32];
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![
+                    wa::HistorySyncMsg {
+                        message: buffa::MessageField::some(wa::WebMessageInfo {
+                            key: buffa::MessageField::some(wa::MessageKey {
+                                remote_jid: Some(chat.to_string()),
+                                from_me: Some(false),
+                                id: Some("HIST_TOP_LEVEL".to_string()),
+                                participant: Some(participant.to_string()),
+                            }),
+                            message_secret: Some(top_level_secret.clone()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    wa::HistorySyncMsg {
+                        message: buffa::MessageField::some(wa::WebMessageInfo {
+                            key: buffa::MessageField::some(wa::MessageKey {
+                                remote_jid: Some(chat.to_string()),
+                                from_me: Some(true),
+                                id: Some("HIST_CONTEXT".to_string()),
+                                participant: None,
+                            }),
+                            message: buffa::MessageField::some(wa::Message {
+                                message_context_info: buffa::MessageField::some(
+                                    wa::MessageContextInfo {
+                                        message_secret: Some(context_secret.clone()),
+                                        ..Default::default()
+                                    },
+                                ),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let compressed = encode_and_compress(&hs);
+        let result = process_history_sync(compressed, None, false, None).unwrap();
+
+        assert_eq!(result.msg_secret_records.len(), 2);
+        assert_eq!(result.msg_secret_records[0].chat_id, chat);
+        assert_eq!(result.msg_secret_records[0].msg_id, "HIST_TOP_LEVEL");
+        assert_eq!(
+            result.msg_secret_records[0].key_participant.as_deref(),
+            Some(participant)
+        );
+        assert_eq!(result.msg_secret_records[0].secret, top_level_secret);
+        assert_eq!(result.msg_secret_records[1].msg_id, "HIST_CONTEXT");
+        assert!(result.msg_secret_records[1].from_me);
+        assert_eq!(result.msg_secret_records[1].secret, context_secret);
+    }
+
+    #[test]
+    fn test_forwarded_message_secrets_skipped_from_history_sync() {
+        let chat = "5511000000001@s.whatsapp.net";
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![wa::HistorySyncMsg {
+                    message: buffa::MessageField::some(wa::WebMessageInfo {
+                        key: buffa::MessageField::some(wa::MessageKey {
+                            remote_jid: Some(chat.to_string()),
+                            from_me: Some(false),
+                            id: Some("HIST_FORWARDED".to_string()),
+                            ..Default::default()
+                        }),
+                        message: buffa::MessageField::some(wa::Message {
+                            extended_text_message: buffa::MessageField::some(
+                                wa::message::ExtendedTextMessage {
+                                    text: Some("forwarded".into()),
+                                    context_info: buffa::MessageField::some(wa::ContextInfo {
+                                        is_forwarded: Some(true),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                },
+                            ),
+                            message_context_info: buffa::MessageField::some(
+                                wa::MessageContextInfo {
+                                    message_secret: Some(vec![0x66u8; 32]),
+                                    ..Default::default()
+                                },
+                            ),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let compressed = encode_and_compress(&hs);
+        let result = process_history_sync(compressed, None, false, None).unwrap();
+
+        assert!(result.msg_secret_records.is_empty());
+    }
+
+    #[test]
+    fn test_nested_forwarded_message_secrets_skipped_from_history_sync() {
+        let chat = "5511000000002@s.whatsapp.net";
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![wa::HistorySyncMsg {
+                    message: buffa::MessageField::some(wa::WebMessageInfo {
+                        key: buffa::MessageField::some(wa::MessageKey {
+                            remote_jid: Some(chat.to_string()),
+                            from_me: Some(false),
+                            id: Some("HIST_NESTED_FORWARDED".to_string()),
+                            ..Default::default()
+                        }),
+                        message: buffa::MessageField::some(wa::Message {
+                            view_once_message: buffa::MessageField::some(
+                                wa::message::FutureProofMessage {
+                                    message: buffa::MessageField::some(wa::Message {
+                                        ephemeral_message: buffa::MessageField::some(
+                                            wa::message::FutureProofMessage {
+                                                message: buffa::MessageField::some(wa::Message {
+                                                    extended_text_message:
+                                                        buffa::MessageField::some(
+                                                            wa::message::ExtendedTextMessage {
+                                                                text: Some("nested".into()),
+                                                                context_info:
+                                                                    buffa::MessageField::some(
+                                                                        wa::ContextInfo {
+                                                                            is_forwarded: Some(
+                                                                                true,
+                                                                            ),
+                                                                            ..Default::default()
+                                                                        },
+                                                                    ),
+                                                                ..Default::default()
+                                                            },
+                                                        ),
+                                                    ..Default::default()
+                                                }),
+                                            },
+                                        ),
+                                        ..Default::default()
+                                    }),
+                                },
+                            ),
+                            message_context_info: buffa::MessageField::some(
+                                wa::MessageContextInfo {
+                                    message_secret: Some(vec![0x77u8; 32]),
+                                    ..Default::default()
+                                },
+                            ),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let compressed = encode_and_compress(&hs);
+        let result = process_history_sync(compressed, None, false, None).unwrap();
+
+        assert!(result.msg_secret_records.is_empty());
     }
 }

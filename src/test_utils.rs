@@ -48,6 +48,18 @@ pub async fn create_test_client() -> Arc<Client> {
 }
 
 pub async fn create_test_client_with_name(name: &str) -> Arc<Client> {
+    create_test_client_with_http(name, Arc::new(MockHttpClient)).await
+}
+
+pub async fn create_test_client_with_failing_http(name: &str) -> Arc<Client> {
+    create_test_client_with_http(name, Arc::new(FailingMockHttpClient)).await
+}
+
+/// Build an isolated in-memory test client backed by the given HTTP client.
+pub async fn create_test_client_with_http(
+    name: &str,
+    http_client: Arc<dyn HttpClient>,
+) -> Arc<Client> {
     use portable_atomic::AtomicU64;
     use std::sync::atomic::Ordering;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -76,44 +88,7 @@ pub async fn create_test_client_with_name(name: &str) -> Arc<Client> {
         Arc::new(TokioRuntime),
         pm,
         Arc::new(MockTransportFactory::new()),
-        Arc::new(MockHttpClient),
-        None,
-    )
-    .await;
-
-    client
-}
-
-pub async fn create_test_client_with_failing_http(name: &str) -> Arc<Client> {
-    use portable_atomic::AtomicU64;
-    use std::sync::atomic::Ordering;
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let unique_id = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let db_name = format!(
-        "file:memdb_fail_{}_{}_{}?mode=memory&cache=shared",
-        name,
-        unique_id,
-        std::process::id()
-    );
-
-    let backend = Arc::new(
-        SqliteStore::new(&db_name)
-            .await
-            .expect("test backend should initialize"),
-    ) as Arc<dyn Backend>;
-
-    let pm = Arc::new(
-        PersistenceManager::new(backend)
-            .await
-            .expect("persistence manager should initialize"),
-    );
-
-    let (client, _rx) = Client::new(
-        Arc::new(TokioRuntime),
-        pm,
-        Arc::new(MockTransportFactory::new()),
-        Arc::new(FailingMockHttpClient),
+        http_client,
         None,
     )
     .await;

@@ -252,6 +252,31 @@ impl Client {
         Ok(())
     }
 
+    /// Fetch a first-party sticker pack's metadata and sticker list from the CDN.
+    ///
+    /// Each returned [`wacore::sticker_pack::StickerPackItem`] is [`Downloadable`],
+    /// so individual stickers can be fetched with [`Self::download`]. The locale
+    /// only affects localized pack names; `"en"` mirrors whatsmeow's default.
+    pub async fn fetch_sticker_pack(
+        &self,
+        pack_id: &str,
+        locale: &str,
+    ) -> Result<wacore::sticker_pack::StickerPack> {
+        let url = wacore::sticker_pack::sticker_pack_data_url(pack_id, locale);
+        let response = self
+            .http_client
+            .execute(crate::http::HttpRequest::get(&url))
+            .await
+            .map_err(|e| anyhow!("sticker pack request failed: {e}"))?;
+        if response.status_code != 200 {
+            return Err(anyhow!(
+                "sticker pack endpoint returned status {}",
+                response.status_code
+            ));
+        }
+        wacore::sticker_pack::parse_sticker_pack_response(&response.body)
+    }
+
     /// Downloads and decrypts media from raw parameters without needing the original message.
     pub async fn download_from_params(
         &self,
@@ -778,5 +803,68 @@ mod tests {
         assert_eq!(seen_urls.len(), 2);
         assert!(seen_urls[0].contains("auth=stale-auth"));
         assert!(seen_urls[1].contains("auth=fresh-auth"));
+    }
+
+    /// HTTP client that records the requested URL and returns a canned response.
+    struct CannedHttpClient {
+        status: u16,
+        body: Vec<u8>,
+        seen_url: Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::http::HttpClient for CannedHttpClient {
+        async fn execute(
+            &self,
+            request: crate::http::HttpRequest,
+        ) -> Result<crate::http::HttpResponse> {
+            *self.seen_url.lock().await = Some(request.url);
+            Ok(crate::http::HttpResponse {
+                status_code: self.status,
+                body: self.body.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_sticker_pack_hits_cdn_and_parses() {
+        use base64::engine::{Engine, general_purpose::STANDARD};
+        let body = format!(
+            r#"[{{"sticker-pack-id":"P1","name":"Cats","stickers":[
+                {{"media-key":"{}","file-hash":"{}","enc-file-hash":"{}","direct-path":"/d","file-size":9}}
+            ]}}]"#,
+            STANDARD.encode([1u8; 32]),
+            STANDARD.encode([2u8; 32]),
+            STANDARD.encode([3u8; 32]),
+        );
+        let http = Arc::new(CannedHttpClient {
+            status: 200,
+            body: body.into_bytes(),
+            seen_url: Mutex::new(None),
+        });
+        let client =
+            crate::test_utils::create_test_client_with_http("sticker_fetch", http.clone()).await;
+
+        let pack = client.fetch_sticker_pack("P1", "en").await.unwrap();
+        assert_eq!(pack.sticker_pack_id.as_deref(), Some("P1"));
+        assert_eq!(pack.stickers.len(), 1);
+        assert_eq!(pack.stickers[0].direct_path(), Some("/d"));
+
+        let url = http.seen_url.lock().await.clone().unwrap();
+        assert_eq!(
+            url,
+            "https://static.whatsapp.net/sticker?lottie=1&cat=sticker_pack_data&id=P1&lg=en"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_sticker_pack_errors_on_non_200() {
+        let http = Arc::new(CannedHttpClient {
+            status: 404,
+            body: Vec::new(),
+            seen_url: Mutex::new(None),
+        });
+        let client = crate::test_utils::create_test_client_with_http("sticker_404", http).await;
+        assert!(client.fetch_sticker_pack("P1", "en").await.is_err());
     }
 }

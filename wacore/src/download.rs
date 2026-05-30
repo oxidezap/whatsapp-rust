@@ -1,4 +1,7 @@
-use crate::libsignal::crypto::{CryptographicMac, aes_256_cbc_decrypt_into};
+use crate::libsignal::crypto::{
+    CryptographicMac, DecryptionError as AesCbcDecryptionError, Error as CryptoError,
+    aes_256_cbc_decrypt_into,
+};
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use base64::prelude::*;
@@ -17,8 +20,10 @@ pub enum MediaDecryptionError {
     PayloadTooShort,
     #[error("invalid MAC signature")]
     InvalidMac,
-    #[error("decryption error: {0}")]
-    Decryption(String),
+    #[error("AES-CBC decryption failed")]
+    Decryption(#[source] AesCbcDecryptionError),
+    #[error("HMAC initialization failed")]
+    Mac(#[source] CryptoError),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -430,7 +435,7 @@ impl DownloadUtils {
         hmac.update(final_ciphertext);
         let expected_mac_full = hmac.finalize().into_bytes();
         let expected_mac = &expected_mac_full[..MAC_SIZE];
-        if mac_bytes != expected_mac {
+        if subtle::ConstantTimeEq::ct_eq(mac_bytes, expected_mac).unwrap_u8() == 0 {
             return Err(anyhow!("MAC mismatch"));
         }
 
@@ -497,7 +502,7 @@ impl DownloadUtils {
     pub fn decrypt_cbc(cipher_key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
         let mut output = Vec::new();
         aes_256_cbc_decrypt_into(ciphertext, cipher_key, iv, &mut output)
-            .map_err(|e| anyhow!(e.to_string()))?;
+            .map_err(anyhow::Error::new)?;
         Ok(output)
     }
 
@@ -517,19 +522,21 @@ impl DownloadUtils {
         let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, media_type)?;
 
         let computed_mac_full = {
-            let mut mac = CryptographicMac::new("HmacSha256", &mac_key)
-                .map_err(|e| MediaDecryptionError::Decryption(e.to_string()))?;
+            let mut mac =
+                CryptographicMac::new("HmacSha256", &mac_key).map_err(MediaDecryptionError::Mac)?;
             mac.update(&iv);
             mac.update(ciphertext);
             mac.finalize()
         };
-        if &computed_mac_full[..MAC_SIZE] != received_mac {
+        if subtle::ConstantTimeEq::ct_eq(&computed_mac_full[..MAC_SIZE], received_mac).unwrap_u8()
+            == 0
+        {
             return Err(MediaDecryptionError::InvalidMac);
         }
 
         let mut output = Vec::new();
         aes_256_cbc_decrypt_into(ciphertext, &cipher_key, &iv, &mut output)
-            .map_err(|e| MediaDecryptionError::Decryption(e.to_string()))?;
+            .map_err(MediaDecryptionError::Decryption)?;
         Ok(output)
     }
 }
@@ -707,5 +714,27 @@ mod tests {
             DownloadUtils::copy_and_validate_plaintext_to_writer(reader, &wrong_hash, &mut writer)
                 .unwrap_err();
         assert!(err.to_string().contains("SHA-256 mismatch"));
+    }
+
+    #[test]
+    fn media_decryption_decryption_preserves_aes_cbc_source() {
+        let inner = AesCbcDecryptionError::BadKeyOrIv;
+        let mde = MediaDecryptionError::Decryption(inner);
+        let src = std::error::Error::source(&mde).expect("source preserved");
+        let cbc = src
+            .downcast_ref::<AesCbcDecryptionError>()
+            .expect("downcasts to AesCbcDecryptionError");
+        assert!(matches!(cbc, AesCbcDecryptionError::BadKeyOrIv));
+    }
+
+    #[test]
+    fn media_decryption_mac_preserves_crypto_error_source() {
+        let inner = CryptoError::UnknownAlgorithm("MAC", "BogusAlg".into());
+        let mde = MediaDecryptionError::Mac(inner);
+        let src = std::error::Error::source(&mde).expect("source preserved");
+        let ce = src
+            .downcast_ref::<CryptoError>()
+            .expect("downcasts to CryptoError");
+        assert!(matches!(ce, CryptoError::UnknownAlgorithm("MAC", _)));
     }
 }

@@ -1,10 +1,9 @@
 //! Regression: concurrent `Client::disconnect()` must not deadlock.
 //!
-//! Bug shape (field report from the baileyrs consumer over WASM): when two
-//! or more independent clients call `disconnect()` at the same time, one
-//! hangs after logging `"Disconnecting client intentionally"` and never
-//! reaches `transport.disconnect()` — so the underlying socket never gets
-//! `close()`d.
+//! Bug shape (field report from a WASM consumer): when two or more
+//! independent clients call `disconnect()` at the same time, one hangs after
+//! logging `"Disconnecting client intentionally"` and never reaches
+//! `transport.disconnect()` — so the underlying socket never gets `close()`d.
 //!
 //! Root cause: the run loop's graceful-exit path (woken by
 //! `notify_connection_shutdown()`) raced into `cleanup_connection_state` and
@@ -15,7 +14,8 @@
 //! the transport also closes it.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use wacore::time::Instant;
 
 use e2e_tests::{TestClient, text_msg};
 use wacore::types::events::Event;

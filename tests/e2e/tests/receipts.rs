@@ -12,6 +12,7 @@ use std::time::Duration;
 use wacore::types::events::Event;
 use wacore::types::presence::ReceiptType;
 use whatsapp_rust::features::{GroupCreateOptions, GroupParticipantOptions};
+use whatsapp_rust::{NodeFilter, SendOptions};
 
 /// Both clients online: A sends message to B, A should receive a delivery receipt.
 #[tokio::test]
@@ -320,7 +321,8 @@ async fn test_group_delivery_receipt() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group created: {group_jid}");
 
     client_b.wait_for_group_notification(10).await?;
@@ -355,26 +357,41 @@ async fn test_group_delivery_receipt() -> anyhow::Result<()> {
 }
 
 /// Regression test for issue #571: disconnect must flush in-flight delivery
-/// receipts so they don't race the transport tear-down. Burst of N messages
-/// reliably hits the race window for at least one receipt.
+/// receipts before teardown. The mock server can still race receipt routing
+/// with a close frame, so this verifies the client builds the receipt stanzas;
+/// the transport ordering is covered by the unit test in `client.rs`.
 #[tokio::test]
 async fn test_delivery_receipts_flushed_on_disconnect() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let mut client_a = TestClient::connect("e2e_rcpt_flush_a").await?;
+    let client_a = TestClient::connect("e2e_rcpt_flush_a").await?;
     let mut client_b = TestClient::connect("e2e_rcpt_flush_b").await?;
 
     let jid_b = client_b.jid().await;
 
     const N: usize = 5;
     let mut msg_ids: Vec<String> = Vec::with_capacity(N);
+    let mut receipt_waiters = Vec::with_capacity(N);
     for i in 0..N {
-        let text = format!("flush burst {i}");
-        let id = client_a
+        let id = client_a.client.generate_message_id().await;
+        let receipt_waiter = client_b
             .client
-            .send_message(jid_b.clone(), text_msg(&text))
+            .wait_for_sent_node(NodeFilter::tag("receipt").attr("id", id.clone()));
+        let text = format!("flush burst {i}");
+        let returned_id = client_a
+            .client
+            .send_message_with_options(
+                jid_b.clone(),
+                text_msg(&text),
+                SendOptions {
+                    message_id: Some(id.clone()),
+                    ..Default::default()
+                },
+            )
             .await?
             .message_id;
+        assert_eq!(returned_id, id);
+        receipt_waiters.push((id.clone(), receipt_waiter));
         msg_ids.push(id);
     }
     info!("A sent {N} messages: {msg_ids:?}");
@@ -409,32 +426,14 @@ async fn test_delivery_receipts_flushed_on_disconnect() -> anyhow::Result<()> {
     client_b.disconnect().await;
     info!("B disconnected");
 
-    // Dedupe by message_id — server may coalesce or split receipt stanzas.
-    let mut pending: std::collections::HashSet<String> = msg_ids.iter().cloned().collect();
-    while !pending.is_empty() {
-        let event = client_a
-            .wait_for_event(15, |e| {
-                matches!(
-                    e,
-                    Event::Receipt(r)
-                    if r.r#type == ReceiptType::Delivered
-                        && r.message_ids.iter().any(|id| pending.contains(id))
-                )
-            })
+    for (id, waiter) in receipt_waiters {
+        let node = tokio::time::timeout(Duration::from_secs(15), waiter)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Timed out waiting for delivery receipts, still pending: {:?} ({e})",
-                    pending
-                )
-            })?;
-        if let Event::Receipt(r) = &*event {
-            for id in &r.message_ids {
-                pending.remove(id);
-            }
-        }
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for sent receipt {id}"))?
+            .map_err(|_| anyhow::anyhow!("Sent receipt waiter canceled for {id}"))?;
+        assert_eq!(node.as_node_ref().tag.as_ref(), "receipt");
     }
-    info!("A received all {N} delivery receipts");
+    info!("B flushed all {N} delivery receipt stanzas");
 
     client_a.disconnect().await;
     Ok(())
@@ -450,7 +449,7 @@ async fn test_disconnect_is_fast_with_no_pending_receipts() -> anyhow::Result<()
 
     let client = TestClient::connect("e2e_rcpt_cold_disconnect").await?;
 
-    let start = std::time::Instant::now();
+    let start = wacore::time::Instant::now();
     client.client.disconnect().await;
     let elapsed = start.elapsed();
 
@@ -489,7 +488,7 @@ async fn test_disconnect_is_fast_with_pending_receipts() -> anyhow::Result<()> {
         .wait_for_text(&format!("burst {}", N - 1), 15)
         .await?;
 
-    let start = std::time::Instant::now();
+    let start = wacore::time::Instant::now();
     client_b.client.disconnect().await;
     let elapsed = start.elapsed();
 

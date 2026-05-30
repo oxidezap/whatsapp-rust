@@ -10,7 +10,6 @@ pub fn new_pre_key_record(id: u32, key_pair: &KeyPair) -> wa::PreKeyRecordStruct
         id: Some(id),
         public_key: Some(key_pair.public_key.public_key_bytes().to_vec()),
         private_key: Some(key_pair.private_key.serialize().to_vec()),
-        ..Default::default()
     }
 }
 
@@ -31,7 +30,6 @@ pub fn new_signed_pre_key_record(
                 .try_into()
                 .expect("Timestamp conversion failed"),
         ),
-        ..Default::default()
     }
 }
 
@@ -65,7 +63,6 @@ pub fn prekey_record_to_structure(
         id: Some(record.id()?.into()),
         public_key: Some(record.key_pair()?.public_key.public_key_bytes().to_vec()),
         private_key: Some(record.key_pair()?.private_key.serialize().to_vec()),
-        ..Default::default()
     })
 }
 
@@ -155,7 +152,8 @@ mod tests {
         let key_pair = KeyPair::generate(&mut rand::rng());
         let mut signature = [0u8; 64];
         rand::rng().fill_bytes(&mut signature);
-        let timestamp = chrono::Utc::now();
+        let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("fixed timestamp is in range");
         let id = 123u32;
 
         // Create structure using new_signed_pre_key_record

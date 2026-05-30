@@ -13,7 +13,7 @@ use whatsapp_rust::waproto::whatsapp as wa;
 async fn test_initial_sync_delivers_push_name() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let mut client = TestClient::connect("e2e_as_init_sync").await?;
+    let mut client = TestClient::connect_without_push_name("e2e_as_init_sync").await?;
     client.wait_for_app_state_sync().await?;
 
     let push_name = client.client.get_push_name().await;
@@ -280,13 +280,7 @@ async fn test_multi_device_app_state_sync() -> anyhow::Result<()> {
 
     // Use a unique push name each run so the test is idempotent even if the
     // mock server persists push_name state across sessions (like the real server).
-    let new_name = format!(
-        "MultiDev_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    );
+    let new_name = format!("MultiDev_{}", wacore::time::now_millis());
     client_a1.client.profile().set_push_name(&new_name).await?;
     info!("A1 set push name to '{new_name}'");
 

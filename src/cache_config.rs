@@ -159,25 +159,32 @@ impl CacheStores {
 pub struct CacheConfig {
     /// Group metadata cache (time_to_live). Default: 1h TTL, 250 entries.
     pub group_cache: CacheEntryConfig,
-    /// Device registry cache (time_to_live). Default: 1h TTL, 5000 entries.
+    /// Device registry cache (time_to_live). Default: 1h TTL, 1000 entries.
     pub device_registry_cache: CacheEntryConfig,
-    /// LID-to-phone cache (time_to_idle). Default: 1h timeout, 10000 entries.
+    /// LID-to-phone cache. WAWebLidPnCache uses plain Maps with no expiry
+    /// and no size cap; evicting a still-valid mapping silently downgrades
+    /// Signal addresses to `@c.us`. Default: no timeout, capacity u64::MAX
+    /// (effectively unbounded — moka doesn't expose an `unbounded()` builder).
     pub lid_pn_cache: CacheEntryConfig,
     /// Optional L1 in-memory cache for sent messages (retry support).
     /// Default: capacity 0 (disabled — DB-only, matching WA Web).
     /// Set capacity > 0 to enable a fast in-memory cache in front of the DB.
     pub recent_messages: CacheEntryConfig,
-    /// Message retry counts (time_to_live). Default: 5m TTL, 1000 entries.
+    /// Message retry counts (time_to_live). Default: 1h TTL, 500 entries.
+    /// Long enough that the MAX_DECRYPT_RETRIES cap survives spaced redeliveries.
     pub message_retry_counts: CacheEntryConfig,
     /// Dedup key for `UndecryptableMessage` dispatch so a server resend of
     /// the same id does not surface a second notification. Default: 5m TTL,
     /// 1000 entries.
     pub undecryptable_dispatched: CacheEntryConfig,
-    /// PDO pending requests (time_to_live). Default: 30s TTL, 500 entries.
+    /// PDO pending requests (time_to_live). Default: 30s TTL, 200 entries.
     pub pdo_pending_requests: CacheEntryConfig,
     /// Sender key device tracking cache (time_to_idle). Default: 1h TTI, 500 entries.
     /// Caches per-group SKDM distribution state to avoid DB reads on every group send.
     pub sender_key_devices_cache: CacheEntryConfig,
+    /// Session-recreate throttle history (time_to_live). Default: 1h TTL, 256
+    /// entries. Replaces a global `Mutex<HashMap>` scanned O(n) per retry receipt.
+    pub session_recreate_history: CacheEntryConfig,
 
     // --- Coordination caches (capacity-only, no TTL) ---
     /// Per-device Signal session lock capacity. Default: 10000.
@@ -189,6 +196,13 @@ pub struct CacheConfig {
     /// TTL in seconds for sent messages in DB before periodic cleanup.
     /// 0 = no automatic cleanup. Default: 300 (5 minutes).
     pub sent_message_ttl_secs: u64,
+
+    // --- MsgSecret retention ---
+    /// TTL in seconds for stored `messageSecret` rows before periodic
+    /// cleanup. `0` (default) disables automatic pruning, matching
+    /// whatsmeow and WA Web. Set to a positive value (e.g. `30 * 86_400`
+    /// for 30 days) to bound DB growth on long-running deployments.
+    pub msg_secret_ttl_secs: u64,
 
     // --- Custom store overrides ---
     /// Per-cache custom store overrides.
@@ -215,9 +229,11 @@ impl std::fmt::Debug for CacheConfig {
             .field("undecryptable_dispatched", &self.undecryptable_dispatched)
             .field("pdo_pending_requests", &self.pdo_pending_requests)
             .field("sender_key_devices_cache", &self.sender_key_devices_cache)
+            .field("session_recreate_history", &self.session_recreate_history)
             .field("session_locks_capacity", &self.session_locks_capacity)
             .field("chat_lanes_capacity", &self.chat_lanes_capacity)
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
+            .field("msg_secret_ttl_secs", &self.msg_secret_ttl_secs)
             .field(
                 "cache_stores.group_cache",
                 &self.cache_stores.group_cache.is_some(),
@@ -241,20 +257,46 @@ impl Default for CacheConfig {
 
         Self {
             group_cache: CacheEntryConfig::new(one_hour, 250),
-            device_registry_cache: CacheEntryConfig::new(one_hour, 5_000),
-            lid_pn_cache: CacheEntryConfig::new(one_hour, 10_000),
+            device_registry_cache: CacheEntryConfig::new(one_hour, 1_000),
+            lid_pn_cache: CacheEntryConfig::new(None, u64::MAX),
             recent_messages: CacheEntryConfig::new(five_min, 0),
-            message_retry_counts: CacheEntryConfig::new(five_min, 1_000),
+            // 1h so the MAX_DECRYPT_RETRIES cap survives spaced redeliveries; a
+            // 5m TTL expired between reconnects so the count never reached the cap.
+            message_retry_counts: CacheEntryConfig::new(one_hour, 500),
             undecryptable_dispatched: CacheEntryConfig::new(five_min, 1_000),
-            pdo_pending_requests: CacheEntryConfig::new(Some(Duration::from_secs(30)), 500),
+            pdo_pending_requests: CacheEntryConfig::new(Some(Duration::from_secs(30)), 200),
             sender_key_devices_cache: CacheEntryConfig::new(one_hour, 500),
+            session_recreate_history: CacheEntryConfig::new(one_hour, 256),
             // Coordination caches hold live mutexes/senders; capacity eviction
             // while a reference is held creates a second lock for the same key,
             // breaking serialization. Size generously to avoid eviction pressure.
             session_locks_capacity: 10_000,
             chat_lanes_capacity: 5_000,
             sent_message_ttl_secs: 300,
+            // Disabled by default — match whatsmeow and WA Web (neither
+            // expires stored secrets). Callers expecting long-lived bot
+            // conversations, polls, or reactions can opt in.
+            msg_secret_ttl_secs: 0,
             cache_stores: CacheStores::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lid_pn_cache_default_is_effectively_unbounded() {
+        let cfg = CacheConfig::default();
+        assert_eq!(
+            cfg.lid_pn_cache.timeout, None,
+            "lid_pn_cache must not expire entries by time; WAWebLidPnCache uses plain Maps"
+        );
+        assert_eq!(
+            cfg.lid_pn_cache.capacity,
+            u64::MAX,
+            "lid_pn_cache must be effectively unbounded; capacity-LRU re-introduces the eviction bug at higher thresholds"
+        );
     }
 }

@@ -5,6 +5,7 @@ mod community;
 mod contacts;
 mod groups;
 mod media_reupload;
+pub mod message_edit;
 mod mex;
 pub(crate) mod newsletter;
 mod polls;
@@ -36,6 +37,8 @@ pub use groups::{
 };
 
 pub use media_reupload::{MediaRetryResult, MediaReupload, MediaReuploadRequest};
+
+pub use message_edit::{EncryptedEdit, SecretEncKind, SecretEncrypted};
 
 pub use mex::{Mex, MexError, MexErrorExtensions, MexGraphQLError, MexRequest, MexResponse};
 

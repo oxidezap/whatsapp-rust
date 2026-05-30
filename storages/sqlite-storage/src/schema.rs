@@ -71,6 +71,8 @@ diesel::table! {
         next_pre_key_id -> Integer,
         nct_salt -> Nullable<Binary>,
         server_has_prekeys -> Bool,
+        server_cert_chain -> Nullable<Binary>,
+        login_counter -> Integer,
     }
 }
 
@@ -157,6 +159,17 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    msg_secrets (chat, sender, msg_id, device_id) {
+        chat -> Text,
+        sender -> Text,
+        msg_id -> Text,
+        secret -> Binary,
+        device_id -> Integer,
+        created_at -> BigInt,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     app_state_keys,
     app_state_mutation_macs,
@@ -166,6 +179,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     device_registry,
     identities,
     lid_pn_mapping,
+    msg_secrets,
     prekeys,
     sender_key_devices,
     sender_keys,

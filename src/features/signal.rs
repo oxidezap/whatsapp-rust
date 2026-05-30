@@ -85,6 +85,11 @@ impl<'a> Signal<'a> {
             EncType::SenderKey => {
                 return Err(anyhow!("use decrypt_group_message for sender-key messages"));
             }
+            EncType::MessageSecret => {
+                return Err(anyhow!(
+                    "msmsg envelopes are not Signal messages; use the bot_message path"
+                ));
+            }
         };
 
         let encryption_jid = self.client.resolve_encryption_jid(jid).await;
@@ -121,8 +126,8 @@ impl<'a> Signal<'a> {
     /// participants when present. This matches WA Web which only creates
     /// SKDM on first group encrypt or after sender key rotation.
     ///
-    /// Not safe to call concurrently with `decrypt_group_message` for the
-    /// same group — sender key state is not internally locked.
+    /// Concurrent calls for the same `(group, sender)` are serialized on the
+    /// sender-key chain, so the SKDM and the skmsg can't be split across keys.
     pub async fn encrypt_group_message(
         &self,
         group_jid: &Jid,
@@ -131,6 +136,14 @@ impl<'a> Signal<'a> {
         let own_jid = self.client.get_own_jid_for_group(group_jid).await?;
         let sender_addr = own_jid.to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_addr);
+
+        // Serialize the key-existence check + SKDM creation + encrypt for this chain.
+        let chain_lock = self
+            .client
+            .signal_cache
+            .sender_key_lock(&sender_key_name)
+            .await;
+        let _chain_guard = chain_lock.lock().await;
 
         // Only create SKDM when no sender key exists (matches WA Web behavior)
         let device_store = self.client.persistence_manager.get_device_arc().await;
@@ -150,8 +163,7 @@ impl<'a> Signal<'a> {
             Some(
                 wacore::send::create_sender_key_distribution_message_for_group(
                     &mut adapter.sender_key_store,
-                    group_jid,
-                    &sender_addr,
+                    &sender_key_name,
                 )
                 .await?,
             )
@@ -161,8 +173,7 @@ impl<'a> Signal<'a> {
 
         let ciphertext = wacore::send::encrypt_group_message(
             &mut adapter.sender_key_store,
-            group_jid,
-            &sender_addr,
+            &sender_key_name,
             plaintext,
             &mut rng,
         )
@@ -273,6 +284,7 @@ impl<'a> Signal<'a> {
 
         let mut stores = adapter.as_signal_stores();
         let result = wacore::send::encrypt_for_devices(
+            &*self.client.runtime,
             &mut stores,
             self.client,
             &device_jids,

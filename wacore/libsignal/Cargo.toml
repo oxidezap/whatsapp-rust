@@ -1,6 +1,6 @@
 [package]
 name = "wacore-libsignal"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
@@ -10,6 +10,7 @@ description = "Signal Protocol implementation for the WhatsApp platform"
 [dependencies]
 aes = { workspace = true }
 arrayref = "0.3.9"
+async-lock = { workspace = true }
 async-trait = { workspace = true }
 buffa = { workspace = true }
 bytes = { workspace = true }
@@ -41,3 +42,6 @@ iai-callgrind = { workspace = true }
 [[bench]]
 name = "libsignal_benchmark"
 harness = false
+
+[lints]
+workspace = true

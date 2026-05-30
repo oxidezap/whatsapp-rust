@@ -2,12 +2,10 @@ use std::str::FromStr;
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
-/// Invokes a callback macro with the list of all message types that have `context_info`.
-///
-/// This macro ensures both `for_each_context_info_message!` and `set_context_info_on_message!`
-/// use the same list of message types, making it easy to add new types in one place.
-///
-/// When WhatsApp adds new message types with context_info, add them here.
+/// Single source of truth for the message types that carry a `context_info`
+/// field. Consumed by `for_each_context_info_message!`, `set_context_info`
+/// (via an inlined `try_attach!`), `get_ephemeral_expiration`, and
+/// `set_ephemeral_expiration`. Add new WA message types with context_info here.
 macro_rules! with_context_info_fields {
     ($callback:ident!($($prefix:tt)*)) => {
         $callback!($($prefix)*
@@ -66,24 +64,25 @@ macro_rules! for_each_context_info_impl {
     };
 }
 
-/// Sets context_info on the first matching message type.
-/// Returns true if context was set, false otherwise.
-macro_rules! set_context_info_on_message {
-    ($msg:expr, $ctx:expr) => {
-        with_context_info_fields!(set_context_info_impl!($msg, $ctx,))
-    };
+/// Returns `Some(ctx)` for the first message variant carrying a `ContextInfo`,
+/// short-circuiting on match (`break 'find`). Read-only variant of
+/// [`for_each_context_info_message!`].
+macro_rules! find_context_info_ref {
+    ($msg:expr) => {{ with_context_info_fields!(find_context_info_impl!($msg,)) }};
 }
 
-macro_rules! set_context_info_impl {
-    ($msg:expr, $ctx:expr, $($field:ident),+ $(,)?) => {{
-        let ctx = $ctx;
+macro_rules! find_context_info_impl {
+    ($msg:expr, $($field:ident),+ $(,)?) => {{
+        let mut found: Option<&wa::ContextInfo> = None;
         $(
-            if let Some(m) = $msg.$field.as_option_mut() {
-                m.context_info = buffa::MessageField::some(ctx);
-                return true;
+            if found.is_none()
+                && let Some(m) = $msg.$field.as_option()
+                && let Some(ctx) = m.context_info.as_option()
+            {
+                found = Some(ctx);
             }
         )+
-        false
+        found
     }};
 }
 
@@ -95,6 +94,9 @@ pub trait MessageExt {
     /// wrapper types (device_sent, ephemeral, view_once, etc.) without cloning.
     fn into_base_message(self) -> wa::Message;
     fn is_ephemeral(&self) -> bool;
+    /// Covers the legacy `view_once_message{_v2,_v2_extension}` wrappers (in any
+    /// nesting order under `device_sent`/`ephemeral`) and the inline `view_once`
+    /// flag on modern image/video/audio/extended-text payloads.
     fn is_view_once(&self) -> bool;
     /// Gets the caption for media messages (Image, Video, Document).
     fn get_caption(&self) -> Option<&str>;
@@ -150,10 +152,24 @@ pub trait MessageExt {
     /// Reads `context_info.expiration` from the first message type that has it.
     fn get_ephemeral_expiration(&self) -> Option<u32>;
 
-    /// Sets `context_info.expiration` on the first message type found.
-    /// Creates a default `context_info` if needed. Returns `false` for
-    /// bare `conversation` messages (use `ExtendedTextMessage` instead).
+    /// Sets `context_info.expiration` on the first message type found, creating
+    /// a default `context_info` if needed. A bare `conversation` body is
+    /// promoted to `extended_text_message { text, context_info { expiration } }`
+    /// (mirrors `WAWebMessageSendUtils`). Returns `true` on success or
+    /// promotion, `false` only when no body can carry the timer.
     fn set_ephemeral_expiration(&mut self, expiration: u32) -> bool;
+
+    /// `context_info.is_forwarded == Some(true)` on the first base message
+    /// that carries a context_info. Mirrors WA Web's `x.isForwarded`
+    /// guard in `processRenderableMessages` (which skips caching
+    /// `messageSecret` for forwarded payloads).
+    fn is_forwarded(&self) -> bool;
+
+    /// `true` if `context_info.mentioned_jid` on any base message contains
+    /// a JID whose user-form ends with `@bot`. Mirrors WA Web's
+    /// `mentionedJidList.find(jid.isBot())` lookup used to derive
+    /// `invokedBotWid` when `messageSecret` is present.
+    fn mentions_any_bot(&self) -> bool;
 }
 
 impl MessageExt for wa::Message {
@@ -219,7 +235,49 @@ impl MessageExt for wa::Message {
     }
 
     fn is_view_once(&self) -> bool {
-        self.view_once_message.is_set() || self.view_once_message_v2.is_set()
+        let mut current = self;
+        loop {
+            if current.view_once_message.is_set()
+                || current.view_once_message_v2.is_set()
+                || current.view_once_message_v2_extension.is_set()
+            {
+                return true;
+            }
+            if let Some(inner) = current
+                .device_sent_message
+                .as_option()
+                .and_then(|m| m.message.as_option())
+            {
+                current = inner;
+                continue;
+            }
+            if let Some(inner) = current
+                .ephemeral_message
+                .as_option()
+                .and_then(|m| m.message.as_option())
+            {
+                current = inner;
+                continue;
+            }
+            break;
+        }
+
+        let base = self.get_base_message();
+        matches!(
+            base.image_message.as_option().and_then(|m| m.view_once),
+            Some(true)
+        ) || matches!(
+            base.video_message.as_option().and_then(|m| m.view_once),
+            Some(true)
+        ) || matches!(
+            base.audio_message.as_option().and_then(|m| m.view_once),
+            Some(true)
+        ) || matches!(
+            base.extended_text_message
+                .as_option()
+                .and_then(|m| m.view_once),
+            Some(true)
+        )
     }
 
     fn get_caption(&self) -> Option<&str> {
@@ -258,7 +316,30 @@ impl MessageExt for wa::Message {
     }
 
     fn set_context_info(&mut self, context: wa::ContextInfo) -> bool {
-        set_context_info_on_message!(self, context)
+        macro_rules! try_attach {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if let Some(m) = self.$field.as_option_mut() {
+                        m.context_info = buffa::MessageField::some(context);
+                        return true;
+                    }
+                )+
+            };
+        }
+        with_context_info_fields!(try_attach!());
+
+        // Promote bare conversation to extended_text_message so the context
+        // can attach; matches WAWebMessageSendUtils.
+        if let Some(text) = self.conversation.take() {
+            self.extended_text_message =
+                buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                    text: Some(text),
+                    context_info: buffa::MessageField::some(context),
+                    ..Default::default()
+                });
+            return true;
+        }
+        false
     }
 
     fn get_ephemeral_expiration(&self) -> Option<u32> {
@@ -297,7 +378,45 @@ impl MessageExt for wa::Message {
             };
         }
         with_context_info_fields!(try_set!());
+
+        // Promote bare conversation so the timer can attach; matches
+        // WAWebMessageSendUtils.
+        if let Some(text) = self.conversation.take() {
+            self.extended_text_message =
+                buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                    text: Some(text),
+                    context_info: buffa::MessageField::some(wa::ContextInfo {
+                        expiration: Some(expiration),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            return true;
+        }
+
         false
+    }
+
+    fn is_forwarded(&self) -> bool {
+        let base = self.get_base_message();
+        find_context_info_ref!(base)
+            .and_then(|ctx| ctx.is_forwarded)
+            .unwrap_or(false)
+    }
+
+    fn mentions_any_bot(&self) -> bool {
+        let base = self.get_base_message();
+        let Some(ctx) = find_context_info_ref!(base) else {
+            return false;
+        };
+        // Use the canonical `Jid::is_bot()` contract — it covers both the
+        // `@bot` server and the legacy PN-form Meta bot (e.g. `1313555…`),
+        // matching WA Web's `jid.isBot()`. The list is short and this only
+        // runs on the group-mention path (chat isn't already a bot).
+        ctx.mentioned_jid
+            .iter()
+            .filter_map(|s| Jid::from_str(s).ok())
+            .any(|jid| jid.is_bot())
     }
 }
 
@@ -504,7 +623,6 @@ pub fn wrap_as_album_child(
     wa::Message {
         associated_child_message: buffa::MessageField::some(wa::message::FutureProofMessage {
             message: buffa::MessageField::some(inner_message),
-            ..Default::default()
         }),
         message_context_info: buffa::MessageField::some(outer_context),
         ..Default::default()
@@ -570,7 +688,6 @@ mod tests {
                     group_mentions: vec![wa::GroupMention {
                         group_jid: Some("120363012345@g.us".to_string()),
                         group_subject: Some("Test Group".to_string()),
-                        ..Default::default()
                     }],
                     ..Default::default()
                 }),
@@ -603,7 +720,6 @@ mod tests {
                     group_mentions: vec![wa::GroupMention {
                         group_jid: Some("120363012345@g.us".to_string()),
                         group_subject: Some("Test Group".to_string()),
-                        ..Default::default()
                     }],
                     // Other context_info fields that should be preserved
                     is_forwarded: Some(true),
@@ -843,9 +959,8 @@ mod tests {
         assert!(loc.context_info.is_set());
     }
 
-    /// Test: set_context_info returns false for unsupported message types
     #[test]
-    fn test_set_context_info_unsupported() {
+    fn test_set_context_info_promotes_bare_conversation() {
         let mut msg = wa::Message {
             conversation: Some("Simple text".to_string()),
             ..Default::default()
@@ -856,7 +971,31 @@ mod tests {
             ..Default::default()
         };
 
+        assert!(msg.set_context_info(context));
+        assert!(msg.conversation.is_none(), "conversation must be moved out");
+        let ext = msg
+            .extended_text_message
+            .as_option()
+            .expect("promoted to extended_text_message");
+        assert_eq!(ext.text.as_deref(), Some("Simple text"));
+        assert_eq!(
+            ext.context_info
+                .as_option()
+                .and_then(|c| c.stanza_id.as_deref()),
+            Some("test-id")
+        );
+    }
+
+    #[test]
+    fn test_set_context_info_returns_false_on_empty_message() {
+        let mut msg = wa::Message::default();
+        let context = wa::ContextInfo {
+            stanza_id: Some("test-id".to_string()),
+            ..Default::default()
+        };
         assert!(!msg.set_context_info(context));
+        assert!(msg.conversation.is_none());
+        assert!(msg.extended_text_message.is_unset());
     }
 
     /// Test: build_quote_context produces correct structure.
@@ -887,7 +1026,6 @@ mod tests {
         let ephemeral_msg = wa::Message {
             ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
                 message: buffa::MessageField::some(create_message_with_mentions()),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -925,7 +1063,6 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -966,7 +1103,6 @@ mod tests {
                                 group_mentions: vec![wa::GroupMention {
                                     group_jid: Some("group@g.us".to_string()),
                                     group_subject: Some("Group Name".to_string()),
-                                    ..Default::default()
                                 }],
                                 ..Default::default()
                             }),
@@ -976,7 +1112,6 @@ mod tests {
                     ..Default::default()
                 }),
                 phash: Some("somephash".to_string()),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1019,7 +1154,6 @@ mod tests {
                                 group_mentions: vec![wa::GroupMention {
                                     group_jid: Some("editedgroup@g.us".to_string()),
                                     group_subject: Some("Edited Group".to_string()),
-                                    ..Default::default()
                                 }],
                                 ..Default::default()
                             }),
@@ -1028,7 +1162,6 @@ mod tests {
                     ),
                     ..Default::default()
                 }),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1076,7 +1209,6 @@ mod tests {
                             }),
                             ..Default::default()
                         }),
-                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -1333,7 +1465,6 @@ mod tests {
                             conversation: Some("secret".to_string()),
                             ..Default::default()
                         }),
-                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -1658,5 +1789,320 @@ mod tests {
         let ctx = wrapped.message_context_info.as_option().unwrap();
         assert_eq!(ctx.message_secret.as_deref(), Some(secret.as_slice()));
         assert!(ctx.message_association.is_set());
+    }
+
+    #[test]
+    fn is_view_once_detects_legacy_wrapper() {
+        let msg = wa::Message {
+            view_once_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(wa::Message::default()),
+            }),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+
+        let msg_v2 = wa::Message {
+            view_once_message_v2: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(wa::Message::default()),
+            }),
+            ..Default::default()
+        };
+        assert!(msg_v2.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_wrapper_nested_in_device_sent() {
+        let msg = wa::Message {
+            device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
+                message: buffa::MessageField::some(wa::Message {
+                    view_once_message_v2: buffa::MessageField::some(
+                        wa::message::FutureProofMessage {
+                            message: buffa::MessageField::some(wa::Message::default()),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_inline_image_flag() {
+        let msg = wa::Message {
+            image_message: buffa::MessageField::some(wa::message::ImageMessage {
+                view_once: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_inline_video_flag() {
+        let msg = wa::Message {
+            video_message: buffa::MessageField::some(wa::message::VideoMessage {
+                view_once: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_inline_audio_flag() {
+        let msg = wa::Message {
+            audio_message: buffa::MessageField::some(wa::message::AudioMessage {
+                view_once: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_inline_extended_text_flag() {
+        let msg = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                view_once: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_inline_flag_through_device_sent() {
+        let msg = wa::Message {
+            device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
+                message: buffa::MessageField::some(wa::Message {
+                    image_message: buffa::MessageField::some(wa::message::ImageMessage {
+                        view_once: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_false_for_plain_image() {
+        let msg = wa::Message {
+            image_message: buffa::MessageField::some(wa::message::ImageMessage::default()),
+            ..Default::default()
+        };
+        assert!(!msg.is_view_once());
+
+        let msg_explicit_false = wa::Message {
+            image_message: buffa::MessageField::some(wa::message::ImageMessage {
+                view_once: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!msg_explicit_false.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_false_for_empty_message() {
+        assert!(!wa::Message::default().is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_v2_extension_wrapper() {
+        let msg = wa::Message {
+            view_once_message_v2_extension: buffa::MessageField::some(
+                wa::message::FutureProofMessage {
+                    message: buffa::MessageField::some(wa::Message::default()),
+                },
+            ),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn set_ephemeral_expiration_promotes_bare_conversation_to_extended_text() {
+        let mut msg = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        assert!(msg.set_ephemeral_expiration(86400));
+        assert!(msg.conversation.is_none());
+        let ext = msg.extended_text_message.as_option().unwrap();
+        assert_eq!(ext.text.as_deref(), Some("hello"));
+        assert_eq!(
+            ext.context_info.as_option().and_then(|c| c.expiration),
+            Some(86400)
+        );
+    }
+
+    #[test]
+    fn set_ephemeral_expiration_returns_false_on_empty_message() {
+        let mut msg = wa::Message::default();
+        assert!(!msg.set_ephemeral_expiration(60));
+        assert!(msg.conversation.is_none());
+        assert!(msg.extended_text_message.is_unset());
+    }
+
+    #[test]
+    fn is_view_once_detects_ephemeral_device_sent_view_once() {
+        let msg = wa::Message {
+            ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(wa::Message {
+                    device_sent_message: buffa::MessageField::some(
+                        wa::message::DeviceSentMessage {
+                            message: buffa::MessageField::some(wa::Message {
+                                view_once_message_v2: buffa::MessageField::some(
+                                    wa::message::FutureProofMessage {
+                                        message: buffa::MessageField::some(wa::Message::default()),
+                                    },
+                                ),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn mentions_any_bot_true_for_bot_jid_in_extended_text() {
+        let msg = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("@MetaAI hi".into()),
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    mentioned_jid: vec![
+                        "5511999998888@s.whatsapp.net".into(),
+                        "867051314767696@bot".into(),
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_true_for_legacy_pn_form_bot() {
+        // `Jid::is_bot()` also matches the legacy PN-form Meta bot; the old
+        // `@bot`-only string split would have missed this.
+        let msg = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("@MetaAI".into()),
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    mentioned_jid: vec!["13135550002@s.whatsapp.net".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_false_without_bot_jid() {
+        let msg = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("hi friends".into()),
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    mentioned_jid: vec![
+                        "5511999998888@s.whatsapp.net".into(),
+                        "120363021033254949@g.us".into(),
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_false_for_no_context_info() {
+        let msg = wa::Message {
+            conversation: Some("plain".into()),
+            ..Default::default()
+        };
+        assert!(!msg.mentions_any_bot());
+    }
+
+    #[test]
+    fn mentions_any_bot_sees_through_device_sent_wrapper() {
+        let msg = wa::Message {
+            device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
+                destination_jid: Some("867051314767696@bot".into()),
+                message: buffa::MessageField::some(wa::Message {
+                    extended_text_message: buffa::MessageField::some(
+                        wa::message::ExtendedTextMessage {
+                            text: Some("@MetaAI".into()),
+                            context_info: buffa::MessageField::some(wa::ContextInfo {
+                                mentioned_jid: vec!["867051314767696@bot".into()],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            msg.mentions_any_bot(),
+            "must unwrap DeviceSentMessage before reading context_info"
+        );
+    }
+
+    #[test]
+    fn is_forwarded_true_and_false() {
+        let fwd = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("fwd".into()),
+                context_info: buffa::MessageField::some(wa::ContextInfo {
+                    is_forwarded: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(fwd.is_forwarded());
+
+        let plain = wa::Message {
+            conversation: Some("plain".into()),
+            ..Default::default()
+        };
+        assert!(!plain.is_forwarded());
+
+        let not_fwd = wa::Message {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+                text: Some("hi".into()),
+                context_info: buffa::MessageField::some(wa::ContextInfo::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!not_fwd.is_forwarded());
     }
 }

@@ -127,7 +127,6 @@ impl<'a> Profile<'a> {
         let value = wa::SyncActionValue {
             push_name_setting: buffa::MessageField::some(wa::sync_action_value::PushNameSetting {
                 name: Some(name.to_string()),
-                ..Default::default()
             }),
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()

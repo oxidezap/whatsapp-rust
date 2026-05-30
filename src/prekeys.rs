@@ -150,7 +150,7 @@ impl Client {
             use buffa::Message;
             let total_len: usize = keys_to_upload
                 .iter()
-                .map(|(_, r)| r.compute_size() as usize)
+                .map(|(_, r)| r.encoded_len() as usize)
                 .sum();
             let mut buf = Vec::with_capacity(total_len);
             let mut offsets = Vec::with_capacity(keys_to_upload.len());
@@ -290,6 +290,11 @@ impl Client {
     ///    does NOT re-upload — WA Web catches all `validateLocalKeyBundle` exceptions without
     ///    re-uploading; the normal `RotateKeyJob` will eventually refresh keys
     pub(crate) async fn validate_digest_key(&self) -> Result<(), anyhow::Error> {
+        // Hold the lock across the whole pass so the 404 re-upload can't race with
+        // `upload_pre_keys_at_login`, `handle_prekey_low`, or `refresh_pre_keys` on
+        // `next_pre_key_id` allocation.
+        let _guard = self.prekey_upload_lock.lock().await;
+
         let response = match self.execute(DigestKeyBundleSpec::new()).await {
             Ok(resp) => resp,
             Err(crate::request::IqError::ServerError { code: 404, .. }) => {

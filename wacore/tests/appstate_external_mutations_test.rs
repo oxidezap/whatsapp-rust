@@ -22,26 +22,18 @@ fn make_mutation(
         record: wa::SyncdRecord {
             index: wa::SyncdIndex {
                 blob: Some(index_mac),
-                ..Default::default()
             }
             .into(),
             value: match value_blob {
-                Some(b) => wa::SyncdValue {
-                    blob: Some(b),
-                    ..Default::default()
-                }
-                .into(),
+                Some(b) => wa::SyncdValue { blob: Some(b) }.into(),
                 None => Default::default(),
             },
             key_id: wa::KeyId {
                 id: Some(key_id.to_vec()),
-                ..Default::default()
             }
             .into(),
-            ..Default::default()
         }
         .into(),
-        ..Default::default()
     }
 }
 
@@ -225,7 +217,6 @@ fn test_external_mutations_decode_from_syncd_mutations() {
     // Encode as SyncdMutations (what external_mutations downloads return)
     let syncd_mutations = wa::SyncdMutations {
         mutations: vec![mutation1, mutation2],
-        ..Default::default()
     };
 
     let encoded = syncd_mutations.encode_to_vec();
@@ -262,15 +253,10 @@ fn test_validate_patch_macs_skips_on_has_missing_remove() {
 
     // Create a patch with a snapshot_mac that won't match our state
     let patch = wa::SyncdPatch {
-        version: wa::SyncdVersion {
-            version: Some(2),
-            ..Default::default()
-        }
-        .into(),
+        version: wa::SyncdVersion { version: Some(2) }.into(),
         snapshot_mac: Some(vec![0u8; 32]), // This won't match our computed MAC
         key_id: wa::KeyId {
             id: Some(key_id.to_vec()),
-            ..Default::default()
         }
         .into(),
         ..Default::default()

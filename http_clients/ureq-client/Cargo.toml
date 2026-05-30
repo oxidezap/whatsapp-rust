@@ -1,6 +1,6 @@
 [package]
 name = "whatsapp-rust-ureq-http-client"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
@@ -18,3 +18,9 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 wacore = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

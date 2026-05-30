@@ -244,6 +244,133 @@ fn base64url_encode(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
 
+// --- First-party sticker pack fetch (download side) ---
+
+use crate::download::{Downloadable, MediaType};
+use serde::Deserialize;
+
+/// Static CDN endpoint serving first-party sticker pack metadata.
+const STICKER_CDN_BASE: &str = "https://static.whatsapp.net/sticker";
+
+/// Build the URL that returns a pack's metadata + sticker list as JSON.
+///
+/// WA Web: `WAWebFetchFirstPartyStickerPacksAction` queries the same endpoint
+/// with `cat=sticker_pack_data&id=<pack>&lg=<locale>`; `lottie=1` (from
+/// `getStickerFetchParamsFromABConfig`) makes lottie packs return lottie data.
+pub fn sticker_pack_data_url(pack_id: &str, locale: &str) -> String {
+    format!("{STICKER_CDN_BASE}?lottie=1&cat=sticker_pack_data&id={pack_id}&lg={locale}")
+}
+
+/// Base64-standard JSON string into bytes; absent/empty becomes `None`.
+/// The CDN encodes `media-key`/`file-hash`/`enc-file-hash` as base64 strings
+/// (matching Go's `[]byte` JSON unmarshalling in whatsmeow).
+fn de_b64_opt<'de, D>(d: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use base64::engine::{Engine, general_purpose::STANDARD};
+    let raw = Option::<String>::deserialize(d)?;
+    match raw {
+        Some(s) if !s.is_empty() => STANDARD
+            .decode(s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
+}
+
+/// One sticker inside a first-party pack, as returned by the CDN.
+///
+/// Implements [`Downloadable`] (as a `Sticker`) so each entry can be fetched
+/// directly. Unknown JSON fields are ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StickerPackItem {
+    #[serde(default, rename = "media-key", deserialize_with = "de_b64_opt")]
+    pub media_key: Option<Vec<u8>>,
+    #[serde(default, rename = "file-hash", deserialize_with = "de_b64_opt")]
+    pub file_hash: Option<Vec<u8>>,
+    #[serde(default, rename = "enc-file-hash", deserialize_with = "de_b64_opt")]
+    pub enc_file_hash: Option<Vec<u8>>,
+    #[serde(default, rename = "direct-path")]
+    pub direct_path: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default, rename = "file-size")]
+    pub file_size: Option<u64>,
+    #[serde(default)]
+    pub mimetype: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+    #[serde(default)]
+    pub emojis: Vec<String>,
+    #[serde(default, rename = "accessibility-text")]
+    pub accessibility_text: Option<String>,
+}
+
+impl Downloadable for StickerPackItem {
+    fn direct_path(&self) -> Option<&str> {
+        self.direct_path.as_deref()
+    }
+    fn media_key(&self) -> Option<&[u8]> {
+        self.media_key.as_deref()
+    }
+    fn file_enc_sha256(&self) -> Option<&[u8]> {
+        self.enc_file_hash.as_deref()
+    }
+    fn file_sha256(&self) -> Option<&[u8]> {
+        self.file_hash.as_deref()
+    }
+    fn file_length(&self) -> Option<u64> {
+        self.file_size
+    }
+    fn app_info(&self) -> MediaType {
+        MediaType::Sticker
+    }
+}
+
+/// A first-party sticker pack fetched from the CDN.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StickerPack {
+    #[serde(default, rename = "sticker-pack-id")]
+    pub sticker_pack_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub publisher: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, rename = "file-size")]
+    pub file_size: Option<String>,
+    #[serde(default, rename = "image-data-hash")]
+    pub image_data_hash: Option<String>,
+    #[serde(default)]
+    pub stickers: Vec<StickerPackItem>,
+    #[serde(default)]
+    pub animated: i32,
+    #[serde(default)]
+    pub lottie: i32,
+    #[serde(default, rename = "preview-image-ids")]
+    pub preview_image_ids: Vec<String>,
+    #[serde(default, rename = "tray-image-id")]
+    pub tray_image_id: Option<String>,
+    #[serde(default, rename = "tray-image-preview")]
+    pub tray_image_preview: Option<String>,
+}
+
+/// Parse the CDN response (a JSON array) and return its first pack.
+///
+/// WA Web treats an empty array as an error; so do we.
+pub fn parse_sticker_pack_response(body: &[u8]) -> Result<StickerPack> {
+    let packs: Vec<StickerPack> = serde_json::from_slice(body)
+        .map_err(|e| anyhow::anyhow!("failed to parse sticker pack response: {e}"))?;
+    packs
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no sticker pack found in response"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,5 +539,77 @@ mod tests {
         assert_eq!(pack.sticker_pack_origin, None);
         assert_eq!(pack.media_key_timestamp, None);
         assert_eq!(pack.image_data_hash, None);
+    }
+
+    #[test]
+    fn sticker_pack_data_url_matches_wa_web_shape() {
+        let url = sticker_pack_data_url("PACK123", "en");
+        assert_eq!(
+            url,
+            "https://static.whatsapp.net/sticker?lottie=1&cat=sticker_pack_data&id=PACK123&lg=en"
+        );
+    }
+
+    #[test]
+    fn parse_sticker_pack_response_decodes_items() {
+        use base64::engine::{Engine, general_purpose::STANDARD};
+        let media_key = STANDARD.encode([1u8; 32]);
+        let file_hash = STANDARD.encode([2u8; 32]);
+        let enc_file_hash = STANDARD.encode([3u8; 32]);
+        let body = format!(
+            r#"[{{
+                "sticker-pack-id": "PACK123",
+                "name": "Cats",
+                "publisher": "Me",
+                "file-size": "1234",
+                "animated": 1,
+                "lottie": 0,
+                "preview-image-ids": ["a", "b"],
+                "tray-image-id": "tray1",
+                "stickers": [{{
+                    "media-key": "{media_key}",
+                    "file-hash": "{file_hash}",
+                    "enc-file-hash": "{enc_file_hash}",
+                    "direct-path": "/mms/sticker/abc",
+                    "url": "https://mmg.whatsapp.net/x",
+                    "file-size": 555,
+                    "mimetype": "image/webp",
+                    "width": 512,
+                    "height": 512,
+                    "emojis": ["🐱"],
+                    "accessibility-text": "a cat",
+                    "some-unknown-field": "ignored"
+                }}]
+            }}]"#
+        );
+
+        let pack = parse_sticker_pack_response(body.as_bytes()).unwrap();
+        assert_eq!(pack.sticker_pack_id.as_deref(), Some("PACK123"));
+        assert_eq!(pack.name.as_deref(), Some("Cats"));
+        assert_eq!(pack.file_size.as_deref(), Some("1234"));
+        assert_eq!(pack.animated, 1);
+        assert_eq!(pack.preview_image_ids, vec!["a", "b"]);
+        assert_eq!(pack.stickers.len(), 1);
+
+        let item = &pack.stickers[0];
+        assert_eq!(item.media_key.as_deref(), Some(&[1u8; 32][..]));
+        assert_eq!(item.file_hash.as_deref(), Some(&[2u8; 32][..]));
+        assert_eq!(item.enc_file_hash.as_deref(), Some(&[3u8; 32][..]));
+        assert_eq!(item.file_size, Some(555));
+        assert_eq!(item.emojis, vec!["🐱"]);
+
+        // Downloadable mapping feeds the standard sticker media download.
+        assert_eq!(item.direct_path(), Some("/mms/sticker/abc"));
+        assert_eq!(item.media_key(), Some(&[1u8; 32][..]));
+        assert_eq!(item.file_sha256(), Some(&[2u8; 32][..]));
+        assert_eq!(item.file_enc_sha256(), Some(&[3u8; 32][..]));
+        assert_eq!(item.file_length(), Some(555));
+        assert_eq!(item.app_info(), MediaType::Sticker);
+        assert!(item.is_encrypted());
+    }
+
+    #[test]
+    fn parse_sticker_pack_response_rejects_empty_array() {
+        assert!(parse_sticker_pack_response(b"[]").is_err());
     }
 }

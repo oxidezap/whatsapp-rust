@@ -211,6 +211,19 @@ impl Server {
             Self::Legacy => "c.us",
         }
     }
+
+    /// Phone-number-namespaced servers (`@s.whatsapp.net`, `@hosted`).
+    /// The PN side of the LID↔PN mapping treats these as a single class.
+    #[inline]
+    pub fn is_pn_family(self) -> bool {
+        matches!(self, Self::Pn | Self::Hosted)
+    }
+
+    /// LID-namespaced servers (`@lid`, `@hosted.lid`).
+    #[inline]
+    pub fn is_lid_family(self) -> bool {
+        matches!(self, Self::Lid | Self::HostedLid)
+    }
 }
 
 impl fmt::Display for Server {
@@ -512,6 +525,27 @@ impl Jid {
             integrator: self.integrator,
             ..Default::default()
         }
+    }
+
+    /// Consuming `to_non_ad`: reuses the owned `user` instead of cloning it.
+    /// Prefer this when the receiver is a throwaway owned `Jid`.
+    pub fn into_non_ad(self) -> Self {
+        Self {
+            user: self.user,
+            server: self.server,
+            integrator: self.integrator,
+            agent: 0,
+            device: 0,
+        }
+    }
+
+    /// Canonical non-AD string form (`user@server`, device + agent stripped)
+    /// in a single allocation. Equivalent to `to_non_ad().to_string()` but
+    /// skips the throwaway intermediate `Jid` and its `CompactString` clone.
+    pub fn to_non_ad_string(&self) -> String {
+        let mut buf = String::with_capacity(self.user.len() + 1 + self.server.as_str().len());
+        push_jid_to_string(&self.user, self.server, 0, 0, &mut buf);
+        buf
     }
 
     /// Check if this JID matches the user or their LID.
@@ -1269,6 +1303,51 @@ mod tests {
         let status = Jid::status_broadcast();
         let status_non_ad = status.to_non_ad();
         assert_eq!(status_non_ad.to_string(), "status@broadcast");
+    }
+
+    #[test]
+    fn test_to_non_ad_string_matches_to_non_ad_to_string() {
+        // to_non_ad_string() must be byte-identical to to_non_ad().to_string()
+        // across PN/LID/bot/group/status, with and without device + agent.
+        for s in [
+            "1234567890:33@s.whatsapp.net",
+            "1234567890@s.whatsapp.net",
+            "100000012345678:25@lid",
+            "100000012345678@lid",
+            "867051314767696:0@bot",
+            "867051314767696@bot",
+            "120363021033254949@g.us",
+            "status@broadcast",
+            "12-34@g.us",
+        ] {
+            let jid: Jid = s.parse().expect("parse");
+            assert_eq!(
+                jid.to_non_ad_string(),
+                jid.to_non_ad().to_string(),
+                "mismatch for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_into_non_ad_matches_to_non_ad() {
+        // into_non_ad (consuming) must produce a JID identical to to_non_ad (cloning).
+        for s in [
+            "1234567890.2:33@s.whatsapp.net",
+            "1234567890@s.whatsapp.net",
+            "100000012345678:25@lid",
+            "user.5:10@bot",
+            "447911123456.3@interop",
+            "120363021033254949@g.us",
+            "status@broadcast",
+        ] {
+            let jid: Jid = s.parse().expect("parse");
+            assert_eq!(
+                jid.clone().into_non_ad(),
+                jid.to_non_ad(),
+                "mismatch for {s}"
+            );
+        }
     }
 
     #[test]

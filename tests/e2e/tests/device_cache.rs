@@ -27,7 +27,7 @@ async fn test_group_send_uses_registry_cache_after_reconnect() -> anyhow::Result
             ..Default::default()
         })
         .await?;
-    let group_jid = group.gid;
+    let group_jid = group.metadata.id;
 
     // First send — populates device registry (in-memory cache + SQLite DB)
     let text_1 = "before reconnect";
@@ -44,7 +44,7 @@ async fn test_group_send_uses_registry_cache_after_reconnect() -> anyhow::Result
 
     // Second send — exercises registry-based device resolution
     let text_2 = "after reconnect";
-    let t = std::time::Instant::now();
+    let t = wacore::time::Instant::now();
     client_a
         .client
         .send_message(group_jid.clone(), text_msg(text_2))

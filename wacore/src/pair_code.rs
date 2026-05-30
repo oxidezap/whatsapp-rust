@@ -19,9 +19,11 @@
 //! - Ephemeral encryption: AES-256-CTR
 //! - Bundle encryption: AES-256-GCM after HKDF key derivation
 
-use crate::WireEnum;
-use crate::libsignal::crypto::aes_256_gcm_encrypt;
-use crate::libsignal::protocol::{KeyPair, PublicKey};
+use crate::companion_reg::{
+    CompanionWebClientType, companion_platform_display, companion_web_client_type_for_props,
+};
+use crate::libsignal::crypto::{CryptoProviderError, aes_256_gcm_encrypt};
+use crate::libsignal::protocol::{CurveError, KeyPair, PublicKey};
 use aes::cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
 use hkdf::Hkdf;
@@ -31,6 +33,7 @@ use sha2::Sha256;
 use wacore_binary::SERVER_JID;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Node, NodeContentRef, NodeRef};
+use waproto::whatsapp as wa;
 
 // Type aliases
 type Aes256Ctr = Ctr128BE<aes::Aes256>;
@@ -78,32 +81,31 @@ fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], rounds: u32, output: &mut [u
 /// Validity duration for pair codes (approximately).
 const PAIR_CODE_VALIDITY_SECS: u64 = 180;
 
-/// Platform identifiers for companion devices.
-/// These match the DeviceProps.PlatformType protobuf enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-#[repr(u8)]
-pub enum PlatformId {
-    #[wire = "0"]
-    Unknown = 0,
-    #[wire_default]
-    #[wire = "1"]
-    Chrome = 1,
-    #[wire = "2"]
-    Firefox = 2,
-    #[wire = "3"]
-    InternetExplorer = 3,
-    #[wire = "4"]
-    Opera = 4,
-    #[wire = "5"]
-    Safari = 5,
-    #[wire = "6"]
-    Edge = 6,
-    #[wire = "7"]
-    Electron = 7,
-    #[wire = "8"]
-    Uwp = 8,
-    #[wire = "9"]
-    OtherWebClient = 9,
+fn build_id_and_display(
+    id: CompanionWebClientType,
+    props: &wa::DeviceProps,
+) -> (CompanionWebClientType, String) {
+    let os = props.os.as_deref().unwrap_or("");
+    (id, companion_platform_display(id, os))
+}
+
+/// `(companion_platform_id, companion_platform_display)` per WA Web's
+/// `Alt/DeviceLinkingIq.js`. Display always Browser-valid (see
+/// `companion_platform_display`).
+pub fn derive_companion_platform(props: &wa::DeviceProps) -> (CompanionWebClientType, String) {
+    build_id_and_display(companion_web_client_type_for_props(props), props)
+}
+
+/// Honours `PairCodeOptions::platform_id` override; display is always
+/// derived (no override — WA Web has none, server rejects arbitrary strings).
+pub fn resolve_companion_platform(
+    options: &PairCodeOptions,
+    props: &wa::DeviceProps,
+) -> (CompanionWebClientType, String) {
+    let id = options
+        .platform_id
+        .unwrap_or_else(|| companion_web_client_type_for_props(props));
+    build_id_and_display(id, props)
 }
 
 /// Options for pair code authentication.
@@ -111,14 +113,12 @@ pub enum PlatformId {
 pub struct PairCodeOptions {
     /// Phone number with country code, no leading zeros or special chars (e.g., "15551234567").
     pub phone_number: String,
-    /// Whether to show push notification on phone (default: true).
+    /// Whether to show push notification on phone (default `true`, matching WA Web).
     pub show_push_notification: bool,
     /// Custom pairing code (8 chars from Crockford alphabet, or None for random).
     pub custom_code: Option<String>,
-    /// Platform identifier for companion device.
-    pub platform_id: PlatformId,
-    /// Platform display name (e.g., "Chrome (Linux)").
-    pub platform_display: String,
+    /// `None` auto-derives from `Device.device_props.platform_type`.
+    pub platform_id: Option<CompanionWebClientType>,
 }
 
 impl Default for PairCodeOptions {
@@ -127,8 +127,17 @@ impl Default for PairCodeOptions {
             phone_number: String::new(),
             show_push_notification: true,
             custom_code: None,
-            platform_id: PlatformId::Chrome,
-            platform_display: "Chrome (Linux)".to_string(),
+            platform_id: None,
+        }
+    }
+}
+
+impl PairCodeOptions {
+    /// Convenience constructor with the phone number preset and other fields defaulted.
+    pub fn for_phone(phone_number: impl Into<String>) -> Self {
+        Self {
+            phone_number: phone_number.into(),
+            ..Self::default()
         }
     }
 }
@@ -290,11 +299,15 @@ impl PairCodeUtils {
     }
 
     /// Builds the stage 1 (companion_hello) IQ node.
+    ///
+    /// `platform_id` and `platform_display` are the resolved strings — callers
+    /// typically obtain them through [`resolve_companion_platform`] so that
+    /// `Device.device_props` is the single source of truth.
     pub fn build_companion_hello_iq(
         phone_number: &str,
         noise_static_pub: &[u8; 32],
         wrapped_ephemeral: &[u8; 80],
-        platform_id: PlatformId,
+        platform_id: &str,
         platform_display: &str,
         show_push_notification: bool,
         req_id: String,
@@ -316,7 +329,7 @@ impl PairCodeUtils {
                     .bytes(noise_static_pub.to_vec())
                     .build(),
                 NodeBuilder::new("companion_platform_id")
-                    .bytes(platform_id.as_str().as_bytes().to_vec())
+                    .bytes(platform_id.as_bytes().to_vec())
                     .build(),
                 NodeBuilder::new("companion_platform_display")
                     .bytes(platform_display.as_bytes().to_vec())
@@ -402,29 +415,21 @@ impl PairCodeUtils {
         primary_identity_pub: &[u8; 32],
         identity_key: &KeyPair,
     ) -> Result<(Vec<u8>, [u8; 32]), PairCodeError> {
-        // Parse primary's ephemeral public key
-        let primary_eph_pub =
-            PublicKey::from_djb_public_key_bytes(primary_ephemeral_pub).map_err(|e| {
-                PairCodeError::CryptoError(format!("Invalid primary ephemeral key: {e}"))
-            })?;
+        let primary_eph_pub = PublicKey::from_djb_public_key_bytes(primary_ephemeral_pub)
+            .map_err(PairCodeError::InvalidPrimaryEphemeralKey)?;
 
-        // Parse primary's identity public key
-        let primary_id_pub =
-            PublicKey::from_djb_public_key_bytes(primary_identity_pub).map_err(|e| {
-                PairCodeError::CryptoError(format!("Invalid primary identity key: {e}"))
-            })?;
+        let primary_id_pub = PublicKey::from_djb_public_key_bytes(primary_identity_pub)
+            .map_err(PairCodeError::InvalidPrimaryIdentityKey)?;
 
-        // DH 1: Ephemeral key exchange
         let ephemeral_shared = ephemeral_keypair
             .private_key
             .calculate_agreement(&primary_eph_pub)
-            .map_err(|e| PairCodeError::CryptoError(format!("Ephemeral DH failed: {e}")))?;
+            .map_err(PairCodeError::EphemeralKeyAgreement)?;
 
-        // DH 2: Identity key exchange (for ADV secret derivation)
         let identity_shared = identity_key
             .private_key
             .calculate_agreement(&primary_id_pub)
-            .map_err(|e| PairCodeError::CryptoError(format!("Identity DH failed: {e}")))?;
+            .map_err(PairCodeError::IdentityKeyAgreement)?;
 
         // Generate random bytes for ADV secret derivation
         let mut random_bytes = [0u8; 32];
@@ -441,7 +446,7 @@ impl PairCodeUtils {
         let mut new_adv_secret = [0u8; 32];
         hk_adv
             .expand(b"adv_secret", &mut new_adv_secret)
-            .map_err(|_| PairCodeError::CryptoError("HKDF expand for adv_secret failed".into()))?;
+            .map_err(|_| PairCodeError::AdvSecretKeyDerivation)?;
 
         // Prepare bundle: companion_identity_pub (32) + primary_identity_pub (32) + random_bytes (32) = 96 bytes
         let mut bundle = Vec::with_capacity(96);
@@ -459,9 +464,7 @@ impl PairCodeUtils {
         let mut enc_key = [0u8; 32];
         hk_bundle
             .expand(b"link_code_pairing_key_bundle_encryption_key", &mut enc_key)
-            .map_err(|_| {
-                PairCodeError::CryptoError("HKDF expand for bundle encryption key failed".into())
-            })?;
+            .map_err(|_| PairCodeError::BundleKeyDerivation)?;
 
         // Generate random IV for AES-GCM (12 bytes)
         let mut iv = [0u8; 12];
@@ -472,7 +475,7 @@ impl PairCodeUtils {
         wrapped_bundle.extend_from_slice(&key_bundle_salt);
         wrapped_bundle.extend_from_slice(&iv);
         aes_256_gcm_encrypt(&enc_key, &iv, b"", &bundle, &mut wrapped_bundle)
-            .map_err(|e| PairCodeError::CryptoError(format!("AES-GCM encryption failed: {e}")))?;
+            .map_err(PairCodeError::BundleAead)?;
 
         Ok((wrapped_bundle, new_adv_secret))
     }
@@ -483,40 +486,59 @@ impl PairCodeUtils {
     }
 }
 
-/// Errors that can occur during pair code operations.
+/// Errors raised by wacore-side pair-code validation, key derivation, and
+/// protocol-bundle building. The high-level crate wraps this in
+/// `whatsapp_rust::pair_code::PairError` and adds an IQ-failure variant for the
+/// transport layer.
 #[derive(Debug, thiserror::Error)]
 pub enum PairCodeError {
-    #[error("Phone number is required")]
+    #[error("phone number is required")]
     PhoneNumberRequired,
 
-    #[error("Phone number is too short (must be at least 7 digits)")]
+    #[error("phone number is too short (must be at least 7 digits)")]
     PhoneNumberTooShort,
 
-    #[error("Phone number must not start with 0 (use international format)")]
+    #[error("phone number must not start with 0 (use international format)")]
     PhoneNumberNotInternational,
 
-    #[error("Invalid custom code: must be 8 characters from Crockford Base32 alphabet")]
+    #[error("invalid custom code: must be 8 characters from Crockford Base32 alphabet")]
     InvalidCustomCode,
 
-    #[error("Invalid wrapped data: expected {expected} bytes, got {got}")]
+    #[error("invalid wrapped data: expected {expected} bytes, got {got}")]
     InvalidWrappedData { expected: usize, got: usize },
 
-    #[error("Cryptographic operation failed: {0}")]
-    CryptoError(String),
+    #[error("primary device sent an invalid ephemeral public key")]
+    InvalidPrimaryEphemeralKey(#[source] CurveError),
 
-    #[error("Not in waiting state for pair code notification")]
+    #[error("primary device sent an invalid identity public key")]
+    InvalidPrimaryIdentityKey(#[source] CurveError),
+
+    #[error("ephemeral key agreement failed")]
+    EphemeralKeyAgreement(#[source] CurveError),
+
+    #[error("identity key agreement failed")]
+    IdentityKeyAgreement(#[source] CurveError),
+
+    #[error("HKDF expand failed for adv_secret")]
+    AdvSecretKeyDerivation,
+
+    #[error("HKDF expand failed for bundle encryption key")]
+    BundleKeyDerivation,
+
+    #[error("AES-GCM encryption of key bundle failed")]
+    BundleAead(#[source] CryptoProviderError),
+
+    #[error("not in waiting state for pair code notification")]
     NotWaiting,
 
-    #[error("Server response missing pairing ref")]
+    #[error("server response missing pairing ref")]
     MissingPairingRef,
-
-    #[error("Request failed: {0}")]
-    RequestFailed(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wacore_binary::NodeContent;
 
     #[test]
     fn test_generate_code() {
@@ -614,14 +636,169 @@ mod tests {
         ));
     }
 
+    fn props(os: Option<&str>, pt: Option<wa::device_props::PlatformType>) -> wa::DeviceProps {
+        wa::DeviceProps {
+            os: os.map(|s| s.to_string()),
+            platform_type: pt,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn test_platform_id_string_enum() {
-        // WireEnum derive works correctly
-        assert_eq!(PlatformId::Chrome.as_str(), "1");
-        assert_eq!(PlatformId::Firefox.to_string(), "2");
-        assert_eq!(PlatformId::default(), PlatformId::Chrome);
-        // repr(u8) values match DeviceProps.PlatformType protobuf enum
-        assert_eq!(PlatformId::Chrome as u8, 1);
+    fn derive_chrome_linux_matches_wa_web() {
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::CHROME));
+        assert_eq!(
+            derive_companion_platform(&p),
+            (CompanionWebClientType::Chrome, "Chrome (Linux)".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_firefox_uses_companion_web_client_wire() {
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::FIREFOX));
+        let (id, display) = derive_companion_platform(&p);
+        assert_eq!(id, CompanionWebClientType::Firefox);
+        assert_eq!(id.wire_byte(), b'3');
+        assert_eq!(display, "Firefox (Linux)");
+    }
+
+    #[test]
+    fn derive_edge_uses_companion_web_client_wire() {
+        let p = props(Some("Windows"), Some(wa::device_props::PlatformType::EDGE));
+        let (id, display) = derive_companion_platform(&p);
+        assert_eq!(id, CompanionWebClientType::Edge);
+        assert_eq!(id.wire_byte(), b'2');
+        assert_eq!(display, "Edge (Windows)");
+    }
+
+    #[test]
+    fn derive_android_platform_types_map_to_chrome() {
+        use wa::device_props::PlatformType as P;
+        for pt in [P::ANDROID_PHONE, P::ANDROID_TABLET, P::ANDROID_AMBIGUOUS] {
+            let (id, display) = derive_companion_platform(&props(Some("Android"), Some(pt)));
+            assert_eq!(id, CompanionWebClientType::Chrome, "{pt:?}");
+            assert_eq!(id.wire_byte(), b'1', "{pt:?}");
+            assert_eq!(display, "Chrome (Android)", "{pt:?}");
+        }
+    }
+
+    #[test]
+    fn derive_ios_phone_falls_back_to_other_web_client_and_chrome() {
+        let p = props(Some("iOS"), Some(wa::device_props::PlatformType::IOS_PHONE));
+        let (id, display) = derive_companion_platform(&p);
+        assert_eq!(id, CompanionWebClientType::OtherWebClient);
+        assert_eq!(display, "Chrome (iOS)");
+    }
+
+    #[test]
+    fn derive_no_os_substitutes_linux() {
+        let p = props(None, Some(wa::device_props::PlatformType::CHROME));
+        assert_eq!(
+            derive_companion_platform(&p),
+            (CompanionWebClientType::Chrome, "Chrome (Linux)".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_empty_os_substitutes_linux() {
+        let p = props(Some("   "), Some(wa::device_props::PlatformType::CHROME));
+        assert_eq!(
+            derive_companion_platform(&p),
+            (CompanionWebClientType::Chrome, "Chrome (Linux)".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_unknown_proto_yields_other_web_client_id_and_chrome_display() {
+        let p = props(None, None);
+        assert_eq!(
+            derive_companion_platform(&p),
+            (
+                CompanionWebClientType::OtherWebClient,
+                "Chrome (Linux)".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn derive_display_uses_known_label_for_every_proto_variant() {
+        use wa::device_props::PlatformType as P;
+        const SERVER_ACCEPT_LIST: &[u8] = b"0123456789abcdefghijklm";
+        const KNOWN_LABELS: &[&str] = &[
+            "Chrome", "Edge", "Firefox", "IE", "Opera", "Safari", "Android",
+        ];
+        for pt in [
+            P::UNKNOWN,
+            P::CHROME,
+            P::FIREFOX,
+            P::IE,
+            P::OPERA,
+            P::SAFARI,
+            P::EDGE,
+            P::DESKTOP,
+            P::IPAD,
+            P::ANDROID_TABLET,
+            P::OHANA,
+            P::ALOHA,
+            P::CATALINA,
+            P::TCL_TV,
+            P::IOS_PHONE,
+            P::IOS_CATALYST,
+            P::ANDROID_PHONE,
+            P::ANDROID_AMBIGUOUS,
+            P::WEAR_OS,
+            P::AR_WRIST,
+            P::AR_DEVICE,
+            P::UWP,
+            P::VR,
+            P::CLOUD_API,
+            P::SMARTGLASSES,
+        ] {
+            let p = props(Some("Linux"), Some(pt));
+            let (id, display) = derive_companion_platform(&p);
+            assert!(
+                SERVER_ACCEPT_LIST.contains(&id.wire_byte()),
+                "{pt:?} wire byte {:?} outside server accept list",
+                id.wire_byte() as char,
+            );
+            let label = display.split(" (").next().unwrap();
+            assert!(
+                KNOWN_LABELS.contains(&label),
+                "{pt:?} produced display {display:?} with unexpected label {label:?}"
+            );
+            assert!(
+                display.ends_with(" (Linux)"),
+                "{pt:?} produced display {display:?} without parenthesised OS"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_explicit_id_overrides_derived() {
+        let p = props(
+            Some("Android"),
+            Some(wa::device_props::PlatformType::ANDROID_PHONE),
+        );
+        let opts = PairCodeOptions {
+            platform_id: Some(CompanionWebClientType::Chrome),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_companion_platform(&opts, &p),
+            (
+                CompanionWebClientType::Chrome,
+                "Chrome (Android)".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_default_uses_derived() {
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::EDGE));
+        assert_eq!(
+            resolve_companion_platform(&PairCodeOptions::default(), &p),
+            (CompanionWebClientType::Edge, "Edge (Linux)".to_string())
+        );
     }
 
     #[test]
@@ -699,14 +876,19 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
+    /// `Default` must not carry any implicit platform identity — the `Chrome (Linux)`
+    /// hardcode caused the companion_hello IQ to claim Chrome even when
+    /// `DeviceProps` said Android. Keep this assertion as a regression guard.
     #[test]
-    fn test_pair_code_options_default() {
+    fn pair_code_options_default_has_no_platform_hardcode() {
         let options = PairCodeOptions::default();
         assert!(options.phone_number.is_empty());
-        assert!(options.show_push_notification);
+        assert!(options.show_push_notification, "default must keep push on");
         assert!(options.custom_code.is_none());
-        assert_eq!(options.platform_id, PlatformId::Chrome);
-        assert_eq!(options.platform_display, "Chrome (Linux)");
+        assert!(
+            options.platform_id.is_none(),
+            "platform_id default must be None so derivation kicks in"
+        );
     }
 
     #[test]
@@ -732,18 +914,18 @@ mod tests {
     #[test]
     fn test_pair_code_error_display() {
         let err = PairCodeError::PhoneNumberRequired;
-        assert_eq!(err.to_string(), "Phone number is required");
+        assert_eq!(err.to_string(), "phone number is required");
 
         let err = PairCodeError::PhoneNumberTooShort;
         assert_eq!(
             err.to_string(),
-            "Phone number is too short (must be at least 7 digits)"
+            "phone number is too short (must be at least 7 digits)"
         );
 
         let err = PairCodeError::InvalidCustomCode;
         assert_eq!(
             err.to_string(),
-            "Invalid custom code: must be 8 characters from Crockford Base32 alphabet"
+            "invalid custom code: must be 8 characters from Crockford Base32 alphabet"
         );
 
         let err = PairCodeError::InvalidWrappedData {
@@ -752,8 +934,28 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            "Invalid wrapped data: expected 80 bytes, got 50"
+            "invalid wrapped data: expected 80 bytes, got 50"
         );
+    }
+
+    #[test]
+    fn invalid_primary_ephemeral_key_preserves_curve_source() {
+        let err = PairCodeError::InvalidPrimaryEphemeralKey(CurveError::NoKeyTypeIdentifier);
+        let src = std::error::Error::source(&err).expect("source preserved");
+        let curve = src
+            .downcast_ref::<CurveError>()
+            .expect("downcasts to CurveError");
+        assert!(matches!(curve, CurveError::NoKeyTypeIdentifier));
+    }
+
+    #[test]
+    fn bundle_aead_preserves_crypto_provider_source() {
+        let err = PairCodeError::BundleAead(CryptoProviderError::BadInput);
+        let src = std::error::Error::source(&err).expect("source preserved");
+        let cpe = src
+            .downcast_ref::<CryptoProviderError>()
+            .expect("downcasts to CryptoProviderError");
+        assert!(matches!(cpe, CryptoProviderError::BadInput));
     }
 
     #[test]
@@ -766,5 +968,139 @@ mod tests {
         let bytes = [0x00, 0x00, 0x00, 0x00, 0x01]; // Last 5 bits = 1 = '2'
         let encoded = PairCodeUtils::encode_crockford(&bytes);
         assert_eq!(encoded.chars().last().unwrap(), '2');
+    }
+
+    // ----- Wire format + regression tests for companion_platform_{id,display} -----
+
+    fn child_bytes<'a>(node: &'a Node, tag: &str) -> &'a [u8] {
+        let n = node
+            .get_optional_child_by_tag(&[tag])
+            .unwrap_or_else(|| panic!("missing <{tag}>"));
+        match n.content.as_ref() {
+            Some(NodeContent::Bytes(b)) => b.as_slice(),
+            other => panic!("expected Bytes for <{tag}>, got {other:?}"),
+        }
+    }
+
+    fn build_iq(pid: &str, pdisp: &str) -> Node {
+        let noise = [0xAAu8; 32];
+        let wrapped = [0xBBu8; 80];
+        PairCodeUtils::build_companion_hello_iq(
+            "15551234567",
+            &noise,
+            &wrapped,
+            pid,
+            pdisp,
+            true,
+            "req-1".to_string(),
+        )
+    }
+
+    #[test]
+    fn companion_hello_iq_shape() {
+        let iq = build_iq("e", "Android (Android)");
+        assert_eq!(iq.tag, "iq");
+
+        let reg = iq
+            .get_optional_child_by_tag(&["link_code_companion_reg"])
+            .expect("link_code_companion_reg");
+        let attrs: std::collections::HashMap<String, String> = reg
+            .attrs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.as_str().into_owned()))
+            .collect();
+        assert_eq!(
+            attrs.get("stage").map(String::as_str),
+            Some("companion_hello")
+        );
+        assert_eq!(
+            attrs.get("jid").map(String::as_str),
+            Some("15551234567@s.whatsapp.net")
+        );
+        assert_eq!(
+            attrs
+                .get("should_show_push_notification")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        // Nonce is the string "0", per whatsmeow/baileys parity.
+        assert_eq!(child_bytes(reg, "link_code_pairing_nonce"), b"0");
+    }
+
+    #[test]
+    fn companion_hello_iq_passes_through_explicit_android_letter() {
+        let iq = build_iq("e", "Android (16)");
+        let reg = iq
+            .get_optional_child_by_tag(&["link_code_companion_reg"])
+            .unwrap();
+        assert_eq!(child_bytes(reg, "companion_platform_id"), b"e");
+        assert_eq!(
+            child_bytes(reg, "companion_platform_display"),
+            b"Android (16)"
+        );
+    }
+
+    #[test]
+    fn companion_hello_iq_chrome_linux_wire_parity() {
+        // Guarantees the refactor didn't shift wire bytes for the legacy web case.
+        let iq = build_iq("1", "Chrome (Linux)");
+        let reg = iq
+            .get_optional_child_by_tag(&["link_code_companion_reg"])
+            .unwrap();
+        assert_eq!(child_bytes(reg, "companion_platform_id"), b"1");
+        assert_eq!(
+            child_bytes(reg, "companion_platform_display"),
+            b"Chrome (Linux)"
+        );
+    }
+
+    #[test]
+    fn android_device_props_emit_server_accepted_companion_hello() {
+        let props = wa::DeviceProps {
+            os: Some("Android".into()),
+            platform_type: Some(wa::device_props::PlatformType::ANDROID_PHONE),
+            ..Default::default()
+        };
+        let (pid, pdisp) = resolve_companion_platform(&PairCodeOptions::default(), &props);
+        assert_eq!(pid, CompanionWebClientType::Chrome);
+        assert_eq!(pid.wire_byte(), b'1');
+        assert_eq!(pdisp, "Chrome (Android)");
+
+        let iq = build_iq(&pid.to_string(), &pdisp);
+        let reg = iq
+            .get_optional_child_by_tag(&["link_code_companion_reg"])
+            .unwrap();
+        assert_eq!(child_bytes(reg, "companion_platform_id"), b"1");
+        assert_eq!(
+            child_bytes(reg, "companion_platform_display"),
+            b"Chrome (Android)"
+        );
+    }
+
+    #[test]
+    fn explicit_options_override_id_and_display_follows() {
+        let props = wa::DeviceProps {
+            os: Some("Android".into()),
+            platform_type: Some(wa::device_props::PlatformType::ANDROID_PHONE),
+            ..Default::default()
+        };
+        let opts = PairCodeOptions {
+            platform_id: Some(CompanionWebClientType::Chrome),
+            ..Default::default()
+        };
+        let (pid, pdisp) = resolve_companion_platform(&opts, &props);
+        assert_eq!(pid, CompanionWebClientType::Chrome);
+        assert_eq!(pdisp, "Chrome (Android)");
+    }
+
+    /// Pair-code and QR share derivation.
+    #[test]
+    fn pair_code_id_matches_qr_id_for_same_device_props() {
+        use crate::companion_reg::companion_web_client_type_for_props;
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::EDGE));
+        let (pair_code_id, _) = derive_companion_platform(&p);
+        let qr_id = companion_web_client_type_for_props(&p);
+        assert_eq!(pair_code_id, qr_id);
     }
 }

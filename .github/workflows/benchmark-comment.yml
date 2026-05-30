@@ -41,8 +41,8 @@ jobs:
       - name: Fetch baseline data
         id: baseline
         run: |
-          gh api repos/${{ github.repository }}/contents/dev/bench/data.js?ref=gh-pages \
-            --jq '.content' | base64 -d > /tmp/baseline_data.js
+          gh api "repos/${{ github.repository }}/contents/dev/bench/data.js?ref=gh-pages" \
+            -H "Accept: application/vnd.github.raw" > /tmp/baseline_data.js
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true

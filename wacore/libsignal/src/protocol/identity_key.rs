@@ -138,7 +138,6 @@ impl IdentityKeyPair {
         let structure = IdentityKeyPairStructure {
             public_key: Some(self.identity_key.serialize().to_vec()),
             private_key: Some(self.private_key.serialize().to_vec()),
-            ..Default::default()
         };
 
         let result = structure.encode_to_vec();

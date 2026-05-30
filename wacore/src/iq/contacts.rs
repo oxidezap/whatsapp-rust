@@ -195,10 +195,9 @@ pub struct SetProfilePictureResponse {
 ///
 /// ## Wire Format (Remove)
 /// ```xml
-/// <iq xmlns="w:profile:picture" type="set" to="s.whatsapp.net" id="...">
-///   <picture type="image"/>
-/// </iq>
+/// <iq xmlns="w:profile:picture" type="set" to="s.whatsapp.net" id="..."/>
 /// ```
+/// No `<picture>` child: `WAWebSendProfilePictureJob` emits an empty IQ.
 ///
 /// ## Response
 /// ```xml
@@ -260,17 +259,18 @@ impl IqSpec for SetProfilePictureSpec {
     type Response = SetProfilePictureResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        let mut picture_builder = NodeBuilder::new("picture").attr("type", "image");
+        // WAWebSendProfilePictureJob: emits `<picture type="image">{bytes}</picture>`
+        // on set, NO `<picture>` child on remove.
+        let content = self.image_data.as_ref().map(|data| {
+            NodeContent::Nodes(vec![
+                NodeBuilder::new("picture")
+                    .attr("type", "image")
+                    .bytes(data.clone())
+                    .build(),
+            ])
+        });
 
-        if let Some(data) = &self.image_data {
-            picture_builder = picture_builder.bytes(data.clone());
-        }
-
-        let mut iq = InfoQuery::set(
-            "w:profile:picture",
-            Jid::new("", Server::Pn),
-            Some(NodeContent::Nodes(vec![picture_builder.build()])),
-        );
+        let mut iq = InfoQuery::set("w:profile:picture", Jid::new("", Server::Pn), content);
 
         if let Some(target) = &self.target {
             iq = iq.with_target_ref(target);
@@ -466,20 +466,24 @@ mod tests {
     }
 
     #[test]
-    fn test_set_profile_picture_spec_remove_own() {
+    fn test_set_profile_picture_spec_remove_own_emits_no_picture_child() {
+        // WAWebSendProfilePictureJob: removal IQ has no `<picture>` child at all.
         let spec = SetProfilePictureSpec::remove_own();
         let iq = spec.build_iq();
+        assert!(
+            iq.content.is_none(),
+            "Remove must emit an empty <iq> with no <picture> child; got {:?}",
+            iq.content
+        );
+    }
 
-        if let Some(NodeContent::Nodes(nodes)) = &iq.content {
-            let picture = &nodes[0];
-            // Remove: picture node with no content
-            assert!(
-                picture.content.is_none(),
-                "Remove should have no picture content"
-            );
-        } else {
-            panic!("Expected NodeContent::Nodes");
-        }
+    #[test]
+    fn test_set_profile_picture_spec_remove_group_emits_no_picture_child() {
+        let group_jid: Jid = "123456789@g.us".parse().unwrap();
+        let spec = SetProfilePictureSpec::remove_group(&group_jid);
+        let iq = spec.build_iq();
+        assert!(iq.content.is_none(), "Remove group: no <picture> child");
+        assert_eq!(iq.target, Some(group_jid));
     }
 
     #[test]

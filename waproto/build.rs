@@ -100,27 +100,19 @@ fn main() -> std::io::Result<()> {
         .generate_views(true)
         .out_dir(&out_path)
         .compile()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    // Add #[serde(skip)] to `__buffa_cached_size` fields on owned structs.
-    // `CachedSize` doesn't impl serde traits, and view structs don't derive
-    // serde, so the replace naturally only hits owned types. The raw
-    // `.replace` would silently no-op if buffa renamed the field, so the
-    // match count is asserted to fail fast on upstream drift.
+    // Buffa <0.7 generated an owned `__buffa_cached_size` field that needed
+    // to be skipped for serde. Buffa 0.7 removed it, so keep the patch only
+    // for older generated output.
     let generated = out_path.join("whatsapp.rs");
     let original = std::fs::read_to_string(&generated)?;
     let needle = "pub __buffa_cached_size:";
     let count = original.matches(needle).count();
-    if count == 0 {
-        return Err(std::io::Error::other(
-            "waproto post-processing: expected `pub __buffa_cached_size:` to \
-             appear in the generated file; buffa codegen likely renamed the \
-             field and the `#[serde(skip)]` injection is no longer covering \
-             it. Review buffa changelog and update this replace.",
-        ));
+    if count > 0 {
+        let patched = original.replace(needle, &format!("#[serde(skip)]\n    {needle}"));
+        std::fs::write(&generated, patched)?;
     }
-    let patched = original.replace(needle, &format!("#[serde(skip)]\n    {needle}"));
-    std::fs::write(&generated, patched)?;
 
     Ok(())
 }

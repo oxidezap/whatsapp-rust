@@ -1,4 +1,3 @@
-use chrono::{Local, Utc};
 use log::{error, info};
 use std::sync::Arc;
 use wacore::proto_helpers::MessageExt;
@@ -40,7 +39,7 @@ fn main() {
             writeln!(
                 buf,
                 "{} [{:<5}] [{}] - {}",
-                Local::now().format("%H:%M:%S"),
+                wacore::time::now_utc().format("%H:%M:%S"),
                 record.level(),
                 record.target(),
                 record.args()
@@ -165,13 +164,12 @@ async fn handle_text_ping(ctx: &MessageContext) {
             .source
             .is_group
             .then(|| ctx.info.source.sender.to_string()),
-        ..Default::default()
     };
     let reaction = wa::Message {
         reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
             key: buffa::MessageField::some(key),
             text: Some(REACTION_EMOJI.to_string()),
-            sender_timestamp_ms: Some(Utc::now().timestamp_millis()),
+            sender_timestamp_ms: Some(wacore::time::now_millis()),
             ..Default::default()
         }),
         ..Default::default()
@@ -180,7 +178,7 @@ async fn handle_text_ping(ctx: &MessageContext) {
         error!("Failed to send reaction: {}", e);
     }
 
-    let start = std::time::Instant::now();
+    let start = wacore::time::Instant::now();
     let context_info = ctx.build_quote_context();
     let reply = wa::Message {
         extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {

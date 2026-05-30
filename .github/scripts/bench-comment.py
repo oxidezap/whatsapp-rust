@@ -17,6 +17,8 @@ def load_baseline(data_js_path: str, bench_name: str) -> dict[str, int]:
     text = open(data_js_path).read()
     # data.js format: window.BENCHMARK_DATA = { ... };
     json_str = re.sub(r"^window\.BENCHMARK_DATA\s*=\s*", "", text).rstrip().rstrip(";")
+    if not json_str.strip():
+        return {}
     data = json.loads(json_str)
 
     baseline = {}

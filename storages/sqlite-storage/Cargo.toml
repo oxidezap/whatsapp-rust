@@ -1,6 +1,6 @@
 [package]
 name = "whatsapp-rust-sqlite-storage"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
@@ -23,7 +23,7 @@ diesel = { version = "2.3.7", default-features = false, features = [
 diesel_migrations = { version = "2.3.1", default-features = false, features = [
     "sqlite",
 ] }
-libsqlite3-sys = { version = "0.36", default-features = false, optional = true }
+libsqlite3-sys = { version = "0.37", default-features = false, optional = true }
 log = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
@@ -32,3 +32,6 @@ wacore = { workspace = true }
 [dev-dependencies]
 portable-atomic = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+
+[lints]
+workspace = true

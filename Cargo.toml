@@ -1,7 +1,7 @@
 
 [package]
 name = "whatsapp-rust"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
@@ -39,6 +39,11 @@ default-members = [
     "waproto",
 ]
 
+[workspace.lints.clippy]
+# Force the wacore::time abstraction so WASM/deterministic-test builds don't
+# regress. Exceptions carry `#[allow(clippy::disallowed_methods)]` inline.
+disallowed_methods = "deny"
+
 [workspace.dependencies]
 # Shared dependencies
 aes = "0.9.0"
@@ -48,8 +53,8 @@ async-channel = { version = "2.5.0", default-features = false, features = ["std"
 async-lock = { version = "3", default-features = false }
 async-trait = "0.1.89"
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-buffa = { git = "https://github.com/anthropics/buffa", branch = "main", default-features = false, features = ["json"] }
-buffa-build = { git = "https://github.com/anthropics/buffa", branch = "main", default-features = false }
+buffa = { git = "https://github.com/anthropics/buffa", tag = "v0.7.0", default-features = false, features = ["json"] }
+buffa-build = { git = "https://github.com/anthropics/buffa", tag = "v0.7.0", default-features = false }
 bytemuck = { version = "1.22", default-features = false }
 bytes = { version = "1.5", default-features = false }
 chrono = { version = "0.4", default-features = false }
@@ -73,24 +78,26 @@ serde-big-array = "0.5"
 serde_json = { version = "1.0", default-features = false }
 sha1 = { version = "0.11.0", default-features = false }
 sha2 = { version = "0.11.0", default-features = false }
+subtle = { version = "2.6", default-features = false }
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", default-features = false }
 uuid = { version = "1", default-features = false }
 
 # Internal workspace crates
-wacore = { path = "./wacore", default-features = false, version = "0.5.0" }
-wacore-appstate = { path = "./wacore/appstate", default-features = false, version = "0.5.0" }
-wacore-binary = { path = "./wacore/binary", default-features = false, version = "0.5.0" }
-wacore-derive = { path = "./wacore/derive", version = "0.5.0" }
-wacore-libsignal = { path = "./wacore/libsignal", version = "0.5.0" }
-wacore-noise = { path = "./wacore/noise", version = "0.5.0" }
-waproto = { path = "./waproto", version = "0.5.0" }
+wacore = { path = "./wacore", default-features = false, version = "0.6.0" }
+wacore-appstate = { path = "./wacore/appstate", default-features = false, version = "0.6.0" }
+wacore-binary = { path = "./wacore/binary", default-features = false, version = "0.6.0" }
+wacore-derive = { path = "./wacore/derive", version = "0.6.0" }
+wacore-libsignal = { path = "./wacore/libsignal", version = "0.6.0" }
+wacore-noise = { path = "./wacore/noise", version = "0.6.0" }
+waproto = { path = "./waproto", version = "0.6.0" }
 yoke = { version = "0.8", features = ["derive"] }
 
 [features]
 debug-diagnostics = ["wacore/debug-diagnostics"]
 debug-snapshots = ["wacore/debug-snapshots"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
+danger-skip-cert-chain-verify = ["wacore/danger-skip-cert-chain-verify"]
 default = [
     "moka-cache",
     "simd",
@@ -136,12 +143,25 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"], optiona
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
 waproto = { workspace = true }
-whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.5.0", optional = true }
-whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.5.0", optional = true }
-whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.5.0", optional = true }
+whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.6.0", optional = true }
+whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.6.0", optional = true }
+whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.6.0", optional = true }
 
 [dev-dependencies]
+aes = { workspace = true }
+cbc = { version = "0.2", features = ["alloc", "block-padding"] }
+flate2 = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+wacore-noise = { path = "./wacore/noise", features = [
+    "test-util",
+    "danger-skip-cert-chain-verify",
+] }
+
+[lints]
+workspace = true
 
 [[example]]
 name = "benchmark"

@@ -172,17 +172,13 @@ mod tests {
         wa::SyncdRecord {
             index: buffa::MessageField::some(wa::SyncdIndex {
                 blob: Some(vec![1; 32]),
-                ..Default::default()
             }),
             value: buffa::MessageField::some(wa::SyncdValue {
                 blob: Some(value_blob),
-                ..Default::default()
             }),
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.to_vec()),
-                ..Default::default()
             }),
-            ..Default::default()
         }
     }
 
@@ -265,12 +261,10 @@ mod tests {
         let snapshot = wa::SyncdSnapshot {
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id_1.clone()),
-                ..Default::default()
             }),
             records: vec![wa::SyncdRecord {
                 key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id_2.clone()),
-                    ..Default::default()
                 }),
                 ..Default::default()
             }],
@@ -280,13 +274,11 @@ mod tests {
         let patches = vec![wa::SyncdPatch {
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id_3.clone()),
-                ..Default::default()
             }),
             mutations: vec![wa::SyncdMutation {
                 record: buffa::MessageField::some(wa::SyncdRecord {
                     key_id: buffa::MessageField::some(wa::KeyId {
                         id: Some(key_id_4.clone()),
-                        ..Default::default()
                     }),
                     ..Default::default()
                 }),
@@ -311,12 +303,10 @@ mod tests {
         let snapshot = wa::SyncdSnapshot {
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
-                ..Default::default()
             }),
             records: vec![wa::SyncdRecord {
                 key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id.clone()),
-                    ..Default::default()
                 }),
                 ..Default::default()
             }],
@@ -326,7 +316,6 @@ mod tests {
         let patches = vec![wa::SyncdPatch {
             key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
-                ..Default::default()
             }),
             ..Default::default()
         }];

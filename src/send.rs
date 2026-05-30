@@ -42,7 +42,6 @@ impl SendResult {
             from_me: Some(true),
             id: Some(self.message_id.clone()),
             participant: None,
-            ..Default::default()
         }
     }
 }
@@ -80,70 +79,143 @@ pub enum RevokeType {
 }
 
 /// Derive stanza-level edit attribute and meta node from message content.
+///
+/// The `edit` attribute and the `<meta>` child are independent in WA Web: the
+/// edit attribute comes from `editAttribute(msg, subtype)` and the meta node
+/// from `genMetaNode(...)`. A message can carry both (e.g. a poll vote sets
+/// `polltype=vote` meta; an event edit sets both `event_type=edit` meta and
+/// `edit="1"` attribute).
 fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>, Option<Node>) {
-    if msg.pin_in_chat_message.is_set() {
-        return (Some(EditAttribute::PinInChat), None);
-    }
+    let edit = EditAttribute::infer_from_message(msg);
 
-    // Poll messages
-    if msg.poll_creation_message.is_set()
+    let meta = if msg.poll_creation_message.is_set()
         || msg.poll_creation_message_v2.is_set()
         || msg.poll_creation_message_v3.is_set()
+        || msg.poll_creation_message_v5.is_set()
     {
-        return (None, Some(meta_node("polltype", "creation")));
-    }
-    if let Some(poll_update) = msg.poll_update_message.as_option()
+        Some(meta_node("polltype", "creation"))
+    } else if let Some(poll_update) = msg.poll_update_message.as_option()
         && poll_update.vote.is_set()
     {
-        return (None, Some(meta_node("polltype", "vote")));
-    }
-    // TODO: polltype="result_snapshot" for poll_result_snapshot_message (gated behind AB flag)
-
-    // Event messages
-    if msg.event_message.is_set() {
-        return (None, Some(meta_node("event_type", "creation")));
-    }
-    if msg.enc_event_response_message.is_set() {
-        return (None, Some(meta_node("event_type", "response")));
-    }
-    if let Some(sec) = msg.secret_encrypted_message.as_option()
+        Some(meta_node("polltype", "vote"))
+        // TODO: polltype="result_snapshot" for poll_result_snapshot_message (gated behind AB flag)
+    } else if msg.event_message.is_set() {
+        Some(meta_node("event_type", "creation"))
+    } else if msg.enc_event_response_message.is_set() {
+        Some(meta_node("event_type", "response"))
+    } else if let Some(sec) = msg.secret_encrypted_message.as_option()
         && sec.secret_enc_type
             == Some(wa::message::secret_encrypted_message::SecretEncType::EVENT_EDIT)
     {
-        return (None, Some(meta_node("event_type", "edit")));
-    }
+        Some(meta_node("event_type", "edit"))
+    } else {
+        None
+    };
 
-    (None, None)
+    (edit, meta)
 }
 
 fn meta_node(key: &'static str, value: &'static str) -> Node {
     NodeBuilder::new("meta").attr(key, value).build()
 }
 
+/// Offset subtracted from the current unix timestamp to produce the
+/// `privacy_mode_ts` attr value on a `<biz>` stanza. Empirically confirmed
+/// against live WhatsApp servers.
+const BIZ_PRIVACY_MODE_TS_OFFSET: u64 = 77_980_457;
+
+enum BizCategory<'a> {
+    /// `<biz actual_actors host_storage privacy_mode_ts native_flow_name=X/>` — no children.
+    PaymentSimple(&'a str),
+    /// Nested form preserving the button's flow name.
+    NestedNamed(&'a str),
+    /// Nested form with `name="mixed"`. Fallback for buttons the server
+    /// silently drops when sent under their literal name.
+    Mixed,
+}
+
+fn classify_button(button_name: &str) -> BizCategory<'_> {
+    match button_name {
+        "payment_info" => BizCategory::PaymentSimple("payment_info"),
+        "review_and_pay" => BizCategory::PaymentSimple("order_details"),
+        "review_order" | "order_status" => BizCategory::PaymentSimple("order_status"),
+        "payment_status" => BizCategory::PaymentSimple("payment_status"),
+        "payment_method" => BizCategory::PaymentSimple("payment_method"),
+        "payment_reminder" => BizCategory::PaymentSimple("payment_reminder"),
+
+        "cta_url" => BizCategory::NestedNamed("cta_url"),
+        "cta_catalog" => BizCategory::NestedNamed("cta_catalog"),
+        "catalog_message" => BizCategory::NestedNamed("catalog_message"),
+        "galaxy_message" => BizCategory::NestedNamed("galaxy_message"),
+        "booking_confirmation" => BizCategory::NestedNamed("booking_confirmation"),
+        "call_permission_request" => BizCategory::NestedNamed("call_permission_request"),
+        "open_webview" => BizCategory::NestedNamed("message_with_link"),
+        "message_with_link_status" => BizCategory::NestedNamed("message_with_link_status"),
+
+        // quick_reply / cta_copy / cta_call / single_select / send_location
+        // and every other unknown name go through the mixed fallback. The
+        // server silently drops messages sent under the literal name for
+        // these buttons.
+        _ => BizCategory::Mixed,
+    }
+}
+
 /// Derive the `<biz>` stanza child for native-flow interactive messages.
-/// All native flow types use the same nested structure (confirmed via protocol capture).
-fn infer_biz_node(msg: &wa::Message) -> Option<Node> {
+///
+/// Returns `None` when the message has no native-flow interactive payload.
+/// Otherwise returns the assembled `<biz>` node. The caller is responsible
+/// for prepending `<bot biz_bot="1"/>` for DM-bound sends (see
+/// `build_extra_stanza_nodes`).
+///
+/// `now_unix_secs` is the current wall-clock time in unix seconds. Taking it
+/// as a parameter keeps the function pure and lets tests pin the resulting
+/// `privacy_mode_ts` deterministically without touching the global time
+/// provider.
+fn infer_biz_node(msg: &wa::Message, now_unix_secs: u64) -> Option<Node> {
     let interactive = extract_interactive_message(msg)?;
-    let wa::message::interactive_message::InteractiveMessageOneof::NativeFlowMessage(nf) =
+    let wa::message::interactive_message::InteractiveMessage::NativeFlowMessage(nf) =
         interactive.interactiveMessage.as_ref()?
     else {
         return None;
     };
 
     let first_button_name = nf.buttons.first()?.name.as_deref()?;
-    let flow_name = button_name_to_flow_name(first_button_name);
+    let category = classify_button(first_button_name);
+    let privacy_mode_ts = now_unix_secs
+        .saturating_sub(BIZ_PRIVACY_MODE_TS_OFFSET)
+        .to_string();
 
-    Some(
-        NodeBuilder::new("biz")
-            .children([NodeBuilder::new("interactive")
+    Some(match category {
+        BizCategory::PaymentSimple(flow_name) => NodeBuilder::new("biz")
+            .attr("actual_actors", "2")
+            .attr("host_storage", "2")
+            .attr("privacy_mode_ts", &privacy_mode_ts)
+            .attr("native_flow_name", flow_name)
+            .build(),
+        BizCategory::NestedNamed(flow_name) => build_nested_biz(&privacy_mode_ts, flow_name),
+        BizCategory::Mixed => build_nested_biz(&privacy_mode_ts, "mixed"),
+    })
+}
+
+fn build_nested_biz(privacy_mode_ts: &str, flow_name: &str) -> Node {
+    NodeBuilder::new("biz")
+        .attr("actual_actors", "2")
+        .attr("host_storage", "2")
+        .attr("privacy_mode_ts", privacy_mode_ts)
+        .children([
+            NodeBuilder::new("interactive")
                 .attr("type", "native_flow")
                 .attr("v", "1")
                 .children([NodeBuilder::new("native_flow")
+                    .attr("v", "9")
                     .attr("name", flow_name)
                     .build()])
-                .build()])
-            .build(),
-    )
+                .build(),
+            NodeBuilder::new("quality_control")
+                .attr("source_type", "third_party")
+                .build(),
+        ])
+        .build()
 }
 
 fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::InteractiveMessage> {
@@ -161,27 +233,32 @@ fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::Intera
     None
 }
 
-fn button_name_to_flow_name(button_name: &str) -> &str {
-    match button_name {
-        "review_and_pay" => "order_details",
-        "payment_info" => "payment_info",
-        "review_order" | "order_status" => "order_status",
-        "payment_status" => "payment_status",
-        "payment_method" => "payment_method",
-        "payment_reminder" => "payment_reminder",
-        "open_webview" => "message_with_link",
-        "message_with_link_status" => "message_with_link_status",
-        "cta_url" => "cta_url",
-        "cta_call" => "cta_call",
-        "cta_copy" => "cta_copy",
-        "cta_catalog" => "cta_catalog",
-        "catalog_message" => "catalog_message",
-        "quick_reply" => "quick_reply",
-        "galaxy_message" => "galaxy_message",
-        "booking_confirmation" => "booking_confirmation",
-        "call_permission_request" => "call_permission_request",
-        other => other,
+/// Assemble the `extra_stanza_nodes` vector for a non-newsletter send.
+///
+/// Order: `inferred_meta`, optional `<bot biz_bot="1"/>` (DM only), `<biz>`,
+/// then any user-provided extra nodes. Pure so the caller stays trivial and
+/// the assembly logic is unit-testable.
+fn build_extra_stanza_nodes(
+    to: &Jid,
+    inferred_meta: Option<Node>,
+    biz: Option<Node>,
+    user_nodes: Vec<Node>,
+) -> Vec<Node> {
+    if inferred_meta.is_none() && biz.is_none() {
+        return user_nodes;
     }
+    let bot_emitted = biz.is_some() && !to.is_group();
+    let extra = inferred_meta.is_some() as usize + biz.is_some() as usize + bot_emitted as usize;
+    let mut nodes = Vec::with_capacity(user_nodes.len() + extra);
+    nodes.extend(inferred_meta);
+    if let Some(node) = biz {
+        if bot_emitted {
+            nodes.push(NodeBuilder::new("bot").attr("biz_bot", "1").build());
+        }
+        nodes.push(node);
+    }
+    nodes.extend(user_nodes);
+    nodes
 }
 
 fn build_revoke_message(
@@ -197,7 +274,6 @@ fn build_revoke_message(
                 from_me: Some(from_me),
                 id: Some(message_id),
                 participant,
-                ..Default::default()
             }),
             r#type: Some(wa::message::protocol_message::Type::REVOKE),
             ..Default::default()
@@ -271,17 +347,11 @@ impl Client {
         }
 
         let (edit, inferred_meta) = infer_stanza_metadata(&message);
-        let inferred_biz = infer_biz_node(&message);
+        let now_unix_secs = wacore::time::now_secs_u64();
+        let biz = infer_biz_node(&message, now_unix_secs);
 
-        let extra_nodes = if inferred_meta.is_none() && inferred_biz.is_none() {
-            options.extra_stanza_nodes
-        } else {
-            let mut nodes = Vec::with_capacity(2 + options.extra_stanza_nodes.len());
-            nodes.extend(inferred_meta);
-            nodes.extend(inferred_biz);
-            nodes.extend(options.extra_stanza_nodes);
-            nodes
-        };
+        let extra_nodes =
+            build_extra_stanza_nodes(&to, inferred_meta, biz, options.extra_stanza_nodes);
         self.send_message_impl(
             to,
             &message,
@@ -419,6 +489,7 @@ impl Client {
         };
 
         let prepared = match wacore::send::prepare_group_stanza(
+            &*self.runtime,
             &mut stores,
             self,
             &mut group_info,
@@ -460,6 +531,7 @@ impl Client {
                     let mut stores_retry = store_adapter_retry.as_signal_stores();
 
                     wacore::send::prepare_group_stanza(
+                        &*self.runtime,
                         &mut stores_retry,
                         self,
                         &mut group_info,
@@ -559,10 +631,8 @@ impl Client {
             })
             .await;
 
-        if cached_map.is_empty() {
-            return None;
-        }
-
+        // No empty-cache early-exit: WA Web iterates an empty `senderKey` Map
+        // as `false` per participant, so the filter below must run unconditionally.
         let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
         let jids_to_resolve: Vec<Jid> = group_info
             .participants
@@ -703,10 +773,38 @@ impl Client {
                             client.invalidate_device_cache(&own_pn.user).await;
                         }
                     }
-                    client
-                        .sender_key_device_cache
-                        .invalidate(&jid.to_string())
-                        .await;
+                    let jid_str = jid.to_string();
+                    // Cache-only invalidation re-reads the same stale rows on
+                    // the next send. Drop the persisted state too so the next
+                    // send takes the full-distribution path. If the clear
+                    // fails, fall back to deleting the bot's own sender key
+                    // for the chat — the next send will see `!key_exists`
+                    // and force_skdm without depending on the tracker.
+                    if jid.is_group() || jid.is_status_broadcast() {
+                        let cleared = client
+                            .persistence_manager
+                            .clear_sender_key_devices(&jid_str)
+                            .await;
+                        if let Err(e) = cleared {
+                            log::warn!(
+                                "phash mismatch: clear_sender_key_devices failed: {e} — \
+                                 deleting own sender key as fallback to force redistribution"
+                            );
+                            use wacore::libsignal::store::sender_key_name::SenderKeyName;
+                            use wacore::types::jid::JidExt;
+                            let snapshot =
+                                client.persistence_manager.get_device_snapshot().await;
+                            for own in snapshot.lid.iter().chain(snapshot.pn.iter()) {
+                                let sk =
+                                    SenderKeyName::from_parts(&jid_str, own.to_protocol_address().as_str());
+                                client.signal_cache.delete_sender_key(sk.cache_key()).await;
+                            }
+                            let _ = client
+                                .flush_signal_cache_logged("phash-mismatch-fallback", None)
+                                .await;
+                        }
+                    }
+                    client.sender_key_device_cache.invalidate(&jid_str).await;
                     if invalidate_group_cache {
                         client.get_group_cache().await.invalidate(&jid).await;
                     }
@@ -764,7 +862,7 @@ impl Client {
                 }
                 // The protocolMessageKey.participant should match the original message's key exactly
                 // Do NOT convert LID to PN - pass through unchanged like WhatsApp Web does
-                let participant_str = original_sender.to_non_ad().to_string();
+                let participant_str = original_sender.to_non_ad_string();
                 log::debug!(
                     "Admin revoke: using participant {} for MessageKey",
                     participant_str
@@ -837,7 +935,6 @@ impl Client {
                 key: buffa::MessageField::some(key),
                 r#type: Some(pin_type),
                 sender_timestamp_ms: Some(wacore::time::now_millis()),
-                ..Default::default()
             }),
             message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
                 message_add_on_duration_in_secs: Some(duration_secs),
@@ -896,6 +993,17 @@ impl Client {
             Some(id) => id,
             None => self.generate_message_id().await,
         };
+        // `request_id` is moved into the branch-specific stanza builders below;
+        // keep a copy for the post-send messageSecret persistence (the secret
+        // itself is generated inside prepare_dm/group_stanza, not on `message`,
+        // so it's threaded back out via PreparedStanza.message_secret below).
+        let outbound_id_clone = request_id.clone();
+        let mut outbound_msg_secret: Option<[u8; 32]> = None;
+        // Group prepares pick LID or PN based on group addressing_mode;
+        // capture it so the persisted secret keys match what
+        // `<meta target_sender_jid>` echoes back. For DMs we resolve from
+        // chat.server (LID for bot, PN otherwise) after send_node succeeds.
+        let mut outbound_group_sender_identity: Option<Jid> = None;
 
         // SKDM update data — only populated for group sends, deferred until after send_node().
         // This matches WhatsApp Web which only calls markHasSenderKey() after server ACK.
@@ -921,6 +1029,7 @@ impl Client {
 
             let mut store_adapter = self.signal_adapter().await;
 
+            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
             wacore::send::prepare_peer_stanza(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
@@ -928,14 +1037,12 @@ impl Client {
                 &signal_addr,
                 message,
                 request_id,
+                device_snapshot.account.as_ref(),
             )
             .await?
         } else if to.is_group() {
-            // Group messages: No client-level lock needed.
-            // Each participant device is encrypted separately with its own per-device lock
-            // inside prepare_group_stanza, so we don't need to serialize entire group sends.
-
-            // Preparation work (no lock needed)
+            // No send-level lock: encrypt_group_message serializes the
+            // sender-key chain advance per (group, sender) at the cipher.
             let mut group_info = self.groups().query_info(&to).await?;
 
             let mut device_snapshot = self.persistence_manager.get_device_snapshot().await;
@@ -974,13 +1081,40 @@ impl Client {
                 let sender_key_name = SenderKeyName::from_parts(&to_str, sender_address.as_str());
 
                 let device_guard = device_store_arc.read().await;
-                let key_exists = self
+                let record = self
                     .signal_cache
                     .get_sender_key(&sender_key_name, &*device_guard.backend)
-                    .await?
-                    .is_some();
+                    .await?;
+                let key_exists = record.is_some();
 
-                force_key_distribution || !key_exists
+                // WA Web posts SenderKeyExpired with `PERIODIC_ROTATION` after
+                // a chain advances past a threshold. Captured-js doesn't show
+                // the value; 1000 mirrors common Signal hygiene defaults.
+                const SENDER_KEY_ROTATION_THRESHOLD: u32 = 1000;
+                let needs_rotation = record
+                    .and_then(|mut r| r.sender_key_state_mut().ok().cloned())
+                    .and_then(|state| state.sender_chain_key().map(|ck| ck.iteration()))
+                    .is_some_and(|iter| iter >= SENDER_KEY_ROTATION_THRESHOLD);
+                drop(device_guard);
+
+                if needs_rotation {
+                    log::info!(
+                        "Periodic sender-key rotation for {to} (chain iteration ≥ {SENDER_KEY_ROTATION_THRESHOLD})"
+                    );
+                    self.signal_cache
+                        .delete_sender_key(sender_key_name.cache_key())
+                        .await;
+                    if let Err(e) = self
+                        .persistence_manager
+                        .clear_sender_key_devices(&to_str)
+                        .await
+                    {
+                        log::warn!("periodic rotation: clear_sender_key_devices failed: {e}");
+                    }
+                    self.sender_key_device_cache.invalidate(&to_str).await;
+                }
+
+                force_key_distribution || !key_exists || needs_rotation
             };
 
             let mut store_adapter = self.signal_adapter_from(device_store_arc.clone());
@@ -997,6 +1131,7 @@ impl Client {
             };
 
             match wacore::send::prepare_group_stanza(
+                &*self.runtime,
                 &mut stores,
                 self,
                 &mut group_info,
@@ -1019,6 +1154,8 @@ impl Client {
                         devices: prepared.skdm_devices,
                         stale_users: prepared.stale_device_users,
                     });
+                    outbound_msg_secret = prepared.message_secret;
+                    outbound_group_sender_identity = Some(prepared.sender_identity);
                     prepared.node
                 }
                 Err(e) => {
@@ -1041,6 +1178,7 @@ impl Client {
                         let mut stores_retry = store_adapter_retry.as_signal_stores();
 
                         let retry_prepared = wacore::send::prepare_group_stanza(
+                            &*self.runtime,
                             &mut stores_retry,
                             self,
                             &mut group_info,
@@ -1062,6 +1200,8 @@ impl Client {
                             devices: retry_prepared.skdm_devices,
                             stale_users: retry_prepared.stale_device_users,
                         });
+                        outbound_msg_secret = retry_prepared.message_secret;
+                        outbound_group_sender_identity = Some(retry_prepared.sender_identity);
                         retry_prepared.node
                     } else {
                         return Err(e);
@@ -1120,7 +1260,8 @@ impl Client {
             // DM fanout: all known recipient devices + own companions.
             // WAWebSendUserMsgJob reads local device table only on the send
             // path; WAWebDBDeviceListFanout excludes hosted devices.
-            let recipient_bare = self.resolve_encryption_jid(&to).await.to_non_ad();
+            let recipient_bare = self.resolve_encryption_jid(&to).await.into_non_ad();
+            let recipient_is_lid = recipient_bare.is_lid();
 
             // Local registry first; network warm only on miss to avoid
             // unnecessary LID-migration side effects from get_user_devices
@@ -1130,11 +1271,25 @@ impl Client {
                 recipient_cached = self.get_devices_from_registry(&recipient_bare).await;
             }
 
-            let mut own_cached = self.get_devices_from_registry(own_jid).await;
-            if own_cached.is_none() {
-                let _ = self.get_user_devices(std::slice::from_ref(own_jid)).await;
-                own_cached = self.get_devices_from_registry(own_jid).await;
-            }
+            let is_self_dm =
+                is_self_dm_recipient(&recipient_bare, own_jid, device_snapshot.lid.as_ref());
+
+            // Skip the own-device lookup only when we already have the
+            // recipient's list — that record covers every own device in a
+            // single namespace. If `recipient_cached` is `None` (cache miss
+            // + warmup failed), the PN-keyed `own_cached` is the only thing
+            // standing between us and a bare-JID fallback that would drop
+            // companion devices.
+            let own_cached: Option<Vec<Jid>> = if is_self_dm && recipient_cached.is_some() {
+                None
+            } else {
+                let mut cached = self.get_devices_from_registry(own_jid).await;
+                if cached.is_none() {
+                    let _ = self.get_user_devices(std::slice::from_ref(own_jid)).await;
+                    cached = self.get_devices_from_registry(own_jid).await;
+                }
+                cached
+            };
 
             // Build device list, filter hosted in-place, reuse Vecs
             let mut all_dm_jids = match recipient_cached {
@@ -1160,9 +1315,23 @@ impl Client {
                 !is_sender
             });
 
-            // Dedup for self-DMs: recipient and own device lists overlap when
-            // sending to own account. `participant_list_hash` sorts internally,
-            // so reordering here is safe.
+            // own_cached is keyed by the bot's PN, so own devices come back
+            // PN-addressed. The server rejects a stanza that mixes PN and LID
+            // participants, so align own devices to LID for a LID recipient
+            // (whatsmeow switches ownID to LID before fanout).
+            if recipient_is_lid {
+                let lid = own_lid.ok_or_else(|| {
+                    anyhow!("Cannot send a LID-addressed DM before the device LID is known")
+                })?;
+                for j in all_dm_jids.iter_mut() {
+                    if j.is_pn() && j.is_same_user_as(own_jid) {
+                        *j = Jid::lid_device(lid.user.clone(), j.device);
+                    }
+                }
+            }
+
+            // Same-namespace dedup only; cross-namespace overlap is avoided
+            // upstream via `is_self_dm_recipient`.
             wacore::types::jid::sort_dedup_by_device(&mut all_dm_jids);
 
             self.ensure_e2e_sessions(&all_dm_jids).await?;
@@ -1195,6 +1364,7 @@ impl Client {
             let mut stores = store_adapter.as_signal_stores();
 
             let prepared = wacore::send::prepare_dm_stanza(
+                &*self.runtime,
                 &mut stores,
                 self,
                 own_jid,
@@ -1209,6 +1379,7 @@ impl Client {
             )
             .await?;
             dm_phash = prepared.phash;
+            outbound_msg_secret = prepared.message_secret;
             prepared.node
         };
 
@@ -1238,8 +1409,33 @@ impl Client {
             return Err(e.into());
         }
 
+        if let Some(secret) = outbound_msg_secret.as_ref() {
+            let sender = match outbound_group_sender_identity {
+                Some(s) => Some(s),
+                None => self.dm_sender_identity_for(&tc_issue_target).await,
+            };
+            if let Some(sender) = sender {
+                self.persist_outbound_msg_secret(
+                    &tc_issue_target,
+                    &sender,
+                    &outbound_id_clone,
+                    secret,
+                )
+                .await;
+            }
+        }
+
         if let Some((rx, phash, msg_id)) = ack {
-            self.spawn_phash_validation(rx, phash, tc_issue_target.clone(), false, msg_id);
+            // Group sends also invalidate group cache on mismatch — server's
+            // participant set diverged, the next send needs a fresh query.
+            let invalidate_group = tc_issue_target.is_group();
+            self.spawn_phash_validation(
+                rx,
+                phash,
+                tc_issue_target.clone(),
+                invalidate_group,
+                msg_id,
+            );
         }
 
         if let Some(update) = skdm_update {
@@ -1274,6 +1470,40 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    /// Persist a generated `MessageContextInfo.message_secret` keyed by
+    /// `(chat_non_ad, sender_non_ad, msg_id)`. The sender identity must
+    /// match what `<meta target_sender_jid>` echoes back at GET time —
+    /// LID for bot chats and LID-mode groups, PN otherwise.
+    pub(crate) async fn persist_outbound_msg_secret(
+        &self,
+        chat: &Jid,
+        sender: &Jid,
+        msg_id: &str,
+        secret: &[u8; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+    ) {
+        let chat_str = chat.to_non_ad_string();
+        let sender_str = sender.to_non_ad_string();
+        if let Err(e) = self
+            .persistence_manager
+            .backend()
+            .put_msg_secret(&chat_str, &sender_str, msg_id, secret)
+            .await
+        {
+            log::warn!("Failed to persist outbound messageSecret for {msg_id}: {e:?}");
+        }
+    }
+
+    /// Decide the identity (LID vs PN) under which an outbound DM's
+    /// `messageSecret` should be persisted. Group sends should use
+    /// `PreparedGroupStanza.sender_identity` directly instead of this.
+    pub(crate) async fn dm_sender_identity_for(&self, to: &Jid) -> Option<Jid> {
+        if to.server == wacore_binary::Server::Bot {
+            self.get_lid().await
+        } else {
+            self.get_pn().await
+        }
     }
 
     /// Look up and include a privacy token in outgoing 1:1 message stanza nodes.
@@ -1509,7 +1739,7 @@ impl Client {
         use wacore::iq::tctoken::{IssuePrivacyTokensSpec, is_sender_tc_token_expired};
 
         // Dedup via session_locks — bare JID won't collide with protocol addresses ("user:device")
-        let bare = sender.to_non_ad().to_string();
+        let bare = sender.to_non_ad_string();
         let mutex = self.session_lock_for(&bare).await;
         let Some(_guard) = mutex.try_lock() else {
             return;
@@ -1693,7 +1923,23 @@ impl Client {
             jid.to_non_ad()
         };
         // Issuance targets bare account JIDs, not device-scoped ones
-        resolved.to_non_ad()
+        resolved.into_non_ad()
+    }
+}
+
+/// Self-DM detection: appending an own-device lookup on top of the
+/// recipient's list would address each physical device twice (LID + PN),
+/// which the server rejects with `ack error="400"`.
+/// WAWebDBDeviceListFanout never re-fetches the own list for the same account.
+pub(crate) fn is_self_dm_recipient(
+    recipient_bare: &Jid,
+    own_pn: &Jid,
+    own_lid: Option<&Jid>,
+) -> bool {
+    match recipient_bare.server {
+        Server::Lid => own_lid.is_some_and(|lid| recipient_bare.user == lid.user),
+        Server::Pn => recipient_bare.user == own_pn.user,
+        _ => false,
     }
 }
 
@@ -1737,7 +1983,6 @@ mod tests {
                             from_me: Some(false),
                             id: Some("ORIGID".into()),
                             participant: Some("120363040237990503@g.us".into()),
-                            ..Default::default()
                         }),
                         text: Some("❤️".into()),
                         sender_timestamp_ms: Some(1),
@@ -1768,7 +2013,6 @@ mod tests {
                             from_me: Some(false),
                             id: Some("ORIGID".into()),
                             participant: None,
-                            ..Default::default()
                         }),
                         text: Some("❤️".into()),
                         sender_timestamp_ms: Some(1),
@@ -1827,7 +2071,7 @@ mod tests {
             ),
             RevokeType::Admin { original_sender } => (
                 false,
-                Some(original_sender.to_non_ad().to_string()),
+                Some(original_sender.to_non_ad_string()),
                 crate::types::message::EditAttribute::AdminRevoke,
             ),
         };
@@ -1867,7 +2111,7 @@ mod tests {
             ),
             RevokeType::Admin { original_sender } => (
                 false,
-                Some(original_sender.to_non_ad().to_string()),
+                Some(original_sender.to_non_ad_string()),
                 crate::types::message::EditAttribute::AdminRevoke,
             ),
         };
@@ -1890,13 +2134,185 @@ mod tests {
         assert_eq!(key.id, Some(message_id));
     }
 
+    // Fictitious JIDs (not real PII):
+    //   own PN user = "5500000000000"
+    //   own LID user = "111111111111111"
+    //   other LID user = "222222222222222"
+    const SELF_PN: &str = "5500000000000";
+    const SELF_LID: &str = "111111111111111";
+    const SELF_DEVICE: u16 = 7;
+    const OTHER_LID: &str = "222222222222222";
+
+    #[test]
+    fn self_dm_lid_recipient_matches_own_lid() {
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient = Jid::lid(SELF_LID);
+
+        assert!(is_self_dm_recipient(&recipient, &own_pn, Some(&own_lid)));
+    }
+
+    #[test]
+    fn self_dm_pn_recipient_matches_own_pn() {
+        // Self-DM addressed in PN namespace (no LID mapping resolved yet).
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient = Jid::pn(SELF_PN);
+
+        assert!(is_self_dm_recipient(&recipient, &own_pn, Some(&own_lid)));
+    }
+
+    #[test]
+    fn self_dm_pn_recipient_self_dm_even_without_own_lid() {
+        // PN-keyed self-detection does not require an own_lid to be known.
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let recipient = Jid::pn(SELF_PN);
+
+        assert!(is_self_dm_recipient(&recipient, &own_pn, None));
+    }
+
+    #[test]
+    fn non_self_lid_recipient_is_not_self_dm() {
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient = Jid::lid(OTHER_LID);
+
+        assert!(!is_self_dm_recipient(&recipient, &own_pn, Some(&own_lid)));
+    }
+
+    #[test]
+    fn lid_recipient_without_own_lid_is_not_self_dm() {
+        // WAWebUserPrefsMeUser.isMeAccount keys on isSameAccountAndAddressingMode;
+        // PN-string equality across namespaces must NOT trigger.
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let recipient = Jid::lid(SELF_PN);
+
+        assert!(!is_self_dm_recipient(&recipient, &own_pn, None));
+    }
+
+    #[test]
+    fn group_or_broadcast_recipient_is_not_self_dm() {
+        // Defensive: only PN/LID DMs ever take the self-DM short-circuit.
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+
+        assert!(!is_self_dm_recipient(
+            &Jid::group("120363000000000000"),
+            &own_pn,
+            Some(&own_lid),
+        ));
+        assert!(!is_self_dm_recipient(
+            &Jid::status_broadcast(),
+            &own_pn,
+            Some(&own_lid),
+        ));
+    }
+
+    #[test]
+    fn self_dm_with_no_recipient_cache_still_appends_own_devices() {
+        // Edge case raised in PR review: if `recipient_cached` ends up `None`
+        // (cache eviction + warmup failed), the self-DM short-circuit must
+        // still let `own_cached` populate the fanout. Otherwise the bare-JID
+        // fallback drops every companion device.
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient_bare = Jid::lid(SELF_LID);
+        assert!(is_self_dm_recipient(
+            &recipient_bare,
+            &own_pn,
+            Some(&own_lid)
+        ));
+
+        let recipient_cached: Option<Vec<Jid>> = None;
+        let own_cached_pn: Vec<Jid> = [0u16, 3, SELF_DEVICE]
+            .into_iter()
+            .map(|d| Jid::pn_device(SELF_PN, d))
+            .collect();
+
+        // Mirrors the call-site logic: we keep own_cached when recipient_cached is None
+        // even in a self-DM.
+        let keep_own = recipient_cached.is_none();
+        assert!(keep_own);
+
+        let mut all_dm_jids = match recipient_cached {
+            Some(devices) => devices,
+            None => vec![recipient_bare],
+        };
+        if keep_own {
+            all_dm_jids.extend(own_cached_pn.iter().cloned());
+        }
+        all_dm_jids.retain(|j| {
+            let is_sender = (j.is_same_user_as(&own_pn) && j.device == own_pn.device)
+                || (j.is_same_user_as(&own_lid) && j.device == own_lid.device);
+            !is_sender
+        });
+        wacore::types::jid::sort_dedup_by_device(&mut all_dm_jids);
+
+        // Must contain the bare LID plus the two non-sender PN companion devices.
+        assert!(
+            all_dm_jids.iter().any(|j| j.is_lid()),
+            "bare recipient LID must remain"
+        );
+        assert_eq!(
+            all_dm_jids.iter().filter(|j| j.is_pn()).count(),
+            2,
+            "companion PN devices must survive when recipient_cached is None"
+        );
+    }
+
+    #[test]
+    fn old_merge_produced_lid_pn_duplicates_for_self_dm() {
+        // Pinning regression: the OLD merge path (recipient_cached LID ++
+        // own_cached PN, then sort_dedup_by_device) left every device listed
+        // twice for a self-DM, which the server rejects with ack error="400".
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient_bare = Jid::lid(SELF_LID);
+
+        let devices = [0u16, 3, 5, SELF_DEVICE];
+        let recipient_cached: Vec<Jid> = devices
+            .iter()
+            .map(|&d| Jid::lid_device(SELF_LID, d))
+            .collect();
+        let own_cached: Vec<Jid> = devices
+            .iter()
+            .map(|&d| Jid::pn_device(SELF_PN, d))
+            .collect();
+
+        let retain_non_sender = |j: &Jid| {
+            let is_sender = (j.is_same_user_as(&own_pn) && j.device == own_pn.device)
+                || (j.is_same_user_as(&own_lid) && j.device == own_lid.device);
+            !is_sender
+        };
+
+        let mut buggy = recipient_cached.clone();
+        buggy.extend(own_cached.clone());
+        buggy.retain(retain_non_sender);
+        wacore::types::jid::sort_dedup_by_device(&mut buggy);
+        assert_eq!(buggy.len(), (devices.len() - 1) * 2);
+
+        assert!(is_self_dm_recipient(
+            &recipient_bare,
+            &own_pn,
+            Some(&own_lid)
+        ));
+
+        let mut fixed = recipient_cached;
+        fixed.retain(retain_non_sender);
+        wacore::types::jid::sort_dedup_by_device(&mut fixed);
+        assert_eq!(fixed.len(), devices.len() - 1);
+        for j in &fixed {
+            assert!(j.is_lid());
+        }
+    }
+
     #[test]
     fn test_admin_revoke_preserves_lid_format() {
         // LID JIDs must NOT be converted to PN (phone number) format.
         // This was a bug that caused error 479 - the participant field must
         // preserve the original JID format exactly (with device stripped).
         let lid_sender = Jid::from_str("236395184570386:22@lid").unwrap();
-        let participant_str = lid_sender.to_non_ad().to_string();
+        let participant_str = lid_sender.to_non_ad_string();
 
         // Must preserve @lid suffix, device number stripped
         assert_eq!(participant_str, "236395184570386@lid");
@@ -2081,6 +2497,118 @@ mod tests {
     }
 
     #[test]
+    fn empty_sender_key_device_map_marks_all_devices_for_skdm() {
+        use crate::sender_key_device_cache::SenderKeyDeviceMap;
+
+        let map = SenderKeyDeviceMap::from_db_rows(&[]);
+        assert_eq!(map.device_has_key("271060335329480", 0), None);
+        assert!(!map.is_user_forgotten("271060335329480"));
+
+        let all_resolved_devices: Vec<Jid> = [
+            "271060335329480@lid",
+            "77610646245392@lid",
+            "276661023027320:5@lid",
+        ]
+        .into_iter()
+        .map(|s| Jid::from_str(s).unwrap())
+        .collect();
+
+        let needs_skdm: Vec<&Jid> = all_resolved_devices
+            .iter()
+            .filter(|device| {
+                !map.device_has_key(&device.user, device.device)
+                    .unwrap_or(false)
+                    || map.is_user_forgotten(&device.user)
+            })
+            .collect();
+
+        assert_eq!(needs_skdm.len(), all_resolved_devices.len());
+    }
+
+    /// Fails if the empty-cache early-exit is reintroduced.
+    #[tokio::test]
+    async fn resolve_skdm_targets_distributes_when_cache_empty_but_devices_known() {
+        use wacore::client::context::GroupInfo;
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        use wacore::types::message::AddressingMode;
+
+        let client = crate::test_utils::create_test_client().await;
+        let group_jid = "120363161500776365@g.us";
+        let own_lid = Jid::from_str("193832511623409:13@lid").unwrap();
+
+        let participant_users = ["271060335329480", "77610646245392", "276661023027320"];
+
+        // Pre-populate so `resolve_devices` succeeds without a transport.
+        for user in &participant_users {
+            let record = DeviceListRecord {
+                user: (*user).into(),
+                devices: vec![DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                }],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            };
+            client
+                .device_registry_cache
+                .insert((*user).into(), record)
+                .await;
+        }
+
+        let participants: Vec<Jid> = participant_users
+            .iter()
+            .map(|u| Jid::from_str(&format!("{u}@lid")).unwrap())
+            .collect();
+
+        let group_info = GroupInfo::new(participants.clone(), AddressingMode::Lid);
+
+        let result = client
+            .resolve_skdm_targets(group_jid, &group_info, &own_lid)
+            .await
+            .expect("None means the empty-cache early-exit is back");
+
+        assert_eq!(result.len(), participants.len());
+        for user in &participant_users {
+            assert!(result.iter().any(|j| j.user == *user));
+        }
+    }
+
+    #[test]
+    fn single_forgotten_row_keeps_full_distribution() {
+        use crate::sender_key_device_cache::SenderKeyDeviceMap;
+
+        let map = SenderKeyDeviceMap::from_db_rows(&[("271060335329480@lid".to_string(), false)]);
+        assert_eq!(map.device_has_key("271060335329480", 0), Some(false));
+        assert!(map.is_user_forgotten("271060335329480"));
+
+        let all_resolved_devices: Vec<Jid> = [
+            "271060335329480@lid",
+            "77610646245392@lid",
+            "276661023027320:5@lid",
+        ]
+        .into_iter()
+        .map(|s| Jid::from_str(s).unwrap())
+        .collect();
+
+        let needs_skdm: Vec<&Jid> = all_resolved_devices
+            .iter()
+            .filter(|device| {
+                !map.device_has_key(&device.user, device.device)
+                    .unwrap_or(false)
+                    || map.is_user_forgotten(&device.user)
+            })
+            .collect();
+
+        assert_eq!(
+            needs_skdm.len(),
+            3,
+            "after retry inserts one row, ALL devices correctly flagged for SKDM \
+             (this is what unblocks redistribution on the SECOND message)"
+        );
+    }
+
+    #[test]
     fn test_skdm_filtering_large_group() {
         use std::collections::HashSet;
 
@@ -2258,91 +2786,265 @@ mod tests {
             assert!(edit.is_none());
             assert!(node.is_none());
         }
-    }
 
-    mod infer_biz {
-        use super::*;
-        use wa::message::interactive_message::{
-            InteractiveMessageOneof, NativeFlowMessage, native_flow_message::NativeFlowButton,
-        };
+        #[test]
+        fn revoked_reaction_returns_sender_revoke() {
+            let msg = wa::Message {
+                reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+                    text: Some(String::new()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let (edit, _) = infer_stanza_metadata(&msg);
+            assert_eq!(edit, Some(EditAttribute::SenderRevoke));
+        }
 
-        fn msg_with_native_flow(button_name: &str) -> wa::Message {
-            wa::Message {
-                document_with_caption_message: buffa::MessageField::some(
-                    wa::message::FutureProofMessage {
-                        message: buffa::MessageField::some(wa::Message {
-                            interactive_message: buffa::MessageField::some(
-                                wa::message::InteractiveMessage {
-                                    interactiveMessage: Some(
-                                        InteractiveMessageOneof::NativeFlowMessage(Box::new(
-                                            NativeFlowMessage {
-                                                buttons: vec![NativeFlowButton {
-                                                    name: Some(button_name.to_string()),
-                                                    ..Default::default()
-                                                }],
-                                                message_version: Some(1),
-                                                ..Default::default()
-                                            },
-                                        )),
-                                    ),
-                                    ..Default::default()
-                                },
-                            ),
-                            ..Default::default()
-                        }),
+        #[test]
+        fn keep_in_chat_undo_returns_sender_revoke() {
+            let msg = wa::Message {
+                keep_in_chat_message: buffa::MessageField::some(wa::message::KeepInChatMessage {
+                    key: buffa::MessageField::some(wa::MessageKey {
+                        from_me: Some(true),
+                        ..Default::default()
+                    }),
+                    keep_type: Some(wa::KeepType::UNDO_KEEP_FOR_ALL),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let (edit, _) = infer_stanza_metadata(&msg);
+            assert_eq!(edit, Some(EditAttribute::SenderRevoke));
+        }
+
+        #[test]
+        fn secret_encrypted_message_edit_returns_message_edit() {
+            let msg = wa::Message {
+                secret_encrypted_message: buffa::MessageField::some(
+                    wa::message::SecretEncryptedMessage {
+                        secret_enc_type: Some(
+                            wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT,
+                        ),
                         ..Default::default()
                     },
                 ),
                 ..Default::default()
-            }
+            };
+            let (edit, _) = infer_stanza_metadata(&msg);
+            assert_eq!(edit, Some(EditAttribute::MessageEdit));
         }
 
-        fn assert_biz_node(node: &Node, expected_flow_name: &str) {
-            assert_eq!(node.tag, "biz");
-            assert!(
-                node.attrs().optional_string("native_flow_name").is_none(),
-                "should NOT use simple attribute form"
-            );
-            let interactive = node.get_optional_child("interactive").unwrap();
-            let mut attrs = interactive.attrs();
+        #[test]
+        fn secret_encrypted_event_edit_emits_both_edit_attr_and_meta_node() {
+            // EVENT_EDIT is the one case where the edit attribute AND the
+            // meta node both fire: `event_type=edit` meta + `edit="1"` attr.
+            let msg = wa::Message {
+                secret_encrypted_message: buffa::MessageField::some(
+                    wa::message::SecretEncryptedMessage {
+                        secret_enc_type: Some(
+                            wa::message::secret_encrypted_message::SecretEncType::EVENT_EDIT,
+                        ),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            };
+            let (edit, node) = infer_stanza_metadata(&msg);
+            assert_eq!(edit, Some(EditAttribute::MessageEdit));
+            let node = node.expect("should have meta node");
             assert_eq!(
-                attrs.optional_string("type").unwrap().as_ref(),
-                "native_flow"
-            );
-            assert_eq!(attrs.optional_string("v").unwrap().as_ref(), "1");
-            let nf = interactive.get_optional_child("native_flow").unwrap();
-            let mut nf_attrs = nf.attrs();
-            assert_eq!(
-                nf_attrs.optional_string("name").unwrap().as_ref(),
-                expected_flow_name
+                node.attrs().optional_string("event_type").unwrap().as_ref(),
+                "edit"
             );
         }
 
         #[test]
-        fn all_button_types_use_nested_structure() {
-            for (button, expected_flow) in [
-                ("cta_url", "cta_url"),
-                ("payment_info", "payment_info"),
-                ("review_and_pay", "order_details"),
-                ("cta_catalog", "cta_catalog"),
-                ("mpm", "mpm"),
-                ("quick_reply", "quick_reply"),
-            ] {
-                let node = infer_biz_node(&msg_with_native_flow(button))
-                    .unwrap_or_else(|| panic!("{button} should produce biz node"));
-                assert_biz_node(&node, expected_flow);
+        fn top_level_edited_message_returns_message_edit() {
+            let msg = wa::Message {
+                edited_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                    message: buffa::MessageField::some(wa::Message::default()),
+                }),
+                ..Default::default()
+            };
+            let (edit, _) = infer_stanza_metadata(&msg);
+            assert_eq!(edit, Some(EditAttribute::MessageEdit));
+        }
+    }
+
+    mod biz_node_tests {
+        use super::*;
+        use std::str::FromStr;
+        use wa::message::interactive_message::{
+            InteractiveMessage as InteractiveMessageOneof, NativeFlowMessage,
+            native_flow_message::NativeFlowButton,
+        };
+
+        // Fixed unix seconds for deterministic privacy_mode_ts assertions.
+        const FIXED_NOW: u64 = 1_700_000_000;
+        // FIXED_NOW - BIZ_PRIVACY_MODE_TS_OFFSET = 1_700_000_000 - 77_980_457
+        const EXPECTED_PRIVACY_TS: &str = "1622019543";
+
+        fn msg_with_native_flow_button(button_name: &str) -> wa::Message {
+            wa::Message {
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
+                    interactiveMessage: Some(InteractiveMessageOneof::NativeFlowMessage(Box::new(
+                        NativeFlowMessage {
+                            buttons: vec![NativeFlowButton {
+                                name: Some(button_name.to_string()),
+                                ..Default::default()
+                            }],
+                            message_version: Some(1),
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                }),
+                ..Default::default()
             }
         }
 
+        fn assert_biz_common_attrs(node: &Node, ctx: &str) {
+            assert_eq!(node.tag, "biz", "{ctx}");
+            let mut a = node.attrs();
+            assert_eq!(
+                a.optional_string("actual_actors").unwrap().as_ref(),
+                "2",
+                "{ctx}"
+            );
+            assert_eq!(
+                a.optional_string("host_storage").unwrap().as_ref(),
+                "2",
+                "{ctx}"
+            );
+            assert_eq!(
+                a.optional_string("privacy_mode_ts").unwrap().as_ref(),
+                EXPECTED_PRIVACY_TS,
+                "{ctx}"
+            );
+        }
+
+        fn assert_nested_biz(node: &Node, expected_flow_name: &str, ctx: &str) {
+            assert_biz_common_attrs(node, ctx);
+            assert!(
+                node.attrs().optional_string("native_flow_name").is_none(),
+                "{ctx}: nested form has no native_flow_name attr"
+            );
+            let interactive = node
+                .get_optional_child("interactive")
+                .unwrap_or_else(|| panic!("{ctx}: missing <interactive>"));
+            let mut ia = interactive.attrs();
+            assert_eq!(
+                ia.optional_string("type").unwrap().as_ref(),
+                "native_flow",
+                "{ctx}"
+            );
+            assert_eq!(ia.optional_string("v").unwrap().as_ref(), "1", "{ctx}");
+
+            let nf = interactive
+                .get_optional_child("native_flow")
+                .unwrap_or_else(|| panic!("{ctx}: missing <native_flow>"));
+            let mut nfa = nf.attrs();
+            assert_eq!(nfa.optional_string("v").unwrap().as_ref(), "9", "{ctx}");
+            assert_eq!(
+                nfa.optional_string("name").unwrap().as_ref(),
+                expected_flow_name,
+                "{ctx}"
+            );
+
+            let qc = node
+                .get_optional_child("quality_control")
+                .unwrap_or_else(|| panic!("{ctx}: missing <quality_control>"));
+            assert_eq!(
+                qc.attrs().optional_string("source_type").unwrap().as_ref(),
+                "third_party",
+                "{ctx}"
+            );
+        }
+
+        /// Payment-family buttons emit the flat `<biz>` form with
+        /// `native_flow_name` as an attr and NO children.
+        #[test]
+        fn payment_simple_form() {
+            let cases: &[(&str, &str)] = &[
+                ("payment_info", "payment_info"),
+                ("review_and_pay", "order_details"),
+                ("review_order", "order_status"),
+                ("order_status", "order_status"),
+                ("payment_status", "payment_status"),
+                ("payment_method", "payment_method"),
+                ("payment_reminder", "payment_reminder"),
+            ];
+            for (button, expected_flow) in cases {
+                let biz = infer_biz_node(&msg_with_native_flow_button(button), FIXED_NOW)
+                    .unwrap_or_else(|| panic!("{button}: should produce biz"));
+                assert_biz_common_attrs(&biz, button);
+                assert_eq!(
+                    biz.attrs()
+                        .optional_string("native_flow_name")
+                        .unwrap()
+                        .as_ref(),
+                    *expected_flow,
+                    "{button}: native_flow_name attr"
+                );
+                assert!(
+                    biz.children().unwrap_or(&[]).is_empty(),
+                    "{button}: PaymentSimple has no children"
+                );
+            }
+        }
+
+        /// Named-nested buttons keep their flow name and gain the new
+        /// privacy attrs plus `<quality_control>`.
+        #[test]
+        fn nested_named_form() {
+            let cases: &[(&str, &str)] = &[
+                ("cta_url", "cta_url"),
+                ("cta_catalog", "cta_catalog"),
+                ("catalog_message", "catalog_message"),
+                ("galaxy_message", "galaxy_message"),
+                ("booking_confirmation", "booking_confirmation"),
+                ("call_permission_request", "call_permission_request"),
+                ("open_webview", "message_with_link"),
+                ("message_with_link_status", "message_with_link_status"),
+            ];
+            for (button, expected_flow) in cases {
+                let biz = infer_biz_node(&msg_with_native_flow_button(button), FIXED_NOW)
+                    .unwrap_or_else(|| panic!("{button}: should produce biz"));
+                assert_nested_biz(&biz, expected_flow, button);
+            }
+        }
+
+        /// quick_reply / cta_copy / cta_call / single_select / send_location
+        /// and unknown future button names route through `name="mixed"`.
+        #[test]
+        fn mixed_form_for_dropped_buttons() {
+            let cases: &[&str] = &[
+                "quick_reply",
+                "cta_copy",
+                "cta_call",
+                "single_select",
+                "send_location",
+                "future_button_xyz",
+            ];
+            for button in cases {
+                let biz = infer_biz_node(&msg_with_native_flow_button(button), FIXED_NOW)
+                    .unwrap_or_else(|| panic!("{button}: should produce biz"));
+                assert_nested_biz(&biz, "mixed", button);
+            }
+        }
+
+        /// Non-interactive messages produce no `<biz>` (no fan-out into the
+        /// extra_stanza_nodes path).
         #[test]
         fn no_interactive_returns_none() {
             let msg = wa::Message {
                 conversation: Some("hello".into()),
                 ..Default::default()
             };
-            assert!(infer_biz_node(&msg).is_none());
+            assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
         }
 
+        /// Interactive but not native-flow (e.g. CollectionMessage) yields None.
         #[test]
         fn interactive_without_native_flow_returns_none() {
             let msg = wa::Message {
@@ -2354,9 +3056,10 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            assert!(infer_biz_node(&msg).is_none());
+            assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
         }
 
+        /// NativeFlow with empty button list yields None — no signal to classify.
         #[test]
         fn native_flow_without_buttons_returns_none() {
             let msg = wa::Message {
@@ -2372,17 +3075,18 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            assert!(infer_biz_node(&msg).is_none());
+            assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
         }
 
+        /// Button with `name = None` is treated as missing classifier → None.
         #[test]
-        fn direct_interactive_message_without_wrapper() {
+        fn button_without_name_returns_none() {
             let msg = wa::Message {
                 interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
                     interactiveMessage: Some(InteractiveMessageOneof::NativeFlowMessage(Box::new(
                         NativeFlowMessage {
                             buttons: vec![NativeFlowButton {
-                                name: Some("cta_url".to_string()),
+                                name: None,
                                 ..Default::default()
                             }],
                             message_version: Some(1),
@@ -2393,8 +3097,148 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            let node = infer_biz_node(&msg).unwrap();
-            assert_biz_node(&node, "cta_url");
+            assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
+        }
+
+        /// Messages wrapped in `documentWithCaptionMessage` still pick up the
+        /// native_flow payload from the inner message.
+        #[test]
+        fn document_with_caption_wrapper() {
+            let inner = wa::Message {
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
+                    interactiveMessage: Some(InteractiveMessageOneof::NativeFlowMessage(Box::new(
+                        NativeFlowMessage {
+                            buttons: vec![NativeFlowButton {
+                                name: Some("quick_reply".into()),
+                                ..Default::default()
+                            }],
+                            message_version: Some(1),
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let msg = wa::Message {
+                document_with_caption_message: buffa::MessageField::some(
+                    wa::message::FutureProofMessage {
+                        message: buffa::MessageField::some(inner),
+                    },
+                ),
+                ..Default::default()
+            };
+            let biz = infer_biz_node(&msg, FIXED_NOW)
+                .expect("doc-with-caption wrapper should propagate the inner native_flow");
+            assert_nested_biz(&biz, "mixed", "doc-with-caption/quick_reply");
+        }
+
+        // -- build_extra_stanza_nodes assembly tests --
+
+        fn quick_reply_biz() -> Node {
+            infer_biz_node(&msg_with_native_flow_button("quick_reply"), FIXED_NOW)
+                .expect("quick_reply produces biz")
+        }
+
+        fn payment_biz() -> Node {
+            infer_biz_node(&msg_with_native_flow_button("payment_info"), FIXED_NOW)
+                .expect("payment_info produces biz")
+        }
+
+        fn jid(s: &str) -> Jid {
+            Jid::from_str(s).expect("valid jid in test")
+        }
+
+        /// DM: `<bot biz_bot="1"/>` is prepended before the `<biz>`. The
+        /// order matters — this is the shape the upstream Baileys
+        /// reproducer emits.
+        #[test]
+        fn dm_emits_bot_before_biz() {
+            let nodes = build_extra_stanza_nodes(
+                &jid("5511999999999@s.whatsapp.net"),
+                None,
+                Some(quick_reply_biz()),
+                vec![],
+            );
+            assert_eq!(nodes.len(), 2, "expected [<bot>, <biz>]");
+            assert_eq!(nodes[0].tag, "bot");
+            assert_eq!(
+                nodes[0]
+                    .attrs()
+                    .optional_string("biz_bot")
+                    .unwrap()
+                    .as_ref(),
+                "1"
+            );
+            assert_eq!(nodes[1].tag, "biz");
+        }
+
+        /// Group: `<bot>` is NOT emitted; only `<biz>`.
+        #[test]
+        fn group_omits_bot() {
+            let nodes = build_extra_stanza_nodes(
+                &jid("120363000000000001@g.us"),
+                None,
+                Some(quick_reply_biz()),
+                vec![],
+            );
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].tag, "biz");
+        }
+
+        /// LID DM (non-group): `<bot>` is still emitted.
+        #[test]
+        fn lid_dm_emits_bot() {
+            let nodes = build_extra_stanza_nodes(
+                &jid("100000000000001@lid"),
+                None,
+                Some(payment_biz()),
+                vec![],
+            );
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(nodes[0].tag, "bot");
+        }
+
+        /// No biz + no meta → user nodes pass through untouched.
+        #[test]
+        fn no_biz_no_meta_passthrough() {
+            let user_nodes = vec![NodeBuilder::new("custom").build()];
+            let nodes =
+                build_extra_stanza_nodes(&jid("X@s.whatsapp.net"), None, None, user_nodes.clone());
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].tag, "custom");
+        }
+
+        /// Full ordering: [meta, bot, biz, user_nodes...].
+        #[test]
+        fn full_ordering_meta_bot_biz_user() {
+            let meta = NodeBuilder::new("meta").attr("appdata", "default").build();
+            let user_a = NodeBuilder::new("user_a").build();
+            let user_b = NodeBuilder::new("user_b").build();
+            let nodes = build_extra_stanza_nodes(
+                &jid("X@s.whatsapp.net"),
+                Some(meta),
+                Some(quick_reply_biz()),
+                vec![user_a, user_b],
+            );
+            assert_eq!(nodes.len(), 5);
+            assert_eq!(nodes[0].tag, "meta");
+            assert_eq!(nodes[1].tag, "bot");
+            assert_eq!(nodes[2].tag, "biz");
+            assert_eq!(nodes[3].tag, "user_a");
+            assert_eq!(nodes[4].tag, "user_b");
+        }
+
+        /// Meta-only (no biz) preserves order: meta then user nodes; no bot.
+        #[test]
+        fn meta_only_preserves_order() {
+            let meta = NodeBuilder::new("meta").build();
+            let user = NodeBuilder::new("u").build();
+            let nodes =
+                build_extra_stanza_nodes(&jid("X@s.whatsapp.net"), Some(meta), None, vec![user]);
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(nodes[0].tag, "meta");
+            assert_eq!(nodes[1].tag, "u");
         }
     }
 
@@ -2579,5 +3423,324 @@ mod tests {
                 "100000012345678@lid.0"
             );
         }
+    }
+
+    // ---- outbound messageSecret capture ---------------------------------
+
+    use crate::store::commands::DeviceCommand;
+    use std::sync::Arc;
+
+    async fn seed_pn(client: &Arc<Client>, pn: &str) {
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(pn.parse().expect("pn"))))
+            .await;
+    }
+
+    async fn seed_pn_and_lid(client: &Arc<Client>, pn: &str, lid: &str) {
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(pn.parse().expect("pn"))))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(lid.parse().expect("lid"))))
+            .await;
+    }
+
+    fn peer_test_account_proto() -> wa::ADVSignedDeviceIdentity {
+        wa::ADVSignedDeviceIdentity {
+            details: Some(vec![0u8; 32]),
+            account_signature_key: Some(vec![0u8; 32]),
+            account_signature: Some(vec![0u8; 64]),
+            device_signature: Some(vec![0u8; 64]),
+        }
+    }
+
+    async fn seed_peer_send_state(client: &Arc<Client>, peer: &Jid) {
+        use wacore::libsignal::protocol::{
+            IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
+            process_prekey_bundle,
+        };
+
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetAccount(Some(peer_test_account_proto())))
+            .await;
+
+        let bundle =
+            tokio::task::spawn_blocking(|| -> Result<PreKeyBundle, SignalProtocolError> {
+                let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+                let receiver = IdentityKeyPair::generate(&mut rng);
+                let spk = KeyPair::generate(&mut rng);
+                let opk = KeyPair::generate(&mut rng);
+                let sig = receiver
+                    .private_key()
+                    .calculate_signature(&spk.public_key.serialize(), &mut rng)?;
+
+                PreKeyBundle::new(
+                    1,
+                    1u32.into(),
+                    Some((1u32.into(), opk.public_key)),
+                    1u32.into(),
+                    spk.public_key,
+                    sig.to_vec(),
+                    *receiver.identity_key(),
+                )
+            })
+            .await
+            .expect("prekey bundle task")
+            .expect("prekey bundle");
+
+        let mut adapter = client.signal_adapter().await;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        process_prekey_bundle(
+            &peer.to_protocol_address(),
+            &mut adapter.session_store,
+            &mut adapter.identity_store,
+            &bundle,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .expect("peer session");
+    }
+
+    fn pdo_request_message(request_type: wa::message::PeerDataOperationRequestType) -> wa::Message {
+        wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(
+                    wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE,
+                ),
+                peer_data_operation_request_message: buffa::MessageField::some(
+                    wa::message::PeerDataOperationRequestMessage {
+                        peer_data_operation_request_type: Some(request_type),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_pdo_send_path_stamps_history_sync_options() {
+        let client = crate::test_utils::create_test_client_with_name("peer_pdo_attrs").await;
+        let peer: Jid = "100000000000001@s.whatsapp.net".parse().unwrap();
+        seed_peer_send_state(&client, &peer).await;
+
+        let request_id = "PDO_PEER_ATTRS_1";
+        let waiter = client
+            .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
+        let msg =
+            pdo_request_message(wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND);
+
+        let result = client
+            .send_message_impl(
+                peer,
+                &msg,
+                Some(request_id.to_string()),
+                true,
+                false,
+                None,
+                vec![],
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "test client has no socket; send should fail after stanza capture"
+        );
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("sent node should be captured")
+            .expect("sent node waiter should resolve");
+        assert_eq!(
+            node.attrs().optional_string("category").unwrap().as_ref(),
+            "peer"
+        );
+        assert_eq!(
+            node.attrs()
+                .optional_string("push_priority")
+                .unwrap()
+                .as_ref(),
+            "high_force"
+        );
+        assert_eq!(
+            node.attrs()
+                .optional_string("privacy_sensitive")
+                .unwrap()
+                .as_ref(),
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_outbound_msg_secret_writes_under_chat_sender_id() {
+        let client = crate::test_utils::create_test_client_with_name("secret_chat_id").await;
+        seed_pn(&client, "5511000000001:0@s.whatsapp.net").await;
+        let chat: Jid = "5511777776666@s.whatsapp.net".parse().unwrap();
+        let sender: Jid = "5511000000001:0@s.whatsapp.net".parse().unwrap();
+        let secret = [0x55u8; 32];
+        client
+            .persist_outbound_msg_secret(&chat, &sender, "MID_1", &secret)
+            .await;
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "5511777776666@s.whatsapp.net",
+                "5511000000001@s.whatsapp.net",
+                "MID_1",
+            )
+            .await
+            .expect("get");
+        assert_eq!(got.as_deref(), Some(&secret[..]));
+    }
+
+    #[tokio::test]
+    async fn persist_outbound_msg_secret_strips_devices_in_key() {
+        let client = crate::test_utils::create_test_client_with_name("secret_strip").await;
+        let chat_with_dev: Jid = "5511777776666:7@s.whatsapp.net".parse().unwrap();
+        let sender_with_dev: Jid = "5511000000001:3@s.whatsapp.net".parse().unwrap();
+        client
+            .persist_outbound_msg_secret(&chat_with_dev, &sender_with_dev, "MID_4", &[2u8; 32])
+            .await;
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "5511777776666@s.whatsapp.net",
+                "5511000000001@s.whatsapp.net",
+                "MID_4",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(&[2u8; 32][..]),
+            "chat and sender must be stored non-AD"
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_sender_identity_picks_lid_for_bot_else_pn() {
+        let client = crate::test_utils::create_test_client_with_name("dm_id_pick").await;
+        seed_pn_and_lid(
+            &client,
+            "5511000000001:0@s.whatsapp.net",
+            "999888777666555:0@lid",
+        )
+        .await;
+        let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
+        let pn_chat: Jid = "5511777776666@s.whatsapp.net".parse().unwrap();
+        let lid_chat: Jid = "111222333444555@lid".parse().unwrap();
+        assert_eq!(
+            client
+                .dm_sender_identity_for(&bot_chat)
+                .await
+                .map(|j| j.to_non_ad_string()),
+            Some("999888777666555@lid".to_string()),
+            "bot chats must resolve to our LID"
+        );
+        assert_eq!(
+            client
+                .dm_sender_identity_for(&pn_chat)
+                .await
+                .map(|j| j.to_non_ad_string()),
+            Some("5511000000001@s.whatsapp.net".to_string()),
+            "PN chats must resolve to our PN"
+        );
+        // LID-DM is presently routed under PN; flagged as a follow-up only
+        // because production hasn't surfaced it. Documented behaviour.
+        assert_eq!(
+            client
+                .dm_sender_identity_for(&lid_chat)
+                .await
+                .map(|j| j.to_non_ad_string()),
+            Some("5511000000001@s.whatsapp.net".to_string()),
+        );
+    }
+
+    /// Regression for Codex P2 (LID-mode group bot replies): the persisted
+    /// sender must match whatever `prepare_group_stanza` picked for the
+    /// group's addressing_mode, surfaced via `PreparedGroupStanza.sender_identity`.
+    #[tokio::test]
+    async fn persist_uses_group_sender_identity_for_lid_mode_groups() {
+        let client = crate::test_utils::create_test_client_with_name("secret_lid_group").await;
+        seed_pn_and_lid(
+            &client,
+            "5511000000001:0@s.whatsapp.net",
+            "999888777666555:0@lid",
+        )
+        .await;
+        // Simulate a LID-mode group: addressing identity is our LID, not PN.
+        let group_chat: Jid = "120363021033254949@g.us".parse().unwrap();
+        let lid_sender: Jid = "999888777666555:0@lid".parse().unwrap();
+        let secret = [0x4Du8; 32];
+        client
+            .persist_outbound_msg_secret(&group_chat, &lid_sender, "GROUP_MID", &secret)
+            .await;
+        let got = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "120363021033254949@g.us",
+                "999888777666555@lid",
+                "GROUP_MID",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(&secret[..]),
+            "LID-mode group secrets must key under our LID, not PN"
+        );
+        let under_pn = client
+            .persistence_manager
+            .backend()
+            .get_msg_secret(
+                "120363021033254949@g.us",
+                "5511000000001@s.whatsapp.net",
+                "GROUP_MID",
+            )
+            .await
+            .unwrap();
+        assert!(
+            under_pn.is_none(),
+            "LID-mode group must NOT key under our PN"
+        );
+    }
+
+    /// Regression: `wacore::send::prepare_dm_stanza` mints the
+    /// `message_secret` on a CLONE of the caller's message. Verify the secret
+    /// is surfaced via `PreparedDmStanza.message_secret` so the post-send hook
+    /// can persist it -- without this an original-message-based check would
+    /// miss every ordinary outbound bot prompt.
+    #[test]
+    fn prepared_dm_stanza_exposes_generated_message_secret() {
+        use wacore::reporting_token::generate_reporting_token;
+
+        let msg = wa::Message {
+            conversation: Some("hi bot".into()),
+            ..Default::default()
+        };
+        let to: Jid = "867051314767696@bot".parse().unwrap();
+        let result = generate_reporting_token(&msg, "MID_X", &to, &to, None);
+        assert!(
+            result.is_some(),
+            "ordinary text messages must produce a reporting token + secret"
+        );
+        let result = result.unwrap();
+        assert_eq!(result.message_secret.len(), 32);
+        // PreparedDmStanza/PreparedGroupStanza now carry this exact array
+        // through to send_message_impl which calls persist_outbound_msg_secret.
+        let prepared = wacore::send::PreparedDmStanza {
+            node: wacore_binary::builder::NodeBuilder::new("message").build(),
+            phash: None,
+            message_secret: Some(result.message_secret),
+        };
+        assert_eq!(prepared.message_secret.as_ref().unwrap().len(), 32);
     }
 }

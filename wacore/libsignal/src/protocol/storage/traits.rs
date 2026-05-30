@@ -162,6 +162,16 @@ pub trait SenderKeyStore: ThreadSafe {
         &self,
         sender_key_name: &SenderKeyName,
     ) -> Result<Option<SenderKeyRecord>>;
+
+    /// Serializes the load/advance/store of one sender-key chain so concurrent
+    /// encrypts to the same `(group, sender)` can't reuse a chain iteration.
+    /// Default is uncontended; stores over shared state override it.
+    async fn sender_key_lock(
+        &self,
+        _sender_key_name: &SenderKeyName,
+    ) -> std::sync::Arc<async_lock::Mutex<()>> {
+        std::sync::Arc::new(async_lock::Mutex::new(()))
+    }
 }
 
 /// Mixes in all the store interfaces defined in this module.

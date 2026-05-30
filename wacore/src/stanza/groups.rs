@@ -46,17 +46,58 @@ pub struct GroupNotification {
     pub actions: Vec<GroupNotificationAction>,
 }
 
+/// Admin tier from `<participant type="...">`. Mirrors
+/// `GROUP_PARTICIPANT_TYPES` in `WAWebGroupApiConst`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
+pub enum GroupParticipantType {
+    #[wire_default]
+    #[wire = "participant"]
+    Participant,
+    #[wire = "admin"]
+    Admin,
+    #[wire = "superadmin"]
+    SuperAdmin,
+}
+
 /// Participant info extracted from `<participant>` child elements.
 ///
 /// Wire format:
 /// ```xml
-/// <participant jid="1234567890@s.whatsapp.net" phone_number="1234567890@s.whatsapp.net"/>
+/// <participant jid="..." type="..." lid="..." phone_number="..."
+///              username="..." display_name="..." join_time="..."/>
 /// ```
+///
+/// `display_name` is the server-rendered label (e.g. `"+55∙∙∙∙∙∙∙∙∙79"` when
+/// the requester is not in the participant's contacts). `type` flags
+/// admin/superadmin tier; LID-addressed groups also carry `lid` and
+/// `username`. WA Web's `WAWebHandleGroupNotification` y() reads all of
+/// these into the participant model so the UI can render notifications
+/// and patch admin caches without resolving the contact locally.
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupParticipantInfo {
     pub jid: Jid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phone_number: Option<Jid>,
+    /// Server-provided display label for this participant. Only populated for
+    /// `<participant>` children inside group notifications; `None` for
+    /// `<requested_user>` (WA Web doesn't read it there either).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Admin tier. Defaults to `Participant` when the attr is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<GroupParticipantType>,
+    /// LID JID when this `<participant>` carries a separate `lid` attr.
+    /// Distinct from `jid` which may already be a LID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lid: Option<Jid>,
+    /// Username, gated by `WAWebUsernameGatingUtils`. Empty in classic
+    /// PN-addressed groups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Unix seconds since the participant joined the group. Used by
+    /// admin UI for tenure display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub join_time: Option<u64>,
 }
 
 /// All possible group notification action types.
@@ -211,6 +252,79 @@ pub enum GroupNotificationAction {
         #[wire(skip)]
         raw: Node,
     },
+    /// `<linked_group_promote>` — Subgroup admin elevated (community parent).
+    #[wire = "linked_group_promote"]
+    LinkedGroupPromote {
+        participants: Vec<GroupParticipantInfo>,
+    },
+    /// `<linked_group_demote>` — Subgroup admin demoted.
+    #[wire = "linked_group_demote"]
+    LinkedGroupDemote {
+        participants: Vec<GroupParticipantInfo>,
+    },
+
+    // -- State toggles --
+    /// `<suspended/>` — Group suspended by Meta moderation.
+    #[wire = "suspended"]
+    Suspended,
+    /// `<unsuspended/>` — Suspension lifted.
+    #[wire = "unsuspended"]
+    Unsuspended,
+    /// `<auto_add_disabled/>` — Community auto-add to general chat disabled.
+    #[wire = "auto_add_disabled"]
+    AutoAddDisabled,
+    /// `<is_capi_hosted_group/>` — Group routed through CAPI hosted server.
+    #[wire = "is_capi_hosted_group"]
+    IsCapiHostedGroup,
+    /// `<group_safety_check/>` — Integrity check toggle.
+    #[wire = "group_safety_check"]
+    GroupSafetyCheck,
+    /// `<limit_sharing_enabled trigger="..."/>` — Limit sharing toggle. The
+    /// optional `trigger` attribute (range 0..20 per
+    /// `WASmaxInGroupsGroupInfoMixin`) identifies the source of the change.
+    #[wire = "limit_sharing_enabled"]
+    LimitSharingEnabled { trigger: Option<u32> },
+    /// `<allow_admin_reports/>` — Admins may receive report alerts.
+    #[wire = "allow_admin_reports"]
+    AllowAdminReports,
+    /// `<not_allow_admin_reports/>` — Admin reports disabled.
+    #[wire = "not_allow_admin_reports"]
+    NotAllowAdminReports,
+    /// `<reports/>` — Generic reports notification.
+    #[wire = "reports"]
+    Reports,
+    /// `<allow_non_admin_sub_group_creation/>` — Community permits members to
+    /// create subgroups without admin approval.
+    #[wire = "allow_non_admin_sub_group_creation"]
+    AllowNonAdminSubGroupCreation,
+    /// `<not_allow_non_admin_sub_group_creation/>` — Community restricts
+    /// subgroup creation to admins.
+    #[wire = "not_allow_non_admin_sub_group_creation"]
+    NotAllowNonAdminSubGroupCreation,
+
+    // -- Subgroup suggestions (community) --
+    /// `<created_sub_group_suggestion>` — Suggested subgroup added.
+    #[wire = "created_sub_group_suggestion"]
+    CreatedSubGroupSuggestion {
+        #[wire(skip)]
+        raw: Node,
+    },
+    /// `<revoked_sub_group_suggestions>` — Subgroup suggestion revoked.
+    #[wire = "revoked_sub_group_suggestions"]
+    RevokedSubGroupSuggestions {
+        #[wire(skip)]
+        raw: Node,
+    },
+
+    /// `<change_number>` — Owner of subgroup suggestions migrated to a new
+    /// number. The old owner is in the parent notification's `participant`
+    /// attribute; the new owner is in the `jid` attribute on the child.
+    /// `sub_group_suggestions` lists the affected subgroup JIDs.
+    #[wire = "change_number"]
+    ChangeNumber {
+        new_owner: Option<Jid>,
+        sub_group_suggestions: Vec<Jid>,
+    },
 
     // -- Catch-all --
     /// Unknown child tag — preserved for forward compatibility. The `tag`
@@ -220,10 +334,9 @@ pub enum GroupNotificationAction {
 }
 
 impl GroupNotification {
-    /// Parse from a `NodeRef`.
-    ///
-    /// Most fields are parsed zero-copy. Only `Create`/`Link`/`Unlink` actions
-    /// call `.to_owned()` on their specific child node (structurally required to store `raw: Node`).
+    /// Parse from a `NodeRef`. Most fields are zero-copy; `Create`, `Link`,
+    /// `Unlink`, `CreatedSubGroupSuggestion` and `RevokedSubGroupSuggestions`
+    /// call `.to_owned()` to store their child as `raw: Node`.
     pub fn try_from_node_ref(node: &NodeRef<'_>) -> Option<Self> {
         let mut attrs = node.attrs();
         let group_jid = attrs.optional_jid("from")?;
@@ -258,7 +371,9 @@ impl GroupNotification {
 /// function. If the `#[wire = "..."]` attribute on a variant changes, both
 /// the serializer and this dispatcher track it automatically.
 ///
-/// Only `Create`/`Link`/`Unlink` call `.to_owned()` because those variants store `raw: Node`.
+/// `Create`, `Link`, `Unlink`, `CreatedSubGroupSuggestion` and
+/// `RevokedSubGroupSuggestions` call `.to_owned()` because those variants
+/// store `raw: Node`.
 fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
     use GroupNotificationActionTag as T;
     use wacore_binary::NodeContentRef;
@@ -334,8 +449,15 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
         // below produce `Ephemeral { expiration: 0, trigger: None }`, matching
         // WA Web's collapse of the two wire tags into one action.
         T::Ephemeral => GroupNotificationAction::Ephemeral {
-            expiration: node.attrs().optional_u64("expiration").unwrap_or(0) as u32,
-            trigger: node.attrs().optional_u64("trigger").map(|t| t as u32),
+            expiration: node
+                .attrs()
+                .optional_u64("expiration")
+                .and_then(|t| t.try_into().ok())
+                .unwrap_or(0),
+            trigger: node
+                .attrs()
+                .optional_u64("trigger")
+                .and_then(|t| t.try_into().ok()),
         },
         T::MembershipApprovalMode => {
             let enabled = node
@@ -386,7 +508,11 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
         },
         T::RevokeInvite => GroupNotificationAction::RevokeInvite,
         T::GrowthLocked => GroupNotificationAction::GrowthLocked {
-            expiration: node.attrs().optional_u64("expiration").unwrap_or(0) as u32,
+            expiration: node
+                .attrs()
+                .optional_u64("expiration")
+                .and_then(|t| t.try_into().ok())
+                .unwrap_or(0),
             lock_type: node
                 .attrs()
                 .optional_string("type")
@@ -426,6 +552,41 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
                 .map(|s| s.into_owned()),
             raw: node.to_owned(),
         },
+        T::LinkedGroupPromote => GroupNotificationAction::LinkedGroupPromote {
+            participants: parse_participants(node),
+        },
+        T::LinkedGroupDemote => GroupNotificationAction::LinkedGroupDemote {
+            participants: parse_participants(node),
+        },
+        T::Suspended => GroupNotificationAction::Suspended,
+        T::Unsuspended => GroupNotificationAction::Unsuspended,
+        T::AutoAddDisabled => GroupNotificationAction::AutoAddDisabled,
+        T::IsCapiHostedGroup => GroupNotificationAction::IsCapiHostedGroup,
+        T::GroupSafetyCheck => GroupNotificationAction::GroupSafetyCheck,
+        T::LimitSharingEnabled => GroupNotificationAction::LimitSharingEnabled {
+            // try_into so >u32::MAX yields None instead of silently truncating.
+            trigger: node
+                .attrs()
+                .optional_u64("trigger")
+                .and_then(|t| t.try_into().ok()),
+        },
+        T::AllowAdminReports => GroupNotificationAction::AllowAdminReports,
+        T::NotAllowAdminReports => GroupNotificationAction::NotAllowAdminReports,
+        T::Reports => GroupNotificationAction::Reports,
+        T::AllowNonAdminSubGroupCreation => GroupNotificationAction::AllowNonAdminSubGroupCreation,
+        T::NotAllowNonAdminSubGroupCreation => {
+            GroupNotificationAction::NotAllowNonAdminSubGroupCreation
+        }
+        T::CreatedSubGroupSuggestion => GroupNotificationAction::CreatedSubGroupSuggestion {
+            raw: node.to_owned(),
+        },
+        T::RevokedSubGroupSuggestions => GroupNotificationAction::RevokedSubGroupSuggestions {
+            raw: node.to_owned(),
+        },
+        T::ChangeNumber => GroupNotificationAction::ChangeNumber {
+            new_owner: node.attrs().optional_jid("jid"),
+            sub_group_suggestions: parse_sub_group_suggestion_jids(node),
+        },
         T::Unknown(_) => GroupNotificationAction::Unknown {
             tag: node.tag.to_string(),
         },
@@ -440,9 +601,33 @@ fn parse_participants(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                 .iter()
                 .filter(|c| c.tag == "participant")
                 .filter_map(|c| {
-                    let jid = c.attrs().optional_jid("jid")?;
-                    let phone_number = c.attrs().optional_jid("phone_number");
-                    Some(GroupParticipantInfo { jid, phone_number })
+                    let mut attrs = c.attrs();
+                    let jid = attrs.optional_jid("jid")?;
+                    let phone_number = attrs.optional_jid("phone_number");
+                    let display_name = attrs
+                        .optional_string("display_name")
+                        .map(|s| s.into_owned());
+                    // WA Web y(): `maybeAttrEnum("type", GROUP_PARTICIPANT_TYPES)
+                    // != null ? _ : "participant"`. Missing and unknown both
+                    // collapse to `Participant`, so the field is always Some.
+                    let r#type = Some(
+                        attrs
+                            .optional_string("type")
+                            .and_then(|s| GroupParticipantType::try_from(s.as_ref()).ok())
+                            .unwrap_or(GroupParticipantType::Participant),
+                    );
+                    let lid = attrs.optional_jid("lid");
+                    let username = attrs.optional_string("username").map(|s| s.into_owned());
+                    let join_time = attrs.optional_u64("join_time");
+                    Some(GroupParticipantInfo {
+                        jid,
+                        phone_number,
+                        display_name,
+                        r#type,
+                        lid,
+                        username,
+                        join_time,
+                    })
                 })
                 .collect()
         })
@@ -450,6 +635,8 @@ fn parse_participants(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
 }
 
 /// Parses `<requested_user>` children from `<created_membership_requests>`.
+/// WA Web's `WAWebHandleGroupNotification` reads only `jid`, `phone_number`,
+/// and `username` from these (`y()` is not called); other fields stay `None`.
 fn parse_requested_users(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
     node.children()
         .map(|children| {
@@ -457,10 +644,33 @@ fn parse_requested_users(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                 .iter()
                 .filter(|c| c.tag == "requested_user")
                 .filter_map(|c| {
-                    let jid = c.attrs().optional_jid("jid")?;
-                    let phone_number = c.attrs().optional_jid("phone_number");
-                    Some(GroupParticipantInfo { jid, phone_number })
+                    let mut attrs = c.attrs();
+                    let jid = attrs.optional_jid("jid")?;
+                    let phone_number = attrs.optional_jid("phone_number");
+                    let username = attrs.optional_string("username").map(|s| s.into_owned());
+                    Some(GroupParticipantInfo {
+                        jid,
+                        phone_number,
+                        display_name: None,
+                        r#type: None,
+                        lid: None,
+                        username,
+                        join_time: None,
+                    })
                 })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parses `<sub_group_suggestion jid="..."/>` children into subgroup JIDs.
+fn parse_sub_group_suggestion_jids(node: &NodeRef<'_>) -> Vec<Jid> {
+    node.children()
+        .map(|children| {
+            children
+                .iter()
+                .filter(|c| c.tag == "sub_group_suggestion")
+                .filter_map(|c| c.attrs().optional_jid("jid"))
                 .collect()
         })
         .unwrap_or_default()
@@ -547,6 +757,189 @@ mod tests {
                 assert!(reason.is_none());
             }
             other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// Mirrors the wire shape seen on `<modify>` in `w:gp2`: versioning
+    /// attrs `v_id`/`prev_v_id` (ignored) plus a `<participant>` carrying
+    /// `display_name`. The label is the server-rendered masked variant
+    /// using U+2219 (bullet operator) when the requester is not in the
+    /// participant's contacts.
+    #[test]
+    fn test_parse_modify_carries_display_name() {
+        let masked =
+            "+55\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}\u{2219}00";
+        let node = make_notification(vec![
+            NodeBuilder::new("modify")
+                .attr("v_id", "1700000000000001")
+                .attr("prev_v_id", "1700000000000000")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", "999000000000001@lid")
+                        .attr("display_name", masked)
+                        .build(),
+                ])
+                .build(),
+        ]);
+
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Modify { participants } => {
+                assert_eq!(participants.len(), 1);
+                assert_eq!(participants[0].display_name.as_deref(), Some(masked));
+            }
+            other => panic!("expected Modify, got {:?}", other),
+        }
+    }
+
+    /// `<add>`/`<remove>` etc. with no `display_name` attr yield `None`,
+    /// which serializes as omitted thanks to `skip_serializing_if`.
+    #[test]
+    fn test_parse_participant_without_display_name_is_none() {
+        let node = make_notification(vec![
+            NodeBuilder::new("add")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", user_jid())
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Add { participants, .. } => {
+                assert!(participants[0].display_name.is_none());
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// `<participant type="admin" lid="..." username="..." join_time="...">`
+    /// surface all extras. Real shape used by `WAWebHandleGroupNotification`
+    /// when admin tier and LID addressing are set.
+    #[test]
+    fn test_parse_participant_with_admin_extras() {
+        let node = make_notification(vec![
+            NodeBuilder::new("add")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", "55510000001@s.whatsapp.net")
+                        .attr("type", "admin")
+                        .attr("lid", "99900000000001@lid")
+                        .attr("username", "alice")
+                        .attr("join_time", "1700000000")
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Add { participants, .. } => {
+                assert_eq!(participants.len(), 1);
+                let p = &participants[0];
+                assert_eq!(p.r#type, Some(GroupParticipantType::Admin));
+                assert_eq!(
+                    p.lid.as_ref().map(|j| j.user.as_str()),
+                    Some("99900000000001")
+                );
+                assert_eq!(p.username.as_deref(), Some("alice"));
+                assert_eq!(p.join_time, Some(1700000000));
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// Missing `type` attr collapses to `Some(Participant)` (not `None`).
+    /// Mirrors WA Web y()'s `maybeAttrEnum("type") != null ? _ : "participant"`.
+    #[test]
+    fn test_participant_missing_type_defaults_to_participant() {
+        let node = make_notification(vec![
+            NodeBuilder::new("add")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", "55510000004@s.whatsapp.net")
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Add { participants, .. } => {
+                assert_eq!(
+                    participants[0].r#type,
+                    Some(GroupParticipantType::Participant)
+                );
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// `type="superadmin"` parses correctly, and `type` survives an unknown
+    /// future value by defaulting to `Participant` instead of dropping the
+    /// participant.
+    #[test]
+    fn test_participant_type_superadmin_and_unknown_fallback() {
+        let node = make_notification(vec![
+            NodeBuilder::new("add")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", "55510000002@s.whatsapp.net")
+                        .attr("type", "superadmin")
+                        .build(),
+                    NodeBuilder::new("participant")
+                        .attr("jid", "55510000003@s.whatsapp.net")
+                        .attr("type", "future_role")
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Add { participants, .. } => {
+                assert_eq!(
+                    participants[0].r#type,
+                    Some(GroupParticipantType::SuperAdmin)
+                );
+                assert_eq!(
+                    participants[1].r#type,
+                    Some(GroupParticipantType::Participant)
+                );
+            }
+            other => panic!("expected Add, got {:?}", other),
+        }
+    }
+
+    /// `<requested_user>` only reads `jid`, `phone_number`, `username` per
+    /// WA Web; the other new fields stay `None`.
+    #[test]
+    fn test_requested_user_does_not_read_admin_extras() {
+        let node = make_notification(vec![
+            NodeBuilder::new("created_membership_requests")
+                .children(vec![
+                    NodeBuilder::new("requested_user")
+                        .attr("jid", "55510000005@s.whatsapp.net")
+                        .attr("type", "admin")
+                        .attr("lid", "99900000000005@lid")
+                        .attr("username", "bob")
+                        .attr("join_time", "1700000005")
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::CreatedMembershipRequests { requests, .. } => {
+                assert_eq!(requests.len(), 1);
+                let r = &requests[0];
+                assert!(
+                    r.r#type.is_none(),
+                    "type must NOT be read on requested_user"
+                );
+                assert!(r.lid.is_none());
+                assert!(r.join_time.is_none());
+                assert_eq!(r.username.as_deref(), Some("bob"));
+            }
+            other => panic!("expected CreatedMembershipRequests, got {:?}", other),
         }
     }
 
@@ -841,6 +1234,232 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_linked_group_promote_demote_carry_participants() {
+        let promote_node = make_notification(vec![
+            NodeBuilder::new("linked_group_promote")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", user_jid())
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&promote_node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::LinkedGroupPromote { participants } => {
+                assert_eq!(participants.len(), 1);
+                assert_eq!(participants[0].jid, user_jid());
+            }
+            other => panic!("expected LinkedGroupPromote, got {:?}", other),
+        }
+
+        let demote_node = make_notification(vec![
+            NodeBuilder::new("linked_group_demote")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", user_jid())
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&demote_node.as_node_ref()).unwrap();
+        assert!(matches!(
+            notif.actions[0],
+            GroupNotificationAction::LinkedGroupDemote { .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_suspended_toggle_variants() {
+        type Matcher = fn(&GroupNotificationAction) -> bool;
+        let table: &[(&str, Matcher)] = &[
+            ("suspended", |a| {
+                matches!(a, GroupNotificationAction::Suspended)
+            }),
+            ("unsuspended", |a| {
+                matches!(a, GroupNotificationAction::Unsuspended)
+            }),
+            ("auto_add_disabled", |a| {
+                matches!(a, GroupNotificationAction::AutoAddDisabled)
+            }),
+            ("is_capi_hosted_group", |a| {
+                matches!(a, GroupNotificationAction::IsCapiHostedGroup)
+            }),
+            ("group_safety_check", |a| {
+                matches!(a, GroupNotificationAction::GroupSafetyCheck)
+            }),
+            ("limit_sharing_enabled", |a| {
+                matches!(a, GroupNotificationAction::LimitSharingEnabled { .. })
+            }),
+            ("allow_admin_reports", |a| {
+                matches!(a, GroupNotificationAction::AllowAdminReports)
+            }),
+            ("not_allow_admin_reports", |a| {
+                matches!(a, GroupNotificationAction::NotAllowAdminReports)
+            }),
+            ("reports", |a| matches!(a, GroupNotificationAction::Reports)),
+            ("allow_non_admin_sub_group_creation", |a| {
+                matches!(a, GroupNotificationAction::AllowNonAdminSubGroupCreation)
+            }),
+            ("not_allow_non_admin_sub_group_creation", |a| {
+                matches!(a, GroupNotificationAction::NotAllowNonAdminSubGroupCreation)
+            }),
+        ];
+        for (tag, matcher) in table {
+            let node = make_notification(vec![NodeBuilder::new(tag).build()]);
+            let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+            assert!(
+                matcher(&notif.actions[0]),
+                "wire tag {tag} parsed to unexpected variant: {:?}",
+                notif.actions[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_limit_sharing_enabled_captures_trigger() {
+        let with_trigger = make_notification(vec![
+            NodeBuilder::new("limit_sharing_enabled")
+                .attr("trigger", "5")
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&with_trigger.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::LimitSharingEnabled { trigger } => {
+                assert_eq!(*trigger, Some(5));
+            }
+            other => panic!("expected LimitSharingEnabled, got {:?}", other),
+        }
+
+        let no_trigger = make_notification(vec![NodeBuilder::new("limit_sharing_enabled").build()]);
+        let notif = GroupNotification::try_from_node_ref(&no_trigger.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::LimitSharingEnabled { trigger } => assert!(trigger.is_none()),
+            other => panic!("expected LimitSharingEnabled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_limit_sharing_enabled_overflow_yields_none() {
+        // trigger > u32::MAX must yield None instead of truncating.
+        let node = make_notification(vec![
+            NodeBuilder::new("limit_sharing_enabled")
+                .attr("trigger", "4294967296")
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::LimitSharingEnabled { trigger } => assert!(trigger.is_none()),
+            other => panic!("expected LimitSharingEnabled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_ephemeral_overflow_yields_zero_and_none() {
+        // expiration > u32::MAX falls back to 0; trigger > u32::MAX yields None.
+        let node = make_notification(vec![
+            NodeBuilder::new("ephemeral")
+                .attr("expiration", "4294967296")
+                .attr("trigger", "4294967296")
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::Ephemeral {
+                expiration,
+                trigger,
+            } => {
+                assert_eq!(*expiration, 0);
+                assert!(trigger.is_none());
+            }
+            other => panic!("expected Ephemeral, got {:?}", other),
+        }
+    }
+
+    /// Verifies the actual wire shape from `WAWebHandleGroupNotification`:
+    /// `<change_number jid="<new_owner>"><sub_group_suggestion jid="<sg>"/>...`.
+    /// The old owner stays in `notification.participant`.
+    #[test]
+    fn test_parse_change_number_real_shape() {
+        let new_owner_jid = "5511888888888@s.whatsapp.net";
+        let sg_a = "111111111111111@g.us";
+        let sg_b = "222222222222222@g.us";
+        let node = make_notification(vec![
+            NodeBuilder::new("change_number")
+                .attr("jid", new_owner_jid)
+                .children(vec![
+                    NodeBuilder::new("sub_group_suggestion")
+                        .attr("jid", sg_a)
+                        .build(),
+                    NodeBuilder::new("sub_group_suggestion")
+                        .attr("jid", sg_b)
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::ChangeNumber {
+                new_owner,
+                sub_group_suggestions,
+            } => {
+                assert_eq!(
+                    new_owner.as_ref().map(|j| j.to_string()).as_deref(),
+                    Some(new_owner_jid)
+                );
+                assert_eq!(sub_group_suggestions.len(), 2);
+                assert_eq!(sub_group_suggestions[0].to_string(), sg_a);
+                assert_eq!(sub_group_suggestions[1].to_string(), sg_b);
+            }
+            other => panic!("expected ChangeNumber, got {:?}", other),
+        }
+    }
+
+    /// Missing `jid` attribute yields `new_owner: None` instead of dropping
+    /// the entire action.
+    #[test]
+    fn test_parse_change_number_missing_jid_is_tolerant() {
+        let node = make_notification(vec![NodeBuilder::new("change_number").build()]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::ChangeNumber {
+                new_owner,
+                sub_group_suggestions,
+            } => {
+                assert!(new_owner.is_none());
+                assert!(sub_group_suggestions.is_empty());
+            }
+            other => panic!("expected ChangeNumber, got {:?}", other),
+        }
+    }
+
+    /// `<participant>` children inside `<change_number>` must NOT leak into
+    /// `sub_group_suggestions`; only `<sub_group_suggestion>` is read.
+    #[test]
+    fn test_parse_change_number_ignores_participant_children() {
+        let node = make_notification(vec![
+            NodeBuilder::new("change_number")
+                .attr("jid", "5511888888888@s.whatsapp.net")
+                .children(vec![
+                    NodeBuilder::new("participant")
+                        .attr("jid", user_jid())
+                        .build(),
+                ])
+                .build(),
+        ]);
+        let notif = GroupNotification::try_from_node_ref(&node.as_node_ref()).unwrap();
+        match &notif.actions[0] {
+            GroupNotificationAction::ChangeNumber {
+                sub_group_suggestions,
+                ..
+            } => {
+                assert!(sub_group_suggestions.is_empty());
+            }
+            other => panic!("expected ChangeNumber, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_parse_unknown_tag() {
         let node = make_notification(vec![NodeBuilder::new("some_future_feature").build()]);
 
@@ -939,12 +1558,40 @@ mod tests {
             GroupNotificationAction::Unlink {
                 unlink_type: "x".into(),
                 unlink_reason: None,
-                raw: dummy_node,
+                raw: dummy_node.clone(),
+            },
+            GroupNotificationAction::LinkedGroupPromote {
+                participants: vec![],
+            },
+            GroupNotificationAction::LinkedGroupDemote {
+                participants: vec![],
+            },
+            GroupNotificationAction::Suspended,
+            GroupNotificationAction::Unsuspended,
+            GroupNotificationAction::AutoAddDisabled,
+            GroupNotificationAction::IsCapiHostedGroup,
+            GroupNotificationAction::GroupSafetyCheck,
+            GroupNotificationAction::LimitSharingEnabled { trigger: None },
+            GroupNotificationAction::AllowAdminReports,
+            GroupNotificationAction::NotAllowAdminReports,
+            GroupNotificationAction::Reports,
+            GroupNotificationAction::AllowNonAdminSubGroupCreation,
+            GroupNotificationAction::NotAllowNonAdminSubGroupCreation,
+            GroupNotificationAction::CreatedSubGroupSuggestion {
+                raw: dummy_node.clone(),
+            },
+            GroupNotificationAction::RevokedSubGroupSuggestions {
+                raw: dummy_node.clone(),
+            },
+            GroupNotificationAction::ChangeNumber {
+                new_owner: None,
+                sub_group_suggestions: vec![],
             },
             GroupNotificationAction::Unknown {
                 tag: "future_tag".into(),
             },
         ];
+        let _ = dummy_node;
 
         for action in &samples {
             let value = serde_json::to_value(action).expect("serialize");

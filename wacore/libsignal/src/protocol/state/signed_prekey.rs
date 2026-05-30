@@ -77,7 +77,6 @@ pub trait GenericSignedPreKey {
             public_key: Some(public_key),
             private_key: Some(private_key),
             signature: Some(signature),
-            ..Default::default()
         })
     }
 

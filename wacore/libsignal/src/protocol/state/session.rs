@@ -14,8 +14,8 @@ use crate::core::curve::KeyType;
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, RootKey};
 use crate::protocol::state::{PreKeyId, SignedPreKeyId};
+use crate::protocol::stores::SessionStructure;
 use crate::protocol::stores::session_structure::{self};
-use crate::protocol::stores::{RecordStructure, SessionStructure};
 use crate::protocol::{IdentityKey, KeyPair, PrivateKey, PublicKey, SignalProtocolError, consts};
 
 /// A distinct error type to keep from accidentally propagating deserialization errors.
@@ -72,9 +72,47 @@ pub struct SessionState {
     session: SessionStructure,
 }
 
+/// Snapshot of the subset of `SessionState` that the decrypt path
+/// can mutate before MAC verification. Captures only those fields so
+/// the rollback on `BadMac` doesn't have to deep-clone `local_identity`,
+/// `remote_identity`, `alice_base_key`, etc. — none of which change
+/// during decrypt.
+///
+/// Held opaque; restore via `SessionState::restore_decrypt_snapshot`.
+pub struct DecryptSnapshot {
+    receiver_chains: Vec<session_structure::Chain>,
+    root_key: Option<Vec<u8>>,
+    previous_counter: Option<u32>,
+    sender_chain: MessageField<session_structure::Chain>,
+}
+
 impl SessionState {
     pub fn from_session_structure(session: SessionStructure) -> Self {
         Self { session }
+    }
+
+    /// Capture the mutable-during-decrypt fields so MAC failure can
+    /// roll back without cloning the whole `SessionState`. Avoids
+    /// deep-copying the static parts of the protobuf on every decrypt
+    /// (identities, base key, version, registration ids, etc.).
+    pub fn decrypt_snapshot(&self) -> DecryptSnapshot {
+        DecryptSnapshot {
+            receiver_chains: self.session.receiver_chains.clone(),
+            root_key: self.session.root_key.clone(),
+            previous_counter: self.session.previous_counter,
+            sender_chain: self.session.sender_chain.clone(),
+        }
+    }
+
+    /// Restore the fields captured by [`Self::decrypt_snapshot`]. Pair
+    /// with `decrypt_snapshot` on the MAC-fail path; leaves the
+    /// non-mutated fields (identities, alice_base_key, version, etc.)
+    /// untouched since they were never modified.
+    pub fn restore_decrypt_snapshot(&mut self, snap: DecryptSnapshot) {
+        self.session.receiver_chains = snap.receiver_chains;
+        self.session.root_key = snap.root_key;
+        self.session.previous_counter = snap.previous_counter;
+        self.session.sender_chain = snap.sender_chain;
     }
 
     pub fn new(
@@ -294,7 +332,6 @@ impl SessionState {
         let chain_key = session_structure::chain::ChainKey {
             index: Some(chain_key.index()),
             key: Some(Bytes::copy_from_slice(chain_key.key())),
-            ..Default::default()
         };
 
         let chain = session_structure::Chain {
@@ -302,7 +339,6 @@ impl SessionState {
             sender_ratchet_key_private: Some(vec![]),
             chain_key: MessageField::some(chain_key),
             message_keys: vec![],
-            ..Default::default()
         };
 
         self.session.receiver_chains.push(chain);
@@ -332,7 +368,6 @@ impl SessionState {
         let chain_key = session_structure::chain::ChainKey {
             index: Some(next_chain_key.index()),
             key: Some(Bytes::copy_from_slice(next_chain_key.key())),
-            ..Default::default()
         };
 
         let new_chain = session_structure::Chain {
@@ -340,7 +375,6 @@ impl SessionState {
             sender_ratchet_key_private: Some(sender.private_key.serialize().to_vec()),
             chain_key: MessageField::some(chain_key),
             message_keys: vec![],
-            ..Default::default()
         };
 
         self.session.sender_chain = MessageField::some(new_chain);
@@ -386,7 +420,6 @@ impl SessionState {
         let chain_key = session_structure::chain::ChainKey {
             index: Some(next_chain_key.index()),
             key: Some(Bytes::copy_from_slice(next_chain_key.key())),
-            ..Default::default()
         };
 
         // Is it actually valid to call this function with sender_chain == None?
@@ -397,7 +430,6 @@ impl SessionState {
                 sender_ratchet_key_private: Some(vec![]),
                 chain_key: MessageField::some(chain_key),
                 message_keys: vec![],
-                ..Default::default()
             },
             Some(mut c) => {
                 c.chain_key = MessageField::some(chain_key);
@@ -481,7 +513,6 @@ impl SessionState {
             MessageField::some(session_structure::chain::ChainKey {
                 index: Some(chain_key.index()),
                 key: Some(Bytes::copy_from_slice(chain_key.key())),
-                ..Default::default()
             });
 
         Ok(())
@@ -498,7 +529,6 @@ impl SessionState {
             pre_key_id: pre_key_id.map(PreKeyId::into),
             signed_pre_key_id: Some(signed_ec_pre_key_id as i32),
             base_key: Some(base_key.serialize().to_vec()),
-            ..Default::default()
         };
         self.session.pending_pre_key = MessageField::some(pending);
     }
@@ -540,7 +570,6 @@ impl SessionState {
             alice_base_key: _alice_base_key,
             needs_refresh: _needs_refresh,
             pending_key_exchange: _pending_key_exchange,
-            __buffa_cached_size: _,
         } = &self.session;
 
         self.session.pending_pre_key = MessageField::none();
@@ -796,29 +825,34 @@ impl SessionRecord {
     pub fn serialize_into(&self, buf: &mut Vec<u8>) {
         use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
 
-        // write_to uses cached_size() internally, so compute_size() must be
-        // called first. We call it once per message during the length-sum pass
-        // and the cache survives into the write pass — no double traversal.
-        fn write_len_delimited(field: u32, msg: &impl Message, buf: &mut Vec<u8>) {
+        fn write_len_delimited(
+            field: u32,
+            msg: &impl Message,
+            msg_len: usize,
+            cache: &mut buffa::SizeCache,
+            buf: &mut Vec<u8>,
+        ) {
             Tag::new(field, WireType::LengthDelimited).encode(buf);
-            encode_varint(msg.cached_size() as u64, buf);
-            msg.write_to(buf);
+            encode_varint(msg_len as u64, buf);
+            msg.write_to(cache, buf);
         }
 
-        let current_len = self
+        let mut cache = buffa::SizeCache::new();
+        let current_msg_len = self
             .current_session
             .as_ref()
-            .map(|s| {
-                let msg_len = s.session.compute_size() as usize;
-                1 + varint_len(msg_len as u64) + msg_len
-            })
+            .map(|s| s.session.compute_size(&mut cache) as usize);
+        let current_len = current_msg_len
+            .map(|msg_len| 1 + varint_len(msg_len as u64) + msg_len)
             .unwrap_or(0);
 
+        let mut previous_msg_lens = Vec::with_capacity(self.previous_sessions.len());
         let previous_len: usize = self
             .previous_sessions
             .iter()
             .map(|s| {
-                let msg_len = s.compute_size() as usize;
+                let msg_len = s.compute_size(&mut cache) as usize;
+                previous_msg_lens.push(msg_len);
                 1 + varint_len(msg_len as u64) + msg_len
             })
             .sum();
@@ -826,11 +860,13 @@ impl SessionRecord {
         buf.clear();
         buf.reserve(current_len + previous_len);
 
-        if let Some(state) = &self.current_session {
-            write_len_delimited(1, &state.session, buf);
+        if let Some(state) = &self.current_session
+            && let Some(msg_len) = current_msg_len
+        {
+            write_len_delimited(1, &state.session, msg_len, &mut cache, buf);
         }
-        for session in self.previous_sessions.iter() {
-            write_len_delimited(2, session, buf);
+        for (session, msg_len) in self.previous_sessions.iter().zip(previous_msg_lens) {
+            write_len_delimited(2, session, msg_len, &mut cache, buf);
         }
     }
 
@@ -1274,6 +1310,24 @@ mod tests {
             .map(|s| s.unwrap().alice_base_key().to_vec())
             .collect();
         assert_eq!(original_base_keys, restored_base_keys);
+    }
+
+    #[test]
+    fn test_session_record_manual_encoding_matches_generated_record_structure() {
+        let record = create_record_with_previous_sessions(4);
+        let expected = waproto::whatsapp::RecordStructure {
+            current_session: MessageField::some(
+                record.current_session.as_ref().unwrap().session.clone(),
+            ),
+            previous_sessions: record.previous_sessions.as_ref().clone(),
+        }
+        .encode_to_vec();
+
+        assert_eq!(record.serialize().unwrap(), expected);
+
+        let mut reused = vec![0xaa; 16];
+        record.serialize_into(&mut reused);
+        assert_eq!(reused, expected);
     }
 
     #[test]

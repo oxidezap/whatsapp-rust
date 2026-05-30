@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use wacore::runtime::Runtime;
+use wacore::runtime::{Runtime, Spawnable};
 
 pub struct FlushScope {
     count: AtomicUsize,
     idle: event_listener::Event,
+    closed: std::sync::Mutex<bool>,
 }
 
 impl Default for FlushScope {
@@ -27,17 +28,35 @@ impl FlushScope {
         Self {
             count: AtomicUsize::new(0),
             idle: event_listener::Event::new(),
+            closed: std::sync::Mutex::new(false),
         }
+    }
+
+    pub fn close(&self) {
+        *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    pub fn reopen(&self) {
+        *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = false;
     }
 
     /// Spawn a tracked task. The counter decrements on completion OR if the
     /// future is dropped (e.g. aborted, or dropped before its first poll), so
     /// `flush` can never deadlock waiting on a cancelled task.
+    // `Spawnable` (not a hardcoded `Send`) so this compiles on wasm, where the
+    // single-threaded runtime accepts !Send futures (see `wacore::runtime`).
     pub fn spawn<F>(self: &Arc<Self>, rt: &dyn Runtime, fut: F)
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future<Output = ()> + Spawnable,
     {
-        self.count.fetch_add(1, Ordering::Relaxed);
+        {
+            let closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
+            if *closed {
+                return;
+            }
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+
         // Construct the guard outside the async block so it's captured as an
         // upvalue. This puts it in the future's state machine BEFORE the first
         // poll, so even if the runtime drops the future without polling it,
@@ -103,7 +122,7 @@ impl Drop for DecrementOnDrop {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
-    use std::time::Instant;
+    use wacore::time::Instant;
 
     fn rt() -> Arc<dyn Runtime> {
         Arc::new(crate::runtime_impl::TokioRuntime)
@@ -135,6 +154,29 @@ mod tests {
         let start = Instant::now();
         scope.flush(&*runtime, Duration::from_secs(5)).await;
         assert!(start.elapsed() < Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn close_rejects_new_tasks_until_reopened() {
+        let scope = Arc::new(FlushScope::new());
+        let runtime = rt();
+        let ran = Arc::new(AtomicBool::new(false));
+
+        scope.close();
+        let ran_closed = Arc::clone(&ran);
+        scope.spawn(&*runtime, async move {
+            ran_closed.store(true, Ordering::Relaxed);
+        });
+        scope.flush(&*runtime, Duration::from_secs(1)).await;
+        assert!(!ran.load(Ordering::Relaxed));
+
+        scope.reopen();
+        let ran_open = Arc::clone(&ran);
+        scope.spawn(&*runtime, async move {
+            ran_open.store(true, Ordering::Relaxed);
+        });
+        scope.flush(&*runtime, Duration::from_secs(1)).await;
+        assert!(ran.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -187,12 +229,11 @@ mod tests {
         );
     }
 
-    /// Regression for the field report from baileyrs (PR #576): if the outer
-    /// wrapping future is dropped *before its first poll* (e.g. the executor
-    /// is shutting down), the guard must still be dropped so the counter
-    /// decrements. Before the fix (guard constructed INSIDE the async body),
-    /// this would leak the counter and cause `flush()` to wait its full
-    /// timeout on every disconnect.
+    /// If the outer wrapping future is dropped *before its first poll* (e.g.
+    /// the executor is shutting down), the guard must still be dropped so the
+    /// counter decrements. Before the fix (guard constructed INSIDE the async
+    /// body), this would leak the counter and cause `flush()` to wait its
+    /// full timeout on every disconnect.
     #[tokio::test]
     async fn decrement_runs_when_future_is_dropped_before_first_poll() {
         let scope = Arc::new(FlushScope::new());

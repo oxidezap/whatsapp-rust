@@ -114,23 +114,25 @@ impl<'a> Polls<'a> {
             .await
             .ok_or_else(|| anyhow!("Not logged in — cannot determine own JID"))?;
         let my_base = my_jid.to_non_ad();
-        let voter_jid_str = my_base.to_string();
-        let creator_jid_str = poll_creator_jid.to_non_ad().to_string();
+
+        let voter_jid = self
+            .resolve_voter_jid(poll_creator_jid, &my_base, poll_msg_id)
+            .await;
+        let voter_jid_str = voter_jid.to_string();
+        let creator_jid_str = poll_creator_jid.to_non_ad_string();
 
         let selected_hashes: Vec<Vec<u8>> = option_names
             .iter()
             .map(|name| poll::compute_option_hash(name).to_vec())
             .collect();
 
-        let key = poll::derive_vote_encryption_key(
+        let (enc_payload, iv) = poll::encrypt_poll_vote_with_secret(
+            &selected_hashes,
             message_secret,
             poll_msg_id,
             &creator_jid_str,
             &voter_jid_str,
         )?;
-
-        let (enc_payload, iv) =
-            poll::encrypt_poll_vote(&selected_hashes, &key, poll_msg_id, &voter_jid_str)?;
 
         let from_me = my_base.is_same_user_as(poll_creator_jid);
 
@@ -144,18 +146,13 @@ impl<'a> Polls<'a> {
                 } else {
                     None
                 },
-                ..Default::default()
             }),
             vote: buffa::MessageField::some(wa::message::PollEncValue {
                 enc_payload: Some(enc_payload),
                 enc_iv: Some(iv.to_vec()),
-                ..Default::default()
             }),
-            metadata: buffa::MessageField::some(wa::message::PollUpdateMessageMetadata {
-                ..Default::default()
-            }),
+            metadata: buffa::MessageField::some(wa::message::PollUpdateMessageMetadata {}),
             sender_timestamp_ms: Some(wacore::time::now_millis()),
-            ..Default::default()
         };
 
         let message = wa::Message {
@@ -166,9 +163,36 @@ impl<'a> Polls<'a> {
         self.client.send_message(chat_jid.clone(), message).await
     }
 
-    /// Returns the selected option hashes (each 32 bytes).
-    /// JIDs are normalized (AD suffix stripped) to match the key derivation in `vote()`.
-    pub fn decrypt_vote(
+    /// The voter (self) JID keys the vote's HKDF/AAD, so it must use the poll
+    /// creator's namespace, else the host derives a different key. Own LID for
+    /// LID-addressed polls, own PN otherwise, falling back to PN when our LID
+    /// isn't known yet. Matches WA Web `WAWebAddonEncryption`.
+    async fn resolve_voter_jid(
+        &self,
+        poll_creator_jid: &Jid,
+        own_pn: &Jid,
+        poll_msg_id: &str,
+    ) -> Jid {
+        if !poll_creator_jid.is_lid() {
+            return own_pn.clone();
+        }
+        match self.client.get_lid().await {
+            Some(lid) => lid.to_non_ad(),
+            None => {
+                log::warn!(
+                    "Poll {poll_msg_id} is LID-addressed but own LID is unknown; \
+                     falling back to PN voter (host may fail to decrypt)"
+                );
+                own_pn.clone()
+            }
+        }
+    }
+
+    /// Selected option hashes (32 bytes each). Retries under the opposite
+    /// namespace (LID/PN) when a counterpart is known, so votes authored across
+    /// the LID migration still open. Mirrors WA Web `WAWebAddonEncryption`.
+    pub async fn decrypt_vote(
+        &self,
         enc_payload: &[u8],
         enc_iv: &[u8],
         message_secret: &[u8],
@@ -176,16 +200,60 @@ impl<'a> Polls<'a> {
         poll_creator_jid: &Jid,
         voter_jid: &Jid,
     ) -> Result<Vec<Vec<u8>>> {
-        let creator = poll_creator_jid.to_non_ad().to_string();
-        let voter = voter_jid.to_non_ad().to_string();
-        let key = poll::derive_vote_encryption_key(message_secret, poll_msg_id, &creator, &voter)?;
-        poll::decrypt_poll_vote(enc_payload, enc_iv, &key, poll_msg_id, &voter)
+        let creator = poll_creator_jid.to_non_ad();
+        let voter = voter_jid.to_non_ad();
+        let creator_str = creator.to_string();
+        let voter_str = voter.to_string();
+
+        let creator_alt = self.swapped_user(&creator).await;
+        let voter_alt = self.swapped_user(&voter).await;
+        let fallback = Self::build_fallback(&creator_alt, &voter_alt);
+
+        poll::decrypt_poll_vote_with_fallback(
+            enc_payload,
+            enc_iv,
+            message_secret,
+            poll_msg_id,
+            poll::PollVoteAddressing {
+                poll_creator_jid: &creator_str,
+                voter_jid: &voter_str,
+            },
+            fallback,
+        )
+    }
+
+    /// Non-AD LID/PN counterpart of a user JID, or `None` when unmapped.
+    async fn swapped_user(&self, jid: &Jid) -> Option<String> {
+        self.client
+            .swap_pn_lid_namespace(jid)
+            .await
+            .map(|j| j.to_non_ad_string())
+    }
+
+    /// Fallback pair only when both JIDs have a counterpart, keeping it
+    /// homogeneous (LID or PN, never mixed) like WA Web's `decryptAddOn`.
+    fn build_fallback<'b>(
+        creator_alt: &'b Option<String>,
+        voter_alt: &'b Option<String>,
+    ) -> Option<poll::PollVoteAddressing<'b>> {
+        match (creator_alt, voter_alt) {
+            (Some(c), Some(v)) => Some(poll::PollVoteAddressing {
+                poll_creator_jid: c,
+                voter_jid: v,
+            }),
+            _ => None,
+        }
     }
 
     /// Decrypts each vote and tallies per-option results.
     /// Later votes from the same voter replace earlier ones (last-vote-wins).
     /// `votes` should be ordered oldest-first.
-    pub fn aggregate_votes(
+    ///
+    /// Dedupes voters by their canonical (LID-preferred) identity so a voter who
+    /// re-votes under the other namespace after migrating replaces, rather than
+    /// duplicates, their earlier vote.
+    pub async fn aggregate_votes(
+        &self,
         poll_options: &[String],
         votes: &[(&Jid, &[u8], &[u8])], // (voter_jid, enc_payload, enc_iv)
         message_secret: &[u8],
@@ -197,33 +265,41 @@ impl<'a> Polls<'a> {
             .map(|name| (poll::compute_option_hash(name), name.as_str()))
             .collect();
 
-        // `creator_str` is invariant across voters; `decrypt_vote` used to
-        // recompute it per voter via `poll_creator_jid.to_non_ad().to_string()`.
-        let creator_str = poll_creator_jid.to_non_ad().to_string();
+        // Creator addressing is constant across voters; resolve its counterpart once.
+        let creator = poll_creator_jid.to_non_ad();
+        let creator_str = creator.to_string();
+        let creator_alt = self.swapped_user(&creator).await;
 
-        // Last-vote-wins: each new vote from the same voter replaces the previous
-        let mut latest_votes: HashMap<String, Vec<Vec<u8>>> = HashMap::with_capacity(votes.len());
+        // Keyed by canonical (LID-preferred) identity; value holds the
+        // as-received JID for the reported voters list. Last-vote-wins.
+        let mut latest_votes: HashMap<String, (String, Vec<Vec<u8>>)> =
+            HashMap::with_capacity(votes.len());
         for (voter_jid, enc_payload, enc_iv) in votes {
-            let voter_str = voter_jid.to_non_ad().to_string();
-            let key = match poll::derive_vote_encryption_key(
+            let voter = voter_jid.to_non_ad();
+            let voter_str = voter.to_string();
+            let voter_alt = self.swapped_user(&voter).await;
+            let fallback = Self::build_fallback(&creator_alt, &voter_alt);
+            let canonical_voter = if voter.is_lid() {
+                voter_str.clone()
+            } else {
+                voter_alt.clone().unwrap_or_else(|| voter_str.clone())
+            };
+            match poll::decrypt_poll_vote_with_fallback(
+                enc_payload,
+                enc_iv,
                 message_secret,
                 poll_msg_id,
-                &creator_str,
-                &voter_str,
+                poll::PollVoteAddressing {
+                    poll_creator_jid: &creator_str,
+                    voter_jid: &voter_str,
+                },
+                fallback,
             ) {
-                Ok(k) => k,
-                Err(e) => {
-                    log::warn!("Failed to derive vote key for {voter_jid}: {e}");
-                    continue;
-                }
-            };
-            match poll::decrypt_poll_vote(enc_payload, enc_iv, &key, poll_msg_id, &voter_str) {
                 Ok(selected_hashes) => {
                     if selected_hashes.is_empty() {
-                        // Empty selection = voter cleared their vote
-                        latest_votes.remove(&voter_str);
+                        latest_votes.remove(&canonical_voter);
                     } else {
-                        latest_votes.insert(voter_str, selected_hashes);
+                        latest_votes.insert(canonical_voter, (voter_str, selected_hashes));
                     }
                 }
                 Err(e) => {
@@ -240,12 +316,12 @@ impl<'a> Polls<'a> {
             })
             .collect();
 
-        for (voter_jid, selected_hashes) in &latest_votes {
+        for (display_jid, selected_hashes) in latest_votes.values() {
             for hash in selected_hashes {
                 if let Ok(hash_arr) = <[u8; 32]>::try_from(hash.as_slice())
                     && let Some(idx) = option_hashes.iter().position(|(h, _)| *h == hash_arr)
                 {
-                    results[idx].voters.push(voter_jid.clone());
+                    results[idx].voters.push(display_jid.clone());
                 }
             }
         }
@@ -257,5 +333,309 @@ impl<'a> Polls<'a> {
 impl Client {
     pub fn polls(&self) -> Polls<'_> {
         Polls::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lid_pn_cache::LearningSource;
+    use crate::store::commands::DeviceCommand;
+    use crate::test_utils::create_test_client;
+    use std::sync::Arc;
+
+    // encrypt-side voter selection (resolve_voter_jid)
+
+    #[tokio::test]
+    async fn voter_is_pn_when_poll_creator_is_pn() {
+        let client: Arc<Client> = create_test_client().await;
+        let own_pn = Jid::pn("5511999999999");
+        let creator = Jid::pn("5511777777777");
+
+        let voter = client
+            .polls()
+            .resolve_voter_jid(&creator, &own_pn, "POLLID")
+            .await;
+        assert_eq!(voter, own_pn);
+    }
+
+    #[tokio::test]
+    async fn voter_is_own_lid_when_poll_creator_is_lid() {
+        let client: Arc<Client> = create_test_client().await;
+        let own_lid: Jid = "888000888000888:3@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(own_lid.clone())))
+            .await;
+
+        let own_pn = Jid::pn("5511999999999");
+        let creator = Jid::lid("111000111000111");
+
+        let voter = client
+            .polls()
+            .resolve_voter_jid(&creator, &own_pn, "POLLID")
+            .await;
+        assert!(voter.is_lid(), "voter must be LID-addressed in a LID poll");
+        assert_eq!(voter.user, own_lid.user);
+        assert_eq!(voter, own_lid.to_non_ad());
+    }
+
+    #[tokio::test]
+    async fn voter_falls_back_to_pn_when_own_lid_unknown() {
+        let client: Arc<Client> = create_test_client().await;
+        // No SetLid, so get_lid() is None.
+        let own_pn = Jid::pn("5511999999999");
+        let creator = Jid::lid("111000111000111");
+
+        let voter = client
+            .polls()
+            .resolve_voter_jid(&creator, &own_pn, "POLLID")
+            .await;
+        assert_eq!(voter, own_pn);
+    }
+
+    // decrypt-side LID/PN fallback
+
+    /// A vote encrypted under the PN pair must still decrypt when the consumer
+    /// only knows the LID JIDs, via the namespace-swap fallback.
+    #[tokio::test]
+    async fn decrypt_vote_recovers_when_fed_lid_but_encrypted_under_pn() {
+        let client: Arc<Client> = create_test_client().await;
+        let secret = [0x21u8; 32];
+        let stanza_id = "3EB0POLLVOTE";
+
+        let creator_pn = "5511777777777";
+        let creator_lid = "111000111000111";
+        let voter_pn = "5511888888888";
+        let voter_lid = "222000222000222";
+
+        client
+            .add_lid_pn_mapping(creator_lid, creator_pn, LearningSource::Usync)
+            .await
+            .unwrap();
+        client
+            .add_lid_pn_mapping(voter_lid, voter_pn, LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let hashes = vec![poll::compute_option_hash("Yes").to_vec()];
+        let (enc, iv) = poll::encrypt_poll_vote_with_secret(
+            &hashes,
+            &secret,
+            stanza_id,
+            &Jid::pn(creator_pn).to_string(),
+            &Jid::pn(voter_pn).to_string(),
+        )
+        .unwrap();
+
+        // Consumer feeds LID JIDs; primary (LID) fails, fallback swaps to PN.
+        let out = client
+            .polls()
+            .decrypt_vote(
+                &enc,
+                &iv,
+                &secret,
+                stanza_id,
+                &Jid::lid(creator_lid),
+                &Jid::lid(voter_lid),
+            )
+            .await
+            .expect("fallback should rescue the PN-encrypted vote");
+        assert_eq!(out, hashes);
+    }
+
+    /// Without a known mapping there is no fallback pair, so a LID-fed decrypt
+    /// of a PN-encrypted vote must fail rather than silently mis-decrypt.
+    #[tokio::test]
+    async fn decrypt_vote_fails_without_mapping() {
+        let client: Arc<Client> = create_test_client().await;
+        let secret = [0x21u8; 32];
+        let stanza_id = "3EB0POLLVOTE";
+
+        let (enc, iv) = poll::encrypt_poll_vote_with_secret(
+            &[poll::compute_option_hash("Yes").to_vec()],
+            &secret,
+            stanza_id,
+            &Jid::pn("5511777777777").to_string(),
+            &Jid::pn("5511888888888").to_string(),
+        )
+        .unwrap();
+
+        let res = client
+            .polls()
+            .decrypt_vote(
+                &enc,
+                &iv,
+                &secret,
+                stanza_id,
+                &Jid::lid("111000111000111"),
+                &Jid::lid("222000222000222"),
+            )
+            .await;
+        assert!(res.is_err(), "no mapping → no fallback → must not decrypt");
+    }
+
+    #[tokio::test]
+    async fn aggregate_votes_recovers_across_addressing() {
+        let client: Arc<Client> = create_test_client().await;
+        let secret = [0x31u8; 32];
+        let stanza_id = "3EB0AGG";
+        let options = vec!["Yes".to_string(), "No".to_string()];
+
+        let creator_pn = "5511777777777";
+        let creator_lid = "111000111000111";
+        let voter_pn = "5511888888888";
+        let voter_lid = "222000222000222";
+
+        client
+            .add_lid_pn_mapping(creator_lid, creator_pn, LearningSource::Usync)
+            .await
+            .unwrap();
+        client
+            .add_lid_pn_mapping(voter_lid, voter_pn, LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let (enc, iv) = poll::encrypt_poll_vote_with_secret(
+            &[poll::compute_option_hash("Yes").to_vec()],
+            &secret,
+            stanza_id,
+            &Jid::pn(creator_pn).to_string(),
+            &Jid::pn(voter_pn).to_string(),
+        )
+        .unwrap();
+
+        let voter_lid_jid = Jid::lid(voter_lid);
+        let votes: Vec<(&Jid, &[u8], &[u8])> = vec![(&voter_lid_jid, &enc, &iv)];
+
+        let results = client
+            .polls()
+            .aggregate_votes(&options, &votes, &secret, stanza_id, &Jid::lid(creator_lid))
+            .await
+            .unwrap();
+
+        let yes = results.iter().find(|r| r.name == "Yes").unwrap();
+        assert_eq!(yes.voters.len(), 1, "the LID voter's 'Yes' must be tallied");
+        let no = results.iter().find(|r| r.name == "No").unwrap();
+        assert!(no.voters.is_empty());
+    }
+
+    /// Same voter votes as PN then re-votes as LID after migrating. The
+    /// canonical key must collapse them so last-vote-wins replaces, not
+    /// duplicates, the earlier namespace's entry.
+    #[tokio::test]
+    async fn aggregate_dedupes_revote_across_namespace() {
+        let client: Arc<Client> = create_test_client().await;
+        let secret = [0x41u8; 32];
+        let stanza_id = "3EB0REVOTE";
+        let options = vec!["Yes".to_string(), "No".to_string()];
+
+        let creator_pn = "5511777777777";
+        let creator_lid = "111000111000111";
+        let voter_pn = "5511888888888";
+        let voter_lid = "222000222000222";
+        client
+            .add_lid_pn_mapping(creator_lid, creator_pn, LearningSource::Usync)
+            .await
+            .unwrap();
+        client
+            .add_lid_pn_mapping(voter_lid, voter_pn, LearningSource::Usync)
+            .await
+            .unwrap();
+
+        // Oldest-first: PN "Yes", then LID "No".
+        let (enc_pn, iv_pn) = poll::encrypt_poll_vote_with_secret(
+            &[poll::compute_option_hash("Yes").to_vec()],
+            &secret,
+            stanza_id,
+            &Jid::pn(creator_pn).to_string(),
+            &Jid::pn(voter_pn).to_string(),
+        )
+        .unwrap();
+        let (enc_lid, iv_lid) = poll::encrypt_poll_vote_with_secret(
+            &[poll::compute_option_hash("No").to_vec()],
+            &secret,
+            stanza_id,
+            &Jid::lid(creator_lid).to_string(),
+            &Jid::lid(voter_lid).to_string(),
+        )
+        .unwrap();
+
+        let voter_pn_jid = Jid::pn(voter_pn);
+        let voter_lid_jid = Jid::lid(voter_lid);
+        let votes: Vec<(&Jid, &[u8], &[u8])> = vec![
+            (&voter_pn_jid, &enc_pn, &iv_pn),
+            (&voter_lid_jid, &enc_lid, &iv_lid),
+        ];
+
+        let results = client
+            .polls()
+            .aggregate_votes(&options, &votes, &secret, stanza_id, &Jid::lid(creator_lid))
+            .await
+            .unwrap();
+
+        let yes = results.iter().find(|r| r.name == "Yes").unwrap();
+        let no = results.iter().find(|r| r.name == "No").unwrap();
+        assert!(yes.voters.is_empty(), "the PN 'Yes' must be replaced");
+        assert_eq!(no.voters.len(), 1, "only the re-vote should count, once");
+    }
+
+    /// A clear-vote received under the other namespace must remove the prior
+    /// vote, not leave a stale entry keyed by the original namespace.
+    #[tokio::test]
+    async fn aggregate_clears_vote_across_namespace() {
+        let client: Arc<Client> = create_test_client().await;
+        let secret = [0x51u8; 32];
+        let stanza_id = "3EB0CLEAR";
+        let options = vec!["Yes".to_string(), "No".to_string()];
+
+        let creator_pn = "5511777777777";
+        let creator_lid = "111000111000111";
+        let voter_pn = "5511888888888";
+        let voter_lid = "222000222000222";
+        client
+            .add_lid_pn_mapping(creator_lid, creator_pn, LearningSource::Usync)
+            .await
+            .unwrap();
+        client
+            .add_lid_pn_mapping(voter_lid, voter_pn, LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let (enc_pn, iv_pn) = poll::encrypt_poll_vote_with_secret(
+            &[poll::compute_option_hash("Yes").to_vec()],
+            &secret,
+            stanza_id,
+            &Jid::pn(creator_pn).to_string(),
+            &Jid::pn(voter_pn).to_string(),
+        )
+        .unwrap();
+        // Empty selection = clear, authored under the LID pair after migrating.
+        let (enc_clear, iv_clear) = poll::encrypt_poll_vote_with_secret(
+            &[],
+            &secret,
+            stanza_id,
+            &Jid::lid(creator_lid).to_string(),
+            &Jid::lid(voter_lid).to_string(),
+        )
+        .unwrap();
+
+        let voter_pn_jid = Jid::pn(voter_pn);
+        let voter_lid_jid = Jid::lid(voter_lid);
+        let votes: Vec<(&Jid, &[u8], &[u8])> = vec![
+            (&voter_pn_jid, &enc_pn, &iv_pn),
+            (&voter_lid_jid, &enc_clear, &iv_clear),
+        ];
+
+        let results = client
+            .polls()
+            .aggregate_votes(&options, &votes, &secret, stanza_id, &Jid::lid(creator_lid))
+            .await
+            .unwrap();
+
+        assert!(
+            results.iter().all(|r| r.voters.is_empty()),
+            "the LID clear-vote must remove the earlier PN 'Yes'"
+        );
     }
 }
