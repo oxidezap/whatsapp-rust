@@ -1,7 +1,7 @@
 use crate::types::events::{Event, LazyHistorySync};
 use std::sync::Arc;
 use wacore::history_sync::{HistoryMsgSecretRecord, TcTokenCandidate, process_history_sync};
-use wacore::store::traits::TcTokenEntry;
+use wacore::store::traits::{MsgSecretEntry, TcTokenEntry};
 use wacore_binary::{Jid, JidExt as _};
 use waproto::whatsapp::message::HistorySyncNotification;
 
@@ -245,28 +245,69 @@ impl Client {
     }
 
     async fn store_history_sync_msg_secrets(&self, records: Vec<HistoryMsgSecretRecord>) -> usize {
+        const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
+
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
         let own_pn = device_snapshot.pn.as_ref().map(|j| j.to_non_ad());
         let own_lid = device_snapshot.lid.as_ref().map(|j| j.to_non_ad());
 
-        let mut stored = 0usize;
+        let mut entries = Vec::new();
         for record in records {
+            if record.secret.len() != SECRET_LEN {
+                continue;
+            }
             let Ok(chat) = record.chat_id.parse::<Jid>() else {
                 continue;
             };
             let senders =
                 history_msg_secret_senders(&chat, &record, own_pn.as_ref(), own_lid.as_ref());
-            for sender in senders {
-                if self
-                    .persist_msg_secret_bytes(&chat, &sender, &record.msg_id, &record.secret)
-                    .await
-                {
-                    stored += 1;
-                }
+            if senders.is_empty() {
+                continue;
+            }
+
+            let sender_count = senders.len();
+            let mut chat_id = chat.to_non_ad_string();
+            let mut msg_id = record.msg_id;
+            let mut secret = record.secret;
+            for (idx, sender) in senders.into_iter().enumerate() {
+                let last_sender = idx + 1 == sender_count;
+                entries.push(MsgSecretEntry {
+                    chat: if last_sender {
+                        std::mem::take(&mut chat_id)
+                    } else {
+                        chat_id.clone()
+                    },
+                    sender: sender.to_non_ad_string(),
+                    msg_id: if last_sender {
+                        std::mem::take(&mut msg_id)
+                    } else {
+                        msg_id.clone()
+                    },
+                    secret: if last_sender {
+                        std::mem::take(&mut secret)
+                    } else {
+                        secret.clone()
+                    },
+                });
             }
         }
 
-        stored
+        if entries.is_empty() {
+            return 0;
+        }
+
+        match self
+            .persistence_manager
+            .backend()
+            .put_msg_secrets(entries)
+            .await
+        {
+            Ok(stored) => stored,
+            Err(e) => {
+                log::warn!("failed to persist history-sync messageSecrets: {e:?}");
+                0
+            }
+        }
     }
 
     /// Ask the phone to re-upload a history-sync blob whose download failed,

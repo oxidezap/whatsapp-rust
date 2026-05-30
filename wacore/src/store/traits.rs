@@ -50,6 +50,15 @@ pub struct TcTokenEntry {
     pub sender_timestamp: Option<i64>,
 }
 
+/// Message-secret write entry keyed by chat, sender, and message ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MsgSecretEntry {
+    pub chat: String,
+    pub sender: String,
+    pub msg_id: String,
+    pub secret: Vec<u8>,
+}
+
 /// Device information for registry tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -380,6 +389,17 @@ pub trait MsgSecretStore: Send + Sync {
         msg_id: &str,
         secret: &[u8],
     ) -> Result<()>;
+
+    /// Batched variant of `put_msg_secret`.
+    async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize> {
+        let mut stored = 0usize;
+        for entry in entries {
+            self.put_msg_secret(&entry.chat, &entry.sender, &entry.msg_id, &entry.secret)
+                .await?;
+            stored += 1;
+        }
+        Ok(stored)
+    }
 
     /// Fetch the persisted secret; returns `None` if absent.
     async fn get_msg_secret(

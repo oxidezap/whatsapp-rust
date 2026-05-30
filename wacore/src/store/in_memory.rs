@@ -608,6 +608,19 @@ impl MsgSecretStore for InMemoryBackend {
         Ok(())
     }
 
+    async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize> {
+        let now = crate::time::now_secs();
+        let stored = entries.len();
+        let mut state = self.state.lock().await;
+        for entry in entries {
+            state.msg_secrets.insert(
+                (entry.chat, entry.sender, entry.msg_id),
+                (entry.secret, now),
+            );
+        }
+        Ok(stored)
+    }
+
     async fn get_msg_secret(
         &self,
         chat: &str,
@@ -757,6 +770,52 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             vec![4u8; 32]
+        );
+    }
+
+    #[tokio::test]
+    async fn msg_secret_batch_round_trip_and_overwrite() {
+        let backend = InMemoryBackend::new();
+        let stored = backend
+            .put_msg_secrets(vec![
+                MsgSecretEntry {
+                    chat: "chat".into(),
+                    sender: "sender".into(),
+                    msg_id: "M1".into(),
+                    secret: vec![1u8; 32],
+                },
+                MsgSecretEntry {
+                    chat: "chat".into(),
+                    sender: "sender".into(),
+                    msg_id: "M2".into(),
+                    secret: vec![2u8; 32],
+                },
+                MsgSecretEntry {
+                    chat: "chat".into(),
+                    sender: "sender".into(),
+                    msg_id: "M1".into(),
+                    secret: vec![9u8; 32],
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(stored, 3);
+        assert_eq!(
+            backend
+                .get_msg_secret("chat", "sender", "M1")
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![9u8; 32]
+        );
+        assert_eq!(
+            backend
+                .get_msg_secret("chat", "sender", "M2")
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![2u8; 32]
         );
     }
 
