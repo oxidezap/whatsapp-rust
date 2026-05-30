@@ -1041,6 +1041,57 @@ mod tests {
         record
     }
 
+    fn make_cache_shape_chain(seed: u8, message_key_count: usize) -> session_structure::Chain {
+        let chain_key = session_structure::chain::ChainKey {
+            index: Some(seed as u32),
+            key: Some(vec![seed; 32].into()),
+        };
+        let message_keys = (0..message_key_count)
+            .map(|idx| {
+                let idx = idx as u8;
+                session_structure::chain::MessageKey {
+                    index: Some(idx as u32),
+                    cipher_key: Some(vec![seed.wrapping_add(idx); 32].into()),
+                    mac_key: Some(vec![seed.wrapping_add(idx).wrapping_add(1); 32].into()),
+                    iv: Some(vec![seed.wrapping_add(idx).wrapping_add(2); 16].into()),
+                }
+            })
+            .collect();
+
+        session_structure::Chain {
+            sender_ratchet_key: Some(vec![seed; 33]),
+            sender_ratchet_key_private: Some(vec![seed.wrapping_add(1); 32]),
+            chain_key: MessageField::some(chain_key),
+            message_keys,
+        }
+    }
+
+    fn make_cache_shape_session(
+        seed: u8,
+        receiver_chain_count: usize,
+        message_key_count: usize,
+    ) -> SessionStructure {
+        let receiver_chains = (0..receiver_chain_count)
+            .map(|idx| make_cache_shape_chain(seed.wrapping_add(idx as u8 + 1), idx + 1))
+            .collect();
+
+        SessionStructure {
+            session_version: Some(3),
+            local_identity_public: Some(vec![seed; 33]),
+            remote_identity_public: Some(vec![seed.wrapping_add(1); 33]),
+            root_key: Some(vec![seed.wrapping_add(2); 32]),
+            previous_counter: Some(seed as u32),
+            sender_chain: MessageField::some(make_cache_shape_chain(seed, message_key_count)),
+            receiver_chains,
+            pending_key_exchange: MessageField::none(),
+            pending_pre_key: MessageField::none(),
+            remote_registration_id: Some(10_000 + seed as u32),
+            local_registration_id: Some(20_000 + seed as u32),
+            needs_refresh: Some(seed.is_multiple_of(2)),
+            alice_base_key: Some(vec![seed.wrapping_add(3); 33]),
+        }
+    }
+
     #[test]
     fn test_take_restore_preserves_order() {
         let mut record = create_record_with_previous_sessions(5);
@@ -1343,6 +1394,27 @@ mod tests {
         let mut reused = vec![0xaa; 16];
         record.serialize_into(&mut reused);
         assert_eq!(reused, expected);
+    }
+
+    #[test]
+    fn test_session_record_manual_encoding_handles_mixed_size_cache_shapes() {
+        let current = make_cache_shape_session(1, 3, 2);
+        let previous_sessions = vec![
+            make_cache_shape_session(20, 0, 5),
+            make_cache_shape_session(40, 6, 0),
+            make_cache_shape_session(60, 1, 8),
+        ];
+        let record = SessionRecord {
+            current_session: Some(SessionState::from_session_structure(current.clone())),
+            previous_sessions: Arc::new(previous_sessions.clone()),
+        };
+        let expected = waproto::whatsapp::RecordStructure {
+            current_session: MessageField::some(current),
+            previous_sessions,
+        }
+        .encode_to_vec();
+
+        assert_eq!(record.serialize().unwrap(), expected);
     }
 
     #[test]
