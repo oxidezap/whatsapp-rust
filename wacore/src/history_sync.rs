@@ -427,49 +427,47 @@ pub(crate) struct FutureProofMessageInternalFields {
 impl MessageInternalFields {
     fn base_message(&self) -> &Self {
         let mut current = self;
-        if let Some(msg) = self
-            .device_sent_message
-            .as_ref()
-            .and_then(|m| m.message.as_deref())
-        {
-            current = msg;
+        loop {
+            let next = current
+                .device_sent_message
+                .as_ref()
+                .and_then(|m| m.message.as_deref())
+                .or_else(|| {
+                    current
+                        .ephemeral_message
+                        .as_ref()
+                        .and_then(|m| m.message.as_deref())
+                })
+                .or_else(|| {
+                    current
+                        .view_once_message
+                        .as_ref()
+                        .and_then(|m| m.message.as_deref())
+                })
+                .or_else(|| {
+                    current
+                        .view_once_message_v2
+                        .as_ref()
+                        .and_then(|m| m.message.as_deref())
+                })
+                .or_else(|| {
+                    current
+                        .document_with_caption_message
+                        .as_ref()
+                        .and_then(|m| m.message.as_deref())
+                })
+                .or_else(|| {
+                    current
+                        .edited_message
+                        .as_ref()
+                        .and_then(|m| m.message.as_deref())
+                });
+
+            match next {
+                Some(msg) => current = msg,
+                None => return current,
+            }
         }
-        if let Some(msg) = current
-            .ephemeral_message
-            .as_ref()
-            .and_then(|m| m.message.as_deref())
-        {
-            current = msg;
-        }
-        if let Some(msg) = current
-            .view_once_message
-            .as_ref()
-            .and_then(|m| m.message.as_deref())
-        {
-            current = msg;
-        }
-        if let Some(msg) = current
-            .view_once_message_v2
-            .as_ref()
-            .and_then(|m| m.message.as_deref())
-        {
-            current = msg;
-        }
-        if let Some(msg) = current
-            .document_with_caption_message
-            .as_ref()
-            .and_then(|m| m.message.as_deref())
-        {
-            current = msg;
-        }
-        if let Some(msg) = current
-            .edited_message
-            .as_ref()
-            .and_then(|m| m.message.as_deref())
-        {
-            current = msg;
-        }
-        current
     }
 
     fn is_forwarded(&self) -> bool {
@@ -775,6 +773,67 @@ mod tests {
                             )),
                             message_context_info: Some(wa::MessageContextInfo {
                                 message_secret: Some(vec![0x66u8; 32]),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let compressed = encode_and_compress(&hs);
+        let result = process_history_sync(compressed, None, false, None).unwrap();
+
+        assert!(result.msg_secret_records.is_empty());
+    }
+
+    #[test]
+    fn test_nested_forwarded_message_secrets_skipped_from_history_sync() {
+        let chat = "5511000000002@s.whatsapp.net";
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![wa::HistorySyncMsg {
+                    message: Some(wa::WebMessageInfo {
+                        key: wa::MessageKey {
+                            remote_jid: Some(chat.to_string()),
+                            from_me: Some(false),
+                            id: Some("HIST_NESTED_FORWARDED".to_string()),
+                            ..Default::default()
+                        },
+                        message: Some(wa::Message {
+                            view_once_message: Some(Box::new(wa::message::FutureProofMessage {
+                                message: Some(Box::new(wa::Message {
+                                    ephemeral_message: Some(Box::new(
+                                        wa::message::FutureProofMessage {
+                                            message: Some(Box::new(wa::Message {
+                                                extended_text_message: Some(Box::new(
+                                                    wa::message::ExtendedTextMessage {
+                                                        text: Some("nested".into()),
+                                                        context_info: Some(Box::new(
+                                                            wa::ContextInfo {
+                                                                is_forwarded: Some(true),
+                                                                ..Default::default()
+                                                            },
+                                                        )),
+                                                        ..Default::default()
+                                                    },
+                                                )),
+                                                ..Default::default()
+                                            })),
+                                        },
+                                    )),
+                                    ..Default::default()
+                                })),
+                            })),
+                            message_context_info: Some(wa::MessageContextInfo {
+                                message_secret: Some(vec![0x77u8; 32]),
                                 ..Default::default()
                             }),
                             ..Default::default()
