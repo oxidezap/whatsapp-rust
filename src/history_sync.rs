@@ -146,7 +146,7 @@ impl Client {
         };
 
         let has_listeners = self.core.event_bus.has_handlers();
-        let retain_history_blob = true;
+        let retain_history_blob = has_listeners;
 
         // Small blobs (PushName, Recent): decode inline to avoid spawn_blocking overhead.
         // Large blobs: use blocking thread to avoid stalling the async runtime.
@@ -221,10 +221,6 @@ impl Client {
                     .await;
 
                 if let Some(decompressed) = sync_result.decompressed_bytes {
-                    if !has_listeners {
-                        return;
-                    }
-
                     let lazy_hs = LazyHistorySync::new(
                         decompressed,
                         notification.sync_type().into(),
