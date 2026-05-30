@@ -259,8 +259,13 @@ impl Client {
             let Ok(chat) = record.chat_id.parse::<Jid>() else {
                 continue;
             };
-            let senders =
+            let mut senders =
                 history_msg_secret_senders(&chat, &record, own_pn.as_ref(), own_lid.as_ref());
+            if chat.is_bot()
+                && let Some(lid) = own_lid.as_ref()
+            {
+                push_unique_sender(&mut senders, lid.to_non_ad());
+            }
             if senders.is_empty() {
                 continue;
             }
@@ -509,5 +514,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, Some(secret));
+    }
+
+    #[tokio::test]
+    async fn process_history_sync_task_stores_bot_dm_secret_alias() {
+        let client =
+            crate::test_utils::create_test_client_with_name("history_bot_msg_secret").await;
+        client
+            .persistence_manager
+            .process_command(wacore::store::commands::DeviceCommand::SetLid(Some(
+                "999888777666555:0@lid".parse().unwrap(),
+            )))
+            .await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let chat = "867051314767696@bot";
+        let parent_id = "HIST_BOT_PARENT";
+        let secret = vec![0x61u8; 32];
+        let history_sync = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![wa::HistorySyncMsg {
+                    message: Some(wa::WebMessageInfo {
+                        key: wa::MessageKey {
+                            remote_jid: Some(chat.to_string()),
+                            from_me: Some(false),
+                            id: Some(parent_id.to_string()),
+                            participant: None,
+                        },
+                        message: Some(wa::Message {
+                            conversation: Some("bot historical".to_string()),
+                            ..Default::default()
+                        }),
+                        message_secret: Some(secret.clone()),
+                        ..Default::default()
+                    }),
+                    msg_order_id: Some(1),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let compressed = compress_history_sync(&history_sync);
+        let notification = HistorySyncNotification {
+            file_length: Some(compressed.len() as u64),
+            sync_type: Some(wa::message::HistorySyncType::InitialBootstrap as i32),
+            initial_hist_bootstrap_inline_payload: Some(compressed),
+            ..Default::default()
+        };
+
+        client
+            .process_history_sync_task("HIST_SYNC_BOT_SECRET".to_string(), notification)
+            .await;
+
+        let backend = client.persistence_manager.backend();
+        let primary = backend.get_msg_secret(chat, chat, parent_id).await.unwrap();
+        let alias = backend
+            .get_msg_secret(chat, "999888777666555@lid", parent_id)
+            .await
+            .unwrap();
+
+        assert_eq!(primary, Some(secret.clone()));
+        assert_eq!(alias, Some(secret));
     }
 }
