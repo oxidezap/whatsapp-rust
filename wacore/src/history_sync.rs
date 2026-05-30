@@ -300,14 +300,216 @@ pub(crate) struct MessageKeyInternalFields {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub(crate) struct MessageInternalFields {
+    #[prost(message, optional, tag = "3")]
+    pub image_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "4")]
+    pub contact_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "5")]
+    pub location_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "6")]
+    pub extended_text_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "7")]
+    pub document_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "8")]
+    pub audio_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "9")]
+    pub video_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "13")]
+    pub contacts_array_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "18")]
+    pub live_location_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "25")]
+    pub template_message: Option<ContextInfoTag3InternalFields>,
+    #[prost(message, optional, tag = "26")]
+    pub sticker_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "28")]
+    pub group_invite_message: Option<ContextInfoTag7InternalFields>,
+    #[prost(message, optional, tag = "29")]
+    pub template_button_reply_message: Option<ContextInfoTag3InternalFields>,
+    #[prost(message, optional, tag = "30")]
+    pub product_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "31")]
+    pub device_sent_message: Option<DeviceSentMessageInternalFields>,
     #[prost(message, optional, tag = "35")]
     pub message_context_info: Option<MessageContextInfoInternalFields>,
+    #[prost(message, optional, tag = "36")]
+    pub list_message: Option<ContextInfoTag8InternalFields>,
+    #[prost(message, optional, tag = "37")]
+    pub view_once_message: Option<FutureProofMessageInternalFields>,
+    #[prost(message, optional, tag = "38")]
+    pub order_message: Option<ContextInfoTag17InternalFields>,
+    #[prost(message, optional, tag = "39")]
+    pub list_response_message: Option<ContextInfoTag4InternalFields>,
+    #[prost(message, optional, tag = "40")]
+    pub ephemeral_message: Option<FutureProofMessageInternalFields>,
+    #[prost(message, optional, tag = "42")]
+    pub buttons_message: Option<ContextInfoTag8InternalFields>,
+    #[prost(message, optional, tag = "43")]
+    pub buttons_response_message: Option<ContextInfoTag3InternalFields>,
+    #[prost(message, optional, tag = "45")]
+    pub interactive_message: Option<ContextInfoTag15InternalFields>,
+    #[prost(message, optional, tag = "48")]
+    pub interactive_response_message: Option<ContextInfoTag15InternalFields>,
+    #[prost(message, optional, tag = "49")]
+    pub poll_creation_message: Option<ContextInfoTag5InternalFields>,
+    #[prost(message, optional, tag = "53")]
+    pub document_with_caption_message: Option<FutureProofMessageInternalFields>,
+    #[prost(message, optional, tag = "55")]
+    pub view_once_message_v2: Option<FutureProofMessageInternalFields>,
+    #[prost(message, optional, tag = "58")]
+    pub edited_message: Option<FutureProofMessageInternalFields>,
+    #[prost(message, optional, tag = "60")]
+    pub poll_creation_message_v2: Option<ContextInfoTag5InternalFields>,
+    #[prost(message, optional, tag = "64")]
+    pub poll_creation_message_v3: Option<ContextInfoTag5InternalFields>,
+    #[prost(message, optional, tag = "75")]
+    pub event_message: Option<ContextInfoTag1InternalFields>,
+    #[prost(message, optional, tag = "78")]
+    pub newsletter_admin_invite_message: Option<ContextInfoTag6InternalFields>,
+    #[prost(message, optional, tag = "86")]
+    pub sticker_pack_message: Option<ContextInfoTag11InternalFields>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub(crate) struct MessageContextInfoInternalFields {
     #[prost(bytes = "vec", optional, tag = "3")]
     pub message_secret: Option<Vec<u8>>,
+}
+
+macro_rules! define_context_info_carrier {
+    ($name:ident, $tag:literal) => {
+        #[derive(Clone, PartialEq, prost::Message)]
+        pub(crate) struct $name {
+            #[prost(message, optional, tag = $tag)]
+            pub context_info: Option<ContextInfoInternalFields>,
+        }
+
+        impl $name {
+            fn is_forwarded(&self) -> bool {
+                self.context_info
+                    .as_ref()
+                    .and_then(|ctx| ctx.is_forwarded)
+                    .unwrap_or(false)
+            }
+        }
+    };
+}
+
+define_context_info_carrier!(ContextInfoTag1InternalFields, "1");
+define_context_info_carrier!(ContextInfoTag3InternalFields, "3");
+define_context_info_carrier!(ContextInfoTag4InternalFields, "4");
+define_context_info_carrier!(ContextInfoTag5InternalFields, "5");
+define_context_info_carrier!(ContextInfoTag6InternalFields, "6");
+define_context_info_carrier!(ContextInfoTag7InternalFields, "7");
+define_context_info_carrier!(ContextInfoTag8InternalFields, "8");
+define_context_info_carrier!(ContextInfoTag11InternalFields, "11");
+define_context_info_carrier!(ContextInfoTag15InternalFields, "15");
+define_context_info_carrier!(ContextInfoTag17InternalFields, "17");
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct ContextInfoInternalFields {
+    #[prost(bool, optional, tag = "22")]
+    pub is_forwarded: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct DeviceSentMessageInternalFields {
+    #[prost(message, optional, boxed, tag = "2")]
+    pub message: Option<Box<MessageInternalFields>>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub(crate) struct FutureProofMessageInternalFields {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub message: Option<Box<MessageInternalFields>>,
+}
+
+impl MessageInternalFields {
+    fn base_message(&self) -> &Self {
+        let mut current = self;
+        if let Some(msg) = self
+            .device_sent_message
+            .as_ref()
+            .and_then(|m| m.message.as_deref())
+        {
+            current = msg;
+        }
+        if let Some(msg) = current
+            .ephemeral_message
+            .as_ref()
+            .and_then(|m| m.message.as_deref())
+        {
+            current = msg;
+        }
+        if let Some(msg) = current
+            .view_once_message
+            .as_ref()
+            .and_then(|m| m.message.as_deref())
+        {
+            current = msg;
+        }
+        if let Some(msg) = current
+            .view_once_message_v2
+            .as_ref()
+            .and_then(|m| m.message.as_deref())
+        {
+            current = msg;
+        }
+        if let Some(msg) = current
+            .document_with_caption_message
+            .as_ref()
+            .and_then(|m| m.message.as_deref())
+        {
+            current = msg;
+        }
+        if let Some(msg) = current
+            .edited_message
+            .as_ref()
+            .and_then(|m| m.message.as_deref())
+        {
+            current = msg;
+        }
+        current
+    }
+
+    fn is_forwarded(&self) -> bool {
+        let base = self.base_message();
+        macro_rules! any_forwarded {
+            ($($field:ident),+ $(,)?) => {
+                false $(|| base.$field.as_ref().map(|m| m.is_forwarded()).unwrap_or(false))+
+            };
+        }
+
+        any_forwarded!(
+            extended_text_message,
+            image_message,
+            video_message,
+            audio_message,
+            document_message,
+            sticker_message,
+            location_message,
+            live_location_message,
+            contact_message,
+            contacts_array_message,
+            buttons_message,
+            buttons_response_message,
+            list_message,
+            list_response_message,
+            template_message,
+            template_button_reply_message,
+            interactive_message,
+            interactive_response_message,
+            poll_creation_message,
+            poll_creation_message_v2,
+            poll_creation_message_v3,
+            product_message,
+            order_message,
+            group_invite_message,
+            event_message,
+            sticker_pack_message,
+            newsletter_admin_invite_message,
+        )
+    }
 }
 
 struct ConversationExtraction {
@@ -378,6 +580,11 @@ fn extract_msg_secret_records(conv: &ConversationInternalFields) -> Vec<HistoryM
         let Some(msg_id) = key.id.as_ref() else {
             continue;
         };
+        if let Some(message) = web_msg.message.as_ref()
+            && message.is_forwarded()
+        {
+            continue;
+        }
         let Some(secret) = web_msg.message_secret.as_ref().or_else(|| {
             web_msg
                 .message
@@ -538,5 +745,52 @@ mod tests {
         assert_eq!(result.msg_secret_records[1].msg_id, "HIST_CONTEXT");
         assert!(result.msg_secret_records[1].from_me);
         assert_eq!(result.msg_secret_records[1].secret, context_secret);
+    }
+
+    #[test]
+    fn test_forwarded_message_secrets_skipped_from_history_sync() {
+        let chat = "5511000000001@s.whatsapp.net";
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![wa::HistorySyncMsg {
+                    message: Some(wa::WebMessageInfo {
+                        key: wa::MessageKey {
+                            remote_jid: Some(chat.to_string()),
+                            from_me: Some(false),
+                            id: Some("HIST_FORWARDED".to_string()),
+                            ..Default::default()
+                        },
+                        message: Some(wa::Message {
+                            extended_text_message: Some(Box::new(
+                                wa::message::ExtendedTextMessage {
+                                    text: Some("forwarded".into()),
+                                    context_info: Some(Box::new(wa::ContextInfo {
+                                        is_forwarded: Some(true),
+                                        ..Default::default()
+                                    })),
+                                    ..Default::default()
+                                },
+                            )),
+                            message_context_info: Some(wa::MessageContextInfo {
+                                message_secret: Some(vec![0x66u8; 32]),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let compressed = encode_and_compress(&hs);
+        let result = process_history_sync(compressed, None, false, None).unwrap();
+
+        assert!(result.msg_secret_records.is_empty());
     }
 }
