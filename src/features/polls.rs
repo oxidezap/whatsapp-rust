@@ -270,21 +270,18 @@ impl<'a> Polls<'a> {
         let creator_str = creator.to_string();
         let creator_alt = self.swapped_user(&creator).await;
 
-        // Keyed by canonical (LID-preferred) identity; value holds the
-        // as-received JID for the reported voters list. Last-vote-wins.
-        let mut latest_votes: HashMap<String, (String, Vec<Vec<u8>>)> =
+        // Keyed by canonical (LID-preferred) identity. The optional display JID
+        // is only stored when it differs from the key. Last-vote-wins.
+        let mut latest_votes: HashMap<String, (Option<String>, Vec<usize>)> =
             HashMap::with_capacity(votes.len());
         for (voter_jid, enc_payload, enc_iv) in votes {
             let voter = voter_jid.to_non_ad();
             let voter_str = voter.to_string();
             let voter_alt = self.swapped_user(&voter).await;
             let fallback = Self::build_fallback(&creator_alt, &voter_alt);
-            let canonical_voter = if voter.is_lid() {
-                voter_str.clone()
-            } else {
-                voter_alt.clone().unwrap_or_else(|| voter_str.clone())
-            };
-            match poll::decrypt_poll_vote_with_fallback(
+            let mut selected_count = 0usize;
+            let mut selected_indices = Vec::new();
+            match poll::visit_decrypted_poll_vote_with_fallback(
                 enc_payload,
                 enc_iv,
                 message_secret,
@@ -294,12 +291,27 @@ impl<'a> Polls<'a> {
                     voter_jid: &voter_str,
                 },
                 fallback,
+                |hash| {
+                    selected_count += 1;
+                    if let Ok(hash_arr) = <[u8; 32]>::try_from(hash)
+                        && let Some(idx) = option_hashes.iter().position(|(h, _)| *h == hash_arr)
+                    {
+                        selected_indices.push(idx);
+                    }
+                },
             ) {
-                Ok(selected_hashes) => {
-                    if selected_hashes.is_empty() {
-                        latest_votes.remove(&canonical_voter);
+                Ok(()) => {
+                    let (canonical_voter, display_jid) = if voter.is_lid() {
+                        (voter_str, None)
+                    } else if let Some(alt) = voter_alt {
+                        (alt, Some(voter_str))
                     } else {
-                        latest_votes.insert(canonical_voter, (voter_str, selected_hashes));
+                        (voter_str, None)
+                    };
+                    if selected_count == 0 {
+                        latest_votes.remove(canonical_voter.as_str());
+                    } else {
+                        latest_votes.insert(canonical_voter, (display_jid, selected_indices));
                     }
                 }
                 Err(e) => {
@@ -316,13 +328,13 @@ impl<'a> Polls<'a> {
             })
             .collect();
 
-        for (display_jid, selected_hashes) in latest_votes.values() {
-            for hash in selected_hashes {
-                if let Ok(hash_arr) = <[u8; 32]>::try_from(hash.as_slice())
-                    && let Some(idx) = option_hashes.iter().position(|(h, _)| *h == hash_arr)
-                {
-                    results[idx].voters.push(display_jid.clone());
+        for (canonical_jid, (display_jid, selected_indices)) in latest_votes {
+            let display_jid = display_jid.unwrap_or(canonical_jid);
+            if let Some((last_idx, prefix_indices)) = selected_indices.split_last() {
+                for idx in prefix_indices {
+                    results[*idx].voters.push(display_jid.clone());
                 }
+                results[*last_idx].voters.push(display_jid);
             }
         }
 

@@ -62,13 +62,9 @@ pub fn encrypt_poll_vote(
     voter_jid: &str,
 ) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE])> {
     use crate::libsignal::crypto::aes_256_gcm_encrypt;
-    use buffa::Message;
     use rand::Rng;
 
-    let vote_msg = waproto::whatsapp::message::PollVoteMessage {
-        selected_options: selected_option_hashes.to_vec(),
-    };
-    let plaintext = vote_msg.encode_to_vec();
+    let plaintext = encode_selected_options(selected_option_hashes);
 
     let mut iv = [0u8; GCM_IV_SIZE];
     rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
@@ -92,18 +88,28 @@ pub fn encrypt_poll_vote_with_secret(
     poll_creator_jid: &str,
     voter_jid: &str,
 ) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE])> {
-    use buffa::Message;
-
-    let vote_msg = waproto::whatsapp::message::PollVoteMessage {
-        selected_options: selected_option_hashes.to_vec(),
-    };
-    let plaintext = vote_msg.encode_to_vec();
+    let plaintext = encode_selected_options(selected_option_hashes);
 
     encrypt_addon(
         &plaintext,
         message_secret,
         &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
     )
+}
+
+fn encode_selected_options(selected_option_hashes: &[Vec<u8>]) -> Vec<u8> {
+    use buffa::encoding::{Tag, WireType};
+
+    let encoded_len = selected_option_hashes
+        .iter()
+        .map(|hash| 1 + buffa::types::bytes_encoded_len(hash))
+        .sum();
+    let mut plaintext = Vec::with_capacity(encoded_len);
+    for hash in selected_option_hashes {
+        Tag::new(1, WireType::LengthDelimited).encode(&mut plaintext);
+        buffa::types::encode_bytes(hash, &mut plaintext);
+    }
+    plaintext
 }
 
 /// Returns the selected option hashes (each 32 bytes).
@@ -118,7 +124,6 @@ pub fn decrypt_poll_vote(
     voter_jid: &str,
 ) -> Result<Vec<Vec<u8>>> {
     use crate::libsignal::crypto::aes_256_gcm_decrypt;
-    use buffa::Message as _;
 
     let nonce: &[u8; GCM_IV_SIZE] = iv
         .try_into()
@@ -137,8 +142,7 @@ pub fn decrypt_poll_vote(
     aes_256_gcm_decrypt(encryption_key, nonce, &aad, enc_payload, &mut plaintext)
         .map_err(|_| anyhow!("Poll vote GCM tag verification failed"))?;
 
-    let vote_msg = waproto::whatsapp::message::PollVoteMessage::decode_from_slice(&plaintext[..])?;
-    Ok(vote_msg.selected_options)
+    decode_selected_options(&plaintext)
 }
 
 /// Creator + voter JIDs (non-AD) that key the poll-vote HKDF and AAD.
@@ -189,6 +193,50 @@ pub fn decrypt_poll_vote_with_fallback(
     }
 }
 
+/// Decrypts a poll vote and visits borrowed selected option hashes.
+///
+/// This avoids copying each selected hash when the caller can consume it before
+/// the decrypted plaintext buffer is dropped.
+pub fn visit_decrypted_poll_vote_with_fallback<F>(
+    enc_payload: &[u8],
+    iv: &[u8],
+    message_secret: &[u8],
+    stanza_id: &str,
+    primary: PollVoteAddressing<'_>,
+    fallback: Option<PollVoteAddressing<'_>>,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(&[u8]),
+{
+    match visit_poll_vote_with_secret(
+        enc_payload,
+        iv,
+        message_secret,
+        stanza_id,
+        primary.poll_creator_jid,
+        primary.voter_jid,
+        &mut visit,
+    ) {
+        Ok(()) => Ok(()),
+        Err(primary_err) => match fallback {
+            Some(fb) => visit_poll_vote_with_secret(
+                enc_payload,
+                iv,
+                message_secret,
+                stanza_id,
+                fb.poll_creator_jid,
+                fb.voter_jid,
+                &mut visit,
+            )
+            .map_err(|fb_err| {
+                anyhow!("poll vote decrypt failed: primary={primary_err}; fallback={fb_err}")
+            }),
+            None => Err(primary_err),
+        },
+    }
+}
+
 /// Decrypt a poll vote given the poll's `messageSecret` directly. Preferred
 /// over the legacy two-step path that splits derive+decrypt.
 pub fn decrypt_poll_vote_with_secret(
@@ -199,16 +247,70 @@ pub fn decrypt_poll_vote_with_secret(
     poll_creator_jid: &str,
     voter_jid: &str,
 ) -> Result<Vec<Vec<u8>>> {
-    use buffa::Message as _;
-
     let plaintext = decrypt_addon(
         enc_payload,
         iv,
         message_secret,
         &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
     )?;
-    let vote_msg = waproto::whatsapp::message::PollVoteMessage::decode_from_slice(&plaintext[..])?;
-    Ok(vote_msg.selected_options)
+    decode_selected_options(&plaintext)
+}
+
+fn visit_poll_vote_with_secret<F>(
+    enc_payload: &[u8],
+    iv: &[u8],
+    message_secret: &[u8],
+    stanza_id: &str,
+    poll_creator_jid: &str,
+    voter_jid: &str,
+    visit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[u8]),
+{
+    let plaintext = decrypt_addon(
+        enc_payload,
+        iv,
+        message_secret,
+        &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
+    )?;
+    scan_selected_options(&plaintext, |_| {})?;
+    scan_selected_options(&plaintext, visit)
+}
+
+fn decode_selected_options(plaintext: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut selected_options = Vec::new();
+    scan_selected_options(plaintext, |selected| {
+        selected_options.push(selected.to_vec());
+    })?;
+    Ok(selected_options)
+}
+
+fn scan_selected_options<'a, F>(plaintext: &'a [u8], mut visit: F) -> Result<()>
+where
+    F: FnMut(&'a [u8]),
+{
+    use buffa::encoding::{Tag, WireType, skip_field_depth};
+
+    let mut cur = plaintext;
+    while !cur.is_empty() {
+        let tag = Tag::decode(&mut cur)?;
+        match tag.field_number() {
+            1 => {
+                if tag.wire_type() != WireType::LengthDelimited {
+                    return Err(buffa::DecodeError::WireTypeMismatch {
+                        field_number: 1,
+                        expected: WireType::LengthDelimited as u8,
+                        actual: tag.wire_type() as u8,
+                    }
+                    .into());
+                }
+                visit(buffa::types::borrow_bytes(&mut cur)?);
+            }
+            _ => skip_field_depth(tag, &mut cur, buffa::RECURSION_LIMIT)?,
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -242,6 +344,21 @@ mod tests {
         let out =
             decrypt_poll_vote_with_secret(&enc, &iv, &secret, stanza_id, creator, voter).unwrap();
         assert_eq!(out, hashes);
+    }
+
+    #[test]
+    fn selected_option_encoding_matches_message_encoding() {
+        use buffa::Message;
+
+        let hashes = vec![
+            compute_option_hash("Yes").to_vec(),
+            compute_option_hash("No").to_vec(),
+        ];
+        let vote_msg = waproto::whatsapp::message::PollVoteMessage {
+            selected_options: hashes.clone(),
+        };
+
+        assert_eq!(encode_selected_options(&hashes), vote_msg.encode_to_vec());
     }
 
     #[test]
@@ -321,6 +438,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, vec![compute_option_hash("Yes").to_vec()]);
+    }
+
+    #[test]
+    fn visit_fallback_yields_selected_hashes() {
+        let secret = [0x34u8; 32];
+        let stanza_id = "3EB0VISIT";
+        let creator_pn = "5511999999999@s.whatsapp.net";
+        let voter_pn = "5511888888888@s.whatsapp.net";
+        let expected = compute_option_hash("Yes");
+        let (enc, iv) = encrypt_poll_vote_with_secret(
+            &[expected.to_vec()],
+            &secret,
+            stanza_id,
+            creator_pn,
+            voter_pn,
+        )
+        .unwrap();
+
+        let mut visited = Vec::new();
+        visit_decrypted_poll_vote_with_fallback(
+            &enc,
+            &iv,
+            &secret,
+            stanza_id,
+            PollVoteAddressing {
+                poll_creator_jid: "111111111111111@lid",
+                voter_jid: "222222222222222@lid",
+            },
+            Some(PollVoteAddressing {
+                poll_creator_jid: creator_pn,
+                voter_jid: voter_pn,
+            }),
+            |hash| visited.push(<[u8; 32]>::try_from(hash).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(visited, vec![expected]);
     }
 
     #[test]

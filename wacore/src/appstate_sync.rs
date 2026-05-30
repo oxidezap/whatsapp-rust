@@ -14,7 +14,7 @@ use crate::appstate::patch_decode::{
     parse_patch_lists_ref,
 };
 use crate::appstate::{
-    collect_key_ids_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
+    collect_key_id_refs_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
 };
 use crate::store::traits::Backend;
 use wacore_binary::{Node, NodeRef};
@@ -87,10 +87,10 @@ impl AppStateProcessor {
 
     /// Pre-fetch and cache all keys needed for a patch list.
     async fn prefetch_keys(&self, pl: &PatchList) -> Result<()> {
-        let key_ids = collect_key_ids_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
+        let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
         for key_id in key_ids {
             // This will fetch and cache if not already cached
-            let _ = self.get_app_state_key(&key_id).await;
+            let _ = self.get_app_state_key(key_id).await;
         }
         Ok(())
     }
@@ -546,11 +546,11 @@ impl AppStateProcessor {
     }
 
     pub async fn get_missing_key_ids(&self, pl: &PatchList) -> Result<Vec<Vec<u8>>> {
-        let key_ids = collect_key_ids_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
+        let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
         let mut missing = Vec::with_capacity(key_ids.len());
         for id in key_ids {
-            if self.backend.get_sync_key(&id).await?.is_none() {
-                missing.push(id);
+            if self.backend.get_sync_key(id).await?.is_none() {
+                missing.push(id.to_vec());
             }
         }
         Ok(missing)

@@ -105,37 +105,40 @@ pub fn collect_key_ids_from_patch_list(
     snapshot: Option<&wa::SyncdSnapshot>,
     patches: &[wa::SyncdPatch],
 ) -> Vec<Vec<u8>> {
-    use std::collections::HashSet;
+    collect_key_id_refs_from_patch_list(snapshot, patches)
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect()
+}
 
-    let mut seen = HashSet::new();
+/// Borrowing variant for callers that only need to look up keys immediately.
+pub fn collect_key_id_refs_from_patch_list<'a>(
+    snapshot: Option<&'a wa::SyncdSnapshot>,
+    patches: &'a [wa::SyncdPatch],
+) -> Vec<&'a [u8]> {
+    fn push_unique<'a>(key_ids: &mut Vec<&'a [u8]>, key_id: Option<&'a Vec<u8>>) {
+        if let Some(k) = key_id {
+            let k = k.as_slice();
+            if !key_ids.contains(&k) {
+                key_ids.push(k);
+            }
+        }
+    }
+
     let mut key_ids = Vec::new();
 
-    let mut check = |key_id: Option<&Vec<u8>>| {
-        if let Some(k) = key_id
-            && !seen.contains(k.as_slice())
-        {
-            // Unique key ID: two owned buffers are allocated via k.clone() and
-            // owned.clone() — one stored in `seen` for future dedup checks, one
-            // pushed to `key_ids` as the result. Duplicate key IDs are skipped
-            // by the seen.contains() check above, avoiding any allocation.
-            let owned = k.clone();
-            seen.insert(owned.clone());
-            key_ids.push(owned);
-        }
-    };
-
     if let Some(snapshot) = snapshot {
-        check(snapshot.key_id.id.as_ref());
+        push_unique(&mut key_ids, snapshot.key_id.id.as_ref());
         for rec in &snapshot.records {
-            check(rec.key_id.id.as_ref());
+            push_unique(&mut key_ids, rec.key_id.id.as_ref());
         }
     }
 
     for patch in patches {
-        check(patch.key_id.id.as_ref());
+        push_unique(&mut key_ids, patch.key_id.id.as_ref());
         for mutation in &patch.mutations {
             if mutation.record.is_set() {
-                check(mutation.record.key_id.id.as_ref());
+                push_unique(&mut key_ids, mutation.record.key_id.id.as_ref());
             }
         }
     }

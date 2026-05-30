@@ -1074,177 +1074,182 @@ impl Client {
 
         let unavailable_node = nr.get_optional_child("unavailable");
 
-        let mut all_enc_nodes: Vec<&NodeRef<'_>> = Vec::with_capacity(4);
-
-        let direct_enc_nodes = nr.get_children_by_tag("enc");
-        all_enc_nodes.extend(direct_enc_nodes);
-
-        let participants = nr.get_optional_child_by_tag(&["participants"]);
-        if let Some(participants_node) = participants {
-            let own_jid = self.get_pn().await;
-            let to_nodes = participants_node.get_children_by_tag("to");
-            for to_node in to_nodes {
-                let to_jid = match to_node.attrs().optional_jid("jid") {
-                    Some(jid) => jid,
-                    None => continue,
-                };
-                if own_jid.as_ref().is_some_and(|ours| *ours == to_jid) {
-                    let enc_children = to_node.get_children_by_tag("enc");
-                    all_enc_nodes.extend(enc_children);
-                }
-            }
-        }
-
-        if all_enc_nodes.is_empty() && unavailable_node.is_none() {
-            log::warn!(
-                "[msg:{}] Received non-newsletter message without <enc> child: {}",
-                info.id,
-                nr.tag
-            );
-            return None;
-        }
-
-        if let Some(unavailable) = unavailable_node
-            && all_enc_nodes.is_empty()
-        {
-            let unavailable_type = match unavailable.get_attr("type").map(|v| v.as_str()).as_deref()
-            {
-                Some("view_once") => crate::types::events::UnavailableType::ViewOnce,
-                _ => crate::types::events::UnavailableType::Unknown,
-            };
-            log::info!(
-                "[msg:{}] Message has <unavailable> child (type: {:?}), requesting from phone via PDO",
-                info.id,
-                unavailable_type
-            );
-            // PDO is the only recovery here (no retry receipt), so run it before
-            // the transport ack in one flush task: the ack must not clear the
-            // offline queue before the PDO request goes out. status is acked by
-            // the should_ack gate. Mirrors whatsmeow's request-then-ack.
-            self.dispatch_undecryptable_event(
-                Arc::clone(&info),
-                true,
-                unavailable_type,
-                crate::types::events::DecryptFailMode::Show,
-            )
-            .await;
-            let client = Arc::clone(self);
-            let info2 = Arc::clone(&info);
-            let skip_ack = info.source.chat.is_status_broadcast();
-            self.outbound_flush.spawn(&*self.runtime, async move {
-                // Only ack once the PDO request is out (or skipped as ancient);
-                // a transient send failure leaves it queued for redelivery.
-                let pdo_sent = client.run_pdo_request(&info2).await;
-                if !skip_ack && pdo_sent {
-                    client.send_transport_ack(&info2).await;
-                }
-            });
-            return None;
-        }
-
-        let mut session_payloads = Vec::with_capacity(all_enc_nodes.len());
-        let mut group_payloads = Vec::with_capacity(all_enc_nodes.len());
-        let mut bot_payloads = Vec::with_capacity(all_enc_nodes.len());
+        let mut session_payloads = Vec::new();
+        let mut group_payloads = Vec::new();
+        let mut bot_payloads = Vec::new();
         let mut max_sender_retry_count: u8 = 0;
         let mut has_hide_fail = false;
         let mut had_unknown_enc = false;
         let mut had_custom_handler = false;
+        let mut has_enc_node = false;
+        let mut first_enc_is_sender_key = false;
 
-        for enc_node in &all_enc_nodes {
-            // Parse sender retry count (WA Web: e.maybeAttrInt("count") ?? 0)
-            // Clamp to MAX_DECRYPT_RETRIES to prevent u64→u8 truncation on unexpected values.
-            let sender_count = enc_node
-                .attrs()
-                .optional_u64("count")
-                .map(|c| c.min(MAX_DECRYPT_RETRIES as u64) as u8)
-                .unwrap_or(0);
-            max_sender_retry_count = max_sender_retry_count.max(sender_count);
+        macro_rules! classify_enc_node {
+            ($enc_node:expr) => {{
+                let enc_node = $enc_node;
+                if !has_enc_node {
+                    first_enc_is_sender_key = enc_node
+                        .get_attr("type")
+                        .map(|v| v.as_str())
+                        .is_some_and(|s| s == EncType::SenderKey.as_wire_str());
+                    has_enc_node = true;
+                }
 
-            // Parse decrypt-fail attribute (WA Web: e.maybeAttrString("decrypt-fail") === "hide")
-            if enc_node
-                .get_attr("decrypt-fail")
-                .map(|v| v.as_str())
-                .is_some_and(|s| s == "hide")
-            {
-                has_hide_fail = true;
-            }
+                // Parse sender retry count (WA Web: e.maybeAttrInt("count") ?? 0)
+                // Clamp to MAX_DECRYPT_RETRIES to prevent u64→u8 truncation on unexpected values.
+                let sender_count = enc_node
+                    .attrs()
+                    .optional_u64("count")
+                    .map(|c| c.min(MAX_DECRYPT_RETRIES as u64) as u8)
+                    .unwrap_or(0);
+                max_sender_retry_count = max_sender_retry_count.max(sender_count);
 
-            let enc_type = match enc_node.attrs().optional_string("type") {
-                Some(t) => t,
-                None => {
-                    log::warn!("Enc node missing 'type' attribute, skipping");
+                // Parse decrypt-fail attribute (WA Web: e.maybeAttrString("decrypt-fail") === "hide")
+                if enc_node
+                    .get_attr("decrypt-fail")
+                    .map(|v| v.as_str())
+                    .is_some_and(|s| s == "hide")
+                {
+                    has_hide_fail = true;
+                }
+
+                let enc_type = match enc_node.attrs().optional_string("type") {
+                    Some(t) => t,
+                    None => {
+                        log::warn!("Enc node missing 'type' attribute, skipping");
+                        had_unknown_enc = true;
+                        continue;
+                    }
+                };
+
+                if let Some(handler) = self
+                    .custom_enc_handlers
+                    .read()
+                    .await
+                    .get(enc_type.as_ref())
+                    .cloned()
+                {
+                    let handler_clone = handler;
+                    let client_clone = self.clone();
+                    let info_arc = Arc::clone(&info);
+                    // Custom enc handlers take &Node (public API); convert from NodeRef here.
+                    let enc_node_owned = (*enc_node).to_owned();
+
+                    self.runtime
+                        .spawn(Box::pin(async move {
+                            if let Err(e) = handler_clone
+                                .handle(client_clone, &enc_node_owned, &info_arc)
+                                .await
+                            {
+                                log::warn!("Custom enc handler failed: {e:?}");
+                            }
+                        }))
+                        .detach();
+                    had_custom_handler = true;
+                    continue;
+                }
+
+                // `had_unknown_enc` means "produced no usable payload": either the
+                // type is unrecognized or it's known but the body is empty.
+                // Either way the stanza needs the fallback ack or the server replays.
+                if EncType::from_wire(enc_type.as_ref()).is_none() {
+                    log::warn!("Enc node has unknown type: {enc_type}");
                     had_unknown_enc = true;
                     continue;
                 }
-            };
 
-            if let Some(handler) = self
-                .custom_enc_handlers
-                .read()
-                .await
-                .get(enc_type.as_ref())
-                .cloned()
-            {
-                let handler_clone = handler;
-                let client_clone = self.clone();
-                let info_arc = Arc::clone(&info);
-                // Custom enc handlers take &Node (public API); convert from NodeRef here.
-                let enc_node_owned = (*enc_node).to_owned();
-                let enc_type_owned = enc_type.to_string();
+                let payload = match EncPayload::from_owned_node(node, enc_node) {
+                    Some(p) => p,
+                    None => {
+                        log::warn!("Enc node {enc_type} has no content");
+                        had_unknown_enc = true;
+                        continue;
+                    }
+                };
 
-                self.runtime
-                    .spawn(Box::pin(async move {
-                        if let Err(e) = handler_clone
-                            .handle(client_clone, &enc_node_owned, &info_arc)
-                            .await
-                        {
-                            log::warn!(
-                                "Custom handler for enc type '{}' failed: {e:?}",
-                                enc_type_owned
-                            );
-                        }
-                    }))
-                    .detach();
-                had_custom_handler = true;
-                continue;
-            }
+                if payload.enc_type.is_bot_secret() {
+                    bot_payloads.push(payload);
+                } else if payload.enc_type.is_session() {
+                    session_payloads.push(payload);
+                } else {
+                    group_payloads.push(payload);
+                }
+            }};
+        }
 
-            // `had_unknown_enc` means "produced no usable payload": either the
-            // type is unrecognized or it's known but the body is empty.
-            // Either way the stanza needs the fallback ack or the server replays.
-            if EncType::from_wire(enc_type.as_ref()).is_none() {
-                log::warn!("Enc node has unknown type: {enc_type}");
-                had_unknown_enc = true;
-                continue;
-            }
+        for enc_node in nr.get_children_by_tag("enc") {
+            classify_enc_node!(enc_node);
+        }
 
-            let payload = match EncPayload::from_owned_node(node, enc_node) {
-                Some(p) => p,
-                None => {
-                    log::warn!("Enc node {enc_type} has no content");
-                    had_unknown_enc = true;
+        let participants = nr.get_optional_child_by_tag(&["participants"]);
+        let own_jid_for_participants = if participants.is_some() {
+            self.get_pn().await
+        } else {
+            None
+        };
+        if let Some(participants_node) = participants {
+            for to_node in participants_node.get_children_by_tag("to") {
+                let Some(to_jid) = to_node.attrs().optional_jid("jid") else {
+                    continue;
+                };
+                if !own_jid_for_participants
+                    .as_ref()
+                    .is_some_and(|ours| *ours == to_jid)
+                {
                     continue;
                 }
-            };
-
-            if payload.enc_type.is_bot_secret() {
-                bot_payloads.push(payload);
-            } else if payload.enc_type.is_session() {
-                session_payloads.push(payload);
-            } else {
-                group_payloads.push(payload);
+                for enc_node in to_node.get_children_by_tag("enc") {
+                    classify_enc_node!(enc_node);
+                }
             }
         }
 
+        if !has_enc_node {
+            if let Some(unavailable) = unavailable_node {
+                let unavailable_type =
+                    match unavailable.get_attr("type").map(|v| v.as_str()).as_deref() {
+                        Some("view_once") => crate::types::events::UnavailableType::ViewOnce,
+                        _ => crate::types::events::UnavailableType::Unknown,
+                    };
+                log::info!(
+                    "[msg:{}] Message has <unavailable> child (type: {:?}), requesting from phone via PDO",
+                    info.id,
+                    unavailable_type
+                );
+                // PDO is the only recovery here (no retry receipt), so run it before
+                // the transport ack in one flush task: the ack must not clear the
+                // offline queue before the PDO request goes out. status is acked by
+                // the should_ack gate. Mirrors whatsmeow's request-then-ack.
+                self.dispatch_undecryptable_event(
+                    Arc::clone(&info),
+                    true,
+                    unavailable_type,
+                    crate::types::events::DecryptFailMode::Show,
+                )
+                .await;
+                let client = Arc::clone(self);
+                let info2 = Arc::clone(&info);
+                let skip_ack = info.source.chat.is_status_broadcast();
+                self.outbound_flush.spawn(&*self.runtime, async move {
+                    // Only ack once the PDO request is out (or skipped as ancient);
+                    // a transient send failure leaves it queued for redelivery.
+                    let pdo_sent = client.run_pdo_request(&info2).await;
+                    if !skip_ack && pdo_sent {
+                        client.send_transport_ack(&info2).await;
+                    }
+                });
+            } else {
+                log::warn!(
+                    "[msg:{}] Received non-newsletter message without <enc> child: {}",
+                    info.id,
+                    nr.tag
+                );
+            }
+            return None;
+        }
+
         // WA Web diagnostic: validate skmsg is not first in multi-enc messages.
-        if !session_payloads.is_empty()
-            && !group_payloads.is_empty()
-            && all_enc_nodes.first().is_some_and(|n| {
-                n.get_attr("type")
-                    .map(|v| v.as_str())
-                    .is_some_and(|s| s == EncType::SenderKey.as_wire_str())
-            })
-        {
+        if !session_payloads.is_empty() && !group_payloads.is_empty() && first_enc_is_sender_key {
             log::error!(
                 "[msg:{}] Protocol violation: skmsg is first in multi-enc message from {}. \
                  Expected pkmsg/msg first (containing SKDM).",
@@ -2614,15 +2619,17 @@ impl Client {
         sender_jid: &Jid,
         axolotl_bytes: &[u8],
     ) {
+        use buffa::MessageView as _;
+
         let skdm = match SenderKeyDistributionMessage::try_from(axolotl_bytes) {
             Ok(msg) => msg,
-            Err(e1) => match wa::SenderKeyDistributionMessage::decode_from_slice(axolotl_bytes) {
+            Err(e1) => match wa::SenderKeyDistributionMessageView::decode_view(axolotl_bytes) {
                 Ok(go_msg) => {
                     let (Some(signing_key), Some(id), Some(iteration), Some(chain_key)) = (
-                        go_msg.signing_key.as_ref(),
+                        go_msg.signing_key,
                         go_msg.id,
                         go_msg.iteration,
-                        go_msg.chain_key.as_ref(),
+                        go_msg.chain_key,
                     ) else {
                         log::warn!(
                             "Go SKDM from {} missing required fields (signing_key={}, id={}, iteration={}, chain_key={})",
@@ -2634,7 +2641,7 @@ impl Client {
                         );
                         return;
                     };
-                    let chain_key_arr: [u8; 32] = match chain_key.as_slice().try_into() {
+                    let chain_key_arr: [u8; 32] = match chain_key.try_into() {
                         Ok(arr) => arr,
                         Err(_) => {
                             log::error!(
@@ -9660,6 +9667,39 @@ mod tests {
             .expect("mixed enc must produce a ClassifiedMessage");
         assert_eq!(classified.session_payloads.len(), 1);
         assert!(classified.group_payloads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn participant_enc_for_own_device_still_classifies() {
+        let (client, _transport) = capturing_client("participant_enc").await;
+        let node = NodeBuilder::new("message")
+            .attr("from", "120363000000000000@g.us")
+            .attr("participant", "5511777776666@s.whatsapp.net")
+            .attr("id", "PARTICIPANT_ENC_1")
+            .attr("type", "text")
+            .children([NodeBuilder::new("participants")
+                .children([NodeBuilder::new("to")
+                    .attr("jid", "5511000000001:0@s.whatsapp.net")
+                    .children([NodeBuilder::new("enc")
+                        .attr("type", "pkmsg")
+                        .bytes(vec![7u8; 8])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+        let owned = node_to_arc(node);
+        let classified = client
+            .classify_incoming_message(&owned)
+            .await
+            .expect("own participant enc should classify");
+
+        assert_eq!(classified.session_payloads.len(), 1);
+        assert_eq!(
+            classified.session_payloads[0].ciphertext.as_ref(),
+            &[7u8; 8]
+        );
+        assert!(classified.group_payloads.is_empty());
+        assert!(classified.bot_payloads.is_empty());
     }
 
     /// A custom handler owns its ack; the fallback must not double-ack.
