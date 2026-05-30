@@ -19,6 +19,7 @@ serde = { workspace = true }
 
 [build-dependencies]
 buffa-build = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

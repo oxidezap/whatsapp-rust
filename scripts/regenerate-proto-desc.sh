@@ -12,6 +12,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 proto="$repo_root/waproto/src/whatsapp.proto"
 desc="$repo_root/waproto/src/whatsapp.desc"
+hash="$repo_root/waproto/src/whatsapp.desc.sha256"
 includes="$repo_root/waproto/src"
 
 if ! command -v protoc >/dev/null 2>&1; then
@@ -26,5 +27,12 @@ protoc \
   -I"$includes" \
   "$proto"
 
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum "$proto" | awk '{print $1}' > "$hash"
+else
+  shasum -a 256 "$proto" | awk '{print $1}' > "$hash"
+fi
+
 echo "regenerated: $desc"
-echo "commit both waproto/src/whatsapp.proto and waproto/src/whatsapp.desc"
+echo "regenerated: $hash"
+echo "commit waproto/src/whatsapp.proto, waproto/src/whatsapp.desc, and waproto/src/whatsapp.desc.sha256"

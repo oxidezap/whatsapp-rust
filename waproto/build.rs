@@ -12,21 +12,11 @@ fn main() -> std::io::Result<()> {
     // Rerun on desc change (new codegen) and proto change (so the staleness
     // guard below runs). `build.rs` itself too.
     println!("cargo:rerun-if-changed=src/whatsapp.desc");
+    println!("cargo:rerun-if-changed=src/whatsapp.desc.sha256");
     println!("cargo:rerun-if-changed=src/whatsapp.proto");
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Fail the build if whatsapp.proto has been edited without refreshing
-    // whatsapp.desc — catching the "forgot to run the regen script" footgun
-    // at compile time instead of shipping a stale descriptor.
-    let proto_mtime = std::fs::metadata("src/whatsapp.proto")?.modified()?;
-    let desc_mtime = std::fs::metadata("src/whatsapp.desc")?.modified()?;
-    if proto_mtime > desc_mtime {
-        return Err(std::io::Error::other(
-            "waproto: src/whatsapp.proto is newer than src/whatsapp.desc. \
-             Run `scripts/regenerate-proto-desc.sh` to refresh the descriptor \
-             and commit both files.",
-        ));
-    }
+    ensure_proto_descriptor_hash()?;
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by cargo");
     let out_path = std::path::PathBuf::from(&out_dir);
@@ -115,4 +105,36 @@ fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+fn ensure_proto_descriptor_hash() -> std::io::Result<()> {
+    let proto = std::fs::read("src/whatsapp.proto")?;
+    let expected = std::fs::read_to_string("src/whatsapp.desc.sha256")?;
+    let expected = expected.split_whitespace().next().unwrap_or_default();
+    let actual = sha256_hex(&proto);
+
+    if actual != expected {
+        return Err(std::io::Error::other(format!(
+            "waproto: src/whatsapp.proto does not match src/whatsapp.desc.sha256. \
+             Run `scripts/regenerate-proto-desc.sh` to refresh the descriptor \
+             and commit src/whatsapp.proto, src/whatsapp.desc, and \
+             src/whatsapp.desc.sha256. expected {expected}, got {actual}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
