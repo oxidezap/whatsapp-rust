@@ -1652,7 +1652,7 @@ impl Client {
                         .clone()
                         .handle_decrypted_plaintext(
                             enc_type,
-                            &padded_plaintext,
+                            padded_plaintext,
                             padding_version,
                             info,
                         )
@@ -1750,7 +1750,7 @@ impl Client {
                                     .clone()
                                     .handle_decrypted_plaintext(
                                         enc_type,
-                                        &padded_plaintext,
+                                        padded_plaintext,
                                         padding_version,
                                         info,
                                     )
@@ -2109,7 +2109,7 @@ impl Client {
                         .clone()
                         .handle_decrypted_plaintext(
                             "skmsg",
-                            &padded_plaintext,
+                            padded_plaintext,
                             padding_version,
                             info,
                         )
@@ -2228,33 +2228,12 @@ impl Client {
     async fn handle_decrypted_plaintext(
         self: Arc<Self>,
         enc_type: &str,
-        padded_plaintext: &[u8],
+        padded_plaintext: Vec<u8>,
         padding_version: u8,
         info: &Arc<MessageInfo>,
     ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
-        if let Some(skdm_only) = wacore::messages::sender_key_distribution_only_plaintext(
-            padded_plaintext,
-            padding_version,
-        )? {
-            log::debug!(
-                "[msg:{}] Skipping owned decode/event dispatch for sender key distribution message",
-                info.id
-            );
-            if let Some(axolotl_bytes) = skdm_only.axolotl_sender_key_distribution_message {
-                self.handle_sender_key_distribution_message(
-                    &info.source.chat,
-                    &info.source.sender,
-                    axolotl_bytes,
-                )
-                .await;
-            }
-            return Ok(PlaintextHandleOutcome {
-                skdm_only: true,
-                ..Default::default()
-            });
-        }
-
-        let original_msg = wacore::messages::decode_plaintext(padded_plaintext, padding_version)?;
+        let original_msg_view =
+            wacore::messages::decode_plaintext_owned_view(padded_plaintext, padding_version)?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
             info.id,
@@ -2262,9 +2241,44 @@ impl Client {
             enc_type
         );
 
+        let msg_view = original_msg_view.view();
+        let has_top_level_skdm = msg_view.sender_key_distribution_message.is_set()
+            || msg_view
+                .fast_ratchet_key_sender_key_distribution_message
+                .is_set();
+        let processed_top_level_skdm = if let Some(skdm) =
+            msg_view.sender_key_distribution_message.as_option()
+            && let Some(axolotl_bytes) = skdm.axolotl_sender_key_distribution_message
+        {
+            self.handle_sender_key_distribution_message(
+                &info.source.chat,
+                &info.source.sender,
+                axolotl_bytes,
+            )
+            .await;
+            true
+        } else {
+            false
+        };
+
+        if has_top_level_skdm
+            && wacore::messages::has_only_sender_key_distribution_top_level_fields(
+                original_msg_view.bytes().as_ref(),
+            )?
+        {
+            log::debug!(
+                "[msg:{}] Skipping owned decode/event dispatch for sender key distribution message",
+                info.id
+            );
+            return Ok(PlaintextHandleOutcome {
+                skdm_only: true,
+                ..Default::default()
+            });
+        }
+
         // Validate DSM presence against sender identity
         // (WAWebHandleMsgError.DeviceSentMessageError)
-        if original_msg.device_sent_message.is_set() && !info.source.is_from_me {
+        if msg_view.device_sent_message.is_set() && !info.source.is_from_me {
             warn!(
                 "[msg:{}] DeviceSentMessage present but sender {} is not self",
                 info.id, info.source.sender,
@@ -2275,10 +2289,12 @@ impl Client {
         // the primary device). The actual content (reactions, text, etc.)
         // is nested inside device_sent_message.message and must be
         // extracted before protocol checks or dispatch.
+        let original_msg = original_msg_view.to_owned_message();
         let mut msg = wacore::messages::unwrap_device_sent(original_msg);
 
         // Post-decryption logic (SKDM, sync keys, etc.)
-        if let Some(skdm) = msg.sender_key_distribution_message.as_option()
+        if !processed_top_level_skdm
+            && let Some(skdm) = msg.sender_key_distribution_message.as_option()
             && let Some(axolotl_bytes) = &skdm.axolotl_sender_key_distribution_message
         {
             self.handle_sender_key_distribution_message(
@@ -2428,7 +2444,7 @@ impl Client {
                 );
                 match self
                     .clone()
-                    .handle_decrypted_plaintext(enc_type, &padded_plaintext, padding_version, info)
+                    .handle_decrypted_plaintext(enc_type, padded_plaintext, padding_version, info)
                     .await
                 {
                     Ok(plaintext_outcome) => MigrationDecryptOutcome {
@@ -9758,7 +9774,7 @@ mod tests {
         info.source.is_from_me = false;
         client
             .clone()
-            .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+            .handle_decrypted_plaintext("msg", padded.clone(), 2, &Arc::new(info))
             .await
             .unwrap();
         assert!(
@@ -9775,7 +9791,7 @@ mod tests {
         info.source.is_from_me = true;
         client
             .clone()
-            .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+            .handle_decrypted_plaintext("msg", padded, 2, &Arc::new(info))
             .await
             .unwrap();
         assert!(

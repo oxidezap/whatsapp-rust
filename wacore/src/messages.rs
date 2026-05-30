@@ -51,9 +51,9 @@ impl MessageUtils {
         ))
     }
 
-    pub fn unpad_message_ref(plaintext: &[u8], version: u8) -> Result<&[u8]> {
+    pub fn unpadded_message_len(plaintext: &[u8], version: u8) -> Result<usize> {
         if version == 3 {
-            return Ok(plaintext);
+            return Ok(plaintext.len());
         }
         if plaintext.is_empty() {
             return Err(anyhow::anyhow!("plaintext is empty, cannot unpad"));
@@ -68,7 +68,12 @@ impl MessageUtils {
                 return Err(anyhow::anyhow!("invalid padding bytes"));
             }
         }
-        Ok(data)
+        Ok(data.len())
+    }
+
+    pub fn unpad_message_ref(plaintext: &[u8], version: u8) -> Result<&[u8]> {
+        let unpadded_len = Self::unpadded_message_len(plaintext, version)?;
+        Ok(&plaintext[..unpadded_len])
     }
 }
 
@@ -90,6 +95,17 @@ pub fn decode_plaintext_view(
 ) -> Result<wa::MessageView<'_>> {
     let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
     wa::MessageView::decode_view(plaintext_slice)
+        .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
+}
+
+/// Decode a plaintext buffer into a self-contained Buffa view.
+pub fn decode_plaintext_owned_view(
+    padded_plaintext: Vec<u8>,
+    padding_version: u8,
+) -> Result<wa::MessageOwnedView> {
+    let unpadded_len = MessageUtils::unpadded_message_len(&padded_plaintext, padding_version)?;
+    let plaintext = buffa::bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len);
+    wa::MessageOwnedView::decode(plaintext)
         .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
 }
 
@@ -120,7 +136,7 @@ pub fn sender_key_distribution_only_plaintext(
     }))
 }
 
-fn has_only_sender_key_distribution_top_level_fields(
+pub fn has_only_sender_key_distribution_top_level_fields(
     encoded: &[u8],
 ) -> Result<bool, buffa::DecodeError> {
     let mut cur = encoded;
@@ -440,6 +456,22 @@ mod plaintext_view_tests {
         let view = decode_plaintext_view(&padded, 2).expect("view decode should succeed");
 
         assert_eq!(view.conversation, Some("hello"));
+    }
+
+    #[test]
+    fn decode_plaintext_owned_view_keeps_unpadded_bytes() {
+        let msg = wa::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        let padded = padded(&msg);
+        let padded_len = padded.len();
+
+        let view =
+            decode_plaintext_owned_view(padded, 2).expect("owned view decode should succeed");
+
+        assert_eq!(view.conversation(), Some("hello"));
+        assert!(view.bytes().len() < padded_len);
     }
 
     #[test]
