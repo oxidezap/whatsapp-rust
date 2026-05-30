@@ -96,6 +96,28 @@ struct PlaintextHandleOutcome {
     skdm_only: bool,
 }
 
+fn should_process_skmsg_after_session(
+    session_payloads_empty: bool,
+    session_outcome: SessionBatchOutcome,
+) -> bool {
+    session_payloads_empty
+        || (!session_outcome.had_failure
+            && (session_outcome.decrypted || session_outcome.duplicate))
+}
+
+fn should_ack_skdm_only_session_fallback(
+    session_outcome: SessionBatchOutcome,
+    bot_payloads_empty: bool,
+) -> bool {
+    session_outcome.decrypted
+        && session_outcome.skdm_only
+        && !session_outcome.dispatched
+        && !session_outcome.had_failure
+        && !session_outcome.plaintext_failed
+        && !session_outcome.undecryptable
+        && bot_payloads_empty
+}
+
 /// Retry count threshold for logging high retry warnings.
 /// WhatsApp Web logs metrics when retry count exceeds this value.
 const HIGH_RETRY_COUNT_THRESHOLD: u8 = 3;
@@ -1137,10 +1159,6 @@ impl Client {
         let session_decrypted_successfully = session_outcome.decrypted;
         let session_had_duplicates = session_outcome.duplicate;
         let session_dispatched_undecryptable = session_outcome.undecryptable;
-        let session_dispatched = session_outcome.dispatched;
-        let session_skdm_only = session_outcome.skdm_only;
-        let session_plaintext_failed = session_outcome.plaintext_failed;
-        let session_had_failure = session_outcome.had_failure;
 
         log::debug!(
             "Starting PASS 2: Processing {} group content messages (skmsg)",
@@ -1157,9 +1175,8 @@ impl Client {
         // to avoid unnecessary retry receipts. The retry for the pkmsg will cause the sender
         // to resend the entire message including SKDM.
         if !group_payloads.is_empty() {
-            let should_process_skmsg = session_payloads.is_empty()
-                || (!session_had_failure
-                    && (session_decrypted_successfully || session_had_duplicates));
+            let should_process_skmsg =
+                should_process_skmsg_after_session(session_payloads.is_empty(), session_outcome);
 
             if should_process_skmsg {
                 match self
@@ -1255,14 +1272,7 @@ impl Client {
             // (a status SKDM pkmsg can reach here), so skip it to avoid a
             // redundant receipt.
             self.ack_received_message(&info);
-        } else if session_decrypted_successfully
-            && session_skdm_only
-            && !session_dispatched
-            && !session_had_failure
-            && !session_plaintext_failed
-            && !session_dispatched_undecryptable
-            && bot_payloads.is_empty()
-        {
+        } else if should_ack_skdm_only_session_fallback(session_outcome, bot_payloads.is_empty()) {
             // SKDM-only session decrypts skip dispatch, so this stanza would
             // otherwise stay queued. WA Web and whatsmeow ack every decrypted
             // message; the ack shape still comes from the message source.
@@ -1480,6 +1490,7 @@ impl Client {
                         // Device::is_trusted_identity reads from backend, not cache.
                         if let Err(e) = self.flush_signal_cache().await {
                             log::warn!("Failed to flush identity deletion for {}: {e:?}", address);
+                            outcome.had_failure = true;
                             continue;
                         }
                         log::info!(
@@ -3390,6 +3401,7 @@ mod tests {
         );
         assert!(outcome.plaintext_failed);
         assert!(outcome.undecryptable);
+        assert!(outcome.had_failure);
         assert!(!outcome.dispatched);
         assert!(!outcome.skdm_only);
 
@@ -6316,9 +6328,15 @@ mod tests {
         for (jid_str, session_empty, session_success, session_dupe, session_failed, expected) in
             test_cases
         {
-            // Recreate the should_process_skmsg logic from handle_incoming_message
-            let should_process_skmsg =
-                session_empty || (!session_failed && (session_success || session_dupe));
+            let should_process_skmsg = should_process_skmsg_after_session(
+                session_empty,
+                SessionBatchOutcome {
+                    decrypted: session_success,
+                    duplicate: session_dupe,
+                    had_failure: session_failed,
+                    ..Default::default()
+                },
+            );
 
             assert_eq!(
                 should_process_skmsg,
@@ -6332,6 +6350,90 @@ mod tests {
                 session_failed,
                 expected,
                 should_process_skmsg
+            );
+        }
+    }
+
+    #[test]
+    fn skdm_only_fallback_ack_decision_requires_clean_session_batch() {
+        let clean_skdm = SessionBatchOutcome {
+            decrypted: true,
+            skdm_only: true,
+            ..Default::default()
+        };
+        assert!(
+            should_ack_skdm_only_session_fallback(clean_skdm, true),
+            "a clean SKDM-only session batch needs the fallback ack"
+        );
+
+        let cases = [
+            (
+                SessionBatchOutcome {
+                    dispatched: true,
+                    ..clean_skdm
+                },
+                true,
+                "content dispatch already acked",
+            ),
+            (
+                SessionBatchOutcome {
+                    had_failure: true,
+                    ..clean_skdm
+                },
+                true,
+                "local session failure must block positive ack",
+            ),
+            (
+                SessionBatchOutcome {
+                    plaintext_failed: true,
+                    had_failure: true,
+                    ..clean_skdm
+                },
+                true,
+                "plaintext handler failure is not SKDM-only success",
+            ),
+            (
+                SessionBatchOutcome {
+                    undecryptable: true,
+                    had_failure: true,
+                    ..clean_skdm
+                },
+                true,
+                "failure event must not be paired with positive ack",
+            ),
+            (
+                SessionBatchOutcome {
+                    decrypted: false,
+                    ..clean_skdm
+                },
+                true,
+                "fallback only applies after Signal decrypt success",
+            ),
+            (
+                SessionBatchOutcome {
+                    skdm_only: false,
+                    ..clean_skdm
+                },
+                true,
+                "regular content must ack via dispatch",
+            ),
+            (
+                SessionBatchOutcome {
+                    duplicate: true,
+                    decrypted: false,
+                    skdm_only: false,
+                    ..Default::default()
+                },
+                true,
+                "duplicates use the duplicate branch",
+            ),
+            (clean_skdm, false, "msmsg work must own its response"),
+        ];
+
+        for (outcome, bot_payloads_empty, reason) in cases {
+            assert!(
+                !should_ack_skdm_only_session_fallback(outcome, bot_payloads_empty),
+                "{reason}: {outcome:?}"
             );
         }
     }
@@ -7549,6 +7651,7 @@ mod tests {
         assert!(!outcome.decrypted);
         assert!(!outcome.duplicate);
         assert!(outcome.undecryptable);
+        assert!(outcome.had_failure);
 
         // spawn_nack is detached; give it a tick to flush through the
         // noise_socket sender_task to our CapturingMockTransport.
@@ -7589,6 +7692,7 @@ mod tests {
             .await;
 
         assert!(outcome.undecryptable);
+        assert!(outcome.had_failure);
 
         for _ in 0..40 {
             if !transport.sent().is_empty() {
