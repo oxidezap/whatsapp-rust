@@ -99,19 +99,49 @@ pub enum RetentionClass {
     Bot,
 }
 
-/// Classify a message for retention. Bot-chat secrets always take the bot
-/// horizon; otherwise poll/event parents get the longer horizon and everything
-/// else is text. Unwraps device-sent/ephemeral/etc. wrappers first.
-pub fn classify(msg: &wa::Message, is_bot_chat: bool) -> RetentionClass {
-    if is_bot_chat {
-        return RetentionClass::Bot;
-    }
+/// Whether `msg` belongs to a bot context for retention: the chat is a bot, or
+/// the message invokes a bot (top-level botMetadata or a bot mention). A group
+/// message that invokes a bot is a bot context even though the chat is a group,
+/// so its secret is kept under `BotOnly` and the later bot reply can decrypt.
+pub fn is_bot_context(chat_is_bot: bool, msg: &wa::Message) -> bool {
+    chat_is_bot || invokes_bot(msg)
+}
+
+fn invokes_bot(msg: &wa::Message) -> bool {
+    let has_bot_metadata = |m: &wa::Message| {
+        m.message_context_info
+            .as_ref()
+            .is_some_and(|c| c.bot_metadata.is_some())
+    };
+    // botMetadata sits on the top-level MessageContextInfo even when wrapped.
+    has_bot_metadata(msg) || has_bot_metadata(msg.get_base_message()) || msg.mentions_any_bot()
+}
+
+fn message_is_poll_or_event(msg: &wa::Message) -> bool {
     let base = msg.get_base_message();
-    if base.poll_creation_message.is_some()
+    base.poll_creation_message.is_some()
         || base.poll_creation_message_v2.is_some()
         || base.poll_creation_message_v3.is_some()
         || base.event_message.is_some()
-    {
+}
+
+/// Classify a message for retention. Bot context wins (bot horizon), then
+/// poll/event (longer horizon), else text. Unwraps device-sent/ephemeral/etc.
+/// wrappers first.
+pub fn classify(msg: &wa::Message, chat_is_bot: bool) -> RetentionClass {
+    classify_from_flags(
+        is_bot_context(chat_is_bot, msg),
+        message_is_poll_or_event(msg),
+    )
+}
+
+/// Classify from precomputed flags. Used where only flags are available — the
+/// history-sync seed has no full `wa::Message` in hand. Keeps the single
+/// three-way rule in one place so the seed and live paths cannot drift.
+pub fn classify_from_flags(bot_context: bool, poll_or_event: bool) -> RetentionClass {
+    if bot_context {
+        RetentionClass::Bot
+    } else if poll_or_event {
         RetentionClass::PollEvent
     } else {
         RetentionClass::Text
@@ -269,6 +299,35 @@ mod tests {
         ));
         // Unknown age is conservatively kept.
         assert!(within_seed_horizon(&r, RetentionClass::Text, None, now));
+    }
+
+    #[test]
+    fn classify_from_flags_precedence() {
+        assert_eq!(classify_from_flags(true, true), RetentionClass::Bot);
+        assert_eq!(classify_from_flags(true, false), RetentionClass::Bot);
+        assert_eq!(classify_from_flags(false, true), RetentionClass::PollEvent);
+        assert_eq!(classify_from_flags(false, false), RetentionClass::Text);
+    }
+
+    #[test]
+    fn is_bot_context_detects_chat_and_invocation() {
+        // Chat is a bot.
+        assert!(is_bot_context(true, &wa::Message::default()));
+        // bot_metadata on a non-bot (e.g. group) chat is still a bot context.
+        let prompt = wa::Message {
+            message_context_info: Some(wa::MessageContextInfo {
+                bot_metadata: Some(wa::BotMetadata::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(is_bot_context(false, &prompt));
+        // A plain message in a non-bot chat is not a bot context.
+        let plain = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        assert!(!is_bot_context(false, &plain));
     }
 
     #[test]

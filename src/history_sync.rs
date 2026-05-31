@@ -272,15 +272,12 @@ impl Client {
             let Ok(chat) = record.chat_id.parse::<Jid>() else {
                 continue;
             };
-            let class = if chat.is_bot() {
-                RetentionClass::Bot
-            } else if record.is_poll_or_event {
-                RetentionClass::PollEvent
-            } else {
-                RetentionClass::Text
-            };
-            // BotOnly restores pre-#665: seed only bot-context secrets.
-            if policy.bot_only() && !chat.is_bot() {
+            // Same three-way rule as the live path; the seed only has flags in
+            // hand (no full message), so a group bot prompt in history can't be
+            // detected here and falls to its poll/event-or-text class.
+            let class = msg_secret::classify_from_flags(chat.is_bot(), record.is_poll_or_event);
+            // BotOnly seeds only bot-context secrets.
+            if policy.bot_only() && class != RetentionClass::Bot {
                 continue;
             }
             // Drop secrets whose parent is already past its retention horizon:

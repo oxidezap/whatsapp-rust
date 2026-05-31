@@ -1411,7 +1411,7 @@ impl Client {
                 None => self.dm_sender_identity_for(&tc_issue_target).await,
             };
             if let Some(sender) = sender {
-                let is_bot_chat = tc_issue_target.server == wacore_binary::Server::Bot;
+                let is_bot_chat = tc_issue_target.is_bot();
                 let class = wacore::msg_secret::classify(message, is_bot_chat);
                 self.persist_outbound_msg_secret(
                     &tc_issue_target,
@@ -1487,7 +1487,9 @@ impl Client {
         if !policy.persists() {
             return;
         }
-        if policy.bot_only() && chat.server != wacore_binary::Server::Bot {
+        // BotOnly keeps only bot-context secrets; a group message that invokes a
+        // bot classifies as Bot, so its reply can still be decrypted.
+        if policy.bot_only() && class != wacore::msg_secret::RetentionClass::Bot {
             return;
         }
         // Outbound secrets are minted "now", so the event time is the current
