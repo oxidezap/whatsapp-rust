@@ -168,6 +168,7 @@ diesel::table! {
         device_id -> Integer,
         created_at -> BigInt,
         expires_at -> BigInt,
+        message_ts -> BigInt,
     }
 }
 

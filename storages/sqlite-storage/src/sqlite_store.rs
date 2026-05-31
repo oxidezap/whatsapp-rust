@@ -2528,6 +2528,7 @@ impl MsgSecretStore for SqliteStore {
                             msg_secrets::device_id.eq(device_id),
                             msg_secrets::created_at.eq(now),
                             msg_secrets::expires_at.eq(entry.expires_at),
+                            msg_secrets::message_ts.eq(entry.message_ts),
                         )
                     })
                     .collect();
@@ -2559,6 +2560,13 @@ impl MsgSecretStore for SqliteStore {
                                      OR excluded.expires_at = 0 THEN 0 \
                                      ELSE MAX(msg_secrets.expires_at, excluded.expires_at) END",
                                 )),
+                                // Parent event time is immutable; keep the known
+                                // (non-zero / later) value across redeliveries.
+                                msg_secrets::message_ts.eq(diesel::dsl::sql::<
+                                    diesel::sql_types::BigInt,
+                                >(
+                                    "MAX(msg_secrets.message_ts, excluded.message_ts)",
+                                )),
                             ))
                             .execute(conn)?;
                     }
@@ -2586,6 +2594,36 @@ impl MsgSecretStore for SqliteStore {
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
             let row: Option<Vec<u8>> = msg_secrets::table
                 .select(msg_secrets::secret)
+                .filter(msg_secrets::chat.eq(&chat))
+                .filter(msg_secrets::sender.eq(&sender))
+                .filter(msg_secrets::msg_id.eq(&msg_id))
+                .filter(msg_secrets::device_id.eq(device_id))
+                .first(&mut conn)
+                .optional()
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(row)
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?
+    }
+
+    async fn get_msg_secret_with_ts(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<(Vec<u8>, i64)>> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let chat = chat.to_string();
+        let sender = sender.to_string();
+        let msg_id = msg_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<(Vec<u8>, i64)>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            let row: Option<(Vec<u8>, i64)> = msg_secrets::table
+                .select((msg_secrets::secret, msg_secrets::message_ts))
                 .filter(msg_secrets::chat.eq(&chat))
                 .filter(msg_secrets::sender.eq(&sender))
                 .filter(msg_secrets::msg_id.eq(&msg_id))
@@ -3299,6 +3337,7 @@ mod tests {
                     msg_id: "M1".into(),
                     secret: vec![1u8; 32],
                     expires_at: 0,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "c".into(),
@@ -3306,6 +3345,7 @@ mod tests {
                     msg_id: "M2".into(),
                     secret: vec![2u8; 32],
                     expires_at: 0,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "c".into(),
@@ -3313,6 +3353,7 @@ mod tests {
                     msg_id: "M1".into(),
                     secret: vec![9u8; 32],
                     expires_at: 0,
+                    message_ts: 0,
                 },
             ])
             .await
@@ -3341,6 +3382,7 @@ mod tests {
                     msg_id: "NEVER".into(),
                     secret: vec![1u8; 32],
                     expires_at: 0,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "c".into(),
@@ -3348,6 +3390,7 @@ mod tests {
                     msg_id: "FUTURE".into(),
                     secret: vec![2u8; 32],
                     expires_at: now + 86_400,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "c".into(),
@@ -3355,6 +3398,7 @@ mod tests {
                     msg_id: "PAST".into(),
                     secret: vec![3u8; 32],
                     expires_at: now - 86_400,
+                    message_ts: 0,
                 },
             ])
             .await
@@ -3404,6 +3448,7 @@ mod tests {
                 msg_id: "M".into(),
                 secret: vec![1u8; 32],
                 expires_at: now + 90 * 86_400,
+                message_ts: 0,
             }])
             .await
             .unwrap();
@@ -3414,6 +3459,7 @@ mod tests {
                 msg_id: "M".into(),
                 secret: vec![1u8; 32],
                 expires_at: now + 30 * 86_400,
+                message_ts: 0,
             }])
             .await
             .unwrap();
@@ -3434,6 +3480,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(removed, 0, "a 0 (never) deadline wins over any finite one");
+    }
+
+    #[tokio::test]
+    async fn get_msg_secret_with_ts_round_trips_and_keeps_parent_ts() {
+        let store = create_test_store().await;
+        let parent_ts = 1_700_000_000i64;
+        store
+            .put_msg_secrets(vec![MsgSecretEntry {
+                chat: "c".into(),
+                sender: "s".into(),
+                msg_id: "M".into(),
+                secret: vec![5u8; 32],
+                expires_at: 0,
+                message_ts: parent_ts,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_msg_secret_with_ts("c", "s", "M").await.unwrap(),
+            Some((vec![5u8; 32], parent_ts))
+        );
+
+        // A later write with an unknown ts (0) must not clobber the known one.
+        store
+            .put_msg_secret("c", "s", "M", &[5u8; 32])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_msg_secret_with_ts("c", "s", "M").await.unwrap(),
+            Some((vec![5u8; 32], parent_ts)),
+            "message_ts (immutable parent time) must survive a 0-ts redelivery"
+        );
+
+        // Absent row → None.
+        assert_eq!(
+            store
+                .get_msg_secret_with_ts("c", "s", "MISSING")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     /// Multi-account isolation: same DB, different device_id rows must not

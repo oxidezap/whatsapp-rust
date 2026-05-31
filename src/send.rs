@@ -1492,14 +1492,15 @@ impl Client {
         if policy.bot_only() && class != wacore::msg_secret::RetentionClass::Bot {
             return;
         }
-        // Outbound secrets are minted "now", so the event time is the current
-        // clock; expires_at falls back to it when message_ts is None.
+        // Outbound secrets are minted "now", so the parent event time is the
+        // current clock.
+        let now = wacore::time::now_secs();
         let expires_at = wacore::msg_secret::expires_at(
             policy,
             &self.cache_config.msg_secret_retention,
             class,
-            None,
-            wacore::time::now_secs(),
+            u64::try_from(now).ok(),
+            now,
         );
         let entry = wacore::store::traits::MsgSecretEntry {
             chat: chat.to_non_ad_string(),
@@ -1507,6 +1508,7 @@ impl Client {
             msg_id: msg_id.to_string(),
             secret: secret.to_vec(),
             expires_at,
+            message_ts: now,
         };
         if let Err(e) = self
             .persistence_manager

@@ -67,9 +67,12 @@ impl MsgSecretPolicy {
 /// time. Defaults are derived from verified protocol limits, not guesses.
 #[derive(Debug, Clone, Copy)]
 pub struct MsgSecretRetention {
-    /// Text / `MESSAGE_EDIT` parents. An edit is sender-gated to 20 min of the
-    /// parent, but WhatsApp's offline queue can deliver that edit up to ~30
-    /// days later, so a 30-day-offline receiver still needs the secret.
+    /// Text / `MESSAGE_EDIT` parents. An edit is only valid when authored within
+    /// 20 min of the parent — enforced on both send and receive against the
+    /// edit's own timestamp (`editTs < parentTs + window`), not "now" — so a
+    /// validly-authored edit still applies after an offline gap. WhatsApp's
+    /// offline queue can deliver it up to ~30 days later, so a 30-day-offline
+    /// receiver still needs the secret; hence a 30-day horizon for delivery.
     pub text: Duration,
     /// Poll / event parents (poll votes, `PollAddOption`, `EventEdit`,
     /// `PollEdit`). These add-ons have no sender-side time window, so the
@@ -98,6 +101,12 @@ impl MsgSecretRetention {
         }
     }
 }
+
+/// Default `message_edit_window_duration_seconds` (WA Web AB prop, 20 min). An
+/// edit is only valid when authored within this window of its parent — checked
+/// against the edit's own timestamp (`editTs < parentTs + window`), not "now" —
+/// so the receive path can drop a stale edit even after an offline delivery gap.
+pub const EDIT_PROCESSING_WINDOW_SECS: i64 = 1200;
 
 /// Retention class of a stored secret, fixed at write time by which call site
 /// wrote it (the store cannot see the add-on kind at prune time).
@@ -211,9 +220,19 @@ pub fn within_seed_horizon(
 /// The call is run under a bounded timeout (configurable, default 5s) because
 /// it executes inside the per-chat receive lane; an implementation that blocks
 /// past the bound is treated as a miss, so keep it fast or internally bounded.
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+///
+/// The `Send + Sync` bound is dropped on wasm32 (single-threaded), so a
+/// resolver there may be backed by `!Send` JS handles; native builds keep it
+/// because the resolver is shared across the multi-threaded receive lanes.
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
 pub trait OriginalMessageResolver: Send + Sync {
+    async fn resolve_msg_secret(&self, chat: &str, sender: &str, msg_id: &str) -> Option<[u8; 32]>;
+}
+
+#[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
+pub trait OriginalMessageResolver {
     async fn resolve_msg_secret(&self, chat: &str, sender: &str, msg_id: &str) -> Option<[u8; 32]>;
 }
 

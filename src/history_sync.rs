@@ -250,11 +250,19 @@ impl Client {
 
         if !self.cache_config.seed_msg_secrets_from_history {
             // Opt-out of the pairing-time seed; live capture still runs.
+            log::debug!(
+                target: "Client/MsgSecret",
+                "Skipping history-sync msg_secret seed (seed_msg_secrets_from_history = false)"
+            );
             return 0;
         }
         let policy = self.cache_config.msg_secret_policy;
         if !policy.persists() {
             // Disabled: rely on the resolver / app store, seed nothing.
+            log::debug!(
+                target: "Client/MsgSecret",
+                "Skipping history-sync msg_secret seed (policy = {policy:?})"
+            );
             return 0;
         }
         let retention = &self.cache_config.msg_secret_retention;
@@ -290,6 +298,10 @@ impl Client {
             }
             let expires_at =
                 msg_secret::expires_at(policy, retention, class, record.timestamp, now);
+            let message_ts = record
+                .timestamp
+                .and_then(|t| i64::try_from(t).ok())
+                .unwrap_or(0);
 
             let mut senders =
                 history_msg_secret_senders(&chat, &record, own_pn.as_ref(), own_lid.as_ref());
@@ -326,6 +338,7 @@ impl Client {
                         secret.clone()
                     },
                     expires_at,
+                    message_ts,
                 });
             }
         }

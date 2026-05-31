@@ -289,6 +289,7 @@ impl Client {
             msg_id: msg_id.to_string(),
             secret: secret.to_vec(),
             expires_at,
+            message_ts: message_ts.and_then(|t| i64::try_from(t).ok()).unwrap_or(0),
         })
     }
 
@@ -368,28 +369,31 @@ impl Client {
             .await
             .unwrap_or_default();
 
+        // Look up the secret AND the parent's event time (for the edit window
+        // check below): primary sender, then the LID/PN alternate.
         let store_secret = match backend
-            .get_msg_secret(&chat_for_lookup, &original_sender_str, target_id)
+            .get_msg_secret_with_ts(&chat_for_lookup, &original_sender_str, target_id)
             .await
         {
-            Ok(Some(secret)) => Some(secret),
-            Ok(None) => match self
-                .alternate_msg_secret_lookup(
-                    &backend,
-                    &chat_for_lookup,
-                    &original_sender,
-                    target_id,
-                )
-                .await
-            {
-                Ok(found) => found,
-                Err(e) => {
-                    log::warn!(
-                        "[msg:{}] secret_encrypted_message alternate secret lookup failed: {e:?}",
-                        info.id
-                    );
-                    None
+            Ok(Some(found)) => Some(found),
+            Ok(None) => match fallback_original_sender.as_ref() {
+                Some(alt) => {
+                    let alt_str = alt.to_non_ad_string();
+                    match backend
+                        .get_msg_secret_with_ts(&chat_for_lookup, &alt_str, target_id)
+                        .await
+                    {
+                        Ok(found) => found,
+                        Err(e) => {
+                            log::warn!(
+                                "[msg:{}] secret_encrypted_message alternate secret lookup failed: {e:?}",
+                                info.id
+                            );
+                            None
+                        }
+                    }
                 }
+                None => None,
             },
             Err(e) => {
                 log::warn!(
@@ -400,9 +404,10 @@ impl Client {
             }
         };
         // On a total store miss, ask the app-supplied resolver (if any) for the
-        // parent secret. This is what lets the Disabled policy still decrypt.
-        let secret = match store_secret {
-            Some(secret) => secret,
+        // parent secret. This is what lets the Disabled policy still decrypt. The
+        // resolver carries no parent timestamp, so parent_ts stays 0 (unknown).
+        let (secret, parent_ts) = match store_secret {
+            Some((secret, ts)) => (secret, ts),
             None => {
                 let alternate = fallback_original_sender
                     .as_ref()
@@ -416,7 +421,7 @@ impl Client {
                     )
                     .await
                 {
-                    Some(secret) => secret,
+                    Some(secret) => (secret, 0),
                     None => return None,
                 }
             }
@@ -508,19 +513,41 @@ impl Client {
             }
         };
 
+        // Mirror WA Web `ProcessEditProtocolMsgs`: drop a MESSAGE_EDIT authored
+        // outside the parent's edit-processing window (editTs >= parentTs + 20m).
+        // The check is on authored time, not "now", so a validly-authored edit
+        // still applies after an offline delivery gap. Only enforceable when we
+        // know the parent's event time; resolver-supplied secrets carry none
+        // (parent_ts == 0), so we stay permissive there.
+        if env.kind == SecretEncKind::MessageEdit && parent_ts > 0 {
+            let edit_ts = info.timestamp.timestamp();
+            if edit_ts >= parent_ts + wacore::msg_secret::EDIT_PROCESSING_WINDOW_SECS {
+                log::debug!(
+                    "[msg:{}] secret edit authored outside the {}s window (editTs={edit_ts}, parentTs={parent_ts}); dropping",
+                    info.id,
+                    wacore::msg_secret::EDIT_PROCESSING_WINDOW_SECS
+                );
+                return None;
+            }
+        }
+
         if let Some(secret_bytes) = inner
             .message_context_info
             .as_ref()
             .and_then(|m| m.message_secret.as_deref())
         {
             // The re-persisted secret keys the NEXT add-on on the same parent,
-            // so its retention class follows the parent kind. The edit's arrival
-            // time is within ~20min of the parent, a bounded over-retention.
+            // so its retention class follows the parent kind and the parent's own
+            // event time (when known) rather than this edit's arrival time.
             let class = match env.kind {
                 SecretEncKind::MessageEdit => wacore::msg_secret::RetentionClass::Text,
                 _ => wacore::msg_secret::RetentionClass::PollEvent,
             };
-            let message_ts = u64::try_from(info.timestamp.timestamp()).ok();
+            let message_ts = if parent_ts > 0 {
+                u64::try_from(parent_ts).ok()
+            } else {
+                u64::try_from(info.timestamp.timestamp()).ok()
+            };
             // Primary + LID/PN alternate in one batch so both survive together.
             let mut entries = Vec::with_capacity(2);
             if let Some(entry) = self.build_msg_secret_entry(
@@ -10082,6 +10109,97 @@ mod tests {
         )
         .await;
         assert!(got.is_some(), "encrypted edit must dispatch as legacy edit");
+    }
+
+    /// Store the parent secret with a known event time, then dispatch a
+    /// secret-encrypted edit authored `edit_offset` seconds after the parent.
+    /// Returns whether the decrypted legacy edit was dispatched.
+    async fn run_secret_edit_with_window(test_id: &str, parent_ts: i64, edit_offset: i64) -> bool {
+        let (client, _transport) = capturing_client(test_id).await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let parent_id = "WINDOW_PARENT";
+        let edit_id = "WINDOW_EDIT";
+        let secret = [0x42u8; 32];
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secrets(vec![wacore::store::traits::MsgSecretEntry {
+                chat: chat.to_string(),
+                sender: chat.to_string(),
+                msg_id: parent_id.to_string(),
+                secret: secret.to_vec(),
+                expires_at: 0,
+                message_ts: parent_ts,
+            }])
+            .await
+            .unwrap();
+
+        let info = Arc::new(MessageInfo {
+            id: edit_id.into(),
+            timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(parent_ts + edit_offset, 0)
+                .unwrap(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: chat.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: None,
+        };
+        let msg =
+            encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
+        client.dispatch_parsed_message(msg, &info).await;
+
+        collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == edit_id
+                        && legacy_edit_text(msg.as_ref()) == Some("edited")
+                        && msg.secret_encrypted_message.is_none())
+            },
+            500,
+        )
+        .await
+        .is_some()
+    }
+
+    #[tokio::test]
+    async fn secret_edit_within_window_is_applied() {
+        // Authored 10 min after the parent — inside the 20 min (1200s) window.
+        assert!(
+            run_secret_edit_with_window("secret_edit_in_window", 1_700_000_000, 600).await,
+            "an in-window edit must dispatch as a legacy edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_edit_outside_window_is_dropped() {
+        // Authored 30 min after the parent — past the 1200s window, like WA Web's
+        // ProcessEditProtocolMsgs, so we drop it (raw envelope surfaces instead).
+        assert!(
+            !run_secret_edit_with_window("secret_edit_out_window", 1_700_000_000, 1800).await,
+            "an out-of-window edit must not dispatch a legacy edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_edit_unknown_parent_ts_is_permissive() {
+        // parent_ts = 0 (unknown, e.g. resolver-supplied): no window check, so a
+        // late edit still applies rather than being silently dropped.
+        assert!(
+            run_secret_edit_with_window("secret_edit_unknown_ts", 0, 5_000_000).await,
+            "with an unknown parent timestamp the edit must still apply"
+        );
     }
 
     #[tokio::test]

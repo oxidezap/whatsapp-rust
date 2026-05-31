@@ -63,6 +63,11 @@ pub struct MsgSecretEntry {
     /// rows whose deadline has passed; it does not know the horizon itself.
     #[serde(default)]
     pub expires_at: i64,
+    /// Parent message event time (unix seconds), or `0` when unknown. Kept so
+    /// the receive path can enforce the edit-processing window
+    /// (`editTs < message_ts + window`) the same way WhatsApp Web does.
+    #[serde(default)]
+    pub message_ts: i64,
 }
 
 /// Device information for registry tracking.
@@ -407,6 +412,7 @@ pub trait MsgSecretStore: Send + Sync {
             msg_id: msg_id.to_string(),
             secret: secret.to_vec(),
             expires_at: 0,
+            message_ts: 0,
         }])
         .await?;
         Ok(())
@@ -415,7 +421,7 @@ pub trait MsgSecretStore: Send + Sync {
     /// Batched upsert carrying a per-row `expires_at` deadline. On key
     /// conflict implementations keep the *later* deadline, treating `0`
     /// ("never") as infinity, so a redelivery or edit re-persist never
-    /// shortens an existing window.
+    /// shortens an existing window; `message_ts` keeps its non-zero value.
     async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize>;
 
     /// Fetch the persisted secret; returns `None` if absent.
@@ -425,6 +431,22 @@ pub trait MsgSecretStore: Send + Sync {
         sender: &str,
         msg_id: &str,
     ) -> Result<Option<Vec<u8>>>;
+
+    /// Fetch the secret together with the parent message's event time
+    /// (`message_ts`, `0` when unknown), so the receive path can enforce the
+    /// edit-processing window. Default pairs `get_msg_secret` with `0`;
+    /// backends that store `message_ts` override this.
+    async fn get_msg_secret_with_ts(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<(Vec<u8>, i64)>> {
+        Ok(self
+            .get_msg_secret(chat, sender, msg_id)
+            .await?
+            .map(|secret| (secret, 0)))
+    }
 
     /// Delete rows whose non-zero `expires_at` is at or before
     /// `cutoff_timestamp` (absolute unix seconds; callers pass "now"). Rows

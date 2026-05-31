@@ -33,6 +33,9 @@ struct PreKeyEntry {
 /// Key for base-key collision detection: `(address, message_id)`.
 type BaseKeyKey = (String, String);
 
+/// Stored msg-secret value: `(secret_bytes, expires_at_secs, message_ts_secs)`.
+type MsgSecretRow = (Vec<u8>, i64, i64);
+
 /// Inner state protected by the mutex.
 #[derive(Default)]
 struct InMemoryState {
@@ -62,9 +65,9 @@ struct InMemoryState {
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
 
     // --- MsgSecret ---
-    /// Value is `(secret_bytes, expires_at_secs)` where `0` means never expire.
-    /// The keepalive cleanup prunes rows whose deadline has passed.
-    msg_secrets: HashMap<(String, String, String), (Vec<u8>, i64)>,
+    /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
+    /// event time is unknown. The keepalive cleanup prunes expired rows.
+    msg_secrets: HashMap<(String, String, String), MsgSecretRow>,
 
     // --- Device ---
     device: Option<Device>,
@@ -599,11 +602,18 @@ impl MsgSecretStore for InMemoryBackend {
         let mut state = self.state.lock().await;
         for entry in entries {
             let key = (entry.chat, entry.sender, entry.msg_id);
-            let expires_at = match state.msg_secrets.get(&key) {
-                Some((_, existing)) => merge_msg_secret_expiry(*existing, entry.expires_at),
-                None => entry.expires_at,
+            let (expires_at, message_ts) = match state.msg_secrets.get(&key) {
+                Some((_, existing_exp, existing_ts)) => (
+                    merge_msg_secret_expiry(*existing_exp, entry.expires_at),
+                    // message_ts is the parent's immutable event time; keep the
+                    // known (non-zero / later) value.
+                    (*existing_ts).max(entry.message_ts),
+                ),
+                None => (entry.expires_at, entry.message_ts),
             };
-            state.msg_secrets.insert(key, (entry.secret, expires_at));
+            state
+                .msg_secrets
+                .insert(key, (entry.secret, expires_at, message_ts));
         }
         Ok(stored)
     }
@@ -620,7 +630,22 @@ impl MsgSecretStore for InMemoryBackend {
             .await
             .msg_secrets
             .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
-            .map(|(secret, _)| secret.clone()))
+            .map(|(secret, _, _)| secret.clone()))
+    }
+
+    async fn get_msg_secret_with_ts(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<(Vec<u8>, i64)>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .msg_secrets
+            .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
+            .map(|(secret, _, message_ts)| (secret.clone(), *message_ts)))
     }
 
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
@@ -629,7 +654,7 @@ impl MsgSecretStore for InMemoryBackend {
         // Keep rows with no deadline (0 = never) or a deadline still in the future.
         state
             .msg_secrets
-            .retain(|_, (_, expires_at)| *expires_at == 0 || *expires_at > cutoff_timestamp);
+            .retain(|_, (_, expires_at, _)| *expires_at == 0 || *expires_at > cutoff_timestamp);
         Ok((before - state.msg_secrets.len()) as u32)
     }
 }
@@ -772,6 +797,7 @@ mod tests {
                     msg_id: "M1".into(),
                     secret: vec![1u8; 32],
                     expires_at: 0,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "chat".into(),
@@ -779,6 +805,7 @@ mod tests {
                     msg_id: "M2".into(),
                     secret: vec![2u8; 32],
                     expires_at: 0,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "chat".into(),
@@ -786,6 +813,7 @@ mod tests {
                     msg_id: "M1".into(),
                     secret: vec![9u8; 32],
                     expires_at: 0,
+                    message_ts: 0,
                 },
             ])
             .await

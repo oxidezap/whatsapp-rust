@@ -3,6 +3,9 @@
 -- every conflict-update and edit re-persist, so no age-based TTL was sound.
 
 ALTER TABLE msg_secrets ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0;
+-- Parent message event time (0 = unknown), kept so the receive path can drop a
+-- stale edit via editTs < message_ts + window, the way WhatsApp Web does.
+ALTER TABLE msg_secrets ADD COLUMN message_ts INTEGER NOT NULL DEFAULT 0;
 
 -- Backfill the pre-existing pairing-burst seed so it ages out under the
 -- default text horizon (30d) once pruning runs, instead of either living
