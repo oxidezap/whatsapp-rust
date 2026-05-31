@@ -212,21 +212,41 @@ impl Client {
             return;
         }
 
+        let policy = self.cache_config.msg_secret_policy;
+        if !policy.persists() {
+            return;
+        }
+        let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
+        // BotOnly restores pre-#665: only capture secrets in bot contexts.
+        if policy.bot_only() && !chat_is_bot {
+            return;
+        }
+        let class = wacore::msg_secret::classify(msg, chat_is_bot);
+        let message_ts = u64::try_from(info.timestamp.timestamp()).ok();
+
         self.persist_msg_secret_bytes(
             &info.source.chat,
             &info.source.sender,
             &info.id,
             secret_bytes,
+            class,
+            message_ts,
         )
         .await;
 
-        let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
         if chat_is_bot
             && let Some(sender) = self.dm_sender_identity_for(&info.source.chat).await
             && sender.to_non_ad() != info.source.sender.to_non_ad()
         {
-            self.persist_msg_secret_bytes(&info.source.chat, &sender, &info.id, secret_bytes)
-                .await;
+            self.persist_msg_secret_bytes(
+                &info.source.chat,
+                &sender,
+                &info.id,
+                secret_bytes,
+                class,
+                message_ts,
+            )
+            .await;
         }
     }
 
@@ -236,21 +256,39 @@ impl Client {
         sender: &Jid,
         msg_id: &str,
         secret_bytes: &[u8],
+        class: wacore::msg_secret::RetentionClass,
+        message_ts: Option<u64>,
     ) -> bool {
         const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
 
         let Ok(secret) = <&[u8; SECRET_LEN]>::try_from(secret_bytes) else {
             return false;
         };
-        let chat_str = chat.to_non_ad_string();
-        let sender_str = sender.to_non_ad_string();
+        let policy = self.cache_config.msg_secret_policy;
+        if !policy.persists() {
+            return false;
+        }
+        let expires_at = wacore::msg_secret::expires_at(
+            policy,
+            &self.cache_config.msg_secret_retention,
+            class,
+            message_ts,
+            wacore::time::now_secs(),
+        );
+        let entry = wacore::store::traits::MsgSecretEntry {
+            chat: chat.to_non_ad_string(),
+            sender: sender.to_non_ad_string(),
+            msg_id: msg_id.to_string(),
+            secret: secret.to_vec(),
+            expires_at,
+        };
         match self
             .persistence_manager
             .backend()
-            .put_msg_secret(&chat_str, &sender_str, msg_id, secret)
+            .put_msg_secrets(vec![entry])
             .await
         {
-            Ok(()) => true,
+            Ok(_) => true,
             Err(e) => {
                 log::warn!("[msg:{msg_id}] failed to persist messageSecret: {e:?}");
                 false
@@ -435,11 +473,21 @@ impl Client {
             .as_ref()
             .and_then(|m| m.message_secret.as_deref())
         {
+            // The re-persisted secret keys the NEXT add-on on the same parent,
+            // so its retention class follows the parent kind. The edit's arrival
+            // time is within ~20min of the parent, a bounded over-retention.
+            let class = match env.kind {
+                SecretEncKind::MessageEdit => wacore::msg_secret::RetentionClass::Text,
+                _ => wacore::msg_secret::RetentionClass::PollEvent,
+            };
+            let message_ts = u64::try_from(info.timestamp.timestamp()).ok();
             self.persist_msg_secret_bytes(
                 &info.source.chat,
                 &original_sender,
                 target_id,
                 secret_bytes,
+                class,
+                message_ts,
             )
             .await;
             if let Some(alternate_sender) = fallback_original_sender.as_ref() {
@@ -448,6 +496,8 @@ impl Client {
                     alternate_sender,
                     target_id,
                     secret_bytes,
+                    class,
+                    message_ts,
                 )
                 .await;
             }
@@ -11622,7 +11672,13 @@ mod tests {
             .await
             .expect("LID seeded");
         client
-            .persist_outbound_msg_secret(&bot_chat, &sender_identity, outbound_id, &secret)
+            .persist_outbound_msg_secret(
+                &bot_chat,
+                &sender_identity,
+                outbound_id,
+                &secret,
+                wacore::msg_secret::RetentionClass::Bot,
+            )
             .await;
 
         // Inbound msmsg payload encrypted under the same (msg_id, target, bot)

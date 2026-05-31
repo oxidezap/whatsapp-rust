@@ -1411,11 +1411,14 @@ impl Client {
                 None => self.dm_sender_identity_for(&tc_issue_target).await,
             };
             if let Some(sender) = sender {
+                let is_bot_chat = tc_issue_target.server == wacore_binary::Server::Bot;
+                let class = wacore::msg_secret::classify(message, is_bot_chat);
                 self.persist_outbound_msg_secret(
                     &tc_issue_target,
                     &sender,
                     &outbound_id_clone,
                     secret,
+                    class,
                 )
                 .await;
             }
@@ -1478,13 +1481,35 @@ impl Client {
         sender: &Jid,
         msg_id: &str,
         secret: &[u8; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+        class: wacore::msg_secret::RetentionClass,
     ) {
-        let chat_str = chat.to_non_ad_string();
-        let sender_str = sender.to_non_ad_string();
+        let policy = self.cache_config.msg_secret_policy;
+        if !policy.persists() {
+            return;
+        }
+        if policy.bot_only() && chat.server != wacore_binary::Server::Bot {
+            return;
+        }
+        // Outbound secrets are minted "now", so the event time is the current
+        // clock; expires_at falls back to it when message_ts is None.
+        let expires_at = wacore::msg_secret::expires_at(
+            policy,
+            &self.cache_config.msg_secret_retention,
+            class,
+            None,
+            wacore::time::now_secs(),
+        );
+        let entry = wacore::store::traits::MsgSecretEntry {
+            chat: chat.to_non_ad_string(),
+            sender: sender.to_non_ad_string(),
+            msg_id: msg_id.to_string(),
+            secret: secret.to_vec(),
+            expires_at,
+        };
         if let Err(e) = self
             .persistence_manager
             .backend()
-            .put_msg_secret(&chat_str, &sender_str, msg_id, secret)
+            .put_msg_secrets(vec![entry])
             .await
         {
             log::warn!("Failed to persist outbound messageSecret for {msg_id}: {e:?}");
@@ -3582,7 +3607,13 @@ mod tests {
         let sender: Jid = "5511000000001:0@s.whatsapp.net".parse().unwrap();
         let secret = [0x55u8; 32];
         client
-            .persist_outbound_msg_secret(&chat, &sender, "MID_1", &secret)
+            .persist_outbound_msg_secret(
+                &chat,
+                &sender,
+                "MID_1",
+                &secret,
+                wacore::msg_secret::RetentionClass::Text,
+            )
             .await;
         let got = client
             .persistence_manager
@@ -3603,7 +3634,13 @@ mod tests {
         let chat_with_dev: Jid = "5511777776666:7@s.whatsapp.net".parse().unwrap();
         let sender_with_dev: Jid = "5511000000001:3@s.whatsapp.net".parse().unwrap();
         client
-            .persist_outbound_msg_secret(&chat_with_dev, &sender_with_dev, "MID_4", &[2u8; 32])
+            .persist_outbound_msg_secret(
+                &chat_with_dev,
+                &sender_with_dev,
+                "MID_4",
+                &[2u8; 32],
+                wacore::msg_secret::RetentionClass::Text,
+            )
             .await;
         let got = client
             .persistence_manager
@@ -3678,7 +3715,13 @@ mod tests {
         let lid_sender: Jid = "999888777666555:0@lid".parse().unwrap();
         let secret = [0x4Du8; 32];
         client
-            .persist_outbound_msg_secret(&group_chat, &lid_sender, "GROUP_MID", &secret)
+            .persist_outbound_msg_secret(
+                &group_chat,
+                &lid_sender,
+                "GROUP_MID",
+                &secret,
+                wacore::msg_secret::RetentionClass::Text,
+            )
             .await;
         let got = client
             .persistence_manager
