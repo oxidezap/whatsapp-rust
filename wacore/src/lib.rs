@@ -24,6 +24,7 @@ pub mod media_retry;
 pub mod message_edit;
 pub mod message_processing;
 pub mod messages;
+pub mod msg_secret;
 pub mod net;
 pub mod pair;
 pub mod pair_code;

@@ -212,47 +212,105 @@ impl Client {
             return;
         }
 
-        self.persist_msg_secret_bytes(
+        let policy = self.cache_config.msg_secret_policy;
+        if !policy.persists() {
+            return;
+        }
+        let chat_is_bot = info.source.chat.is_bot();
+        // BotOnly enforcement lives in build_msg_secret_entry (the chokepoint),
+        // which keys off the classified bot context including group bot prompts.
+        let class = wacore::msg_secret::classify(msg, chat_is_bot);
+        let message_ts = u64::try_from(info.timestamp.timestamp()).ok();
+
+        // Build both aliases (primary, plus the bot-DM LID key) and write them
+        // in one batch so a partial write can't leave only one stored.
+        let mut entries = Vec::with_capacity(2);
+        if let Some(entry) = self.build_msg_secret_entry(
             &info.source.chat,
             &info.source.sender,
             &info.id,
             secret_bytes,
-        )
-        .await;
-
-        let chat_is_bot = info.source.chat.server == wacore_binary::Server::Bot;
+            class,
+            message_ts,
+        ) {
+            entries.push(entry);
+        }
         if chat_is_bot
             && let Some(sender) = self.dm_sender_identity_for(&info.source.chat).await
             && sender.to_non_ad() != info.source.sender.to_non_ad()
+            && let Some(entry) = self.build_msg_secret_entry(
+                &info.source.chat,
+                &sender,
+                &info.id,
+                secret_bytes,
+                class,
+                message_ts,
+            )
         {
-            self.persist_msg_secret_bytes(&info.source.chat, &sender, &info.id, secret_bytes)
-                .await;
+            entries.push(entry);
         }
+        self.persist_msg_secret_entries(entries).await;
     }
 
-    pub(crate) async fn persist_msg_secret_bytes(
+    /// Build one retention entry, applying the policy gates and computing the
+    /// per-row deadline. Returns `None` when the policy skips this write (not
+    /// persisting, or `BotOnly` and the class isn't `Bot`) or the secret isn't
+    /// 32 bytes. Pure (no I/O) so callers can batch several aliases atomically.
+    fn build_msg_secret_entry(
         &self,
         chat: &Jid,
         sender: &Jid,
         msg_id: &str,
         secret_bytes: &[u8],
-    ) -> bool {
+        class: wacore::msg_secret::RetentionClass,
+        message_ts: Option<u64>,
+    ) -> Option<wacore::store::traits::MsgSecretEntry> {
         const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
+        let secret = <&[u8; SECRET_LEN]>::try_from(secret_bytes).ok()?;
+        let policy = self.cache_config.msg_secret_policy;
+        if !policy.persists() {
+            return None;
+        }
+        // Single chokepoint for the BotOnly invariant: only bot-context secrets
+        // (class == Bot) are persisted, no matter which write path got here.
+        if policy.bot_only() && class != wacore::msg_secret::RetentionClass::Bot {
+            return None;
+        }
+        let expires_at = wacore::msg_secret::expires_at(
+            policy,
+            &self.cache_config.msg_secret_retention,
+            class,
+            message_ts,
+            wacore::time::now_secs(),
+        );
+        Some(wacore::store::traits::MsgSecretEntry {
+            chat: chat.to_non_ad_string(),
+            sender: sender.to_non_ad_string(),
+            msg_id: msg_id.to_string(),
+            secret: secret.to_vec(),
+            expires_at,
+            message_ts: message_ts.and_then(|t| i64::try_from(t).ok()).unwrap_or(0),
+        })
+    }
 
-        let Ok(secret) = <&[u8; SECRET_LEN]>::try_from(secret_bytes) else {
+    /// Write a batch of secret aliases in one atomic upsert, so a multi-alias
+    /// capture/re-persist never leaves only some aliases stored.
+    async fn persist_msg_secret_entries(
+        &self,
+        entries: Vec<wacore::store::traits::MsgSecretEntry>,
+    ) -> bool {
+        if entries.is_empty() {
             return false;
-        };
-        let chat_str = chat.to_non_ad_string();
-        let sender_str = sender.to_non_ad_string();
+        }
         match self
             .persistence_manager
             .backend()
-            .put_msg_secret(&chat_str, &sender_str, msg_id, secret)
+            .put_msg_secrets(entries)
             .await
         {
-            Ok(()) => true,
+            Ok(_) => true,
             Err(e) => {
-                log::warn!("[msg:{msg_id}] failed to persist messageSecret: {e:?}");
+                log::warn!("failed to persist messageSecrets: {e:?}");
                 false
             }
         }
@@ -315,36 +373,61 @@ impl Client {
             .await
             .unwrap_or_default();
 
-        let primary = backend
-            .get_msg_secret(&chat_for_lookup, &original_sender_str, target_id)
-            .await;
-        let secret = match primary {
-            Ok(Some(secret)) => secret,
-            Ok(None) => match self
-                .alternate_msg_secret_lookup(
-                    &backend,
-                    &chat_for_lookup,
-                    &original_sender,
-                    target_id,
-                )
-                .await
-            {
-                Ok(Some(secret)) => secret,
-                Ok(None) => return None,
-                Err(e) => {
-                    log::warn!(
-                        "[msg:{}] secret_encrypted_message alternate secret lookup failed: {e:?}",
-                        info.id
-                    );
-                    return None;
+        // Look up the secret AND the parent's event time (for the edit window
+        // check below): primary sender, then the LID/PN alternate.
+        let store_secret = match backend
+            .get_msg_secret_with_ts(&chat_for_lookup, &original_sender_str, target_id)
+            .await
+        {
+            Ok(Some(found)) => Some(found),
+            Ok(None) => match fallback_original_sender.as_ref() {
+                Some(alt) => {
+                    let alt_str = alt.to_non_ad_string();
+                    match backend
+                        .get_msg_secret_with_ts(&chat_for_lookup, &alt_str, target_id)
+                        .await
+                    {
+                        Ok(found) => found,
+                        Err(e) => {
+                            log::warn!(
+                                "[msg:{}] secret_encrypted_message alternate secret lookup failed: {e:?}",
+                                info.id
+                            );
+                            None
+                        }
+                    }
                 }
+                None => None,
             },
             Err(e) => {
                 log::warn!(
                     "[msg:{}] backend error reading secret_encrypted_message secret: {e:?}",
                     info.id
                 );
-                return None;
+                None
+            }
+        };
+        // On a total store miss, ask the app-supplied resolver (if any) for the
+        // parent secret. This is what lets the Disabled policy still decrypt. The
+        // resolver carries no parent timestamp, so parent_ts stays 0 (unknown).
+        let (secret, parent_ts) = match store_secret {
+            Some((secret, ts)) => (secret, ts),
+            None => {
+                let alternate = fallback_original_sender
+                    .as_ref()
+                    .map(|j| j.to_non_ad_string());
+                match self
+                    .resolve_msg_secret_via_app(
+                        &chat_for_lookup,
+                        &original_sender_str,
+                        alternate.as_deref(),
+                        target_id,
+                    )
+                    .await
+                {
+                    Some(secret) => (secret, 0),
+                    None => return None,
+                }
             }
         };
 
@@ -434,27 +517,66 @@ impl Client {
             }
         };
 
+        // Mirror WA Web `ProcessEditProtocolMsgs`: drop a MESSAGE_EDIT authored
+        // outside the parent's edit-processing window (editTs >= parentTs + 20m).
+        // The check is on authored time, not "now", so a validly-authored edit
+        // still applies after an offline delivery gap. Only enforceable when we
+        // know the parent's event time; resolver-supplied secrets carry none
+        // (parent_ts == 0), so we stay permissive there.
+        if env.kind == SecretEncKind::MessageEdit && parent_ts > 0 {
+            let edit_ts = info.timestamp.timestamp();
+            if edit_ts >= parent_ts + wacore::msg_secret::EDIT_PROCESSING_WINDOW_SECS {
+                log::debug!(
+                    "[msg:{}] secret edit authored outside the {}s window (editTs={edit_ts}, parentTs={parent_ts}); dropping",
+                    info.id,
+                    wacore::msg_secret::EDIT_PROCESSING_WINDOW_SECS
+                );
+                return None;
+            }
+        }
+
         if let Some(secret_bytes) = inner
             .message_context_info
             .as_ref()
             .and_then(|m| m.message_secret.as_deref())
         {
-            self.persist_msg_secret_bytes(
+            // The re-persisted secret keys the NEXT add-on on the same parent,
+            // so its retention class follows the parent kind and the parent's own
+            // event time (when known) rather than this edit's arrival time.
+            let class = match env.kind {
+                SecretEncKind::MessageEdit => wacore::msg_secret::RetentionClass::Text,
+                _ => wacore::msg_secret::RetentionClass::PollEvent,
+            };
+            let message_ts = if parent_ts > 0 {
+                u64::try_from(parent_ts).ok()
+            } else {
+                u64::try_from(info.timestamp.timestamp()).ok()
+            };
+            // Primary + LID/PN alternate in one batch so both survive together.
+            let mut entries = Vec::with_capacity(2);
+            if let Some(entry) = self.build_msg_secret_entry(
                 &info.source.chat,
                 &original_sender,
                 target_id,
                 secret_bytes,
-            )
-            .await;
-            if let Some(alternate_sender) = fallback_original_sender.as_ref() {
-                self.persist_msg_secret_bytes(
+                class,
+                message_ts,
+            ) {
+                entries.push(entry);
+            }
+            if let Some(alternate_sender) = fallback_original_sender.as_ref()
+                && let Some(entry) = self.build_msg_secret_entry(
                     &info.source.chat,
                     alternate_sender,
                     target_id,
                     secret_bytes,
+                    class,
+                    message_ts,
                 )
-                .await;
+            {
+                entries.push(entry);
             }
+            self.persist_msg_secret_entries(entries).await;
         }
 
         if env.kind != SecretEncKind::MessageEdit {
@@ -553,52 +675,73 @@ impl Client {
         // target_sender_jid>` echoes the other. Covers LID migration windows
         // and asymmetric outbound/inbound identities.
         let backend = self.persistence_manager.backend();
-        let primary = backend
+        // Store lookup: primary, then the LID/PN alternate. A backend error is
+        // logged and treated as a miss (not a hard nack) so the resolver still
+        // gets a chance — mirrors the secret-encrypted edit path.
+        let store_secret = match backend
             .get_msg_secret(&chat_for_lookup, &target_sender_str, target_id)
-            .await;
-        let secret = match primary {
-            Ok(Some(s)) => s,
+            .await
+        {
+            Ok(Some(s)) => Some(s),
             Ok(None) => match self
                 .alternate_msg_secret_lookup(&backend, &chat_for_lookup, &target_sender, target_id)
                 .await
             {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    // For a group bot invocation initiated by our PRIMARY
-                    // device, the messageSecret lives in the bot-addressed copy
-                    // the primary sent directly to the bot — it is NOT mirrored
-                    // to companions in the group skmsg. So a companion
-                    // legitimately never holds the secret; this miss is expected
-                    // and benign (we nack 495 and the server stops replaying).
-                    // A miss in a 1:1 bot chat is unexpected and worth a warn.
-                    log::log!(
-                        if info.source.is_group {
-                            log::Level::Debug
-                        } else {
-                            log::Level::Warn
-                        },
-                        "[msg:{}] msmsg: no message_secret stored for target_id={target_id} (primary or alternate)",
-                        info.id
-                    );
-                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
-                    return;
-                }
+                Ok(found) => found,
                 Err(e) => {
-                    log::warn!(
-                        "[msg:{}] msmsg: alternate lookup failed: {e:?}; nack 495",
-                        info.id
-                    );
-                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
-                    return;
+                    log::warn!("[msg:{}] msmsg: alternate lookup failed: {e:?}", info.id);
+                    None
                 }
             },
             Err(e) => {
                 log::warn!(
-                    "[msg:{}] backend error reading message_secret ({e:?}); nack 495 so the server stops replaying",
+                    "[msg:{}] backend error reading message_secret: {e:?}",
                     info.id
                 );
-                self.spawn_nack(info, NackReason::MissingMessageSecret, None);
-                return;
+                None
+            }
+        };
+        let secret = match store_secret {
+            Some(s) => s,
+            None => {
+                let alternate = self
+                    .alternate_msg_secret_jid(&backend, &target_sender)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|j| j.to_non_ad_string());
+                match self
+                    .resolve_msg_secret_via_app(
+                        &chat_for_lookup,
+                        &target_sender_str,
+                        alternate.as_deref(),
+                        target_id,
+                    )
+                    .await
+                {
+                    Some(s) => s,
+                    None => {
+                        // For a group bot invocation initiated by our PRIMARY
+                        // device, the messageSecret lives in the bot-addressed
+                        // copy the primary sent directly to the bot — it is NOT
+                        // mirrored to companions in the group skmsg. So a
+                        // companion legitimately never holds the secret; this
+                        // miss is expected and benign (we nack 495 and the server
+                        // stops replaying). A miss in a 1:1 bot chat is unexpected
+                        // and worth a warn.
+                        log::log!(
+                            if info.source.is_group {
+                                log::Level::Debug
+                            } else {
+                                log::Level::Warn
+                            },
+                            "[msg:{}] msmsg: no message_secret stored for target_id={target_id} (primary or alternate)",
+                            info.id
+                        );
+                        self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                        return;
+                    }
+                }
             }
         };
 
@@ -748,8 +891,47 @@ impl Client {
             .await
     }
 
+    /// On a total store miss, consult the app-supplied resolver for the parent
+    /// secret, trying the primary then the LID/PN alternate sender. Bounded by a
+    /// timeout because it runs inside the per-chat receive lane, so a slow app
+    /// callback degrades to a miss instead of stalling the chat.
+    async fn resolve_msg_secret_via_app(
+        &self,
+        chat: &str,
+        primary_sender: &str,
+        alternate_sender: Option<&str>,
+        msg_id: &str,
+    ) -> Option<Vec<u8>> {
+        let resolver = self.cache_config.original_message_resolver.as_ref()?;
+        let lookup = async {
+            if let Some(secret) = resolver
+                .resolve_msg_secret(chat, primary_sender, msg_id)
+                .await
+            {
+                return Some(secret);
+            }
+            if let Some(alt) = alternate_sender
+                && alt != primary_sender
+                && let Some(secret) = resolver.resolve_msg_secret(chat, alt, msg_id).await
+            {
+                return Some(secret);
+            }
+            None
+        };
+        match tokio::time::timeout(self.cache_config.msg_secret_resolver_timeout, lookup).await {
+            Ok(Some(secret)) => Some(secret.to_vec()),
+            Ok(None) => None,
+            Err(_) => {
+                log::warn!("[msg:{msg_id}] original_message_resolver timed out");
+                None
+            }
+        }
+    }
+
     /// Handles a newsletter plaintext message.
     /// Newsletters are not E2E encrypted and use the <plaintext> tag directly.
+    /// They never carry a `secret_encrypted_message`, so no messageSecret is
+    /// stored or retained for newsletter chats (no newsletter retention class).
     async fn handle_newsletter_message(
         self: &Arc<Self>,
         node: &NodeRef<'_>,
@@ -9998,6 +10180,204 @@ mod tests {
         );
     }
 
+    /// Store the parent secret with a known event time, then dispatch a
+    /// secret-encrypted edit authored `edit_offset` seconds after the parent.
+    /// Returns whether the decrypted legacy edit was dispatched.
+    async fn run_secret_edit_with_window(test_id: &str, parent_ts: i64, edit_offset: i64) -> bool {
+        let (client, _transport) = capturing_client(test_id).await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let parent_id = "WINDOW_PARENT";
+        let edit_id = "WINDOW_EDIT";
+        let secret = [0x42u8; 32];
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secrets(vec![wacore::store::traits::MsgSecretEntry {
+                chat: chat.to_string(),
+                sender: chat.to_string(),
+                msg_id: parent_id.to_string(),
+                secret: secret.to_vec(),
+                expires_at: 0,
+                message_ts: parent_ts,
+            }])
+            .await
+            .unwrap();
+
+        let info = Arc::new(MessageInfo {
+            id: edit_id.into(),
+            timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(parent_ts + edit_offset, 0)
+                .unwrap(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: chat.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: None,
+        };
+        let msg =
+            encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
+        client.dispatch_parsed_message(msg, &info).await;
+
+        collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == edit_id
+                        && legacy_edit_text(msg.as_ref()) == Some("edited")
+                        && msg.secret_encrypted_message.is_none())
+            },
+            500,
+        )
+        .await
+        .is_some()
+    }
+
+    #[tokio::test]
+    async fn secret_edit_within_window_is_applied() {
+        // Authored 10 min after the parent — inside the 20 min (1200s) window.
+        assert!(
+            run_secret_edit_with_window("secret_edit_in_window", 1_700_000_000, 600).await,
+            "an in-window edit must dispatch as a legacy edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_edit_outside_window_is_dropped() {
+        // Authored 30 min after the parent — past the 1200s window, like WA Web's
+        // ProcessEditProtocolMsgs, so we drop it (raw envelope surfaces instead).
+        assert!(
+            !run_secret_edit_with_window("secret_edit_out_window", 1_700_000_000, 1800).await,
+            "an out-of-window edit must not dispatch a legacy edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_edit_unknown_parent_ts_is_permissive() {
+        // parent_ts = 0 (unknown, e.g. resolver-supplied): no window check, so a
+        // late edit still applies rather than being silently dropped.
+        assert!(
+            run_secret_edit_with_window("secret_edit_unknown_ts", 0, 5_000_000).await,
+            "with an unknown parent timestamp the edit must still apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
+        use crate::cache_config::{CacheConfig, MsgSecretPolicy};
+
+        struct StaticResolver {
+            chat: String,
+            sender: String,
+            msg_id: String,
+            secret: [u8; 32],
+        }
+        #[async_trait::async_trait]
+        impl wacore::msg_secret::OriginalMessageResolver for StaticResolver {
+            async fn resolve_msg_secret(
+                &self,
+                chat: &str,
+                sender: &str,
+                msg_id: &str,
+            ) -> Option<[u8; 32]> {
+                (chat == self.chat && sender == self.sender && msg_id == self.msg_id)
+                    .then_some(self.secret)
+            }
+        }
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let parent_id = "RESOLVER_PARENT";
+        let edit_id = "RESOLVER_EDIT";
+        let secret = [0x7Au8; 32];
+
+        let resolver = Arc::new(StaticResolver {
+            chat: chat.to_string(),
+            sender: chat.to_string(),
+            msg_id: parent_id.to_string(),
+            secret,
+        });
+        // Disabled persists nothing, so the only path to the secret is the resolver.
+        let cfg = CacheConfig {
+            msg_secret_policy: MsgSecretPolicy::Disabled,
+            original_message_resolver: Some(resolver),
+            ..Default::default()
+        };
+        let client = crate::test_utils::create_test_client_with_config(
+            "resolver_edit",
+            Arc::new(crate::test_utils::MockHttpClient),
+            cfg,
+        )
+        .await;
+        seed_test_pn(&client).await;
+
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(chat, chat, parent_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "store must be empty under Disabled"
+        );
+
+        let info = Arc::new(MessageInfo {
+            id: edit_id.into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: chat.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: None,
+        };
+        let msg = encrypted_message_edit(
+            target_key,
+            chat,
+            chat,
+            parent_id,
+            &secret,
+            "edited via resolver",
+            None,
+        );
+
+        client.dispatch_parsed_message(msg, &info).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == edit_id
+                        && legacy_edit_text(msg.as_ref()) == Some("edited via resolver")
+                        && msg.secret_encrypted_message.is_none())
+            },
+            500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "edit must decrypt via the resolver when the store is empty"
+        );
+    }
+
     #[tokio::test]
     async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         let (client, _transport) = capturing_client("secret_edit_chain").await;
@@ -11194,6 +11574,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn bot_only_captures_group_bot_prompt_skips_plain() {
+        use crate::cache_config::{CacheConfig, MsgSecretPolicy};
+        let cfg = CacheConfig {
+            msg_secret_policy: MsgSecretPolicy::BotOnly,
+            ..Default::default()
+        };
+        let client = crate::test_utils::create_test_client_with_config(
+            "botonly_capture",
+            Arc::new(crate::test_utils::MockHttpClient),
+            cfg,
+        )
+        .await;
+
+        let group = "120363021033254949@g.us";
+        let sender = "5511888887777@s.whatsapp.net";
+
+        // A plain group message is not a bot context → skipped under BotOnly.
+        let plain_info = Arc::new(MessageInfo {
+            id: "PLAIN".into(),
+            source: crate::types::message::MessageSource {
+                chat: group.parse().unwrap(),
+                sender: sender.parse().unwrap(),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let plain_msg = wa::Message {
+            conversation: Some("hi".into()),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0x01; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client
+            .maybe_capture_inbound_msg_secret(&plain_msg, &plain_info)
+            .await;
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(group, sender, "PLAIN")
+                .await
+                .unwrap()
+                .is_none(),
+            "BotOnly must skip a plain (non-bot) group message"
+        );
+
+        // A group message that invokes a bot (bot_metadata) classifies as Bot,
+        // so its secret is kept and the later bot reply can decrypt.
+        let bot_info = Arc::new(MessageInfo {
+            id: "BOTP".into(),
+            source: crate::types::message::MessageSource {
+                chat: group.parse().unwrap(),
+                sender: sender.parse().unwrap(),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let bot_msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("continue".into()),
+                ..Default::default()
+            })),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0x02; 32]),
+                bot_metadata: Some(wa::BotMetadata {
+                    persona_id: Some("867051314767696".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        client
+            .maybe_capture_inbound_msg_secret(&bot_msg, &bot_info)
+            .await;
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(group, sender, "BOTP")
+                .await
+                .unwrap(),
+            Some(vec![0x02; 32]),
+            "BotOnly must capture a group bot invocation"
+        );
+    }
+
     /// Group flow: another participant invokes the bot, their decrypted prompt
     /// carries the secret. We must key it under THE PARTICIPANT (the future
     /// reply's `<meta target_sender_jid>`), not our own identity.
@@ -11691,7 +12163,13 @@ mod tests {
             .await
             .expect("LID seeded");
         client
-            .persist_outbound_msg_secret(&bot_chat, &sender_identity, outbound_id, &secret)
+            .persist_outbound_msg_secret(
+                &bot_chat,
+                &sender_identity,
+                outbound_id,
+                &secret,
+                wacore::msg_secret::RetentionClass::Bot,
+            )
             .await;
 
         // Inbound msmsg payload encrypted under the same (msg_id, target, bot)

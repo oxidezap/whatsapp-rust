@@ -57,6 +57,17 @@ pub struct MsgSecretEntry {
     pub sender: String,
     pub msg_id: String,
     pub secret: Vec<u8>,
+    /// Absolute unix-seconds retention deadline. `0` means never expire.
+    /// Computed by the caller from the parent message's event time plus a
+    /// per-add-on-kind horizon (see `MsgSecretRetention`). The store prunes
+    /// rows whose deadline has passed; it does not know the horizon itself.
+    #[serde(default)]
+    pub expires_at: i64,
+    /// Parent message event time (unix seconds), or `0` when unknown. Kept so
+    /// the receive path can enforce the edit-processing window
+    /// (`editTs < message_ts + window`) the same way WhatsApp Web does.
+    #[serde(default)]
+    pub message_ts: i64,
 }
 
 /// Device information for registry tracking.
@@ -378,28 +389,41 @@ pub trait DeviceStore: Send + Sync {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait MsgSecretStore: Send + Sync {
-    /// Persist `secret` (typically 32 bytes) under the composite key.
+    /// Persist `secret` (typically 32 bytes) under the composite key with NO
+    /// expiry (`expires_at = 0`). Convenience wrapper over [`put_msg_secrets`].
     /// `chat`, `sender`, and `msg_id` are JID strings / message ID strings;
     /// callers should pass non-AD (no-device) form for the JIDs so lookups
     /// match regardless of which device echo'd the stanza back.
+    ///
+    /// Real call sites that compute a retention deadline build
+    /// [`MsgSecretEntry`] directly and call [`put_msg_secrets`].
+    ///
+    /// [`put_msg_secrets`]: MsgSecretStore::put_msg_secrets
     async fn put_msg_secret(
         &self,
         chat: &str,
         sender: &str,
         msg_id: &str,
         secret: &[u8],
-    ) -> Result<()>;
-
-    /// Batched variant of `put_msg_secret`.
-    async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize> {
-        let mut stored = 0usize;
-        for entry in entries {
-            self.put_msg_secret(&entry.chat, &entry.sender, &entry.msg_id, &entry.secret)
-                .await?;
-            stored += 1;
-        }
-        Ok(stored)
+    ) -> Result<()> {
+        self.put_msg_secrets(vec![MsgSecretEntry {
+            chat: chat.to_string(),
+            sender: sender.to_string(),
+            msg_id: msg_id.to_string(),
+            secret: secret.to_vec(),
+            expires_at: 0,
+            message_ts: 0,
+        }])
+        .await?;
+        Ok(())
     }
+
+    /// Batched upsert carrying a per-row `expires_at` deadline. On key conflict
+    /// implementations merge deterministically via [`merge_msg_secret_expiry`]
+    /// (later deadline wins, `0` = "never" = infinity) so a redelivery or edit
+    /// re-persist never shortens a window, and via [`merge_msg_secret_message_ts`]
+    /// (the later non-zero parent time wins; a `0` never clobbers a known one).
+    async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize>;
 
     /// Fetch the persisted secret; returns `None` if absent.
     async fn get_msg_secret(
@@ -409,10 +433,44 @@ pub trait MsgSecretStore: Send + Sync {
         msg_id: &str,
     ) -> Result<Option<Vec<u8>>>;
 
-    /// Delete rows whose `created_at` is older than `cutoff_timestamp`
-    /// (seconds since epoch). Returns the number of rows removed so the
-    /// keepalive cleanup can log/throttle.
+    /// Fetch the secret together with the parent message's event time
+    /// (`message_ts`, `0` when unknown), so the receive path can enforce the
+    /// edit-processing window. Default pairs `get_msg_secret` with `0`;
+    /// backends that store `message_ts` override this.
+    async fn get_msg_secret_with_ts(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<(Vec<u8>, i64)>> {
+        Ok(self
+            .get_msg_secret(chat, sender, msg_id)
+            .await?
+            .map(|secret| (secret, 0)))
+    }
+
+    /// Delete rows whose non-zero `expires_at` is at or before
+    /// `cutoff_timestamp` (absolute unix seconds; callers pass "now"). Rows
+    /// with `expires_at = 0` (never) are kept. Returns the number removed so
+    /// the keepalive cleanup can log/throttle.
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32>;
+}
+
+/// Merge two `expires_at` deadlines on key conflict: `0` ("never") wins,
+/// otherwise the later (larger) deadline is kept so windows never shrink.
+pub fn merge_msg_secret_expiry(existing: i64, incoming: i64) -> i64 {
+    if existing == 0 || incoming == 0 {
+        0
+    } else {
+        existing.max(incoming)
+    }
+}
+
+/// Merge two parent `message_ts` values on key conflict: the later (larger)
+/// non-zero value wins, so a `0` ("unknown") never clobbers a known parent
+/// time. `max` already yields this because every real timestamp is `> 0`.
+pub fn merge_msg_secret_message_ts(existing: i64, incoming: i64) -> i64 {
+    existing.max(incoming)
 }
 
 /// Combined storage backend trait.

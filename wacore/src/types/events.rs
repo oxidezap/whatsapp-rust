@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration, Utc};
 use prost::Message;
 use serde::Serialize;
 use std::fmt;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use wacore_binary::Node;
 use wacore_binary::OwnedNodeRef;
 use wacore_binary::{Jid, MessageId};
@@ -26,7 +26,13 @@ use waproto::whatsapp as wa;
 /// global settings, past participants, call logs, and everything else in
 /// the `wa::HistorySync` proto.
 pub struct LazyHistorySync {
-    raw_bytes: Bytes,
+    /// Decompressed protobuf bytes. Taken (freed) once [`get()`](Self::get)
+    /// materializes the owned proto, so the two halves don't coexist (~2x the
+    /// decompressed size) for the event's lifetime.
+    raw_bytes: Mutex<Option<Bytes>>,
+    /// Original decompressed size, kept after `raw_bytes` is freed so Debug and
+    /// [`raw_size()`](Self::raw_size) stay meaningful.
+    raw_size: usize,
     sync_type: i32,
     chunk_order: Option<u32>,
     progress: Option<u32>,
@@ -38,13 +44,25 @@ pub struct LazyHistorySync {
 
 impl Clone for LazyHistorySync {
     fn clone(&self) -> Self {
+        // Common case (not yet decoded): carry the raw bytes for a cheap, lazy
+        // clone. Once `get()` has freed the raw bytes, carry the decoded proto
+        // instead (a deep copy, only when cloning an already-inspected blob) so
+        // the clone stays usable rather than decoding to `None`.
+        let raw = self.locked_raw().clone();
+        let parsed = OnceLock::new();
+        if raw.is_none()
+            && let Some(decoded) = self.parsed.get()
+        {
+            let _ = parsed.set(decoded.clone());
+        }
         Self {
-            raw_bytes: self.raw_bytes.clone(),
+            raw_bytes: Mutex::new(raw),
+            raw_size: self.raw_size,
             sync_type: self.sync_type,
             chunk_order: self.chunk_order,
             progress: self.progress,
             peer_data_request_session_id: self.peer_data_request_session_id.clone(),
-            parsed: OnceLock::new(), // don't deep-copy the decoded proto
+            parsed,
         }
     }
 }
@@ -57,13 +75,20 @@ impl LazyHistorySync {
         progress: Option<u32>,
     ) -> Self {
         Self {
-            raw_bytes,
+            raw_size: raw_bytes.len(),
+            raw_bytes: Mutex::new(Some(raw_bytes)),
             sync_type,
             chunk_order,
             progress,
             peer_data_request_session_id: None,
             parsed: OnceLock::new(),
         }
+    }
+
+    /// Lock the raw-bytes slot, recovering from a poisoned mutex (a poison only
+    /// means a prior holder panicked; the `Option<Bytes>` is still valid).
+    fn locked_raw(&self) -> std::sync::MutexGuard<'_, Option<Bytes>> {
+        self.raw_bytes.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn with_peer_data_request_session_id(mut self, id: Option<String>) -> Self {
@@ -95,23 +120,37 @@ impl LazyHistorySync {
     /// Full decode of the history sync proto, cached via OnceLock.
     /// Returns `None` if decoding fails.
     ///
-    /// Note: decoding materializes the full proto in memory alongside the
-    /// raw bytes (~2x decompressed size). For large InitialBootstrap blobs,
-    /// prefer [`raw_bytes()`](Self::raw_bytes) with partial decoding if
-    /// you only need specific fields.
+    /// On the first successful decode the decompressed `raw_bytes` are freed, so
+    /// only the owned proto is retained afterwards (not ~2x). A consumer that
+    /// needs the raw bytes for partial decoding must read [`raw_bytes()`] before
+    /// calling this; afterwards it returns `None`.
+    ///
+    /// [`raw_bytes()`]: Self::raw_bytes
     pub fn get(&self) -> Option<&wa::HistorySync> {
-        self.parsed
-            .get_or_init(|| {
-                wa::HistorySync::decode(&self.raw_bytes[..])
-                    .ok()
-                    .map(Box::new)
-            })
-            .as_deref()
+        let parsed = self.parsed.get_or_init(|| {
+            // Cheap refcount bump; the lock is released before decoding so a
+            // concurrent reader isn't blocked by the parse.
+            let raw = self.locked_raw().clone()?;
+            wa::HistorySync::decode(&raw[..]).ok().map(Box::new)
+        });
+        // Free the raw bytes only AFTER the owned proto is committed, so a
+        // concurrent clone never sees both gone (raw == None implies parsed set).
+        if parsed.is_some() {
+            *self.locked_raw() = None;
+        }
+        parsed.as_deref()
     }
 
-    /// Access the raw decompressed protobuf bytes for custom/partial decoding.
-    pub fn raw_bytes(&self) -> &[u8] {
-        &self.raw_bytes
+    /// The raw decompressed protobuf bytes for custom/partial decoding, or
+    /// `None` once [`get()`](Self::get) has consumed them on a successful decode.
+    pub fn raw_bytes(&self) -> Option<Bytes> {
+        self.locked_raw().clone()
+    }
+
+    /// Size of the decompressed blob in bytes, available even after the raw
+    /// bytes have been freed by [`get()`](Self::get).
+    pub fn raw_size(&self) -> usize {
+        self.raw_size
     }
 }
 
@@ -125,7 +164,8 @@ impl fmt::Debug for LazyHistorySync {
                 "peer_data_request_session_id",
                 &self.peer_data_request_session_id,
             )
-            .field("raw_size", &self.raw_bytes.len())
+            .field("raw_size", &self.raw_size)
+            .field("raw_freed", &self.locked_raw().is_none())
             .field(
                 "parsed",
                 &self.parsed.get().and_then(|o| o.as_ref()).is_some(),
@@ -994,11 +1034,97 @@ mod tests {
         let raw = bytes.clone();
         let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
 
-        assert_eq!(lazy.raw_bytes(), &raw[..]);
+        assert_eq!(lazy.raw_bytes().as_deref(), Some(&raw[..]));
 
         // Consumer can partial-decode from raw_bytes
-        let decoded = wa::HistorySync::decode(lazy.raw_bytes()).expect("should decode");
+        let raw_bytes = lazy.raw_bytes().expect("raw still present before get()");
+        let decoded = wa::HistorySync::decode(&raw_bytes[..]).expect("should decode");
         assert_eq!(decoded.conversations[0].id, "raw@s.whatsapp.net");
+    }
+
+    #[test]
+    fn lazy_history_sync_get_frees_raw_bytes() {
+        let bytes = make_history_sync_bytes(vec![wa::Conversation {
+            id: "freed@s.whatsapp.net".to_string(),
+            ..Default::default()
+        }]);
+        let raw_len = bytes.len();
+        let lazy = LazyHistorySync::new(Bytes::from(bytes), 7, Some(1), Some(42));
+
+        assert!(lazy.raw_bytes().is_some(), "raw present before get()");
+        assert_eq!(
+            lazy.get().expect("decodes").conversations[0].id,
+            "freed@s.whatsapp.net"
+        );
+
+        // The decompressed bytes are released once the owned proto exists.
+        assert!(
+            lazy.raw_bytes().is_none(),
+            "raw freed after a successful get()"
+        );
+        // Metadata survives the free.
+        assert_eq!(lazy.raw_size(), raw_len);
+        assert_eq!(lazy.sync_type(), 7);
+        assert_eq!(lazy.chunk_order(), Some(1));
+        assert_eq!(lazy.progress(), Some(42));
+        // get() still returns the cached proto after raw is gone.
+        assert_eq!(
+            lazy.get().expect("cached").conversations[0].id,
+            "freed@s.whatsapp.net"
+        );
+    }
+
+    #[test]
+    fn lazy_history_sync_keeps_raw_when_decode_fails() {
+        // A corrupt blob fails to decode; raw is kept so partial decode / retry
+        // remains possible (only a successful decode frees it).
+        let lazy = LazyHistorySync::new(Bytes::from_static(&[0xFF, 0xFF, 0xFF]), 0, None, None);
+        assert!(lazy.get().is_none());
+        assert!(
+            lazy.raw_bytes().is_some(),
+            "raw must survive a failed decode"
+        );
+    }
+
+    #[test]
+    fn lazy_history_sync_clone_after_get_stays_decodable() {
+        let bytes = make_history_sync_bytes(vec![wa::Conversation {
+            id: "cloned@s.whatsapp.net".to_string(),
+            ..Default::default()
+        }]);
+        let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
+
+        // Decode on the original, which frees its raw bytes.
+        assert_eq!(
+            lazy.get().expect("decodes").conversations[0].id,
+            "cloned@s.whatsapp.net"
+        );
+        assert!(lazy.raw_bytes().is_none());
+
+        // A clone taken AFTER the original decoded must still yield the history
+        // (the decoded proto is carried over since the raw bytes are gone).
+        let cloned = lazy.clone();
+        assert_eq!(
+            cloned.get().expect("clone still decodes").conversations[0].id,
+            "cloned@s.whatsapp.net"
+        );
+    }
+
+    #[test]
+    fn lazy_history_sync_clone_before_get_is_lazy() {
+        let bytes = make_history_sync_bytes(vec![wa::Conversation {
+            id: "lazyclone@s.whatsapp.net".to_string(),
+            ..Default::default()
+        }]);
+        let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
+
+        // Cloning before any decode carries the raw bytes (cheap, still lazy).
+        let cloned = lazy.clone();
+        assert!(cloned.raw_bytes().is_some(), "lazy clone carries raw");
+        assert_eq!(
+            cloned.get().expect("decodes").conversations[0].id,
+            "lazyclone@s.whatsapp.net"
+        );
     }
 
     #[test]

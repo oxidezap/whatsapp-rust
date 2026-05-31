@@ -33,6 +33,9 @@ struct PreKeyEntry {
 /// Key for base-key collision detection: `(address, message_id)`.
 type BaseKeyKey = (String, String);
 
+/// Stored msg-secret value: `(secret_bytes, expires_at_secs, message_ts_secs)`.
+type MsgSecretRow = (Vec<u8>, i64, i64);
+
 /// Inner state protected by the mutex.
 #[derive(Default)]
 struct InMemoryState {
@@ -62,10 +65,9 @@ struct InMemoryState {
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
 
     // --- MsgSecret ---
-    /// Value is `(secret_bytes, created_at_secs)` so the keepalive cleanup
-    /// can prune expired entries the same way `delete_expired_sent_messages`
-    /// does for the retry cache.
-    msg_secrets: HashMap<(String, String, String), (Vec<u8>, i64)>,
+    /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
+    /// event time is unknown. The keepalive cleanup prunes expired rows.
+    msg_secrets: HashMap<(String, String, String), MsgSecretRow>,
 
     // --- Device ---
     device: Option<Device>,
@@ -594,29 +596,22 @@ impl ProtocolStore for InMemoryBackend {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl MsgSecretStore for InMemoryBackend {
-    async fn put_msg_secret(
-        &self,
-        chat: &str,
-        sender: &str,
-        msg_id: &str,
-        secret: &[u8],
-    ) -> Result<()> {
-        self.state.lock().await.msg_secrets.insert(
-            (chat.to_string(), sender.to_string(), msg_id.to_string()),
-            (secret.to_vec(), crate::time::now_secs()),
-        );
-        Ok(())
-    }
-
     async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize> {
-        let now = crate::time::now_secs();
+        use crate::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
         let stored = entries.len();
         let mut state = self.state.lock().await;
         for entry in entries {
-            state.msg_secrets.insert(
-                (entry.chat, entry.sender, entry.msg_id),
-                (entry.secret, now),
-            );
+            let key = (entry.chat, entry.sender, entry.msg_id);
+            let (expires_at, message_ts) = match state.msg_secrets.get(&key) {
+                Some((_, existing_exp, existing_ts)) => (
+                    merge_msg_secret_expiry(*existing_exp, entry.expires_at),
+                    merge_msg_secret_message_ts(*existing_ts, entry.message_ts),
+                ),
+                None => (entry.expires_at, entry.message_ts),
+            };
+            state
+                .msg_secrets
+                .insert(key, (entry.secret, expires_at, message_ts));
         }
         Ok(stored)
     }
@@ -628,20 +623,33 @@ impl MsgSecretStore for InMemoryBackend {
         msg_id: &str,
     ) -> Result<Option<Vec<u8>>> {
         Ok(self
+            .get_msg_secret_with_ts(chat, sender, msg_id)
+            .await?
+            .map(|(secret, _)| secret))
+    }
+
+    async fn get_msg_secret_with_ts(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<(Vec<u8>, i64)>> {
+        Ok(self
             .state
             .lock()
             .await
             .msg_secrets
             .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
-            .map(|(secret, _)| secret.clone()))
+            .map(|(secret, _, message_ts)| (secret.clone(), *message_ts)))
     }
 
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
         let mut state = self.state.lock().await;
         let before = state.msg_secrets.len();
+        // Keep rows with no deadline (0 = never) or a deadline still in the future.
         state
             .msg_secrets
-            .retain(|_, (_, ts)| *ts >= cutoff_timestamp);
+            .retain(|_, (_, expires_at, _)| *expires_at == 0 || *expires_at > cutoff_timestamp);
         Ok((before - state.msg_secrets.len()) as u32)
     }
 }
@@ -783,18 +791,24 @@ mod tests {
                     sender: "sender".into(),
                     msg_id: "M1".into(),
                     secret: vec![1u8; 32],
+                    expires_at: 0,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M2".into(),
                     secret: vec![2u8; 32],
+                    expires_at: 0,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M1".into(),
                     secret: vec![9u8; 32],
+                    expires_at: 0,
+                    message_ts: 0,
                 },
             ])
             .await
@@ -826,7 +840,7 @@ mod tests {
             .put_msg_secret("c", "s", "OLD", &[1u8; 32])
             .await
             .unwrap();
-        // Mutate timestamp directly to simulate an old row.
+        // Set a deadline already in the past to simulate an expired row.
         {
             let mut state = backend.state.lock().await;
             let entry = state
@@ -835,6 +849,7 @@ mod tests {
                 .unwrap();
             entry.1 = crate::time::now_secs() - 86_400 * 30;
         }
+        // NEW keeps the default `expires_at = 0` (never), so it survives.
         backend
             .put_msg_secret("c", "s", "NEW", &[2u8; 32])
             .await

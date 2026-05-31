@@ -13,7 +13,10 @@ pub mod cache;
 pub mod portable_cache;
 
 pub mod cache_config;
-pub use cache_config::{CacheConfig, CacheEntryConfig, CacheStores};
+pub use cache_config::{
+    CacheConfig, CacheEntryConfig, CacheStores, MsgSecretPolicy, MsgSecretRetention,
+    OriginalMessageResolver,
+};
 pub mod cache_store;
 pub(crate) mod pending_device_sync;
 pub(crate) mod sender_key_device_cache;

@@ -6,6 +6,7 @@ use crate::cache::Cache;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::cache_store::TypedCache;
+pub use wacore::msg_secret::{MsgSecretPolicy, MsgSecretRetention, OriginalMessageResolver};
 pub use wacore::store::cache::CacheStore;
 
 /// Configuration for a single cache instance.
@@ -198,11 +199,39 @@ pub struct CacheConfig {
     pub sent_message_ttl_secs: u64,
 
     // --- MsgSecret retention ---
-    /// TTL in seconds for stored `messageSecret` rows before periodic
-    /// cleanup. `0` (default) disables automatic pruning, matching
-    /// whatsmeow and WA Web. Set to a positive value (e.g. `30 * 86_400`
-    /// for 30 days) to bound DB growth on long-running deployments.
-    pub msg_secret_ttl_secs: u64,
+    /// How the per-message `messageSecret` store is managed (capture / seed /
+    /// prune). Default [`MsgSecretPolicy::Managed`] bounds DB growth: it seeds
+    /// only the still-relevant slice of history and prunes by a per-add-on-kind
+    /// event-time horizon. Set [`MsgSecretPolicy::Full`] to keep everything
+    /// forever, or [`MsgSecretPolicy::Disabled`] to persist nothing and delegate
+    /// to [`original_message_resolver`].
+    ///
+    /// [`original_message_resolver`]: CacheConfig::original_message_resolver
+    pub msg_secret_policy: MsgSecretPolicy,
+    /// Per-add-on-kind retention horizons applied under `Managed`/`BotOnly`.
+    pub msg_secret_retention: MsgSecretRetention,
+    /// Whether to seed `messageSecret`s from history-sync blobs. Default `true`.
+    ///
+    /// Independent of live capture (which `msg_secret_policy` governs): seeding
+    /// only matters for add-ons that arrive live after connect yet reference a
+    /// parent delivered via history sync — edits of just-pre-pairing messages,
+    /// add-options/edits on still-open polls, or replays to a reconnecting
+    /// offline device. Headless consumers that only react to new messages can
+    /// set this to `false` to skip the pairing-time seed entirely. When `true`,
+    /// the policy still filters the seed (age/type under `Managed`, bot-only
+    /// under `BotOnly`, everything under `Full`).
+    pub seed_msg_secrets_from_history: bool,
+    /// Optional app-supplied fallback consulted when an add-on's parent secret
+    /// is absent from the store (and its LID/PN alternates). Lets an app that
+    /// keeps its own message store own secret retention; required for the
+    /// `Disabled` policy to decrypt anything beyond what it has seen live.
+    pub original_message_resolver: Option<Arc<dyn OriginalMessageResolver>>,
+    /// Bound on each [`original_message_resolver`] call. The resolver runs
+    /// inside the per-chat receive lane, so a slow callback would stall that
+    /// chat; on timeout the lookup degrades to a miss. Default: 5s.
+    ///
+    /// [`original_message_resolver`]: CacheConfig::original_message_resolver
+    pub msg_secret_resolver_timeout: Duration,
 
     // --- Custom store overrides ---
     /// Per-cache custom store overrides.
@@ -233,7 +262,20 @@ impl std::fmt::Debug for CacheConfig {
             .field("session_locks_capacity", &self.session_locks_capacity)
             .field("chat_lanes_capacity", &self.chat_lanes_capacity)
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
-            .field("msg_secret_ttl_secs", &self.msg_secret_ttl_secs)
+            .field("msg_secret_policy", &self.msg_secret_policy)
+            .field("msg_secret_retention", &self.msg_secret_retention)
+            .field(
+                "seed_msg_secrets_from_history",
+                &self.seed_msg_secrets_from_history,
+            )
+            .field(
+                "original_message_resolver",
+                &self.original_message_resolver.is_some(),
+            )
+            .field(
+                "msg_secret_resolver_timeout",
+                &self.msg_secret_resolver_timeout,
+            )
             .field(
                 "cache_stores.group_cache",
                 &self.cache_stores.group_cache.is_some(),
@@ -273,10 +315,14 @@ impl Default for CacheConfig {
             session_locks_capacity: 10_000,
             chat_lanes_capacity: 5_000,
             sent_message_ttl_secs: 300,
-            // Disabled by default — match whatsmeow and WA Web (neither
-            // expires stored secrets). Callers expecting long-lived bot
-            // conversations, polls, or reactions can opt in.
-            msg_secret_ttl_secs: 0,
+            // Bounded by default: seed only the still-relevant slice of history
+            // and prune by per-add-on-kind event-time horizons, so the store no
+            // longer accumulates a secret for every message forever.
+            msg_secret_policy: MsgSecretPolicy::default(),
+            msg_secret_retention: MsgSecretRetention::default(),
+            seed_msg_secrets_from_history: true,
+            original_message_resolver: None,
+            msg_secret_resolver_timeout: Duration::from_secs(5),
             cache_stores: CacheStores::default(),
         }
     }

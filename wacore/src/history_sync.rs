@@ -282,6 +282,10 @@ pub(crate) struct WebMessageInfoInternalFields {
     pub key: Option<MessageKeyInternalFields>,
     #[prost(message, optional, tag = "2")]
     pub message: Option<MessageInternalFields>,
+    /// Parent message event time (unix seconds). Drives msg-secret retention
+    /// so a horizon expires by the message's real age, not when we seeded it.
+    #[prost(uint64, optional, tag = "3")]
+    pub message_timestamp: Option<u64>,
     #[prost(string, optional, tag = "5")]
     pub participant: Option<String>,
     #[prost(bytes = "vec", optional, tag = "49")]
@@ -374,6 +378,10 @@ pub(crate) struct MessageInternalFields {
 pub(crate) struct MessageContextInfoInternalFields {
     #[prost(bytes = "vec", optional, tag = "3")]
     pub message_secret: Option<Vec<u8>>,
+    /// Raw `BotMetadata` bytes; only its presence matters (a bot invocation),
+    /// so it stays opaque to keep the partial decode cheap.
+    #[prost(bytes = "vec", optional, tag = "7")]
+    pub bot_metadata: Option<Vec<u8>>,
 }
 
 macro_rules! define_context_info_carrier {
@@ -470,6 +478,29 @@ impl MessageInternalFields {
         }
     }
 
+    /// Whether the message invokes a bot, detected via `botMetadata` presence.
+    /// botMetadata sits on the top-level `MessageContextInfo` even when wrapped,
+    /// so check both the outer message and the unwrapped base. (Mentions are not
+    /// decoded in this partial path; a mention-only prompt falls back to text.)
+    fn invokes_bot(&self) -> bool {
+        let has = |m: &Self| {
+            m.message_context_info
+                .as_ref()
+                .is_some_and(|c| c.bot_metadata.is_some())
+        };
+        has(self) || has(self.base_message())
+    }
+
+    /// Whether the (unwrapped) message is a poll-creation or event message.
+    /// These carry the longer poll/event retention horizon.
+    fn is_poll_or_event(&self) -> bool {
+        let base = self.base_message();
+        base.poll_creation_message.is_some()
+            || base.poll_creation_message_v2.is_some()
+            || base.poll_creation_message_v3.is_some()
+            || base.event_message.is_some()
+    }
+
     fn is_forwarded(&self) -> bool {
         let base = self.base_message();
         macro_rules! any_forwarded {
@@ -524,6 +555,17 @@ pub struct HistoryMsgSecretRecord {
     pub web_msg_participant: Option<String>,
     pub msg_id: String,
     pub secret: Vec<u8>,
+    /// Parent message event time (unix seconds), if present in the blob.
+    /// Used by the seed-time retention filter; `None` falls back to seed time.
+    pub timestamp: Option<u64>,
+    /// Whether the parent is a poll-creation or event message. These get the
+    /// longer poll/event retention horizon because their add-ons (poll votes,
+    /// PollAddOption, EventEdit) have no sender-side time window.
+    pub is_poll_or_event: bool,
+    /// Whether the parent invokes a bot (botMetadata present). Kept so the seed
+    /// classifies a group bot prompt as a bot context, matching live capture, so
+    /// `BotOnly` retains it and a later bot reply can decrypt.
+    pub is_bot_invocation: bool,
 }
 
 fn extract_conversation_fields(data: &[u8]) -> ConversationExtraction {
@@ -593,6 +635,17 @@ fn extract_msg_secret_records(conv: &ConversationInternalFields) -> Vec<HistoryM
             continue;
         };
 
+        let is_poll_or_event = web_msg
+            .message
+            .as_ref()
+            .map(|m| m.is_poll_or_event())
+            .unwrap_or(false);
+        let is_bot_invocation = web_msg
+            .message
+            .as_ref()
+            .map(|m| m.invokes_bot())
+            .unwrap_or(false);
+
         records.push(HistoryMsgSecretRecord {
             chat_id: conv.id.clone(),
             from_me: key.from_me == Some(true),
@@ -600,6 +653,9 @@ fn extract_msg_secret_records(conv: &ConversationInternalFields) -> Vec<HistoryM
             web_msg_participant: web_msg.participant.clone(),
             msg_id: msg_id.clone(),
             secret: secret.clone(),
+            timestamp: web_msg.message_timestamp,
+            is_poll_or_event,
+            is_bot_invocation,
         });
     }
 

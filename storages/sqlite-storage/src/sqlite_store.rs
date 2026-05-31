@@ -2506,52 +2506,6 @@ impl ProtocolStore for SqliteStore {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl MsgSecretStore for SqliteStore {
-    async fn put_msg_secret(
-        &self,
-        chat: &str,
-        sender: &str,
-        msg_id: &str,
-        secret: &[u8],
-    ) -> Result<()> {
-        let device_id = self.device_id;
-        let chat: Arc<str> = Arc::from(chat);
-        let sender: Arc<str> = Arc::from(sender);
-        let msg_id: Arc<str> = Arc::from(msg_id);
-        let secret: Arc<[u8]> = Arc::from(secret);
-        let now = wacore::time::now_secs();
-        self.with_retry("put_msg_secret", || {
-            let chat = Arc::clone(&chat);
-            let sender = Arc::clone(&sender);
-            let msg_id = Arc::clone(&msg_id);
-            let secret = Arc::clone(&secret);
-            Box::new(move |conn: &mut SqliteConnection| {
-                diesel::insert_into(msg_secrets::table)
-                    .values((
-                        msg_secrets::chat.eq(chat.as_ref()),
-                        msg_secrets::sender.eq(sender.as_ref()),
-                        msg_secrets::msg_id.eq(msg_id.as_ref()),
-                        msg_secrets::secret.eq(secret.as_ref()),
-                        msg_secrets::device_id.eq(device_id),
-                        msg_secrets::created_at.eq(now),
-                    ))
-                    .on_conflict((
-                        msg_secrets::chat,
-                        msg_secrets::sender,
-                        msg_secrets::msg_id,
-                        msg_secrets::device_id,
-                    ))
-                    .do_update()
-                    .set((
-                        msg_secrets::secret.eq(secret.as_ref()),
-                        msg_secrets::created_at.eq(now),
-                    ))
-                    .execute(conn)?;
-                Ok(())
-            })
-        })
-        .await
-    }
-
     async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize> {
         if entries.is_empty() {
             return Ok(0);
@@ -2573,6 +2527,8 @@ impl MsgSecretStore for SqliteStore {
                             msg_secrets::secret.eq(entry.secret.as_slice()),
                             msg_secrets::device_id.eq(device_id),
                             msg_secrets::created_at.eq(now),
+                            msg_secrets::expires_at.eq(entry.expires_at),
+                            msg_secrets::message_ts.eq(entry.message_ts),
                         )
                     })
                     .collect();
@@ -2593,7 +2549,24 @@ impl MsgSecretStore for SqliteStore {
                             .do_update()
                             .set((
                                 msg_secrets::secret.eq(excluded(msg_secrets::secret)),
-                                msg_secrets::created_at.eq(excluded(msg_secrets::created_at)),
+                                msg_secrets::created_at.eq(now),
+                                // Keep the later deadline; 0 (never) wins. Mirrors
+                                // merge_msg_secret_expiry so a redelivery or edit
+                                // re-persist never shortens an existing window.
+                                msg_secrets::expires_at.eq(diesel::dsl::sql::<
+                                    diesel::sql_types::BigInt,
+                                >(
+                                    "CASE WHEN msg_secrets.expires_at = 0 \
+                                     OR excluded.expires_at = 0 THEN 0 \
+                                     ELSE MAX(msg_secrets.expires_at, excluded.expires_at) END",
+                                )),
+                                // Parent event time is immutable; keep the known
+                                // (non-zero / later) value across redeliveries.
+                                msg_secrets::message_ts.eq(diesel::dsl::sql::<
+                                    diesel::sql_types::BigInt,
+                                >(
+                                    "MAX(msg_secrets.message_ts, excluded.message_ts)",
+                                )),
                             ))
                             .execute(conn)?;
                     }
@@ -2634,13 +2607,45 @@ impl MsgSecretStore for SqliteStore {
         .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
+    async fn get_msg_secret_with_ts(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<(Vec<u8>, i64)>> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let chat = chat.to_string();
+        let sender = sender.to_string();
+        let msg_id = msg_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<(Vec<u8>, i64)>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            let row: Option<(Vec<u8>, i64)> = msg_secrets::table
+                .select((msg_secrets::secret, msg_secrets::message_ts))
+                .filter(msg_secrets::chat.eq(&chat))
+                .filter(msg_secrets::sender.eq(&sender))
+                .filter(msg_secrets::msg_id.eq(&msg_id))
+                .filter(msg_secrets::device_id.eq(device_id))
+                .first(&mut conn)
+                .optional()
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(row)
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?
+    }
+
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
         let device_id = self.device_id;
         self.with_retry("delete_expired_msg_secrets", || {
             Box::new(move |conn: &mut SqliteConnection| {
+                // Rows with expires_at = 0 never expire; only delete passed deadlines.
                 let deleted = diesel::delete(
                     msg_secrets::table
-                        .filter(msg_secrets::created_at.lt(cutoff_timestamp))
+                        .filter(msg_secrets::expires_at.ne(0))
+                        .filter(msg_secrets::expires_at.le(cutoff_timestamp))
                         .filter(msg_secrets::device_id.eq(device_id)),
                 )
                 .execute(conn)?;
@@ -3331,18 +3336,24 @@ mod tests {
                     sender: "s".into(),
                     msg_id: "M1".into(),
                     secret: vec![1u8; 32],
+                    expires_at: 0,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "c".into(),
                     sender: "s".into(),
                     msg_id: "M2".into(),
                     secret: vec![2u8; 32],
+                    expires_at: 0,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "c".into(),
                     sender: "s".into(),
                     msg_id: "M1".into(),
                     secret: vec![9u8; 32],
+                    expires_at: 0,
+                    message_ts: 0,
                 },
             ])
             .await
@@ -3360,30 +3371,156 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_expired_msg_secrets_deletes_only_below_cutoff() {
+    async fn delete_expired_msg_secrets_deletes_only_passed_deadlines() {
         let store = create_test_store().await;
-        store
-            .put_msg_secret("c", "s", "M", &[7u8; 32])
-            .await
-            .unwrap();
         let now = wacore::time::now_secs();
-        // cutoff well before insert → nothing deleted
-        let removed = store
-            .delete_expired_msg_secrets(now - 86_400)
+        store
+            .put_msg_secrets(vec![
+                MsgSecretEntry {
+                    chat: "c".into(),
+                    sender: "s".into(),
+                    msg_id: "NEVER".into(),
+                    secret: vec![1u8; 32],
+                    expires_at: 0,
+                    message_ts: 0,
+                },
+                MsgSecretEntry {
+                    chat: "c".into(),
+                    sender: "s".into(),
+                    msg_id: "FUTURE".into(),
+                    secret: vec![2u8; 32],
+                    expires_at: now + 86_400,
+                    message_ts: 0,
+                },
+                MsgSecretEntry {
+                    chat: "c".into(),
+                    sender: "s".into(),
+                    msg_id: "PAST".into(),
+                    secret: vec![3u8; 32],
+                    expires_at: now - 86_400,
+                    message_ts: 0,
+                },
+            ])
             .await
             .unwrap();
-        assert_eq!(removed, 0);
-        assert!(
-            store.get_msg_secret("c", "s", "M").await.unwrap().is_some(),
-            "row newer than cutoff must survive"
+
+        let removed = store.delete_expired_msg_secrets(now).await.unwrap();
+        assert_eq!(
+            removed, 1,
+            "only the row whose deadline has passed is deleted"
         );
-        // cutoff after insert → deleted
-        let removed = store
-            .delete_expired_msg_secrets(now + 86_400)
+        assert!(
+            store
+                .get_msg_secret("c", "s", "NEVER")
+                .await
+                .unwrap()
+                .is_some(),
+            "expires_at = 0 never expires"
+        );
+        assert!(
+            store
+                .get_msg_secret("c", "s", "FUTURE")
+                .await
+                .unwrap()
+                .is_some(),
+            "a future deadline survives"
+        );
+        assert!(
+            store
+                .get_msg_secret("c", "s", "PAST")
+                .await
+                .unwrap()
+                .is_none(),
+            "a passed deadline is pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_msg_secrets_keeps_later_deadline_on_conflict() {
+        let store = create_test_store().await;
+        let now = wacore::time::now_secs();
+        // First write a finite deadline, then a re-persist with an EARLIER one:
+        // the window must not shrink.
+        store
+            .put_msg_secrets(vec![MsgSecretEntry {
+                chat: "c".into(),
+                sender: "s".into(),
+                msg_id: "M".into(),
+                secret: vec![1u8; 32],
+                expires_at: now + 90 * 86_400,
+                message_ts: 0,
+            }])
             .await
             .unwrap();
-        assert_eq!(removed, 1);
-        assert!(store.get_msg_secret("c", "s", "M").await.unwrap().is_none());
+        store
+            .put_msg_secrets(vec![MsgSecretEntry {
+                chat: "c".into(),
+                sender: "s".into(),
+                msg_id: "M".into(),
+                secret: vec![1u8; 32],
+                expires_at: now + 30 * 86_400,
+                message_ts: 0,
+            }])
+            .await
+            .unwrap();
+        // The 90-day deadline must remain: a cutoff at now+60d deletes nothing.
+        let removed = store
+            .delete_expired_msg_secrets(now + 60 * 86_400)
+            .await
+            .unwrap();
+        assert_eq!(removed, 0, "conflict must keep the later (90d) deadline");
+
+        // A never-expire (0) write must override any finite deadline.
+        store
+            .put_msg_secret("c", "s", "M", &[1u8; 32])
+            .await
+            .unwrap();
+        let removed = store
+            .delete_expired_msg_secrets(now + 200 * 86_400)
+            .await
+            .unwrap();
+        assert_eq!(removed, 0, "a 0 (never) deadline wins over any finite one");
+    }
+
+    #[tokio::test]
+    async fn get_msg_secret_with_ts_round_trips_and_keeps_parent_ts() {
+        let store = create_test_store().await;
+        let parent_ts = 1_700_000_000i64;
+        store
+            .put_msg_secrets(vec![MsgSecretEntry {
+                chat: "c".into(),
+                sender: "s".into(),
+                msg_id: "M".into(),
+                secret: vec![5u8; 32],
+                expires_at: 0,
+                message_ts: parent_ts,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_msg_secret_with_ts("c", "s", "M").await.unwrap(),
+            Some((vec![5u8; 32], parent_ts))
+        );
+
+        // A later write with an unknown ts (0) must not clobber the known one.
+        store
+            .put_msg_secret("c", "s", "M", &[5u8; 32])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_msg_secret_with_ts("c", "s", "M").await.unwrap(),
+            Some((vec![5u8; 32], parent_ts)),
+            "message_ts (immutable parent time) must survive a 0-ts redelivery"
+        );
+
+        // Absent row → None.
+        assert_eq!(
+            store
+                .get_msg_secret_with_ts("c", "s", "MISSING")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     /// Multi-account isolation: same DB, different device_id rows must not
