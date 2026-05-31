@@ -248,6 +248,10 @@ impl Client {
         use wacore::msg_secret::{self, RetentionClass};
         const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
 
+        if !self.cache_config.seed_msg_secrets_from_history {
+            // Opt-out of the pairing-time seed; live capture still runs.
+            return 0;
+        }
         let policy = self.cache_config.msg_secret_policy;
         if !policy.persists() {
             // Disabled: rely on the resolver / app store, seed nothing.
@@ -857,6 +861,50 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "row must be pruned once its message-time deadline passes"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_seed_skipped_when_flag_disabled() {
+        use crate::cache_config::{CacheConfig, MsgSecretPolicy};
+        let cfg = CacheConfig {
+            msg_secret_policy: MsgSecretPolicy::Managed,
+            seed_msg_secrets_from_history: false,
+            ..Default::default()
+        };
+        let client = crate::test_utils::create_test_client_with_config(
+            "seed_flag_off",
+            std::sync::Arc::new(crate::test_utils::MockHttpClient),
+            cfg,
+        )
+        .await;
+        client
+            .persistence_manager
+            .process_command(wacore::store::commands::DeviceCommand::SetId(Some(
+                "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+            )))
+            .await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let now = wacore::time::now_secs() as u64;
+        let notification = history_notification(
+            chat,
+            vec![history_msg(chat, "RECENT", &[0x77u8; 32], now - 60, false)],
+        );
+        client
+            .process_history_sync_task("S6".to_string(), notification)
+            .await;
+
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(chat, chat, "RECENT")
+                .await
+                .unwrap(),
+            None,
+            "seed flag off must skip history seeding even under Managed"
         );
     }
 }

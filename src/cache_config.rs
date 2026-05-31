@@ -210,6 +210,17 @@ pub struct CacheConfig {
     pub msg_secret_policy: MsgSecretPolicy,
     /// Per-add-on-kind retention horizons applied under `Managed`/`BotOnly`.
     pub msg_secret_retention: MsgSecretRetention,
+    /// Whether to seed `messageSecret`s from history-sync blobs. Default `true`.
+    ///
+    /// Independent of live capture (which `msg_secret_policy` governs): seeding
+    /// only matters for add-ons that arrive live after connect yet reference a
+    /// parent delivered via history sync — edits of just-pre-pairing messages,
+    /// add-options/edits on still-open polls, or replays to a reconnecting
+    /// offline device. Headless consumers that only react to new messages can
+    /// set this to `false` to skip the pairing-time seed entirely. When `true`,
+    /// the policy still filters the seed (age/type under `Managed`, bot-only
+    /// under `BotOnly`, everything under `Full`).
+    pub seed_msg_secrets_from_history: bool,
     /// Optional app-supplied fallback consulted when an add-on's parent secret
     /// is absent from the store (and its LID/PN alternates). Lets an app that
     /// keeps its own message store own secret retention; required for the
@@ -247,6 +258,10 @@ impl std::fmt::Debug for CacheConfig {
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
             .field("msg_secret_policy", &self.msg_secret_policy)
             .field("msg_secret_retention", &self.msg_secret_retention)
+            .field(
+                "seed_msg_secrets_from_history",
+                &self.seed_msg_secrets_from_history,
+            )
             .field(
                 "original_message_resolver",
                 &self.original_message_resolver.is_some(),
@@ -295,6 +310,7 @@ impl Default for CacheConfig {
             // longer accumulates a secret for every message forever.
             msg_secret_policy: MsgSecretPolicy::default(),
             msg_secret_retention: MsgSecretRetention::default(),
+            seed_msg_secrets_from_history: true,
             original_message_resolver: None,
             cache_stores: CacheStores::default(),
         }
