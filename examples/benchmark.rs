@@ -51,7 +51,7 @@ fn main() {
         .expect("Failed to build tokio runtime");
 
     rt.block_on(async {
-        let backend = Arc::new(InMemoryBackend::new().with_sent_message_ttl(30));
+        let backend = Arc::new(InMemoryBackend::new());
 
         // Accept either WHATSAPP_WS_URL or MOCK_SERVER_URL — the latter
         // matches the convention the e2e suite uses.

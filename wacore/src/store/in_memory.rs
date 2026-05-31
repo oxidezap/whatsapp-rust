@@ -73,15 +73,12 @@ struct InMemoryState {
     device: Option<Device>,
 }
 
-/// Default TTL for sent messages (seconds). Matches the client's
-/// `sent_message_ttl_secs` default of 300s.
-const DEFAULT_SENT_MESSAGE_TTL_SECS: i64 = 300;
-
-/// Eviction runs inline when the map exceeds this many entries.
-const SENT_MESSAGE_EVICT_THRESHOLD: usize = 64;
-
-/// Minimum interval between eviction scans (seconds).
-const SENT_MESSAGE_EVICT_INTERVAL_SECS: i64 = 30;
+/// Hard cap on retained sent messages, bounding memory regardless of the
+/// configured retention window. Time-based pruning is the client's keepalive
+/// sweep (`delete_expired_sent_messages`, driven by
+/// `CacheConfig::sent_message_ttl_secs`, the single source of truth for the
+/// time window); this cap only guards against a burst between sweeps.
+const MAX_SENT_MESSAGES: usize = 4096;
 
 /// In-memory implementation of the full [`Backend`] trait.
 ///
@@ -90,8 +87,6 @@ const SENT_MESSAGE_EVICT_INTERVAL_SECS: i64 = 30;
 pub struct InMemoryBackend {
     state: Mutex<InMemoryState>,
     next_device_id: AtomicI32,
-    sent_message_ttl_secs: i64,
-    last_eviction: std::sync::atomic::AtomicI64,
 }
 
 impl InMemoryBackend {
@@ -100,17 +95,7 @@ impl InMemoryBackend {
         Self {
             state: Mutex::new(InMemoryState::default()),
             next_device_id: AtomicI32::new(1),
-            sent_message_ttl_secs: DEFAULT_SENT_MESSAGE_TTL_SECS,
-            last_eviction: std::sync::atomic::AtomicI64::new(0),
         }
-    }
-
-    /// Create with a custom sent-message TTL. Values ≤ 0 are ignored.
-    pub fn with_sent_message_ttl(mut self, ttl_secs: i64) -> Self {
-        if ttl_secs > 0 {
-            self.sent_message_ttl_secs = ttl_secs;
-        }
-        self
     }
 }
 
@@ -545,18 +530,20 @@ impl ProtocolStore for InMemoryBackend {
         let now = crate::time::now_secs();
         let mut s = self.state.lock().await;
 
-        // Amortized eviction: only scan when the map is large AND enough time
-        // has passed since the last eviction to avoid O(n) work on every insert.
-        if s.sent_messages.len() >= SENT_MESSAGE_EVICT_THRESHOLD {
-            let last = self
-                .last_eviction
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let interval = SENT_MESSAGE_EVICT_INTERVAL_SECS.min(self.sent_message_ttl_secs);
-            if now - last >= interval {
-                let cutoff = now - self.sent_message_ttl_secs;
-                s.sent_messages.retain(|_, e| e.timestamp >= cutoff);
-                self.last_eviction
-                    .store(now, std::sync::atomic::Ordering::Relaxed);
+        // Memory bound only: when the map hits the cap, drop the oldest entries
+        // (by timestamp) down to 3/4 of it so this O(n log n) scan amortizes
+        // across many inserts. Time-based pruning is the caller's keepalive sweep.
+        if s.sent_messages.len() >= MAX_SENT_MESSAGES {
+            let target = MAX_SENT_MESSAGES * 3 / 4;
+            let drop_count = s.sent_messages.len().saturating_sub(target);
+            let mut by_age: Vec<_> = s
+                .sent_messages
+                .iter()
+                .map(|(k, e)| (e.timestamp, k.clone()))
+                .collect();
+            by_age.sort_unstable_by_key(|(ts, _)| *ts);
+            for (_, k) in by_age.into_iter().take(drop_count) {
+                s.sent_messages.remove(&k);
             }
         }
 
@@ -694,6 +681,33 @@ mod tests {
     #[test]
     fn in_memory_backend_implements_backend() {
         is_backend::<InMemoryBackend>();
+    }
+
+    #[tokio::test]
+    async fn store_sent_message_is_memory_bounded() {
+        let backend = InMemoryBackend::new();
+        for i in 0..(MAX_SENT_MESSAGES + 500) {
+            backend
+                .store_sent_message("chat@g.us", &format!("m{i}"), b"payload")
+                .await
+                .unwrap();
+        }
+        let len = backend.state.lock().await.sent_messages.len();
+        assert!(
+            len <= MAX_SENT_MESSAGES,
+            "sent_messages must stay within the hard cap, got {len}"
+        );
+        // The most recently stored message is inserted after eviction, so it
+        // always survives.
+        let last = format!("m{}", MAX_SENT_MESSAGES + 500 - 1);
+        assert!(
+            backend
+                .take_sent_message("chat@g.us", &last)
+                .await
+                .unwrap()
+                .is_some(),
+            "the newest message must survive count-cap eviction"
+        );
     }
 
     #[tokio::test]

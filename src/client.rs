@@ -1435,10 +1435,14 @@ impl Client {
         // Flush before clear: clear() drops dirty entries, so a disconnect
         // racing an in-flight encrypt would lose the just-advanced sender-key
         // chain and force a full SKDM re-fanout. A disconnect is not a logout.
-        self.flush_signal_cache_logged("cleanup_connection_state", None)
-            .await;
-        // Clear signal cache so stale state doesn't leak across connections.
-        self.signal_cache.clear().await;
+        // Only clear on a successful flush; on a backend error keep the cache so
+        // the dirty state isn't dropped and the next operation can persist it.
+        match self.flush_signal_cache().await {
+            Ok(()) => self.signal_cache.clear().await,
+            Err(e) => log::error!(
+                "cleanup_connection_state: signal cache flush failed, keeping cache to avoid dropping Signal state: {e:?}"
+            ),
+        }
         // Reset semaphore to 1 permit for next offline sync.
         self.swap_message_semaphore(1);
         // Reset dead-socket timestamps so stale values from the previous
@@ -5575,6 +5579,43 @@ mod tests {
         assert!(
             persisted.is_some(),
             "dirty sender key must survive a transport disconnect (flush-before-clear)"
+        );
+    }
+
+    /// When the flush itself fails, cleanup must NOT clear the cache, or it would
+    /// drop the very state the flush was meant to persist.
+    #[tokio::test]
+    async fn cleanup_connection_state_keeps_state_when_flush_fails() {
+        use wacore::libsignal::protocol::{ProtocolAddress, SenderKeyRecord};
+        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        let client = create_offline_sync_test_client().await;
+
+        // A malformed identity (not 32 bytes) makes flush() error out, standing
+        // in for a transient backend write failure during cleanup.
+        let bad = ProtocolAddress::new("5550002000@s.whatsapp.net".to_string(), 1u32.into());
+        client.signal_cache.put_identity(&bad, &[0u8; 16]).await;
+
+        // A valid dirty sender key that must not be dropped when the flush fails.
+        let name = SenderKeyName::from_parts("group@g.us", "5550001000@s.whatsapp.net:1");
+        client
+            .signal_cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+
+        client.cleanup_connection_state().await;
+
+        // flush() failed, so clear() was skipped; the unpersisted sender key
+        // survives in the write-back cache instead of being dropped.
+        let device = client.persistence_manager.get_device_arc().await;
+        let guard = device.read().await;
+        let persisted = client
+            .signal_cache
+            .get_sender_key(&name, &*guard.backend)
+            .await
+            .expect("get_sender_key must not error");
+        assert!(
+            persisted.is_some(),
+            "a flush failure must not drop dirty Signal state"
         );
     }
 
