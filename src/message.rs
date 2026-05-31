@@ -9933,6 +9933,71 @@ mod tests {
         assert!(got.is_some(), "encrypted edit must dispatch as legacy edit");
     }
 
+    /// Regression for #667: an incoming peer edit writes `target_message_key`
+    /// in the editor's frame (`from_me = true`, no `participant`, even in a
+    /// group), so the target-key resolver maps the parent author to *us* and
+    /// misses the secret stored under the real author. The dispatch path must
+    /// take the author from the envelope sender instead. Fails on the pre-fix
+    /// code (envelope stays encrypted), passes after it.
+    #[tokio::test]
+    async fn secret_encrypted_peer_edit_resolves_sender_from_envelope() {
+        let (client, _transport) = capturing_client("secret_peer_edit_dispatch").await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let group = "123456789012345678@g.us";
+        let peer = "5511777776666@s.whatsapp.net";
+        let parent_id = "PEER_PARENT";
+        let edit_id = "PEER_EDIT";
+        let secret = [0x42u8; 32];
+        // The parent (peer's own message) was stored under the real author.
+        client
+            .persistence_manager
+            .backend()
+            .put_msg_secret(group, peer, parent_id, &secret)
+            .await
+            .unwrap();
+
+        let info = Arc::new(MessageInfo {
+            id: edit_id.into(),
+            source: crate::types::message::MessageSource {
+                chat: group.parse().unwrap(),
+                sender: peer.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        // Editor's frame: from_me = true, no participant, even in a group.
+        let target_key = wa::MessageKey {
+            remote_jid: Some(group.to_string()),
+            from_me: Some(true),
+            id: Some(parent_id.to_string()),
+            participant: None,
+        };
+        // HKDF binds the real author (peer) as both original sender and editor.
+        let msg =
+            encrypted_message_edit(target_key, peer, peer, parent_id, &secret, "edited", None);
+
+        client.dispatch_parsed_message(msg, &info).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == edit_id
+                        && legacy_edit_text(msg.as_ref()) == Some("edited")
+                        && msg.secret_encrypted_message.is_none())
+            },
+            500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "incoming peer edit must resolve the author from the envelope and dispatch as legacy edit"
+        );
+    }
+
     #[tokio::test]
     async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         let (client, _transport) = capturing_client("secret_edit_chain").await;
