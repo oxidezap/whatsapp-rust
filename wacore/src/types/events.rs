@@ -44,14 +44,25 @@ pub struct LazyHistorySync {
 
 impl Clone for LazyHistorySync {
     fn clone(&self) -> Self {
+        // Common case (not yet decoded): carry the raw bytes for a cheap, lazy
+        // clone. Once `get()` has freed the raw bytes, carry the decoded proto
+        // instead (a deep copy, only when cloning an already-inspected blob) so
+        // the clone stays usable rather than decoding to `None`.
+        let raw = self.locked_raw().clone();
+        let parsed = OnceLock::new();
+        if raw.is_none()
+            && let Some(decoded) = self.parsed.get()
+        {
+            let _ = parsed.set(decoded.clone());
+        }
         Self {
-            raw_bytes: Mutex::new(self.locked_raw().clone()),
+            raw_bytes: Mutex::new(raw),
             raw_size: self.raw_size,
             sync_type: self.sync_type,
             chunk_order: self.chunk_order,
             progress: self.progress,
             peer_data_request_session_id: self.peer_data_request_session_id.clone(),
-            parsed: OnceLock::new(), // don't deep-copy the decoded proto
+            parsed,
         }
     }
 }
@@ -116,20 +127,18 @@ impl LazyHistorySync {
     ///
     /// [`raw_bytes()`]: Self::raw_bytes
     pub fn get(&self) -> Option<&wa::HistorySync> {
-        self.parsed
-            .get_or_init(|| {
-                // Cheap refcount bump; the lock is released before decoding so a
-                // concurrent reader isn't blocked by the parse.
-                let raw = self.locked_raw().clone()?;
-                let parsed = wa::HistorySync::decode(&raw[..]).ok().map(Box::new);
-                if parsed.is_some() {
-                    // Drop the stored handle; the local `raw` clone drops at the
-                    // end of this closure, freeing the buffer once decode is done.
-                    *self.locked_raw() = None;
-                }
-                parsed
-            })
-            .as_deref()
+        let parsed = self.parsed.get_or_init(|| {
+            // Cheap refcount bump; the lock is released before decoding so a
+            // concurrent reader isn't blocked by the parse.
+            let raw = self.locked_raw().clone()?;
+            wa::HistorySync::decode(&raw[..]).ok().map(Box::new)
+        });
+        // Free the raw bytes only AFTER the owned proto is committed, so a
+        // concurrent clone never sees both gone (raw == None implies parsed set).
+        if parsed.is_some() {
+            *self.locked_raw() = None;
+        }
+        parsed.as_deref()
     }
 
     /// The raw decompressed protobuf bytes for custom/partial decoding, or
@@ -1074,6 +1083,47 @@ mod tests {
         assert!(
             lazy.raw_bytes().is_some(),
             "raw must survive a failed decode"
+        );
+    }
+
+    #[test]
+    fn lazy_history_sync_clone_after_get_stays_decodable() {
+        let bytes = make_history_sync_bytes(vec![wa::Conversation {
+            id: "cloned@s.whatsapp.net".to_string(),
+            ..Default::default()
+        }]);
+        let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
+
+        // Decode on the original, which frees its raw bytes.
+        assert_eq!(
+            lazy.get().expect("decodes").conversations[0].id,
+            "cloned@s.whatsapp.net"
+        );
+        assert!(lazy.raw_bytes().is_none());
+
+        // A clone taken AFTER the original decoded must still yield the history
+        // (the decoded proto is carried over since the raw bytes are gone).
+        let cloned = lazy.clone();
+        assert_eq!(
+            cloned.get().expect("clone still decodes").conversations[0].id,
+            "cloned@s.whatsapp.net"
+        );
+    }
+
+    #[test]
+    fn lazy_history_sync_clone_before_get_is_lazy() {
+        let bytes = make_history_sync_bytes(vec![wa::Conversation {
+            id: "lazyclone@s.whatsapp.net".to_string(),
+            ..Default::default()
+        }]);
+        let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
+
+        // Cloning before any decode carries the raw bytes (cheap, still lazy).
+        let cloned = lazy.clone();
+        assert!(cloned.raw_bytes().is_some(), "lazy clone carries raw");
+        assert_eq!(
+            cloned.get().expect("decodes").conversations[0].id,
+            "lazyclone@s.whatsapp.net"
         );
     }
 
