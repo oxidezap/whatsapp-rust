@@ -214,16 +214,21 @@ impl Client {
                 .detach();
         }
 
-        // msg_secrets retention: disabled by default (matches whatsmeow + WA
-        // Web). Caller opts in via CacheConfig.msg_secret_ttl_secs.
-        let secret_ttl = self.cache_config.msg_secret_ttl_secs;
-        if secret_ttl > 0 {
+        // msg_secrets retention: prune rows whose per-row deadline has passed.
+        // expires_at is absolute, so the cutoff is simply "now"; per-kind
+        // horizons and never-expire (0) rows are baked in at write time.
+        if self.cache_config.msg_secret_policy.prunes() {
             let backend = self.persistence_manager.backend();
-            let cutoff = cutoff_for(secret_ttl);
             self.runtime
                 .spawn(Box::pin(async move {
-                    if let Err(e) = backend.delete_expired_msg_secrets(cutoff).await {
-                        log::debug!(target: "Client/Keepalive", "msg_secrets cleanup error: {e}");
+                    match backend.delete_expired_msg_secrets(now).await {
+                        Ok(n) if n > 0 => {
+                            log::debug!(target: "Client/Keepalive", "Pruned {n} expired msg_secrets");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::debug!(target: "Client/Keepalive", "msg_secrets cleanup error: {e}");
+                        }
                     }
                 }))
                 .detach();

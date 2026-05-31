@@ -293,6 +293,9 @@ impl Client {
                     } else {
                         secret.clone()
                     },
+                    // Real deadline + age/type seed filter land in a follow-up
+                    // commit; keep prior never-expire behavior until then.
+                    expires_at: 0,
                 });
             }
         }
