@@ -245,7 +245,16 @@ impl Client {
     }
 
     async fn store_history_sync_msg_secrets(&self, records: Vec<HistoryMsgSecretRecord>) -> usize {
+        use wacore::msg_secret::{self, RetentionClass};
         const SECRET_LEN: usize = wacore::reporting_token::MESSAGE_SECRET_SIZE;
+
+        let policy = self.cache_config.msg_secret_policy;
+        if !policy.persists() {
+            // Disabled: rely on the resolver / app store, seed nothing.
+            return 0;
+        }
+        let retention = &self.cache_config.msg_secret_retention;
+        let now = wacore::time::now_secs();
 
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
         let own_pn = device_snapshot.pn.as_ref().map(|j| j.to_non_ad());
@@ -259,6 +268,28 @@ impl Client {
             let Ok(chat) = record.chat_id.parse::<Jid>() else {
                 continue;
             };
+            let class = if chat.is_bot() {
+                RetentionClass::Bot
+            } else if record.is_poll_or_event {
+                RetentionClass::PollEvent
+            } else {
+                RetentionClass::Text
+            };
+            // BotOnly restores pre-#665: seed only bot-context secrets.
+            if policy.bot_only() && !chat.is_bot() {
+                continue;
+            }
+            // Drop secrets whose parent is already past its retention horizon:
+            // no add-on can still reference them, so seeding is pure waste. Full
+            // skips the filter (prunes() is false) and seeds everything.
+            if policy.prunes()
+                && !msg_secret::within_seed_horizon(retention, class, record.timestamp, now)
+            {
+                continue;
+            }
+            let expires_at =
+                msg_secret::expires_at(policy, retention, class, record.timestamp, now);
+
             let mut senders =
                 history_msg_secret_senders(&chat, &record, own_pn.as_ref(), own_lid.as_ref());
             if chat.is_bot()
@@ -293,9 +324,7 @@ impl Client {
                     } else {
                         secret.clone()
                     },
-                    // Real deadline + age/type seed filter land in a follow-up
-                    // commit; keep prior never-expire behavior until then.
-                    expires_at: 0,
+                    expires_at,
                 });
             }
         }
