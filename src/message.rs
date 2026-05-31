@@ -349,11 +349,11 @@ impl Client {
             .await
             .unwrap_or_default();
 
-        let primary = backend
+        let store_secret = match backend
             .get_msg_secret(&chat_for_lookup, &original_sender_str, target_id)
-            .await;
-        let secret = match primary {
-            Ok(Some(secret)) => secret,
+            .await
+        {
+            Ok(Some(secret)) => Some(secret),
             Ok(None) => match self
                 .alternate_msg_secret_lookup(
                     &backend,
@@ -363,14 +363,13 @@ impl Client {
                 )
                 .await
             {
-                Ok(Some(secret)) => secret,
-                Ok(None) => return None,
+                Ok(found) => found,
                 Err(e) => {
                     log::warn!(
                         "[msg:{}] secret_encrypted_message alternate secret lookup failed: {e:?}",
                         info.id
                     );
-                    return None;
+                    None
                 }
             },
             Err(e) => {
@@ -378,7 +377,29 @@ impl Client {
                     "[msg:{}] backend error reading secret_encrypted_message secret: {e:?}",
                     info.id
                 );
-                return None;
+                None
+            }
+        };
+        // On a total store miss, ask the app-supplied resolver (if any) for the
+        // parent secret. This is what lets the Disabled policy still decrypt.
+        let secret = match store_secret {
+            Some(secret) => secret,
+            None => {
+                let alternate = fallback_original_sender
+                    .as_ref()
+                    .map(|j| j.to_non_ad_string());
+                match self
+                    .resolve_msg_secret_via_app(
+                        &chat_for_lookup,
+                        &original_sender_str,
+                        alternate.as_deref(),
+                        target_id,
+                    )
+                    .await
+                {
+                    Some(secret) => secret,
+                    None => return None,
+                }
             }
         };
 
@@ -610,24 +631,44 @@ impl Client {
             {
                 Ok(Some(s)) => s,
                 Ok(None) => {
-                    // For a group bot invocation initiated by our PRIMARY
-                    // device, the messageSecret lives in the bot-addressed copy
-                    // the primary sent directly to the bot — it is NOT mirrored
-                    // to companions in the group skmsg. So a companion
-                    // legitimately never holds the secret; this miss is expected
-                    // and benign (we nack 495 and the server stops replaying).
-                    // A miss in a 1:1 bot chat is unexpected and worth a warn.
-                    log::log!(
-                        if info.source.is_group {
-                            log::Level::Debug
-                        } else {
-                            log::Level::Warn
-                        },
-                        "[msg:{}] msmsg: no message_secret stored for target_id={target_id} (primary or alternate)",
-                        info.id
-                    );
-                    self.spawn_nack(info, NackReason::MissingMessageSecret, None);
-                    return;
+                    let alternate = self
+                        .alternate_msg_secret_jid(&backend, &target_sender)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|j| j.to_non_ad_string());
+                    match self
+                        .resolve_msg_secret_via_app(
+                            &chat_for_lookup,
+                            &target_sender_str,
+                            alternate.as_deref(),
+                            target_id,
+                        )
+                        .await
+                    {
+                        Some(s) => s,
+                        None => {
+                            // For a group bot invocation initiated by our PRIMARY
+                            // device, the messageSecret lives in the bot-addressed
+                            // copy the primary sent directly to the bot — it is NOT
+                            // mirrored to companions in the group skmsg. So a
+                            // companion legitimately never holds the secret; this
+                            // miss is expected and benign (we nack 495 and the
+                            // server stops replaying). A miss in a 1:1 bot chat is
+                            // unexpected and worth a warn.
+                            log::log!(
+                                if info.source.is_group {
+                                    log::Level::Debug
+                                } else {
+                                    log::Level::Warn
+                                },
+                                "[msg:{}] msmsg: no message_secret stored for target_id={target_id} (primary or alternate)",
+                                info.id
+                            );
+                            self.spawn_nack(info, NackReason::MissingMessageSecret, None);
+                            return;
+                        }
+                    }
                 }
                 Err(e) => {
                     log::warn!(
@@ -794,8 +835,47 @@ impl Client {
             .await
     }
 
+    /// On a total store miss, consult the app-supplied resolver for the parent
+    /// secret, trying the primary then the LID/PN alternate sender. Bounded by a
+    /// timeout because it runs inside the per-chat receive lane, so a slow app
+    /// callback degrades to a miss instead of stalling the chat.
+    async fn resolve_msg_secret_via_app(
+        &self,
+        chat: &str,
+        primary_sender: &str,
+        alternate_sender: Option<&str>,
+        msg_id: &str,
+    ) -> Option<Vec<u8>> {
+        let resolver = self.cache_config.original_message_resolver.as_ref()?;
+        let lookup = async {
+            if let Some(secret) = resolver
+                .resolve_msg_secret(chat, primary_sender, msg_id)
+                .await
+            {
+                return Some(secret);
+            }
+            if let Some(alt) = alternate_sender
+                && alt != primary_sender
+                && let Some(secret) = resolver.resolve_msg_secret(chat, alt, msg_id).await
+            {
+                return Some(secret);
+            }
+            None
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
+            Ok(Some(secret)) => Some(secret.to_vec()),
+            Ok(None) => None,
+            Err(_) => {
+                log::warn!("[msg:{msg_id}] original_message_resolver timed out");
+                None
+            }
+        }
+    }
+
     /// Handles a newsletter plaintext message.
     /// Newsletters are not E2E encrypted and use the <plaintext> tag directly.
+    /// They never carry a `secret_encrypted_message`, so no messageSecret is
+    /// stored or retained for newsletter chats (no newsletter retention class).
     async fn handle_newsletter_message(
         self: &Arc<Self>,
         node: &NodeRef<'_>,
