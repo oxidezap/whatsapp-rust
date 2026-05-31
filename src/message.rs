@@ -10060,6 +10060,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
+        use crate::cache_config::{CacheConfig, MsgSecretPolicy};
+
+        struct StaticResolver {
+            chat: String,
+            sender: String,
+            msg_id: String,
+            secret: [u8; 32],
+        }
+        #[async_trait::async_trait]
+        impl wacore::msg_secret::OriginalMessageResolver for StaticResolver {
+            async fn resolve_msg_secret(
+                &self,
+                chat: &str,
+                sender: &str,
+                msg_id: &str,
+            ) -> Option<[u8; 32]> {
+                (chat == self.chat && sender == self.sender && msg_id == self.msg_id)
+                    .then_some(self.secret)
+            }
+        }
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let parent_id = "RESOLVER_PARENT";
+        let edit_id = "RESOLVER_EDIT";
+        let secret = [0x7Au8; 32];
+
+        let resolver = Arc::new(StaticResolver {
+            chat: chat.to_string(),
+            sender: chat.to_string(),
+            msg_id: parent_id.to_string(),
+            secret,
+        });
+        // Disabled persists nothing, so the only path to the secret is the resolver.
+        let cfg = CacheConfig {
+            msg_secret_policy: MsgSecretPolicy::Disabled,
+            original_message_resolver: Some(resolver),
+            ..Default::default()
+        };
+        let client = crate::test_utils::create_test_client_with_config(
+            "resolver_edit",
+            Arc::new(crate::test_utils::MockHttpClient),
+            cfg,
+        )
+        .await;
+        seed_test_pn(&client).await;
+
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(chat, chat, parent_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "store must be empty under Disabled"
+        );
+
+        let info = Arc::new(MessageInfo {
+            id: edit_id.into(),
+            source: crate::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: chat.parse().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let target_key = wa::MessageKey {
+            remote_jid: Some(chat.to_string()),
+            from_me: Some(false),
+            id: Some(parent_id.to_string()),
+            participant: None,
+        };
+        let msg = encrypted_message_edit(
+            target_key,
+            chat,
+            chat,
+            parent_id,
+            &secret,
+            "edited via resolver",
+            None,
+        );
+
+        client.dispatch_parsed_message(msg, &info).await;
+
+        let got = collect_event(
+            &client,
+            collector,
+            |e| {
+                matches!(e, wacore::types::events::Event::Message(msg, info)
+                    if info.id == edit_id
+                        && legacy_edit_text(msg.as_ref()) == Some("edited via resolver")
+                        && msg.secret_encrypted_message.is_none())
+            },
+            500,
+        )
+        .await;
+        assert!(
+            got.is_some(),
+            "edit must decrypt via the resolver when the store is empty"
+        );
+    }
+
+    #[tokio::test]
     async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         let (client, _transport) = capturing_client("secret_edit_chain").await;
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());

@@ -610,4 +610,253 @@ mod tests {
         assert_eq!(primary, Some(secret.clone()));
         assert_eq!(alias, Some(secret));
     }
+
+    /// One inbound history message in `chat`, stamped at `ts_secs`, optionally a
+    /// poll-creation message, carrying `secret`.
+    fn history_msg(
+        chat: &str,
+        msg_id: &str,
+        secret: &[u8],
+        ts_secs: u64,
+        is_poll: bool,
+    ) -> wa::HistorySyncMsg {
+        let message = if is_poll {
+            wa::Message {
+                poll_creation_message: Some(Box::new(wa::message::PollCreationMessage::default())),
+                ..Default::default()
+            }
+        } else {
+            wa::Message {
+                conversation: Some("historical".to_string()),
+                ..Default::default()
+            }
+        };
+        wa::HistorySyncMsg {
+            message: Some(wa::WebMessageInfo {
+                key: wa::MessageKey {
+                    remote_jid: Some(chat.to_string()),
+                    from_me: Some(false),
+                    id: Some(msg_id.to_string()),
+                    participant: None,
+                },
+                message: Some(message),
+                message_secret: Some(secret.to_vec()),
+                message_timestamp: Some(ts_secs),
+                ..Default::default()
+            }),
+            msg_order_id: Some(1),
+        }
+    }
+
+    fn history_notification(
+        chat: &str,
+        messages: Vec<wa::HistorySyncMsg>,
+    ) -> HistorySyncNotification {
+        let history_sync = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let compressed = compress_history_sync(&history_sync);
+        HistorySyncNotification {
+            file_length: Some(compressed.len() as u64),
+            sync_type: Some(wa::message::HistorySyncType::InitialBootstrap as i32),
+            initial_hist_bootstrap_inline_payload: Some(compressed),
+            ..Default::default()
+        }
+    }
+
+    async fn seeded_client(
+        name: &str,
+        policy: crate::cache_config::MsgSecretPolicy,
+    ) -> Arc<Client> {
+        let cfg = crate::cache_config::CacheConfig {
+            msg_secret_policy: policy,
+            ..Default::default()
+        };
+        let client = crate::test_utils::create_test_client_with_config(
+            name,
+            std::sync::Arc::new(crate::test_utils::MockHttpClient),
+            cfg,
+        )
+        .await;
+        client
+            .persistence_manager
+            .process_command(wacore::store::commands::DeviceCommand::SetId(Some(
+                "5511000000001:0@s.whatsapp.net".parse().unwrap(),
+            )))
+            .await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client
+    }
+
+    #[tokio::test]
+    async fn history_seed_managed_drops_old_text_keeps_recent() {
+        use crate::cache_config::MsgSecretPolicy;
+        let client = seeded_client("seed_managed_text", MsgSecretPolicy::Managed).await;
+        let chat = "5511777776666@s.whatsapp.net";
+        let now = wacore::time::now_secs() as u64;
+        let old_ts = now - 60 * 86_400; // past the 30d text horizon
+        let recent_ts = now - 86_400; // within it
+
+        let notification = history_notification(
+            chat,
+            vec![
+                history_msg(chat, "OLD_TEXT", &[0x11u8; 32], old_ts, false),
+                history_msg(chat, "RECENT_TEXT", &[0x22u8; 32], recent_ts, false),
+            ],
+        );
+        client
+            .process_history_sync_task("S1".to_string(), notification)
+            .await;
+
+        let backend = client.persistence_manager.backend();
+        assert_eq!(
+            backend
+                .get_msg_secret(chat, chat, "OLD_TEXT")
+                .await
+                .unwrap(),
+            None,
+            "a text secret past its 30d horizon must not be seeded"
+        );
+        assert_eq!(
+            backend
+                .get_msg_secret(chat, chat, "RECENT_TEXT")
+                .await
+                .unwrap(),
+            Some(vec![0x22u8; 32]),
+            "a recent text secret must be seeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_seed_managed_keeps_old_poll_within_90d() {
+        use crate::cache_config::MsgSecretPolicy;
+        let client = seeded_client("seed_managed_poll", MsgSecretPolicy::Managed).await;
+        let chat = "5511777776666@s.whatsapp.net";
+        let now = wacore::time::now_secs() as u64;
+        let ts = now - 60 * 86_400; // past 30d text but within 90d poll/event
+
+        let notification = history_notification(
+            chat,
+            vec![history_msg(chat, "OLD_POLL", &[0x33u8; 32], ts, true)],
+        );
+        client
+            .process_history_sync_task("S2".to_string(), notification)
+            .await;
+
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(chat, chat, "OLD_POLL")
+                .await
+                .unwrap(),
+            Some(vec![0x33u8; 32]),
+            "a poll parent within the 90d horizon must be seeded even past 30d"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_seed_full_keeps_old_text() {
+        use crate::cache_config::MsgSecretPolicy;
+        let client = seeded_client("seed_full", MsgSecretPolicy::Full).await;
+        let chat = "5511777776666@s.whatsapp.net";
+        let now = wacore::time::now_secs() as u64;
+        let old_ts = now - 365 * 86_400; // a year old
+
+        let notification = history_notification(
+            chat,
+            vec![history_msg(chat, "ANCIENT", &[0x44u8; 32], old_ts, false)],
+        );
+        client
+            .process_history_sync_task("S3".to_string(), notification)
+            .await;
+
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(chat, chat, "ANCIENT")
+                .await
+                .unwrap(),
+            Some(vec![0x44u8; 32]),
+            "Full seeds everything regardless of age"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_seed_disabled_stores_nothing() {
+        use crate::cache_config::MsgSecretPolicy;
+        let client = seeded_client("seed_disabled", MsgSecretPolicy::Disabled).await;
+        let chat = "5511777776666@s.whatsapp.net";
+        let now = wacore::time::now_secs() as u64;
+
+        let notification = history_notification(
+            chat,
+            vec![history_msg(chat, "ANY", &[0x55u8; 32], now - 60, false)],
+        );
+        client
+            .process_history_sync_task("S4".to_string(), notification)
+            .await;
+
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_msg_secret(chat, chat, "ANY")
+                .await
+                .unwrap(),
+            None,
+            "Disabled persists nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_seed_managed_stamps_expires_at_from_message_time() {
+        use crate::cache_config::MsgSecretPolicy;
+        let client = seeded_client("seed_expires", MsgSecretPolicy::Managed).await;
+        let chat = "5511777776666@s.whatsapp.net";
+        let now = wacore::time::now_secs();
+        let msg_ts = (now - 86_400) as u64; // 1 day old text → expires at msg_ts + 30d
+
+        let notification = history_notification(
+            chat,
+            vec![history_msg(chat, "RECENT", &[0x66u8; 32], msg_ts, false)],
+        );
+        client
+            .process_history_sync_task("S5".to_string(), notification)
+            .await;
+
+        let backend = client.persistence_manager.backend();
+        // Deadline is msg_ts + 30d ≈ now + 29d: a prune at "now" keeps it.
+        backend.delete_expired_msg_secrets(now).await.unwrap();
+        assert!(
+            backend
+                .get_msg_secret(chat, chat, "RECENT")
+                .await
+                .unwrap()
+                .is_some(),
+            "row must survive a prune before its deadline"
+        );
+        // A prune past msg_ts + 30d removes it, proving the deadline tracks
+        // message time, not seed time.
+        let removed = backend
+            .delete_expired_msg_secrets(now + 31 * 86_400)
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            backend
+                .get_msg_secret(chat, chat, "RECENT")
+                .await
+                .unwrap()
+                .is_none(),
+            "row must be pruned once its message-time deadline passes"
+        );
+    }
 }

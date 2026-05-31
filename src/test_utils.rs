@@ -60,6 +60,21 @@ pub async fn create_test_client_with_http(
     name: &str,
     http_client: Arc<dyn HttpClient>,
 ) -> Arc<Client> {
+    create_test_client_with_config(
+        name,
+        http_client,
+        crate::cache_config::CacheConfig::default(),
+    )
+    .await
+}
+
+/// Build an isolated in-memory test client with an explicit [`CacheConfig`],
+/// e.g. to exercise a non-default [`crate::cache_config::MsgSecretPolicy`].
+pub async fn create_test_client_with_config(
+    name: &str,
+    http_client: Arc<dyn HttpClient>,
+    cache_config: crate::cache_config::CacheConfig,
+) -> Arc<Client> {
     use portable_atomic::AtomicU64;
     use std::sync::atomic::Ordering;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -84,12 +99,13 @@ pub async fn create_test_client_with_http(
             .expect("persistence manager should initialize"),
     );
 
-    let (client, _rx) = Client::new(
+    let (client, _rx) = Client::new_with_cache_config(
         Arc::new(TokioRuntime),
         pm,
         Arc::new(MockTransportFactory::new()),
         http_client,
         None,
+        cache_config,
     )
     .await;
 
