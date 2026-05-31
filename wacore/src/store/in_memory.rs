@@ -597,7 +597,7 @@ impl ProtocolStore for InMemoryBackend {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl MsgSecretStore for InMemoryBackend {
     async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize> {
-        use crate::store::traits::merge_msg_secret_expiry;
+        use crate::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
         let stored = entries.len();
         let mut state = self.state.lock().await;
         for entry in entries {
@@ -605,9 +605,7 @@ impl MsgSecretStore for InMemoryBackend {
             let (expires_at, message_ts) = match state.msg_secrets.get(&key) {
                 Some((_, existing_exp, existing_ts)) => (
                     merge_msg_secret_expiry(*existing_exp, entry.expires_at),
-                    // message_ts is the parent's immutable event time; keep the
-                    // known (non-zero / later) value.
-                    (*existing_ts).max(entry.message_ts),
+                    merge_msg_secret_message_ts(*existing_ts, entry.message_ts),
                 ),
                 None => (entry.expires_at, entry.message_ts),
             };
@@ -625,12 +623,9 @@ impl MsgSecretStore for InMemoryBackend {
         msg_id: &str,
     ) -> Result<Option<Vec<u8>>> {
         Ok(self
-            .state
-            .lock()
-            .await
-            .msg_secrets
-            .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
-            .map(|(secret, _, _)| secret.clone()))
+            .get_msg_secret_with_ts(chat, sender, msg_id)
+            .await?
+            .map(|(secret, _)| secret))
     }
 
     async fn get_msg_secret_with_ts(

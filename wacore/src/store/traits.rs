@@ -418,10 +418,11 @@ pub trait MsgSecretStore: Send + Sync {
         Ok(())
     }
 
-    /// Batched upsert carrying a per-row `expires_at` deadline. On key
-    /// conflict implementations keep the *later* deadline, treating `0`
-    /// ("never") as infinity, so a redelivery or edit re-persist never
-    /// shortens an existing window; `message_ts` keeps its non-zero value.
+    /// Batched upsert carrying a per-row `expires_at` deadline. On key conflict
+    /// implementations merge deterministically via [`merge_msg_secret_expiry`]
+    /// (later deadline wins, `0` = "never" = infinity) so a redelivery or edit
+    /// re-persist never shortens a window, and via [`merge_msg_secret_message_ts`]
+    /// (the later non-zero parent time wins; a `0` never clobbers a known one).
     async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize>;
 
     /// Fetch the persisted secret; returns `None` if absent.
@@ -463,6 +464,13 @@ pub fn merge_msg_secret_expiry(existing: i64, incoming: i64) -> i64 {
     } else {
         existing.max(incoming)
     }
+}
+
+/// Merge two parent `message_ts` values on key conflict: the later (larger)
+/// non-zero value wins, so a `0` ("unknown") never clobbers a known parent
+/// time. `max` already yields this because every real timestamp is `> 0`.
+pub fn merge_msg_secret_message_ts(existing: i64, incoming: i64) -> i64 {
+    existing.max(incoming)
 }
 
 /// Combined storage backend trait.

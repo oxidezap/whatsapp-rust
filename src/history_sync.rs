@@ -280,10 +280,13 @@ impl Client {
             let Ok(chat) = record.chat_id.parse::<Jid>() else {
                 continue;
             };
-            // Same three-way rule as the live path; the seed only has flags in
-            // hand (no full message), so a group bot prompt in history can't be
-            // detected here and falls to its poll/event-or-text class.
-            let class = msg_secret::classify_from_flags(chat.is_bot(), record.is_poll_or_event);
+            // Same three-way rule as the live path. A group bot prompt is a bot
+            // context via its botMetadata (record.is_bot_invocation), so BotOnly
+            // keeps it and a later bot reply can still decrypt.
+            let class = msg_secret::classify_from_flags(
+                chat.is_bot() || record.is_bot_invocation,
+                record.is_poll_or_event,
+            );
             // BotOnly seeds only bot-context secrets.
             if policy.bot_only() && class != RetentionClass::Bot {
                 continue;
@@ -915,6 +918,99 @@ mod tests {
                 .unwrap(),
             None,
             "seed flag off must skip history seeding even under Managed"
+        );
+    }
+
+    /// A group message in `chat` from `participant`, optionally carrying
+    /// botMetadata (a bot invocation), with `secret`.
+    fn group_history_msg(
+        chat: &str,
+        participant: &str,
+        msg_id: &str,
+        secret: &[u8],
+        ts_secs: u64,
+        bot_prompt: bool,
+    ) -> wa::HistorySyncMsg {
+        let message_context_info = bot_prompt.then(|| wa::MessageContextInfo {
+            bot_metadata: Some(wa::BotMetadata {
+                persona_id: Some("867051314767696".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        wa::HistorySyncMsg {
+            message: Some(wa::WebMessageInfo {
+                key: wa::MessageKey {
+                    remote_jid: Some(chat.to_string()),
+                    from_me: Some(false),
+                    id: Some(msg_id.to_string()),
+                    participant: Some(participant.to_string()),
+                },
+                message: Some(wa::Message {
+                    extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                        text: Some("hi".into()),
+                        ..Default::default()
+                    })),
+                    message_context_info,
+                    ..Default::default()
+                }),
+                message_secret: Some(secret.to_vec()),
+                message_timestamp: Some(ts_secs),
+                ..Default::default()
+            }),
+            msg_order_id: Some(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn history_seed_botonly_keeps_group_bot_prompt_skips_plain() {
+        use crate::cache_config::MsgSecretPolicy;
+        let client = seeded_client("seed_botonly_bot", MsgSecretPolicy::BotOnly).await;
+        let group = "120363021033254949@g.us";
+        let participant = "5511888887777@s.whatsapp.net";
+        let now = wacore::time::now_secs() as u64;
+
+        let notification = history_notification(
+            group,
+            vec![
+                group_history_msg(
+                    group,
+                    participant,
+                    "BOT_PROMPT",
+                    &[0x88u8; 32],
+                    now - 60,
+                    true,
+                ),
+                group_history_msg(
+                    group,
+                    participant,
+                    "PLAIN_GRP",
+                    &[0x99u8; 32],
+                    now - 60,
+                    false,
+                ),
+            ],
+        );
+        client
+            .process_history_sync_task("SB".to_string(), notification)
+            .await;
+
+        let backend = client.persistence_manager.backend();
+        assert_eq!(
+            backend
+                .get_msg_secret(group, participant, "BOT_PROMPT")
+                .await
+                .unwrap(),
+            Some(vec![0x88u8; 32]),
+            "BotOnly must seed a group bot prompt (botMetadata = bot context)"
+        );
+        assert_eq!(
+            backend
+                .get_msg_secret(group, participant, "PLAIN_GRP")
+                .await
+                .unwrap(),
+            None,
+            "BotOnly must skip a plain group message"
         );
     }
 }
