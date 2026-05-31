@@ -611,8 +611,11 @@ pub enum ConnectFailureReason {
     LoggedOut,
     #[wire = 402]
     TempBanned,
+    /// WA Web 403 = REASON_LOCKED: account/device locked server-side; the client
+    /// logs out as LogoutReason.AccountLocked. (A manual unlink instead arrives
+    /// as `<conflict type="device_removed">`.)
     #[wire = 403]
-    MainDeviceGone,
+    AccountLocked,
     #[wire = 406]
     UnknownLogout,
     #[wire = 405]
@@ -641,7 +644,7 @@ impl ConnectFailureReason {
     pub fn is_logged_out(&self) -> bool {
         matches!(
             self,
-            Self::LoggedOut | Self::MainDeviceGone | Self::UnknownLogout
+            Self::LoggedOut | Self::AccountLocked | Self::UnknownLogout
         )
     }
 
@@ -1046,5 +1049,36 @@ mod tests {
                 .as_deref(),
             Some("msg-0")
         );
+    }
+
+    #[test]
+    fn connect_failure_reason_403_is_account_locked() {
+        // WA Web maps reason 403 to REASON_LOCKED (account/device locked),
+        // a logout that must not auto-reconnect.
+        assert_eq!(
+            ConnectFailureReason::from(403),
+            ConnectFailureReason::AccountLocked
+        );
+        assert!(ConnectFailureReason::AccountLocked.is_logged_out());
+        assert!(!ConnectFailureReason::AccountLocked.should_reconnect());
+
+        assert!(ConnectFailureReason::LoggedOut.is_logged_out());
+        assert!(ConnectFailureReason::UnknownLogout.is_logged_out());
+
+        // Transient server errors reconnect instead of logging out.
+        assert!(ConnectFailureReason::ServiceUnavailable.should_reconnect());
+        assert!(ConnectFailureReason::InternalServerError.should_reconnect());
+        assert!(!ConnectFailureReason::ServiceUnavailable.is_logged_out());
+
+        // A temp ban is neither a logout nor a reconnect on this path.
+        assert!(!ConnectFailureReason::TempBanned.is_logged_out());
+        assert!(!ConnectFailureReason::TempBanned.should_reconnect());
+
+        // Unrecognized codes fall through to the catch-all, never a logout.
+        assert_eq!(
+            ConnectFailureReason::from(499),
+            ConnectFailureReason::Unknown(499)
+        );
+        assert!(!ConnectFailureReason::from(499).is_logged_out());
     }
 }

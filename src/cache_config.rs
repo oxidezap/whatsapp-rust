@@ -194,8 +194,10 @@ pub struct CacheConfig {
     pub chat_lanes_capacity: u64,
 
     // --- Sent message DB cleanup ---
-    /// TTL in seconds for sent messages in DB before periodic cleanup.
-    /// 0 = no automatic cleanup. Default: 300 (5 minutes).
+    /// TTL in seconds for sent messages in DB before periodic cleanup. Must
+    /// outlive retry receipts (which can arrive well after a send) or the retry
+    /// is dropped as "not found in cache". The periodic sweep keeps the table
+    /// bounded. 0 = no automatic cleanup. Default: 7200 (2 hours).
     pub sent_message_ttl_secs: u64,
 
     // --- MsgSecret retention ---
@@ -314,7 +316,7 @@ impl Default for CacheConfig {
             // breaking serialization. Size generously to avoid eviction pressure.
             session_locks_capacity: 10_000,
             chat_lanes_capacity: 5_000,
-            sent_message_ttl_secs: 300,
+            sent_message_ttl_secs: 7200,
             // Bounded by default: seed only the still-relevant slice of history
             // and prune by per-add-on-kind event-time horizons, so the store no
             // longer accumulates a secret for every message forever.
