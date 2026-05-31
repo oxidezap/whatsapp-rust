@@ -226,6 +226,12 @@ pub struct CacheConfig {
     /// keeps its own message store own secret retention; required for the
     /// `Disabled` policy to decrypt anything beyond what it has seen live.
     pub original_message_resolver: Option<Arc<dyn OriginalMessageResolver>>,
+    /// Bound on each [`original_message_resolver`] call. The resolver runs
+    /// inside the per-chat receive lane, so a slow callback would stall that
+    /// chat; on timeout the lookup degrades to a miss. Default: 5s.
+    ///
+    /// [`original_message_resolver`]: CacheConfig::original_message_resolver
+    pub msg_secret_resolver_timeout: Duration,
 
     // --- Custom store overrides ---
     /// Per-cache custom store overrides.
@@ -265,6 +271,10 @@ impl std::fmt::Debug for CacheConfig {
             .field(
                 "original_message_resolver",
                 &self.original_message_resolver.is_some(),
+            )
+            .field(
+                "msg_secret_resolver_timeout",
+                &self.msg_secret_resolver_timeout,
             )
             .field(
                 "cache_stores.group_cache",
@@ -312,6 +322,7 @@ impl Default for CacheConfig {
             msg_secret_retention: MsgSecretRetention::default(),
             seed_msg_secrets_from_history: true,
             original_message_resolver: None,
+            msg_secret_resolver_timeout: Duration::from_secs(5),
             cache_stores: CacheStores::default(),
         }
     }

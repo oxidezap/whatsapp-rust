@@ -887,7 +887,7 @@ impl Client {
             }
             None
         };
-        match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
+        match tokio::time::timeout(self.cache_config.msg_secret_resolver_timeout, lookup).await {
             Ok(Some(secret)) => Some(secret.to_vec()),
             Ok(None) => None,
             Err(_) => {

@@ -47,9 +47,18 @@ impl MsgSecretPolicy {
         matches!(self, MsgSecretPolicy::BotOnly)
     }
 
-    /// Whether the periodic prune sweep should run. `Full` keeps everything;
-    /// `Disabled` writes nothing to prune.
+    /// Whether the periodic prune sweep should run. Everything except `Full`
+    /// prunes: `Managed`/`BotOnly` reap their own expired rows, and `Disabled`
+    /// still reaps legacy rows left by a prior policy (it just writes no new
+    /// ones). Only `Full` keeps everything forever.
     pub fn prunes(self) -> bool {
+        !matches!(self, MsgSecretPolicy::Full)
+    }
+
+    /// Whether rows written under this policy get a finite deadline. Only
+    /// `Managed`/`BotOnly` do; `Full` writes never-expire rows and `Disabled`
+    /// writes none.
+    pub fn bounds_retention(self) -> bool {
         matches!(self, MsgSecretPolicy::Managed | MsgSecretPolicy::BotOnly)
     }
 }
@@ -162,7 +171,7 @@ pub fn expires_at(
     message_ts: Option<u64>,
     now: i64,
 ) -> i64 {
-    if !policy.prunes() {
+    if !policy.bounds_retention() {
         return 0;
     }
     let base = message_ts
@@ -198,6 +207,10 @@ pub fn within_seed_horizon(
 /// what makes the [`MsgSecretPolicy::Disabled`] tier able to decrypt add-ons
 /// whose parent the core never persisted. Consulted only after the in-core
 /// store and LID/PN alternate lookups miss.
+///
+/// The call is run under a bounded timeout (configurable, default 5s) because
+/// it executes inside the per-chat receive lane; an implementation that blocks
+/// past the bound is treated as a miss, so keep it fast or internally bounded.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait OriginalMessageResolver: Send + Sync {
@@ -334,7 +347,10 @@ mod tests {
     fn policy_predicates() {
         assert!(MsgSecretPolicy::Managed.persists());
         assert!(MsgSecretPolicy::Managed.prunes());
+        assert!(MsgSecretPolicy::BotOnly.prunes());
         assert!(!MsgSecretPolicy::Full.prunes());
+        // Disabled writes nothing but still reaps legacy rows.
+        assert!(MsgSecretPolicy::Disabled.prunes());
         assert!(!MsgSecretPolicy::Disabled.persists());
         assert!(MsgSecretPolicy::BotOnly.bot_only());
     }
