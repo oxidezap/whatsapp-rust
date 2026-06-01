@@ -467,6 +467,17 @@ mod tests {
         use wacore::usync::UsyncLidMapping;
 
         let client = create_test_client().await;
+
+        // Pin that we exercise the BATCHED branch, not the per-mapping fallback:
+        // the branch is `if let Some(client) = self.self_weak...upgrade()`, so a
+        // live self_weak upgrade means learn_lid_pn_mappings_batch is the path
+        // taken. (Both paths warm the cache, so without this the test could pass
+        // via the fallback.)
+        assert!(
+            client.self_weak.get().and_then(|w| w.upgrade()).is_some(),
+            "fixture must populate self_weak so the batched learner is exercised"
+        );
+
         let response = DeviceListResponse {
             device_lists: vec![],
             lid_mappings: vec![UsyncLidMapping {
