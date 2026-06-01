@@ -220,8 +220,7 @@ fn process_history_sync_streaming(
                         }
                         // pushnames (repeated) — only our own is needed
                         7 => {
-                            if own_user.is_some()
-                                && result.own_pushname.is_none()
+                            if result.own_pushname.is_none()
                                 && let Some(own) = own_user
                                 && let Some(name) = extract_own_pushname(value, own)
                             {
