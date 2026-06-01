@@ -1314,7 +1314,12 @@ where
 /// tracking without re-resolving devices.
 pub struct PreparedGroupStanza {
     pub node: Node,
-    /// Devices that actually received SKDM (successfully encrypted).
+    /// Full SKDM distribution target set, marked `has_key=true` after the
+    /// server ACK. Mirrors WA Web `markHasSenderKey(x, M)` which marks the
+    /// whole target set `M`, not only the devices that encrypted successfully:
+    /// devices that failed (406 / no bundle) are marked too so they are not
+    /// re-targeted on every send (the retry-receipt path repairs any that are
+    /// actually alive and keyless via `mark_forget_sender_key`).
     pub skdm_devices: Vec<Jid>,
     /// Users whose device registry should be invalidated because their
     /// devices returned 406 (unregistered) during SKDM prekey fetch.
@@ -1350,6 +1355,11 @@ pub async fn prepare_group_stanza<
     request_id: String,
     force_skdm_distribution: bool,
     skdm_target_devices: Option<Vec<Jid>>,
+    // Full resolved device set for the phash (groups only). `Some` on warm/partial
+    // sends so the phash covers every device + self even when no SKDM is sent;
+    // `None` on the cold `force_skdm` path (the set is resolved here) and for
+    // status broadcasts (which keep the prior phash behavior).
+    all_devices_for_phash: Option<Vec<Jid>>,
     edit: Option<crate::types::message::EditAttribute>,
     extra_stanza_nodes: &[Node],
 ) -> Result<PreparedGroupStanza> {
@@ -1513,15 +1523,37 @@ pub async fn prepare_group_stanza<
         None
     };
 
+    // Phash (groups): cover the FULL participant device set + the sending device
+    // on EVERY send, matching WA Web `phashV2([].concat(A, [B]))`. Verified
+    // against a real WA Web capture: the recipient set plus the sending device
+    // reproduced the on-wire phash exactly, the recipient set alone did not. The
+    // server validates it silently (it is not echoed on a normal ack). Status
+    // broadcasts keep the prior behavior (phash over the distribution list only,
+    // when distributing); WA Web's status path does not augment with self.
+    if to_jid.is_group() {
+        // Warm/partial sends pass the complete set in `all_devices_for_phash`;
+        // the cold `force_skdm` path leaves it None and `distribution_list`
+        // already holds the full resolved set.
+        if let Some(src) = all_devices_for_phash
+            .as_deref()
+            .or(distribution_list.as_deref())
+        {
+            let phash_set = build_group_phash_set(src, &own_sending_jid);
+            match MessageUtils::participant_list_hash(&phash_set) {
+                Ok(phash) => phash_for_stanza = Some(phash),
+                Err(e) => log::warn!("Failed to compute group phash for {}: {:?}", to_jid, e),
+            }
+        }
+    } else if let Some(ref distribution_list) = distribution_list {
+        match MessageUtils::participant_list_hash(distribution_list) {
+            Ok(phash) => phash_for_stanza = Some(phash),
+            Err(e) => log::warn!("Failed to compute phash for {}: {:?}", to_jid, e),
+        }
+    }
+
     let mut had_unregistered_devices = false;
 
     if let Some(ref distribution_list) = distribution_list {
-        // WA Web computes phash from the full distribution list (target set at
-        // send time), not the actual encrypted outcome
-        match MessageUtils::participant_list_hash(distribution_list) {
-            Ok(phash) => phash_for_stanza = Some(phash),
-            Err(e) => log::warn!("Failed to compute phash for group {}: {:?}", to_jid, e),
-        }
         let axolotl_skdm_bytes = create_sender_key_distribution_message_for_group(
             stores.sender_key_store,
             &sender_key_name,
@@ -1661,11 +1693,33 @@ pub async fn prepare_group_stanza<
 
     Ok(PreparedGroupStanza {
         node: stanza,
-        skdm_devices: skdm_encrypted_devices,
+        // Mark the full target set (matches WA Web `markHasSenderKey(x, M)`), not
+        // just `skdm_encrypted_devices`. `stale_users` above already used the
+        // encrypted subset to find which devices to re-resolve.
+        skdm_devices: distribution_list.unwrap_or_default(),
         stale_device_users: stale_users,
         message_secret: reporting_result.map(|r| r.message_secret),
         sender_identity: own_sending_jid,
     })
+}
+
+/// Build the device set hashed into a group `phash`, matching WA Web
+/// `phashV2([].concat(A, [B]))`: every participant device (`A`) plus the
+/// sending device `B`. `devices` is the resolved set (recipients); the sending
+/// device is excluded from it (we never SKDM ourselves) so it is appended here.
+/// Hosted devices don't take part in group E2EE and are dropped, mirroring the
+/// SKDM distribution filter. `participant_list_hash` sorts before hashing, so
+/// order here is irrelevant.
+pub(crate) fn build_group_phash_set(devices: &[Jid], own_sending_jid: &Jid) -> Vec<Jid> {
+    let mut set: Vec<Jid> = devices.iter().filter(|d| !d.is_hosted()).cloned().collect();
+    if !set
+        .iter()
+        .any(|d| d.user == own_sending_jid.user && d.device == own_sending_jid.device)
+    {
+        set.push(own_sending_jid.clone());
+    }
+    crate::types::jid::sort_dedup_by_device(&mut set);
+    set
 }
 
 /// Collect users whose devices failed SKDM so the caller can invalidate their
@@ -4252,6 +4306,372 @@ mod tests {
             assert!(out.is_empty());
             let out = collect_stale_device_users(Some(&[]), &[], &info);
             assert!(out.is_empty());
+        }
+    }
+
+    /// Item 2 — WA Web `markHasSenderKey(x, M)`: a key-distributing group send
+    /// marks the FULL SKDM target set `has_key=true`, not only the devices that
+    /// encrypted successfully. A device whose SKDM encryption fails (no session
+    /// and no bundle, mimicking a 406) must still land in
+    /// `PreparedGroupStanza.skdm_devices`, so the next send does not re-target
+    /// it every time (the fan-out storm); the retry-receipt path repairs any
+    /// device that is actually alive and keyless.
+    mod mark_full_distribution_list {
+        use super::*;
+        use crate::libsignal::protocol::{
+            Direction, IdentityChange, IdentityKey, IdentityKeyStore, PreKeyId, PreKeyRecord,
+            PreKeyStore, ProtocolAddress, SenderKeyRecord, SenderKeyStore, SessionStore,
+            SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore, UsePQRatchet,
+            process_prekey_bundle,
+        };
+        use crate::libsignal::store::sender_key_name::SenderKeyName;
+        use crate::runtime::{AbortHandle, Runtime};
+        use crate::types::jid::JidExt;
+        use crate::types::message::AddressingMode;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::time::Duration;
+
+        type SigResult<T> = crate::libsignal::protocol::error::Result<T>;
+
+        #[derive(Clone, Default)]
+        struct MemSessionStore(HashMap<ProtocolAddress, Vec<u8>>);
+        #[async_trait::async_trait]
+        impl SessionStore for MemSessionStore {
+            async fn load_session(
+                &self,
+                a: &ProtocolAddress,
+            ) -> SigResult<Option<crate::libsignal::protocol::SessionRecord>> {
+                Ok(self
+                    .0
+                    .get(a)
+                    .and_then(|b| crate::libsignal::protocol::SessionRecord::deserialize(b).ok()))
+            }
+            async fn has_session(&self, a: &ProtocolAddress) -> SigResult<bool> {
+                Ok(self.0.contains_key(a))
+            }
+            async fn store_session(
+                &mut self,
+                a: &ProtocolAddress,
+                r: crate::libsignal::protocol::SessionRecord,
+            ) -> SigResult<()> {
+                self.0.insert(a.clone(), r.serialize()?);
+                Ok(())
+            }
+        }
+
+        #[derive(Clone)]
+        struct MemIdentityStore {
+            pair: IdentityKeyPair,
+            reg_id: u32,
+            known: HashMap<ProtocolAddress, IdentityKey>,
+        }
+        #[async_trait::async_trait]
+        impl IdentityKeyStore for MemIdentityStore {
+            async fn get_identity_key_pair(&self) -> SigResult<IdentityKeyPair> {
+                Ok(self.pair.clone())
+            }
+            async fn get_local_registration_id(&self) -> SigResult<u32> {
+                Ok(self.reg_id)
+            }
+            async fn save_identity(
+                &mut self,
+                a: &ProtocolAddress,
+                id: &IdentityKey,
+            ) -> SigResult<IdentityChange> {
+                self.known.insert(a.clone(), *id);
+                Ok(IdentityChange::from_changed(false))
+            }
+            async fn is_trusted_identity(
+                &self,
+                _: &ProtocolAddress,
+                _: &IdentityKey,
+                _: Direction,
+            ) -> SigResult<bool> {
+                Ok(true)
+            }
+            async fn get_identity(&self, a: &ProtocolAddress) -> SigResult<Option<IdentityKey>> {
+                Ok(self.known.get(a).copied())
+            }
+        }
+
+        #[derive(Default)]
+        struct MemSenderKeyStore(HashMap<SenderKeyName, SenderKeyRecord>);
+        #[async_trait::async_trait]
+        impl SenderKeyStore for MemSenderKeyStore {
+            async fn store_sender_key(
+                &mut self,
+                n: &SenderKeyName,
+                r: SenderKeyRecord,
+            ) -> SigResult<()> {
+                self.0.insert(n.clone(), r);
+                Ok(())
+            }
+            async fn load_sender_key(
+                &self,
+                n: &SenderKeyName,
+            ) -> SigResult<Option<SenderKeyRecord>> {
+                Ok(self.0.get(n).cloned())
+            }
+        }
+
+        // Outgoing group encryption never consumes our own prekeys, and device B
+        // has no bundle (so no session is established for it) — these are never
+        // called; present only to satisfy the generic bounds.
+        struct UnusedPreKeyStore;
+        #[async_trait::async_trait]
+        impl PreKeyStore for UnusedPreKeyStore {
+            async fn get_pre_key(&self, _: PreKeyId) -> SigResult<PreKeyRecord> {
+                unreachable!("prekey store not used in outgoing group encrypt")
+            }
+            async fn save_pre_key(&mut self, _: PreKeyId, _: &PreKeyRecord) -> SigResult<()> {
+                unreachable!()
+            }
+            async fn remove_pre_key(&mut self, _: PreKeyId) -> SigResult<()> {
+                unreachable!()
+            }
+        }
+        struct UnusedSignedPreKeyStore;
+        #[async_trait::async_trait]
+        impl SignedPreKeyStore for UnusedSignedPreKeyStore {
+            async fn get_signed_pre_key(&self, _: SignedPreKeyId) -> SigResult<SignedPreKeyRecord> {
+                unreachable!("signed prekey store not used in outgoing group encrypt")
+            }
+            async fn save_signed_pre_key(
+                &mut self,
+                _: SignedPreKeyId,
+                _: &SignedPreKeyRecord,
+            ) -> SigResult<()> {
+                unreachable!()
+            }
+        }
+
+        struct TokioTestRuntime;
+        #[async_trait::async_trait]
+        impl Runtime for TokioTestRuntime {
+            fn spawn(
+                &self,
+                future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+            ) -> AbortHandle {
+                let handle = tokio::spawn(future);
+                AbortHandle::new(move || handle.abort())
+            }
+            fn sleep(&self, _d: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                // Not exercised on the send path; wacore dev-deps omit tokio's
+                // "time" feature, so resolve immediately rather than time out.
+                Box::pin(async {})
+            }
+            fn spawn_blocking(
+                &self,
+                f: Box<dyn FnOnce() + Send + 'static>,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async move {
+                    let _ = tokio::task::spawn_blocking(f).await;
+                })
+            }
+            fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+                None
+            }
+        }
+
+        // Establish a real Signal session for `a` so its SKDM encrypts; the
+        // returned identity store is the sender's (knows `a` after X3DH).
+        async fn established_stores(a: &Jid) -> (MemSessionStore, MemIdentityStore) {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let sender = IdentityKeyPair::generate(&mut rng);
+            let receiver = IdentityKeyPair::generate(&mut rng);
+            let spk = KeyPair::generate(&mut rng);
+            let opk = KeyPair::generate(&mut rng);
+            let sig = receiver
+                .private_key()
+                .calculate_signature(&spk.public_key.serialize(), &mut rng)
+                .unwrap();
+            let bundle = PreKeyBundle::new(
+                1,
+                1u32.into(),
+                Some((1u32.into(), opk.public_key)),
+                1u32.into(),
+                spk.public_key,
+                sig.to_vec(),
+                *receiver.identity_key(),
+            )
+            .unwrap();
+            let mut ss = MemSessionStore::default();
+            let mut is = MemIdentityStore {
+                pair: sender,
+                reg_id: 42,
+                known: HashMap::new(),
+            };
+            process_prekey_bundle(
+                &a.to_protocol_address(),
+                &mut ss,
+                &mut is,
+                &bundle,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .unwrap();
+            (ss, is)
+        }
+
+        #[tokio::test]
+        async fn failed_device_is_still_marked_has_key() {
+            let group: Jid = "120363000000000001@g.us".parse().unwrap();
+            let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
+            let own_lid: Jid = "100000000000000@lid".parse().unwrap();
+            // A has a session (encrypts ok); B has neither session nor bundle,
+            // mimicking a device that 406'd / has no key material.
+            let a: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+            let b: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+            let (mut ss, mut is) = established_stores(&a).await;
+            let mut sks = MemSenderKeyStore::default();
+            let mut pks = UnusedPreKeyStore;
+            let spks = UnusedSignedPreKeyStore;
+            let mut stores = SignalStores {
+                sender_key_store: &mut sks,
+                session_store: &mut ss,
+                identity_store: &mut is,
+                prekey_store: &mut pks,
+                signed_prekey_store: &spks,
+            };
+
+            // Empty resolver: no LID overrides; B's prekey fetch returns nothing
+            // → B is dropped by the encrypt fan-out (not in encrypted_devices).
+            let resolver = MockSendContextResolver::new();
+            let rt = TokioTestRuntime;
+
+            let mut group_info = GroupInfo::new(
+                vec![own_jid.to_non_ad(), a.to_non_ad(), b.to_non_ad()],
+                AddressingMode::Pn,
+            );
+            let msg = wa::Message {
+                conversation: Some("hi".into()),
+                ..Default::default()
+            };
+
+            let prepared = prepare_group_stanza(
+                &rt,
+                &mut stores,
+                &resolver,
+                &mut group_info,
+                &own_jid,
+                &own_lid,
+                None,
+                group,
+                &msg,
+                "TESTREQID".into(),
+                false,
+                Some(vec![a.clone(), b.clone()]),
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("prepare_group_stanza should succeed even when a device fails to encrypt");
+
+            let marked: std::collections::HashSet<String> = prepared
+                .skdm_devices
+                .iter()
+                .map(|j| j.to_string())
+                .collect();
+
+            assert!(
+                marked.contains(&a.to_string()),
+                "device that encrypted must be marked"
+            );
+            assert!(
+                marked.contains(&b.to_string()),
+                "device whose SKDM encryption FAILED must still be marked has_key \
+                 (WA Web markHasSenderKey(x, M) marks the full target set → no re-fanout storm)"
+            );
+            assert_eq!(
+                prepared.skdm_devices.len(),
+                2,
+                "exactly the full distribution list (A + B), not just the encrypted subset"
+            );
+
+            // A key-distributing send must carry a phash (computed over the list).
+            assert!(
+                prepared.node.attrs().optional_string("phash").is_some(),
+                "a key-distributing group send must carry a phash"
+            );
+        }
+    }
+
+    /// Item 3 — phash device-set construction. The set hashed is the full
+    /// recipient list PLUS the sending device (which is never in the recipient
+    /// list, since we don't SKDM ourselves), matching WA Web
+    /// `phashV2([].concat(A, [B]))`.
+    ///
+    /// This was confirmed against a real WA Web capture sent to the production
+    /// server: the recipient `<to>` set plus the sending device reproduced the
+    /// exact `phash` on the wire, while the recipient set alone did not — so the
+    /// sending device is part of the hash. Raw identifiers are not committed
+    /// (PII); the vectors below are fictitious but exercise the same logic.
+    mod group_phash_golden {
+        use super::*;
+
+        #[test]
+        fn phash_set_includes_sending_device() {
+            // Fictitious group: a few users with bare (device 0) + companion
+            // devices. The self user appears as a companion (device 0) in the
+            // recipient list; its SENDING device (24) is excluded, mirroring a
+            // real send (we never SKDM ourselves).
+            let recipients: Vec<Jid> = [
+                "100000000000001@lid",
+                "100000000000001:5@lid",
+                "100000000000002@lid",
+                "100000000000003@lid",
+                "100000000000003:12@lid",
+                "100000000000099@lid",
+            ]
+            .iter()
+            .map(|s| s.parse().expect("valid LID jid"))
+            .collect();
+
+            let own_sending: Jid = "100000000000099:24@lid".parse().unwrap();
+            assert!(
+                !recipients
+                    .iter()
+                    .any(|j: &Jid| j.user == "100000000000099" && j.device == 24),
+                "the sending device must not already be in the recipient list"
+            );
+
+            let set = build_group_phash_set(&recipients, &own_sending);
+            assert_eq!(set.len(), 7, "6 recipients + the sending device");
+
+            // Dropping the sending device changes the hash, proving it is part
+            // of the hashed set (WA Web `[].concat(A, [B])`).
+            let with_self = MessageUtils::participant_list_hash(&set).unwrap();
+            let without_self = MessageUtils::participant_list_hash(&recipients).unwrap();
+            assert_ne!(with_self, without_self);
+
+            // Deterministic standard-base64 vectors (regression guard).
+            assert_eq!(without_self, "2:rZoSAdIV");
+            assert_eq!(with_self, "2:sti8OtHX");
+        }
+
+        #[test]
+        fn phash_set_drops_hosted_devices() {
+            // Hosted (Cloud API) devices don't take part in group E2EE and must
+            // not enter the phash, mirroring the SKDM distribution filter.
+            let with_hosted: Vec<Jid> = ["100000000000001@lid", "100000000000002:99@hosted"]
+                .iter()
+                .map(|s| s.parse().expect("valid jid"))
+                .collect();
+            let without_hosted: Vec<Jid> = ["100000000000001@lid"]
+                .iter()
+                .map(|s| s.parse().expect("valid jid"))
+                .collect();
+            let own: Jid = "100000000000099:24@lid".parse().unwrap();
+
+            assert_eq!(
+                build_group_phash_set(&with_hosted, &own),
+                build_group_phash_set(&without_hosted, &own),
+                "hosted devices must not affect the phash set"
+            );
         }
     }
 }

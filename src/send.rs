@@ -462,12 +462,15 @@ impl Client {
         let mut store_adapter = self.signal_adapter_from(device_store_arc.clone());
         let mut stores = store_adapter.as_signal_stores();
 
-        // Determine which devices need SKDM using the unified per-device map
+        // Determine which devices need SKDM using the unified per-device map.
+        // Status keeps the prior phash behavior, so we drop the full device set
+        // and only use the SKDM-target subset.
         let skdm_target_devices: Option<Vec<Jid>> = if force_skdm {
             None
         } else {
             self.resolve_skdm_targets(&to_str, &group_info, &own_lid)
                 .await
+                .map(|(_all, needs)| needs)
         };
 
         // `<meta status_setting>` describes the POSTER's privacy on their own
@@ -497,6 +500,9 @@ impl Client {
             request_id.clone(),
             force_skdm,
             skdm_target_devices,
+            // Status broadcasts keep the prior phash behavior (no full-set/self
+            // augmentation) — that path is group-only.
+            None,
             None,
             &extra_stanza_nodes,
         )
@@ -538,6 +544,7 @@ impl Client {
                         &message,
                         request_id.clone(),
                         true,
+                        None,
                         None,
                         None,
                         &extra_stanza_nodes,
@@ -591,8 +598,12 @@ impl Client {
         })
     }
 
-    /// Resolve which devices need SKDM. Returns `None` for full distribution
-    /// (no cache data), or `Some(devices)` listing devices that need fresh SKDM.
+    /// Resolve the group's device set for a warm/partial send. Returns
+    /// `None` when device resolution fails (caller falls back to the full
+    /// `force_skdm` path), otherwise `Some((all_devices, needs_skdm))` where
+    /// `all_devices` is the complete resolved set (feeds the phash) and
+    /// `needs_skdm` is the subset still missing the sender key (feeds SKDM
+    /// distribution). `needs_skdm` may be empty (fully warm send).
     ///
     /// For LID mode, uses `group_info.phone_jid_for_lid_user` to query devices
     /// via PN when available (LID usync is unreliable for own JID), then
@@ -602,7 +613,7 @@ impl Client {
         group_jid: &str,
         group_info: &wacore::client::context::GroupInfo,
         own_sending_jid: &Jid,
-    ) -> Option<Vec<Jid>> {
+    ) -> Option<(Vec<Jid>, Vec<Jid>)> {
         use crate::sender_key_device_cache::SenderKeyDeviceMap;
 
         // Atomic get-or-init: if another task invalidated the cache during our
@@ -655,8 +666,11 @@ impl Client {
                     all_devices
                 };
 
+                // Borrow for the filter so `all_devices` survives to feed the
+                // phash (the full set), while `needs_skdm` is just the subset
+                // still missing the key.
                 let needs_skdm: Vec<Jid> = all_devices
-                    .into_iter()
+                    .iter()
                     .filter(|device| {
                         if device.is_hosted() {
                             return false;
@@ -672,18 +686,16 @@ impl Client {
                             .unwrap_or(false)
                             || cached_map.is_user_forgotten(&device.user)
                     })
+                    .cloned()
                     .collect();
 
-                if needs_skdm.is_empty() {
-                    Some(vec![])
-                } else {
-                    log::debug!(
-                        "Found {} devices needing SKDM for {}",
-                        needs_skdm.len(),
-                        group_jid
-                    );
-                    Some(needs_skdm)
-                }
+                log::debug!(
+                    "Resolved {} devices ({} need SKDM) for {}",
+                    all_devices.len(),
+                    needs_skdm.len(),
+                    group_jid
+                );
+                Some((all_devices, needs_skdm))
             }
             Err(e) => {
                 log::warn!(
@@ -1137,12 +1149,23 @@ impl Client {
 
             // Determine which devices need SKDM distribution using the unified
             // per-device sender key map (matches WA Web's participant.senderKey Map).
-            let skdm_target_devices: Option<Vec<Jid>> = if force_skdm {
-                None
-            } else {
-                self.resolve_skdm_targets(&to_str, &group_info, &own_sending_jid)
-                    .await
-            };
+            // `all_devices_for_phash` carries the FULL resolved set so the phash
+            // covers every device + self even on a warm send (WA Web sends a
+            // phash on every group send); `skdm_target_devices` is the subset
+            // still missing the key. On the cold/`force_skdm` path both are
+            // `None` and `prepare_group_stanza` resolves the set itself.
+            let (all_devices_for_phash, skdm_target_devices): (Option<Vec<Jid>>, Option<Vec<Jid>>) =
+                if force_skdm {
+                    (None, None)
+                } else {
+                    match self
+                        .resolve_skdm_targets(&to_str, &group_info, &own_sending_jid)
+                        .await
+                    {
+                        Some((all, needs)) => (Some(all), Some(needs)),
+                        None => (None, None),
+                    }
+                };
 
             match wacore::send::prepare_group_stanza(
                 &*self.runtime,
@@ -1157,6 +1180,7 @@ impl Client {
                 request_id.clone(),
                 force_skdm,
                 skdm_target_devices,
+                all_devices_for_phash,
                 edit.clone(),
                 &extra_stanza_nodes,
             )
@@ -1203,6 +1227,7 @@ impl Client {
                             message,
                             request_id,
                             true,
+                            None,
                             None,
                             edit.clone(),
                             &extra_stanza_nodes,
@@ -2606,14 +2631,18 @@ mod tests {
 
         let group_info = GroupInfo::new(participants.clone(), AddressingMode::Lid);
 
-        let result = client
+        let (all_devices, needs_skdm) = client
             .resolve_skdm_targets(group_jid, &group_info, &own_lid)
             .await
-            .expect("None means the empty-cache early-exit is back");
+            .expect("None means device resolution failed");
 
-        assert_eq!(result.len(), participants.len());
+        // Empty cache → every participant needs SKDM, and the full set equals
+        // the target set on this cold path.
+        assert_eq!(needs_skdm.len(), participants.len());
+        assert_eq!(all_devices.len(), participants.len());
         for user in &participant_users {
-            assert!(result.iter().any(|j| j.user == *user));
+            assert!(needs_skdm.iter().any(|j| j.user == *user));
+            assert!(all_devices.iter().any(|j| j.user == *user));
         }
     }
 

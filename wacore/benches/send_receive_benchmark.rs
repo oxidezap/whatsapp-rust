@@ -664,6 +664,7 @@ fn setup_group_recv() -> GrpRecvData {
         false,
         None,
         None,
+        None,
         &[],
     ))
     .unwrap();
@@ -733,6 +734,7 @@ fn run_group_send(d: &mut GrpSendData) {
         &d.msg,
         "b-grp".into(),
         d.force_skdm,
+        None,
         None,
         None,
         &[],
