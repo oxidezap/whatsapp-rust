@@ -105,12 +105,22 @@ impl<'a> InflateReader<'a> {
 
         match status {
             Status::StreamEnd => self.eof = true,
-            _ => {
-                // No progress and not at stream end → truncated/corrupt input.
-                if produced == 0 && self.in_pos >= self.input.len() {
+            // No output produced and not at stream end: distinguish a truncated
+            // tail (no input left → treat as end) from a stalled/corrupt stream
+            // (input remains but the decompressor consumed none → error, instead
+            // of spinning forever since 64 KB of output is always available).
+            // Mirrors the no-progress guard in `decompress_zlib_pooled`.
+            _ if produced == 0 => {
+                if self.in_pos >= self.input.len() {
                     self.eof = true;
+                } else if self.decomp.total_in() == prev_in {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "zlib stream stalled (no progress)",
+                    ));
                 }
             }
+            _ => {}
         }
         Ok(())
     }

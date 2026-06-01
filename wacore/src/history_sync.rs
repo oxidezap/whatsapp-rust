@@ -75,7 +75,10 @@ pub fn process_history_sync(
         conversations_processed: 0,
         tc_token_candidates: Vec::new(),
         msg_secret_records: Vec::with_capacity(estimated_records),
-        decompressed_bytes: if retain_blob { Some(buf.clone()) } else { None },
+        // Always retained on this path: the `!retain_blob` case returned above
+        // and ran the streaming variant, so control only reaches here when the
+        // caller wants the blob.
+        decompressed_bytes: Some(buf.clone()),
     };
 
     while pos < buf.len() {
@@ -248,7 +251,9 @@ fn process_history_sync_streaming(
                     .ensure(8)
                     .map_err(HistorySyncError::DecompressionError)?
                 {
-                    break;
+                    return Err(HistorySyncError::MalformedProtobuf(
+                        "fixed64 field truncated".into(),
+                    ));
                 }
                 reader.consume(8);
             }
@@ -257,7 +262,9 @@ fn process_history_sync_streaming(
                     .ensure(4)
                     .map_err(HistorySyncError::DecompressionError)?
                 {
-                    break;
+                    return Err(HistorySyncError::MalformedProtobuf(
+                        "fixed32 field truncated".into(),
+                    ));
                 }
                 reader.consume(4);
             }
@@ -780,7 +787,15 @@ fn extract_conversation_fields(
                 let Ok(end) = checked_end(pos, len, data.len(), "conv-id") else {
                     break;
                 };
-                chat_id = std::str::from_utf8(&data[pos..end]).unwrap_or("");
+                let Ok(id) = std::str::from_utf8(&data[pos..end]) else {
+                    // A real conversation id is a JID (always UTF-8). If it
+                    // isn't, the conversation is malformed; skip it rather than
+                    // pushing its secrets under an empty chat id. Field 1
+                    // precedes messages (field 2) in tag order, so nothing has
+                    // been extracted from it yet.
+                    return None;
+                };
+                chat_id = id;
                 pos = end;
             }
             (2, wire_type::LENGTH_DELIMITED) => {
