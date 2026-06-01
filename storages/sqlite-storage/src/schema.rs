@@ -49,6 +49,15 @@ diesel::table! {
 }
 
 diesel::table! {
+    group_metadata (group_jid, device_id) {
+        group_jid -> Text,
+        info -> Binary,
+        device_id -> Integer,
+        updated_at -> BigInt,
+    }
+}
+
+diesel::table! {
     device (id) {
         id -> Integer,
         lid -> Text,
@@ -179,6 +188,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     base_keys,
     device,
     device_registry,
+    group_metadata,
     identities,
     lid_pn_mapping,
     msg_secrets,

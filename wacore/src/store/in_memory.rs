@@ -61,6 +61,7 @@ struct InMemoryState {
     pn_to_lid: HashMap<String, String>,
     base_keys: HashMap<BaseKeyKey, Vec<u8>>,
     device_lists: HashMap<String, DeviceListRecord>,
+    group_metadata: HashMap<String, Vec<u8>>,
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
 
@@ -497,6 +498,25 @@ impl ProtocolStore for InMemoryBackend {
         Ok(())
     }
 
+    async fn get_group_metadata(&self, group_jid: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .group_metadata
+            .get(group_jid)
+            .cloned())
+    }
+
+    async fn put_group_metadata(&self, group_jid: &str, blob: &[u8]) -> Result<()> {
+        self.state
+            .lock()
+            .await
+            .group_metadata
+            .insert(group_jid.to_string(), blob.to_vec());
+        Ok(())
+    }
+
     // --- TcToken Storage ---
 
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>> {
@@ -691,6 +711,25 @@ mod tests {
     #[test]
     fn in_memory_backend_implements_backend() {
         is_backend::<InMemoryBackend>();
+    }
+
+    #[tokio::test]
+    async fn group_metadata_round_trip() {
+        use crate::store::traits::ProtocolStore;
+        let backend = InMemoryBackend::new();
+        let jid = "120363000000000001@g.us";
+
+        assert!(backend.get_group_metadata(jid).await.unwrap().is_none());
+        backend.put_group_metadata(jid, b"blob-v1").await.unwrap();
+        assert_eq!(
+            backend.get_group_metadata(jid).await.unwrap().as_deref(),
+            Some(&b"blob-v1"[..])
+        );
+        backend.put_group_metadata(jid, b"blob-v2").await.unwrap();
+        assert_eq!(
+            backend.get_group_metadata(jid).await.unwrap().as_deref(),
+            Some(&b"blob-v2"[..])
+        );
     }
 
     #[tokio::test]

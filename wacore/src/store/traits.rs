@@ -330,6 +330,21 @@ pub trait ProtocolStore: Send + Sync {
     /// Delete a device list record, forcing a network re-fetch on next query.
     async fn delete_devices(&self, user: &str) -> Result<()>;
 
+    // --- Group Metadata Cache (WA Web participant-phash re-query skip) ---
+
+    /// Get the persisted, opaque serialized group metadata blob for `group_jid`.
+    /// The blob is a caller-serialized GroupInfo snapshot; backends without group
+    /// persistence return `None` (the group is then re-queried in full).
+    async fn get_group_metadata(&self, _group_jid: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Persist (upsert) the serialized group metadata blob for `group_jid`.
+    /// No-op by default; backends override to enable the phash re-query skip.
+    async fn put_group_metadata(&self, _group_jid: &str, _blob: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
     // --- TcToken Storage ---
 
     /// Get a trusted contact token for a JID (stored under LID).

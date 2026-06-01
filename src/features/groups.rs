@@ -6,11 +6,12 @@ use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
     BatchGetGroupInfoIq, CancelMembershipRequestsIq, DemoteParticipantsIq, GetGroupInviteInfoIq,
     GetGroupInviteLinkIq, GetGroupProfilePicturesIq, GetMembershipRequestsIq, GroupCreateIq,
-    GroupInfoResponse, GroupParticipantResponse, GroupParticipatingIq, GroupQueryIq, LeaveGroupIq,
-    MembershipRequestActionIq, PromoteParticipantsIq, RemoveParticipantsIq, RevokeRequestCodeIq,
-    SetAllowAdminReportsIq, SetGroupAnnouncementIq, SetGroupDescriptionIq, SetGroupEphemeralIq,
-    SetGroupHistoryIq, SetGroupLockedIq, SetGroupMembershipApprovalIq, SetGroupSubjectIq,
-    SetMemberAddModeIq, SetNoFrequentlyForwardedIq, normalize_participants,
+    GroupInfoOutcome, GroupInfoResponse, GroupParticipantResponse, GroupParticipatingIq,
+    GroupQueryIq, LeaveGroupIq, MembershipRequestActionIq, PromoteParticipantsIq,
+    RemoveParticipantsIq, RevokeRequestCodeIq, SetAllowAdminReportsIq, SetGroupAnnouncementIq,
+    SetGroupDescriptionIq, SetGroupEphemeralIq, SetGroupHistoryIq, SetGroupLockedIq,
+    SetGroupMembershipApprovalIq, SetGroupSubjectIq, SetMemberAddModeIq,
+    SetNoFrequentlyForwardedIq, normalize_participants,
 };
 use wacore::types::message::AddressingMode;
 use wacore_binary::{Jid, JidExt as _};
@@ -191,7 +192,37 @@ impl<'a> Groups<'a> {
             return Ok(cached);
         }
 
-        let group = self.client.execute(GroupQueryIq::new(jid)).await?;
+        // Send the persisted participant phash (WA Web queryGroup phash) so the
+        // server can answer "not-modified" by omitting <group> for an unchanged
+        // group, letting us reuse the persisted metadata instead of re-parsing it.
+        let jid_str = jid.to_string();
+        let backend = self.client.persistence_manager.backend();
+        let persisted: Option<GroupInfo> = match backend.get_group_metadata(&jid_str).await {
+            Ok(Some(blob)) => serde_json::from_slice(&blob).ok(),
+            _ => None,
+        };
+        let phash = persisted.as_ref().and_then(|info| {
+            wacore::messages::MessageUtils::participant_list_hash(&info.participants).ok()
+        });
+
+        let group = match self
+            .client
+            .execute(GroupQueryIq::with_phash(jid, phash))
+            .await?
+        {
+            GroupInfoOutcome::NotModified => {
+                let info = persisted.ok_or_else(|| {
+                    anyhow::anyhow!("server returned not-modified group but nothing was cached")
+                })?;
+                self.client
+                    .get_group_cache()
+                    .await
+                    .insert(jid.clone(), info.clone())
+                    .await;
+                return Ok(info);
+            }
+            GroupInfoOutcome::Full(group) => *group,
+        };
 
         // Single pass: move participants out and build lid_to_pn_map alongside.
         let n = group.participants.len();
@@ -238,6 +269,17 @@ impl<'a> Groups<'a> {
             info.set_lid_to_pn_map(lid_to_pn_map);
         }
 
+        // Persist so the next query can send this group's participant phash and
+        // skip the full re-query when membership is unchanged.
+        match serde_json::to_vec(&info) {
+            Ok(blob) => {
+                if let Err(e) = backend.put_group_metadata(&jid_str, &blob).await {
+                    log::warn!("Failed to persist group metadata for {jid}: {e}");
+                }
+            }
+            Err(e) => log::warn!("Failed to serialize group metadata for {jid}: {e}"),
+        }
+
         self.client
             .get_group_cache()
             .await
@@ -264,8 +306,13 @@ impl<'a> Groups<'a> {
     }
 
     pub async fn get_metadata(&self, jid: &Jid) -> Result<GroupMetadata, anyhow::Error> {
-        let group = self.client.execute(GroupQueryIq::new(jid)).await?;
-        Ok(GroupMetadata::from(group))
+        // No phash is sent, so the server always returns the full group.
+        match self.client.execute(GroupQueryIq::new(jid)).await? {
+            GroupInfoOutcome::Full(group) => Ok(GroupMetadata::from(*group)),
+            GroupInfoOutcome::NotModified => Err(anyhow::anyhow!(
+                "group query returned not-modified without a phash"
+            )),
+        }
     }
 
     pub async fn create_group(

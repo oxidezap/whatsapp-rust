@@ -2333,6 +2333,59 @@ impl ProtocolStore for SqliteStore {
         Ok(())
     }
 
+    async fn get_group_metadata(&self, group_jid: &str) -> Result<Option<Vec<u8>>> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let group_jid = group_jid.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            let row: Option<Vec<u8>> = group_metadata::table
+                .select(group_metadata::info)
+                .filter(group_metadata::group_jid.eq(&group_jid))
+                .filter(group_metadata::device_id.eq(device_id))
+                .first(&mut conn)
+                .optional()
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(row)
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?
+    }
+
+    async fn put_group_metadata(&self, group_jid: &str, blob: &[u8]) -> Result<()> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let group_jid = group_jid.to_string();
+        let blob = blob.to_vec();
+        let now = wacore::time::now_secs();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            diesel::insert_into(group_metadata::table)
+                .values((
+                    group_metadata::group_jid.eq(&group_jid),
+                    group_metadata::info.eq(&blob),
+                    group_metadata::device_id.eq(device_id),
+                    group_metadata::updated_at.eq(now),
+                ))
+                .on_conflict((group_metadata::group_jid, group_metadata::device_id))
+                .do_update()
+                .set((
+                    group_metadata::info.eq(&blob),
+                    group_metadata::updated_at.eq(now),
+                ))
+                .execute(&mut conn)
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))??;
+        Ok(())
+    }
+
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
@@ -3286,6 +3339,28 @@ mod tests {
         assert!(
             reloaded.server_cert_chain.is_none(),
             "cleared chain must round-trip as None"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_metadata_round_trip_sqlite() {
+        use wacore::store::traits::ProtocolStore;
+        let store = create_test_store().await;
+        let jid = "120363000000000001@g.us";
+
+        assert!(store.get_group_metadata(jid).await.unwrap().is_none());
+
+        store.put_group_metadata(jid, b"blob-v1").await.unwrap();
+        assert_eq!(
+            store.get_group_metadata(jid).await.unwrap().as_deref(),
+            Some(&b"blob-v1"[..])
+        );
+
+        // Upsert overwrites the prior blob.
+        store.put_group_metadata(jid, b"blob-v2").await.unwrap();
+        assert_eq!(
+            store.get_group_metadata(jid).await.unwrap().as_deref(),
+            Some(&b"blob-v2"[..])
         );
     }
 
