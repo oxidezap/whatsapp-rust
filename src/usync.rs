@@ -50,26 +50,44 @@ impl Client {
     /// simply absent here, so their cached records are left untouched (the
     /// merge-safe behavior the `device_hash` optimization depends on).
     async fn process_device_list_response(&self, response: &DeviceListResponse) -> Vec<Jid> {
-        // Extract and persist LID mappings from the response
-        for mapping in &response.lid_mappings {
-            if let Err(err) = self
-                .add_lid_pn_mapping(
-                    &mapping.lid,
-                    &mapping.phone_number,
-                    crate::lid_pn_cache::LearningSource::Usync,
-                )
-                .await
-            {
-                warn!(
-                    "Failed to persist LID {} -> {} from usync: {err}",
-                    mapping.lid, mapping.phone_number,
-                );
-                continue;
+        // Learn LID↔PN mappings from the response via the batched, guarded path:
+        // one detached DB transaction for genuinely-new pairs (skipping ones
+        // already durably learned, e.g. by query_info's batch learn right before
+        // a group send). The previous per-mapping add_lid_pn_mapping awaited a DB
+        // write + migrations serially, so a large cold group send redid ~N writes
+        // on the critical path for mappings we already had. Falls back to the
+        // per-mapping path if the owning Arc<Client> isn't available.
+        if !response.lid_mappings.is_empty() {
+            if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
+                let mappings: Vec<(String, String)> = response
+                    .lid_mappings
+                    .iter()
+                    .map(|m| (m.lid.to_string(), m.phone_number.to_string()))
+                    .collect();
+                client
+                    .learn_lid_pn_mappings_batch(
+                        mappings,
+                        crate::lid_pn_cache::LearningSource::Usync,
+                        false,
+                    )
+                    .await;
+            } else {
+                for mapping in &response.lid_mappings {
+                    if let Err(err) = self
+                        .add_lid_pn_mapping(
+                            &mapping.lid,
+                            &mapping.phone_number,
+                            crate::lid_pn_cache::LearningSource::Usync,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "Failed to persist LID {} -> {} from usync: {err}",
+                            mapping.lid, mapping.phone_number,
+                        );
+                    }
+                }
             }
-            debug!(
-                "Learned LID mapping from usync: {} -> {}",
-                mapping.lid, mapping.phone_number
-            );
         }
 
         let mut fetched_devices = Vec::with_capacity(response.device_lists.len());
