@@ -50,13 +50,18 @@ impl Client {
     /// simply absent here, so their cached records are left untouched (the
     /// merge-safe behavior the `device_hash` optimization depends on).
     async fn process_device_list_response(&self, response: &DeviceListResponse) -> Vec<Jid> {
-        // Learn LID↔PN mappings from the response via the batched, guarded path:
-        // one detached DB transaction for genuinely-new pairs (skipping ones
-        // already durably learned, e.g. by query_info's batch learn right before
-        // a group send). The previous per-mapping add_lid_pn_mapping awaited a DB
-        // write + migrations serially, so a large cold group send redid ~N writes
-        // on the critical path for mappings we already had. Falls back to the
-        // per-mapping path if the owning Arc<Client> isn't available.
+        // Learn LID↔PN mappings via the same batched, guarded learner query_info
+        // uses (one detached transaction, skipping already-durable pairs), so
+        // per-mapping DB writes stay off the send's critical path. Falls back to
+        // the per-mapping path if the owning Arc<Client> isn't available.
+        //
+        // Ordering: the old per-mapping path AWAITED migrate_signal_sessions_on_lid_discovery.
+        // Detaching it can let a standalone usync (sync_own_device_list /
+        // flush_pending_device_sync) that is the FIRST learner of a LID for a
+        // contact with prior PN Signal state encrypt before the PN-wins migration
+        // runs — but the per-address session_lock_for both take is the real
+        // barrier (they can't interleave). The group-send path is unchanged:
+        // query_info already learns these same pairs detached upstream.
         if !response.lid_mappings.is_empty() {
             if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
                 let mappings: Vec<(String, String)> = response
@@ -450,6 +455,44 @@ mod tests {
             b_devices.len(),
             2,
             "omitted user's devices must be preserved"
+        );
+    }
+
+    /// The batched LID-PN learn path warms the in-memory cache SYNCHRONOUSLY
+    /// (the persist runs detached), so a mapping from the usync response is
+    /// resolvable the moment `process_device_list_response` returns. Locks the
+    /// contract that the new path doesn't defer the cache update.
+    #[tokio::test]
+    async fn process_response_warms_lid_pn_cache_synchronously() {
+        use wacore::usync::UsyncLidMapping;
+
+        let client = create_test_client().await;
+        let response = DeviceListResponse {
+            device_lists: vec![],
+            lid_mappings: vec![UsyncLidMapping {
+                phone_number: "559980000123".into(),
+                lid: "100000000000123".into(),
+            }],
+        };
+
+        assert!(
+            client
+                .lid_pn_cache
+                .get_current_lid("559980000123")
+                .await
+                .is_none()
+        );
+
+        let _ = client.process_device_list_response(&response).await;
+
+        assert_eq!(
+            client
+                .lid_pn_cache
+                .get_current_lid("559980000123")
+                .await
+                .as_deref(),
+            Some("100000000000123"),
+            "usync LID mapping must be in the cache synchronously after the call"
         );
     }
 }
