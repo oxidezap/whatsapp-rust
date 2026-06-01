@@ -7,6 +7,12 @@ thread_local! {
         Decompress::new(true),
         Vec::with_capacity(4096),
     ));
+
+    // Free-list of streaming-reader state (Decompress ~48 KB + 64 KB buf). A
+    // connection's bootstrap history sync decompresses several blobs sequentially,
+    // each via a fresh `InflateReader`; reusing the state avoids re-initializing
+    // zlib and re-allocating the buffer per blob.
+    static INFLATE_POOL: RefCell<Vec<(Decompress, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Streaming zlib reader: decompresses `input` incrementally into a small
@@ -19,7 +25,9 @@ thread_local! {
 pub struct InflateReader<'a> {
     input: &'a [u8],
     in_pos: usize,
-    decomp: Decompress,
+    // `Option` so `Drop` can move the state back into the pool (Decompress has no
+    // cheap throwaway value to swap in). Always `Some` until dropped.
+    decomp: Option<Decompress>,
     buf: Vec<u8>,
     cursor: usize,
     total_out: u64,
@@ -30,13 +38,24 @@ pub struct InflateReader<'a> {
 impl<'a> InflateReader<'a> {
     /// Output decompress window per pump; also the compaction threshold.
     const CHUNK: usize = 64 * 1024;
+    /// Cap on retained free-list entries, so concurrently-alive readers on one
+    /// thread don't grow the pool unbounded.
+    const POOL_MAX: usize = 4;
 
     pub fn new(input: &'a [u8], max: u64) -> Self {
+        let (decomp, buf) = INFLATE_POOL.with(|p| p.borrow_mut().pop()).map_or_else(
+            || (Decompress::new(true), Vec::with_capacity(Self::CHUNK)),
+            |(mut decomp, mut buf)| {
+                decomp.reset(true);
+                buf.clear();
+                (decomp, buf)
+            },
+        );
         Self {
             input,
             in_pos: 0,
-            decomp: Decompress::new(true),
-            buf: Vec::with_capacity(Self::CHUNK),
+            decomp: Some(decomp),
+            buf,
             cursor: 0,
             total_out: 0,
             max,
@@ -82,18 +101,19 @@ impl<'a> InflateReader<'a> {
         }
 
         let mut chunk = [0u8; Self::CHUNK];
-        let prev_in = self.decomp.total_in();
-        let prev_out = self.decomp.total_out();
-        let status = self
-            .decomp
+        let decomp = self.decomp.as_mut().expect("decomp present until drop");
+        let prev_in = decomp.total_in();
+        let prev_out = decomp.total_out();
+        let status = decomp
             .decompress(
                 &self.input[self.in_pos..],
                 &mut chunk,
                 FlushDecompress::None,
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let produced = (self.decomp.total_out() - prev_out) as usize;
-        self.in_pos += (self.decomp.total_in() - prev_in) as usize;
+        let new_in = decomp.total_in();
+        let produced = (decomp.total_out() - prev_out) as usize;
+        self.in_pos += (new_in - prev_in) as usize;
         self.total_out += produced as u64;
         if self.total_out > self.max {
             return Err(io::Error::new(
@@ -113,7 +133,7 @@ impl<'a> InflateReader<'a> {
             _ if produced == 0 => {
                 if self.in_pos >= self.input.len() {
                     self.eof = true;
-                } else if self.decomp.total_in() == prev_in {
+                } else if new_in == prev_in {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "zlib stream stalled (no progress)",
@@ -123,6 +143,22 @@ impl<'a> InflateReader<'a> {
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl Drop for InflateReader<'_> {
+    fn drop(&mut self) {
+        // Return the decompressor + buffer to the per-thread free-list for reuse.
+        // `reset` on the next checkout makes prior stream state (incl. errors) moot.
+        if let Some(decomp) = self.decomp.take() {
+            let buf = std::mem::take(&mut self.buf);
+            INFLATE_POOL.with(|p| {
+                let mut pool = p.borrow_mut();
+                if pool.len() < Self::POOL_MAX {
+                    pool.push((decomp, buf));
+                }
+            });
+        }
     }
 }
 
@@ -279,5 +315,40 @@ mod tests {
         let compressed = zlib(&original);
         let one_shot = decompress_zlib_pooled(&compressed, 64 * 1024 * 1024).unwrap();
         assert_eq!(one_shot, original);
+    }
+
+    fn drain_reader(compressed: &[u8], n: usize) -> Vec<u8> {
+        let mut r = InflateReader::new(compressed, 64 * 1024 * 1024);
+        let mut out = Vec::with_capacity(n);
+        while r.ensure(1).unwrap() {
+            let take = r.available().len();
+            out.extend_from_slice(r.available());
+            r.consume(take);
+        }
+        assert!(r.is_done());
+        out
+    }
+
+    #[test]
+    fn inflate_reader_reuses_pool_state_correctly() {
+        // Back-to-back readers each checkout the pooled Decompress and reset it, so
+        // no state may carry over between streams. Verify several sizes in sequence.
+        for n in [10_000usize, 250_000, 1, 80_000] {
+            let original = varied(n);
+            assert_eq!(drain_reader(&zlib(&original), n), original, "size {n}");
+        }
+    }
+
+    #[test]
+    fn inflate_reader_reuse_after_error() {
+        // A reader aborted mid-stream (max exceeded) returns partial zlib state to
+        // the pool; the next checkout must reset it and decompress a full stream.
+        {
+            let compressed = zlib(&varied(500_000));
+            let mut r = InflateReader::new(&compressed, 4096);
+            assert!(r.ensure(500_000).is_err());
+        }
+        let original = varied(120_000);
+        assert_eq!(drain_reader(&zlib(&original), 120_000), original);
     }
 }
