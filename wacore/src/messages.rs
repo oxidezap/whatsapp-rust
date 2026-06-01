@@ -54,6 +54,15 @@ impl MessageUtils {
         ))
     }
 
+    /// Validate a broadcast-contact-list hash from an incoming `deviceSentMessage`
+    /// against the message's `<participants>` set. Mirrors WA Web `validateBclHash`:
+    /// the sender (our own other device) hashes the broadcast recipients with
+    /// phashV2; we recompute over the same set and compare. Returns `true` when
+    /// they match (or trivially when there are no participants to hash).
+    pub fn validate_bcl_hash(participants: &[wacore_binary::Jid], expected: &str) -> bool {
+        Self::participant_list_hash(participants).is_ok_and(|computed| computed == expected)
+    }
+
     pub fn unpad_message_ref(plaintext: &[u8], version: u8) -> Result<&[u8]> {
         if version == 3 {
             return Ok(plaintext);
@@ -249,6 +258,21 @@ pub fn parse_message_info(
 
     source.addressing_mode = addressing_mode;
 
+    // Broadcast/status only: collect <participants><to jid> so the receive path
+    // can validate a deviceSentMessage.phash (WA Web validateBclHash). Group
+    // <participants> carry the device fanout, not a bcl, so they're skipped.
+    let bcl_participants: Vec<wacore_binary::Jid> = if from.server == Server::Broadcast {
+        node.get_optional_child("participants")
+            .map(|p| {
+                p.get_children_by_tag("to")
+                    .filter_map(|to| to.attrs().optional_jid("jid"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let category = attrs
         .optional_string("category")
         .map(|s| MessageCategory::from(s.as_ref()))
@@ -351,6 +375,7 @@ pub fn parse_message_info(
         peer_recipient_pn,
         meta_info,
         bot_info,
+        bcl_participants,
         ..Default::default()
     })
 }
@@ -649,5 +674,68 @@ mod parse_message_info_tests {
         assert_eq!(h_single, "2:5s+YxCff");
         assert_eq!(h_control, "2:RJWVxcMQ");
         assert_eq!(h_multi, "2:AAv/hwhn");
+    }
+
+    // #6 — validate_bcl_hash accepts the matching phashV2 and rejects a tampered
+    // one (the WA Web validateBclHash check on device-sent broadcasts).
+    #[test]
+    fn validate_bcl_hash_matches_and_rejects() {
+        let participants = vec![
+            Jid::from_str("100000000000001@lid").unwrap(),
+            Jid::from_str("100000000000002@lid").unwrap(),
+        ];
+        let good = MessageUtils::participant_list_hash(&participants).unwrap();
+        assert!(MessageUtils::validate_bcl_hash(&participants, &good));
+        assert!(!MessageUtils::validate_bcl_hash(&participants, "2:wrongxx"));
+    }
+
+    // #6 — broadcast/status stanzas expose <participants><to jid> as
+    // `bcl_participants` (for the device-sent phash check).
+    #[test]
+    fn broadcast_populates_bcl_participants() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "status@broadcast")
+            .attr("type", "media")
+            .attr("id", "BCL-1")
+            .attr("t", "1777415965")
+            .attr("participant", "559980000001@s.whatsapp.net")
+            .children([NodeBuilder::new("participants")
+                .children([
+                    NodeBuilder::new("to")
+                        .attr("jid", "100000000000001@lid")
+                        .build(),
+                    NodeBuilder::new("to")
+                        .attr("jid", "100000000000002@lid")
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+        assert_eq!(info.bcl_participants.len(), 2);
+    }
+
+    // #6 — a group's <participants> is the device fanout, NOT a bcl, so it must
+    // not feed the bcl hash check.
+    #[test]
+    fn group_participants_do_not_populate_bcl() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "120363000000000001@g.us")
+            .attr("participant", "559980000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "G-1")
+            .attr("t", "1777415965")
+            .children([NodeBuilder::new("participants")
+                .children([NodeBuilder::new("to")
+                    .attr("jid", "559980000002:3@s.whatsapp.net")
+                    .build()])
+                .build()])
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+        assert!(
+            info.bcl_participants.is_empty(),
+            "group fanout participants are not a bcl"
+        );
     }
 }

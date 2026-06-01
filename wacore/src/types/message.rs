@@ -338,6 +338,12 @@ pub struct MessageInfo {
     /// goes to the right routing target).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_recipient_pn: Option<Jid>,
+    /// Broadcast-contact-list recipients from `<participants><to jid>` on an
+    /// incoming broadcast/status stanza. Populated only for broadcasts; used to
+    /// validate a `deviceSentMessage.phash` (WA Web `validateBclHash`). Empty
+    /// otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub bcl_participants: Vec<Jid>,
 }
 
 impl MessageInfo {

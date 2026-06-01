@@ -2441,6 +2441,22 @@ impl Client {
             );
         }
 
+        // WA Web validateBclHash: a self-synced broadcast/status carries a
+        // phashV2 of the broadcast recipients in deviceSentMessage.phash.
+        // Recompute over our <participants> view and warn on divergence. We log
+        // only (no drop) until the participant hash form is confirmed live.
+        if let Some(dsm) = &original_msg.device_sent_message
+            && let Some(expected) = dsm.phash.as_deref()
+            && !info.bcl_participants.is_empty()
+            && !wacore::messages::MessageUtils::validate_bcl_hash(&info.bcl_participants, expected)
+        {
+            warn!(
+                "[msg:{}] bcl hash mismatch on device-sent broadcast (expected={expected}); \
+                 keeping message (validate-only)",
+                info.id,
+            );
+        }
+
         // Unwrap DeviceSentMessage wrapper (self-sent messages synced from
         // the primary device). The actual content (reactions, text, etc.)
         // is nested inside device_sent_message.message and must be
@@ -6237,6 +6253,7 @@ mod tests {
             verified_level: None,
             verified_name_serial: None,
             peer_recipient_pn: None,
+            bcl_participants: Vec::new(),
         }
     }
 
