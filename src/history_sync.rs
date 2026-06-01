@@ -1,4 +1,4 @@
-use crate::types::events::{Event, LazyHistorySync};
+use crate::types::events::{Event, EventKind, LazyHistorySync};
 use std::sync::Arc;
 use wacore::history_sync::{HistoryMsgSecretRecord, TcTokenCandidate, process_history_sync};
 use wacore::store::traits::{MsgSecretEntry, TcTokenEntry};
@@ -145,8 +145,11 @@ impl Client {
             device_snapshot.pn.as_ref().map(|j| j.to_non_ad().user)
         };
 
-        let has_listeners = self.core.event_bus.has_handlers();
-        let retain_history_blob = has_listeners;
+        // Retain (and fully decompress) the blob only when a handler actually
+        // wants HistorySync. A message-only bot leaves this false, so the
+        // streaming decompress-and-parse path runs instead of materializing the
+        // whole payload just to drop it at dispatch.
+        let retain_history_blob = self.core.event_bus.has_handler_for(EventKind::HistorySync);
 
         // Small blobs (PushName, Recent): decode inline to avoid spawn_blocking overhead.
         // Large blobs: use blocking thread to avoid stalling the async runtime.

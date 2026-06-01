@@ -350,6 +350,17 @@ impl CoreEventBus {
             .is_empty()
     }
 
+    /// Whether any registered handler is interested in `kind`. Lets callers
+    /// skip producing an event nobody would receive (e.g. retaining a large
+    /// `HistorySync` blob when only message-only handlers are registered).
+    pub fn has_handler_for(&self, kind: EventKind) -> bool {
+        self.handlers
+            .read()
+            .expect("RwLock should not be poisoned")
+            .iter()
+            .any(|h| h.interest().wants(kind))
+    }
+
     pub fn dispatch(&self, event: Event) {
         let handlers = self
             .handlers
