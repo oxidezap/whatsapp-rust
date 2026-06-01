@@ -105,6 +105,15 @@ impl LidPnCache {
         self.pn_to_entry.get(phone).await.map(|e| e.lid.clone())
     }
 
+    /// Whether the cached LID for `phone` equals `lid`, comparing in place
+    /// instead of cloning the LID out like `get_current_lid(..) == Some(lid)`.
+    pub(crate) async fn current_lid_is(&self, phone: &str, lid: &str) -> bool {
+        self.pn_to_entry
+            .get(phone)
+            .await
+            .is_some_and(|e| e.lid == lid)
+    }
+
     /// Get the phone number for a LID.
     ///
     /// Returns the phone number user part if a mapping exists, None otherwise.

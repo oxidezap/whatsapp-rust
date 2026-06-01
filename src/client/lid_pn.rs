@@ -103,12 +103,7 @@ impl Client {
         // and cache-resolvable to this exact lid (so a remap or an evicted entry
         // re-warms). `source` drift is ignored (best-effort metadata).
         if self.lid_pn_cache.is_persisted(phone_number).await
-            && self
-                .lid_pn_cache
-                .get_current_lid(phone_number)
-                .await
-                .as_deref()
-                == Some(lid)
+            && self.lid_pn_cache.current_lid_is(phone_number, lid).await
         {
             return;
         }
