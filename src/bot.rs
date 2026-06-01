@@ -5,7 +5,7 @@ use crate::store::commands::DeviceCommand;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::store::traits::Backend;
 use crate::types::enc_handler::EncHandler;
-use crate::types::events::{Event, EventHandler};
+use crate::types::events::{Event, EventHandler, EventInterest, EventKind};
 use crate::types::message::MessageInfo;
 use anyhow::Result;
 use log::{info, warn};
@@ -119,15 +119,23 @@ impl MessageContext {
 type EventHandlerCallback =
     Arc<dyn Fn(Arc<Event>, Arc<Client>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// The user callback bundled with the set of event kinds it wants. Carrying the
+/// interest here lets the bus skip materializing (and boxing) events the
+/// callback ignores.
+struct RegisteredHandler {
+    callback: EventHandlerCallback,
+    interest: EventInterest,
+}
+
 struct BotEventHandler {
     client: Arc<Client>,
-    event_handler: Option<EventHandlerCallback>,
+    event_handler: Option<RegisteredHandler>,
 }
 
 impl EventHandler for BotEventHandler {
     fn handle_event(&self, event: Arc<Event>) {
         if let Some(handler) = &self.event_handler {
-            let handler_clone = handler.clone();
+            let handler_clone = handler.callback.clone();
             let client_clone = self.client.clone();
 
             self.client
@@ -137,6 +145,13 @@ impl EventHandler for BotEventHandler {
                 }))
                 .detach();
         }
+    }
+
+    fn interest(&self) -> EventInterest {
+        self.event_handler
+            .as_ref()
+            .map(|h| h.interest)
+            .unwrap_or(EventInterest::none())
     }
 }
 
@@ -168,7 +183,7 @@ impl std::future::Future for BotHandle {
 pub struct Bot {
     client: Arc<Client>,
     sync_task_receiver: Option<async_channel::Receiver<crate::sync_task::MajorSyncTask>>,
-    event_handler: Option<EventHandlerCallback>,
+    event_handler: Option<RegisteredHandler>,
     pair_code_options: Option<PairCodeOptions>,
 }
 
@@ -274,7 +289,7 @@ pub struct BotBuilder<B = Missing, T = Missing, H = Missing, R = Missing> {
     http_client: Option<Arc<dyn crate::http::HttpClient>>,
     runtime: Option<Arc<dyn Runtime>>,
     // Optional fields
-    event_handler: Option<EventHandlerCallback>,
+    event_handler: Option<RegisteredHandler>,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     override_version: Option<(u32, u32, u32)>,
     device_props_override: Option<DevicePropsOverride>,
@@ -444,14 +459,35 @@ impl<B, T, H> BotBuilder<B, T, H, Missing> {
 // ── Optional-field setters (available in any state) ──────────────────────
 
 impl<B, T, H, R> BotBuilder<B, T, H, R> {
-    pub fn on_event<F, Fut>(mut self, handler: F) -> Self
+    /// Register a handler that receives every event kind.
+    pub fn on_event<F, Fut>(self, handler: F) -> Self
     where
         F: Fn(Arc<Event>, Arc<Client>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.event_handler = Some(Arc::new(move |event, client| {
-            Box::pin(handler(event, client))
-        }));
+        self.register_event_handler(EventInterest::ALL, handler)
+    }
+
+    /// Register a handler that receives only the given event kinds. The bus
+    /// skips materializing (and boxing the handler future for) every other
+    /// kind, so a narrowly-scoped bot does not pay for events it ignores.
+    pub fn on_event_for<F, Fut>(self, kinds: &[EventKind], handler: F) -> Self
+    where
+        F: Fn(Arc<Event>, Arc<Client>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.register_event_handler(EventInterest::of(kinds), handler)
+    }
+
+    fn register_event_handler<F, Fut>(mut self, interest: EventInterest, handler: F) -> Self
+    where
+        F: Fn(Arc<Event>, Arc<Client>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.event_handler = Some(RegisteredHandler {
+            callback: Arc::new(move |event, client| Box::pin(handler(event, client))),
+            interest,
+        });
         self
     }
 

@@ -192,8 +192,108 @@ impl Serialize for LazyHistorySync {
     }
 }
 
+/// Discriminant for each [`Event`] variant, used to express handler interest
+/// without materializing the event. One per `Event` variant, in declaration
+/// order; the value doubles as a bit index in [`EventInterest`], so there can
+/// be at most 64 kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EventKind {
+    Connected,
+    Disconnected,
+    PairSuccess,
+    PairError,
+    LoggedOut,
+    PairingQrCode,
+    PairingCode,
+    QrScannedWithoutMultidevice,
+    ClientOutdated,
+    Message,
+    Receipt,
+    UndecryptableMessage,
+    Notification,
+    ChatPresence,
+    Presence,
+    PictureUpdate,
+    UserAboutUpdate,
+    ContactUpdated,
+    ContactNumberChanged,
+    ContactSyncRequested,
+    GroupUpdate,
+    ContactUpdate,
+    IncomingCall,
+    PushNameUpdate,
+    SelfPushNameUpdated,
+    PinUpdate,
+    MuteUpdate,
+    ArchiveUpdate,
+    StarUpdate,
+    MarkChatAsReadUpdate,
+    DeleteChatUpdate,
+    DeleteMessageForMeUpdate,
+    HistorySync,
+    OfflineSyncPreview,
+    OfflineSyncCompleted,
+    DeviceListUpdate,
+    IdentityChange,
+    BusinessStatusUpdate,
+    StreamReplaced,
+    TemporaryBan,
+    ConnectFailure,
+    StreamError,
+    DisappearingModeChanged,
+    NewsletterLiveUpdate,
+    RawNode,
+    MexNotification,
+}
+
+/// A set of [`EventKind`]s a handler wants delivered. The event bus skips
+/// materializing and dispatching events whose kind no handler wants, so a
+/// handler that subscribes to a few kinds never pays for boxing the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventInterest(u64);
+
+impl EventInterest {
+    /// Every kind. Default for handlers that don't narrow their interest.
+    pub const ALL: EventInterest = EventInterest(u64::MAX);
+
+    /// No kinds.
+    pub const fn none() -> Self {
+        EventInterest(0)
+    }
+
+    /// Interest in exactly the given kinds.
+    pub fn of(kinds: &[EventKind]) -> Self {
+        let mut bits = 0u64;
+        let mut i = 0;
+        while i < kinds.len() {
+            bits |= 1u64 << (kinds[i] as u8);
+            i += 1;
+        }
+        EventInterest(bits)
+    }
+
+    /// Add a kind to the set.
+    pub const fn with(self, kind: EventKind) -> Self {
+        EventInterest(self.0 | (1u64 << (kind as u8)))
+    }
+
+    /// Whether `kind` is in the set.
+    #[inline]
+    pub const fn wants(self, kind: EventKind) -> bool {
+        self.0 & (1u64 << (kind as u8)) != 0
+    }
+}
+
 pub trait EventHandler: crate::sync_marker::MaybeSendSync {
     fn handle_event(&self, event: Arc<Event>);
+
+    /// Which event kinds this handler wants. Defaults to all kinds, so the bus
+    /// keeps delivering everything to handlers that don't opt into a narrower
+    /// set. Override to let the bus skip materializing unwanted events.
+    fn interest(&self) -> EventInterest {
+        EventInterest::ALL
+    }
 }
 
 /// Event handler that forwards events to an async channel.
@@ -259,9 +359,18 @@ impl CoreEventBus {
         if handlers.is_empty() {
             return;
         }
+        // Skip materializing the event (Arc) and invoking handlers whose
+        // declared interest excludes this kind. A handler that subscribed to a
+        // few kinds never pays for boxing the events it ignores.
+        let kind = event.kind();
+        if !handlers.iter().any(|h| h.interest().wants(kind)) {
+            return;
+        }
         let event = Arc::new(event);
         for handler in &handlers {
-            handler.handle_event(Arc::clone(&event));
+            if handler.interest().wants(kind) {
+                handler.handle_event(Arc::clone(&event));
+            }
         }
     }
 }
@@ -529,6 +638,59 @@ pub struct MexNotification {
 }
 
 impl Event {
+    /// The [`EventKind`] discriminant for this event, used by the bus to test
+    /// handler interest before materializing the event.
+    pub fn kind(&self) -> EventKind {
+        match self {
+            Event::Connected(_) => EventKind::Connected,
+            Event::Disconnected(_) => EventKind::Disconnected,
+            Event::PairSuccess(_) => EventKind::PairSuccess,
+            Event::PairError(_) => EventKind::PairError,
+            Event::LoggedOut(_) => EventKind::LoggedOut,
+            Event::PairingQrCode { .. } => EventKind::PairingQrCode,
+            Event::PairingCode { .. } => EventKind::PairingCode,
+            Event::QrScannedWithoutMultidevice(_) => EventKind::QrScannedWithoutMultidevice,
+            Event::ClientOutdated(_) => EventKind::ClientOutdated,
+            Event::Message(_, _) => EventKind::Message,
+            Event::Receipt(_) => EventKind::Receipt,
+            Event::UndecryptableMessage(_) => EventKind::UndecryptableMessage,
+            Event::Notification(_) => EventKind::Notification,
+            Event::ChatPresence(_) => EventKind::ChatPresence,
+            Event::Presence(_) => EventKind::Presence,
+            Event::PictureUpdate(_) => EventKind::PictureUpdate,
+            Event::UserAboutUpdate(_) => EventKind::UserAboutUpdate,
+            Event::ContactUpdated(_) => EventKind::ContactUpdated,
+            Event::ContactNumberChanged(_) => EventKind::ContactNumberChanged,
+            Event::ContactSyncRequested(_) => EventKind::ContactSyncRequested,
+            Event::GroupUpdate(_) => EventKind::GroupUpdate,
+            Event::ContactUpdate(_) => EventKind::ContactUpdate,
+            Event::IncomingCall(_) => EventKind::IncomingCall,
+            Event::PushNameUpdate(_) => EventKind::PushNameUpdate,
+            Event::SelfPushNameUpdated(_) => EventKind::SelfPushNameUpdated,
+            Event::PinUpdate(_) => EventKind::PinUpdate,
+            Event::MuteUpdate(_) => EventKind::MuteUpdate,
+            Event::ArchiveUpdate(_) => EventKind::ArchiveUpdate,
+            Event::StarUpdate(_) => EventKind::StarUpdate,
+            Event::MarkChatAsReadUpdate(_) => EventKind::MarkChatAsReadUpdate,
+            Event::DeleteChatUpdate(_) => EventKind::DeleteChatUpdate,
+            Event::DeleteMessageForMeUpdate(_) => EventKind::DeleteMessageForMeUpdate,
+            Event::HistorySync(_) => EventKind::HistorySync,
+            Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
+            Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
+            Event::DeviceListUpdate(_) => EventKind::DeviceListUpdate,
+            Event::IdentityChange(_) => EventKind::IdentityChange,
+            Event::BusinessStatusUpdate(_) => EventKind::BusinessStatusUpdate,
+            Event::StreamReplaced(_) => EventKind::StreamReplaced,
+            Event::TemporaryBan(_) => EventKind::TemporaryBan,
+            Event::ConnectFailure(_) => EventKind::ConnectFailure,
+            Event::StreamError(_) => EventKind::StreamError,
+            Event::DisappearingModeChanged(_) => EventKind::DisappearingModeChanged,
+            Event::NewsletterLiveUpdate(_) => EventKind::NewsletterLiveUpdate,
+            Event::RawNode(_) => EventKind::RawNode,
+            Event::MexNotification(_) => EventKind::MexNotification,
+        }
+    }
+
     pub fn as_message(&self) -> Option<(&Arc<wa::Message>, &MessageInfo)> {
         if let Event::Message(msg, info) = self {
             Some((msg, &**info))
@@ -1206,5 +1368,59 @@ mod tests {
             ConnectFailureReason::Unknown(499)
         );
         assert!(!ConnectFailureReason::from(499).is_logged_out());
+    }
+
+    #[test]
+    fn interest_filters_dispatch() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Recorder {
+            kinds: Mutex<Vec<EventKind>>,
+            interest: EventInterest,
+        }
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: Arc<Event>) {
+                self.kinds.lock().unwrap().push(event.kind());
+            }
+            fn interest(&self) -> EventInterest {
+                self.interest
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let only_msg = Arc::new(Recorder {
+            kinds: Mutex::new(Vec::new()),
+            interest: EventInterest::of(&[EventKind::Message]),
+        });
+        let all = Arc::new(Recorder {
+            kinds: Mutex::new(Vec::new()),
+            interest: EventInterest::ALL,
+        });
+        bus.add_handler(only_msg.clone());
+        bus.add_handler(all.clone());
+
+        bus.dispatch(Event::Connected(Connected));
+
+        // The narrow handler (Message-only) was skipped; the ALL handler got it.
+        assert!(only_msg.kinds.lock().unwrap().is_empty());
+        assert_eq!(*all.kinds.lock().unwrap(), vec![EventKind::Connected]);
+
+        // A kind nobody wants is dropped before materialization: prove the bus
+        // never invokes a handler for it.
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        struct Counter;
+        impl EventHandler for Counter {
+            fn handle_event(&self, _: Arc<Event>) {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+            }
+            fn interest(&self) -> EventInterest {
+                EventInterest::of(&[EventKind::Message])
+            }
+        }
+        let bus2 = CoreEventBus::new();
+        bus2.add_handler(Arc::new(Counter));
+        bus2.dispatch(Event::Connected(Connected));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
     }
 }
