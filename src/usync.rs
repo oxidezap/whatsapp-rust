@@ -5,7 +5,7 @@
 use crate::client::Client;
 use log::{debug, warn};
 use std::collections::HashSet;
-use wacore::iq::usync::DeviceListSpec;
+use wacore::iq::usync::{DeviceListResponse, DeviceListSpec};
 use wacore_binary::Jid;
 
 impl Client {
@@ -34,161 +34,184 @@ impl Client {
 
             let response = self.execute(spec).await?;
 
-            // Extract and persist LID mappings from the response
-            for mapping in &response.lid_mappings {
-                if let Err(err) = self
-                    .add_lid_pn_mapping(
-                        &mapping.lid,
-                        &mapping.phone_number,
-                        crate::lid_pn_cache::LearningSource::Usync,
-                    )
-                    .await
-                {
-                    warn!(
-                        "Failed to persist LID {} -> {} from usync: {err}",
-                        mapping.lid, mapping.phone_number,
-                    );
-                    continue;
-                }
-                debug!(
-                    "Learned LID mapping from usync: {} -> {}",
-                    mapping.lid, mapping.phone_number
-                );
-            }
-
-            let mut fetched_devices = Vec::with_capacity(response.device_lists.len());
-            let mut device_records: Vec<wacore::store::traits::DeviceListRecord> =
-                Vec::with_capacity(response.device_lists.len());
-
-            for user_list in &response.device_lists {
-                // Update device registry (single source of truth for device lists).
-                // Preserve key_index values from existing records (set via account_sync)
-                // Use alias-aware lookup (resolves LID ↔ PN) to find
-                // existing record regardless of which key it was stored under
-                let existing_record = self.load_device_record(&user_list.user.user).await;
-
-                let mut existing_key_indices: std::collections::HashMap<u32, Option<u32>> =
-                    existing_record
-                        .as_ref()
-                        .map(|r| {
-                            r.devices
-                                .iter()
-                                .map(|d| (d.device_id, d.key_index))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                // Decode key-index-list if present (WA Web: handleKeyIndexResult)
-                let decoded_key_index = user_list
-                    .key_index_bytes
-                    .as_deref()
-                    .and_then(wacore::adv::decode_key_index_list);
-
-                // Check raw_id mismatch for identity change detection
-                // TODO: also check advAccountType mismatch (see patch_device_add TODO)
-                let mut raw_id = decoded_key_index.as_ref().map(|d| d.raw_id);
-                if let Some(ref decoded) = decoded_key_index
-                    && let Some(ref existing) = existing_record
-                    && let Some(stored_raw_id) = existing.raw_id
-                    && stored_raw_id != decoded.raw_id
-                {
-                    log::info!(
-                        "raw_id mismatch for user {} in usync: stored={stored_raw_id}, received={}. Clearing record.",
-                        user_list.user.user,
-                        decoded.raw_id
-                    );
-                    self.clear_device_record(
-                        &user_list.user.user,
-                        user_list.user.server.as_str(),
-                        existing,
-                    )
-                    .await;
-                    // Old key indices are from the previous identity — don't reuse
-                    existing_key_indices.clear();
-                }
-
-                // Preserve raw_id from existing when usync didn't provide one
-                // (no key-index-list) and no mismatch cleared the indices.
-                // existing_key_indices is empty after a mismatch clear, so this
-                // correctly skips preservation after identity change.
-                if raw_id.is_none() && !existing_key_indices.is_empty() {
-                    raw_id = existing_record.as_ref().and_then(|r| r.raw_id);
-                }
-
-                let mut devices: Vec<wacore::store::traits::DeviceInfo> = user_list
-                    .devices
-                    .iter()
-                    .map(|d| wacore::store::traits::DeviceInfo {
-                        device_id: d.device as u32,
-                        // Server-returned key_index takes priority over cached
-                        key_index: d.key_index.or_else(|| {
-                            existing_key_indices
-                                .get(&(d.device as u32))
-                                .copied()
-                                .flatten()
-                        }),
-                    })
-                    .collect();
-
-                // Apply valid_indexes filtering if key-index-list was decoded
-                if let Some(ref decoded) = decoded_key_index {
-                    devices = wacore::adv::filter_devices_by_key_index(&devices, decoded);
-                }
-
-                // Convert filtered DeviceInfo list back to JIDs for return
-                let user_jid = &user_list.user;
-                for d in &devices {
-                    let mut jid = user_jid.clone();
-                    jid.device = d.device_id as u16;
-                    fetched_devices.push(jid);
-                }
-
-                device_records.push(wacore::store::traits::DeviceListRecord {
-                    user: user_list.user.user.to_string(),
-                    devices,
-                    timestamp: wacore::time::now_secs(),
-                    phash: user_list.phash.clone(),
-                    raw_id,
-                });
-            }
-
-            // One batched backend write for the whole usync response — for
-            // large groups this collapses N spawn_blocking SQLite hops into
-            // a single transaction, which dominated the per-send wall-clock.
-            if let Err(e) = self.update_device_lists(device_records).await {
-                warn!("Failed to update device registry batch: {e}");
-            }
-
+            let fetched_devices = self.process_device_list_response(&response).await;
             all_devices.extend(fetched_devices);
         }
 
         Ok(all_devices)
     }
 
-    /// Sync own device list from the server, bypassing cache.
-    /// Matches WA Web's `syncMyDeviceList()` called during bootstrap.
+    /// Apply a usync device-list response to the registry: persist LID mappings,
+    /// rebuild each returned user's `DeviceListRecord` (preserving key indices and
+    /// handling raw_id identity changes), and batch-write them. Returns the
+    /// resolved device JIDs for the users present in the response.
+    ///
+    /// Users the server OMITS — unchanged ones, when we sent a `device_hash` — are
+    /// simply absent here, so their cached records are left untouched (the
+    /// merge-safe behavior the `device_hash` optimization depends on).
+    async fn process_device_list_response(&self, response: &DeviceListResponse) -> Vec<Jid> {
+        // Extract and persist LID mappings from the response
+        for mapping in &response.lid_mappings {
+            if let Err(err) = self
+                .add_lid_pn_mapping(
+                    &mapping.lid,
+                    &mapping.phone_number,
+                    crate::lid_pn_cache::LearningSource::Usync,
+                )
+                .await
+            {
+                warn!(
+                    "Failed to persist LID {} -> {} from usync: {err}",
+                    mapping.lid, mapping.phone_number,
+                );
+                continue;
+            }
+            debug!(
+                "Learned LID mapping from usync: {} -> {}",
+                mapping.lid, mapping.phone_number
+            );
+        }
+
+        let mut fetched_devices = Vec::with_capacity(response.device_lists.len());
+        let mut device_records: Vec<wacore::store::traits::DeviceListRecord> =
+            Vec::with_capacity(response.device_lists.len());
+
+        for user_list in &response.device_lists {
+            // Update device registry (single source of truth for device lists).
+            // Preserve key_index values from existing records (set via account_sync)
+            // Use alias-aware lookup (resolves LID ↔ PN) to find
+            // existing record regardless of which key it was stored under
+            let existing_record = self.load_device_record(&user_list.user.user).await;
+
+            let mut existing_key_indices: std::collections::HashMap<u32, Option<u32>> =
+                existing_record
+                    .as_ref()
+                    .map(|r| {
+                        r.devices
+                            .iter()
+                            .map(|d| (d.device_id, d.key_index))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+            // Decode key-index-list if present (WA Web: handleKeyIndexResult)
+            let decoded_key_index = user_list
+                .key_index_bytes
+                .as_deref()
+                .and_then(wacore::adv::decode_key_index_list);
+
+            // Check raw_id mismatch for identity change detection
+            // TODO: also check advAccountType mismatch (see patch_device_add TODO)
+            let mut raw_id = decoded_key_index.as_ref().map(|d| d.raw_id);
+            if let Some(ref decoded) = decoded_key_index
+                && let Some(ref existing) = existing_record
+                && let Some(stored_raw_id) = existing.raw_id
+                && stored_raw_id != decoded.raw_id
+            {
+                log::info!(
+                    "raw_id mismatch for user {} in usync: stored={stored_raw_id}, received={}. Clearing record.",
+                    user_list.user.user,
+                    decoded.raw_id
+                );
+                self.clear_device_record(
+                    &user_list.user.user,
+                    user_list.user.server.as_str(),
+                    existing,
+                )
+                .await;
+                // Old key indices are from the previous identity — don't reuse
+                existing_key_indices.clear();
+            }
+
+            // Preserve raw_id from existing when usync didn't provide one
+            // (no key-index-list) and no mismatch cleared the indices.
+            // existing_key_indices is empty after a mismatch clear, so this
+            // correctly skips preservation after identity change.
+            if raw_id.is_none() && !existing_key_indices.is_empty() {
+                raw_id = existing_record.as_ref().and_then(|r| r.raw_id);
+            }
+
+            let mut devices: Vec<wacore::store::traits::DeviceInfo> = user_list
+                .devices
+                .iter()
+                .map(|d| wacore::store::traits::DeviceInfo {
+                    device_id: d.device as u32,
+                    // Server-returned key_index takes priority over cached
+                    key_index: d.key_index.or_else(|| {
+                        existing_key_indices
+                            .get(&(d.device as u32))
+                            .copied()
+                            .flatten()
+                    }),
+                })
+                .collect();
+
+            // Apply valid_indexes filtering if key-index-list was decoded
+            if let Some(ref decoded) = decoded_key_index {
+                devices = wacore::adv::filter_devices_by_key_index(&devices, decoded);
+            }
+
+            // Convert filtered DeviceInfo list back to JIDs for return
+            let user_jid = &user_list.user;
+            for d in &devices {
+                let mut jid = user_jid.clone();
+                jid.device = d.device_id as u16;
+                fetched_devices.push(jid);
+            }
+
+            device_records.push(wacore::store::traits::DeviceListRecord {
+                user: user_list.user.user.to_string(),
+                devices,
+                timestamp: wacore::time::now_secs(),
+                phash: user_list.phash.clone(),
+                raw_id,
+            });
+        }
+
+        // One batched backend write for the whole usync response — for
+        // large groups this collapses N spawn_blocking SQLite hops into
+        // a single transaction, which dominated the per-send wall-clock.
+        if let Err(e) = self.update_device_lists(device_records).await {
+            warn!("Failed to update device registry batch: {e}");
+        }
+
+        fetched_devices
+    }
+
+    /// Re-sync own device list from the server. Mirrors WA Web `syncMyDeviceList`:
+    /// sends the cached per-user `device_hash` so the server answers "unchanged"
+    /// (by omitting the user) instead of returning the full list on every reconnect.
+    /// On a changed list the server returns it and we update; omitted users keep
+    /// their cache.
     pub(crate) async fn sync_own_device_list(&self) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
 
         let mut jids = Vec::with_capacity(2);
-        if let Some(ref pn) = device_snapshot.pn {
-            let pn_bare = pn.to_non_ad();
-            self.invalidate_device_cache(&pn_bare.user).await;
-            jids.push(pn_bare);
-        }
-        if let Some(ref lid) = device_snapshot.lid {
-            let lid_bare = lid.to_non_ad();
-            self.invalidate_device_cache(&lid_bare.user).await;
-            jids.push(lid_bare);
+        let mut hashes: std::collections::HashMap<Jid, (String, i64)> =
+            std::collections::HashMap::new();
+        for own in device_snapshot.pn.iter().chain(device_snapshot.lid.iter()) {
+            let bare = own.to_non_ad();
+            // Carry the cached device_hash so an unchanged list is skipped server-side.
+            if let Some(record) = self.load_device_record(&bare.user).await
+                && let Some(phash) = record.phash
+            {
+                hashes.insert(bare.clone(), (phash, record.timestamp));
+            }
+            jids.push(bare);
         }
 
         if jids.is_empty() {
             return Ok(());
         }
 
-        let devices = self.get_user_devices(&jids).await?;
+        let sid = self.generate_request_id();
+        let spec = DeviceListSpec::with_hashes(jids, sid, hashes);
+        let response = self.execute(spec).await?;
+        // `process_device_list_response` only touches users the server actually
+        // returned, so unchanged (omitted) own devices keep their cache.
+        let devices = self.process_device_list_response(&response).await;
         log::info!(
-            "Synced own device list from server: {} devices",
+            "Re-synced own device list: {} device(s) updated",
             devices.len()
         );
         Ok(())
@@ -345,6 +368,70 @@ mod tests {
             count <= 2,
             "Cache should have at most 2 items, has {}",
             count
+        );
+    }
+
+    /// #3 merge-safety: when the server omits an unchanged user (the `device_hash`
+    /// skip), `process_device_list_response` must update only the returned users
+    /// and leave the omitted user's cached devices untouched.
+    #[tokio::test]
+    async fn process_response_preserves_omitted_users() {
+        use wacore::iq::usync::DeviceListResponse;
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        let client = create_test_client().await;
+
+        // Seed user B in the registry (will be the "unchanged/omitted" one).
+        client
+            .update_device_list(DeviceListRecord {
+                user: "2222222222".into(),
+                devices: vec![
+                    DeviceInfo {
+                        device_id: 0,
+                        key_index: None,
+                    },
+                    DeviceInfo {
+                        device_id: 7,
+                        key_index: None,
+                    },
+                ],
+                timestamp: wacore::time::now_secs(),
+                phash: Some("2:oldB".to_string()),
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+
+        // Response only contains user A — B is omitted (unchanged).
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: "1111111111@s.whatsapp.net".parse().unwrap(),
+                devices: vec![UsyncDevice {
+                    device: 0,
+                    key_index: None,
+                }],
+                phash: Some("2:a".to_string()),
+                key_index_bytes: None,
+            }],
+            lid_mappings: vec![],
+        };
+
+        let fetched = client.process_device_list_response(&response).await;
+        assert!(
+            fetched.iter().any(|j| j.user == "1111111111"),
+            "returned user A must be resolved"
+        );
+
+        // B's cache is preserved (still 2 devices) — not wiped by the omission.
+        let b_jid: Jid = "2222222222@s.whatsapp.net".parse().unwrap();
+        let b_devices = client
+            .get_devices_from_registry(&b_jid)
+            .await
+            .expect("omitted user B must keep its cached record");
+        assert_eq!(
+            b_devices.len(),
+            2,
+            "omitted user's devices must be preserved"
         );
     }
 }
