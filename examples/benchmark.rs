@@ -5,7 +5,7 @@ use std::sync::Arc;
 use wacore::net::{HttpClient, HttpRequest};
 use wacore::proto_helpers::MessageExt;
 use wacore::store::InMemoryBackend;
-use wacore::types::events::Event;
+use wacore::types::events::{Event, EventKind};
 use waproto::whatsapp as wa;
 use whatsapp_rust::TokioRuntime;
 use whatsapp_rust::bot::{Bot, MessageContext};
@@ -77,71 +77,79 @@ fn main() {
             .with_runtime(TokioRuntime);
 
         let mut bot = builder
-            .on_event(move |event, client| {
-                let admin_scan_url = admin_scan_url.clone();
-                async move {
-                    match &*event {
-                        Event::Message(msg, info) => {
-                            if let Some(text) = msg.text_content()
-                                && text == "ping"
-                            {
-                                let ctx = MessageContext::from_parts(msg, info, client);
-                                info!("Received text ping, sending pong...");
+            .on_event_for(
+                &[
+                    EventKind::Message,
+                    EventKind::PairingQrCode,
+                    EventKind::Connected,
+                    EventKind::LoggedOut,
+                ],
+                move |event, client| {
+                    let admin_scan_url = admin_scan_url.clone();
+                    async move {
+                        match &*event {
+                            Event::Message(msg, info) => {
+                                if let Some(text) = msg.text_content()
+                                    && text == "ping"
+                                {
+                                    let ctx = MessageContext::from_parts(msg, info, client);
+                                    info!("Received text ping, sending pong...");
 
-                                let pong_text = format!("pong {}", ctx.info.id);
-                                let reply_message = wa::Message {
-                                    conversation: Some(pong_text),
-                                    ..Default::default()
-                                };
+                                    let pong_text = format!("pong {}", ctx.info.id);
+                                    let reply_message = wa::Message {
+                                        conversation: Some(pong_text),
+                                        ..Default::default()
+                                    };
 
-                                if let Err(e) = ctx.send_message(reply_message).await {
-                                    error!("Failed to send pong reply: {}", e);
+                                    if let Err(e) = ctx.send_message(reply_message).await {
+                                        error!("Failed to send pong reply: {}", e);
+                                    }
                                 }
                             }
-                        }
-                        Event::PairingQrCode { code, .. } => {
-                            // Mirrors tests/e2e/src/lib.rs::spawn_qr_autoresponder_http.
-                            // Auto-pair against the mock server's admin endpoint
-                            // when the configured WS URL looks like a mock
-                            // server; real WhatsApp connections fall back to
-                            // manual scan via the printed code below.
-                            if let Some(url) = admin_scan_url.as_ref() {
-                                let http = UreqHttpClient::new();
-                                let req = HttpRequest {
-                                    url: url.clone(),
-                                    method: "POST".into(),
-                                    headers: HashMap::new(),
-                                    body: Some(code.as_bytes().to_vec()),
-                                };
-                                match http.execute(req).await {
-                                    Ok(resp) if (200..300).contains(&resp.status_code) => {
-                                        info!("Auto-paired with mock server via {url}");
+                            Event::PairingQrCode { code, .. } => {
+                                // Mirrors tests/e2e/src/lib.rs::spawn_qr_autoresponder_http.
+                                // Auto-pair against the mock server's admin endpoint
+                                // when the configured WS URL looks like a mock
+                                // server; real WhatsApp connections fall back to
+                                // manual scan via the printed code below.
+                                if let Some(url) = admin_scan_url.as_ref() {
+                                    let http = UreqHttpClient::new();
+                                    let req = HttpRequest {
+                                        url: url.clone(),
+                                        method: "POST".into(),
+                                        headers: HashMap::new(),
+                                        body: Some(code.as_bytes().to_vec()),
+                                    };
+                                    match http.execute(req).await {
+                                        Ok(resp) if (200..300).contains(&resp.status_code) => {
+                                            info!("Auto-paired with mock server via {url}");
+                                        }
+                                        Ok(resp) => {
+                                            warn!(
+                                                "mock admin POST returned status {}: {}",
+                                                resp.status_code,
+                                                String::from_utf8_lossy(&resp.body)
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!("mock admin POST transport error: {e}");
+                                        }
                                     }
-                                    Ok(resp) => {
-                                        warn!(
-                                            "mock admin POST returned status {}: {}",
-                                            resp.status_code,
-                                            String::from_utf8_lossy(&resp.body)
-                                        );
-                                    }
-                                    Err(e) => {
-                                        warn!("mock admin POST transport error: {e}");
-                                    }
+                                } else {
+                                    info!("Scan this QR code with WhatsApp:\n{code}");
                                 }
-                            } else {
-                                info!("Scan this QR code with WhatsApp:\n{code}");
                             }
+                            Event::Connected(_) => {
+                                info!("✅ Bot connected successfully!");
+                            }
+                            Event::LoggedOut(_) => {
+                                error!("❌ Bot was logged out!");
+                            }
+                            _ => {}
                         }
-                        Event::Connected(_) => {
-                            info!("✅ Bot connected successfully!");
-                        }
-                        Event::LoggedOut(_) => {
-                            error!("❌ Bot was logged out!");
-                        }
-                        _ => {}
                     }
-                }
-            })
+                },
+            )
             .build()
             .await
             .expect("Failed to build bot");
