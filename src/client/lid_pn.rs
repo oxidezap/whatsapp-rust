@@ -97,13 +97,12 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        // Skip the per-message re-record/re-persist only once the pair is both
-        // durably persisted and cache-resolvable. Gating on persistence (not
-        // just cache presence) is what keeps an offline replay, which warms the
-        // cache memory-only, from making this path swallow the first live
-        // message's persist. The cache check still re-runs on a remap or an
-        // evicted entry; `source` drift is ignored (best-effort metadata).
-        if self.lid_pn_cache.is_persisted(phone_number).await
+        // Skip the per-message re-record/re-persist only once this exact pair is
+        // durably persisted (pair-specific marker, so an offline-only learn and a
+        // remap or failed-remap write both fall through to persist) and still
+        // cache-resolvable (so an evicted entry re-warms). `source` drift is
+        // ignored (best-effort metadata).
+        if self.lid_pn_cache.is_persisted(phone_number, lid).await
             && self
                 .lid_pn_cache
                 .get_current_lid(phone_number)
@@ -241,7 +240,7 @@ impl Client {
         // After the write, not before: a failed persist stays un-marked so the
         // next live message retries instead of skipping.
         self.lid_pn_cache
-            .mark_persisted(&storage_entry.phone_number)
+            .mark_persisted(&storage_entry.phone_number, &storage_entry.lid)
             .await;
 
         if is_new_mapping {
@@ -288,7 +287,9 @@ impl Client {
             .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
 
         for (entry, is_new) in storage.iter().zip(is_new_flags.iter()) {
-            self.lid_pn_cache.mark_persisted(&entry.phone_number).await;
+            self.lid_pn_cache
+                .mark_persisted(&entry.phone_number, &entry.lid)
+                .await;
             if *is_new {
                 self.migrate_device_registry_on_lid_discovery(&entry.phone_number, &entry.lid)
                     .await;

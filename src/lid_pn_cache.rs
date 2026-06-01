@@ -36,15 +36,18 @@ const NS_PN: &str = "lid_pn_by_pn";
 ///
 /// The cache is thread-safe and can be shared across async tasks.
 pub struct LidPnCache {
-    /// LID -> Entry mapping
-    lid_to_entry: TypedCache<String, LidPnEntry>,
+    /// LID -> Entry mapping. `Arc` so the hot `get_*` lookups clone a refcount,
+    /// not the entry's two `String`s; only the owned-`LidPnEntry` accessors deep-clone.
+    lid_to_entry: TypedCache<String, Arc<LidPnEntry>>,
     /// Phone number -> Entry mapping (stores the most recent LID for that PN)
-    pn_to_entry: TypedCache<String, LidPnEntry>,
-    /// PNs this process has durably persisted. Lets the learn hot path skip a
-    /// re-persist without swallowing the first live persist of a mapping that an
-    /// offline replay only warmed in memory. In-memory only; cold after restart
-    /// just replays the idempotent upsert.
-    persisted: TypedCache<String, ()>,
+    pn_to_entry: TypedCache<String, Arc<LidPnEntry>>,
+    /// PN -> the LID this process has durably persisted for it. Lets the learn
+    /// hot path skip a re-persist without swallowing the first live persist of a
+    /// mapping an offline replay only warmed in memory. Keyed by the pair (not
+    /// PN-only) so a remap whose background write failed still re-persists
+    /// instead of resting on the stale marker. In-memory only; cold after
+    /// restart just replays the idempotent upsert.
+    persisted: TypedCache<String, String>,
 }
 
 impl Default for LidPnCache {
@@ -113,12 +116,12 @@ impl LidPnCache {
 
     /// Get the full entry for a LID.
     pub async fn get_entry_by_lid(&self, lid: &str) -> Option<LidPnEntry> {
-        self.lid_to_entry.get(lid).await
+        self.lid_to_entry.get(lid).await.map(|e| (*e).clone())
     }
 
     /// Get the full entry for a phone number.
     pub async fn get_entry_by_phone(&self, phone: &str) -> Option<LidPnEntry> {
-        self.pn_to_entry.get(phone).await
+        self.pn_to_entry.get(phone).await.map(|e| (*e).clone())
     }
 
     /// Add or update a mapping in the cache.
@@ -138,28 +141,30 @@ impl LidPnCache {
             None => true,
         };
 
-        // Update LID -> Entry map
+        // One heap copy of the entry, shared by both maps via the Arc refcount.
+        let shared = Arc::new(entry.clone());
         self.lid_to_entry
-            .insert(entry.lid.clone(), entry.clone())
+            .insert(entry.lid.clone(), Arc::clone(&shared))
             .await;
 
         // Update PN -> Entry map (only if newer or equal timestamp)
         if should_update_pn {
             self.pn_to_entry
-                .insert(entry.phone_number.clone(), entry.clone())
+                .insert(entry.phone_number.clone(), shared)
                 .await;
         }
     }
 
-    /// Whether this process has durably persisted a mapping for `phone`.
-    /// Presence-only; pair with [`get_current_lid`](Self::get_current_lid) so a
-    /// remap (same PN, new LID) still re-persists.
-    pub(crate) async fn is_persisted(&self, phone: &str) -> bool {
-        self.persisted.get(phone).await.is_some()
+    /// Whether this process has durably persisted exactly `phone -> lid`.
+    /// Pair-specific so a remap (or a remap whose write failed) re-persists.
+    pub(crate) async fn is_persisted(&self, phone: &str, lid: &str) -> bool {
+        self.persisted.get(phone).await.as_deref() == Some(lid)
     }
 
-    pub(crate) async fn mark_persisted(&self, phone: &str) {
-        self.persisted.insert(phone.to_string(), ()).await;
+    pub(crate) async fn mark_persisted(&self, phone: &str, lid: &str) {
+        self.persisted
+            .insert(phone.to_string(), lid.to_string())
+            .await;
     }
 
     /// Warm up the cache with entries from persistent storage.
@@ -362,6 +367,17 @@ mod tests {
         assert_eq!(cache.lid_count().await, 0);
         assert_eq!(cache.pn_count().await, 0);
         assert!(cache.get_current_lid("559980000001").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn persisted_marker_is_pair_specific() {
+        let cache = LidPnCache::new();
+        let pn = "559980000099";
+        assert!(!cache.is_persisted(pn, "100000000000001").await);
+        cache.mark_persisted(pn, "100000000000001").await;
+        assert!(cache.is_persisted(pn, "100000000000001").await);
+        // A remap to a different LID is not persisted, so it re-persists.
+        assert!(!cache.is_persisted(pn, "100000000000002").await);
     }
 
     #[test]
