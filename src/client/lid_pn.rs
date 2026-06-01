@@ -97,19 +97,19 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        // Steady-state hot path: every incoming message re-asserts the
-        // sender's own LID↔PN pair, which never changes once learned. Skip
-        // re-allocating the entry, re-inserting both cache maps, and spawning
-        // the (no-op upsert) persist task when the mapping is already current.
-        // `add` always writes the LID→PN side too, so PN→LID == lid implies the
-        // pair is fully cached; a genuine remap (different lid) still falls
-        // through. `source` drift is intentionally ignored (best-effort metadata).
-        if self
-            .lid_pn_cache
-            .get_current_lid(phone_number)
-            .await
-            .as_deref()
-            == Some(lid)
+        // Skip the per-message re-record/re-persist only once the pair is both
+        // durably persisted and cache-resolvable. Gating on persistence (not
+        // just cache presence) is what keeps an offline replay, which warms the
+        // cache memory-only, from making this path swallow the first live
+        // message's persist. The cache check still re-runs on a remap or an
+        // evicted entry; `source` drift is ignored (best-effort metadata).
+        if self.lid_pn_cache.is_persisted(phone_number).await
+            && self
+                .lid_pn_cache
+                .get_current_lid(phone_number)
+                .await
+                .as_deref()
+                == Some(lid)
         {
             return;
         }
@@ -238,6 +238,12 @@ impl Client {
             .await
             .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"))?;
 
+        // After the write, not before: a failed persist stays un-marked so the
+        // next live message retries instead of skipping.
+        self.lid_pn_cache
+            .mark_persisted(&storage_entry.phone_number)
+            .await;
+
         if is_new_mapping {
             self.migrate_device_registry_on_lid_discovery(
                 &storage_entry.phone_number,
@@ -282,6 +288,7 @@ impl Client {
             .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
 
         for (entry, is_new) in storage.iter().zip(is_new_flags.iter()) {
+            self.lid_pn_cache.mark_persisted(&entry.phone_number).await;
             if *is_new {
                 self.migrate_device_registry_on_lid_discovery(&entry.phone_number, &entry.lid)
                     .await;
@@ -758,6 +765,40 @@ mod tests {
         let resolved = client.resolve_encryption_jid(&Jid::pn(pn)).await;
         assert_eq!(resolved.user, lid, "cache must have the mapping on return");
         assert_eq!(resolved.server, Server::Lid);
+    }
+
+    /// A mapping first warmed memory-only by an offline replay must still be
+    /// persisted on its first live message; the fast-path skip must not swallow
+    /// it just because the cache already holds it.
+    #[tokio::test]
+    async fn learn_fast_offline_then_live_persists() {
+        let client: Arc<Client> = create_test_client().await;
+        let lid = "200000000012345";
+        let pn = "5511988887777";
+        let backend = client.persistence_manager.backend();
+
+        client
+            .learn_lid_pn_mapping_fast(lid, pn, LearningSource::PeerPnMessage, true)
+            .await;
+        assert_eq!(client.resolve_encryption_jid(&Jid::pn(pn)).await.user, lid);
+        assert!(
+            backend.get_lid_mapping(lid).await.unwrap().is_none(),
+            "offline learn must not persist"
+        );
+
+        client
+            .learn_lid_pn_mapping_fast(lid, pn, LearningSource::PeerPnMessage, false)
+            .await;
+        // Poll until persisted; tolerate the transient SQLite read/write lock
+        // while the detached persist task is mid-write.
+        let start = wacore::time::Instant::now();
+        while !matches!(backend.get_lid_mapping(lid).await, Ok(Some(_))) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "live learn after an offline-only learn must persist"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     /// Batched variant must populate the in-memory cache synchronously for

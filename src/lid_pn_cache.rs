@@ -40,6 +40,11 @@ pub struct LidPnCache {
     lid_to_entry: TypedCache<String, LidPnEntry>,
     /// Phone number -> Entry mapping (stores the most recent LID for that PN)
     pn_to_entry: TypedCache<String, LidPnEntry>,
+    /// PNs this process has durably persisted. Lets the learn hot path skip a
+    /// re-persist without swallowing the first live persist of a mapping that an
+    /// offline replay only warmed in memory. In-memory only; cold after restart
+    /// just replays the idempotent upsert.
+    persisted: TypedCache<String, ()>,
 }
 
 impl Default for LidPnCache {
@@ -68,10 +73,14 @@ impl LidPnCache {
             Some(s) => Self {
                 lid_to_entry: TypedCache::from_store(s.clone(), NS_LID, config.timeout),
                 pn_to_entry: TypedCache::from_store(s, NS_PN, config.timeout),
+                // Always in-memory: tracks per-process persist state, never the
+                // mapping itself, so it must not go through the shared store.
+                persisted: TypedCache::from_moka(config.build_with_tti()),
             },
             None => Self {
                 lid_to_entry: TypedCache::from_moka(config.build_with_tti()),
                 pn_to_entry: TypedCache::from_moka(config.build_with_tti()),
+                persisted: TypedCache::from_moka(config.build_with_tti()),
             },
         }
     }
@@ -142,6 +151,17 @@ impl LidPnCache {
         }
     }
 
+    /// Whether this process has durably persisted a mapping for `phone`.
+    /// Presence-only; pair with [`get_current_lid`](Self::get_current_lid) so a
+    /// remap (same PN, new LID) still re-persists.
+    pub(crate) async fn is_persisted(&self, phone: &str) -> bool {
+        self.persisted.get(phone).await.is_some()
+    }
+
+    pub(crate) async fn mark_persisted(&self, phone: &str) {
+        self.persisted.insert(phone.to_string(), ()).await;
+    }
+
     /// Warm up the cache with entries from persistent storage.
     ///
     /// This should be called during client initialization to populate
@@ -169,6 +189,7 @@ impl LidPnCache {
     pub async fn clear(&self) {
         self.lid_to_entry.clear().await;
         self.pn_to_entry.clear().await;
+        self.persisted.clear().await;
     }
 
     /// Get the number of LID entries in the cache.
