@@ -918,7 +918,13 @@ impl Client {
             }
             None
         };
-        match tokio::time::timeout(self.cache_config.msg_secret_resolver_timeout, lookup).await {
+        match wacore::runtime::timeout(
+            &*self.runtime,
+            self.cache_config.msg_secret_resolver_timeout,
+            lookup,
+        )
+        .await
+        {
             Ok(Some(secret)) => Some(secret.to_vec()),
             Ok(None) => None,
             Err(_) => {

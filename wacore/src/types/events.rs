@@ -192,7 +192,7 @@ impl Serialize for LazyHistorySync {
     }
 }
 
-pub trait EventHandler: Send + Sync {
+pub trait EventHandler: crate::sync_marker::MaybeSendSync {
     fn handle_event(&self, event: Arc<Event>);
 }
 

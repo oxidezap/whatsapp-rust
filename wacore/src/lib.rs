@@ -41,6 +41,7 @@ pub mod stanza;
 pub mod sticker_pack;
 
 pub mod store;
+pub mod sync_marker;
 pub mod time;
 pub mod types;
 pub mod upload;

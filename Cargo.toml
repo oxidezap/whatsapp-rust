@@ -147,6 +147,12 @@ whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "
 whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.6.0", optional = true }
 whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.6.0", optional = true }
 
+# Select getrandom's browser backend so the crate builds for wasm32 standalone
+# (CI wasm guard + downstream consumers like whatsapp-rust-bridge). Needs
+# `--cfg getrandom_backend="wasm_js"` in RUSTFLAGS; no effect on native targets.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+
 [dev-dependencies]
 aes = { workspace = true }
 cbc = { version = "0.2", features = ["alloc", "block-padding"] }
