@@ -97,6 +97,22 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
+        // Steady-state hot path: every incoming message re-asserts the
+        // sender's own LID↔PN pair, which never changes once learned. Skip
+        // re-allocating the entry, re-inserting both cache maps, and spawning
+        // the (no-op upsert) persist task when the mapping is already current.
+        // `add` always writes the LID→PN side too, so PN→LID == lid implies the
+        // pair is fully cached; a genuine remap (different lid) still falls
+        // through. `source` drift is intentionally ignored (best-effort metadata).
+        if self
+            .lid_pn_cache
+            .get_current_lid(phone_number)
+            .await
+            .as_deref()
+            == Some(lid)
+        {
+            return;
+        }
         let (entry, is_new_mapping) = self
             .record_lid_pn_in_memory(lid, phone_number, source)
             .await;
