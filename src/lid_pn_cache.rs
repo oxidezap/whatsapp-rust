@@ -105,13 +105,25 @@ impl LidPnCache {
         self.pn_to_entry.get(phone).await.map(|e| e.lid.clone())
     }
 
-    /// Whether the cached LID for `phone` equals `lid`, comparing in place
-    /// instead of cloning the LID out like `get_current_lid(..) == Some(lid)`.
-    pub(crate) async fn current_lid_is(&self, phone: &str, lid: &str) -> bool {
-        self.pn_to_entry
-            .get(phone)
-            .await
-            .is_some_and(|e| e.lid == lid)
+    /// Whether the learn fast path can skip re-recording `phone <-> lid`: the
+    /// pair is durably persisted AND resolvable in BOTH cache directions.
+    /// Requiring both directions means skipping never leaves the reverse
+    /// (LID -> PN) lookup cold under a configured eviction; that lookup
+    /// (`get_phone_number`, e.g. in PN->LID session migration) has no backend
+    /// fallback. All checks compare in place over the Arc-shared values, no
+    /// payload clone.
+    pub(crate) async fn can_skip_relearn(&self, phone: &str, lid: &str) -> bool {
+        self.is_persisted(phone, lid).await
+            && self
+                .pn_to_entry
+                .get(phone)
+                .await
+                .is_some_and(|e| e.lid == lid)
+            && self
+                .lid_to_entry
+                .get(lid)
+                .await
+                .is_some_and(|e| e.phone_number == phone)
     }
 
     /// Get the phone number for a LID.
@@ -393,6 +405,29 @@ mod tests {
         // A remap to a new LID is not persisted (even a stale mark of the old
         // LID never satisfies the new pair), so it re-persists.
         assert!(!cache.is_persisted(pn, lid_b).await);
+    }
+
+    #[tokio::test]
+    async fn skip_requires_both_cache_directions() {
+        let cache = LidPnCache::new();
+        let (pn, lid) = ("559980000099", "100000000000001");
+        cache
+            .add(&LidPnEntry::new(
+                lid.to_string(),
+                pn.to_string(),
+                LearningSource::PeerPnMessage,
+            ))
+            .await;
+        cache.mark_persisted(pn, lid).await;
+        assert!(cache.can_skip_relearn(pn, lid).await);
+
+        // Evict the reverse (LID -> PN) entry: the fast path must stop skipping
+        // so the next live message re-warms it (get_phone_number has no fallback).
+        cache.lid_to_entry.invalidate(lid).await;
+        assert!(
+            !cache.can_skip_relearn(pn, lid).await,
+            "skip must require the reverse map, not just PN -> LID"
+        );
     }
 
     #[test]

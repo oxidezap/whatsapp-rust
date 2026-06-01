@@ -97,13 +97,11 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        // Skip the per-message re-record/re-persist only once this exact pair is
-        // durably persisted (so an offline-only learn and a remap, including one
-        // whose write failed, still persist) and cache-resolvable (so an evicted
-        // entry re-warms). `source` drift is ignored (best-effort metadata).
-        if self.lid_pn_cache.is_persisted(phone_number, lid).await
-            && self.lid_pn_cache.current_lid_is(phone_number, lid).await
-        {
+        // Skip the per-message re-record/re-persist only when this exact pair is
+        // durably persisted and resolvable both ways in cache: an offline-only
+        // learn, a remap (even one whose write failed), or an evicted entry all
+        // fall through and re-warm/persist. `source` drift is ignored.
+        if self.lid_pn_cache.can_skip_relearn(phone_number, lid).await {
             return;
         }
         let (entry, is_new_mapping) = self
@@ -167,9 +165,11 @@ impl Client {
         let mut is_new_flags: Vec<bool> = Vec::with_capacity(deduped.len());
         for (phone_number, lid) in deduped {
             // Same fast path as the single-entry learn: an already durable and
-            // cache-resolvable pair needs no re-add, re-persist or migration.
-            if self.lid_pn_cache.is_persisted(&phone_number, &lid).await
-                && self.lid_pn_cache.current_lid_is(&phone_number, &lid).await
+            // both-ways cached pair needs no re-add, re-persist or migration.
+            if self
+                .lid_pn_cache
+                .can_skip_relearn(&phone_number, &lid)
+                .await
             {
                 continue;
             }
