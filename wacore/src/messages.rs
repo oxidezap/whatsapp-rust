@@ -57,8 +57,10 @@ impl MessageUtils {
     /// Validate a broadcast-contact-list hash from an incoming `deviceSentMessage`
     /// against the message's `<participants>` set. Mirrors WA Web `validateBclHash`:
     /// the sender (our own other device) hashes the broadcast recipients with
-    /// phashV2; we recompute over the same set and compare. Returns `true` when
-    /// they match (or trivially when there are no participants to hash).
+    /// phashV2; here we recompute via [`participant_list_hash`](Self::participant_list_hash)
+    /// and return `true` only when the computed hash equals `expected` (including
+    /// for an empty participant list, which hashes to its own deterministic value
+    /// — not a trivial pass).
     pub fn validate_bcl_hash(participants: &[wacore_binary::Jid], expected: &str) -> bool {
         Self::participant_list_hash(participants).is_ok_and(|computed| computed == expected)
     }
