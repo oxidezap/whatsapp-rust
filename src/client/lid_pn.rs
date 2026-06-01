@@ -97,12 +97,11 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        // Skip the per-message re-record/re-persist only once the mapping is both
-        // durably persisted (so an offline-only learn still persists on its first
-        // live message, and a remap clears the marker via `add` to re-persist)
-        // and cache-resolvable to this exact lid (so a remap or an evicted entry
-        // re-warms). `source` drift is ignored (best-effort metadata).
-        if self.lid_pn_cache.is_persisted(phone_number).await
+        // Skip the per-message re-record/re-persist only once this exact pair is
+        // durably persisted (so an offline-only learn and a remap, including one
+        // whose write failed, still persist) and cache-resolvable (so an evicted
+        // entry re-warms). `source` drift is ignored (best-effort metadata).
+        if self.lid_pn_cache.is_persisted(phone_number, lid).await
             && self.lid_pn_cache.current_lid_is(phone_number, lid).await
         {
             return;
@@ -167,6 +166,13 @@ impl Client {
         let mut entries: Vec<LidPnEntry> = Vec::with_capacity(deduped.len());
         let mut is_new_flags: Vec<bool> = Vec::with_capacity(deduped.len());
         for (phone_number, lid) in deduped {
+            // Same fast path as the single-entry learn: an already durable and
+            // cache-resolvable pair needs no re-add, re-persist or migration.
+            if self.lid_pn_cache.is_persisted(&phone_number, &lid).await
+                && self.lid_pn_cache.current_lid_is(&phone_number, &lid).await
+            {
+                continue;
+            }
             let is_new = self
                 .lid_pn_cache
                 .get_current_lid(&phone_number)
@@ -178,7 +184,8 @@ impl Client {
             is_new_flags.push(is_new);
         }
 
-        if is_offline {
+        // Every pair was already durable; nothing to persist or migrate.
+        if is_offline || entries.is_empty() {
             return;
         }
 
@@ -235,7 +242,7 @@ impl Client {
         // After the write, not before: a failed persist stays un-marked so the
         // next live message retries instead of skipping.
         self.lid_pn_cache
-            .mark_persisted(&storage_entry.phone_number)
+            .mark_persisted(&storage_entry.phone_number, &storage_entry.lid)
             .await;
 
         if is_new_mapping {
@@ -282,7 +289,9 @@ impl Client {
             .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
 
         for (entry, is_new) in storage.iter().zip(is_new_flags.iter()) {
-            self.lid_pn_cache.mark_persisted(&entry.phone_number).await;
+            self.lid_pn_cache
+                .mark_persisted(&entry.phone_number, &entry.lid)
+                .await;
             if *is_new {
                 self.migrate_device_registry_on_lid_discovery(&entry.phone_number, &entry.lid)
                     .await;
