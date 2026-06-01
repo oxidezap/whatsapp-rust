@@ -101,7 +101,12 @@ impl<'a> InflateReader<'a> {
         }
 
         let mut chunk = [0u8; Self::CHUNK];
-        let decomp = self.decomp.as_mut().expect("decomp present until drop");
+        // `decomp` is `Some` for the reader's whole lifetime (only `Drop` takes it),
+        // so this is unreachable in practice; surface it as an error rather than panic.
+        let decomp = self
+            .decomp
+            .as_mut()
+            .ok_or_else(|| io::Error::other("InflateReader used after pool return"))?;
         let prev_in = decomp.total_in();
         let prev_out = decomp.total_out();
         let status = decomp
@@ -151,7 +156,12 @@ impl Drop for InflateReader<'_> {
         // Return the decompressor + buffer to the per-thread free-list for reuse.
         // `reset` on the next checkout makes prior stream state (incl. errors) moot.
         if let Some(decomp) = self.decomp.take() {
-            let buf = std::mem::take(&mut self.buf);
+            let mut buf = std::mem::take(&mut self.buf);
+            // A large top-level record (e.g. a big conversation, up to `max`) can
+            // grow `buf` to many MB; don't retain that allocation in the pool for
+            // the thread's lifetime. Shrink back toward the normal working size.
+            buf.clear();
+            buf.shrink_to(Self::CHUNK);
             INFLATE_POOL.with(|p| {
                 let mut pool = p.borrow_mut();
                 if pool.len() < Self::POOL_MAX {
@@ -350,5 +360,24 @@ mod tests {
         }
         let original = varied(120_000);
         assert_eq!(drain_reader(&zlib(&original), 120_000), original);
+    }
+
+    #[test]
+    fn drop_shrinks_oversized_buffer_before_pooling() {
+        // Buffering a large record grows `buf` to many MB; on return to the pool it
+        // must be shrunk back toward CHUNK, not parked at full size for the thread.
+        INFLATE_POOL.with(|p| p.borrow_mut().clear());
+        let big = varied(2 * 1024 * 1024);
+        let compressed = zlib(&big);
+        {
+            let mut r = InflateReader::new(&compressed, 64 * 1024 * 1024);
+            assert!(r.ensure(big.len()).unwrap());
+            assert!(r.buf.capacity() >= big.len(), "buf should grow while alive");
+        }
+        let pooled = INFLATE_POOL.with(|p| p.borrow().last().map(|(_, b)| b.capacity()));
+        assert!(
+            matches!(pooled, Some(cap) if cap <= InflateReader::CHUNK * 2),
+            "pooled buffer not shrunk: {pooled:?}"
+        );
     }
 }
