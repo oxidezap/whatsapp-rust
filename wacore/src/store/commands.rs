@@ -41,7 +41,7 @@ pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
             device.push_name = name;
         }
         DeviceCommand::SetAccount(account) => {
-            device.account = account;
+            device.account = account.map(std::sync::Arc::new);
         }
         DeviceCommand::SetAppVersion((p, s, t)) => {
             device.app_version_primary = p;

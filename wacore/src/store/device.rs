@@ -3,7 +3,7 @@ use crate::libsignal::protocol::{IdentityKeyPair, KeyPair};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
@@ -21,7 +21,7 @@ pub mod account_serde {
     }
 
     pub fn serialize<S: serde::Serializer>(
-        val: &Option<wa::AdvSignedDeviceIdentity>,
+        val: &Option<std::sync::Arc<wa::AdvSignedDeviceIdentity>>,
         s: S,
     ) -> Result<S::Ok, S::Error> {
         match val {
@@ -32,10 +32,12 @@ pub mod account_serde {
 
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         d: D,
-    ) -> Result<Option<wa::AdvSignedDeviceIdentity>, D::Error> {
+    ) -> Result<Option<std::sync::Arc<wa::AdvSignedDeviceIdentity>>, D::Error> {
         let bytes: Option<Vec<u8>> = serde::Deserialize::deserialize(d)?;
         match bytes {
-            Some(b) => from_bytes(&b).map(Some).map_err(serde::de::Error::custom),
+            Some(b) => from_bytes(&b)
+                .map(|a| Some(std::sync::Arc::new(a)))
+                .map_err(serde::de::Error::custom),
             None => Ok(None),
         }
     }
@@ -222,15 +224,19 @@ pub struct Device {
     #[serde(with = "BigArray")]
     pub signed_pre_key_signature: [u8; 64],
     pub adv_secret_key: [u8; 32],
+    // Arc: immutable after pairing, so per-snapshot clones bump a refcount
+    // instead of deep-copying its four Vec<u8> fields.
     #[serde(with = "account_serde", default)]
-    pub account: Option<wa::AdvSignedDeviceIdentity>,
+    pub account: Option<Arc<wa::AdvSignedDeviceIdentity>>,
     pub push_name: String,
     pub app_version_primary: u32,
     pub app_version_secondary: u32,
     pub app_version_tertiary: u32,
     pub app_version_last_fetched_ms: i64,
+    // Arc: set once at setup then read-only, so snapshot clones bump a refcount;
+    // the rare mutations go through `Arc::make_mut`.
     #[serde(skip)]
-    pub device_props: wa::DeviceProps,
+    pub device_props: Arc<wa::DeviceProps>,
     /// Runtime-only. Set before `connect()` on every process start.
     #[serde(skip)]
     pub client_profile: ClientProfile,
@@ -355,7 +361,7 @@ impl Device {
             app_version_secondary: 3000,
             app_version_tertiary: 1035617621,
             app_version_last_fetched_ms: 0,
-            device_props: DEVICE_PROPS.clone(),
+            device_props: Arc::new(DEVICE_PROPS.clone()),
             client_profile: ClientProfile::web(),
             edge_routing_info: None,
             props_hash: None,
@@ -394,17 +400,18 @@ impl Device {
     }
 
     pub fn set_device_props(&mut self, o: DevicePropsOverride) {
+        let props = Arc::make_mut(&mut self.device_props);
         if let Some(os) = o.os {
-            self.device_props.os = Some(os);
+            props.os = Some(os);
         }
         if let Some(version) = o.version {
-            self.device_props.version = Some(version);
+            props.version = Some(version);
         }
         if let Some(platform_type) = o.platform_type {
-            self.device_props.platform_type = Some(platform_type as i32);
+            props.platform_type = Some(platform_type as i32);
         }
         if let Some(history_sync_config) = o.history_sync_config {
-            self.device_props.history_sync_config = Some(history_sync_config);
+            props.history_sync_config = Some(history_sync_config);
         }
     }
 
@@ -564,12 +571,12 @@ mod tests {
     #[test]
     fn test_device_serde_preserves_account() {
         let mut device = Device::new();
-        device.account = Some(wa::AdvSignedDeviceIdentity {
+        device.account = Some(Arc::new(wa::AdvSignedDeviceIdentity {
             details: Some(b"test-details".to_vec()),
             account_signature_key: Some(vec![1; 32]),
             account_signature: Some(vec![2; 64]),
             device_signature: Some(vec![3; 64]),
-        });
+        }));
 
         let json = serde_json::to_string(&device).expect("serialize should succeed");
         let restored: Device = serde_json::from_str(&json).expect("deserialize should succeed");
