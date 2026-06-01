@@ -558,18 +558,22 @@ mod tests {
         // The MESSAGE_EDIT-specific consumer API resolves from the envelope
         // frame, ignoring the editor-framed target key (here from_me=true).
         let msg = wa::Message {
-            secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
-                target_message_key: buffa::MessageField::some(wa::MessageKey {
-                    remote_jid: Some("100000000000001@lid".to_string()),
-                    from_me: Some(true),
-                    id: Some("AC1".to_string()),
-                    participant: None,
-                }),
-                enc_payload: Some(vec![0u8; 32]),
-                enc_iv: Some(vec![0u8; 12]),
-                secret_enc_type: Some(wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT),
-                remote_key_id: None,
-            }),
+            secret_encrypted_message: buffa::MessageField::some(
+                wa::message::SecretEncryptedMessage {
+                    target_message_key: buffa::MessageField::some(wa::MessageKey {
+                        remote_jid: Some("100000000000001@lid".to_string()),
+                        from_me: Some(true),
+                        id: Some("AC1".to_string()),
+                        participant: None,
+                    }),
+                    enc_payload: Some(vec![0u8; 32]),
+                    enc_iv: Some(vec![0u8; 12]),
+                    secret_enc_type: Some(
+                        wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT,
+                    ),
+                    remote_key_id: None,
+                },
+            ),
             ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
@@ -598,18 +602,22 @@ mod tests {
         // is always the author (you can only edit your own message), so the
         // sender must come from the envelope frame.
         let msg = wa::Message {
-            secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
-                target_message_key: buffa::MessageField::some(wa::MessageKey {
-                    remote_jid: Some("100000000000001@lid".to_string()), // our LID (editor's frame)
-                    from_me: Some(true),
-                    id: Some("AC1".to_string()),
-                    participant: None,
-                }),
-                enc_payload: Some(vec![0u8; 32]),
-                enc_iv: Some(vec![0u8; 12]),
-                secret_enc_type: Some(wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT),
-                remote_key_id: None,
-            }),
+            secret_encrypted_message: buffa::MessageField::some(
+                wa::message::SecretEncryptedMessage {
+                    target_message_key: buffa::MessageField::some(wa::MessageKey {
+                        remote_jid: Some("100000000000001@lid".to_string()), // our LID (editor's frame)
+                        from_me: Some(true),
+                        id: Some("AC1".to_string()),
+                        participant: None,
+                    }),
+                    enc_payload: Some(vec![0u8; 32]),
+                    enc_iv: Some(vec![0u8; 12]),
+                    secret_enc_type: Some(
+                        wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT,
+                    ),
+                    remote_key_id: None,
+                },
+            ),
             ..Default::default()
         };
         let env = extract_secret_encrypted(&msg).expect("recognised");
@@ -629,18 +637,22 @@ mod tests {
         // Our own edit, synced from another linked device: the envelope IS from
         // me, so the original sender is us — device suffix stripped.
         let msg = wa::Message {
-            secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
-                target_message_key: buffa::MessageField::some(wa::MessageKey {
-                    remote_jid: Some("200000000000002@lid".to_string()),
-                    from_me: Some(true),
-                    id: Some("AC1".to_string()),
-                    participant: None,
-                }),
-                enc_payload: Some(vec![0u8; 32]),
-                enc_iv: Some(vec![0u8; 12]),
-                secret_enc_type: Some(wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT),
-                remote_key_id: None,
-            }),
+            secret_encrypted_message: buffa::MessageField::some(
+                wa::message::SecretEncryptedMessage {
+                    target_message_key: buffa::MessageField::some(wa::MessageKey {
+                        remote_jid: Some("200000000000002@lid".to_string()),
+                        from_me: Some(true),
+                        id: Some("AC1".to_string()),
+                        participant: None,
+                    }),
+                    enc_payload: Some(vec![0u8; 32]),
+                    enc_iv: Some(vec![0u8; 12]),
+                    secret_enc_type: Some(
+                        wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT,
+                    ),
+                    remote_key_id: None,
+                },
+            ),
             ..Default::default()
         };
         let env = extract_secret_encrypted(&msg).expect("recognised");
@@ -660,18 +672,22 @@ mod tests {
         // other than the target's author (e.g. a peer votes on our poll), so the
         // target key stays authoritative for non-edit kinds.
         let msg = wa::Message {
-            secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
-                target_message_key: buffa::MessageField::some(wa::MessageKey {
-                    remote_jid: Some("g@g.us".to_string()),
-                    from_me: Some(false),
-                    id: Some("AC1".to_string()),
-                    participant: Some("creator@s.whatsapp.net".to_string()),
-                }),
-                enc_payload: Some(vec![0u8; 32]),
-                enc_iv: Some(vec![0u8; 12]),
-                secret_enc_type: Some(wa::message::secret_encrypted_message::SecretEncType::POLL_EDIT),
-                remote_key_id: None,
-            }),
+            secret_encrypted_message: buffa::MessageField::some(
+                wa::message::SecretEncryptedMessage {
+                    target_message_key: buffa::MessageField::some(wa::MessageKey {
+                        remote_jid: Some("g@g.us".to_string()),
+                        from_me: Some(false),
+                        id: Some("AC1".to_string()),
+                        participant: Some("creator@s.whatsapp.net".to_string()),
+                    }),
+                    enc_payload: Some(vec![0u8; 32]),
+                    enc_iv: Some(vec![0u8; 12]),
+                    secret_enc_type: Some(
+                        wa::message::secret_encrypted_message::SecretEncType::POLL_EDIT,
+                    ),
+                    remote_key_id: None,
+                },
+            ),
             ..Default::default()
         };
         let env = extract_secret_encrypted(&msg).expect("recognised");
