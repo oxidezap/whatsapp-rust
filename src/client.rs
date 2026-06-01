@@ -408,7 +408,7 @@ pub struct Client {
 
     /// Cache for recent messages (serialized bytes) for retry functionality.
     /// Uses moka cache with TTL and max capacity for automatic eviction.
-    pub(crate) recent_messages: Cache<ChatMessageId, Vec<u8>>,
+    pub(crate) recent_messages: Cache<ChatMessageId, Arc<Vec<u8>>>,
 
     pub(crate) sender_key_device_cache: crate::sender_key_device_cache::SenderKeyDeviceCache,
 

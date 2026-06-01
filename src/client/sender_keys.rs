@@ -251,14 +251,22 @@ impl Client {
         let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
 
         if has_l1_cache {
-            // L1 cache serves reads immediately; DB write can be backgrounded
+            // L1 cache serves reads immediately; DB write can be backgrounded.
+            // Share the serialized bytes via Arc so the cache and the DB task
+            // hold the same buffer instead of memcpy-ing the whole message.
             let chat_str = key.chat.to_string();
             let msg_id = key.id.clone();
-            self.recent_messages.insert(key, bytes.clone()).await;
+            let shared = std::sync::Arc::new(bytes);
+            self.recent_messages
+                .insert(key, std::sync::Arc::clone(&shared))
+                .await;
             let backend = self.persistence_manager.backend();
             self.runtime
                 .spawn(Box::pin(async move {
-                    if let Err(e) = backend.store_sent_message(&chat_str, &msg_id, &bytes).await {
+                    if let Err(e) = backend
+                        .store_sent_message(&chat_str, &msg_id, &shared)
+                        .await
+                    {
                         log::warn!("Failed to store sent message to DB: {e}");
                     }
                 }))
