@@ -82,7 +82,10 @@ fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
                 }
                 let start = wacore::time::Instant::now();
                 let client = client_for_worker.clone();
-                Box::pin(client.handle_incoming_message(msg_node)).await;
+                // Awaited inline (not boxed): the future lives in this
+                // once-per-chat worker task instead of a fresh ~31 KB heap box
+                // per message, which dominated per-message allocation churn.
+                client.handle_incoming_message(msg_node).await;
                 let elapsed = start.elapsed();
                 if elapsed.as_millis() as u64 > MAX_MESSAGE_DELAY_MS {
                     warn!(
