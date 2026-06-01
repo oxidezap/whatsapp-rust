@@ -275,6 +275,32 @@ impl SignalStoreCache {
         }
     }
 
+    /// Whether any session or identity is known for `user` (across device ids),
+    /// checking the in-memory cache first, then the durable backend. Lets a
+    /// caller skip a per-device migration scan for a user we've never had Signal
+    /// state with. Conservative on the cache side: any matching key counts
+    /// (even a stale/checked-out marker), so it never reports "none" when state
+    /// might exist.
+    pub async fn has_state_for_user(&self, user: &str, backend: &dyn SignalStore) -> Result<bool> {
+        fn matches(addr: &str, user: &str) -> bool {
+            addr.strip_prefix(user)
+                .is_some_and(|rest| rest.starts_with('@') || rest.starts_with(':'))
+        }
+        {
+            let state = self.sessions.lock().await;
+            if state.cache.keys().any(|k| matches(k, user)) {
+                return Ok(true);
+            }
+        }
+        {
+            let state = self.identities.lock().await;
+            if state.cache.keys().any(|k| matches(k, user)) {
+                return Ok(true);
+            }
+        }
+        Ok(backend.has_signal_state_for_user(user).await?)
+    }
+
     // === Sessions (object cache — serialize only during flush) ===
 
     /// Takes ownership of the cached session, leaving a `CheckedOut` marker.

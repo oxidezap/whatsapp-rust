@@ -408,7 +408,7 @@ pub struct Client {
 
     /// Cache for recent messages (serialized bytes) for retry functionality.
     /// Uses moka cache with TTL and max capacity for automatic eviction.
-    pub(crate) recent_messages: Cache<ChatMessageId, Vec<u8>>,
+    pub(crate) recent_messages: Cache<ChatMessageId, Arc<Vec<u8>>>,
 
     pub(crate) sender_key_device_cache: crate::sender_key_device_cache::SenderKeyDeviceCache,
 
@@ -1432,8 +1432,17 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
-        // Clear signal cache so stale state doesn't leak across connections
-        self.signal_cache.clear().await;
+        // Flush before clear: clear() drops dirty entries, so a disconnect
+        // racing an in-flight encrypt would lose the just-advanced sender-key
+        // chain and force a full SKDM re-fanout. A disconnect is not a logout.
+        // Only clear on a successful flush; on a backend error keep the cache so
+        // the dirty state isn't dropped and the next operation can persist it.
+        match self.flush_signal_cache().await {
+            Ok(()) => self.signal_cache.clear().await,
+            Err(e) => log::error!(
+                "cleanup_connection_state: signal cache flush failed, keeping cache to avoid dropping Signal state: {e:?}"
+            ),
+        }
         // Reset semaphore to 1 permit for next offline sync.
         self.swap_message_semaphore(1);
         // Reset dead-socket timestamps so stale values from the previous
@@ -3427,7 +3436,7 @@ impl Client {
                             .map(|v| v.as_str().to_string())
                             .unwrap_or_default();
                         warn!(
-                            "Stream error: server rejected ack (class={class:?}, id={id}); reconnect will follow on stream end"
+                            "Stream error carrying <ack> (class={class:?}, id={id}): server-driven stream rotation, not an ack rejection; reconnect follows on stream end"
                         );
                     } else {
                         warn!("Unknown stream error: {}", DisplayableNodeRef(node));
@@ -3475,7 +3484,12 @@ impl Client {
         }
 
         if reason.is_logged_out() {
-            info!("Got {reason:?} connect failure, logging out.");
+            // Log the full <failure> so a server-side lock/ban is diagnosable;
+            // `location` (e.g. "rva") is a routing token, not the cause.
+            warn!(
+                "Got {reason:?} connect failure, logging out: {}",
+                DisplayableNodeRef(node)
+            );
             self.core
                 .event_bus
                 .dispatch(wacore::types::events::Event::LoggedOut(
@@ -5509,6 +5523,132 @@ mod tests {
         )
         .await;
         client
+    }
+
+    /// Regression: a transport disconnect must flush dirty Signal state before
+    /// clearing the cache, or a just-advanced sender-key chain is lost (forcing
+    /// a full SKDM re-fanout on the next send).
+    #[tokio::test]
+    async fn cleanup_connection_state_flushes_dirty_signal_state() {
+        use wacore::libsignal::protocol::ProtocolAddress;
+        let client = create_offline_sync_test_client().await;
+
+        // A dirty identity lives only in the write-back cache until flushed.
+        let addr = ProtocolAddress::new("5550001000@s.whatsapp.net".to_string(), 1u32.into());
+        client.signal_cache.put_identity(&addr, &[7u8; 32]).await;
+
+        client.cleanup_connection_state().await;
+
+        // cleanup cleared the cache, so a hit now can only come from the DB,
+        // proving the flush ran before the clear.
+        let device = client.persistence_manager.get_device_arc().await;
+        let guard = device.read().await;
+        let persisted = client
+            .signal_cache
+            .get_identity(&addr, &*guard.backend)
+            .await
+            .expect("get_identity must not error");
+        assert!(
+            persisted.is_some(),
+            "dirty Signal state must survive a transport disconnect (flush-before-clear)"
+        );
+    }
+
+    /// Same guarantee on the sender-key store, which drives SKDM fanout.
+    #[tokio::test]
+    async fn cleanup_connection_state_flushes_dirty_sender_key() {
+        use wacore::libsignal::protocol::SenderKeyRecord;
+        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        let client = create_offline_sync_test_client().await;
+
+        let name = SenderKeyName::from_parts("group@g.us", "5550001000@s.whatsapp.net:1");
+        client
+            .signal_cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+
+        client.cleanup_connection_state().await;
+
+        let device = client.persistence_manager.get_device_arc().await;
+        let guard = device.read().await;
+        let persisted = client
+            .signal_cache
+            .get_sender_key(&name, &*guard.backend)
+            .await
+            .expect("get_sender_key must not error");
+        assert!(
+            persisted.is_some(),
+            "dirty sender key must survive a transport disconnect (flush-before-clear)"
+        );
+    }
+
+    /// When the flush itself fails, cleanup must NOT clear the cache, or it would
+    /// drop the very state the flush was meant to persist.
+    #[tokio::test]
+    async fn cleanup_connection_state_keeps_state_when_flush_fails() {
+        use wacore::libsignal::protocol::{ProtocolAddress, SenderKeyRecord};
+        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        let client = create_offline_sync_test_client().await;
+
+        // A malformed identity (not 32 bytes) makes flush() error out, standing
+        // in for a transient backend write failure during cleanup.
+        let bad = ProtocolAddress::new("5550002000@s.whatsapp.net".to_string(), 1u32.into());
+        client.signal_cache.put_identity(&bad, &[0u8; 16]).await;
+
+        // A valid dirty sender key that must not be dropped when the flush fails.
+        let name = SenderKeyName::from_parts("group@g.us", "5550001000@s.whatsapp.net:1");
+        client
+            .signal_cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+
+        client.cleanup_connection_state().await;
+
+        // flush() failed, so clear() was skipped; the unpersisted sender key
+        // survives in the write-back cache instead of being dropped.
+        let device = client.persistence_manager.get_device_arc().await;
+        let guard = device.read().await;
+        let persisted = client
+            .signal_cache
+            .get_sender_key(&name, &*guard.backend)
+            .await
+            .expect("get_sender_key must not error");
+        assert!(
+            persisted.is_some(),
+            "a flush failure must not drop dirty Signal state"
+        );
+    }
+
+    /// A 403 connect failure is WA Web's REASON_LOCKED: it must surface a logout
+    /// carrying AccountLocked and disable auto-reconnect (a lock is not transient).
+    #[tokio::test]
+    async fn connect_failure_403_dispatches_account_locked_logout() {
+        use wacore::types::events::ChannelEventHandler;
+        let client = create_offline_sync_test_client().await;
+        let (handler, events) = ChannelEventHandler::new();
+        client.register_handler(handler);
+
+        // location="rva" is a region routing token and must not change the verdict.
+        let failure = NodeBuilder::new("failure")
+            .attr("reason", "403")
+            .attr("location", "rva")
+            .build();
+        client.handle_connect_failure(&failure.as_node_ref()).await;
+
+        let evt = events
+            .try_recv()
+            .expect("403 must dispatch a LoggedOut event");
+        match &*evt {
+            Event::LoggedOut(lo) => {
+                assert!(lo.on_connect, "403 arrives as a failure-on-connect");
+                assert_eq!(lo.reason, ConnectFailureReason::AccountLocked);
+            }
+            _ => panic!("expected Event::LoggedOut for reason=403"),
+        }
+        assert!(
+            !client.enable_auto_reconnect.load(Ordering::Relaxed),
+            "a server-side lock must not auto-reconnect"
+        );
     }
 
     #[tokio::test]

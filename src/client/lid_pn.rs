@@ -97,6 +97,13 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
+        // Skip the per-message re-record/re-persist only when this exact pair is
+        // durably persisted and resolvable both ways in cache: an offline-only
+        // learn, a remap (even one whose write failed), or an evicted entry all
+        // fall through and re-warm/persist. `source` drift is ignored.
+        if self.lid_pn_cache.can_skip_relearn(phone_number, lid).await {
+            return;
+        }
         let (entry, is_new_mapping) = self
             .record_lid_pn_in_memory(lid, phone_number, source)
             .await;
@@ -157,6 +164,15 @@ impl Client {
         let mut entries: Vec<LidPnEntry> = Vec::with_capacity(deduped.len());
         let mut is_new_flags: Vec<bool> = Vec::with_capacity(deduped.len());
         for (phone_number, lid) in deduped {
+            // Same fast path as the single-entry learn: an already durable and
+            // both-ways cached pair needs no re-add, re-persist or migration.
+            if self
+                .lid_pn_cache
+                .can_skip_relearn(&phone_number, &lid)
+                .await
+            {
+                continue;
+            }
             let is_new = self
                 .lid_pn_cache
                 .get_current_lid(&phone_number)
@@ -168,7 +184,8 @@ impl Client {
             is_new_flags.push(is_new);
         }
 
-        if is_offline {
+        // Every pair was already durable; nothing to persist or migrate.
+        if is_offline || entries.is_empty() {
             return;
         }
 
@@ -222,6 +239,12 @@ impl Client {
             .await
             .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"))?;
 
+        // After the write, not before: a failed persist stays un-marked so the
+        // next live message retries instead of skipping.
+        self.lid_pn_cache
+            .mark_persisted(&storage_entry.phone_number, &storage_entry.lid)
+            .await;
+
         if is_new_mapping {
             self.migrate_device_registry_on_lid_discovery(
                 &storage_entry.phone_number,
@@ -266,6 +289,9 @@ impl Client {
             .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
 
         for (entry, is_new) in storage.iter().zip(is_new_flags.iter()) {
+            self.lid_pn_cache
+                .mark_persisted(&entry.phone_number, &entry.lid)
+                .await;
             if *is_new {
                 self.migrate_device_registry_on_lid_discovery(&entry.phone_number, &entry.lid)
                     .await;
@@ -377,6 +403,18 @@ impl Client {
         use wacore::types::jid::JidExt;
 
         let backend = self.persistence_manager.backend();
+
+        // Nothing to migrate unless the PN side has Signal state. For a freshly
+        // resolved peer (e.g. every member of a large group on first send) this
+        // skips MIGRATION_DEVICE_RANGE lock+lookup iterations that would all
+        // find nothing. On a lookup error, fall through to the full scan.
+        if let Ok(false) = self
+            .signal_cache
+            .has_state_for_user(pn, backend.as_ref())
+            .await
+        {
+            return;
+        }
 
         for device_id in 0..MIGRATION_DEVICE_RANGE {
             // `&str` → `CompactString` is inline for ≤24-byte user parts
@@ -744,6 +782,40 @@ mod tests {
         assert_eq!(resolved.server, Server::Lid);
     }
 
+    /// A mapping first warmed memory-only by an offline replay must still be
+    /// persisted on its first live message; the fast-path skip must not swallow
+    /// it just because the cache already holds it.
+    #[tokio::test]
+    async fn learn_fast_offline_then_live_persists() {
+        let client: Arc<Client> = create_test_client().await;
+        let lid = "200000000012345";
+        let pn = "5511988887777";
+        let backend = client.persistence_manager.backend();
+
+        client
+            .learn_lid_pn_mapping_fast(lid, pn, LearningSource::PeerPnMessage, true)
+            .await;
+        assert_eq!(client.resolve_encryption_jid(&Jid::pn(pn)).await.user, lid);
+        assert!(
+            backend.get_lid_mapping(lid).await.unwrap().is_none(),
+            "offline learn must not persist"
+        );
+
+        client
+            .learn_lid_pn_mapping_fast(lid, pn, LearningSource::PeerPnMessage, false)
+            .await;
+        // Poll until persisted; tolerate the transient SQLite read/write lock
+        // while the detached persist task is mid-write.
+        let start = wacore::time::Instant::now();
+        while !matches!(backend.get_lid_mapping(lid).await, Ok(Some(_))) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "live learn after an offline-only learn must persist"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     /// Batched variant must populate the in-memory cache synchronously for
     /// every entry before returning; WA Web parity for `createLidPnMappings`.
     #[tokio::test]
@@ -1040,6 +1112,49 @@ mod tests {
         );
     }
 
+    /// A freshly-resolved peer (no prior PN Signal state) must short-circuit the
+    /// per-device migration scan: nothing to move, so no LID session appears and
+    /// the MIGRATION_DEVICE_RANGE lock/lookup loop is skipped.
+    #[tokio::test]
+    async fn migrate_skips_when_no_pn_signal_state() {
+        use wacore::types::jid::JidExt as _;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000000777";
+        let lid = "222222222222222";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+        let backend = client.persistence_manager.backend();
+
+        // Fresh peer: no PN session or identity anywhere, so the guard skips.
+        assert!(
+            !client
+                .signal_cache
+                .has_state_for_user(pn, backend.as_ref())
+                .await
+                .unwrap(),
+            "fresh peer should have no PN Signal state"
+        );
+
+        client
+            .migrate_signal_sessions_on_lid_discovery(pn, lid)
+            .await;
+
+        // No LID session was materialized (nothing was migrated).
+        let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
+        assert!(
+            client
+                .signal_cache
+                .get_session(&lid_addr, backend.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "migration of a stateless peer must not create a LID session"
+        );
+    }
+
     /// Migration must hold the same per-address session locks that
     /// encrypt/decrypt take. Otherwise a concurrent `message_encrypt`
     /// on the LID slot can clobber the just-migrated session (or read
@@ -1057,6 +1172,21 @@ mod tests {
             .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
             .await
             .unwrap();
+
+        // Seed a PN session so the migration actually enters its per-device
+        // loop. The existence guard skips when there is nothing to migrate, and
+        // this test is about the lock the loop takes when migrating real state.
+        let pn_addr = Jid::pn_device(pn.to_string(), 0).to_protocol_address();
+        client
+            .signal_cache
+            .put_session(
+                &pn_addr,
+                wacore::libsignal::protocol::SessionRecord::deserialize(&tagged_session_blob(
+                    0xDEAD_BEEF,
+                ))
+                .expect("seed PN blob deserializes"),
+            )
+            .await;
 
         let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
         let lid_lock = client.session_lock_for(lid_addr.as_str()).await;

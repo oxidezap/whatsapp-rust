@@ -1,0 +1,44 @@
+permissions:
+  contents: read
+name: WASM Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+
+jobs:
+  wasm:
+    name: Build whatsapp-rust (wasm32, release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-05
+          targets: wasm32-unknown-unknown
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache Rust registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+      # Mirrors how whatsapp-rust-bridge consumes the crate: lib only (the
+      # binary pulls tokio/sqlite), no default features. Guards against code
+      # reachable from wasm regressing on tokio/std-only APIs.
+      # getrandom needs both the wasm_js feature (declared for wasm32 in
+      # Cargo.toml) and this backend cfg.
+      - name: Build whatsapp-rust lib for wasm32 (release)
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        run: >
+          cargo build -p whatsapp-rust --lib --release
+          --target wasm32-unknown-unknown
+          --no-default-features --features debug-diagnostics

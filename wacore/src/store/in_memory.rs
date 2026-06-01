@@ -33,6 +33,9 @@ struct PreKeyEntry {
 /// Key for base-key collision detection: `(address, message_id)`.
 type BaseKeyKey = (String, String);
 
+/// Stored msg-secret value: `(secret_bytes, expires_at_secs, message_ts_secs)`.
+type MsgSecretRow = (Vec<u8>, i64, i64);
+
 /// Inner state protected by the mutex.
 #[derive(Default)]
 struct InMemoryState {
@@ -58,28 +61,25 @@ struct InMemoryState {
     pn_to_lid: HashMap<String, String>,
     base_keys: HashMap<BaseKeyKey, Vec<u8>>,
     device_lists: HashMap<String, DeviceListRecord>,
+    group_metadata: HashMap<String, Vec<u8>>,
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
 
     // --- MsgSecret ---
-    /// Value is `(secret_bytes, created_at_secs)` so the keepalive cleanup
-    /// can prune expired entries the same way `delete_expired_sent_messages`
-    /// does for the retry cache.
-    msg_secrets: HashMap<(String, String, String), (Vec<u8>, i64)>,
+    /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
+    /// event time is unknown. The keepalive cleanup prunes expired rows.
+    msg_secrets: HashMap<(String, String, String), MsgSecretRow>,
 
     // --- Device ---
     device: Option<Device>,
 }
 
-/// Default TTL for sent messages (seconds). Matches the client's
-/// `sent_message_ttl_secs` default of 300s.
-const DEFAULT_SENT_MESSAGE_TTL_SECS: i64 = 300;
-
-/// Eviction runs inline when the map exceeds this many entries.
-const SENT_MESSAGE_EVICT_THRESHOLD: usize = 64;
-
-/// Minimum interval between eviction scans (seconds).
-const SENT_MESSAGE_EVICT_INTERVAL_SECS: i64 = 30;
+/// Hard cap on retained sent messages, bounding memory regardless of the
+/// configured retention window. Time-based pruning is the client's keepalive
+/// sweep (`delete_expired_sent_messages`, driven by
+/// `CacheConfig::sent_message_ttl_secs`, the single source of truth for the
+/// time window); this cap only guards against a burst between sweeps.
+const MAX_SENT_MESSAGES: usize = 4096;
 
 /// In-memory implementation of the full [`Backend`] trait.
 ///
@@ -88,8 +88,6 @@ const SENT_MESSAGE_EVICT_INTERVAL_SECS: i64 = 30;
 pub struct InMemoryBackend {
     state: Mutex<InMemoryState>,
     next_device_id: AtomicI32,
-    sent_message_ttl_secs: i64,
-    last_eviction: std::sync::atomic::AtomicI64,
 }
 
 impl InMemoryBackend {
@@ -98,17 +96,7 @@ impl InMemoryBackend {
         Self {
             state: Mutex::new(InMemoryState::default()),
             next_device_id: AtomicI32::new(1),
-            sent_message_ttl_secs: DEFAULT_SENT_MESSAGE_TTL_SECS,
-            last_eviction: std::sync::atomic::AtomicI64::new(0),
         }
-    }
-
-    /// Create with a custom sent-message TTL. Values ≤ 0 are ignored.
-    pub fn with_sent_message_ttl(mut self, ttl_secs: i64) -> Self {
-        if ttl_secs > 0 {
-            self.sent_message_ttl_secs = ttl_secs;
-        }
-        self
     }
 }
 
@@ -158,6 +146,16 @@ impl SignalStore for InMemoryBackend {
 
     async fn has_session(&self, address: &str) -> Result<bool> {
         Ok(self.state.lock().await.sessions.contains_key(address))
+    }
+
+    async fn has_signal_state_for_user(&self, user: &str) -> Result<bool> {
+        fn matches(addr: &str, user: &str) -> bool {
+            addr.strip_prefix(user)
+                .is_some_and(|rest| rest.starts_with('@') || rest.starts_with(':'))
+        }
+        let state = self.state.lock().await;
+        Ok(state.sessions.keys().any(|k| matches(k, user))
+            || state.identities.keys().any(|k| matches(k, user)))
     }
 
     async fn delete_session(&self, address: &str) -> Result<()> {
@@ -500,6 +498,25 @@ impl ProtocolStore for InMemoryBackend {
         Ok(())
     }
 
+    async fn get_group_metadata(&self, group_jid: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .group_metadata
+            .get(group_jid)
+            .cloned())
+    }
+
+    async fn put_group_metadata(&self, group_jid: &str, blob: &[u8]) -> Result<()> {
+        self.state
+            .lock()
+            .await
+            .group_metadata
+            .insert(group_jid.to_string(), blob.to_vec());
+        Ok(())
+    }
+
     // --- TcToken Storage ---
 
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>> {
@@ -543,18 +560,20 @@ impl ProtocolStore for InMemoryBackend {
         let now = crate::time::now_secs();
         let mut s = self.state.lock().await;
 
-        // Amortized eviction: only scan when the map is large AND enough time
-        // has passed since the last eviction to avoid O(n) work on every insert.
-        if s.sent_messages.len() >= SENT_MESSAGE_EVICT_THRESHOLD {
-            let last = self
-                .last_eviction
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let interval = SENT_MESSAGE_EVICT_INTERVAL_SECS.min(self.sent_message_ttl_secs);
-            if now - last >= interval {
-                let cutoff = now - self.sent_message_ttl_secs;
-                s.sent_messages.retain(|_, e| e.timestamp >= cutoff);
-                self.last_eviction
-                    .store(now, std::sync::atomic::Ordering::Relaxed);
+        // Memory bound only: when the map hits the cap, drop the oldest entries
+        // (by timestamp) down to 3/4 of it so this O(n log n) scan amortizes
+        // across many inserts. Time-based pruning is the caller's keepalive sweep.
+        if s.sent_messages.len() >= MAX_SENT_MESSAGES {
+            let target = MAX_SENT_MESSAGES * 3 / 4;
+            let drop_count = s.sent_messages.len().saturating_sub(target);
+            let mut by_age: Vec<_> = s
+                .sent_messages
+                .iter()
+                .map(|(k, e)| (e.timestamp, k.clone()))
+                .collect();
+            by_age.sort_unstable_by_key(|(ts, _)| *ts);
+            for (_, k) in by_age.into_iter().take(drop_count) {
+                s.sent_messages.remove(&k);
             }
         }
 
@@ -594,29 +613,22 @@ impl ProtocolStore for InMemoryBackend {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl MsgSecretStore for InMemoryBackend {
-    async fn put_msg_secret(
-        &self,
-        chat: &str,
-        sender: &str,
-        msg_id: &str,
-        secret: &[u8],
-    ) -> Result<()> {
-        self.state.lock().await.msg_secrets.insert(
-            (chat.to_string(), sender.to_string(), msg_id.to_string()),
-            (secret.to_vec(), crate::time::now_secs()),
-        );
-        Ok(())
-    }
-
     async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize> {
-        let now = crate::time::now_secs();
+        use crate::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
         let stored = entries.len();
         let mut state = self.state.lock().await;
         for entry in entries {
-            state.msg_secrets.insert(
-                (entry.chat, entry.sender, entry.msg_id),
-                (entry.secret, now),
-            );
+            let key = (entry.chat, entry.sender, entry.msg_id);
+            let (expires_at, message_ts) = match state.msg_secrets.get(&key) {
+                Some((_, existing_exp, existing_ts)) => (
+                    merge_msg_secret_expiry(*existing_exp, entry.expires_at),
+                    merge_msg_secret_message_ts(*existing_ts, entry.message_ts),
+                ),
+                None => (entry.expires_at, entry.message_ts),
+            };
+            state
+                .msg_secrets
+                .insert(key, (entry.secret, expires_at, message_ts));
         }
         Ok(stored)
     }
@@ -628,20 +640,33 @@ impl MsgSecretStore for InMemoryBackend {
         msg_id: &str,
     ) -> Result<Option<Vec<u8>>> {
         Ok(self
+            .get_msg_secret_with_ts(chat, sender, msg_id)
+            .await?
+            .map(|(secret, _)| secret))
+    }
+
+    async fn get_msg_secret_with_ts(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> Result<Option<(Vec<u8>, i64)>> {
+        Ok(self
             .state
             .lock()
             .await
             .msg_secrets
             .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
-            .map(|(secret, _)| secret.clone()))
+            .map(|(secret, _, message_ts)| (secret.clone(), *message_ts)))
     }
 
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
         let mut state = self.state.lock().await;
         let before = state.msg_secrets.len();
+        // Keep rows with no deadline (0 = never) or a deadline still in the future.
         state
             .msg_secrets
-            .retain(|_, (_, ts)| *ts >= cutoff_timestamp);
+            .retain(|_, (_, expires_at, _)| *expires_at == 0 || *expires_at > cutoff_timestamp);
         Ok((before - state.msg_secrets.len()) as u32)
     }
 }
@@ -686,6 +711,82 @@ mod tests {
     #[test]
     fn in_memory_backend_implements_backend() {
         is_backend::<InMemoryBackend>();
+    }
+
+    #[tokio::test]
+    async fn group_metadata_round_trip() {
+        use crate::store::traits::ProtocolStore;
+        let backend = InMemoryBackend::new();
+        let jid = "120363000000000001@g.us";
+
+        assert!(backend.get_group_metadata(jid).await.unwrap().is_none());
+        backend.put_group_metadata(jid, b"blob-v1").await.unwrap();
+        assert_eq!(
+            backend.get_group_metadata(jid).await.unwrap().as_deref(),
+            Some(&b"blob-v1"[..])
+        );
+        backend.put_group_metadata(jid, b"blob-v2").await.unwrap();
+        assert_eq!(
+            backend.get_group_metadata(jid).await.unwrap().as_deref(),
+            Some(&b"blob-v2"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn has_signal_state_for_user_matches_by_user_prefix() {
+        let backend = InMemoryBackend::new();
+        let user = "5511999990000";
+
+        assert!(!backend.has_signal_state_for_user(user).await.unwrap());
+
+        // Device 0 is keyed `user@server`.
+        backend
+            .put_session("5511999990000@s.whatsapp.net", b"sess")
+            .await
+            .unwrap();
+        assert!(backend.has_signal_state_for_user(user).await.unwrap());
+
+        // A different user that this one is a prefix of must NOT match.
+        let other = InMemoryBackend::new();
+        other
+            .put_session("55119999900001@s.whatsapp.net", b"sess")
+            .await
+            .unwrap();
+        assert!(!other.has_signal_state_for_user(user).await.unwrap());
+
+        // Non-zero device is keyed `user:dev@server`; identity-only also counts.
+        let dev = InMemoryBackend::new();
+        dev.put_identity("5511999990000:5@s.whatsapp.net", [7u8; 32])
+            .await
+            .unwrap();
+        assert!(dev.has_signal_state_for_user(user).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn store_sent_message_is_memory_bounded() {
+        let backend = InMemoryBackend::new();
+        for i in 0..(MAX_SENT_MESSAGES + 500) {
+            backend
+                .store_sent_message("chat@g.us", &format!("m{i}"), b"payload")
+                .await
+                .unwrap();
+        }
+        let len = backend.state.lock().await.sent_messages.len();
+        assert!(
+            len <= MAX_SENT_MESSAGES,
+            "sent_messages must stay within the hard cap, got {len}"
+        );
+        // The most recently stored message is inserted after eviction, so it
+        // always survives.
+        let last = format!("m{}", MAX_SENT_MESSAGES + 500 - 1);
+        assert!(
+            backend
+                .take_sent_message("chat@g.us", &last)
+                .await
+                .unwrap()
+                .is_some(),
+            "the newest message must survive count-cap eviction"
+        );
     }
 
     #[tokio::test]
@@ -783,18 +884,24 @@ mod tests {
                     sender: "sender".into(),
                     msg_id: "M1".into(),
                     secret: vec![1u8; 32],
+                    expires_at: 0,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M2".into(),
                     secret: vec![2u8; 32],
+                    expires_at: 0,
+                    message_ts: 0,
                 },
                 MsgSecretEntry {
                     chat: "chat".into(),
                     sender: "sender".into(),
                     msg_id: "M1".into(),
                     secret: vec![9u8; 32],
+                    expires_at: 0,
+                    message_ts: 0,
                 },
             ])
             .await
@@ -826,7 +933,7 @@ mod tests {
             .put_msg_secret("c", "s", "OLD", &[1u8; 32])
             .await
             .unwrap();
-        // Mutate timestamp directly to simulate an old row.
+        // Set a deadline already in the past to simulate an expired row.
         {
             let mut state = backend.state.lock().await;
             let entry = state
@@ -835,6 +942,7 @@ mod tests {
                 .unwrap();
             entry.1 = crate::time::now_secs() - 86_400 * 30;
         }
+        // NEW keeps the default `expires_at = 0` (never), so it survives.
         backend
             .put_msg_secret("c", "s", "NEW", &[2u8; 32])
             .await

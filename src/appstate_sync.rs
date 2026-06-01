@@ -233,14 +233,11 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl MsgSecretStore for MockBackend {
-        async fn put_msg_secret(
+        async fn put_msg_secrets(
             &self,
-            _chat: &str,
-            _sender: &str,
-            _msg_id: &str,
-            _secret: &[u8],
-        ) -> StoreResult<()> {
-            Ok(())
+            entries: Vec<wacore::store::traits::MsgSecretEntry>,
+        ) -> StoreResult<usize> {
+            Ok(entries.len())
         }
 
         async fn get_msg_secret(

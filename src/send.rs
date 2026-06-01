@@ -466,12 +466,15 @@ impl Client {
         let mut store_adapter = self.signal_adapter_from(device_store_arc.clone());
         let mut stores = store_adapter.as_signal_stores();
 
-        // Determine which devices need SKDM using the unified per-device map
+        // Determine which devices need SKDM using the unified per-device map.
+        // Status keeps the prior phash behavior, so we drop the full device set
+        // and only use the SKDM-target subset.
         let skdm_target_devices: Option<Vec<Jid>> = if force_skdm {
             None
         } else {
             self.resolve_skdm_targets(&to_str, &group_info, &own_lid)
                 .await
+                .map(|(_all, needs)| needs)
         };
 
         // `<meta status_setting>` describes the POSTER's privacy on their own
@@ -495,12 +498,15 @@ impl Client {
             &mut group_info,
             &own_jid,
             &own_lid,
-            account_info.as_ref(),
+            account_info.as_deref(),
             to.clone(),
             &message,
             request_id.clone(),
             force_skdm,
             skdm_target_devices,
+            // Status broadcasts keep the prior phash behavior (no full-set/self
+            // augmentation) — that path is group-only.
+            None,
             None,
             &extra_stanza_nodes,
         )
@@ -537,11 +543,12 @@ impl Client {
                         &mut group_info,
                         &own_jid,
                         &own_lid,
-                        account_info.as_ref(),
+                        account_info.as_deref(),
                         to.clone(),
                         &message,
                         request_id.clone(),
                         true,
+                        None,
                         None,
                         None,
                         &extra_stanza_nodes,
@@ -595,8 +602,12 @@ impl Client {
         })
     }
 
-    /// Resolve which devices need SKDM. Returns `None` for full distribution
-    /// (no cache data), or `Some(devices)` listing devices that need fresh SKDM.
+    /// Resolve the group's device set for a warm/partial send. Returns
+    /// `None` when device resolution fails (caller falls back to the full
+    /// `force_skdm` path), otherwise `Some((all_devices, needs_skdm))` where
+    /// `all_devices` is the complete resolved set (feeds the phash) and
+    /// `needs_skdm` is the subset still missing the sender key (feeds SKDM
+    /// distribution). `needs_skdm` may be empty (fully warm send).
     ///
     /// For LID mode, uses `group_info.phone_jid_for_lid_user` to query devices
     /// via PN when available (LID usync is unreliable for own JID), then
@@ -606,7 +617,7 @@ impl Client {
         group_jid: &str,
         group_info: &wacore::client::context::GroupInfo,
         own_sending_jid: &Jid,
-    ) -> Option<Vec<Jid>> {
+    ) -> Option<(Vec<Jid>, Vec<Jid>)> {
         use crate::sender_key_device_cache::SenderKeyDeviceMap;
 
         // Atomic get-or-init: if another task invalidated the cache during our
@@ -659,8 +670,11 @@ impl Client {
                     all_devices
                 };
 
+                // Borrow for the filter so `all_devices` survives to feed the
+                // phash (the full set), while `needs_skdm` is just the subset
+                // still missing the key.
                 let needs_skdm: Vec<Jid> = all_devices
-                    .into_iter()
+                    .iter()
                     .filter(|device| {
                         if device.is_hosted() {
                             return false;
@@ -676,18 +690,16 @@ impl Client {
                             .unwrap_or(false)
                             || cached_map.is_user_forgotten(&device.user)
                     })
+                    .cloned()
                     .collect();
 
-                if needs_skdm.is_empty() {
-                    Some(vec![])
-                } else {
-                    log::debug!(
-                        "Found {} devices needing SKDM for {}",
-                        needs_skdm.len(),
-                        group_jid
-                    );
-                    Some(needs_skdm)
-                }
+                log::debug!(
+                    "Resolved {} devices ({} need SKDM) for {}",
+                    all_devices.len(),
+                    needs_skdm.len(),
+                    group_jid
+                );
+                Some((all_devices, needs_skdm))
             }
             Err(e) => {
                 log::warn!(
@@ -757,60 +769,78 @@ impl Client {
                         return;
                     }
                 };
+                // Cold path: box the heavy mismatch handler so the common
+                // (phash matches) spawned future stays small instead of carrying
+                // all the invalidation/clear awaits inline.
                 if let Some(server) = ack.get().get_attr("phash").map(|v| v.as_str())
                     && server != our_phash
                 {
-                    log::warn!(
-                        "Phash mismatch for {jid}: ours={our_phash}, server={server}. Invalidating caches."
-                    );
-                    // DM phash covers both recipient + own devices
-                    // (WA Web: syncDeviceListJob([recipient, me]))
-                    if !jid.is_group() && !jid.is_status_broadcast() {
-                        client.invalidate_device_cache(&jid.user).await;
-                        if let Some(own_pn) =
-                            &client.persistence_manager.get_device_snapshot().await.pn
-                        {
-                            client.invalidate_device_cache(&own_pn.user).await;
-                        }
-                    }
-                    let jid_str = jid.to_string();
-                    // Cache-only invalidation re-reads the same stale rows on
-                    // the next send. Drop the persisted state too so the next
-                    // send takes the full-distribution path. If the clear
-                    // fails, fall back to deleting the bot's own sender key
-                    // for the chat — the next send will see `!key_exists`
-                    // and force_skdm without depending on the tracker.
-                    if jid.is_group() || jid.is_status_broadcast() {
-                        let cleared = client
-                            .persistence_manager
-                            .clear_sender_key_devices(&jid_str)
-                            .await;
-                        if let Err(e) = cleared {
-                            log::warn!(
-                                "phash mismatch: clear_sender_key_devices failed: {e} — \
-                                 deleting own sender key as fallback to force redistribution"
-                            );
-                            use wacore::libsignal::store::sender_key_name::SenderKeyName;
-                            use wacore::types::jid::JidExt;
-                            let snapshot =
-                                client.persistence_manager.get_device_snapshot().await;
-                            for own in snapshot.lid.iter().chain(snapshot.pn.iter()) {
-                                let sk =
-                                    SenderKeyName::from_parts(&jid_str, own.to_protocol_address().as_str());
-                                client.signal_cache.delete_sender_key(sk.cache_key()).await;
-                            }
-                            let _ = client
-                                .flush_signal_cache_logged("phash-mismatch-fallback", None)
-                                .await;
-                        }
-                    }
-                    client.sender_key_device_cache.invalidate(&jid_str).await;
-                    if invalidate_group_cache {
-                        client.get_group_cache().await.invalidate(&jid).await;
-                    }
+                    Box::pin(client.handle_phash_mismatch(
+                        &jid,
+                        &our_phash,
+                        &server,
+                        invalidate_group_cache,
+                    ))
+                    .await;
                 }
             }))
             .detach();
+    }
+
+    /// Cold path of [`spawn_phash_validation`](Self::spawn_phash_validation): the
+    /// server's phash disagreed with ours, so invalidate the relevant
+    /// device/group caches and (for groups) force sender-key redistribution.
+    async fn handle_phash_mismatch(
+        &self,
+        jid: &Jid,
+        our_phash: &str,
+        server_phash: &str,
+        invalidate_group_cache: bool,
+    ) {
+        log::warn!(
+            "Phash mismatch for {jid}: ours={our_phash}, server={server_phash}. Invalidating caches."
+        );
+        // DM phash covers both recipient + own devices
+        // (WA Web: syncDeviceListJob([recipient, me]))
+        if !jid.is_group() && !jid.is_status_broadcast() {
+            self.invalidate_device_cache(&jid.user).await;
+            if let Some(own_pn) = &self.persistence_manager.get_device_snapshot().await.pn {
+                self.invalidate_device_cache(&own_pn.user).await;
+            }
+        }
+        let jid_str = jid.to_string();
+        // Cache-only invalidation re-reads the same stale rows on the next send.
+        // Drop the persisted state too so the next send takes the full-
+        // distribution path. If the clear fails, fall back to deleting the bot's
+        // own sender key for the chat — the next send will see `!key_exists` and
+        // force_skdm without depending on the tracker.
+        if jid.is_group() || jid.is_status_broadcast() {
+            let cleared = self
+                .persistence_manager
+                .clear_sender_key_devices(&jid_str)
+                .await;
+            if let Err(e) = cleared {
+                log::warn!(
+                    "phash mismatch: clear_sender_key_devices failed: {e} — \
+                     deleting own sender key as fallback to force redistribution"
+                );
+                use wacore::libsignal::store::sender_key_name::SenderKeyName;
+                use wacore::types::jid::JidExt;
+                let snapshot = self.persistence_manager.get_device_snapshot().await;
+                for own in snapshot.lid.iter().chain(snapshot.pn.iter()) {
+                    let sk =
+                        SenderKeyName::from_parts(&jid_str, own.to_protocol_address().as_str());
+                    self.signal_cache.delete_sender_key(sk.cache_key()).await;
+                }
+                let _ = self
+                    .flush_signal_cache_logged("phash-mismatch-fallback", None)
+                    .await;
+            }
+        }
+        self.sender_key_device_cache.invalidate(&jid_str).await;
+        if invalidate_group_cache {
+            self.get_group_cache().await.invalidate(jid).await;
+        }
     }
 
     /// Ensure the status stanza has a <participants> node listing all recipient
@@ -1037,7 +1067,7 @@ impl Client {
                 &signal_addr,
                 message,
                 request_id,
-                device_snapshot.account.as_ref(),
+                device_snapshot.account.as_deref(),
             )
             .await?
         } else if to.is_group() {
@@ -1123,12 +1153,23 @@ impl Client {
 
             // Determine which devices need SKDM distribution using the unified
             // per-device sender key map (matches WA Web's participant.senderKey Map).
-            let skdm_target_devices: Option<Vec<Jid>> = if force_skdm {
-                None
-            } else {
-                self.resolve_skdm_targets(&to_str, &group_info, &own_sending_jid)
-                    .await
-            };
+            // `all_devices_for_phash` carries the FULL resolved set so the phash
+            // covers every device + self even on a warm send (WA Web sends a
+            // phash on every group send); `skdm_target_devices` is the subset
+            // still missing the key. On the cold/`force_skdm` path both are
+            // `None` and `prepare_group_stanza` resolves the set itself.
+            let (all_devices_for_phash, skdm_target_devices): (Option<Vec<Jid>>, Option<Vec<Jid>>) =
+                if force_skdm {
+                    (None, None)
+                } else {
+                    match self
+                        .resolve_skdm_targets(&to_str, &group_info, &own_sending_jid)
+                        .await
+                    {
+                        Some((all, needs)) => (Some(all), Some(needs)),
+                        None => (None, None),
+                    }
+                };
 
             match wacore::send::prepare_group_stanza(
                 &*self.runtime,
@@ -1137,12 +1178,13 @@ impl Client {
                 &mut group_info,
                 &own_jid,
                 &own_lid,
-                account_info.as_ref(),
+                account_info.as_deref(),
                 to.clone(),
                 message,
                 request_id.clone(),
                 force_skdm,
                 skdm_target_devices,
+                all_devices_for_phash,
                 edit.clone(),
                 &extra_stanza_nodes,
             )
@@ -1184,11 +1226,12 @@ impl Client {
                             &mut group_info,
                             &own_jid,
                             &own_lid,
-                            account_info.as_ref(),
+                            account_info.as_deref(),
                             to,
                             message,
                             request_id,
                             true,
+                            None,
                             None,
                             edit.clone(),
                             &extra_stanza_nodes,
@@ -1369,7 +1412,7 @@ impl Client {
                 self,
                 own_jid,
                 device_snapshot.lid.as_ref(),
-                device_snapshot.account.as_ref(),
+                device_snapshot.account.as_deref(),
                 to,
                 message,
                 request_id,
@@ -1415,11 +1458,14 @@ impl Client {
                 None => self.dm_sender_identity_for(&tc_issue_target).await,
             };
             if let Some(sender) = sender {
+                let is_bot_chat = tc_issue_target.is_bot();
+                let class = wacore::msg_secret::classify(message, is_bot_chat);
                 self.persist_outbound_msg_secret(
                     &tc_issue_target,
                     &sender,
                     &outbound_id_clone,
                     secret,
+                    class,
                 )
                 .await;
             }
@@ -1482,13 +1528,39 @@ impl Client {
         sender: &Jid,
         msg_id: &str,
         secret: &[u8; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+        class: wacore::msg_secret::RetentionClass,
     ) {
-        let chat_str = chat.to_non_ad_string();
-        let sender_str = sender.to_non_ad_string();
+        let policy = self.cache_config.msg_secret_policy;
+        if !policy.persists() {
+            return;
+        }
+        // BotOnly keeps only bot-context secrets; a group message that invokes a
+        // bot classifies as Bot, so its reply can still be decrypted.
+        if policy.bot_only() && class != wacore::msg_secret::RetentionClass::Bot {
+            return;
+        }
+        // Outbound secrets are minted "now", so the parent event time is the
+        // current clock.
+        let now = wacore::time::now_secs();
+        let expires_at = wacore::msg_secret::expires_at(
+            policy,
+            &self.cache_config.msg_secret_retention,
+            class,
+            u64::try_from(now).ok(),
+            now,
+        );
+        let entry = wacore::store::traits::MsgSecretEntry {
+            chat: chat.to_non_ad_string(),
+            sender: sender.to_non_ad_string(),
+            msg_id: msg_id.to_string(),
+            secret: secret.to_vec(),
+            expires_at,
+            message_ts: now,
+        };
         if let Err(e) = self
             .persistence_manager
             .backend()
-            .put_msg_secret(&chat_str, &sender_str, msg_id, secret)
+            .put_msg_secrets(vec![entry])
             .await
         {
             log::warn!("Failed to persist outbound messageSecret for {msg_id}: {e:?}");
@@ -2563,14 +2635,18 @@ mod tests {
 
         let group_info = GroupInfo::new(participants.clone(), AddressingMode::Lid);
 
-        let result = client
+        let (all_devices, needs_skdm) = client
             .resolve_skdm_targets(group_jid, &group_info, &own_lid)
             .await
-            .expect("None means the empty-cache early-exit is back");
+            .expect("None means device resolution failed");
 
-        assert_eq!(result.len(), participants.len());
+        // Empty cache → every participant needs SKDM, and the full set equals
+        // the target set on this cold path.
+        assert_eq!(needs_skdm.len(), participants.len());
+        assert_eq!(all_devices.len(), participants.len());
         for user in &participant_users {
-            assert!(result.iter().any(|j| j.user == *user));
+            assert!(needs_skdm.iter().any(|j| j.user == *user));
+            assert!(all_devices.iter().any(|j| j.user == *user));
         }
     }
 
@@ -3584,7 +3660,13 @@ mod tests {
         let sender: Jid = "5511000000001:0@s.whatsapp.net".parse().unwrap();
         let secret = [0x55u8; 32];
         client
-            .persist_outbound_msg_secret(&chat, &sender, "MID_1", &secret)
+            .persist_outbound_msg_secret(
+                &chat,
+                &sender,
+                "MID_1",
+                &secret,
+                wacore::msg_secret::RetentionClass::Text,
+            )
             .await;
         let got = client
             .persistence_manager
@@ -3605,7 +3687,13 @@ mod tests {
         let chat_with_dev: Jid = "5511777776666:7@s.whatsapp.net".parse().unwrap();
         let sender_with_dev: Jid = "5511000000001:3@s.whatsapp.net".parse().unwrap();
         client
-            .persist_outbound_msg_secret(&chat_with_dev, &sender_with_dev, "MID_4", &[2u8; 32])
+            .persist_outbound_msg_secret(
+                &chat_with_dev,
+                &sender_with_dev,
+                "MID_4",
+                &[2u8; 32],
+                wacore::msg_secret::RetentionClass::Text,
+            )
             .await;
         let got = client
             .persistence_manager
@@ -3680,7 +3768,13 @@ mod tests {
         let lid_sender: Jid = "999888777666555:0@lid".parse().unwrap();
         let secret = [0x4Du8; 32];
         client
-            .persist_outbound_msg_secret(&group_chat, &lid_sender, "GROUP_MID", &secret)
+            .persist_outbound_msg_secret(
+                &group_chat,
+                &lid_sender,
+                "GROUP_MID",
+                &secret,
+                wacore::msg_secret::RetentionClass::Text,
+            )
             .await;
         let got = client
             .persistence_manager

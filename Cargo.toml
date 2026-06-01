@@ -147,6 +147,15 @@ whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "
 whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.6.0", optional = true }
 whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.6.0", optional = true }
 
+# wasm32-unknown-unknown has no default getrandom backend, so make the browser
+# one available (the only valid choice there) to build the crate standalone:
+# CI wasm guard + downstream consumers like whatsapp-rust-bridge. Gated to the
+# unknown-unknown triple per getrandom's guidance so wasm32-wasi/emscripten keep
+# their own backends and don't pull wasm-bindgen/js-sys. Backend is still
+# selected via `--cfg getrandom_backend="wasm_js"` in RUSTFLAGS; no native effect.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+
 [dev-dependencies]
 aes = { workspace = true }
 cbc = { version = "0.2", features = ["alloc", "block-padding"] }

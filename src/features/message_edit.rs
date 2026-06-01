@@ -152,23 +152,51 @@ impl<'a> EncryptedEdit<'a> {
         self.target_message_key.id.as_deref()
     }
 
-    /// Resolve the original sender JID from the target message key.
+    /// Resolve the original sender JID from the target message key alone.
     ///
-    /// `my_jid` is the receiver's own JID in the addressing mode of the
-    /// chat (PN or LID). It is needed because for self-sent edits — e.g.
-    /// edits to our own messages that arrive via device sync —
-    /// `target_message_key` has `from_me = true` and its `remote_jid`
-    /// points to the *other* party, not us. WA Web's
-    /// `MsgGetters.getOriginalSender` reads `originalSelfAuthor || sender`
-    /// from its materialised msg-row store; we have no row here, so we
-    /// reconstruct the same fact from `from_me` + own jid.
+    /// CAUTION: `target_message_key` is written in the *editor's* frame, so its
+    /// `from_me` is `true` for any edit the editor authored, including an
+    /// incoming peer edit, where it then resolves to `my_jid` (the receiver)
+    /// rather than the peer. On the receive path use
+    /// [`Self::original_sender_for_dispatch`], which takes the author from the
+    /// envelope frame. This target-key-only resolver is kept for callers that
+    /// have no envelope frame.
     ///
-    /// Resolution order:
+    /// `my_jid` is the receiver's own JID in the addressing mode of the chat
+    /// (PN or LID). Resolution order:
     /// 1. `participant` if present (always set in groups).
-    /// 2. `my_jid` if `from_me == Some(true)` (self-sent edit sync).
-    /// 3. `remote_jid` (1:1 incoming edit; the chat is the other party).
+    /// 2. `my_jid` if `from_me == Some(true)`.
+    /// 3. `remote_jid` otherwise.
     pub fn original_sender_jid(&self, my_jid: &Jid) -> Result<Jid> {
         resolve_target_sender(self.target_message_key, my_jid)
+    }
+
+    /// Resolve the edit's parent author from the dispatch-time envelope frame.
+    ///
+    /// A message can only be edited by its author, so the parent author of a
+    /// MESSAGE_EDIT is always the editor: ourselves for a self-synced edit
+    /// (`is_from_me`), else the envelope sender. Mirrors WA Web's
+    /// `MsgGetters.getOriginalSender = originalSelfAuthor || sender` and is the
+    /// correct resolver for the receive path, where the target key's `from_me`
+    /// reflects the editor, not the receiver.
+    pub fn original_sender_for_dispatch(
+        &self,
+        is_from_me: bool,
+        envelope_sender: &Jid,
+        my_jid: &Jid,
+    ) -> Jid {
+        edit_author_from_envelope(is_from_me, envelope_sender, my_jid)
+    }
+}
+
+/// Resolve a MESSAGE_EDIT's parent author from the dispatch-time envelope
+/// frame: us for a self-synced edit (`is_from_me`), else the envelope sender.
+/// The editor is always the author, so this is the parent author too.
+fn edit_author_from_envelope(is_from_me: bool, envelope_sender: &Jid, my_jid: &Jid) -> Jid {
+    if is_from_me {
+        my_jid.to_non_ad()
+    } else {
+        envelope_sender.to_non_ad()
     }
 }
 
@@ -245,8 +273,40 @@ impl<'a> SecretEncrypted<'a> {
         self.target_message_key.id.as_deref()
     }
 
+    /// Resolve the targeted message's author from the target key alone.
+    ///
+    /// See the caution on [`EncryptedEdit::original_sender_jid`]: for
+    /// MESSAGE_EDIT prefer [`Self::original_sender_for_dispatch`] on the receive
+    /// path. Authoritative for poll/event kinds (whose target key carries the
+    /// real author).
     pub fn original_sender_jid(&self, my_jid: &Jid) -> Result<Jid> {
         resolve_target_sender(self.target_message_key, my_jid)
+    }
+
+    /// Resolve the parent message's author for the secret lookup + HKDF info,
+    /// using the dispatch-time envelope frame.
+    ///
+    /// For `MESSAGE_EDIT` the editor is always the author (you can only edit
+    /// your own message) and `target_message_key` is written in the editor's
+    /// frame — its `from_me` is `true` even for an incoming peer edit, so it is
+    /// not a reliable receiver-side signal. Take the author from the envelope
+    /// instead: ourselves for a self-synced edit, else the envelope sender.
+    /// Other kinds (poll/event) can be modified by a non-author, so for those
+    /// `target_message_key` stays authoritative.
+    pub fn original_sender_for_dispatch(
+        &self,
+        is_from_me: bool,
+        envelope_sender: &Jid,
+        my_jid: &Jid,
+    ) -> Result<Jid> {
+        match self.kind {
+            SecretEncKind::MessageEdit => Ok(edit_author_from_envelope(
+                is_from_me,
+                envelope_sender,
+                my_jid,
+            )),
+            _ => resolve_target_sender(self.target_message_key, my_jid),
+        }
     }
 }
 
@@ -463,7 +523,11 @@ mod tests {
     }
 
     #[test]
-    fn original_sender_jid_falls_back_to_remote_jid_for_incoming_one_to_one_edit() {
+    fn original_sender_jid_uses_remote_jid_when_target_not_from_me() {
+        // Unit-tests the `resolve_target_sender` remote_jid branch, not a real
+        // edit frame: an actual incoming peer edit writes the target key in the
+        // editor's frame (from_me=true), so the receive path uses the envelope
+        // sender via `original_sender_for_dispatch`, not this resolver.
         let msg = wa::Message {
             secret_encrypted_message: MessageField::some(wa::message::SecretEncryptedMessage {
                 target_message_key: MessageField::some(wa::MessageKey {
@@ -486,6 +550,140 @@ mod tests {
         assert_eq!(
             env.original_sender_jid(&my_jid).unwrap().to_string(),
             "5510000@s.whatsapp.net"
+        );
+    }
+
+    #[test]
+    fn encrypted_edit_dispatch_resolver_uses_envelope_frame() {
+        // The MESSAGE_EDIT-specific consumer API resolves from the envelope
+        // frame, ignoring the editor-framed target key (here from_me=true).
+        let msg = wa::Message {
+            secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: buffa::MessageField::some(wa::MessageKey {
+                    remote_jid: Some("100000000000001@lid".to_string()),
+                    from_me: Some(true),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = extract_envelope(&msg).expect("recognised");
+        let my_jid = "100000000000001:3@lid".parse::<Jid>().unwrap();
+        let editor = "200000000000002@lid".parse::<Jid>().unwrap();
+        // Incoming peer edit → envelope sender (editor); device suffix stripped.
+        assert_eq!(
+            env.original_sender_for_dispatch(false, &editor, &my_jid)
+                .to_string(),
+            "200000000000002@lid"
+        );
+        // Self-synced edit → us, device suffix stripped.
+        assert_eq!(
+            env.original_sender_for_dispatch(true, &editor, &my_jid)
+                .to_string(),
+            "100000000000001@lid"
+        );
+    }
+
+    #[test]
+    fn message_edit_original_sender_uses_envelope_sender_for_incoming_peer_edit() {
+        // Captured wire data: when a peer edits THEIR OWN message, the target
+        // key is written in the EDITOR's frame — from_me=true, no participant,
+        // even in groups. Trusting target_key.from_me resolves the original
+        // sender to *us*, so the parent messageSecret lookup misses. The editor
+        // is always the author (you can only edit your own message), so the
+        // sender must come from the envelope frame.
+        let msg = wa::Message {
+            secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: buffa::MessageField::some(wa::MessageKey {
+                    remote_jid: Some("100000000000001@lid".to_string()), // our LID (editor's frame)
+                    from_me: Some(true),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = extract_secret_encrypted(&msg).expect("recognised");
+        let my_jid = "100000000000001@lid".parse::<Jid>().unwrap();
+        let editor = "200000000000002@lid".parse::<Jid>().unwrap();
+        // Incoming peer edit: envelope is NOT from me → sender is the editor.
+        assert_eq!(
+            env.original_sender_for_dispatch(false, &editor, &my_jid)
+                .unwrap()
+                .to_string(),
+            "200000000000002@lid"
+        );
+    }
+
+    #[test]
+    fn message_edit_original_sender_uses_my_jid_for_self_synced_edit() {
+        // Our own edit, synced from another linked device: the envelope IS from
+        // me, so the original sender is us — device suffix stripped.
+        let msg = wa::Message {
+            secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: buffa::MessageField::some(wa::MessageKey {
+                    remote_jid: Some("200000000000002@lid".to_string()),
+                    from_me: Some(true),
+                    id: Some("AC1".to_string()),
+                    participant: None,
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = extract_secret_encrypted(&msg).expect("recognised");
+        let my_jid = "100000000000001:3@lid".parse::<Jid>().unwrap();
+        let editor = "100000000000001@lid".parse::<Jid>().unwrap();
+        assert_eq!(
+            env.original_sender_for_dispatch(true, &editor, &my_jid)
+                .unwrap()
+                .to_string(),
+            "100000000000001@lid"
+        );
+    }
+
+    #[test]
+    fn poll_edit_original_sender_still_uses_target_key() {
+        // Regression guard: poll/event modifications can be authored by someone
+        // other than the target's author (e.g. a peer votes on our poll), so the
+        // target key stays authoritative for non-edit kinds.
+        let msg = wa::Message {
+            secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
+                target_message_key: buffa::MessageField::some(wa::MessageKey {
+                    remote_jid: Some("g@g.us".to_string()),
+                    from_me: Some(false),
+                    id: Some("AC1".to_string()),
+                    participant: Some("creator@s.whatsapp.net".to_string()),
+                }),
+                enc_payload: Some(vec![0u8; 32]),
+                enc_iv: Some(vec![0u8; 12]),
+                secret_enc_type: Some(wa::message::secret_encrypted_message::SecretEncType::POLL_EDIT),
+                remote_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let env = extract_secret_encrypted(&msg).expect("recognised");
+        let my_jid = "999@s.whatsapp.net".parse::<Jid>().unwrap();
+        let voter = "voter@s.whatsapp.net".parse::<Jid>().unwrap();
+        // Envelope sender (voter) differs, but the target's participant (poll
+        // creator) wins for poll kinds.
+        assert_eq!(
+            env.original_sender_for_dispatch(false, &voter, &my_jid)
+                .unwrap()
+                .to_string(),
+            "creator@s.whatsapp.net"
         );
     }
 

@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use thiserror::Error;
-use wacore_binary::zlib_pool::decompress_zlib_pooled;
+use wacore_binary::zlib_pool::{InflateReader, decompress_zlib_pooled};
 use waproto::whatsapp as wa;
 
 use buffa::view::MessageView as _;
@@ -55,6 +55,13 @@ pub fn process_history_sync(
     // Hard limit to prevent OOM on malformed blobs.
     // Typical InitialBootstrap: 5-20 MB decompressed.
     const MAX_DECOMPRESSED: u64 = 64 * 1024 * 1024;
+
+    // When the caller doesn't need the full decompressed blob (no
+    // Event::HistorySync consumer), stream-decompress and extract incrementally
+    // so peak memory stays ~one conversation instead of the whole blob.
+    if !retain_blob {
+        return process_history_sync_streaming(&compressed_data, own_user, MAX_DECOMPRESSED);
+    }
 
     let decompressed = decompress_zlib_pooled(&compressed_data, MAX_DECOMPRESSED)
         .map_err(HistorySyncError::DecompressionError)?;
@@ -123,6 +130,138 @@ pub fn process_history_sync(
             }
             _ => {
                 pos = skip_field(wire_type_raw, &buf, pos)?;
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Streaming variant of [`process_history_sync`] for when the full decompressed
+/// blob is NOT needed (`retain_blob == false`). Decompresses incrementally and
+/// parses each top-level field as soon as its bytes are buffered, so peak memory
+/// is bounded by the largest single conversation rather than the whole blob.
+/// Produces the same extraction results (secrets, tctokens, pushname, nctSalt)
+/// as the full path, but with `decompressed_bytes == None`.
+fn process_history_sync_streaming(
+    compressed_data: &[u8],
+    own_user: Option<&str>,
+    max_decompressed: u64,
+) -> Result<HistorySyncResult, HistorySyncError> {
+    let mut reader = InflateReader::new(compressed_data, max_decompressed);
+    let mut result = HistorySyncResult {
+        own_pushname: None,
+        nct_salt: None,
+        conversations_processed: 0,
+        tc_token_candidates: Vec::new(),
+        msg_secret_records: Vec::new(),
+        decompressed_bytes: None,
+    };
+
+    loop {
+        // A field starts with a tag varint; stop cleanly when the stream ends.
+        if !reader
+            .ensure(1)
+            .map_err(HistorySyncError::DecompressionError)?
+        {
+            break;
+        }
+        // A varint is at most 10 bytes (fewer is fine right at EOF).
+        reader
+            .ensure(10)
+            .map_err(HistorySyncError::DecompressionError)?;
+        let (tag, tlen) = read_varint(reader.available())?;
+        reader.consume(tlen);
+
+        let field_number = (tag >> 3) as u32;
+        let wire_type_raw = (tag & 0x7) as u32;
+
+        match wire_type_raw {
+            wire_type::LENGTH_DELIMITED => {
+                reader
+                    .ensure(10)
+                    .map_err(HistorySyncError::DecompressionError)?;
+                let (len, vlen) = read_varint(reader.available())?;
+                reader.consume(vlen);
+                let len = usize::try_from(len).map_err(|_| {
+                    HistorySyncError::MalformedProtobuf(format!(
+                        "field length overflows usize: {len}"
+                    ))
+                })?;
+                if !reader
+                    .ensure(len)
+                    .map_err(HistorySyncError::DecompressionError)?
+                {
+                    return Err(HistorySyncError::MalformedProtobuf(
+                        "length-delimited field truncated".into(),
+                    ));
+                }
+                {
+                    let value = &reader.available()[..len];
+                    match field_number {
+                        // conversations (repeated)
+                        2 => {
+                            let conversation = wa::ConversationView::decode_view(value)?;
+                            result.conversations_processed += 1;
+                            let extracted = extract_conversation_fields(&conversation);
+                            if let Some(candidate) = extracted.tc_token_candidate {
+                                result.tc_token_candidates.push(candidate);
+                            }
+                            result
+                                .msg_secret_records
+                                .extend(extracted.msg_secret_records);
+                        }
+                        // pushnames (repeated) — only our own is needed
+                        7 => {
+                            if result.own_pushname.is_none()
+                                && let Some(own) = own_user
+                                && let Some(name) = extract_own_pushname(value, own)?
+                            {
+                                result.own_pushname = Some(name);
+                            }
+                        }
+                        // nctSalt
+                        19 if !value.is_empty() => {
+                            result.nct_salt = Some(value.to_vec());
+                        }
+                        _ => {}
+                    }
+                }
+                reader.consume(len);
+            }
+            wire_type::VARINT => {
+                reader
+                    .ensure(10)
+                    .map_err(HistorySyncError::DecompressionError)?;
+                let (_, vlen) = read_varint(reader.available())?;
+                reader.consume(vlen);
+            }
+            wire_type::FIXED64 => {
+                if !reader
+                    .ensure(8)
+                    .map_err(HistorySyncError::DecompressionError)?
+                {
+                    return Err(HistorySyncError::MalformedProtobuf(
+                        "fixed64 field truncated".into(),
+                    ));
+                }
+                reader.consume(8);
+            }
+            wire_type::FIXED32 => {
+                if !reader
+                    .ensure(4)
+                    .map_err(HistorySyncError::DecompressionError)?
+                {
+                    return Err(HistorySyncError::MalformedProtobuf(
+                        "fixed32 field truncated".into(),
+                    ));
+                }
+                reader.consume(4);
+            }
+            _ => {
+                return Err(HistorySyncError::MalformedProtobuf(format!(
+                    "unknown wire type {wire_type_raw}"
+                )));
             }
         }
     }
@@ -225,6 +364,17 @@ pub struct HistoryMsgSecretRecord {
     pub web_msg_participant: Option<String>,
     pub msg_id: String,
     pub secret: Vec<u8>,
+    /// Parent message event time (unix seconds), if present in the blob.
+    /// Used by the seed-time retention filter; `None` falls back to seed time.
+    pub timestamp: Option<u64>,
+    /// Whether the parent is a poll-creation or event message. These get the
+    /// longer poll/event retention horizon because their add-ons (poll votes,
+    /// PollAddOption, EventEdit) have no sender-side time window.
+    pub is_poll_or_event: bool,
+    /// Whether the parent invokes a bot (botMetadata present). Kept so the seed
+    /// classifies a group bot prompt as a bot context, matching live capture, so
+    /// `BotOnly` retains it and a later bot reply can decrypt.
+    pub is_bot_invocation: bool,
 }
 
 fn extract_conversation_fields(conv: &wa::ConversationView<'_>) -> ConversationExtraction {
@@ -295,6 +445,10 @@ fn extract_msg_secret_records(conv: &wa::ConversationView<'_>) -> Vec<HistoryMsg
             continue;
         };
 
+        let inner = web_msg.message.as_option();
+        let is_poll_or_event = inner.is_some_and(message_is_poll_or_event);
+        let is_bot_invocation = inner.is_some_and(message_invokes_bot);
+
         records.push(HistoryMsgSecretRecord {
             chat_id: chat_id.to_string(),
             from_me: key.from_me == Some(true),
@@ -302,10 +456,53 @@ fn extract_msg_secret_records(conv: &wa::ConversationView<'_>) -> Vec<HistoryMsg
             web_msg_participant: web_msg.participant.map(str::to_string),
             msg_id: msg_id.to_string(),
             secret: secret.to_vec(),
+            timestamp: web_msg.message_timestamp,
+            is_poll_or_event,
+            is_bot_invocation,
         });
     }
 
     records
+}
+
+/// Walk wrapper layers (deviceSent/ephemeral/viewOnce/etc.) to the innermost
+/// message, mirroring main's `MessageInternalFields::base_message`. Bounded the
+/// same way as [`message_is_forwarded_at_depth`].
+fn base_message_view<'a>(message: &'a wa::MessageView<'a>) -> &'a wa::MessageView<'a> {
+    let mut current = message;
+    let mut depth = 0usize;
+    while depth <= 16 {
+        match first_wrapped_message(current) {
+            Some(inner) => {
+                current = inner;
+                depth += 1;
+            }
+            None => break,
+        }
+    }
+    current
+}
+
+/// Whether the (unwrapped) message is a poll-creation or event message. These
+/// carry the longer poll/event retention horizon.
+fn message_is_poll_or_event(message: &wa::MessageView<'_>) -> bool {
+    let base = base_message_view(message);
+    base.poll_creation_message.as_option().is_some()
+        || base.poll_creation_message_v2.as_option().is_some()
+        || base.poll_creation_message_v3.as_option().is_some()
+        || base.event_message.as_option().is_some()
+}
+
+/// Whether the message invokes a bot, detected via `botMetadata` presence.
+/// botMetadata sits on the top-level `MessageContextInfo` even when wrapped,
+/// so check both the outer message and the unwrapped base.
+fn message_invokes_bot(message: &wa::MessageView<'_>) -> bool {
+    let has = |m: &wa::MessageView<'_>| {
+        m.message_context_info
+            .as_option()
+            .is_some_and(|c| c.bot_metadata.as_option().is_some())
+    };
+    has(message) || has(base_message_view(message))
 }
 
 fn extract_message_context_secret<'a>(message: &'a wa::MessageView<'a>) -> Option<&'a [u8]> {

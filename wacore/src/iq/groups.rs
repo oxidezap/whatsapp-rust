@@ -1010,36 +1010,66 @@ impl ProtocolNode for GroupParticipatingResponse {
         Ok(Self { groups })
     }
 }
+/// Outcome of a [`GroupQueryIq`]. `NotModified` is returned when we sent a
+/// participant `phash` that matched the server's, so it omitted `<group>` (WA Web
+/// queryGroup phash skip) — the caller should reuse its cached metadata.
+#[derive(Debug, Clone)]
+pub enum GroupInfoOutcome {
+    Full(Box<GroupInfoResponse>),
+    NotModified,
+}
+
 /// IQ specification for querying a specific group's info.
+///
+/// When `phash` is set, the query carries `<query request="interactive"
+/// phash="2:.."/>` so an unchanged group is answered with an absent `<group>`
+/// ([`GroupInfoOutcome::NotModified`]).
 #[derive(Debug, Clone)]
 pub struct GroupQueryIq {
     pub group_jid: Jid,
+    pub phash: Option<String>,
 }
 
 impl GroupQueryIq {
     pub fn new(group_jid: &Jid) -> Self {
         Self {
             group_jid: group_jid.clone(),
+            phash: None,
+        }
+    }
+
+    /// Query carrying the cached participant `phash` so the server can answer
+    /// "not-modified" by omitting `<group>`.
+    pub fn with_phash(group_jid: &Jid, phash: Option<String>) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            phash,
         }
     }
 }
 
 impl IqSpec for GroupQueryIq {
-    type Response = GroupInfoResponse;
+    type Response = GroupInfoOutcome;
 
     fn build_iq(&self) -> InfoQuery<'static> {
+        let mut query = GroupQueryRequest::default().into_node();
+        if let Some(ref phash) = self.phash {
+            query.attrs.insert("phash", phash.clone());
+        }
         InfoQuery::get_ref(
             GROUP_IQ_NAMESPACE,
             &self.group_jid,
-            Some(NodeContent::Nodes(vec![
-                GroupQueryRequest::default().into_node(),
-            ])),
+            Some(NodeContent::Nodes(vec![query])),
         )
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        let group_node = required_child(response, "group")?;
-        GroupInfoResponse::try_from_node_ref(group_node)
+        match response.get_optional_child("group") {
+            Some(group_node) => Ok(GroupInfoOutcome::Full(Box::new(
+                GroupInfoResponse::try_from_node_ref(group_node)?,
+            ))),
+            None => Ok(GroupInfoOutcome::NotModified),
+        }
     }
 }
 
@@ -2937,6 +2967,58 @@ impl IqSpec for GetGroupProfilePicturesIq {
 mod tests {
     use super::*;
     use crate::request::InfoQueryType;
+
+    #[test]
+    fn group_query_iq_with_phash_emits_attr() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let iq = GroupQueryIq::with_phash(&jid, Some("2:abc123".to_string())).build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        let query = &nodes[0];
+        assert_eq!(query.tag, "query");
+        assert!(
+            query
+                .attrs
+                .get("request")
+                .is_some_and(|s| s == "interactive")
+        );
+        assert!(query.attrs.get("phash").is_some_and(|s| s == "2:abc123"));
+    }
+
+    #[test]
+    fn group_query_iq_without_phash_has_no_attr() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let iq = GroupQueryIq::new(&jid).build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        assert!(nodes[0].attrs.get("phash").is_none());
+    }
+
+    #[test]
+    fn group_query_parse_full_vs_not_modified() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let spec = GroupQueryIq::new(&jid);
+
+        // Present <group> → Full.
+        let full = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000001@g.us")
+                .build()])
+            .build();
+        assert!(matches!(
+            spec.parse_response(&full.as_node_ref()).unwrap(),
+            GroupInfoOutcome::Full(_)
+        ));
+
+        // Absent <group> → NotModified (server confirmed the phash matched).
+        let nm = NodeBuilder::new("iq").build();
+        assert!(matches!(
+            spec.parse_response(&nm.as_node_ref()).unwrap(),
+            GroupInfoOutcome::NotModified
+        ));
+    }
 
     #[test]
     fn test_group_subject_validation() {

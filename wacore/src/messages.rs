@@ -45,10 +45,24 @@ impl MessageUtils {
             .finalize_sha256_array()
             .map_err(|e| anyhow!("failed to finalize hash: {:?}", e))?;
 
+        // Standard base64 ('+'/'/'), matching whatsmeow (`base64.RawStdEncoding`)
+        // and WA Web (`WABase64.encodeB64`). URL-safe ('-'/'_') diverges from the
+        // server on ~22% of phashes (any output hitting base64 index 62/63).
         Ok(format!(
             "2:{hash}",
-            hash = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(&full_hash[..6])
+            hash = base64::prelude::BASE64_STANDARD_NO_PAD.encode(&full_hash[..6])
         ))
+    }
+
+    /// Validate a broadcast-contact-list hash from an incoming `deviceSentMessage`
+    /// against the message's `<participants>` set. Mirrors WA Web `validateBclHash`:
+    /// the sender (our own other device) hashes the broadcast recipients with
+    /// phashV2; here we recompute via [`participant_list_hash`](Self::participant_list_hash)
+    /// and return `true` only when the computed hash equals `expected` (including
+    /// for an empty participant list, which hashes to its own deterministic value
+    /// — not a trivial pass).
+    pub fn validate_bcl_hash(participants: &[wacore_binary::Jid], expected: &str) -> bool {
+        Self::participant_list_hash(participants).is_ok_and(|computed| computed == expected)
     }
 
     pub fn unpadded_message_len(plaintext: &[u8], version: u8) -> Result<usize> {
@@ -324,6 +338,21 @@ pub fn parse_message_info(
 
     source.addressing_mode = addressing_mode;
 
+    // Broadcast/status only: collect <participants><to jid> so the receive path
+    // can validate a deviceSentMessage.phash (WA Web validateBclHash). Group
+    // <participants> carry the device fanout, not a bcl, so they're skipped.
+    let bcl_participants: Vec<wacore_binary::Jid> = if from.server == Server::Broadcast {
+        node.get_optional_child("participants")
+            .map(|p| {
+                p.get_children_by_tag("to")
+                    .filter_map(|to| to.attrs().optional_jid("jid"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let category = attrs
         .optional_string("category")
         .map(|s| MessageCategory::from(s.as_ref()))
@@ -426,6 +455,7 @@ pub fn parse_message_info(
         peer_recipient_pn,
         meta_info,
         bot_info,
+        bcl_participants,
         ..Default::default()
     })
 }
@@ -775,6 +805,112 @@ mod parse_message_info_tests {
         assert!(
             saw_16,
             "pad len 16 must be reachable (was unreachable before)"
+        );
+    }
+
+    // Cross-impl phash parity vs whatsmeow (`base64.RawStdEncoding`) and WA Web
+    // (`WABase64.encodeB64` = standard '+'/'/'). Inputs engineered so
+    // sha256(adstrings)[..6] hits base64 index 62/63 — these are exactly the
+    // bytes that URL-safe ('-'/'_') would have encoded differently from the
+    // server. Pins our output to the standard alphabet the server expects.
+    #[test]
+    fn phash_crosscheck_vectors() {
+        fn dev(user: &str, device: u16, server: wacore_binary::Server) -> Jid {
+            Jid {
+                user: user.into(),
+                server,
+                agent: 0,
+                device,
+                integrator: 0,
+            }
+        }
+
+        let single = vec![dev("5511999999999", 3, wacore_binary::Server::Pn)];
+        assert_eq!(single[0].to_ad_string(), "5511999999999.0:3@s.whatsapp.net");
+        let h_single = MessageUtils::participant_list_hash(&single).unwrap();
+
+        let control = vec![dev("5511999999999", 0, wacore_binary::Server::Pn)];
+        let h_control = MessageUtils::participant_list_hash(&control).unwrap();
+
+        let multi = vec![
+            dev("5511988887777", 14, wacore_binary::Server::Pn),
+            dev("7469250125917", 21, wacore_binary::Server::Pn),
+        ];
+        let h_multi = MessageUtils::participant_list_hash(&multi).unwrap();
+
+        eprintln!("RUST_PHASH single   = {h_single}");
+        eprintln!("RUST_PHASH control  = {h_control}");
+        eprintln!("RUST_PHASH multi    = {h_multi}");
+
+        // Standard-base64 outputs (match whatsmeow + WA Web = the server).
+        // `single` and `multi` carry a 62/63 byte, so they differ from the
+        // old URL-safe output (`2:5s-YxCff` / `2:AAv_hwhn`); `control` has
+        // neither, so it is unchanged across alphabets.
+        assert_eq!(h_single, "2:5s+YxCff");
+        assert_eq!(h_control, "2:RJWVxcMQ");
+        assert_eq!(h_multi, "2:AAv/hwhn");
+    }
+
+    // #6 — validate_bcl_hash accepts the matching phashV2 and rejects a tampered
+    // one (the WA Web validateBclHash check on device-sent broadcasts).
+    #[test]
+    fn validate_bcl_hash_matches_and_rejects() {
+        let participants = vec![
+            Jid::from_str("100000000000001@lid").unwrap(),
+            Jid::from_str("100000000000002@lid").unwrap(),
+        ];
+        let good = MessageUtils::participant_list_hash(&participants).unwrap();
+        assert!(MessageUtils::validate_bcl_hash(&participants, &good));
+        assert!(!MessageUtils::validate_bcl_hash(&participants, "2:wrongxx"));
+    }
+
+    // #6 — broadcast/status stanzas expose <participants><to jid> as
+    // `bcl_participants` (for the device-sent phash check).
+    #[test]
+    fn broadcast_populates_bcl_participants() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "status@broadcast")
+            .attr("type", "media")
+            .attr("id", "BCL-1")
+            .attr("t", "1777415965")
+            .attr("participant", "559980000001@s.whatsapp.net")
+            .children([NodeBuilder::new("participants")
+                .children([
+                    NodeBuilder::new("to")
+                        .attr("jid", "100000000000001@lid")
+                        .build(),
+                    NodeBuilder::new("to")
+                        .attr("jid", "100000000000002@lid")
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+        assert_eq!(info.bcl_participants.len(), 2);
+    }
+
+    // #6 — a group's <participants> is the device fanout, NOT a bcl, so it must
+    // not feed the bcl hash check.
+    #[test]
+    fn group_participants_do_not_populate_bcl() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "120363000000000001@g.us")
+            .attr("participant", "559980000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "G-1")
+            .attr("t", "1777415965")
+            .children([NodeBuilder::new("participants")
+                .children([NodeBuilder::new("to")
+                    .attr("jid", "559980000002:3@s.whatsapp.net")
+                    .build()])
+                .build()])
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+        assert!(
+            info.bcl_participants.is_empty(),
+            "group fanout participants are not a bcl"
         );
     }
 }

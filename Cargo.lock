@@ -2370,6 +2370,7 @@ dependencies = [
  "event-listener",
  "flate2",
  "futures",
+ "getrandom 0.4.2",
  "hex",
  "hkdf",
  "hmac",

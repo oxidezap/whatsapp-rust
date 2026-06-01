@@ -24,6 +24,7 @@ pub mod media_retry;
 pub mod message_edit;
 pub mod message_processing;
 pub mod messages;
+pub mod msg_secret;
 pub mod net;
 pub mod pair;
 pub mod pair_code;
@@ -40,6 +41,7 @@ pub mod stanza;
 pub mod sticker_pack;
 
 pub mod store;
+pub mod sync_marker;
 pub mod time;
 pub mod types;
 pub mod upload;

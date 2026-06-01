@@ -485,7 +485,7 @@ impl Client {
                 &original_msg,
                 message_id,
                 retry_count,
-                device_snapshot.account.as_ref(),
+                device_snapshot.account.as_deref(),
                 addressing_mode,
                 edit_attr,
             )
@@ -521,7 +521,7 @@ impl Client {
                 &original_msg,
                 message_id,
                 retry_count,
-                device_snapshot.account.as_ref(),
+                device_snapshot.account.as_deref(),
                 edit_attr,
             )
             .await?;

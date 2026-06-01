@@ -1,7 +1,7 @@
 use log::{error, info};
 use std::sync::Arc;
 use wacore::proto_helpers::MessageExt;
-use wacore::types::events::Event;
+use wacore::types::events::{Event, EventKind};
 use waproto::whatsapp as wa;
 use whatsapp_rust::TokioRuntime;
 use whatsapp_rust::bot::{Bot, MessageContext};
@@ -80,44 +80,53 @@ fn main() {
         }
 
         let mut bot = builder
-            .on_event(move |event, client| async move {
-                match &*event {
-                    Event::PairingQrCode { code, timeout } => {
-                        info!("----------------------------------------");
-                        info!(
-                            "QR code received (valid for {} seconds):",
-                            timeout.as_secs()
-                        );
-                        info!("\n{}\n", code);
-                        info!("----------------------------------------");
-                    }
-                    Event::PairingCode { code, timeout } => {
-                        info!("========================================");
-                        info!("PAIR CODE (valid for {} seconds):", timeout.as_secs());
-                        info!("Enter this code on your phone:");
-                        info!("WhatsApp > Linked Devices > Link a Device");
-                        info!("> Link with phone number instead");
-                        info!("");
-                        info!("    >>> {} <<<", code);
-                        info!("");
-                        info!("========================================");
-                    }
-                    Event::Message(msg, info) => {
-                        let ctx = MessageContext::from_parts(msg, info, client);
-                        if let Some(reply) = build_media_pong(msg) {
-                            info!("Received media ping from {}", ctx.info.source.sender);
-                            if let Err(e) = ctx.send_message(reply).await {
-                                error!("Failed to send media pong: {}", e);
-                            }
-                        } else if msg.text_content() == Some(PING_TRIGGER) {
-                            handle_text_ping(&ctx).await;
+            .on_event_for(
+                &[
+                    EventKind::PairingQrCode,
+                    EventKind::PairingCode,
+                    EventKind::Message,
+                    EventKind::Connected,
+                    EventKind::LoggedOut,
+                ],
+                move |event, client| async move {
+                    match &*event {
+                        Event::PairingQrCode { code, timeout } => {
+                            info!("----------------------------------------");
+                            info!(
+                                "QR code received (valid for {} seconds):",
+                                timeout.as_secs()
+                            );
+                            info!("\n{}\n", code);
+                            info!("----------------------------------------");
                         }
+                        Event::PairingCode { code, timeout } => {
+                            info!("========================================");
+                            info!("PAIR CODE (valid for {} seconds):", timeout.as_secs());
+                            info!("Enter this code on your phone:");
+                            info!("WhatsApp > Linked Devices > Link a Device");
+                            info!("> Link with phone number instead");
+                            info!("");
+                            info!("    >>> {} <<<", code);
+                            info!("");
+                            info!("========================================");
+                        }
+                        Event::Message(msg, info) => {
+                            let ctx = MessageContext::from_parts(msg, info, client);
+                            if let Some(reply) = build_media_pong(msg) {
+                                info!("Received media ping from {}", ctx.info.source.sender);
+                                if let Err(e) = ctx.send_message(reply).await {
+                                    error!("Failed to send media pong: {}", e);
+                                }
+                            } else if msg.text_content() == Some(PING_TRIGGER) {
+                                handle_text_ping(&ctx).await;
+                            }
+                        }
+                        Event::Connected(_) => info!("✅ Bot connected successfully!"),
+                        Event::LoggedOut(_) => error!("❌ Bot was logged out!"),
+                        _ => {}
                     }
-                    Event::Connected(_) => info!("✅ Bot connected successfully!"),
-                    Event::LoggedOut(_) => error!("❌ Bot was logged out!"),
-                    _ => {}
-                }
-            })
+                },
+            )
             .build()
             .await
             .expect("Failed to build bot");

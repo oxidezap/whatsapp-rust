@@ -664,6 +664,7 @@ fn setup_group_recv() -> GrpRecvData {
         false,
         None,
         None,
+        None,
         &[],
     ))
     .unwrap();
@@ -712,6 +713,11 @@ fn bench_dm_recv(mut d: DmRecvData) {
 
 fn run_group_send(d: &mut GrpSendData) {
     let own_jid = d.alice.jid.clone();
+    // Warm sends (force_skdm=false) distribute no SKDM, so prepare_group_stanza
+    // only emits a phash if it gets the full device set. Mirror the real
+    // warm-send caller by passing it; the cold/force_skdm path resolves the set
+    // itself and keeps None.
+    let all_devices_for_phash = (!d.force_skdm).then(|| d.participants.clone());
     let mut group_info = GroupInfo::new(std::mem::take(&mut d.participants), AddressingMode::Pn);
     let mut stores = SignalStores {
         sender_key_store: &mut d.alice.sender_keys,
@@ -734,6 +740,7 @@ fn run_group_send(d: &mut GrpSendData) {
         "b-grp".into(),
         d.force_skdm,
         None,
+        all_devices_for_phash,
         None,
         &[],
     ))

@@ -15,13 +15,19 @@ use super::Client;
 enum UserLookupKeys {
     /// User is a LID with known phone number mapping.
     /// Keys: [LID, PN]
-    LidWithPn { lid: String, pn: String },
+    LidWithPn {
+        lid: wacore_binary::CompactString,
+        pn: wacore_binary::CompactString,
+    },
     /// User is a phone number with known LID mapping.
     /// Keys: [LID, PN]
-    PnWithLid { lid: String, pn: String },
+    PnWithLid {
+        lid: wacore_binary::CompactString,
+        pn: wacore_binary::CompactString,
+    },
     /// Unknown user - no LID-PN mapping exists.
     /// Could be either a LID or PN, we don't know.
-    Unknown { user: String },
+    Unknown { user: wacore_binary::CompactString },
 }
 
 impl UserLookupKeys {
@@ -61,26 +67,26 @@ impl Client {
     /// - `PnWithLid`: User is a phone number with known LID mapping
     /// - `Unknown`: No LID-PN mapping exists (could be either type)
     async fn resolve_lookup_keys(&self, user: &str) -> UserLookupKeys {
-        // Check if user is a LID (has a phone number mapping)
+        // Check if user is a LID (has a phone number mapping). The `user`-derived
+        // key is built inline via CompactString (LID/PN are short), avoiding a
+        // heap String per member on every group send.
         if let Some(pn) = self.lid_pn_cache.get_phone_number(user).await {
             return UserLookupKeys::LidWithPn {
-                lid: user.to_string(),
-                pn,
+                lid: user.into(),
+                pn: pn.into(),
             };
         }
 
         // Check if user is a PN (has a LID mapping)
         if let Some(lid) = self.lid_pn_cache.get_current_lid(user).await {
             return UserLookupKeys::PnWithLid {
-                lid,
-                pn: user.to_string(),
+                lid: lid.into(),
+                pn: user.into(),
             };
         }
 
         // Unknown user - no mapping exists
-        UserLookupKeys::Unknown {
-            user: user.to_string(),
-        }
+        UserLookupKeys::Unknown { user: user.into() }
     }
 
     /// Get all possible lookup keys for a user (for bidirectional lookup).
@@ -557,10 +563,14 @@ impl Client {
     /// This follows the same 2-tier pattern as [`has_device`]: registry cache first,
     /// then the backend database.
     pub(crate) async fn get_devices_from_registry(&self, jid: &Jid) -> Option<Vec<Jid>> {
-        let lookup_keys = self.get_lookup_keys(&jid.user).await;
+        // Use the borrowed `&str` keys directly: both the moka cache and the
+        // backend take `&str`, so going through `get_lookup_keys` (which re-owns
+        // the already-cloned keys into a `Vec<String>`) just churns per member on
+        // every group send. `lookup` owns the key Strings for the duration here.
+        let lookup = self.resolve_lookup_keys(&jid.user).await;
 
         // L1: device_registry_cache (moka, fast)
-        for key in &lookup_keys {
+        for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
                 return Some(Self::reconstruct_device_jids(jid, &record));
             }
@@ -568,7 +578,7 @@ impl Client {
 
         // L2: backend DB
         let backend = self.persistence_manager.backend();
-        for key in &lookup_keys {
+        for key in lookup.all_keys() {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
                     let devices = Self::reconstruct_device_jids(jid, &record);
