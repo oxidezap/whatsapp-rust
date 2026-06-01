@@ -404,6 +404,18 @@ impl Client {
 
         let backend = self.persistence_manager.backend();
 
+        // Nothing to migrate unless the PN side has Signal state. For a freshly
+        // resolved peer (e.g. every member of a large group on first send) this
+        // skips MIGRATION_DEVICE_RANGE lock+lookup iterations that would all
+        // find nothing. On a lookup error, fall through to the full scan.
+        if let Ok(false) = self
+            .signal_cache
+            .has_state_for_user(pn, backend.as_ref())
+            .await
+        {
+            return;
+        }
+
         for device_id in 0..MIGRATION_DEVICE_RANGE {
             // `&str` → `CompactString` is inline for ≤24-byte user parts
             // (all PN/LID identifiers fit), so no String intermediate.
@@ -1100,6 +1112,49 @@ mod tests {
         );
     }
 
+    /// A freshly-resolved peer (no prior PN Signal state) must short-circuit the
+    /// per-device migration scan: nothing to move, so no LID session appears and
+    /// the MIGRATION_DEVICE_RANGE lock/lookup loop is skipped.
+    #[tokio::test]
+    async fn migrate_skips_when_no_pn_signal_state() {
+        use wacore::types::jid::JidExt as _;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000000777";
+        let lid = "222222222222222";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+        let backend = client.persistence_manager.backend();
+
+        // Fresh peer: no PN session or identity anywhere, so the guard skips.
+        assert!(
+            !client
+                .signal_cache
+                .has_state_for_user(pn, backend.as_ref())
+                .await
+                .unwrap(),
+            "fresh peer should have no PN Signal state"
+        );
+
+        client
+            .migrate_signal_sessions_on_lid_discovery(pn, lid)
+            .await;
+
+        // No LID session was materialized (nothing was migrated).
+        let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
+        assert!(
+            client
+                .signal_cache
+                .get_session(&lid_addr, backend.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "migration of a stateless peer must not create a LID session"
+        );
+    }
+
     /// Migration must hold the same per-address session locks that
     /// encrypt/decrypt take. Otherwise a concurrent `message_encrypt`
     /// on the LID slot can clobber the just-migrated session (or read
@@ -1117,6 +1172,21 @@ mod tests {
             .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
             .await
             .unwrap();
+
+        // Seed a PN session so the migration actually enters its per-device
+        // loop. The existence guard skips when there is nothing to migrate, and
+        // this test is about the lock the loop takes when migrating real state.
+        let pn_addr = Jid::pn_device(pn.to_string(), 0).to_protocol_address();
+        client
+            .signal_cache
+            .put_session(
+                &pn_addr,
+                wacore::libsignal::protocol::SessionRecord::deserialize(&tagged_session_blob(
+                    0xDEAD_BEEF,
+                ))
+                .expect("seed PN blob deserializes"),
+            )
+            .await;
 
         let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
         let lid_lock = client.session_lock_for(lid_addr.as_str()).await;

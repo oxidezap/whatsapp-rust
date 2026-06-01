@@ -147,6 +147,16 @@ impl SignalStore for InMemoryBackend {
         Ok(self.state.lock().await.sessions.contains_key(address))
     }
 
+    async fn has_signal_state_for_user(&self, user: &str) -> Result<bool> {
+        fn matches(addr: &str, user: &str) -> bool {
+            addr.strip_prefix(user)
+                .is_some_and(|rest| rest.starts_with('@') || rest.starts_with(':'))
+        }
+        let state = self.state.lock().await;
+        Ok(state.sessions.keys().any(|k| matches(k, user))
+            || state.identities.keys().any(|k| matches(k, user)))
+    }
+
     async fn delete_session(&self, address: &str) -> Result<()> {
         self.state.lock().await.sessions.remove(address);
         Ok(())
@@ -681,6 +691,36 @@ mod tests {
     #[test]
     fn in_memory_backend_implements_backend() {
         is_backend::<InMemoryBackend>();
+    }
+
+    #[tokio::test]
+    async fn has_signal_state_for_user_matches_by_user_prefix() {
+        let backend = InMemoryBackend::new();
+        let user = "5511999990000";
+
+        assert!(!backend.has_signal_state_for_user(user).await.unwrap());
+
+        // Device 0 is keyed `user@server`.
+        backend
+            .put_session("5511999990000@s.whatsapp.net", b"sess")
+            .await
+            .unwrap();
+        assert!(backend.has_signal_state_for_user(user).await.unwrap());
+
+        // A different user that this one is a prefix of must NOT match.
+        let other = InMemoryBackend::new();
+        other
+            .put_session("55119999900001@s.whatsapp.net", b"sess")
+            .await
+            .unwrap();
+        assert!(!other.has_signal_state_for_user(user).await.unwrap());
+
+        // Non-zero device is keyed `user:dev@server`; identity-only also counts.
+        let dev = InMemoryBackend::new();
+        dev.put_identity("5511999990000:5@s.whatsapp.net", [7u8; 32])
+            .await
+            .unwrap();
+        assert!(dev.has_signal_state_for_user(user).await.unwrap());
     }
 
     #[tokio::test]

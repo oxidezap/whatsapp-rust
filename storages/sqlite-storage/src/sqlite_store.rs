@@ -1267,6 +1267,47 @@ impl SignalStore for SqliteStore {
         .await
     }
 
+    async fn has_signal_state_for_user(&self, user: &str) -> Result<bool> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        // Address is `user@server` (device 0) or `user:dev@server`; `user` is a
+        // numeric PN/LID so it carries no LIKE wildcards.
+        let pat_at = format!("{user}@%");
+        let pat_dev = format!("{user}:%");
+        self.with_semaphore(move || -> Result<bool> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            let has_session = diesel::select(diesel::dsl::exists(
+                sessions::table
+                    .filter(sessions::device_id.eq(device_id))
+                    .filter(
+                        sessions::address
+                            .like(&pat_at)
+                            .or(sessions::address.like(&pat_dev)),
+                    ),
+            ))
+            .get_result::<bool>(&mut conn)
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+            if has_session {
+                return Ok(true);
+            }
+            let has_identity = diesel::select(diesel::dsl::exists(
+                identities::table
+                    .filter(identities::device_id.eq(device_id))
+                    .filter(
+                        identities::address
+                            .like(&pat_at)
+                            .or(identities::address.like(&pat_dev)),
+                    ),
+            ))
+            .get_result::<bool>(&mut conn)
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(has_identity)
+        })
+        .await
+    }
+
     async fn put_session(&self, address: &str, session: &[u8]) -> Result<()> {
         self.put_session_for_device(address, session, self.device_id)
             .await

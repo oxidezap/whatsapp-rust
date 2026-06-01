@@ -130,6 +130,16 @@ pub trait SignalStore: Send + Sync {
         Ok(self.get_session(address).await?.is_some())
     }
 
+    /// Whether any session or identity exists for `user` across all device ids.
+    /// Addresses are keyed `user@server` (device 0) or `user:dev@server`. Used
+    /// to skip the per-device PN->LID migration scan for users we've never had
+    /// Signal state with. Default is conservative (`true`) so a backend that
+    /// doesn't implement it keeps the caller's full per-device scan.
+    async fn has_signal_state_for_user(&self, user: &str) -> Result<bool> {
+        let _ = user;
+        Ok(true)
+    }
+
     // --- PreKey Operations ---
 
     /// Store a pre-key.
