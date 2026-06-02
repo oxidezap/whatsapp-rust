@@ -56,10 +56,13 @@ const CROCKFORD_ALPHABET: &[u8; 32] = b"123456789ABCDEFGHJKLMNPQRSTVWXYZ";
 /// which hasn't released a digest 0.11-compatible stable version yet.
 fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], rounds: u32, output: &mut [u8]) {
     use hmac::KeyInit as _;
+    // Derive the HMAC key schedule (ipad/opad) once and clone that keyed state
+    // per use. `new_from_slice` re-absorbs the padded key (2 SHA-256 blocks)
+    // on every call, which is wasted work repeated across all PBKDF2 rounds.
+    let keyed = Hmac::<Sha256>::new_from_slice(password).expect("HMAC accepts any key length");
     for (i, chunk) in output.chunks_mut(32).enumerate() {
         let mut u = {
-            let mut mac =
-                Hmac::<Sha256>::new_from_slice(password).expect("HMAC accepts any key length");
+            let mut mac = keyed.clone();
             mac.update(salt);
             mac.update(&((i as u32) + 1).to_be_bytes());
             let result: [u8; 32] = mac.finalize().into_bytes().into();
@@ -67,8 +70,7 @@ fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], rounds: u32, output: &mut [u
         };
         chunk.copy_from_slice(&u[..chunk.len()]);
         for _ in 1..rounds {
-            let mut mac =
-                Hmac::<Sha256>::new_from_slice(password).expect("HMAC accepts any key length");
+            let mut mac = keyed.clone();
             mac.update(&u);
             u = mac.finalize().into_bytes().into();
             for (a, b) in chunk.iter_mut().zip(u.iter()) {
@@ -539,6 +541,50 @@ pub enum PairCodeError {
 mod tests {
     use super::*;
     use wacore_binary::NodeContent;
+
+    /// The keyed-clone PBKDF2 must produce byte-identical output to the original
+    /// form that re-ran `new_from_slice` every round.
+    #[test]
+    fn test_pbkdf2_matches_per_iteration_reference() {
+        use hmac::{KeyInit as _, Mac as _};
+
+        fn reference(password: &[u8], salt: &[u8], rounds: u32, output: &mut [u8]) {
+            for (i, chunk) in output.chunks_mut(32).enumerate() {
+                let mut u = {
+                    let mut mac = Hmac::<Sha256>::new_from_slice(password).unwrap();
+                    mac.update(salt);
+                    mac.update(&((i as u32) + 1).to_be_bytes());
+                    let r: [u8; 32] = mac.finalize().into_bytes().into();
+                    r
+                };
+                chunk.copy_from_slice(&u[..chunk.len()]);
+                for _ in 1..rounds {
+                    let mut mac = Hmac::<Sha256>::new_from_slice(password).unwrap();
+                    mac.update(&u);
+                    u = mac.finalize().into_bytes().into();
+                    for (a, b) in chunk.iter_mut().zip(u.iter()) {
+                        *a ^= b;
+                    }
+                }
+            }
+        }
+
+        let cases: &[(&[u8], &[u8], u32, usize)] = &[
+            (b"password", b"salt", 1, 32),
+            (b"password", b"salt", 7, 32),
+            (b"pw", b"NaCl", 100, 64),              // multi-block output
+            (b"", b"", 50, 16),                     // empty pw/salt, partial chunk
+            (&[0xffu8; 40], &[0x01u8; 13], 33, 48), // long key, odd lengths
+        ];
+        for &(pw, salt, rounds, len) in cases {
+            let mut got = vec![0u8; len];
+            let mut want = vec![0u8; len];
+            pbkdf2_hmac_sha256(pw, salt, rounds, &mut got);
+            reference(pw, salt, rounds, &mut want);
+            assert_eq!(got, want, "pbkdf2 mismatch for rounds={rounds} len={len}");
+            assert_ne!(got, vec![0u8; len], "output must not be all zeros");
+        }
+    }
 
     #[test]
     fn test_generate_code() {

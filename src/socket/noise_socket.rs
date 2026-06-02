@@ -87,7 +87,7 @@ impl NoiseSocket {
                 &transport,
                 &write_key,
                 &mut write_counter,
-                &job.plaintext,
+                job.plaintext,
                 &mut enc_buf,
                 &mut out_buf,
             )
@@ -103,7 +103,7 @@ impl NoiseSocket {
         transport: &Arc<dyn Transport>,
         write_key: &Arc<NoiseCipher>,
         write_counter: &mut u32,
-        plaintext: &[u8],
+        plaintext: bytes::Bytes,
         enc_buf: &mut Vec<u8>,
         out_buf: &mut BytesMut,
     ) -> SendResult {
@@ -111,7 +111,7 @@ impl NoiseSocket {
 
         if plaintext.len() <= INLINE_ENCRYPT_THRESHOLD {
             enc_buf.clear();
-            enc_buf.extend_from_slice(plaintext);
+            enc_buf.extend_from_slice(&plaintext);
             if let Err(e) = write_key.encrypt_in_place_with_counter(counter, enc_buf) {
                 return Err(EncryptSendError::crypto(anyhow::anyhow!(e.to_string())));
             }
@@ -121,10 +121,10 @@ impl NoiseSocket {
             }
         } else {
             let write_key = write_key.clone();
-            let plaintext_owned = plaintext.to_vec();
-
+            // `Bytes` is Send + 'static: move it into the blocking task (a refcount
+            // bump) instead of copying the whole >16KB plaintext with `to_vec()`.
             let encrypt_result = wacore::runtime::blocking(&**runtime, move || {
-                write_key.encrypt_with_counter(counter, &plaintext_owned)
+                write_key.encrypt_with_counter(counter, &plaintext)
             })
             .await;
 
@@ -209,6 +209,76 @@ mod tests {
 
         let result = socket.encrypt_and_send(bytes::Bytes::new()).await;
         assert!(result.is_ok(), "encrypt_and_send should succeed");
+    }
+
+    /// Frames above INLINE_ENCRYPT_THRESHOLD take the blocking path that now moves
+    /// the `Bytes` plaintext (refcount) instead of `to_vec()`-copying it. Verify
+    /// both a small (inline) and a large (>16KB) frame still encrypt to ciphertext
+    /// that decrypts back to the exact original.
+    #[tokio::test]
+    async fn test_large_frame_round_trips_via_bytes_path() {
+        use async_lock::Mutex;
+        use async_trait::async_trait;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct CapturingTransport {
+            captured: Arc<Mutex<Vec<Vec<u8>>>>,
+            read_key: NoiseCipher,
+            counter: AtomicU32,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl crate::transport::Transport for CapturingTransport {
+            async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+                let mut data = data.to_vec();
+                data.drain(..3); // strip the 3-byte frame length prefix
+                let counter = self.counter.fetch_add(1, Ordering::SeqCst);
+                self.read_key
+                    .decrypt_in_place_with_counter(counter, &mut data)
+                    .expect("frame should decrypt");
+                self.captured.lock().await.push(data);
+                Ok(())
+            }
+            async fn disconnect(&self) {}
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let key = [7u8; 32];
+        let transport = Arc::new(CapturingTransport {
+            captured: captured.clone(),
+            read_key: NoiseCipher::new(&key).expect("32-byte key"),
+            counter: AtomicU32::new(0),
+        });
+        let socket = NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            transport,
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        );
+
+        let small: Vec<u8> = (0..1_000u32).map(|i| i as u8).collect();
+        let large: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        assert!(small.len() <= INLINE_ENCRYPT_THRESHOLD);
+        assert!(large.len() > INLINE_ENCRYPT_THRESHOLD);
+
+        socket
+            .encrypt_and_send(bytes::Bytes::from(small.clone()))
+            .await
+            .expect("small frame send");
+        socket
+            .encrypt_and_send(bytes::Bytes::from(large.clone()))
+            .await
+            .expect("large frame send");
+
+        let got = captured.lock().await;
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], small, "inline (<=16KB) frame must round-trip");
+        assert_eq!(
+            got[1], large,
+            "large (>16KB) frame must round-trip via the moved-Bytes path"
+        );
     }
 
     #[tokio::test]

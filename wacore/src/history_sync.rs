@@ -759,7 +759,7 @@ fn extract_conversation_fields(
                     break;
                 };
                 if let Ok(msg) = HistorySyncMsgInternalFields::decode(&data[pos..end]) {
-                    push_secret_record(chat_id, &msg, secrets_out);
+                    push_secret_record(chat_id, msg, secrets_out);
                 }
                 pos = end;
             }
@@ -816,33 +816,30 @@ fn extract_conversation_fields(
 /// forwarded/poll/bot detection stays in prost via the typed fields/methods.
 fn push_secret_record(
     chat_id: &str,
-    history_msg: &HistorySyncMsgInternalFields,
+    mut history_msg: HistorySyncMsgInternalFields,
     out: &mut Vec<HistoryMsgSecretRecord>,
 ) {
-    let Some(web_msg) = history_msg.message.as_ref() else {
+    // Takes `history_msg` by value: the message is decoded fresh per record and
+    // dropped right after, so the owned fields are moved into the record instead
+    // of cloned.
+    let Some(web_msg) = history_msg.message.as_mut() else {
         return;
     };
     let Some(key) = web_msg.key.as_ref() else {
         return;
     };
-    let Some(msg_id) = key.id.as_ref() else {
+    if key.id.is_none() {
         return;
-    };
+    }
+    let from_me = key.from_me == Some(true);
+
     if let Some(message) = web_msg.message.as_ref()
         && message.is_forwarded()
     {
         return;
     }
-    let Some(secret) = web_msg.message_secret.as_ref().or_else(|| {
-        web_msg
-            .message
-            .as_ref()
-            .and_then(|m| m.message_context_info.as_ref())
-            .and_then(|mci| mci.message_secret.as_ref())
-    }) else {
-        return;
-    };
 
+    // Read the Copy-flag fields by borrow before moving any owned field out.
     let is_poll_or_event = web_msg
         .message
         .as_ref()
@@ -853,15 +850,36 @@ fn push_secret_record(
         .as_ref()
         .map(|m| m.invokes_bot())
         .unwrap_or(false);
+    let timestamp = web_msg.message_timestamp;
+
+    // Top-level message_secret takes priority over the context-info one (same
+    // order as the previous `or_else`); take it rather than clone.
+    let secret = if web_msg.message_secret.is_some() {
+        web_msg.message_secret.take()
+    } else {
+        web_msg
+            .message
+            .as_mut()
+            .and_then(|m| m.message_context_info.as_mut())
+            .and_then(|mci| mci.message_secret.take())
+    };
+    let Some(secret) = secret else {
+        return;
+    };
+
+    let key = web_msg.key.as_mut().expect("key presence checked above");
+    let msg_id = key.id.take().expect("id presence checked above");
+    let key_participant = key.participant.take();
+    let web_msg_participant = web_msg.participant.take();
 
     out.push(HistoryMsgSecretRecord {
         chat_id: chat_id.to_string(),
-        from_me: key.from_me == Some(true),
-        key_participant: key.participant.clone(),
-        web_msg_participant: web_msg.participant.clone(),
-        msg_id: msg_id.clone(),
-        secret: secret.clone(),
-        timestamp: web_msg.message_timestamp,
+        from_me,
+        key_participant,
+        web_msg_participant,
+        msg_id,
+        secret,
+        timestamp,
         is_poll_or_event,
         is_bot_invocation,
     });
@@ -1004,6 +1022,58 @@ mod tests {
         assert_eq!(result.msg_secret_records[1].msg_id, "HIST_CONTEXT");
         assert!(result.msg_secret_records[1].from_me);
         assert_eq!(result.msg_secret_records[1].secret, context_secret);
+    }
+
+    #[test]
+    fn test_top_level_message_secret_takes_priority_over_context() {
+        // A message carrying BOTH the top-level WebMessageInfo.message_secret and a
+        // nested message_context_info.message_secret must extract the top-level one
+        // (the move-based push_secret_record must `.take()` the right source).
+        let chat = "5511777776666@s.whatsapp.net";
+        let top_level_secret = vec![0xAAu8; 32];
+        let context_secret = vec![0xBBu8; 32];
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![wa::HistorySyncMsg {
+                    message: Some(wa::WebMessageInfo {
+                        key: wa::MessageKey {
+                            remote_jid: Some(chat.to_string()),
+                            from_me: Some(false),
+                            id: Some("HIST_BOTH".to_string()),
+                            participant: Some("5511888889999@s.whatsapp.net".to_string()),
+                        },
+                        message_secret: Some(top_level_secret.clone()),
+                        message: Some(wa::Message {
+                            message_context_info: Some(wa::MessageContextInfo {
+                                message_secret: Some(context_secret.clone()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let compressed = encode_and_compress(&hs);
+        let result = process_history_sync(compressed, None, false, None).unwrap();
+
+        assert_eq!(result.msg_secret_records.len(), 1);
+        assert_eq!(result.msg_secret_records[0].msg_id, "HIST_BOTH");
+        assert_eq!(
+            result.msg_secret_records[0].secret, top_level_secret,
+            "top-level message_secret must win over the context-info one"
+        );
+        assert_eq!(
+            result.msg_secret_records[0].key_participant.as_deref(),
+            Some("5511888889999@s.whatsapp.net")
+        );
     }
 
     #[test]
