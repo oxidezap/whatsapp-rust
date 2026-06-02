@@ -10,14 +10,19 @@ use waproto::whatsapp as wa;
 pub struct Mutation {
     /// The decoded action value.
     pub action_value: Option<wa::SyncActionValue>,
-    /// The MAC of the index.
-    pub index_mac: Vec<u8>,
-    /// The MAC of the value.
-    pub value_mac: Vec<u8>,
     /// The parsed index components (JSON array of strings).
     pub index: Vec<String>,
     /// The operation type (Set or Remove).
     pub operation: wa::syncd_mutation::SyncdOperation,
+}
+
+/// Index/value MACs extracted from a record, returned alongside the decoded
+/// [`Mutation`]. Kept out of `Mutation` so the MACs live only in the persisted
+/// MAC list rather than being duplicated on every returned mutation.
+#[derive(Debug, Clone)]
+pub struct RecordMacs {
+    pub index_mac: Vec<u8>,
+    pub value_mac: Vec<u8>,
 }
 
 /// Decode a single encrypted record into a mutation.
@@ -33,14 +38,15 @@ pub struct Mutation {
 /// * `validate_macs` - Whether to validate MACs during decoding
 ///
 /// # Returns
-/// A decoded `Mutation` or an error if decoding/validation fails.
+/// The decoded `Mutation` together with its index/value MACs, or an error if
+/// decoding/validation fails.
 pub fn decode_record(
     operation: wa::syncd_mutation::SyncdOperation,
     record: &wa::SyncdRecord,
     keys: &ExpandedAppStateKeys,
     key_id: &[u8],
     validate_macs: bool,
-) -> Result<Mutation, AppStateError> {
+) -> Result<(Mutation, RecordMacs), AppStateError> {
     let value_blob = record
         .value
         .as_ref()
@@ -88,17 +94,22 @@ pub fn decode_record(
         }
     }
 
-    Ok(Mutation {
-        action_value: action.value,
-        index_mac: record
-            .index
-            .as_ref()
-            .and_then(|i| i.blob.clone())
-            .unwrap_or_default(),
-        value_mac: value_mac.to_vec(),
-        index: index_list,
-        operation,
-    })
+    let index_mac = record
+        .index
+        .as_ref()
+        .and_then(|i| i.blob.clone())
+        .unwrap_or_default();
+    Ok((
+        Mutation {
+            action_value: action.value,
+            index: index_list,
+            operation,
+        },
+        RecordMacs {
+            index_mac,
+            value_mac: value_mac.to_vec(),
+        },
+    ))
 }
 
 /// Extract all unique key IDs from a patch list that need to be fetched.
@@ -207,7 +218,7 @@ mod tests {
             &action_data,
         );
 
-        let mutation = decode_record(
+        let (mutation, _macs) = decode_record(
             wa::syncd_mutation::SyncdOperation::Set,
             &record,
             &keys,

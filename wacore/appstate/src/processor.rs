@@ -119,7 +119,7 @@ where
             .ok_or(AppStateError::MissingKeyId)?;
         let keys = get_keys(key_id)?;
 
-        let mutation = decode_record(
+        let (mutation, macs) = decode_record(
             wa::syncd_mutation::SyncdOperation::Set,
             rec,
             &keys,
@@ -128,8 +128,8 @@ where
         )?;
 
         mutation_macs.push(AppStateMutationMAC {
-            index_mac: mutation.index_mac.clone(),
-            value_mac: mutation.value_mac.clone(),
+            index_mac: macs.index_mac,
+            value_mac: macs.value_mac,
         });
 
         mutations.push(mutation);
@@ -254,17 +254,17 @@ where
                 .ok_or(AppStateError::MissingKeyId)?;
             let keys = get_keys(key_id)?;
 
-            let mutation = decode_record(op, rec, &keys, key_id, validate_macs)?;
+            let (mutation, macs) = decode_record(op, rec, &keys, key_id, validate_macs)?;
 
             match op {
                 wa::syncd_mutation::SyncdOperation::Set => {
                     added_macs.push(AppStateMutationMAC {
-                        index_mac: mutation.index_mac.clone(),
-                        value_mac: mutation.value_mac.clone(),
+                        index_mac: macs.index_mac,
+                        value_mac: macs.value_mac,
                     });
                 }
                 wa::syncd_mutation::SyncdOperation::Remove => {
-                    removed_index_macs.push(mutation.index_mac.clone());
+                    removed_index_macs.push(macs.index_mac);
                 }
             }
 
