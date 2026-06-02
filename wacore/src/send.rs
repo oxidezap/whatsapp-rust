@@ -399,7 +399,6 @@ struct EncryptOneResult {
     enc_type: &'static str,
     is_prekey: bool,
     ciphertext: Vec<u8>,
-    mediatype: Option<String>,
     hide_decrypt_fail: bool,
 }
 
@@ -510,7 +509,6 @@ async fn encrypt_one_device(
     session_store: &mut dyn crate::libsignal::protocol::SessionStore,
     identity_store: &mut dyn crate::libsignal::protocol::IdentityKeyStore,
     device_jid: Jid,
-    mediatype: Option<&str>,
     hide_decrypt_fail: bool,
 ) -> (Jid, Result<Option<EncryptOneResult>, String>) {
     match message_encrypt(plaintext, addr, session_store, identity_store).await {
@@ -526,7 +524,6 @@ async fn encrypt_one_device(
                     enc_type,
                     is_prekey,
                     ciphertext: serialized_bytes.to_vec(),
-                    mediatype: mediatype.map(|s| s.to_string()),
                     hide_decrypt_fail,
                 })),
             )
@@ -539,6 +536,7 @@ async fn encrypt_one_device(
 /// success, a logged skip on failure.
 fn push_encrypt_result(
     (device_jid, res): (Jid, Result<Option<EncryptOneResult>, String>),
+    mediatype: Option<&str>,
     participant_nodes: &mut Vec<Node>,
     encrypted_devices: &mut Vec<Jid>,
     includes_prekey_message: &mut bool,
@@ -549,7 +547,9 @@ fn push_encrypt_result(
             let mut enc_builder = NodeBuilder::new("enc")
                 .attr("v", stanza::ENC_VERSION)
                 .attr("type", one.enc_type);
-            if let Some(mt) = one.mediatype.as_deref() {
+            // `mediatype` is batch-level (same for every device) and originates as
+            // a `&'static str`, so it's threaded here instead of cloned per result.
+            if let Some(mt) = mediatype {
                 enc_builder = enc_builder.attr("mediatype", mt);
             }
             if one.hide_decrypt_fail {
@@ -789,12 +789,12 @@ where
             &mut *stores.session_store,
             &mut *stores.identity_store,
             device_jid,
-            mediatype,
             hide_decrypt_fail,
         )
         .await;
         push_encrypt_result(
             res,
+            mediatype,
             &mut participant_nodes,
             &mut encrypted_devices,
             &mut includes_prekey_message,
@@ -804,7 +804,6 @@ where
         // ENCRYPT_FANOUT_CONCURRENCY; collected in completion order so the
         // fastest encrypts ship first.
         let plaintext_arc: std::sync::Arc<[u8]> = std::sync::Arc::from(plaintext_to_encrypt);
-        let mediatype_owned: Option<String> = mediatype.map(|s| s.to_string());
 
         let total = devices.len();
         let mut next_spawn = 0usize;
@@ -819,7 +818,6 @@ where
                 .unwrap_or(&devices[idx])
                 .to_protocol_address();
             let plaintext = plaintext_arc.clone();
-            let mediatype = mediatype_owned.clone();
             let mut session_store = stores.session_store.clone();
             let mut identity_store = stores.identity_store.clone();
 
@@ -830,7 +828,6 @@ where
                     &mut session_store,
                     &mut identity_store,
                     device_jid,
-                    mediatype.as_deref(),
                     hide_decrypt_fail,
                 )
                 .await
@@ -846,6 +843,7 @@ where
             match spawn_result {
                 Ok(res) => push_encrypt_result(
                     res,
+                    mediatype,
                     &mut participant_nodes,
                     &mut encrypted_devices,
                     &mut includes_prekey_message,
