@@ -104,8 +104,23 @@ impl AppStateProcessor {
     where
         FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
     {
-        let mut pl = parse_patch_list_ref(stanza_root)?;
+        let pl = parse_patch_list_ref(stanza_root)?;
+        self.process_parsed_patch_list(pl, download, validate_macs)
+            .await
+    }
 
+    /// Process an already-parsed single PatchList: download external blobs via
+    /// `download`, then decode + apply. Lets a caller that parsed the response for
+    /// pre-download avoid re-parsing it. See [`decode_patch_list_ref`].
+    pub async fn process_parsed_patch_list<FDownload>(
+        &self,
+        mut pl: PatchList,
+        download: FDownload,
+        validate_macs: bool,
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)>
+    where
+        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
+    {
         // Download external snapshot if present (matches WhatsApp Web behavior)
         if pl.snapshot.is_none()
             && let Some(ext) = &pl.snapshot_ref
@@ -246,7 +261,10 @@ impl AppStateProcessor {
             .await
     }
 
-    async fn process_patch_lists<FDownload>(
+    /// Process already-parsed patch lists, downloading any external blobs via
+    /// `download`. Lets callers that already parsed the IQ response (e.g. to
+    /// pre-download blobs) avoid re-parsing it. See [`decode_multi_patch_list_ref`].
+    pub async fn process_patch_lists<FDownload>(
         &self,
         patch_lists: Vec<PatchList>,
         download: &FDownload,

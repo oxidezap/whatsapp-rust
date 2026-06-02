@@ -119,7 +119,7 @@ where
             .ok_or(AppStateError::MissingKeyId)?;
         let keys = get_keys(key_id)?;
 
-        let mutation = decode_record(
+        let mut mutation = decode_record(
             wa::syncd_mutation::SyncdOperation::Set,
             rec,
             &keys,
@@ -127,9 +127,12 @@ where
             validate_macs,
         )?;
 
+        // Move the MACs out instead of cloning: nothing downstream reads
+        // Mutation.index_mac/value_mac after processing (only the MAC vecs are
+        // persisted), so the decoded mutation can surrender them.
         mutation_macs.push(AppStateMutationMAC {
-            index_mac: mutation.index_mac.clone(),
-            value_mac: mutation.value_mac.clone(),
+            index_mac: std::mem::take(&mut mutation.index_mac),
+            value_mac: std::mem::take(&mut mutation.value_mac),
         });
 
         mutations.push(mutation);
@@ -254,17 +257,18 @@ where
                 .ok_or(AppStateError::MissingKeyId)?;
             let keys = get_keys(key_id)?;
 
-            let mutation = decode_record(op, rec, &keys, key_id, validate_macs)?;
+            let mut mutation = decode_record(op, rec, &keys, key_id, validate_macs)?;
 
+            // Move the MACs out instead of cloning (see process_snapshot).
             match op {
                 wa::syncd_mutation::SyncdOperation::Set => {
                     added_macs.push(AppStateMutationMAC {
-                        index_mac: mutation.index_mac.clone(),
-                        value_mac: mutation.value_mac.clone(),
+                        index_mac: std::mem::take(&mut mutation.index_mac),
+                        value_mac: std::mem::take(&mut mutation.value_mac),
                     });
                 }
                 wa::syncd_mutation::SyncdOperation::Remove => {
-                    removed_index_macs.push(mutation.index_mac.clone());
+                    removed_index_macs.push(std::mem::take(&mut mutation.index_mac));
                 }
             }
 
