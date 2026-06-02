@@ -357,7 +357,7 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
 }
 
 /// Message-secret data extracted from a conversation during streaming.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct HistoryMsgSecretRecord {
     pub chat_id: String,
     pub from_me: bool,
@@ -670,7 +670,7 @@ fn context_info_is_forwarded(context: &wa::HsContextInfoExtractView<'_>) -> bool
 }
 
 /// Tctoken data extracted from a conversation during streaming.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TcTokenCandidate {
     pub id: String,
     pub tc_token: Vec<u8>,
@@ -937,5 +937,101 @@ mod tests {
         let result = process_history_sync(compressed, None, false, None).unwrap();
 
         assert!(result.msg_secret_records.is_empty());
+    }
+
+    /// Streaming (>64 KB crossover) and full-decompress paths must extract
+    /// identical secrets, tctokens, pushname and nctSalt. Also guards the
+    /// `Hs*Extract` projection field numbers against drift from the canonical
+    /// proto: a wrong tag would silently change what gets extracted here.
+    #[test]
+    fn streaming_and_full_paths_produce_identical_results() {
+        let own = "5511000000000";
+        let dm = "5511777776666@s.whatsapp.net";
+        let group = "123456789-987654321@g.us";
+        let participant = "5511888889999@s.whatsapp.net";
+
+        // Big 1:1 conversation (>64 KB decompressed) carrying a tctoken.
+        let mut big_msgs = Vec::new();
+        for i in 0..1500u32 {
+            big_msgs.push(wa::HistorySyncMsg {
+                message: buffa::MessageField::some(wa::WebMessageInfo {
+                    key: buffa::MessageField::some(wa::MessageKey {
+                        remote_jid: Some(dm.to_string()),
+                        from_me: Some(i % 2 == 0),
+                        id: Some(format!("BIG-{i}")),
+                        participant: Some(participant.to_string()),
+                    }),
+                    message_timestamp: Some(1_700_000_000 + i as u64),
+                    message_secret: Some(vec![(i % 251) as u8; 32]),
+                    ..Default::default()
+                }),
+                msg_order_id: Some(i as u64 + 1),
+            });
+        }
+        let big_conv = wa::Conversation {
+            id: dm.to_string(),
+            messages: big_msgs,
+            tc_token: Some(vec![0xABu8; 16]),
+            tc_token_timestamp: Some(1_700_000_123),
+            ..Default::default()
+        };
+
+        // Group conversation: a secret message, but its tctoken must be ignored.
+        let group_conv = wa::Conversation {
+            id: group.to_string(),
+            messages: vec![wa::HistorySyncMsg {
+                message: buffa::MessageField::some(wa::WebMessageInfo {
+                    key: buffa::MessageField::some(wa::MessageKey {
+                        remote_jid: Some(group.to_string()),
+                        from_me: Some(false),
+                        id: Some("GRP-1".to_string()),
+                        participant: Some(participant.to_string()),
+                    }),
+                    message_secret: Some(vec![0x33u8; 32]),
+                    ..Default::default()
+                }),
+                msg_order_id: Some(1),
+            }],
+            tc_token: Some(vec![0xCDu8; 16]),
+            tc_token_timestamp: Some(1_700_000_456),
+            ..Default::default()
+        };
+
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![big_conv, group_conv],
+            pushnames: vec![wa::Pushname {
+                id: Some(own.to_string()),
+                pushname: Some("Me".into()),
+            }],
+            nct_salt: Some(vec![0x01, 0x02, 0x03, 0x04]),
+            ..Default::default()
+        };
+
+        let compressed = encode_and_compress(&hs);
+        let full = process_history_sync(compressed.clone(), Some(own), true, None).unwrap();
+        let streamed = process_history_sync(compressed, Some(own), false, None).unwrap();
+
+        assert!(full.decompressed_bytes.is_some(), "full path retains blob");
+        assert!(
+            streamed.decompressed_bytes.is_none(),
+            "streaming path drops blob"
+        );
+        assert_eq!(full.nct_salt, streamed.nct_salt);
+        assert_eq!(full.own_pushname, streamed.own_pushname);
+        assert_eq!(full.own_pushname.as_deref(), Some("Me"));
+        assert_eq!(
+            full.conversations_processed,
+            streamed.conversations_processed
+        );
+        assert_eq!(full.conversations_processed, 2);
+        assert_eq!(full.tc_token_candidates, streamed.tc_token_candidates);
+        assert_eq!(
+            full.tc_token_candidates.len(),
+            1,
+            "only the DM has a tctoken"
+        );
+        assert_eq!(full.msg_secret_records, streamed.msg_secret_records);
+        assert_eq!(full.msg_secret_records.len(), 1500 + 1);
     }
 }
