@@ -127,6 +127,8 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
         || msg.newsletter_follower_invite_message_v2.is_some()
         || msg.message_history_notice.is_some()
         || msg.album_message.is_some()
+        || msg.request_payment_message.is_some()
+        || msg.group_status_message_v2.is_some()
     {
         return stanza::MSG_TYPE_TEXT;
     }
@@ -4146,6 +4148,24 @@ mod tests {
         fn album_is_text() {
             let msg = wa::Message {
                 album_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&msg), stanza::MSG_TYPE_TEXT);
+        }
+
+        #[test]
+        fn request_payment_is_text() {
+            let msg = wa::Message {
+                request_payment_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&msg), stanza::MSG_TYPE_TEXT);
+        }
+
+        #[test]
+        fn group_status_v2_is_text() {
+            let msg = wa::Message {
+                group_status_message_v2: Some(Box::default()),
                 ..Default::default()
             };
             assert_eq!(stanza_type_from_message(&msg), stanza::MSG_TYPE_TEXT);
