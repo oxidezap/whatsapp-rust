@@ -76,6 +76,22 @@ pub(crate) fn unwrap_message(msg: &wa::Message) -> &wa::Message {
         bot_invoke_message,
         associated_child_message,
         poll_creation_option_image_message,
+        // Remaining FutureProofMessage wrappers from WA Web's
+        // getUnwrappedProtobufMessage list; classify by the inner message.
+        event_cover_image,
+        group_status_message,
+        group_status_message_v2,
+        group_status_mention_message,
+        status_add_yours,
+        status_mention_message,
+        question_message,
+        question_reply_message,
+        spoiler_message,
+        lottie_sticker_message,
+        limit_sharing_message,
+        newsletter_admin_profile_message,
+        newsletter_admin_profile_message_v2,
+        poll_creation_message_v4,
     );
     if let Some(ref dsm) = msg.device_sent_message
         && let Some(ref inner) = dsm.message
@@ -127,8 +143,6 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
         || msg.newsletter_follower_invite_message_v2.is_some()
         || msg.message_history_notice.is_some()
         || msg.album_message.is_some()
-        || msg.request_payment_message.is_some()
-        || msg.group_status_message_v2.is_some()
     {
         return stanza::MSG_TYPE_TEXT;
     }
@@ -4153,22 +4167,161 @@ mod tests {
             assert_eq!(stanza_type_from_message(&msg), stanza::MSG_TYPE_TEXT);
         }
 
-        #[test]
-        fn request_payment_is_text() {
-            let msg = wa::Message {
-                request_payment_message: Some(Box::default()),
+        // Helpers for wrapper tests. WA Web's typeAttributeFromProtobuf unwraps
+        // FutureProofMessage wrappers (via getUnwrappedProtobufMessage) and then
+        // classifies the inner message.
+        fn fpm(inner: wa::Message) -> Box<wa::message::FutureProofMessage> {
+            Box::new(wa::message::FutureProofMessage {
+                message: Some(Box::new(inner)),
+            })
+        }
+        fn text_inner() -> wa::Message {
+            wa::Message {
+                conversation: Some("hi".to_string()),
                 ..Default::default()
-            };
-            assert_eq!(stanza_type_from_message(&msg), stanza::MSG_TYPE_TEXT);
+            }
+        }
+        fn image_inner() -> wa::Message {
+            wa::Message {
+                image_message: Some(Box::default()),
+                ..Default::default()
+            }
         }
 
         #[test]
-        fn group_status_v2_is_text() {
-            let msg = wa::Message {
+        fn group_status_v2_classifies_by_inner() {
+            let txt = wa::Message {
+                group_status_message_v2: Some(fpm(text_inner())),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&txt), stanza::MSG_TYPE_TEXT);
+
+            // Regression guard: forcing this wrapper to "text" dropped the
+            // mediatype and silently dropped the stanza. WA Web unwraps it and
+            // sends type="media" mediatype="image".
+            let img = wa::Message {
+                group_status_message_v2: Some(fpm(image_inner())),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&img), stanza::MSG_TYPE_MEDIA);
+            assert_eq!(media_type_from_message(&img), Some("image"));
+        }
+
+        #[test]
+        fn group_status_v2_empty_is_media() {
+            // An empty wrapper is not one of WA Web's four re-checked wrappers
+            // (ephemeral/groupMentioned/botInvoke/deviceSent), so it falls through
+            // to the media default in both WA Web and here.
+            let m = wa::Message {
                 group_status_message_v2: Some(Box::default()),
                 ..Default::default()
             };
-            assert_eq!(stanza_type_from_message(&msg), stanza::MSG_TYPE_TEXT);
+            assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_MEDIA);
+        }
+
+        #[test]
+        fn request_payment_is_media_default() {
+            // Not in WA Web's stanza classifier (only the internal MSG_TYPE.PAYMENT
+            // enum, which is not the wire `type`) and not a wrapper -> media default.
+            let m = wa::Message {
+                request_payment_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_MEDIA);
+        }
+
+        #[test]
+        fn backfilled_wrappers_classify_by_inner() {
+            let spoiler = wa::Message {
+                spoiler_message: Some(fpm(text_inner())),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&spoiler), stanza::MSG_TYPE_TEXT);
+
+            let status_mention = wa::Message {
+                status_mention_message: Some(fpm(image_inner())),
+                ..Default::default()
+            };
+            assert_eq!(
+                stanza_type_from_message(&status_mention),
+                stanza::MSG_TYPE_MEDIA
+            );
+            assert_eq!(media_type_from_message(&status_mention), Some("image"));
+
+            let question = wa::Message {
+                question_message: Some(fpm(text_inner())),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&question), stanza::MSG_TYPE_TEXT);
+
+            let group_status_v1 = wa::Message {
+                group_status_message: Some(fpm(text_inner())),
+                ..Default::default()
+            };
+            assert_eq!(
+                stanza_type_from_message(&group_status_v1),
+                stanza::MSG_TYPE_TEXT
+            );
+        }
+
+        #[test]
+        fn nested_wrappers_reach_innermost() {
+            // ephemeral { viewOnceV2 { image } } -> media + mediatype.
+            let inner = wa::Message {
+                view_once_message_v2: Some(fpm(image_inner())),
+                ..Default::default()
+            };
+            let m = wa::Message {
+                ephemeral_message: Some(fpm(inner)),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_MEDIA);
+            assert_eq!(media_type_from_message(&m), Some("image"));
+        }
+
+        #[test]
+        fn preserved_classifier_branches() {
+            let r = wa::Message {
+                reaction_message: Some(Default::default()),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&r), stanza::MSG_TYPE_REACTION);
+
+            let ev = wa::Message {
+                event_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&ev), stanza::MSG_TYPE_EVENT);
+
+            let poll = wa::Message {
+                poll_creation_message_v3: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&poll), stanza::MSG_TYPE_POLL);
+
+            assert_eq!(
+                stanza_type_from_message(&text_inner()),
+                stanza::MSG_TYPE_TEXT
+            );
+            assert_eq!(
+                stanza_type_from_message(&image_inner()),
+                stanza::MSG_TYPE_MEDIA
+            );
+
+            let proto = wa::Message {
+                protocol_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&proto), stanza::MSG_TYPE_TEXT);
+
+            let url = wa::Message {
+                extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                    matched_text: Some("https://example.com".to_string()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&url), stanza::MSG_TYPE_MEDIA);
         }
     }
 
