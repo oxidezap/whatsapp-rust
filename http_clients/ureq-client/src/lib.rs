@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use wacore::net::{HttpClient, HttpRequest, HttpResponse, StreamingHttpResponse};
+use wacore::net::{HttpClient, HttpRequest, HttpResponse, StreamingHttpResponse, UploadBody};
 
 /// Matches `MAX_FILE_SIZE_BYTES` in `WAWebServerPropConstants` (2 GiB).
 /// Overrides ureq's 10 MiB default on `read_to_vec()`.
@@ -154,6 +154,49 @@ impl HttpClient for UreqHttpClient {
             body: Box::new(reader),
         })
     }
+
+    fn supports_upload_streaming(&self) -> bool {
+        true
+    }
+
+    fn execute_upload(
+        &self,
+        request: HttpRequest,
+        body: UploadBody,
+        content_length: u64,
+    ) -> Result<HttpResponse> {
+        // No spawn_blocking — like execute_streaming, this is driven from within
+        // a blocking context, and the reader is read on this thread.
+        if request.method != "POST" {
+            return Err(anyhow::anyhow!(
+                "Upload streaming only supports POST, got: {}",
+                request.method
+            ));
+        }
+
+        let mut req = self.agent.post(&request.url);
+        for (key, value) in &request.headers {
+            req = req.header(key, value);
+        }
+        // Explicit Content-Length keeps ureq length-delimited instead of chunked
+        // (which WhatsApp's CDN rejects) for an arbitrary reader body.
+        let content_length = content_length.to_string();
+        req = req.header("content-length", content_length.as_str());
+
+        let response = req.send(ureq::SendBody::from_owned_reader(body))?;
+
+        let status_code = response.status().as_u16();
+        let body_bytes = response
+            .into_body()
+            .into_with_config()
+            .limit(self.max_body_bytes)
+            .read_to_vec()?;
+
+        Ok(HttpResponse {
+            status_code,
+            body: body_bytes,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +271,142 @@ mod tests {
             })
             .await
             .expect_err("1 KiB cap must reject a 4 MiB body");
+    }
+
+    /// Captures the raw request headers and body of a single POST, then replies 200.
+    fn spawn_capture_server() -> (String, std::sync::mpsc::Receiver<(String, Vec<u8>)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let header_end = loop {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                let n = stream.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_length = headers.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    v.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            });
+            let mut body = buf[header_end..].to_vec();
+            if let Some(cl) = content_length {
+                while body.len() < cl {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&tmp[..n]);
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            let _ = tx.send((headers, body));
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    fn parsed_content_length(headers: &str) -> Option<usize> {
+        headers.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())
+                .flatten()
+        })
+    }
+
+    /// The key invariant: an arbitrary (non-`File`) reader body must be sent with
+    /// an explicit Content-Length and never chunked — matching WhatsApp Web.
+    #[test]
+    fn upload_streaming_sets_content_length_not_chunked() {
+        let (url, rx) = spawn_capture_server();
+        let payload: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+        let client = UreqHttpClient::new();
+
+        let resp = client
+            .execute_upload(
+                HttpRequest {
+                    method: "POST".into(),
+                    url,
+                    headers: std::collections::HashMap::new(),
+                    body: None,
+                },
+                Box::new(std::io::Cursor::new(payload.clone())),
+                payload.len() as u64,
+            )
+            .expect("upload should succeed");
+        assert_eq!(resp.status_code, 200);
+
+        let (headers, body) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server should capture the request");
+        assert_eq!(
+            parsed_content_length(&headers),
+            Some(payload.len()),
+            "exact Content-Length expected, headers:\n{headers}"
+        );
+        assert!(
+            !headers.to_ascii_lowercase().contains("transfer-encoding"),
+            "body must not be chunked, headers:\n{headers}"
+        );
+        assert_eq!(body, payload, "server must receive the exact bytes");
+    }
+
+    /// A body larger than the 16 KiB output buffer exercises real chunked reads
+    /// from the reader while still arriving intact and length-delimited.
+    #[test]
+    fn upload_streaming_large_body_integrity() {
+        let (url, rx) = spawn_capture_server();
+        let payload: Vec<u8> = (0..200_000usize).map(|i| (i % 251) as u8).collect();
+        let client = UreqHttpClient::new();
+
+        let resp = client
+            .execute_upload(
+                HttpRequest {
+                    method: "POST".into(),
+                    url,
+                    headers: std::collections::HashMap::new(),
+                    body: None,
+                },
+                Box::new(std::io::Cursor::new(payload.clone())),
+                payload.len() as u64,
+            )
+            .expect("upload should succeed");
+        assert_eq!(resp.status_code, 200);
+
+        let (headers, body) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("server should capture the request");
+        assert_eq!(parsed_content_length(&headers), Some(payload.len()));
+        assert_eq!(body, payload);
+    }
+
+    #[test]
+    fn upload_streaming_rejects_non_post() {
+        let client = UreqHttpClient::new();
+        let err = client.execute_upload(
+            HttpRequest {
+                method: "GET".into(),
+                url: "http://127.0.0.1:0/never".into(),
+                headers: std::collections::HashMap::new(),
+                body: None,
+            },
+            Box::new(std::io::Cursor::new(vec![1u8, 2, 3])),
+            3,
+        );
+        assert!(err.is_err(), "only POST is allowed for upload streaming");
     }
 }
