@@ -470,6 +470,13 @@ mod tests {
         assert_eq!(result.state.version, 1);
         assert_eq!(result.mutations.len(), 1);
         assert_eq!(result.mutation_macs.len(), 1);
+        // Exact MAC bytes (not just counts): catches empty/swapped MACs.
+        assert_eq!(result.mutation_macs[0].index_mac, index_mac);
+        assert!(!result.mutation_macs[0].value_mac.is_empty());
+        assert_ne!(
+            result.mutation_macs[0].index_mac,
+            result.mutation_macs[0].value_mac
+        );
         assert_eq!(
             result.mutations[0]
                 .action_value
@@ -516,6 +523,13 @@ mod tests {
         assert_eq!(result.state.version, 2);
         assert_eq!(result.mutations.len(), 1);
         assert_eq!(result.added_macs.len(), 1);
+        // Exact MAC bytes (not just counts): catches empty/swapped MACs.
+        assert_eq!(result.added_macs[0].index_mac, index_mac);
+        assert!(!result.added_macs[0].value_mac.is_empty());
+        assert_ne!(
+            result.added_macs[0].index_mac,
+            result.added_macs[0].value_mac
+        );
         assert!(result.removed_index_macs.is_empty());
     }
 

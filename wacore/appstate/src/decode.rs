@@ -94,11 +94,13 @@ pub fn decode_record(
         }
     }
 
+    // A record without an index MAC is malformed; never persist an empty MAC
+    // (previously unwrap_or_default() let this through when validate_macs=false).
     let index_mac = record
         .index
         .as_ref()
         .and_then(|i| i.blob.clone())
-        .unwrap_or_default();
+        .ok_or(AppStateError::MissingIndexMAC)?;
     Ok((
         Mutation {
             action_value: action.value,
@@ -218,7 +220,7 @@ mod tests {
             &action_data,
         );
 
-        let (mutation, _macs) = decode_record(
+        let (mutation, macs) = decode_record(
             wa::syncd_mutation::SyncdOperation::Set,
             &record,
             &keys,
@@ -232,6 +234,11 @@ mod tests {
             Some(1234567890)
         );
         assert_eq!(mutation.operation, wa::syncd_mutation::SyncdOperation::Set);
+        // MACs are returned separately and must carry the real bytes, not empty
+        // or swapped values: the record's index blob is `vec![1; 32]`.
+        assert_eq!(macs.index_mac, vec![1u8; 32]);
+        assert!(!macs.value_mac.is_empty());
+        assert_ne!(macs.index_mac, macs.value_mac);
     }
 
     #[test]
