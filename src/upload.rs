@@ -432,8 +432,10 @@ impl Client {
                 let source = std::sync::Arc::clone(&source);
                 let http = std::sync::Arc::clone(&self.http_client);
                 async move {
-                    let reader = source.reader_from(offset)?;
+                    // reader_from may open/seek a file, so run it in the blocking
+                    // task with execute_upload, not on the async worker.
                     wacore::runtime::blocking(&*self.runtime, move || {
+                        let reader = source.reader_from(offset)?;
                         http.execute_upload(request, reader, remaining)
                     })
                     .await
