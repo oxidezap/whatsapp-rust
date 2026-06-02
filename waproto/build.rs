@@ -24,21 +24,44 @@ fn main() -> std::io::Result<()> {
     buffa_build::Config::new()
         .descriptor_set("src/whatsapp.desc")
         .files(&["whatsapp.proto"])
-        // Serialize always; Deserialize only for WASM bridge (halves serde codegen).
-        .type_attribute(".", "#[derive(serde::Serialize)]")
-        .type_attribute(
+        // Messages + oneofs: serde over the struct/oneof shape. Serialize always;
+        // Deserialize only for the WASM bridge (halves serde codegen).
+        .message_attribute(".", "#[derive(serde::Serialize)]")
+        .message_attribute(
             ".",
             "#[cfg_attr(feature = \"serde-deserialize\", derive(serde::Deserialize))]",
         )
-        // Default missing fields to match protobuf semantics (structs only).
         .message_attribute(
             ".",
             "#[cfg_attr(feature = \"serde-deserialize\", serde(default))]",
         )
-        // Accept snake_case on deserialization for WASM bridge enum variants.
-        .type_attribute(
+        .oneof_attribute(".", "#[derive(serde::Serialize)]")
+        .oneof_attribute(
             ".",
-            "#[cfg_attr(feature = \"serde-snake-case\", serde(rename_all(deserialize = \"snake_case\")))]",
+            "#[cfg_attr(feature = \"serde-deserialize\", derive(serde::Deserialize))]",
+        )
+        // Enums: variant name by default; numeric repr (prost parity, JS bridge)
+        // under `serde-enum-repr`. Targeting enums separately from oneofs needs
+        // buffa's enum_attribute/oneof_attribute split.
+        .enum_attribute(
+            ".",
+            "#[cfg_attr(not(feature = \"serde-enum-repr\"), derive(serde::Serialize))]",
+        )
+        .enum_attribute(
+            ".",
+            "#[cfg_attr(feature = \"serde-enum-repr\", derive(serde_repr::Serialize_repr))]",
+        )
+        .enum_attribute(
+            ".",
+            "#[cfg_attr(all(feature = \"serde-deserialize\", not(feature = \"serde-enum-repr\")), derive(serde::Deserialize))]",
+        )
+        .enum_attribute(
+            ".",
+            "#[cfg_attr(all(feature = \"serde-deserialize\", feature = \"serde-enum-repr\"), derive(serde_repr::Deserialize_repr))]",
+        )
+        .enum_attribute(
+            ".",
+            "#[cfg_attr(all(feature = \"serde-snake-case\", not(feature = \"serde-enum-repr\")), serde(rename_all(deserialize = \"snake_case\")))]",
         )
         // O(1)-clone Bytes for hot-path crypto structures instead of Vec<u8>.
         .use_bytes_type_in(&[

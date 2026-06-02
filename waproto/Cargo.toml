@@ -11,11 +11,18 @@ description = "Protocol Buffers definitions for WhatsApp"
 default = []
 serde-deserialize = []
 serde-snake-case = ["serde-deserialize"]
+# Enums (de)serialize as their numeric repr (prost parity) instead of the
+# variant name — what the JS bridge / camelCase serializer expects.
+serde-enum-repr = ["dep:serde_repr"]
 
 [dependencies]
 buffa = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
+serde_repr = { version = "0.1", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
 
 [build-dependencies]
 buffa-build = { workspace = true }
