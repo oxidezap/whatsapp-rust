@@ -59,9 +59,12 @@ fn main() -> std::io::Result<()> {
             ".",
             "#[cfg_attr(all(feature = \"serde-deserialize\", feature = \"serde-enum-repr\"), derive(serde_repr::Deserialize_repr))]",
         )
+        // buffa emits SCREAMING_SNAKE variant names (CHROME, MESSAGE_EDIT), so
+        // `lowercase` yields the intended chrome / message_edit. `snake_case`
+        // would insert a separator before every char (c_h_r_o_m_e).
         .enum_attribute(
             ".",
-            "#[cfg_attr(all(feature = \"serde-snake-case\", not(feature = \"serde-enum-repr\")), serde(rename_all(deserialize = \"snake_case\")))]",
+            "#[cfg_attr(all(feature = \"serde-snake-case\", not(feature = \"serde-enum-repr\")), serde(rename_all(deserialize = \"lowercase\")))]",
         )
         // O(1)-clone Bytes for hot-path crypto structures instead of Vec<u8>.
         .use_bytes_type_in(&[
