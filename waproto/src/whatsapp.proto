@@ -5895,16 +5895,10 @@ message WebNotificationsInfo {
   repeated WebMessageInfo notify_messages = 5;
 }
 
-// === History-sync extraction projections (wacore::history_sync) — INTERIM ===
-// Narrow projections of the Conversation/WebMessageInfo subtree the streaming
-// history extractor reads. buffa views materialize every nested + repeated
-// message eagerly (Box/Vec), so decoding the full Conversation view for the
-// thousands of messages in a history blob allocates the whole tree even though
-// only a few fields per message are read. These projections keep the decoded
-// sub-tree narrow. Field NUMBERS mirror the canonical messages above and the
-// history_sync tests guard against drift; forwarded-detection coverage matches
-// the prost baseline (main). Delete once buffa supports lazy views
-// (anthropics/buffa#165) and the canonical views can be read directly.
+// History-sync extraction projections (wacore::history_sync) — INTERIM.
+// Narrow views so decode doesn't materialize the full message tree per history
+// message. Field numbers mirror the canonical messages (tests guard drift).
+// Delete once buffa supports lazy views (anthropics/buffa#165).
 message HsConversationExtract {
   required string id = 1;
   repeated HsHistorySyncMsgExtract messages = 2;

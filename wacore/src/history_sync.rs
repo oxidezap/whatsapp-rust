@@ -74,8 +74,7 @@ pub fn process_history_sync(
         nct_salt: None,
         conversations_processed: 0,
         tc_token_candidates: Vec::new(),
-        // Pre-size from a single allocation-free count pass so the accumulator
-        // never grows by repeated doubling as conversations are processed.
+        // Pre-size from a count pass so the accumulator doesn't grow by doubling.
         msg_secret_records: Vec::with_capacity(count_history_sync_messages(&buf)),
         decompressed_bytes: if retain_blob { Some(buf.clone()) } else { None },
     };
@@ -93,12 +92,15 @@ pub fn process_history_sync(
                 pos += vlen;
                 let end = checked_end(pos, len, buf.len(), "conversation")?;
 
-                let conversation = wa::HsConversationExtractView::decode_view(&buf[pos..end])?;
-                result.conversations_processed += 1;
-                if let Some(candidate) =
-                    extract_conversation_fields(&conversation, &mut result.msg_secret_records)
+                // Best-effort: a malformed conversation must not abort the sync.
+                if let Ok(conversation) = wa::HsConversationExtractView::decode_view(&buf[pos..end])
                 {
-                    result.tc_token_candidates.push(candidate);
+                    result.conversations_processed += 1;
+                    if let Some(candidate) =
+                        extract_conversation_fields(&conversation, &mut result.msg_secret_records)
+                    {
+                        result.tc_token_candidates.push(candidate);
+                    }
                 }
                 pos = end;
             }
@@ -111,7 +113,7 @@ pub fn process_history_sync(
                 let end = checked_end(pos, len, buf.len(), "pushname")?;
 
                 if let Some(own) = own_user
-                    && let Some(name) = extract_own_pushname(&buf[pos..end], own)?
+                    && let Some(name) = extract_own_pushname(&buf[pos..end], own)
                 {
                     result.own_pushname = Some(name);
                 }
@@ -201,20 +203,24 @@ fn process_history_sync_streaming(
                     match field_number {
                         // conversations (repeated)
                         2 => {
-                            let conversation = wa::HsConversationExtractView::decode_view(value)?;
-                            result.conversations_processed += 1;
-                            if let Some(candidate) = extract_conversation_fields(
-                                &conversation,
-                                &mut result.msg_secret_records,
-                            ) {
-                                result.tc_token_candidates.push(candidate);
+                            // Best-effort: skip a malformed conversation (reader still advances).
+                            if let Ok(conversation) =
+                                wa::HsConversationExtractView::decode_view(value)
+                            {
+                                result.conversations_processed += 1;
+                                if let Some(candidate) = extract_conversation_fields(
+                                    &conversation,
+                                    &mut result.msg_secret_records,
+                                ) {
+                                    result.tc_token_candidates.push(candidate);
+                                }
                             }
                         }
                         // pushnames (repeated) — only our own is needed
                         7 => {
                             if result.own_pushname.is_none()
                                 && let Some(own) = own_user
-                                && let Some(name) = extract_own_pushname(value, own)?
+                                && let Some(name) = extract_own_pushname(value, own)
                             {
                                 result.own_pushname = Some(name);
                             }
@@ -339,14 +345,15 @@ fn skip_field(wire_type: u32, buf: &[u8], pos: usize) -> Result<usize, HistorySy
     }
 }
 
-fn extract_own_pushname(data: &[u8], own_user: &str) -> Result<Option<String>, buffa::DecodeError> {
-    let pushname = wa::PushnameView::decode_view(data)?;
+// Best-effort: a malformed pushname (optional metadata) must not abort the sync.
+fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
+    let pushname = wa::PushnameView::decode_view(data).ok()?;
     if pushname.id == Some(own_user)
         && let Some(name) = pushname.pushname
     {
-        return Ok(Some(name.to_string()));
+        return Some(name.to_string());
     }
-    Ok(None)
+    None
 }
 
 /// Message-secret data extracted from a conversation during streaming.

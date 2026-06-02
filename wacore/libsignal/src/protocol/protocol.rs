@@ -818,14 +818,17 @@ impl buffa::Message for DecryptionErrorMessageProto {
         buf: &mut impl buffa::bytes::Buf,
         _depth: u32,
     ) -> core::result::Result<(), buffa::DecodeError> {
+        use buffa::encoding::WireType;
+        // Validate wire type per field; a mismatch falls through to skip_field
+        // instead of mis-decoding peer input.
         match tag.field_number() {
-            1 => {
+            1 if tag.wire_type() == WireType::LengthDelimited => {
                 buffa::types::merge_bytes(self.ratchet_key.get_or_insert_with(Vec::new), buf)?;
             }
-            2 => {
+            2 if tag.wire_type() == WireType::Varint => {
                 self.timestamp = Some(buffa::types::decode_uint64(buf)?);
             }
-            3 => {
+            3 if tag.wire_type() == WireType::Varint => {
                 self.device_id = Some(buffa::types::decode_uint32(buf)?);
             }
             _ => {
