@@ -43,12 +43,13 @@ impl<'a> Status<'a> {
     /// Send a text status update to the given recipients.
     ///
     /// `background_argb` is the background color as 0xAARRGGBB (e.g., `0xFF1E6E4F`).
-    /// `font` is the font style index (0-4 on WhatsApp Web).
+    /// `font` selects the status font; values outside the protocol enum can't be
+    /// passed (the prior `i32` form silently dropped them at encode time).
     pub async fn send_text(
         &self,
         text: &str,
         background_argb: u32,
-        font: i32,
+        font: wa::message::extended_text_message::FontType,
         recipients: &[Jid],
         options: StatusSendOptions,
     ) -> Result<SendResult, anyhow::Error> {
@@ -56,7 +57,7 @@ impl<'a> Status<'a> {
             extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some(text.to_string()),
                 background_argb: Some(background_argb),
-                font: buffa::Enumeration::from_i32(font),
+                font: Some(font),
                 ..Default::default()
             }),
             ..Default::default()
@@ -188,10 +189,11 @@ impl Client {
     /// # Example
     /// ```no_run
     /// # async fn example(client: &whatsapp_rust::Client) -> anyhow::Result<()> {
+    /// use waproto::whatsapp::message::extended_text_message::FontType;
     /// let recipients = [whatsapp_rust::Jid::pn("15551234567")];
     /// let id = client
     ///     .status()
-    ///     .send_text("Hello!", 0xFF1E6E4F, 0, &recipients, Default::default())
+    ///     .send_text("Hello!", 0xFF1E6E4F, FontType::SYSTEM, &recipients, Default::default())
     ///     .await?;
     /// # Ok(())
     /// # }
