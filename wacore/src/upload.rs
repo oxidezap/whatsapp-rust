@@ -8,6 +8,8 @@ use rand::rng;
 use std::io::{Read, Write};
 
 const BLOCK: usize = 16;
+/// Length of the truncated HMAC-SHA256 appended to the ciphertext.
+const MEDIA_MAC_LEN: usize = 10;
 
 /// Streaming sidecar chunk size: one HMAC per 64 KiB of ciphertext.
 const SIDECAR_CHUNK: usize = 64 * 1024;
@@ -378,6 +380,47 @@ impl UploadSource for std::sync::Arc<[u8]> {
     }
 }
 
+/// O(1) to construct from an owned `Vec<u8>` (`Bytes::from(vec)` adopts the
+/// buffer), unlike `Arc::<[u8]>::from(vec.into_boxed_slice())` which copies the
+/// whole ciphertext into a fresh refcounted allocation. Prefer this when the
+/// encrypted blob was produced into a `Vec` (e.g. by [`encrypt_media_streaming`]).
+impl UploadSource for bytes::Bytes {
+    fn len(&self) -> u64 {
+        (**self).len() as u64
+    }
+
+    fn reader_from(&self, offset: u64) -> std::io::Result<Box<dyn Read + Send>> {
+        let mut cursor = std::io::Cursor::new(self.clone());
+        cursor.set_position(offset.min((**self).len() as u64));
+        Ok(Box::new(cursor))
+    }
+}
+
+/// The exact size, in bytes, of the encrypted blob that [`encrypt_media`] /
+/// [`encrypt_media_streaming`] produce for a `plaintext_len`-byte input.
+///
+/// WhatsApp media encryption is AES-256-CBC with PKCS#7 padding followed by a
+/// 10-byte truncated HMAC-SHA256. PKCS#7 always appends between 1 and 16 bytes —
+/// a *full* block when the input is already 16-byte aligned — so the ciphertext
+/// is `plaintext_len` rounded **up** to the next 16-byte boundary, plus 10.
+///
+/// Use it to size the destination buffer exactly so a `Vec` neither grows during
+/// [`encrypt_media_streaming`]'s per-block writes nor shrink-reallocates when
+/// wrapped as an [`UploadSource`] — the encrypted blob is the single biggest
+/// allocation in the upload path:
+///
+/// ```
+/// use wacore::upload::{encrypt_media_streaming, encrypted_len};
+/// use wacore::download::MediaType;
+/// let plaintext = vec![0u8; 1000];
+/// let mut ciphertext = Vec::with_capacity(encrypted_len(plaintext.len()));
+/// encrypt_media_streaming(&plaintext[..], &mut ciphertext, MediaType::Image).unwrap();
+/// assert_eq!(ciphertext.len(), encrypted_len(plaintext.len()));
+/// ```
+pub const fn encrypted_len(plaintext_len: usize) -> usize {
+    (plaintext_len / BLOCK + 1) * BLOCK + MEDIA_MAC_LEN
+}
+
 /// Encrypt media streaming with constant memory. A streaming sidecar is
 /// generated automatically for audio/video.
 pub fn encrypt_media_streaming<R: Read, W: Write>(
@@ -460,6 +503,57 @@ mod tests {
     use super::*;
     use crate::download::DownloadUtils;
     use std::io::Cursor;
+
+    #[test]
+    fn encrypted_len_matches_encryptor_output() {
+        // Tie the helper to the real encryptor across block boundaries (incl. the
+        // aligned case, where PKCS#7 appends a full padding block) so a change to
+        // the padding/MAC can't silently desync `encrypted_len` from reality.
+        for &n in &[0usize, 1, 15, 16, 17, 31, 32, 100, 4096, 59383] {
+            let enc = encrypt_media(&vec![0xABu8; n], MediaType::Image).unwrap();
+            assert_eq!(
+                enc.data_to_upload.len(),
+                encrypted_len(n),
+                "encrypted_len mismatch for plaintext_len={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_upload_source_reads_from_offset() {
+        let data = bytes::Bytes::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(UploadSource::len(&data), 8);
+        assert!(!UploadSource::is_empty(&data));
+
+        let mut reader = data.reader_from(3).unwrap();
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, vec![4, 5, 6, 7, 8]);
+
+        // Offset at/past the end yields an empty read (mirrors the Arc impl).
+        let mut past = data.reader_from(100).unwrap();
+        let mut empty = Vec::new();
+        past.read_to_end(&mut empty).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn bytes_upload_source_matches_arc_slice() {
+        // The two in-memory UploadSource impls must stream identical bytes.
+        let raw = vec![7u8; 1000];
+        let as_bytes = bytes::Bytes::from(raw.clone());
+        let as_arc: std::sync::Arc<[u8]> = std::sync::Arc::from(raw.into_boxed_slice());
+        assert_eq!(UploadSource::len(&as_bytes), UploadSource::len(&as_arc));
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        as_bytes
+            .reader_from(0)
+            .unwrap()
+            .read_to_end(&mut a)
+            .unwrap();
+        as_arc.reader_from(0).unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(a, b);
+    }
 
     #[test]
     fn roundtrip_decrypt_stream() {
