@@ -523,7 +523,8 @@ async fn encrypt_one_device(
                 Ok(Some(EncryptOneResult {
                     enc_type,
                     is_prekey,
-                    ciphertext: serialized_bytes.to_vec(),
+                    // Box<[u8]> -> Vec<u8> reuses the allocation (no copy).
+                    ciphertext: serialized_bytes.into(),
                     hide_decrypt_fail,
                 })),
             )
