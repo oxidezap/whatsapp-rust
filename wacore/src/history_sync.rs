@@ -74,7 +74,9 @@ pub fn process_history_sync(
         nct_salt: None,
         conversations_processed: 0,
         tc_token_candidates: Vec::new(),
-        msg_secret_records: Vec::new(),
+        // Pre-size from a single allocation-free count pass so the accumulator
+        // never grows by repeated doubling as conversations are processed.
+        msg_secret_records: Vec::with_capacity(count_history_sync_messages(&buf)),
         decompressed_bytes: if retain_blob { Some(buf.clone()) } else { None },
     };
 
@@ -91,15 +93,13 @@ pub fn process_history_sync(
                 pos += vlen;
                 let end = checked_end(pos, len, buf.len(), "conversation")?;
 
-                let conversation = wa::ConversationView::decode_view(&buf[pos..end])?;
+                let conversation = wa::HsConversationExtractView::decode_view(&buf[pos..end])?;
                 result.conversations_processed += 1;
-                let extracted = extract_conversation_fields(&conversation);
-                if let Some(candidate) = extracted.tc_token_candidate {
+                if let Some(candidate) =
+                    extract_conversation_fields(&conversation, &mut result.msg_secret_records)
+                {
                     result.tc_token_candidates.push(candidate);
                 }
-                result
-                    .msg_secret_records
-                    .extend(extracted.msg_secret_records);
                 pos = end;
             }
             7 if own_user.is_some()
@@ -201,15 +201,14 @@ fn process_history_sync_streaming(
                     match field_number {
                         // conversations (repeated)
                         2 => {
-                            let conversation = wa::ConversationView::decode_view(value)?;
+                            let conversation = wa::HsConversationExtractView::decode_view(value)?;
                             result.conversations_processed += 1;
-                            let extracted = extract_conversation_fields(&conversation);
-                            if let Some(candidate) = extracted.tc_token_candidate {
+                            if let Some(candidate) = extract_conversation_fields(
+                                &conversation,
+                                &mut result.msg_secret_records,
+                            ) {
                                 result.tc_token_candidates.push(candidate);
                             }
-                            result
-                                .msg_secret_records
-                                .extend(extracted.msg_secret_records);
                         }
                         // pushnames (repeated) — only our own is needed
                         7 => {
@@ -350,11 +349,6 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Result<Option<String>, b
     Ok(None)
 }
 
-struct ConversationExtraction {
-    tc_token_candidate: Option<TcTokenCandidate>,
-    msg_secret_records: Vec<HistoryMsgSecretRecord>,
-}
-
 /// Message-secret data extracted from a conversation during streaming.
 #[derive(Debug)]
 pub struct HistoryMsgSecretRecord {
@@ -377,18 +371,18 @@ pub struct HistoryMsgSecretRecord {
     pub is_bot_invocation: bool,
 }
 
-fn extract_conversation_fields(conv: &wa::ConversationView<'_>) -> ConversationExtraction {
-    let tc_token_candidate = extract_tc_token_fields(conv);
-    let msg_secret_records = extract_msg_secret_records(conv);
-
-    ConversationExtraction {
-        tc_token_candidate,
-        msg_secret_records,
-    }
+/// Appends this conversation's message-secret records directly into `records`
+/// (no per-conversation Vec) and returns its tctoken candidate, if any.
+fn extract_conversation_fields(
+    conv: &wa::HsConversationExtractView<'_>,
+    records: &mut Vec<HistoryMsgSecretRecord>,
+) -> Option<TcTokenCandidate> {
+    extract_msg_secret_records(conv, records);
+    extract_tc_token_fields(conv)
 }
 
 /// Returns `None` for groups, newsletters, bots, or conversations without tctokens.
-fn extract_tc_token_fields(conv: &wa::ConversationView<'_>) -> Option<TcTokenCandidate> {
+fn extract_tc_token_fields(conv: &wa::HsConversationExtractView<'_>) -> Option<TcTokenCandidate> {
     let id = conv.id;
     if id.is_empty() {
         return None;
@@ -412,11 +406,13 @@ fn extract_tc_token_fields(conv: &wa::ConversationView<'_>) -> Option<TcTokenCan
     })
 }
 
-fn extract_msg_secret_records(conv: &wa::ConversationView<'_>) -> Vec<HistoryMsgSecretRecord> {
-    let mut records = Vec::new();
+fn extract_msg_secret_records(
+    conv: &wa::HsConversationExtractView<'_>,
+    records: &mut Vec<HistoryMsgSecretRecord>,
+) {
     let chat_id = conv.id;
     if chat_id.is_empty() {
-        return records;
+        return;
     }
 
     for history_msg in &conv.messages {
@@ -461,14 +457,68 @@ fn extract_msg_secret_records(conv: &wa::ConversationView<'_>) -> Vec<HistoryMsg
             is_bot_invocation,
         });
     }
+}
 
-    records
+/// Upper-bound count of message entries across all conversations, via an
+/// allocation-free wire scan. Used to pre-size the secret-record accumulator.
+fn count_history_sync_messages(buf: &[u8]) -> usize {
+    let mut pos = 0;
+    let mut total = 0;
+    while pos < buf.len() {
+        let Ok((tag, br)) = read_varint(&buf[pos..]) else {
+            break;
+        };
+        pos += br;
+        let field = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+        if field == 2 && wt == wire_type::LENGTH_DELIMITED {
+            let Ok((len, vl)) = read_varint(&buf[pos..]) else {
+                break;
+            };
+            pos += vl;
+            let Ok(end) = checked_end(pos, len, buf.len(), "conv-count") else {
+                break;
+            };
+            total += count_conversation_messages(&buf[pos..end]);
+            pos = end;
+        } else {
+            match skip_field(wt, buf, pos) {
+                Ok(np) => pos = np,
+                Err(_) => break,
+            }
+        }
+    }
+    total
+}
+
+/// Count field-2 (message) entries within a single conversation's bytes.
+fn count_conversation_messages(buf: &[u8]) -> usize {
+    let mut pos = 0;
+    let mut n = 0;
+    while pos < buf.len() {
+        let Ok((tag, br)) = read_varint(&buf[pos..]) else {
+            break;
+        };
+        pos += br;
+        let field = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+        if field == 2 && wt == wire_type::LENGTH_DELIMITED {
+            n += 1;
+        }
+        match skip_field(wt, buf, pos) {
+            Ok(np) => pos = np,
+            Err(_) => break,
+        }
+    }
+    n
 }
 
 /// Walk wrapper layers (deviceSent/ephemeral/viewOnce/etc.) to the innermost
 /// message, mirroring main's `MessageInternalFields::base_message`. Bounded the
 /// same way as [`message_is_forwarded_at_depth`].
-fn base_message_view<'a>(message: &'a wa::MessageView<'a>) -> &'a wa::MessageView<'a> {
+fn base_message_view<'a>(
+    message: &'a wa::HsMessageExtractView<'a>,
+) -> &'a wa::HsMessageExtractView<'a> {
     let mut current = message;
     let mut depth = 0usize;
     while depth <= 16 {
@@ -485,7 +535,7 @@ fn base_message_view<'a>(message: &'a wa::MessageView<'a>) -> &'a wa::MessageVie
 
 /// Whether the (unwrapped) message is a poll-creation or event message. These
 /// carry the longer poll/event retention horizon.
-fn message_is_poll_or_event(message: &wa::MessageView<'_>) -> bool {
+fn message_is_poll_or_event(message: &wa::HsMessageExtractView<'_>) -> bool {
     let base = base_message_view(message);
     base.poll_creation_message.as_option().is_some()
         || base.poll_creation_message_v2.as_option().is_some()
@@ -496,24 +546,26 @@ fn message_is_poll_or_event(message: &wa::MessageView<'_>) -> bool {
 /// Whether the message invokes a bot, detected via `botMetadata` presence.
 /// botMetadata sits on the top-level `MessageContextInfo` even when wrapped,
 /// so check both the outer message and the unwrapped base.
-fn message_invokes_bot(message: &wa::MessageView<'_>) -> bool {
-    let has = |m: &wa::MessageView<'_>| {
+fn message_invokes_bot(message: &wa::HsMessageExtractView<'_>) -> bool {
+    let has = |m: &wa::HsMessageExtractView<'_>| {
         m.message_context_info
             .as_option()
-            .is_some_and(|c| c.bot_metadata.as_option().is_some())
+            .is_some_and(|c| c.bot_metadata.is_some())
     };
     has(message) || has(base_message_view(message))
 }
 
-fn extract_message_context_secret<'a>(message: &'a wa::MessageView<'a>) -> Option<&'a [u8]> {
+fn extract_message_context_secret<'a>(
+    message: &'a wa::HsMessageExtractView<'a>,
+) -> Option<&'a [u8]> {
     message.message_context_info.as_option()?.message_secret
 }
 
-fn message_is_forwarded(message: &wa::MessageView<'_>) -> bool {
+fn message_is_forwarded(message: &wa::HsMessageExtractView<'_>) -> bool {
     message_is_forwarded_at_depth(message, 0)
 }
 
-fn message_is_forwarded_at_depth(message: &wa::MessageView<'_>, depth: usize) -> bool {
+fn message_is_forwarded_at_depth(message: &wa::HsMessageExtractView<'_>, depth: usize) -> bool {
     if depth > 16 {
         return false;
     }
@@ -525,7 +577,9 @@ fn message_is_forwarded_at_depth(message: &wa::MessageView<'_>, depth: usize) ->
     message_context_is_forwarded(message)
 }
 
-fn first_wrapped_message<'a>(message: &'a wa::MessageView<'a>) -> Option<&'a wa::MessageView<'a>> {
+fn first_wrapped_message<'a>(
+    message: &'a wa::HsMessageExtractView<'a>,
+) -> Option<&'a wa::HsMessageExtractView<'a>> {
     if let Some(wrapper) = message.device_sent_message.as_option()
         && let Some(inner) = wrapper.message.as_option()
     {
@@ -544,39 +598,19 @@ fn first_wrapped_message<'a>(message: &'a wa::MessageView<'a>) -> Option<&'a wa:
         };
     }
 
+    // Wrapper set mirrors the prost baseline (main); see HsMessageExtract.
     future_proof_inner!(
         ephemeral_message,
         view_once_message,
         view_once_message_v2,
-        view_once_message_v2_extension,
         document_with_caption_message,
         edited_message,
-        group_mentioned_message,
-        bot_invoke_message,
-        lottie_sticker_message,
-        event_cover_image,
-        status_mention_message,
-        poll_creation_option_image_message,
-        associated_child_message,
-        group_status_mention_message,
-        poll_creation_message_v4,
-        status_add_yours,
-        group_status_message,
-        limit_sharing_message,
-        bot_task_message,
-        question_message,
-        group_status_message_v2,
-        bot_forwarded_message,
-        question_reply_message,
-        newsletter_admin_profile_message,
-        newsletter_admin_profile_message_v2,
-        spoiler_message,
     );
 
     None
 }
 
-fn message_context_is_forwarded(message: &wa::MessageView<'_>) -> bool {
+fn message_context_is_forwarded(message: &wa::HsMessageExtractView<'_>) -> bool {
     macro_rules! has_forwarded_context {
         ($($field:ident),* $(,)?) => {
             $(
@@ -590,6 +624,7 @@ fn message_context_is_forwarded(message: &wa::MessageView<'_>) -> bool {
         };
     }
 
+    // Content-variant set mirrors the prost baseline (main); see HsMessageExtract.
     has_forwarded_context!(
         event_message,
         template_message,
@@ -599,8 +634,6 @@ fn message_context_is_forwarded(message: &wa::MessageView<'_>) -> bool {
         poll_creation_message,
         poll_creation_message_v2,
         poll_creation_message_v3,
-        poll_creation_message_v5,
-        poll_creation_message_v6,
         newsletter_admin_invite_message,
         group_invite_message,
         list_message,
@@ -615,21 +648,17 @@ fn message_context_is_forwarded(message: &wa::MessageView<'_>) -> bool {
         document_message,
         audio_message,
         video_message,
-        ptv_message,
         contacts_array_message,
         live_location_message,
         sticker_message,
         product_message,
         order_message,
-        rich_response_message,
-        message_history_notice,
-        event_invite_message,
     );
 
     false
 }
 
-fn context_info_is_forwarded(context: &wa::ContextInfoView<'_>) -> bool {
+fn context_info_is_forwarded(context: &wa::HsContextInfoExtractView<'_>) -> bool {
     context.is_forwarded == Some(true)
 }
 

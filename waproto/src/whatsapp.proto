@@ -5894,3 +5894,93 @@ message WebNotificationsInfo {
   optional uint32 notify_message_count = 4;
   repeated WebMessageInfo notify_messages = 5;
 }
+
+// === History-sync extraction projections (wacore::history_sync) — INTERIM ===
+// Narrow projections of the Conversation/WebMessageInfo subtree the streaming
+// history extractor reads. buffa views materialize every nested + repeated
+// message eagerly (Box/Vec), so decoding the full Conversation view for the
+// thousands of messages in a history blob allocates the whole tree even though
+// only a few fields per message are read. These projections keep the decoded
+// sub-tree narrow. Field NUMBERS mirror the canonical messages above and the
+// history_sync tests guard against drift; forwarded-detection coverage matches
+// the prost baseline (main). Delete once buffa supports lazy views
+// (anthropics/buffa#165) and the canonical views can be read directly.
+message HsConversationExtract {
+  required string id = 1;
+  repeated HsHistorySyncMsgExtract messages = 2;
+  optional bytes tc_token = 21;
+  optional uint64 tc_token_timestamp = 22;
+  optional uint64 tc_token_sender_timestamp = 28;
+}
+message HsHistorySyncMsgExtract {
+  optional HsWebMessageInfoExtract message = 1;
+}
+message HsWebMessageInfoExtract {
+  optional HsMessageKeyExtract key = 1;
+  optional HsMessageExtract message = 2;
+  optional uint64 message_timestamp = 3;
+  optional string participant = 5;
+  optional bytes message_secret = 49;
+}
+message HsMessageKeyExtract {
+  optional bool from_me = 2;
+  optional string id = 3;
+  optional string participant = 4;
+}
+message HsContextInfoExtract {
+  optional bool is_forwarded = 22;
+}
+// context_info carriers, named by the tag context_info sits at in each variant.
+message HsCtxTag1 { optional HsContextInfoExtract context_info = 1; }
+message HsCtxTag3 { optional HsContextInfoExtract context_info = 3; }
+message HsCtxTag4 { optional HsContextInfoExtract context_info = 4; }
+message HsCtxTag5 { optional HsContextInfoExtract context_info = 5; }
+message HsCtxTag6 { optional HsContextInfoExtract context_info = 6; }
+message HsCtxTag7 { optional HsContextInfoExtract context_info = 7; }
+message HsCtxTag8 { optional HsContextInfoExtract context_info = 8; }
+message HsCtxTag11 { optional HsContextInfoExtract context_info = 11; }
+message HsCtxTag15 { optional HsContextInfoExtract context_info = 15; }
+message HsCtxTag17 { optional HsContextInfoExtract context_info = 17; }
+message HsMessageContextInfoExtract {
+  optional bytes message_secret = 3;
+  optional bytes bot_metadata = 7;
+}
+// Wrapper carriers: the wrapped message lives at tag 1 (future-proof) or 2 (deviceSent).
+message HsFutureProofExtract { optional HsMessageExtract message = 1; }
+message HsDeviceSentExtract { optional HsMessageExtract message = 2; }
+message HsMessageExtract {
+  optional HsCtxTag17 image_message = 3;
+  optional HsCtxTag17 contact_message = 4;
+  optional HsCtxTag17 location_message = 5;
+  optional HsCtxTag17 extended_text_message = 6;
+  optional HsCtxTag17 document_message = 7;
+  optional HsCtxTag17 audio_message = 8;
+  optional HsCtxTag17 video_message = 9;
+  optional HsCtxTag17 contacts_array_message = 13;
+  optional HsCtxTag17 live_location_message = 18;
+  optional HsCtxTag3 template_message = 25;
+  optional HsCtxTag17 sticker_message = 26;
+  optional HsCtxTag7 group_invite_message = 28;
+  optional HsCtxTag3 template_button_reply_message = 29;
+  optional HsCtxTag17 product_message = 30;
+  optional HsDeviceSentExtract device_sent_message = 31;
+  optional HsMessageContextInfoExtract message_context_info = 35;
+  optional HsCtxTag8 list_message = 36;
+  optional HsFutureProofExtract view_once_message = 37;
+  optional HsCtxTag17 order_message = 38;
+  optional HsCtxTag4 list_response_message = 39;
+  optional HsFutureProofExtract ephemeral_message = 40;
+  optional HsCtxTag8 buttons_message = 42;
+  optional HsCtxTag3 buttons_response_message = 43;
+  optional HsCtxTag15 interactive_message = 45;
+  optional HsCtxTag15 interactive_response_message = 48;
+  optional HsCtxTag5 poll_creation_message = 49;
+  optional HsFutureProofExtract document_with_caption_message = 53;
+  optional HsFutureProofExtract view_once_message_v2 = 55;
+  optional HsFutureProofExtract edited_message = 58;
+  optional HsCtxTag5 poll_creation_message_v2 = 60;
+  optional HsCtxTag5 poll_creation_message_v3 = 64;
+  optional HsCtxTag1 event_message = 75;
+  optional HsCtxTag6 newsletter_admin_invite_message = 78;
+  optional HsCtxTag11 sticker_pack_message = 86;
+}
