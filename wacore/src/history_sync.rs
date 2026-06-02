@@ -306,12 +306,21 @@ fn checked_end(
 /// Read a protobuf varint from `data`, returning (value, bytes_consumed).
 #[inline]
 fn read_varint(data: &[u8]) -> Result<(u64, usize), HistorySyncError> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-    for (i, &byte) in data.iter().enumerate() {
+    // Single-byte fast-path: most history-sync varints (tags, small lengths) fit in one byte.
+    let Some(&first) = data.first() else {
+        return Err(HistorySyncError::MalformedProtobuf(
+            "unexpected end of data in varint".into(),
+        ));
+    };
+    if first < 0x80 {
+        return Ok((first as u64, 1));
+    }
+    let mut value = (first & 0x7F) as u64;
+    let mut shift = 7u32;
+    for (i, &byte) in data[1..].iter().enumerate() {
         value |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
-            return Ok((value, i + 1));
+            return Ok((value, i + 2));
         }
         shift += 7;
         if shift >= 64 {
