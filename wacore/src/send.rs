@@ -502,6 +502,73 @@ where
 
 /// Encrypt padded plaintext for each device JID, producing participant `<to>` nodes.
 ///
+/// Encrypt the plaintext for one device's Signal session. Shared by the
+/// single-device fast path and the parallel fan-out so both behave identically.
+async fn encrypt_one_device(
+    plaintext: &[u8],
+    addr: &ProtocolAddress,
+    session_store: &mut dyn crate::libsignal::protocol::SessionStore,
+    identity_store: &mut dyn crate::libsignal::protocol::IdentityKeyStore,
+    device_jid: Jid,
+    mediatype: Option<&str>,
+    hide_decrypt_fail: bool,
+) -> (Jid, Result<Option<EncryptOneResult>, String>) {
+    match message_encrypt(plaintext, addr, session_store, identity_store).await {
+        Ok(encrypted_payload) => {
+            let Some((enc_type, is_prekey, serialized_bytes)) =
+                extract_ciphertext(encrypted_payload)
+            else {
+                return (device_jid, Ok(None));
+            };
+            (
+                device_jid,
+                Ok(Some(EncryptOneResult {
+                    enc_type,
+                    is_prekey,
+                    ciphertext: serialized_bytes.to_vec(),
+                    mediatype: mediatype.map(|s| s.to_string()),
+                    hide_decrypt_fail,
+                })),
+            )
+        }
+        Err(e) => (device_jid, Err(format!("{addr}: {e}"))),
+    }
+}
+
+/// Append one encrypt result to the fan-out output: a `<to>` participant node on
+/// success, a logged skip on failure.
+fn push_encrypt_result(
+    (device_jid, res): (Jid, Result<Option<EncryptOneResult>, String>),
+    participant_nodes: &mut Vec<Node>,
+    encrypted_devices: &mut Vec<Jid>,
+    includes_prekey_message: &mut bool,
+) {
+    match res {
+        Ok(Some(one)) => {
+            *includes_prekey_message |= one.is_prekey;
+            let mut enc_builder = NodeBuilder::new("enc")
+                .attr("v", stanza::ENC_VERSION)
+                .attr("type", one.enc_type);
+            if let Some(mt) = one.mediatype.as_deref() {
+                enc_builder = enc_builder.attr("mediatype", mt);
+            }
+            if one.hide_decrypt_fail {
+                enc_builder = enc_builder.attr("decrypt-fail", "hide");
+            }
+            let enc_node = enc_builder.bytes(one.ciphertext).build();
+            participant_nodes.push(
+                NodeBuilder::new("to")
+                    .attr("jid", device_jid.clone())
+                    .children([enc_node])
+                    .build(),
+            );
+            encrypted_devices.push(device_jid);
+        }
+        Ok(None) => {}
+        Err(msg) => log::warn!("Failed to encrypt for device: {msg}. Skipping."),
+    }
+}
+
 /// Per-device Signal sessions are independent (different ratchet state per
 /// recipient), so this fans the encrypt loop out across tokio tasks bounded
 /// by [`ENCRYPT_FANOUT_CONCURRENCY`]. Each task clones the store handles
@@ -703,105 +770,95 @@ where
     let mut includes_prekey_message = false;
     let mut encrypted_devices = Vec::with_capacity(devices.len());
 
-    // Parallel encrypt fan-out. The wire-order of `<to>` participants does
-    // not need to match the input device order: WA Web's `phash` (computed
-    // both client and server side) sorts before hashing, and our
-    // `participant_list_hash` does the same. Collecting in completion order
-    // lets the fastest encrypts ship first.
-    let plaintext_arc: std::sync::Arc<[u8]> = std::sync::Arc::from(plaintext_to_encrypt);
-    let mediatype_owned: Option<String> = mediatype.map(|s| s.to_string());
-
-    let total = devices.len();
-    let mut next_spawn = 0usize;
-
-    let make_encrypt_task = |idx: usize| {
-        let device_jid = devices[idx].clone();
-        // The encryption JID is only needed to build the Signal address, so
-        // derive it here from a borrow rather than cloning the whole Jid into
-        // the task (device_jid is still cloned because it's returned).
-        let addr = encryption_overrides[idx]
+    // The wire-order of `<to>` participants does not need to match the input
+    // device order: WA Web's `phash` (computed both client and server side)
+    // sorts before hashing, as does our `participant_list_hash`.
+    if devices.len() == 1 {
+        // Single recipient device: the parallel fan-out is pure overhead here
+        // (an Arc<[u8]> copy of the plaintext, a spawned task + oneshot channel,
+        // a FuturesUnordered, and two store clones), with no parallelism to gain.
+        // Encrypt inline.
+        let device_jid = devices[0].clone();
+        let addr = encryption_overrides[0]
             .as_ref()
-            .unwrap_or(&devices[idx])
+            .unwrap_or(&devices[0])
             .to_protocol_address();
-        let plaintext = plaintext_arc.clone();
-        let mediatype = mediatype_owned.clone();
-        let mut session_store = stores.session_store.clone();
-        let mut identity_store = stores.identity_store.clone();
+        let res = encrypt_one_device(
+            plaintext_to_encrypt,
+            &addr,
+            &mut *stores.session_store,
+            &mut *stores.identity_store,
+            device_jid,
+            mediatype,
+            hide_decrypt_fail,
+        )
+        .await;
+        push_encrypt_result(
+            res,
+            &mut participant_nodes,
+            &mut encrypted_devices,
+            &mut includes_prekey_message,
+        );
+    } else {
+        // Parallel encrypt fan-out across tokio tasks bounded by
+        // ENCRYPT_FANOUT_CONCURRENCY; collected in completion order so the
+        // fastest encrypts ship first.
+        let plaintext_arc: std::sync::Arc<[u8]> = std::sync::Arc::from(plaintext_to_encrypt);
+        let mediatype_owned: Option<String> = mediatype.map(|s| s.to_string());
 
-        spawn_oneshot(runtime, async move {
-            match message_encrypt(&plaintext, &addr, &mut session_store, &mut identity_store).await
-            {
-                Ok(encrypted_payload) => {
-                    let Some((enc_type, is_prekey, serialized_bytes)) =
-                        extract_ciphertext(encrypted_payload)
-                    else {
-                        return (device_jid, Ok(None));
-                    };
-                    (
-                        device_jid,
-                        Ok(Some(EncryptOneResult {
-                            enc_type,
-                            is_prekey,
-                            ciphertext: serialized_bytes.to_vec(),
-                            mediatype,
-                            hide_decrypt_fail,
-                        })),
-                    )
-                }
-                Err(e) => {
-                    let addr_str = addr.to_string();
-                    (device_jid, Err(format!("{addr_str}: {e}")))
-                }
-            }
-        })
-    };
+        let total = devices.len();
+        let mut next_spawn = 0usize;
 
-    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-    while next_spawn < total && in_flight.len() < ENCRYPT_FANOUT_CONCURRENCY {
-        in_flight.push(make_encrypt_task(next_spawn));
-        next_spawn += 1;
-    }
-    while let Some(spawn_result) = in_flight.next().await {
-        match spawn_result {
-            Ok((device_jid, Ok(Some(one)))) => {
-                includes_prekey_message |= one.is_prekey;
+        let make_encrypt_task = |idx: usize| {
+            let device_jid = devices[idx].clone();
+            // The encryption JID is only needed to build the Signal address, so
+            // derive it here from a borrow rather than cloning the whole Jid into
+            // the task (device_jid is still cloned because it's returned).
+            let addr = encryption_overrides[idx]
+                .as_ref()
+                .unwrap_or(&devices[idx])
+                .to_protocol_address();
+            let plaintext = plaintext_arc.clone();
+            let mediatype = mediatype_owned.clone();
+            let mut session_store = stores.session_store.clone();
+            let mut identity_store = stores.identity_store.clone();
 
-                let mut enc_builder = NodeBuilder::new("enc")
-                    .attr("v", stanza::ENC_VERSION)
-                    .attr("type", one.enc_type);
-                if let Some(mt) = one.mediatype.as_deref() {
-                    enc_builder = enc_builder.attr("mediatype", mt);
-                }
-                if one.hide_decrypt_fail {
-                    enc_builder = enc_builder.attr("decrypt-fail", "hide");
-                }
-                let enc_node = enc_builder.bytes(one.ciphertext).build();
+            spawn_oneshot(runtime, async move {
+                encrypt_one_device(
+                    &plaintext,
+                    &addr,
+                    &mut session_store,
+                    &mut identity_store,
+                    device_jid,
+                    mediatype.as_deref(),
+                    hide_decrypt_fail,
+                )
+                .await
+            })
+        };
 
-                participant_nodes.push(
-                    NodeBuilder::new("to")
-                        .attr("jid", device_jid.clone())
-                        .children([enc_node])
-                        .build(),
-                );
-                encrypted_devices.push(device_jid);
-            }
-            Ok((_, Ok(None))) => {
-                // extract_ciphertext returned None; skip silently as the
-                // serial path did.
-            }
-            Ok((_, Err(msg))) => {
-                log::warn!("Failed to encrypt for device: {msg}. Skipping.");
-            }
-            Err(SpawnCanceled) => {
-                // Spawned task panicked or runtime tore it down. Same
-                // log+skip semantics as a regular encrypt failure.
-                log::warn!("Encrypt task did not deliver a result; skipping device.");
-            }
-        }
-
-        if next_spawn < total {
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        while next_spawn < total && in_flight.len() < ENCRYPT_FANOUT_CONCURRENCY {
             in_flight.push(make_encrypt_task(next_spawn));
             next_spawn += 1;
+        }
+        while let Some(spawn_result) = in_flight.next().await {
+            match spawn_result {
+                Ok(res) => push_encrypt_result(
+                    res,
+                    &mut participant_nodes,
+                    &mut encrypted_devices,
+                    &mut includes_prekey_message,
+                ),
+                Err(SpawnCanceled) => {
+                    log::warn!("Encrypt task did not deliver a result; skipping device.");
+                }
+            }
+
+            if next_spawn < total {
+                in_flight.push(make_encrypt_task(next_spawn));
+                next_spawn += 1;
+            }
         }
     }
 
@@ -2342,8 +2399,11 @@ mod tests {
             unimplemented!("resolve_group_info not needed for send.rs tests")
         }
 
-        async fn get_lid_for_phone(&self, phone_user: &str) -> Option<String> {
-            self.phone_to_lid.get(phone_user).cloned()
+        async fn get_lid_for_phone(
+            &self,
+            phone_user: &str,
+        ) -> Option<wacore_binary::CompactString> {
+            self.phone_to_lid.get(phone_user).map(|s| s.as_str().into())
         }
     }
 

@@ -1962,7 +1962,7 @@ impl Client {
         }
 
         if let Some(lid_user) = self.lid_pn_cache.get_current_lid(&jid.user).await {
-            Jid::new(&lid_user, Server::Lid)
+            Jid::new(lid_user, Server::Lid)
         } else {
             jid.to_non_ad()
         }

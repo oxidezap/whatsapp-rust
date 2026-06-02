@@ -91,7 +91,7 @@ pub enum UsyncContext {
 pub struct IsOnWhatsAppUser {
     pub jid: Jid,
     /// Helps server optimize the lookup (WA Web pre-populates this from its LID cache).
-    pub known_lid: Option<String>,
+    pub known_lid: Option<wacore_binary::CompactString>,
 }
 
 fn build_user_nodes(users: &[IsOnWhatsAppUser]) -> Vec<Node> {
@@ -106,7 +106,11 @@ fn build_user_nodes(users: &[IsOnWhatsAppUser]) -> Vec<Node> {
                 };
                 let mut children = vec![NodeBuilder::new("contact").string_content(phone).build()];
                 if let Some(lid) = &user.known_lid {
-                    children.push(NodeBuilder::new("lid").attr("jid", Jid::lid(lid)).build());
+                    children.push(
+                        NodeBuilder::new("lid")
+                            .attr("jid", Jid::lid(lid.as_str()))
+                            .build(),
+                    );
                 }
                 NodeBuilder::new("user").children(children).build()
             } else {
@@ -855,7 +859,7 @@ mod tests {
         let spec = IsOnWhatsAppSpec::new(
             vec![IsOnWhatsAppUser {
                 jid: Jid::pn("1234567890"),
-                known_lid: Some("100000001".to_string()),
+                known_lid: Some("100000001".into()),
             }],
             "sid",
             IsOnWhatsAppQueryType::Pn,

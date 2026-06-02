@@ -160,7 +160,7 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
     /// when sending to a phone number address.
     ///
     /// Returns None if no LID mapping is known for this phone number.
-    async fn get_lid_for_phone(&self, phone_user: &str) -> Option<String> {
+    async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {
         // Default implementation returns None - subclasses can override
         let _ = phone_user;
         None

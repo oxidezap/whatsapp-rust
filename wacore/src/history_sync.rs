@@ -66,15 +66,15 @@ pub fn process_history_sync(
 
     let buf = Bytes::from(decompressed);
     let mut pos = 0;
-    // Pre-size the secret-record accumulator from a single allocation-free count
-    // pass, so it never grows by repeated doubling as conversations stream in.
-    let estimated_records = count_history_sync_messages(&buf);
     let mut result = HistorySyncResult {
         own_pushname: None,
         nct_salt: None,
         conversations_processed: 0,
         tc_token_candidates: Vec::new(),
-        msg_secret_records: Vec::with_capacity(estimated_records),
+        // Grown on demand: a full pre-count pass scanned the whole blob just to
+        // size a Vec that only holds the secret-record subset (it over-allocated
+        // and cost ~2.5% of the decode); plain growth is cheaper here.
+        msg_secret_records: Vec::new(),
         // Always retained on this path: the `!retain_blob` case returned above
         // and ran the streaming variant, so control only reaches here when the
         // caller wants the blob.
@@ -355,63 +355,6 @@ fn skip_field(wire_type: u32, buf: &[u8], pos: usize) -> Result<usize, HistorySy
             )))
         }
     }
-}
-
-/// Best-effort count of total `HistorySyncMsg` entries (field 2 inside each
-/// field-2 conversation) in a decompressed HistorySync blob. Allocation-free;
-/// used to pre-size the message-secret accumulator in one shot instead of letting
-/// it grow by repeated doubling. An under-count (e.g. on a malformed tail) only
-/// costs a few late re-grows, never correctness — the decode loop re-validates.
-fn count_history_sync_messages(buf: &[u8]) -> usize {
-    let mut pos = 0;
-    let mut total = 0;
-    while pos < buf.len() {
-        let Ok((tag, br)) = read_varint(&buf[pos..]) else {
-            break;
-        };
-        pos += br;
-        let field = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-        if field == 2 && wt == wire_type::LENGTH_DELIMITED {
-            let Ok((len, vl)) = read_varint(&buf[pos..]) else {
-                break;
-            };
-            pos += vl;
-            let Ok(end) = checked_end(pos, len, buf.len(), "conv-count") else {
-                break;
-            };
-            total += count_conversation_messages(&buf[pos..end]);
-            pos = end;
-        } else {
-            match skip_field(wt, buf, pos) {
-                Ok(np) => pos = np,
-                Err(_) => break,
-            }
-        }
-    }
-    total
-}
-
-/// Count field-2 (message) entries within a single conversation's bytes.
-fn count_conversation_messages(buf: &[u8]) -> usize {
-    let mut pos = 0;
-    let mut n = 0;
-    while pos < buf.len() {
-        let Ok((tag, br)) = read_varint(&buf[pos..]) else {
-            break;
-        };
-        pos += br;
-        let field = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-        if field == 2 && wt == wire_type::LENGTH_DELIMITED {
-            n += 1;
-        }
-        match skip_field(wt, buf, pos) {
-            Ok(np) => pos = np,
-            Err(_) => break,
-        }
-    }
-    n
 }
 
 /// Manual pushname parser — Pushname proto has fields: id (tag 1) and pushname (tag 2).

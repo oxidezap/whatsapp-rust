@@ -653,8 +653,8 @@ async fn handle_privacy_token_notification(client: &Arc<Client>, node: &NodeRef<
         .filter(|j| !j.user.is_empty());
 
     // Resolve to a LID key. We borrow from Jid.user (CompactString) or from
-    // get_current_lid (String), then pass as &str to the storage layer.
-    let resolved_lid: Option<String>;
+    // get_current_lid (CompactString), then pass as &str to the storage layer.
+    let resolved_lid: Option<wacore_binary::CompactString>;
     let sender_lid: &str = if let Some(ref lid_jid) = sender_lid_jid {
         &lid_jid.user
     } else {
