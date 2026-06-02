@@ -4220,14 +4220,21 @@ mod tests {
         }
 
         #[test]
-        fn request_payment_is_media_default() {
-            // Not in WA Web's stanza classifier (only the internal MSG_TYPE.PAYMENT
-            // enum, which is not the wire `type`) and not a wrapper -> media default.
+        fn request_payment_carries_no_mediatype_and_is_not_text() {
+            // request_payment_message is absent from WA Web's typeAttributeFromProtobuf
+            // (it only maps to the internal MSG_TYPE.PAYMENT enum, not the wire `type`)
+            // and carries no mediatype. WA Web's classifier defaults it to "media", but
+            // a media stanza without a `mediatype` attribute is dropped by the server,
+            // so WA Web does not send request_payment_message standalone through this
+            // path. Pin the two stable facts — no mediatype, and not misclassified as
+            // text (the bug this PR removes) — rather than hardening that droppable
+            // "media" wire shape as if it were a valid send.
             let m = wa::Message {
                 request_payment_message: Some(Box::default()),
                 ..Default::default()
             };
-            assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_MEDIA);
+            assert_eq!(media_type_from_message(&m), None);
+            assert_ne!(stanza_type_from_message(&m), stanza::MSG_TYPE_TEXT);
         }
 
         #[test]
