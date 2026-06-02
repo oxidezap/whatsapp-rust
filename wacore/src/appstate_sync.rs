@@ -381,18 +381,12 @@ impl AppStateProcessor {
                 }
             }
 
-            // Batch fetch previous value MACs from database
-            let mut db_prev: HashMap<Vec<u8>, Vec<u8>> =
-                HashMap::with_capacity(need_db_lookup.len());
-            for index_mac in need_db_lookup {
-                if let Some(mac) = self
-                    .backend
-                    .get_mutation_mac(collection_name, &index_mac)
-                    .await?
-                {
-                    db_prev.insert(index_mac, mac);
-                }
-            }
+            // Fetch previous value MACs in one backend round-trip instead of a
+            // spawn_blocking + query per mutation (N+1).
+            let db_prev: HashMap<Vec<u8>, Vec<u8>> = self
+                .backend
+                .get_mutation_macs(collection_name, &need_db_lookup)
+                .await?;
 
             // Clone data for blocking task
             let patch_clone = patch.clone();

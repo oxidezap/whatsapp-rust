@@ -1209,6 +1209,48 @@ impl SqliteStore {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))?
     }
+
+    /// Batched read of previous-MAC values for many index_macs in one query
+    /// (single spawn_blocking + `index_mac IN (...)`), replacing the per-mutation
+    /// N+1 in appstate sync.
+    pub async fn get_app_state_mutation_macs_batch_for_device(
+        &self,
+        name: &str,
+        index_macs: &[Vec<u8>],
+        device_id: i32,
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+        if index_macs.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let pool = self.pool.clone();
+        let name = name.to_string();
+        let index_macs: Vec<Vec<u8>> = index_macs.to_vec();
+        tokio::task::spawn_blocking(
+            move || -> Result<std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+                let mut conn = pool
+                    .get()
+                    .map_err(|e| StoreError::Connection(Box::new(e)))?;
+                let mut out = std::collections::HashMap::with_capacity(index_macs.len());
+                const CHUNK_SIZE: usize = 500;
+                for chunk in index_macs.chunks(CHUNK_SIZE) {
+                    let rows: Vec<(Vec<u8>, Vec<u8>)> = app_state_mutation_macs::table
+                        .select((
+                            app_state_mutation_macs::index_mac,
+                            app_state_mutation_macs::value_mac,
+                        ))
+                        .filter(app_state_mutation_macs::name.eq(&name))
+                        .filter(app_state_mutation_macs::index_mac.eq_any(chunk))
+                        .filter(app_state_mutation_macs::device_id.eq(device_id))
+                        .load(&mut conn)
+                        .map_err(|e| StoreError::Database(Box::new(e)))?;
+                    out.extend(rows);
+                }
+                Ok(out)
+            },
+        )
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -1775,6 +1817,15 @@ impl AppSyncStore for SqliteStore {
 
     async fn get_mutation_mac(&self, name: &str, index_mac: &[u8]) -> Result<Option<Vec<u8>>> {
         self.get_app_state_mutation_mac_for_device(name, index_mac, self.device_id)
+            .await
+    }
+
+    async fn get_mutation_macs(
+        &self,
+        name: &str,
+        index_macs: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+        self.get_app_state_mutation_macs_batch_for_device(name, index_macs, self.device_id)
             .await
     }
 
@@ -2864,6 +2915,56 @@ mod tests {
         SqliteStore::new(&db_name)
             .await
             .expect("Failed to create test store")
+    }
+
+    #[tokio::test]
+    async fn batch_mutation_macs_matches_per_item() {
+        let store = create_test_store().await;
+        let name = "regular";
+        let device_id = 1;
+
+        let macs: Vec<AppStateMutationMAC> = (0..25u8)
+            .map(|i| {
+                let mut index_mac = vec![0u8; 32];
+                index_mac[0] = i;
+                AppStateMutationMAC {
+                    index_mac,
+                    value_mac: vec![i; 32],
+                }
+            })
+            .collect();
+        store
+            .put_app_state_mutation_macs_for_device(name, 1, &macs, device_id)
+            .await
+            .unwrap();
+
+        let mut index_macs: Vec<Vec<u8>> = macs.iter().map(|m| m.index_mac.clone()).collect();
+        // an index that was never stored must be absent from the batch result
+        index_macs.push(vec![0xFF; 32]);
+
+        let batch = store
+            .get_app_state_mutation_macs_batch_for_device(name, &index_macs, device_id)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.len(), macs.len());
+        assert!(!batch.contains_key(&vec![0xFF; 32]));
+        for m in &macs {
+            // parity with the per-item path it replaces
+            let per_item = store
+                .get_app_state_mutation_mac_for_device(name, &m.index_mac, device_id)
+                .await
+                .unwrap();
+            assert_eq!(per_item.as_ref(), batch.get(&m.index_mac));
+            assert_eq!(batch.get(&m.index_mac), Some(&m.value_mac));
+        }
+
+        // empty input short-circuits to an empty map
+        let empty = store
+            .get_app_state_mutation_macs_batch_for_device(name, &[], device_id)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]
