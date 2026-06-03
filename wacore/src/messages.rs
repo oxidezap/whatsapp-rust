@@ -97,6 +97,22 @@ pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<
         .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
 }
 
+/// Wrap a message into a DeviceSentMessage for own-device sync, hoisting
+/// `message_context_info` onto the outer message (matching WA Web). Inverse of
+/// [`unwrap_device_sent`].
+pub fn wrap_device_sent(mut message: wa::Message, destination_jid: String) -> wa::Message {
+    let context = message.message_context_info.take();
+    wa::Message {
+        message_context_info: context,
+        device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+            destination_jid: Some(destination_jid),
+            message: Some(Box::new(message)),
+            phash: None,
+        })),
+        ..Default::default()
+    }
+}
+
 /// Unwrap a DeviceSentMessage wrapper, returning the inner message.
 ///
 /// When a message is sent from our own device, the actual content is nested
@@ -738,6 +754,72 @@ mod parse_message_info_tests {
         assert!(
             info.bcl_participants.is_empty(),
             "group fanout participants are not a bcl"
+        );
+    }
+}
+
+#[cfg(test)]
+mod device_sent_tests {
+    use super::*;
+
+    fn msg_with_secret(secret: &[u8]) -> wa::Message {
+        wa::Message {
+            conversation: Some("hi".into()),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(secret.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wrap_hoists_context_to_outer_on_wire() {
+        let secret = [7u8; 32];
+        let wrapped = wrap_device_sent(msg_with_secret(&secret), "1@s.whatsapp.net".into());
+
+        let bytes = wrapped.encode_to_vec();
+        let decoded = wa::Message::decode(bytes.as_slice()).unwrap();
+
+        assert_eq!(
+            decoded
+                .message_context_info
+                .and_then(|c| c.message_secret)
+                .as_deref(),
+            Some(secret.as_slice())
+        );
+        let inner = decoded.device_sent_message.unwrap().message.unwrap();
+        assert!(inner.message_context_info.is_none());
+        assert_eq!(inner.conversation.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn wrap_without_context_leaves_outer_empty() {
+        let inner = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        let wrapped = wrap_device_sent(inner, "1@s.whatsapp.net".into());
+
+        assert!(wrapped.message_context_info.is_none());
+        let dsm = wrapped.device_sent_message.unwrap();
+        assert_eq!(dsm.destination_jid.as_deref(), Some("1@s.whatsapp.net"));
+        assert!(dsm.message.unwrap().message_context_info.is_none());
+    }
+
+    #[test]
+    fn wrap_then_unwrap_round_trips_secret() {
+        let secret = [9u8; 32];
+        let wrapped = wrap_device_sent(msg_with_secret(&secret), "1@s.whatsapp.net".into());
+        let unwrapped = unwrap_device_sent(wrapped);
+
+        assert_eq!(unwrapped.conversation.as_deref(), Some("hi"));
+        assert_eq!(
+            unwrapped
+                .message_context_info
+                .and_then(|c| c.message_secret)
+                .as_deref(),
+            Some(secret.as_slice())
         );
     }
 }

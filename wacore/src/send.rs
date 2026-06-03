@@ -23,7 +23,6 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, JidExt as _};
 use wacore_libsignal::crypto::aes_256_cbc_encrypt_into;
 use waproto::whatsapp as wa;
-use waproto::whatsapp::message::DeviceSentMessage;
 
 /// Wire-format constants (MsgCreateDeviceStanza.js).
 pub(crate) mod stanza {
@@ -1004,14 +1003,7 @@ pub async fn prepare_dm_stanza<
         MessageUtils::participant_list_hash(&sent).ok()
     };
 
-    let dsm = wa::Message {
-        device_sent_message: Some(Box::new(DeviceSentMessage {
-            destination_jid: Some(to_jid.to_string()),
-            message: Some(Box::new(message_for_encryption)),
-            phash: None, // WA Web only sets DSM phash for groups
-        })),
-        ..Default::default()
-    };
+    let dsm = crate::messages::wrap_device_sent(message_for_encryption, to_jid.to_string());
 
     let own_devices_plaintext = MessageUtils::encode_and_pad(&dsm);
 
