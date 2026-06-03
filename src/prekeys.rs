@@ -19,9 +19,27 @@ use wacore_binary::Jid;
 
 pub use wacore::prekeys::PreKeyUtils;
 
-/// Matches WA Web's UPLOAD_KEYS_COUNT from WAWebSignalStoreApi.
-const WANTED_PRE_KEY_COUNT: usize = 812;
+/// Default number of one-time pre-keys generated and uploaded per batch.
+/// Mirrors WA Web's UPLOAD_KEYS_COUNT (`WAWebUploadPreKeysJob`).
+pub(crate) const DEFAULT_WANTED_PRE_KEY_COUNT: usize = 812;
+
 const MIN_PRE_KEY_COUNT: usize = 5;
+
+/// WA Web uses 24-bit PreKey IDs (max 2^24 - 1); IDs wrap modulo this.
+const MAX_PREKEY_ID: u32 = 16_777_215;
+
+/// The upload IQ encodes the pre-key `<list>` length as a u16
+/// (`Encoder::write_list_start`), so a larger batch fails to encode after the
+/// keys were already generated and stored. Well below MAX_PREKEY_ID, so a single
+/// batch never reuses an ID either.
+const MAX_PRE_KEY_UPLOAD_BATCH: usize = u16::MAX as usize;
+
+/// Below MIN_PRE_KEY_COUNT the pool ends up flagged-but-empty or loops on
+/// re-upload (the count guard never clears); above MAX_PRE_KEY_UPLOAD_BATCH the
+/// upload IQ fails to encode. Only an explicitly misconfigured count hits either.
+fn clamp_wanted_pre_key_count(n: usize) -> usize {
+    n.clamp(MIN_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH)
+}
 
 impl Client {
     pub(crate) async fn fetch_pre_keys(
@@ -97,9 +115,9 @@ impl Client {
         self.upload_pre_keys_inner().await
     }
 
-    /// Generate and upload WANTED_PRE_KEY_COUNT pre-keys. Shared by
-    /// `upload_pre_keys` and `upload_pre_keys_at_login` to avoid
-    /// redundant server count queries.
+    /// Generate and upload the configured number of pre-keys (see
+    /// [`Client::set_wanted_pre_key_count`]). Shared by `upload_pre_keys` and
+    /// `upload_pre_keys_at_login` to avoid redundant server count queries.
     async fn upload_pre_keys_inner(&self) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
         let device_store = self.persistence_manager.get_device_arc().await;
@@ -123,35 +141,40 @@ impl Client {
             max_id + 1
         };
 
-        // WA Web uses 24-bit PreKey IDs (max 2^24 - 1 = 16777215).
         // Wrap into valid range so lingering high-ID rows don't pin start_id
-        // above the boundary and cause repeated overwrites of low IDs.
-        const MAX_PREKEY_ID: u32 = 16777215;
+        // above the 24-bit boundary and cause repeated overwrites of low IDs.
         let start_id = ((raw_start as u64 - 1) % MAX_PREKEY_ID as u64) as u32 + 1;
 
-        let mut keys_to_upload = Vec::with_capacity(WANTED_PRE_KEY_COUNT);
-        let mut key_pairs_to_upload = Vec::with_capacity(WANTED_PRE_KEY_COUNT);
-
-        for i in 0..WANTED_PRE_KEY_COUNT {
-            let pre_key_id =
-                (((start_id as u64 - 1) + i as u64) % (MAX_PREKEY_ID as u64)) as u32 + 1;
-
-            let key_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
-            let pre_key_record = new_pre_key_record(pre_key_id, &key_pair);
-
-            keys_to_upload.push((pre_key_id, pre_key_record));
-            key_pairs_to_upload.push((pre_key_id, key_pair));
+        let configured = self.wanted_pre_key_count.load(Ordering::Relaxed);
+        let wanted = clamp_wanted_pre_key_count(configured);
+        if wanted != configured {
+            log::warn!("wanted_pre_key_count {configured} out of range, clamped to {wanted}");
         }
 
-        // Encode all prekey records into a single contiguous buffer, then slice
-        // into Bytes sub-views. This replaces 812 individual encode_to_vec() allocs
-        // with one large allocation + zero-copy slicing.
-        let encoded_batch: Vec<(u32, bytes::Bytes)> = {
+        // Per-key X25519 generation and prost encoding are CPU-bound, and the
+        // batch size is caller-configurable, so offload the whole batch to keep
+        // the async executor responsive. Records are encoded into one contiguous
+        // buffer with zero-copy Bytes slices instead of an alloc per record.
+        let (encoded_batch, pre_key_pairs) = wacore::runtime::blocking(&*self.runtime, move || {
             use prost::Message;
-            let total_len: usize = keys_to_upload.iter().map(|(_, r)| r.encoded_len()).sum();
+
+            // Seed one CSPRNG and advance it per key, rather than reseeding from
+            // entropy on every iteration.
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut records = Vec::with_capacity(wanted);
+            let mut pre_key_pairs: Vec<(u32, PublicKey)> = Vec::with_capacity(wanted);
+            for i in 0..wanted {
+                let pre_key_id =
+                    (((start_id as u64 - 1) + i as u64) % (MAX_PREKEY_ID as u64)) as u32 + 1;
+                let key_pair = KeyPair::generate(&mut rng);
+                records.push((pre_key_id, new_pre_key_record(pre_key_id, &key_pair)));
+                pre_key_pairs.push((pre_key_id, key_pair.public_key));
+            }
+
+            let total_len: usize = records.iter().map(|(_, r)| r.encoded_len()).sum();
             let mut buf = Vec::with_capacity(total_len);
-            let mut offsets = Vec::with_capacity(keys_to_upload.len());
-            for (id, record) in &keys_to_upload {
+            let mut offsets = Vec::with_capacity(records.len());
+            for (id, record) in &records {
                 let start = buf.len();
                 record
                     .encode(&mut buf)
@@ -159,11 +182,14 @@ impl Client {
                 offsets.push((*id, start..buf.len()));
             }
             let shared = bytes::Bytes::from(buf);
-            offsets
+            let encoded_batch: Vec<(u32, bytes::Bytes)> = offsets
                 .into_iter()
                 .map(|(id, range)| (id, shared.slice(range)))
-                .collect()
-        };
+                .collect();
+
+            (encoded_batch, pre_key_pairs)
+        })
+        .await;
 
         // Persist the freshly generated prekeys before uploading them so they are
         // already available for local decryption if the server starts sending
@@ -171,11 +197,6 @@ impl Client {
         // Propagate errors — uploading a key we can't store locally would cause
         // decryption failures when the server hands it out.
         backend.store_prekeys_batch(&encoded_batch, false).await?;
-
-        let pre_key_pairs: Vec<(u32, PublicKey)> = key_pairs_to_upload
-            .iter()
-            .map(|(id, key_pair)| (*id, key_pair.public_key))
-            .collect();
 
         let spec = PreKeyUploadSpec::new(
             device_snapshot.registration_id,
@@ -197,9 +218,7 @@ impl Client {
         // high-ID prekeys still exist, the upsert (.on_conflict.do_update)
         // silently overwrites them. Acceptable: the server consumes keys well
         // before a full 16M cycle completes.
-        let next_id = (((start_id as u64 - 1) + key_pairs_to_upload.len() as u64)
-            % (MAX_PREKEY_ID as u64)) as u32
-            + 1;
+        let next_id = (((start_id as u64 - 1) + wanted as u64) % (MAX_PREKEY_ID as u64)) as u32 + 1;
         self.persistence_manager
             .process_command(DeviceCommand::SetNextPreKeyId(next_id))
             .await;
@@ -211,7 +230,7 @@ impl Client {
 
         log::debug!(
             "Successfully uploaded {} new pre-keys with sequential IDs starting from {}.",
-            key_pairs_to_upload.len(),
+            wanted,
             start_id
         );
 
@@ -406,5 +425,43 @@ impl Client {
 
         log::debug!("digestKey: key bundle validation successful");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_WANTED_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH, MIN_PRE_KEY_COUNT,
+        clamp_wanted_pre_key_count,
+    };
+
+    #[test]
+    fn default_matches_wa_web_upload_keys_count() {
+        // WAWebUploadPreKeysJob's UPLOAD_KEYS_COUNT; drift here diverges from WA Web.
+        assert_eq!(DEFAULT_WANTED_PRE_KEY_COUNT, 812);
+    }
+
+    #[test]
+    fn clamp_wanted_pre_key_count_bounds() {
+        assert_eq!(clamp_wanted_pre_key_count(0), MIN_PRE_KEY_COUNT);
+        assert_eq!(clamp_wanted_pre_key_count(2), MIN_PRE_KEY_COUNT);
+        assert_eq!(clamp_wanted_pre_key_count(4), MIN_PRE_KEY_COUNT);
+        assert_eq!(
+            clamp_wanted_pre_key_count(MIN_PRE_KEY_COUNT),
+            MIN_PRE_KEY_COUNT
+        );
+        assert_eq!(clamp_wanted_pre_key_count(812), 812);
+        assert_eq!(
+            clamp_wanted_pre_key_count(MAX_PRE_KEY_UPLOAD_BATCH),
+            MAX_PRE_KEY_UPLOAD_BATCH
+        );
+        assert_eq!(
+            clamp_wanted_pre_key_count(MAX_PRE_KEY_UPLOAD_BATCH + 1),
+            MAX_PRE_KEY_UPLOAD_BATCH
+        );
+        assert_eq!(
+            clamp_wanted_pre_key_count(usize::MAX),
+            MAX_PRE_KEY_UPLOAD_BATCH
+        );
     }
 }

@@ -297,6 +297,7 @@ pub struct BotBuilder<B = Missing, T = Missing, H = Missing, R = Missing> {
     skip_history_sync: bool,
     initial_push_name: Option<String>,
     cache_config: CacheConfig,
+    wanted_pre_key_count: Option<usize>,
     _marker: PhantomData<(B, T, H, R)>,
 }
 
@@ -315,6 +316,7 @@ impl BotBuilder<Missing, Missing, Missing, Missing> {
             skip_history_sync: false,
             initial_push_name: None,
             cache_config: CacheConfig::default(),
+            wanted_pre_key_count: None,
             _marker: PhantomData,
         }
     }
@@ -351,6 +353,7 @@ impl<T, H, R> BotBuilder<Missing, T, H, R> {
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
+            wanted_pre_key_count: self.wanted_pre_key_count,
             _marker: PhantomData,
         }
     }
@@ -390,6 +393,7 @@ impl<B, H, R> BotBuilder<B, Missing, H, R> {
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
+            wanted_pre_key_count: self.wanted_pre_key_count,
             _marker: PhantomData,
         }
     }
@@ -428,6 +432,7 @@ impl<B, T, R> BotBuilder<B, T, Missing, R> {
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
+            wanted_pre_key_count: self.wanted_pre_key_count,
             _marker: PhantomData,
         }
     }
@@ -451,6 +456,7 @@ impl<B, T, H> BotBuilder<B, T, H, Missing> {
             skip_history_sync: self.skip_history_sync,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
+            wanted_pre_key_count: self.wanted_pre_key_count,
             _marker: PhantomData,
         }
     }
@@ -620,6 +626,27 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Set how many one-time pre-keys are generated and uploaded per batch.
+    ///
+    /// Defaults to WA Web's UPLOAD_KEYS_COUNT (812). The value is clamped to the
+    /// protocol-safe range at upload time. Useful for memory-constrained or
+    /// embedded consumers that want a smaller batch.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let bot = Bot::builder()
+    ///     .with_backend(backend)
+    ///     .with_transport_factory(transport)
+    ///     .with_http_client(http_client)
+    ///     .with_wanted_pre_key_count(200)
+    ///     .build()
+    ///     .await?;
+    /// ```
+    pub fn with_wanted_pre_key_count(mut self, count: usize) -> Self {
+        self.wanted_pre_key_count = Some(count);
+        self
+    }
+
     /// Set an initial push name on the device before connecting.
     ///
     /// This is included in the `ClientPayload` during registration, allowing the
@@ -728,6 +755,10 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
 
         if self.skip_history_sync {
             client.set_skip_history_sync(true);
+        }
+
+        if let Some(count) = self.wanted_pre_key_count {
+            client.set_wanted_pre_key_count(count);
         }
 
         Ok(Bot {
@@ -1113,6 +1144,46 @@ mod tests {
             .expect("Failed to build bot");
 
         assert!(!bot.client().skip_history_sync_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_bot_builder_wanted_pre_key_count() {
+        let backend = create_test_sqlite_backend().await;
+        let transport = TokioWebSocketTransportFactory::new();
+        let http_client = MockHttpClient;
+
+        let bot = Bot::builder()
+            .with_backend(backend)
+            .with_transport_factory(transport)
+            .with_http_client(http_client)
+            .with_wanted_pre_key_count(200)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot with custom pre-key count");
+
+        assert_eq!(bot.client().wanted_pre_key_count(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_bot_builder_default_wanted_pre_key_count() {
+        let backend = create_test_sqlite_backend().await;
+        let transport = TokioWebSocketTransportFactory::new();
+        let http_client = MockHttpClient;
+
+        let bot = Bot::builder()
+            .with_backend(backend)
+            .with_transport_factory(transport)
+            .with_http_client(http_client)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+
+        assert_eq!(
+            bot.client().wanted_pre_key_count(),
+            crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT
+        );
     }
 
     #[tokio::test]

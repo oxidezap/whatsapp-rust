@@ -524,6 +524,12 @@ pub struct Client {
     /// or processed. Set via `BotBuilder::skip_history_sync()`.
     pub(crate) skip_history_sync: AtomicBool,
 
+    /// Number of one-time pre-keys generated per upload batch. Defaults to
+    /// [`crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT`]; set via
+    /// [`BotBuilder::with_wanted_pre_key_count`] or [`Client::set_wanted_pre_key_count`].
+    /// Clamped to the protocol-safe range at upload time.
+    pub(crate) wanted_pre_key_count: AtomicUsize,
+
     /// Cache configuration for TTL and capacity of all caches.
     /// Stored for use by lazily-initialized caches (group_cache).
     pub(crate) cache_config: CacheConfig,
@@ -722,6 +728,22 @@ impl Client {
         self.skip_history_sync.load(Ordering::Relaxed)
     }
 
+    /// Set how many one-time pre-keys are generated per upload batch.
+    ///
+    /// Defaults to WA Web's UPLOAD_KEYS_COUNT (812). Call before connecting; it
+    /// takes effect on the next pre-key upload. The value is clamped to the
+    /// protocol-safe range at upload time, so out-of-range values are coerced
+    /// (and logged) rather than rejected here.
+    pub fn set_wanted_pre_key_count(&self, count: usize) {
+        self.wanted_pre_key_count.store(count, Ordering::Relaxed);
+    }
+
+    /// Returns the configured pre-key upload batch size (the raw value, before
+    /// the upload-time clamp).
+    pub fn wanted_pre_key_count(&self) -> usize {
+        self.wanted_pre_key_count.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.expected_disconnect.load(Ordering::Relaxed) || !self.is_running.load(Ordering::Relaxed)
     }
@@ -881,6 +903,7 @@ impl Client {
             http_client,
             override_version,
             skip_history_sync: AtomicBool::new(false),
+            wanted_pre_key_count: AtomicUsize::new(crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT),
             cache_config,
             self_weak: std::sync::OnceLock::new(),
             saver_handle: std::sync::OnceLock::new(),
