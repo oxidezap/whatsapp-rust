@@ -68,10 +68,14 @@ impl MessageContext {
     }
 
     pub fn build_quote_context(&self) -> wa::ContextInfo {
+        // A bot reply is same-chat: quoted chat and send target are both
+        // info.source.chat, so remote_jid is omitted (WA Web parity).
+        let chat = &self.info.source.chat;
         wacore::proto_helpers::build_quote_context_with_info(
             &self.info.id,
             &self.info.source.sender,
-            &self.info.source.chat,
+            chat,
+            chat,
             &self.message,
         )
     }

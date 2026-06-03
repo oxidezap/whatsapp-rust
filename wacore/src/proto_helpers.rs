@@ -577,22 +577,31 @@ pub fn build_quote_context(
     }
 }
 
-/// Builds a quote ContextInfo matching WA Web's EProtoGenerator + getQuotedParticipantForContextInfo.
+/// Builds a quote ContextInfo matching WA Web's `msgContextInfo` + `getQuotedParticipantForContextInfo`.
 ///
-/// Sets `remote_jid` (required by iOS to scope the quote) and resolves `participant`
-/// based on chat type (newsletter → channel JID, otherwise → sender JID).
+/// `remote_jid` is emitted only for a cross-chat quote (the quoted message's
+/// chat differs from `target_chat_jid`), mirroring WA Web's quote-context getter
+/// (`remoteJid` set only when `quotedMsg.remote != targetChat`); a same-chat
+/// reply omits it. The defense against re-notifying mentions inside the quoted
+/// copy is `prepare_for_quote`, not `remote_jid`.
+/// `participant`: newsletter uses the channel JID, otherwise the sender.
 pub fn build_quote_context_with_info(
     message_id: impl Into<String>,
     sender_jid: &Jid,
-    chat_jid: &Jid,
+    quoted_chat_jid: &Jid,
+    target_chat_jid: &Jid,
     quoted_message: &wa::Message,
 ) -> wa::ContextInfo {
-    // WA Web always sets remoteJid to the chat JID (EProtoGenerator.js:108).
-    let remote_jid = chat_jid.to_string();
+    // remote_jid only for a cross-chat quote, in device-less chat form: a chat
+    // reference carries no device, and the compare above is device-insensitive.
+    // with_device(0) keeps the agent that @bot/@interop chat JIDs render (to_non_ad
+    // would wrongly drop it).
+    let remote_jid = (!quoted_chat_jid.is_same_chat_as(target_chat_jid))
+        .then(|| quoted_chat_jid.with_device(0).to_string());
 
     // Newsletter quotes use the channel JID as participant; others use the sender.
-    let participant = if chat_jid.is_newsletter() {
-        remote_jid.clone()
+    let participant = if quoted_chat_jid.is_newsletter() {
+        quoted_chat_jid.to_string()
     } else {
         sender_jid.to_string()
     };
@@ -600,7 +609,7 @@ pub fn build_quote_context_with_info(
     wa::ContextInfo {
         stanza_id: Some(message_id.into()),
         participant: Some(participant),
-        remote_jid: Some(remote_jid),
+        remote_jid,
         quoted_message: Some(quoted_message.prepare_for_quote()),
         ..Default::default()
     }
@@ -1371,7 +1380,7 @@ mod tests {
         let chat: Jid = "1234567890@newsletter".parse().unwrap();
         let msg = wa::Message::default();
 
-        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &msg);
+        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &chat, &msg);
 
         assert_eq!(
             ctx.participant.as_deref(),
@@ -1388,7 +1397,7 @@ mod tests {
         let chat: Jid = "group@g.us".parse().unwrap();
         let msg = wa::Message::default();
 
-        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &msg);
+        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &chat, &msg);
 
         assert_eq!(
             ctx.participant.as_deref(),
@@ -1404,7 +1413,7 @@ mod tests {
         let chat: Jid = "status@broadcast".parse().unwrap();
         let msg = wa::Message::default();
 
-        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &msg);
+        let ctx = build_quote_context_with_info("msg-id", &sender, &chat, &chat, &msg);
 
         assert_eq!(
             ctx.participant.as_deref(),
@@ -1659,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    fn quote_context_sets_remote_jid_for_group() {
+    fn quote_context_omits_remote_jid_same_chat_group() {
         let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let msg = wa::Message {
@@ -1667,20 +1676,21 @@ mod tests {
             ..Default::default()
         };
 
-        let ctx = build_quote_context_with_info("msg-id-123", &sender, &group, &msg);
+        // Same-chat reply (quoted chat == target): WA Web omits remote_jid.
+        let ctx = build_quote_context_with_info("msg-id-123", &sender, &group, &group, &msg);
 
         assert_eq!(ctx.stanza_id.as_deref(), Some("msg-id-123"));
         assert_eq!(
             ctx.participant.as_deref(),
             Some("551199887766@s.whatsapp.net")
         );
-        assert_eq!(ctx.remote_jid.as_deref(), Some("120363098765432100@g.us"));
+        assert_eq!(ctx.remote_jid, None);
         assert!(ctx.quoted_message.is_some());
         assert!(ctx.mentioned_jid.is_empty());
     }
 
     #[test]
-    fn quote_context_sets_remote_jid_for_dm() {
+    fn quote_context_omits_remote_jid_same_chat_dm() {
         let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
         let chat: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
         let msg = wa::Message {
@@ -1688,14 +1698,73 @@ mod tests {
             ..Default::default()
         };
 
-        let ctx = build_quote_context_with_info("msg-id-456", &sender, &chat, &msg);
+        let ctx = build_quote_context_with_info("msg-id-456", &sender, &chat, &chat, &msg);
+
+        assert_eq!(ctx.remote_jid, None);
+        assert_eq!(
+            ctx.participant.as_deref(),
+            Some("551199887766@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn quote_context_emits_remote_jid_cross_chat() {
+        // Quoting a message from group A while sending into group B.
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let quoted_chat: Jid = "120363000000000001@g.us".parse().unwrap();
+        let target_chat: Jid = "120363000000000002@g.us".parse().unwrap();
+        let msg = wa::Message {
+            conversation: Some("cross".into()),
+            ..Default::default()
+        };
+
+        let ctx =
+            build_quote_context_with_info("msg-id-x", &sender, &quoted_chat, &target_chat, &msg);
+
+        assert_eq!(ctx.remote_jid.as_deref(), Some("120363000000000001@g.us"));
+    }
+
+    #[test]
+    fn quote_context_status_reply_is_cross_chat() {
+        // Replying in a DM to a status: status@broadcast != DM target.
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let status: Jid = "status@broadcast".parse().unwrap();
+        let target: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let msg = wa::Message::default();
+
+        let ctx = build_quote_context_with_info("msg-id-s", &sender, &status, &target, &msg);
+
+        assert_eq!(ctx.remote_jid.as_deref(), Some("status@broadcast"));
+    }
+
+    #[test]
+    fn quote_context_device_suffix_treated_as_same_chat() {
+        // is_same_chat_as ignores the device suffix, so this stays a same-chat reply.
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let quoted_chat: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let target_chat = quoted_chat.with_device(5);
+        let msg = wa::Message::default();
+
+        let ctx =
+            build_quote_context_with_info("msg-id-d", &sender, &quoted_chat, &target_chat, &msg);
+
+        assert_eq!(ctx.remote_jid, None);
+    }
+
+    #[test]
+    fn quote_context_cross_chat_remote_jid_drops_device_suffix() {
+        // A device-scoped quoted chat must emit a device-less remote_jid: a chat
+        // reference carries no device.
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let quoted_chat = sender.with_device(5);
+        let target_chat: Jid = "5521988776655@s.whatsapp.net".parse().unwrap();
+        let msg = wa::Message::default();
+
+        let ctx =
+            build_quote_context_with_info("msg-id-dev", &sender, &quoted_chat, &target_chat, &msg);
 
         assert_eq!(
             ctx.remote_jid.as_deref(),
-            Some("551199887766@s.whatsapp.net")
-        );
-        assert_eq!(
-            ctx.participant.as_deref(),
             Some("551199887766@s.whatsapp.net")
         );
     }
@@ -1706,7 +1775,27 @@ mod tests {
         let newsletter: Jid = "120363099999999999@newsletter".parse().unwrap();
         let msg = wa::Message::default();
 
-        let ctx = build_quote_context_with_info("msg-id-789", &sender, &newsletter, &msg);
+        // Same-chat newsletter reply: participant stays the channel; remote_jid omitted.
+        let ctx =
+            build_quote_context_with_info("msg-id-789", &sender, &newsletter, &newsletter, &msg);
+
+        assert_eq!(
+            ctx.participant.as_deref(),
+            Some("120363099999999999@newsletter")
+        );
+        assert_eq!(ctx.remote_jid, None);
+    }
+
+    #[test]
+    fn quote_context_newsletter_cross_chat_sets_both() {
+        // Quoting a newsletter post while sending into a different newsletter:
+        // participant stays the quoted channel AND remote_jid is emitted.
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let quoted: Jid = "120363099999999999@newsletter".parse().unwrap();
+        let target: Jid = "120363011111111111@newsletter".parse().unwrap();
+        let msg = wa::Message::default();
+
+        let ctx = build_quote_context_with_info("msg-id-nx", &sender, &quoted, &target, &msg);
 
         assert_eq!(
             ctx.participant.as_deref(),
@@ -1724,7 +1813,7 @@ mod tests {
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let msg = create_message_with_mentions();
 
-        let ctx = build_quote_context_with_info("msg-id", &sender, &group, &msg);
+        let ctx = build_quote_context_with_info("msg-id", &sender, &group, &group, &msg);
 
         // The quoted message's nested context_info should have mentions stripped
         let quoted = ctx.quoted_message.unwrap();

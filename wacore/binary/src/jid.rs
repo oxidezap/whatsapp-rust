@@ -224,6 +224,15 @@ impl Server {
     pub fn is_lid_family(self) -> bool {
         matches!(self, Self::Lid | Self::HostedLid)
     }
+
+    /// Whether the `agent` byte is part of the rendered JID for this server.
+    /// AD-capable servers (Pn/Lid/Hosted/HostedLid) carry it as a hidden domain
+    /// byte and suppress it in display; others (e.g. `@bot`/`@interop`) render it.
+    /// Single source of truth shared by the formatter and `Jid::is_same_chat_as`.
+    #[inline]
+    pub fn renders_agent(self) -> bool {
+        !matches!(self, Self::Pn | Self::Lid | Self::Hosted | Self::HostedLid)
+    }
 }
 
 impl fmt::Display for Server {
@@ -539,6 +548,20 @@ impl Jid {
         }
     }
 
+    /// Device-insensitive "same chat" check: two JIDs address the same chat when
+    /// they render to the same string ignoring the multi-device `device`. Compares
+    /// `user`, `server`, `integrator`, and `agent` only where the server renders
+    /// the agent (`@bot`/`@interop`); Pn/Lid/Hosted suppress it in display, so a
+    /// stray decoded agent byte there must not split the chat. Allocates nothing.
+    /// Stricter than `is_same_user_as`, which ignores `server`.
+    #[inline]
+    pub fn is_same_chat_as(&self, other: &Jid) -> bool {
+        self.user == other.user
+            && self.server == other.server
+            && self.integrator == other.integrator
+            && (!self.server.renders_agent() || self.agent == other.agent)
+    }
+
     /// Canonical non-AD string form (`user@server`, device + agent stripped)
     /// in a single allocation. Equivalent to `to_non_ad().to_string()` but
     /// skips the throwaway intermediate `Jid` and its `CompactString` clone.
@@ -749,12 +772,7 @@ macro_rules! write_jid {
             return;
         }
         $buf.push_str(user);
-        if agent > 0
-            && !matches!(
-                server,
-                Server::Pn | Server::Lid | Server::Hosted | Server::HostedLid
-            )
-        {
+        if agent > 0 && server.renders_agent() {
             $buf.push('.');
             $buf.push_str(itoa::Buffer::new().format(agent));
         }
@@ -772,12 +790,7 @@ macro_rules! write_jid {
             return $f.write_str(server.as_str());
         }
         $f.write_str(user)?;
-        if agent > 0
-            && !matches!(
-                server,
-                Server::Pn | Server::Lid | Server::Hosted | Server::HostedLid
-            )
-        {
+        if agent > 0 && server.renders_agent() {
             $f.write_str(".")?;
             $f.write_str(itoa::Buffer::new().format(agent))?;
         }
@@ -1145,6 +1158,55 @@ mod tests {
             !bot_jid.is_hosted(),
             "Bot JID should NOT be detected as hosted (different mechanism)"
         );
+    }
+
+    #[test]
+    fn is_same_chat_as_matches_rendered_chat_identity() {
+        let base: Jid = "5511999887766@s.whatsapp.net".parse().unwrap();
+
+        // Device is ignored.
+        assert!(base.is_same_chat_as(&base.with_device(33)));
+        assert!(base.with_device(5).is_same_chat_as(&base.with_device(0)));
+
+        // Different user or server -> different chat (server guards the
+        // is_same_user_as looseness that ignores server).
+        let other_user: Jid = "5521988776655@s.whatsapp.net".parse().unwrap();
+        assert!(!base.is_same_chat_as(&other_user));
+        let as_lid: Jid = "5511999887766@lid".parse().unwrap();
+        assert!(!base.is_same_chat_as(&as_lid));
+
+        // integrator participates in identity.
+        let other_integrator = Jid {
+            integrator: 1,
+            ..base.clone()
+        };
+        assert!(!base.is_same_chat_as(&other_integrator));
+
+        // Pn suppresses the agent in display, so a stray decoded agent byte must
+        // not split the chat: same rendered string -> same chat.
+        let pn_agent1 = Jid {
+            agent: 1,
+            ..base.clone()
+        };
+        assert_eq!(base.to_string(), pn_agent1.to_string());
+        assert!(base.is_same_chat_as(&pn_agent1));
+
+        // @bot renders the agent, so distinct agents are distinct chats; device
+        // is still ignored.
+        let bot_a = Jid {
+            user: "13136555001".into(),
+            server: Server::Bot,
+            agent: 1,
+            device: 0,
+            integrator: 0,
+        };
+        let bot_b = Jid {
+            agent: 2,
+            ..bot_a.clone()
+        };
+        assert_ne!(bot_a.to_string(), bot_b.to_string());
+        assert!(!bot_a.is_same_chat_as(&bot_b));
+        assert!(bot_a.is_same_chat_as(&bot_a.with_device(7)));
     }
 
     /// Tests that document the filtering behavior for group messages.
