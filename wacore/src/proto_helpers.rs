@@ -511,14 +511,9 @@ pub fn merge_dsm_context(
             inner.limit_sharing_v2 = None;
             Some(inner)
         }
-        (None, Some(outer)) => Some(wa::MessageContextInfo {
-            message_secret: outer.message_secret.clone(),
-            message_association: outer.message_association.clone(),
-            limit_sharing_v2: outer.limit_sharing_v2,
-            thread_id: outer.thread_id.clone(),
-            bot_metadata: outer.bot_metadata.clone(),
-            ..Default::default()
-        }),
+        // Inner was cleared by a WA-Web-style hoist; restore the full context the
+        // sender moved to the outer message, not just the merge subset.
+        (None, Some(outer)) => Some(outer.clone()),
         (Some(mut inner), Some(outer)) => {
             if inner.message_secret.is_none() {
                 inner.message_secret = outer.message_secret.clone();
@@ -1547,6 +1542,20 @@ mod tests {
         assert!(
             result.limit_sharing_v2.is_some(),
             "limit_sharing_v2 should come from outer"
+        );
+    }
+
+    #[test]
+    fn test_merge_dsm_context_outer_only_preserves_non_subset_fields() {
+        let outer = wa::MessageContextInfo {
+            message_add_on_duration_in_secs: Some(86400),
+            ..Default::default()
+        };
+        let result = merge_dsm_context(None, Some(&outer)).unwrap();
+        assert_eq!(
+            result.message_add_on_duration_in_secs,
+            Some(86400),
+            "hoisted fields outside the merge subset must survive unwrap"
         );
     }
 

@@ -808,6 +808,24 @@ mod device_sent_tests {
     }
 
     #[test]
+    fn wrap_then_unwrap_preserves_non_secret_context_fields() {
+        let inner = wa::Message {
+            message_context_info: Some(wa::MessageContextInfo {
+                message_add_on_duration_in_secs: Some(604800),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let unwrapped = unwrap_device_sent(wrap_device_sent(inner, "1@s.whatsapp.net".into()));
+        assert_eq!(
+            unwrapped
+                .message_context_info
+                .and_then(|c| c.message_add_on_duration_in_secs),
+            Some(604800)
+        );
+    }
+
+    #[test]
     fn wrap_then_unwrap_round_trips_secret() {
         let secret = [9u8; 32];
         let wrapped = wrap_device_sent(msg_with_secret(&secret), "1@s.whatsapp.net".into());
