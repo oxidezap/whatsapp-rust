@@ -30,9 +30,11 @@ impl MessageUtils {
         buf
     }
 
-    pub fn participant_list_hash(devices: &[wacore_binary::Jid]) -> Result<String> {
+    pub fn participant_list_hash<'a>(
+        devices: impl IntoIterator<Item = &'a wacore_binary::Jid>,
+    ) -> Result<String> {
         // Hash sorted ad_strings incrementally (avoids join() allocation).
-        let mut jids: Vec<String> = devices.iter().map(|j| j.to_ad_string()).collect();
+        let mut jids: Vec<String> = devices.into_iter().map(|j| j.to_ad_string()).collect();
         jids.sort_unstable();
 
         let mut h = CryptographicHash::new("SHA-256")
@@ -48,10 +50,10 @@ impl MessageUtils {
         // Standard base64 ('+'/'/'), matching whatsmeow (`base64.RawStdEncoding`)
         // and WA Web (`WABase64.encodeB64`). URL-safe ('-'/'_') diverges from the
         // server on ~22% of phashes (any output hitting base64 index 62/63).
-        Ok(format!(
-            "2:{hash}",
-            hash = base64::prelude::BASE64_STANDARD_NO_PAD.encode(&full_hash[..6])
-        ))
+        let mut out = String::with_capacity(10);
+        out.push_str("2:");
+        base64::prelude::BASE64_STANDARD_NO_PAD.encode_string(&full_hash[..6], &mut out);
+        Ok(out)
     }
 
     /// Validate a broadcast-contact-list hash from an incoming `deviceSentMessage`

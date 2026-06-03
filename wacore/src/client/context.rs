@@ -126,15 +126,15 @@ impl GroupInfo {
         }
     }
 
-    /// Convert a phone-based device JID to a LID-based device JID using the mapping.
-    /// If no mapping exists, returns the original JID unchanged.
-    pub fn phone_device_jid_to_lid(&self, phone_device_jid: &Jid) -> Jid {
+    /// Convert a phone-based device JID to a LID-based device JID using the mapping,
+    /// consuming the JID. If no mapping exists, returns it unchanged.
+    pub fn phone_device_jid_into_lid(&self, phone_device_jid: Jid) -> Jid {
         if phone_device_jid.is_pn()
             && let Some(lid_base) = self.lid_jid_for_phone_user(&phone_device_jid.user)
         {
             return Jid::lid_device(lid_base.user.clone(), phone_device_jid.device);
         }
-        phone_device_jid.clone()
+        phone_device_jid
     }
 }
 

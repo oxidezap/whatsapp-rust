@@ -668,7 +668,7 @@ impl Client {
                 let all_devices: Vec<Jid> = if is_lid_mode {
                     all_devices
                         .into_iter()
-                        .map(|d| group_info.phone_device_jid_to_lid(&d))
+                        .map(|d| group_info.phone_device_jid_into_lid(d))
                         .collect()
                 } else {
                     all_devices

@@ -997,12 +997,10 @@ pub async fn prepare_dm_stanza<
     let (recipient_devices, own_other_devices) =
         partition_dm_devices(all_devices, own_jid, own_lid);
 
-    let phash = {
-        let mut sent = Vec::with_capacity(recipient_devices.len() + own_other_devices.len());
-        sent.extend_from_slice(&recipient_devices);
-        sent.extend_from_slice(&own_other_devices);
-        MessageUtils::participant_list_hash(&sent).ok()
-    };
+    let phash = MessageUtils::participant_list_hash(
+        recipient_devices.iter().chain(own_other_devices.iter()),
+    )
+    .ok();
 
     let dsm = wa::Message {
         device_sent_message: Some(Box::new(DeviceSentMessage {
@@ -1578,7 +1576,7 @@ pub async fn prepare_group_stanza<
         if group_info.addressing_mode == crate::types::message::AddressingMode::Lid {
             resolved_list = resolved_list
                 .into_iter()
-                .map(|device_jid| group_info.phone_device_jid_to_lid(&device_jid))
+                .map(|device_jid| group_info.phone_device_jid_into_lid(device_jid))
                 .collect();
             log::debug!(
                 "Converted {} devices to LID addressing for group {}",
