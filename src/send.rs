@@ -3666,6 +3666,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stanza_type_override_sets_wire_type_attr() {
+        let client = crate::test_utils::create_test_client_with_name("stanza_type_override").await;
+        let peer: Jid = "100000000000003@s.whatsapp.net".parse().unwrap();
+        seed_peer_send_state(&client, &peer).await;
+
+        let request_id = "STANZA_TYPE_OVERRIDE_1";
+        let waiter = client
+            .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
+        let msg =
+            pdo_request_message(wa::message::PeerDataOperationRequestType::HistorySyncOnDemand);
+
+        // Poll is never the type for this message; it can only come from the override.
+        let result = client
+            .send_message_impl(
+                peer,
+                &msg,
+                Some(request_id.to_string()),
+                true,
+                false,
+                None,
+                vec![],
+                Some(wacore::send::StanzaType::Poll),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "test client has no socket; send should fail after stanza capture"
+        );
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("sent node should be captured")
+            .expect("sent node waiter should resolve");
+        assert_eq!(
+            node.attrs().optional_string("type").unwrap().as_ref(),
+            wacore::send::StanzaType::Poll.as_wire()
+        );
+    }
+
+    #[tokio::test]
     async fn persist_outbound_msg_secret_writes_under_chat_sender_id() {
         let client = crate::test_utils::create_test_client_with_name("secret_chat_id").await;
         seed_pn(&client, "5511000000001:0@s.whatsapp.net").await;
