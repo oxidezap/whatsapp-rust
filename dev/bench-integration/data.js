@@ -1,122 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780454219299,
+  "lastUpdate": 1780459007251,
   "repoUrl": "https://github.com/oxidezap/whatsapp-rust",
   "entries": {
     "whatsapp-rust integration benchmarks": [
-      {
-        "commit": {
-          "author": {
-            "email": "55464917+jlucaso1@users.noreply.github.com",
-            "name": "João Lucas",
-            "username": "jlucaso1"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "c1b600ddae0ce5b94544553695d4a3304e718534",
-          "message": "fix: e2e reconnect and receipt flakes (#591)",
-          "timestamp": "2026-04-24T20:43:10-03:00",
-          "tree_id": "fe10c6dec5a906a2484c2b02d532ebd411b919f7",
-          "url": "https://github.com/oxidezap/whatsapp-rust/commit/c1b600ddae0ce5b94544553695d4a3304e718534"
-        },
-        "date": 1777074308483,
-        "tool": "customSmallerIsBetter",
-        "benches": [
-          {
-            "name": "integration::connect_to_ready::alloc_count",
-            "value": 9544,
-            "unit": "allocations"
-          },
-          {
-            "name": "integration::connect_to_ready::alloc_bytes",
-            "value": 3221861,
-            "unit": "bytes"
-          },
-          {
-            "name": "integration::connect_to_ready::wall_ms",
-            "value": 390,
-            "unit": "milliseconds"
-          },
-          {
-            "name": "integration::send_message::alloc_count",
-            "value": 228,
-            "unit": "allocations"
-          },
-          {
-            "name": "integration::send_message::alloc_bytes",
-            "value": 37897,
-            "unit": "bytes"
-          },
-          {
-            "name": "integration::send_message::wall_ms",
-            "value": 1,
-            "unit": "milliseconds"
-          },
-          {
-            "name": "integration::send_message_x20_amortized::alloc_count",
-            "value": 387,
-            "unit": "allocations"
-          },
-          {
-            "name": "integration::send_message_x20_amortized::alloc_bytes",
-            "value": 94608,
-            "unit": "bytes"
-          },
-          {
-            "name": "integration::send_message_x20_amortized::wall_ms",
-            "value": 0,
-            "unit": "milliseconds"
-          },
-          {
-            "name": "integration::send_and_receive_message::alloc_count",
-            "value": 362,
-            "unit": "allocations"
-          },
-          {
-            "name": "integration::send_and_receive_message::alloc_bytes",
-            "value": 96892,
-            "unit": "bytes"
-          },
-          {
-            "name": "integration::send_and_receive_message::wall_ms",
-            "value": 1,
-            "unit": "milliseconds"
-          },
-          {
-            "name": "integration::send_and_receive_x20_amortized::alloc_count",
-            "value": 428,
-            "unit": "allocations"
-          },
-          {
-            "name": "integration::send_and_receive_x20_amortized::alloc_bytes",
-            "value": 107980,
-            "unit": "bytes"
-          },
-          {
-            "name": "integration::send_and_receive_x20_amortized::wall_ms",
-            "value": 57,
-            "unit": "milliseconds"
-          },
-          {
-            "name": "integration::reconnect::alloc_count",
-            "value": 1476,
-            "unit": "allocations"
-          },
-          {
-            "name": "integration::reconnect::alloc_bytes",
-            "value": 450502,
-            "unit": "bytes"
-          },
-          {
-            "name": "integration::reconnect::wall_ms",
-            "value": 49,
-            "unit": "milliseconds"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -11394,6 +11280,120 @@ window.BENCHMARK_DATA = {
           {
             "name": "integration::reconnect::alloc_bytes",
             "value": 213037,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::reconnect::wall_ms",
+            "value": 8,
+            "unit": "milliseconds"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "55464917+jlucaso1@users.noreply.github.com",
+            "name": "João Lucas",
+            "username": "jlucaso1"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "072b1d6c57100dec896a336d92d5258e8fb30c93",
+          "message": "fix(client): use portable_atomic::AtomicU64 in offline_resume (#694)",
+          "timestamp": "2026-06-03T00:53:18-03:00",
+          "tree_id": "95edf6b66b47f72eec3c0ad3f621a86954ce1b66",
+          "url": "https://github.com/oxidezap/whatsapp-rust/commit/072b1d6c57100dec896a336d92d5258e8fb30c93"
+        },
+        "date": 1780459006249,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "integration::connect_to_ready::alloc_count",
+            "value": 8222,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::connect_to_ready::alloc_bytes",
+            "value": 2892504,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::connect_to_ready::wall_ms",
+            "value": 345,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_message::alloc_count",
+            "value": 236,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_message::alloc_bytes",
+            "value": 41149,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_message::wall_ms",
+            "value": 0,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_message_x20_amortized::alloc_count",
+            "value": 297,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_message_x20_amortized::alloc_bytes",
+            "value": 58016,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_message_x20_amortized::wall_ms",
+            "value": 0,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_and_receive_message::alloc_count",
+            "value": 400,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_and_receive_message::alloc_bytes",
+            "value": 70932,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_and_receive_message::wall_ms",
+            "value": 41,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::send_and_receive_x20_amortized::alloc_count",
+            "value": 362,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::send_and_receive_x20_amortized::alloc_bytes",
+            "value": 76859,
+            "unit": "bytes"
+          },
+          {
+            "name": "integration::send_and_receive_x20_amortized::wall_ms",
+            "value": 43,
+            "unit": "milliseconds"
+          },
+          {
+            "name": "integration::reconnect::alloc_count",
+            "value": 1020,
+            "unit": "allocations"
+          },
+          {
+            "name": "integration::reconnect::alloc_bytes",
+            "value": 253826,
             "unit": "bytes"
           },
           {
