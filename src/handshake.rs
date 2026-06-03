@@ -1,8 +1,8 @@
 use crate::socket::NoiseSocket;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::transport::{Transport, TransportEvent};
+use buffa::Message;
 use log::{debug, info, warn};
-use prost::Message;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -91,8 +91,7 @@ impl HandshakeError {
             // inputs, HKDF can't reasonably fail, and a single handshake
             // can't exhaust the counter. None of these mean the cache
             // is bad.
-            Core::Proto(_)
-            | Core::Crypto(_)
+            Core::Crypto(_)
             | Core::Noise(NoiseError::Encrypt(_))
             | Core::Noise(NoiseError::HkdfExpandFailed)
             | Core::Noise(NoiseError::InvalidPatternLength { .. })

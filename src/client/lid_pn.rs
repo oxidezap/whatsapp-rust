@@ -1008,14 +1008,14 @@ mod tests {
             remote_identity_public: None,
             root_key: None,
             previous_counter: Some(0),
-            sender_chain: None,
+            sender_chain: buffa::MessageField::none(),
             receiver_chains: vec![],
-            pending_pre_key: None,
+            pending_pre_key: buffa::MessageField::none(),
             remote_registration_id: Some(remote_regid),
             local_registration_id: Some(0),
             alice_base_key: Some(vec![]),
             needs_refresh: None,
-            pending_key_exchange: None,
+            pending_key_exchange: buffa::MessageField::none(),
         });
         SessionRecord::new(state)
             .serialize()

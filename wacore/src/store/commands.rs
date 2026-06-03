@@ -9,7 +9,7 @@ pub enum DeviceCommand {
     SetId(Option<Jid>),
     SetLid(Option<Jid>),
     SetPushName(String),
-    SetAccount(Option<wa::AdvSignedDeviceIdentity>),
+    SetAccount(Option<wa::ADVSignedDeviceIdentity>),
     SetAppVersion((u32, u32, u32)),
     SetDeviceProps(DevicePropsOverride),
     SetClientProfile(ClientProfile),

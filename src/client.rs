@@ -1263,6 +1263,21 @@ impl Client {
             }
         };
 
+        // The handshake can take seconds; a concurrent `disconnect()` /
+        // `signal_shutdown_sync()` may have fired in that window. If so, bail
+        // before `reset_connection_shutdown()` (which would clobber the fresh
+        // shutdown signal) and before installing the socket — otherwise we'd
+        // resurrect a connection that was just torn down.
+        if !self.is_running.load(Ordering::Relaxed)
+            || self.expected_disconnect.load(Ordering::Relaxed)
+        {
+            debug!("Shutdown requested during handshake; aborting connect before socket install.");
+            transport.disconnect().await;
+            return Err(anyhow!(
+                "connect aborted: shutdown requested during handshake"
+            ));
+        }
+
         // Fresh per-connection shutdown so subscribers registered during this
         // connection see a clean signal; the previous notifier was already
         // fired on the prior cleanup_connection_state.
@@ -2829,7 +2844,7 @@ impl Client {
 
                     // Download external mutations
                     for patch in &pl.patches {
-                        if let Some(ext) = &patch.external_mutations
+                        if let Some(ext) = patch.external_mutations.as_option()
                             && let Some(path) = &ext.direct_path
                         {
                             match self.download(ext).await {
@@ -2837,8 +2852,7 @@ impl Client {
                                     pre_downloaded.insert(path.clone(), bytes);
                                 }
                                 Err(e) => {
-                                    let v =
-                                        patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
+                                    let v = patch.version.version.unwrap_or(0);
                                     warn!(
                                         "Failed to download external mutations for patch v{}: {e}",
                                         v
@@ -3050,11 +3064,10 @@ impl Client {
 
                 // Download external mutations for each patch that has them
                 for patch in &pl.patches {
-                    if let Some(ext) = &patch.external_mutations
+                    if let Some(ext) = patch.external_mutations.as_option()
                         && let Some(path) = &ext.direct_path
                     {
-                        let patch_version =
-                            patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
+                        let patch_version = patch.version.version.unwrap_or(0);
                         match self.download(ext).await {
                             Ok(bytes) => {
                                 debug!(target: "Client/AppState", "Downloaded external mutations for patch v{} ({} bytes)", patch_version, bytes.len());
@@ -3174,11 +3187,13 @@ impl Client {
             })
             .collect();
         let msg = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest as i32),
-                app_state_sync_key_request: Some(wa::message::AppStateSyncKeyRequest { key_ids }),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::APP_STATE_SYNC_KEY_REQUEST),
+                app_state_sync_key_request: buffa::MessageField::some(
+                    wa::message::AppStateSyncKeyRequest { key_ids },
+                ),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         self.send_message_impl(
@@ -3250,13 +3265,13 @@ impl Client {
         // NCT salt sync — handles both "set" (store salt) and "remove" (clear salt).
         // Source: WAWebNctSaltSync, syncd collection RegularHigh, action "nct_salt_sync".
         if m.index[0] == "nct_salt_sync" {
-            if m.operation == wa::syncd_mutation::SyncdOperation::Remove {
+            if m.operation == wa::syncd_mutation::SyncdOperation::REMOVE {
                 debug!(target: "Client/AppState", "Removing NCT salt via app state sync");
                 self.persistence_manager
                     .process_command(DeviceCommand::SetNctSalt(None))
                     .await;
             } else if let Some(val) = &m.action_value
-                && let Some(act) = &val.nct_salt_sync_action
+                && let Some(act) = val.nct_salt_sync_action.as_option()
                 && let Some(salt) = &act.salt
             {
                 if salt.is_empty() {
@@ -3274,7 +3289,7 @@ impl Client {
         }
 
         // All remaining mutations only care about Set operations
-        if m.operation != wa::syncd_mutation::SyncdOperation::Set {
+        if m.operation != wa::syncd_mutation::SyncdOperation::SET {
             return;
         }
 
@@ -3287,7 +3302,7 @@ impl Client {
         // Handle client-internal mutations that need persistence/presence access
         if m.index[0] == "setting_pushName"
             && let Some(val) = &m.action_value
-            && let Some(act) = &val.push_name_setting
+            && let Some(act) = val.push_name_setting.as_option()
             && let Some(new_name) = &act.name
         {
             let new_name = new_name.clone();
@@ -3791,23 +3806,23 @@ impl Client {
         };
 
         let edit_container_message = wa::Message {
-            edited_message: Some(Box::new(wa::message::FutureProofMessage {
-                message: Some(Box::new(wa::Message {
-                    protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                        key: Some(wa::MessageKey {
+            edited_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(wa::Message {
+                    protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                        key: buffa::MessageField::some(wa::MessageKey {
                             remote_jid: Some(to.to_string()),
                             from_me: Some(true),
                             id: Some(original_id.clone()),
                             participant,
                         }),
-                        r#type: Some(wa::message::protocol_message::Type::MessageEdit as i32),
-                        edited_message: Some(Box::new(new_content)),
+                        r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                        edited_message: buffa::MessageField::some(new_content),
                         timestamp_ms: Some(wacore::time::now_millis()),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
-                })),
-            })),
+                }),
+            }),
             ..Default::default()
         };
 

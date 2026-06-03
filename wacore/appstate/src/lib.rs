@@ -8,7 +8,9 @@ pub mod lthash;
 pub mod patch_decode;
 pub mod processor;
 
-pub use decode::{Mutation, collect_key_ids_from_patch_list, decode_record};
+pub use decode::{
+    Mutation, collect_key_id_refs_from_patch_list, collect_key_ids_from_patch_list, decode_record,
+};
 pub use encode::encode_record;
 pub use errors::*;
 pub use keys::{ExpandedAppStateKeys, expand_app_state_keys};

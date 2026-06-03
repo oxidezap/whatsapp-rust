@@ -2,9 +2,9 @@ use crate::stanza::BusinessSubscription;
 use crate::types::call::IncomingCall;
 use crate::types::message::MessageInfo;
 use crate::types::presence::{ChatPresence, ChatPresenceMedia, ReceiptType};
+use buffa::Message;
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
-use prost::Message;
 use serde::Serialize;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -22,9 +22,8 @@ use waproto::whatsapp as wa;
 /// Cheap metadata (`sync_type`, `chunk_order`, `progress`) is available
 /// without decoding — useful for filtering events.
 ///
-/// Call [`get()`](Self::get) for full access to conversations, pushnames,
-/// global settings, past participants, call logs, and everything else in
-/// the `wa::HistorySync` proto.
+/// Call [`get()`](Self::get) when you need the owned `wa::HistorySync` proto;
+/// the decompressed `raw_bytes` are freed on the first successful decode.
 pub struct LazyHistorySync {
     /// Decompressed protobuf bytes. Taken (freed) once [`get()`](Self::get)
     /// materializes the owned proto, so the two halves don't coexist (~2x the
@@ -131,7 +130,9 @@ impl LazyHistorySync {
             // Cheap refcount bump; the lock is released before decoding so a
             // concurrent reader isn't blocked by the parse.
             let raw = self.locked_raw().clone()?;
-            wa::HistorySync::decode(&raw[..]).ok().map(Box::new)
+            wa::HistorySync::decode_from_slice(&raw[..])
+                .ok()
+                .map(Box::new)
         });
         // Free the raw bytes only AFTER the owned proto is committed, so a
         // concurrent clone never sees both gone (raw == None implies parsed set).
@@ -1135,13 +1136,13 @@ pub struct DeleteMessageForMeUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message;
+    use buffa::Message;
     use waproto::whatsapp as wa;
 
     /// Build a HistorySync proto with conversations and encode it.
     fn make_history_sync_bytes(conversations: Vec<wa::Conversation>) -> Vec<u8> {
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations,
             ..Default::default()
         };
@@ -1214,7 +1215,7 @@ mod tests {
 
         // Consumer can partial-decode from raw_bytes
         let raw_bytes = lazy.raw_bytes().expect("raw still present before get()");
-        let decoded = wa::HistorySync::decode(&raw_bytes[..]).expect("should decode");
+        let decoded = wa::HistorySync::decode_from_slice(&raw_bytes[..]).expect("should decode");
         assert_eq!(decoded.conversations[0].id, "raw@s.whatsapp.net");
     }
 
@@ -1322,13 +1323,15 @@ mod tests {
         let conv = wa::Conversation {
             id: "chat@s.whatsapp.net".to_string(),
             messages: vec![wa::HistorySyncMsg {
-                message: Some(wa::WebMessageInfo {
+                message: wa::WebMessageInfo {
                     key: wa::MessageKey {
                         id: Some("msg-0".to_string()),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..Default::default()
-                }),
+                }
+                .into(),
                 msg_order_id: Some(0),
             }],
             ..Default::default()
@@ -1341,7 +1344,7 @@ mod tests {
         assert_eq!(
             hs.conversations[0].messages[0]
                 .message
-                .as_ref()
+                .as_option()
                 .unwrap()
                 .key
                 .id

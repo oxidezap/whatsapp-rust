@@ -11,7 +11,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  PROTOC_VERSION: '3.25.3'
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
 
@@ -36,10 +35,6 @@ jobs:
         with:
           toolchain: nightly-2026-04-05
           components: clippy
-      - name: Install protoc
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache Rust registry
@@ -57,10 +52,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-04-05
-      - name: Install protoc
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache Rust registry
@@ -71,6 +62,12 @@ jobs:
         run: cargo build --workspace --exclude e2e-tests --all-targets --verbose
       - name: Run tests
         run: cargo test --workspace --exclude e2e-tests --verbose -- --no-capture
+      # waproto serde tests are feature-gated and produce zero tests under the
+      # default feature set, so exercise each representation explicitly.
+      - name: Test waproto serde (enum repr)
+        run: cargo test -p waproto --features serde-enum-repr --verbose
+      - name: Test waproto serde (snake_case)
+        run: cargo test -p waproto --features serde-snake-case --verbose
 
   test-stable:
     name: Test Stable (no-simd)
@@ -78,10 +75,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache Rust registry

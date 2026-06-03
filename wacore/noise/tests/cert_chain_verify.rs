@@ -7,7 +7,7 @@
 
 #![cfg(not(feature = "danger-skip-cert-chain-verify"))]
 
-use prost::Message;
+use buffa::Message;
 use waproto::whatsapp::{self as wa, cert_chain::noise_certificate};
 
 use wacore_noise::HandshakeUtils;
@@ -23,11 +23,9 @@ fn build_zero_signed_chain(server_static_pub: &[u8; 32]) -> Vec<u8> {
         key: Some(vec![0xCC; 32]),
         not_before: Some(1_700_000_000),
         not_after: Some(1_900_000_000),
+        ..Default::default()
     };
-    let mut intermediate_details_bytes = Vec::new();
-    intermediate_details
-        .encode(&mut intermediate_details_bytes)
-        .unwrap();
+    let intermediate_details_bytes = intermediate_details.encode_to_vec();
 
     let leaf_details = noise_certificate::Details {
         serial: Some(2),
@@ -35,23 +33,24 @@ fn build_zero_signed_chain(server_static_pub: &[u8; 32]) -> Vec<u8> {
         key: Some(server_static_pub.to_vec()),
         not_before: Some(1_700_000_500),
         not_after: Some(1_899_999_500),
+        ..Default::default()
     };
-    let mut leaf_details_bytes = Vec::new();
-    leaf_details.encode(&mut leaf_details_bytes).unwrap();
+    let leaf_details_bytes = leaf_details.encode_to_vec();
 
     let chain = wa::CertChain {
-        leaf: Some(wa::cert_chain::NoiseCertificate {
+        leaf: buffa::MessageField::some(wa::cert_chain::NoiseCertificate {
             details: Some(leaf_details_bytes),
             signature: Some(vec![0u8; 64]),
+            ..Default::default()
         }),
-        intermediate: Some(wa::cert_chain::NoiseCertificate {
+        intermediate: buffa::MessageField::some(wa::cert_chain::NoiseCertificate {
             details: Some(intermediate_details_bytes),
             signature: Some(vec![0u8; 64]),
+            ..Default::default()
         }),
+        ..Default::default()
     };
-    let mut bytes = Vec::new();
-    chain.encode(&mut bytes).unwrap();
-    bytes
+    chain.encode_to_vec()
 }
 
 #[test]

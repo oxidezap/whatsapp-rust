@@ -22,8 +22,8 @@
 //! (i.e. it speaks IK shape, not XX shape) AND completes successfully.
 
 use async_trait::async_trait;
+use buffa::Message;
 use bytes::Bytes;
-use prost::Message;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU32;
@@ -131,8 +131,8 @@ async fn xx_serve_full(
     let raw_hello = transport.sent.lock().unwrap()[0].to_vec();
     let client_hello_bytes = parse_first_client_frame(&raw_hello);
 
-    let msg = wa::HandshakeMessage::decode(client_hello_bytes.as_slice()).unwrap();
-    let client_eph_pub_vec = msg.client_hello.unwrap().ephemeral.unwrap();
+    let msg = wa::HandshakeMessage::decode_from_slice(client_hello_bytes.as_slice()).unwrap();
+    let client_eph_pub_vec = msg.client_hello.into_option().unwrap().ephemeral.unwrap();
     let client_eph_pub: [u8; 32] = client_eph_pub_vec.try_into().unwrap();
 
     let mut noise = NoiseHandshake::new(NOISE_PATTERN_XX, &WA_CONN_HEADER).unwrap();
@@ -151,7 +151,7 @@ async fn xx_serve_full(
     let encrypted_payload = noise.encrypt(&server.cert_chain_bytes).unwrap();
 
     let server_hello = wa::HandshakeMessage {
-        server_hello: Some(wa::handshake_message::ServerHello {
+        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
             ephemeral: Some(server_eph_pub.to_vec()),
             r#static: Some(encrypted_static),
             payload: Some(encrypted_payload),
@@ -159,8 +159,7 @@ async fn xx_serve_full(
         }),
         ..Default::default()
     };
-    let mut sh_bytes = Vec::new();
-    server_hello.encode(&mut sh_bytes).unwrap();
+    let sh_bytes = server_hello.encode_to_vec();
     let framed = wacore::framing::encode_frame(&sh_bytes, None).unwrap();
     events_tx
         .send(TransportEvent::DataReceived(framed.into()))
@@ -186,8 +185,8 @@ async fn ik_serve_accept(
     let raw_hello = transport.sent.lock().unwrap()[0].to_vec();
     let client_hello_bytes = parse_first_client_frame(&raw_hello);
 
-    let msg = wa::HandshakeMessage::decode(client_hello_bytes.as_slice()).unwrap();
-    let ch = msg.client_hello.unwrap();
+    let msg = wa::HandshakeMessage::decode_from_slice(client_hello_bytes.as_slice()).unwrap();
+    let ch = msg.client_hello.into_option().unwrap();
     let client_eph_pub: [u8; 32] = ch.ephemeral.unwrap().try_into().unwrap();
     let encrypted_static = ch.r#static.unwrap();
     let encrypted_payload = ch.payload.unwrap();
@@ -217,7 +216,7 @@ async fn ik_serve_accept(
     let encrypted_cert = noise.encrypt(&server.cert_chain_bytes).unwrap();
 
     let server_hello = wa::HandshakeMessage {
-        server_hello: Some(wa::handshake_message::ServerHello {
+        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
             ephemeral: Some(server_eph_pub.to_vec()),
             r#static: None,
             payload: Some(encrypted_cert),
@@ -225,8 +224,7 @@ async fn ik_serve_accept(
         }),
         ..Default::default()
     };
-    let mut sh_bytes = Vec::new();
-    server_hello.encode(&mut sh_bytes).unwrap();
+    let sh_bytes = server_hello.encode_to_vec();
     let framed = wacore::framing::encode_frame(&sh_bytes, None).unwrap();
     events_tx
         .send(TransportEvent::DataReceived(framed.into()))
@@ -378,8 +376,8 @@ async fn cold_start_xx_then_cached_ik_reconnect() {
     let sent = transport2.sent.lock().unwrap();
     let raw = sent[0].to_vec();
     let body = parse_first_client_frame(&raw);
-    let parsed = wa::HandshakeMessage::decode(body.as_slice()).unwrap();
-    let ch = parsed.client_hello.unwrap();
+    let parsed = wa::HandshakeMessage::decode_from_slice(body.as_slice()).unwrap();
+    let ch = parsed.client_hello.into_option().unwrap();
     assert!(
         ch.r#static.is_some(),
         "IK ClientHello carries client static"
@@ -399,7 +397,7 @@ async fn ik_serve_fallback_with_corrupt_payloads(
     let server_eph_pub: [u8; 32] = server_eph.public_key.public_key_bytes().try_into().unwrap();
 
     let server_hello = wa::HandshakeMessage {
-        server_hello: Some(wa::handshake_message::ServerHello {
+        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
             ephemeral: Some(server_eph_pub.to_vec()),
             r#static: Some(vec![0xCC; 32 + 16]),
             payload: Some(vec![0xDE; 64]),
@@ -407,8 +405,7 @@ async fn ik_serve_fallback_with_corrupt_payloads(
         }),
         ..Default::default()
     };
-    let mut sh_bytes = Vec::new();
-    server_hello.encode(&mut sh_bytes).unwrap();
+    let sh_bytes = server_hello.encode_to_vec();
     let framed = wacore::framing::encode_frame(&sh_bytes, None).unwrap();
     events_tx
         .send(TransportEvent::DataReceived(framed.into()))
@@ -678,9 +675,10 @@ async fn ik_serve_force_fallback_then_consume_finish(
     let raw_hello = transport.sent.lock().unwrap()[0].to_vec();
     let client_hello_bytes = parse_first_client_frame(&raw_hello);
 
-    let msg = wa::HandshakeMessage::decode(client_hello_bytes.as_slice()).unwrap();
+    let msg = wa::HandshakeMessage::decode_from_slice(client_hello_bytes.as_slice()).unwrap();
     let client_eph_pub: [u8; 32] = msg
         .client_hello
+        .into_option()
         .unwrap()
         .ephemeral
         .unwrap()
@@ -709,7 +707,7 @@ async fn ik_serve_force_fallback_then_consume_finish(
     let encrypted_cert = noise.encrypt(&server.cert_chain_bytes).unwrap();
 
     let server_hello = wa::HandshakeMessage {
-        server_hello: Some(wa::handshake_message::ServerHello {
+        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
             ephemeral: Some(server_eph_pub.to_vec()),
             r#static: Some(encrypted_static),
             payload: Some(encrypted_cert),
@@ -717,8 +715,7 @@ async fn ik_serve_force_fallback_then_consume_finish(
         }),
         ..Default::default()
     };
-    let mut sh_bytes = Vec::new();
-    server_hello.encode(&mut sh_bytes).unwrap();
+    let sh_bytes = server_hello.encode_to_vec();
     let framed = wacore::framing::encode_frame(&sh_bytes, None).unwrap();
     events_tx
         .send(TransportEvent::DataReceived(framed.into()))
@@ -837,7 +834,7 @@ async fn ik_with_stale_cache_invalidates_and_increments_counter() {
     let bogus_server_eph = KeyPair::generate(&mut rand::rng()).public_key;
     let bogus_server_eph_bytes: [u8; 32] = bogus_server_eph.public_key_bytes().try_into().unwrap();
     let server_hello = wa::HandshakeMessage {
-        server_hello: Some(wa::handshake_message::ServerHello {
+        server_hello: buffa::MessageField::some(wa::handshake_message::ServerHello {
             ephemeral: Some(bogus_server_eph_bytes.to_vec()),
             r#static: None,
             // `payload` here is just garbage — AEAD MAC check will fail.
@@ -846,8 +843,7 @@ async fn ik_with_stale_cache_invalidates_and_increments_counter() {
         }),
         ..Default::default()
     };
-    let mut sh_bytes = Vec::new();
-    server_hello.encode(&mut sh_bytes).unwrap();
+    let sh_bytes = server_hello.encode_to_vec();
     let framed = wacore::framing::encode_frame(&sh_bytes, None).unwrap();
 
     let transport_for_task = transport.clone();

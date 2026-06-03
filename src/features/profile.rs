@@ -125,7 +125,7 @@ impl<'a> Profile<'a> {
         let index = serde_json::to_vec(&["setting_pushName"])?;
 
         let value = wa::SyncActionValue {
-            push_name_setting: Some(wa::sync_action_value::PushNameSetting {
+            push_name_setting: buffa::MessageField::some(wa::sync_action_value::PushNameSetting {
                 name: Some(name.to_string()),
             }),
             timestamp: Some(wacore::time::now_millis()),
@@ -147,7 +147,7 @@ impl<'a> Profile<'a> {
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
 
         let (mutation, _) = encode_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index,
             &value,
             &keys,

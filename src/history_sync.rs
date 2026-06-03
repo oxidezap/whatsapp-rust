@@ -17,7 +17,7 @@ impl Client {
             log::debug!(
                 "Dropping history sync {} during shutdown (Type: {:?})",
                 message_id,
-                notification.sync_type()
+                notification.sync_type
             );
             return;
         }
@@ -26,7 +26,7 @@ impl Client {
             log::debug!(
                 "Skipping history sync for message {} (Type: {:?})",
                 message_id,
-                notification.sync_type()
+                notification.sync_type
             );
             // Send receipt so the phone considers this chunk delivered and stops
             // retrying. This intentionally diverges from WhatsApp Web's AB prop
@@ -73,8 +73,8 @@ impl Client {
         log::info!(
             "Processing history sync for message {} (Size: {}, Type: {:?})",
             message_id,
-            notification.file_length(),
-            notification.sync_type()
+            notification.file_length.unwrap_or(0),
+            notification.sync_type
         );
 
         self.send_protocol_receipt(
@@ -226,7 +226,7 @@ impl Client {
                 if let Some(decompressed) = sync_result.decompressed_bytes {
                     let lazy_hs = LazyHistorySync::new(
                         decompressed,
-                        notification.sync_type().into(),
+                        notification.sync_type.map(|t| t as i32).unwrap_or(0),
                         notification.chunk_order,
                         notification.progress,
                     )
@@ -495,8 +495,8 @@ fn push_unique_sender(senders: &mut Vec<Jid>, sender: Jid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffa::Message as ProtoMessage;
     use flate2::{Compression, write::ZlibEncoder};
-    use prost::Message as ProtoMessage;
     use std::io::Write;
     use std::sync::atomic::Ordering;
     use waproto::whatsapp as wa;
@@ -523,18 +523,18 @@ mod tests {
         let parent_id = "HIST_PARENT";
         let secret = vec![0x44u8; 32];
         let history_sync = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
-                        key: wa::MessageKey {
+                    message: buffa::MessageField::some(wa::WebMessageInfo {
+                        key: buffa::MessageField::some(wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
                             id: Some(parent_id.to_string()),
                             participant: None,
-                        },
-                        message: Some(wa::Message {
+                        }),
+                        message: buffa::MessageField::some(wa::Message {
                             conversation: Some("historical".to_string()),
                             ..Default::default()
                         }),
@@ -550,7 +550,7 @@ mod tests {
         let compressed = compress_history_sync(&history_sync);
         let notification = HistorySyncNotification {
             file_length: Some(compressed.len() as u64),
-            sync_type: Some(wa::message::HistorySyncType::InitialBootstrap as i32),
+            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
             initial_hist_bootstrap_inline_payload: Some(compressed),
             ..Default::default()
         };
@@ -584,18 +584,18 @@ mod tests {
         let parent_id = "HIST_BOT_PARENT";
         let secret = vec![0x61u8; 32];
         let history_sync = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
-                        key: wa::MessageKey {
+                    message: buffa::MessageField::some(wa::WebMessageInfo {
+                        key: buffa::MessageField::some(wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
                             id: Some(parent_id.to_string()),
                             participant: None,
-                        },
-                        message: Some(wa::Message {
+                        }),
+                        message: buffa::MessageField::some(wa::Message {
                             conversation: Some("bot historical".to_string()),
                             ..Default::default()
                         }),
@@ -611,7 +611,7 @@ mod tests {
         let compressed = compress_history_sync(&history_sync);
         let notification = HistorySyncNotification {
             file_length: Some(compressed.len() as u64),
-            sync_type: Some(wa::message::HistorySyncType::InitialBootstrap as i32),
+            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
             initial_hist_bootstrap_inline_payload: Some(compressed),
             ..Default::default()
         };
@@ -642,7 +642,9 @@ mod tests {
     ) -> wa::HistorySyncMsg {
         let message = if is_poll {
             wa::Message {
-                poll_creation_message: Some(Box::new(wa::message::PollCreationMessage::default())),
+                poll_creation_message: buffa::MessageField::some(
+                    wa::message::PollCreationMessage::default(),
+                ),
                 ..Default::default()
             }
         } else {
@@ -652,14 +654,14 @@ mod tests {
             }
         };
         wa::HistorySyncMsg {
-            message: Some(wa::WebMessageInfo {
-                key: wa::MessageKey {
+            message: buffa::MessageField::some(wa::WebMessageInfo {
+                key: buffa::MessageField::some(wa::MessageKey {
                     remote_jid: Some(chat.to_string()),
                     from_me: Some(false),
                     id: Some(msg_id.to_string()),
                     participant: None,
-                },
-                message: Some(message),
+                }),
+                message: buffa::MessageField::some(message),
                 message_secret: Some(secret.to_vec()),
                 message_timestamp: Some(ts_secs),
                 ..Default::default()
@@ -673,7 +675,7 @@ mod tests {
         messages: Vec<wa::HistorySyncMsg>,
     ) -> HistorySyncNotification {
         let history_sync = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages,
@@ -684,7 +686,7 @@ mod tests {
         let compressed = compress_history_sync(&history_sync);
         HistorySyncNotification {
             file_length: Some(compressed.len() as u64),
-            sync_type: Some(wa::message::HistorySyncType::InitialBootstrap as i32),
+            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
             initial_hist_bootstrap_inline_payload: Some(compressed),
             ..Default::default()
         }
@@ -934,26 +936,30 @@ mod tests {
         ts_secs: u64,
         bot_prompt: bool,
     ) -> wa::HistorySyncMsg {
-        let message_context_info = bot_prompt.then(|| wa::MessageContextInfo {
-            bot_metadata: Some(wa::BotMetadata {
-                persona_id: Some("867051314767696".into()),
+        let message_context_info: buffa::MessageField<wa::MessageContextInfo> = bot_prompt
+            .then(|| wa::MessageContextInfo {
+                bot_metadata: buffa::MessageField::some(wa::BotMetadata {
+                    persona_id: Some("867051314767696".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        });
+            })
+            .into();
         wa::HistorySyncMsg {
-            message: Some(wa::WebMessageInfo {
-                key: wa::MessageKey {
+            message: buffa::MessageField::some(wa::WebMessageInfo {
+                key: buffa::MessageField::some(wa::MessageKey {
                     remote_jid: Some(chat.to_string()),
                     from_me: Some(false),
                     id: Some(msg_id.to_string()),
                     participant: Some(participant.to_string()),
-                },
-                message: Some(wa::Message {
-                    extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
-                        text: Some("hi".into()),
-                        ..Default::default()
-                    })),
+                }),
+                message: buffa::MessageField::some(wa::Message {
+                    extended_text_message: buffa::MessageField::some(
+                        wa::message::ExtendedTextMessage {
+                            text: Some("hi".into()),
+                            ..Default::default()
+                        },
+                    ),
                     message_context_info,
                     ..Default::default()
                 }),

@@ -92,23 +92,24 @@ pub enum RevokeType {
 fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>, Option<Node>) {
     let edit = EditAttribute::infer_from_message(msg);
 
-    let meta = if msg.poll_creation_message.is_some()
-        || msg.poll_creation_message_v2.is_some()
-        || msg.poll_creation_message_v3.is_some()
+    let meta = if msg.poll_creation_message.is_set()
+        || msg.poll_creation_message_v2.is_set()
+        || msg.poll_creation_message_v3.is_set()
+        || msg.poll_creation_message_v5.is_set()
     {
         Some(meta_node("polltype", "creation"))
-    } else if let Some(ref poll_update) = msg.poll_update_message
-        && poll_update.vote.is_some()
+    } else if let Some(poll_update) = msg.poll_update_message.as_option()
+        && poll_update.vote.is_set()
     {
         Some(meta_node("polltype", "vote"))
         // TODO: polltype="result_snapshot" for poll_result_snapshot_message (gated behind AB flag)
-    } else if msg.event_message.is_some() {
+    } else if msg.event_message.is_set() {
         Some(meta_node("event_type", "creation"))
-    } else if msg.enc_event_response_message.is_some() {
+    } else if msg.enc_event_response_message.is_set() {
         Some(meta_node("event_type", "response"))
-    } else if let Some(ref sec) = msg.secret_encrypted_message
+    } else if let Some(sec) = msg.secret_encrypted_message.as_option()
         && sec.secret_enc_type
-            == Some(wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32)
+            == Some(wa::message::secret_encrypted_message::SecretEncType::EVENT_EDIT)
     {
         Some(meta_node("event_type", "edit"))
     } else {
@@ -177,7 +178,7 @@ fn classify_button(button_name: &str) -> BizCategory<'_> {
 fn infer_biz_node(msg: &wa::Message, now_unix_secs: u64) -> Option<Node> {
     let interactive = extract_interactive_message(msg)?;
     let wa::message::interactive_message::InteractiveMessage::NativeFlowMessage(nf) =
-        interactive.interactive_message.as_ref()?
+        interactive.interactiveMessage.as_ref()?
     else {
         return None;
     };
@@ -224,13 +225,16 @@ fn build_nested_biz(privacy_mode_ts: &str, flow_name: &str) -> Node {
 fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::InteractiveMessage> {
     // Only checks documentWithCaptionMessage wrapper (for media headers) and direct field.
     // Does not use unwrap_message() since we need the InteractiveMessage specifically.
-    if let Some(ref doc) = msg.document_with_caption_message
-        && let Some(ref inner) = doc.message
-        && let Some(ref im) = inner.interactive_message
+    if let Some(doc) = msg.document_with_caption_message.as_option()
+        && let Some(inner) = doc.message.as_option()
+        && inner.interactive_message.is_set()
     {
-        return Some(im);
+        return Some(&inner.interactive_message);
     }
-    msg.interactive_message.as_deref()
+    if msg.interactive_message.is_set() {
+        return Some(&msg.interactive_message);
+    }
+    None
 }
 
 /// Assemble the `extra_stanza_nodes` vector for a non-newsletter send.
@@ -268,16 +272,16 @@ fn build_revoke_message(
     participant: Option<String>,
 ) -> wa::Message {
     wa::Message {
-        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-            key: Some(wa::MessageKey {
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            key: buffa::MessageField::some(wa::MessageKey {
                 remote_jid: Some(remote_jid.to_string()),
                 from_me: Some(from_me),
                 id: Some(message_id),
                 participant,
             }),
-            r#type: Some(wa::message::protocol_message::Type::Revoke as i32),
+            r#type: Some(wa::message::protocol_message::Type::REVOKE),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     }
 }
@@ -327,7 +331,7 @@ impl Client {
         // Newsletters are not E2E encrypted — send as plaintext via SMAX stanza.
         // Matches WA Web's OutMessagePublishNewsletterRequest + ContentType mixins.
         if to.is_newsletter() {
-            use prost::Message as _;
+            use buffa::Message as _;
             let stanza_type = stanza_type_override
                 .map(StanzaType::as_wire)
                 .unwrap_or_else(|| wacore::send::stanza_type_from_message(&message));
@@ -941,7 +945,7 @@ impl Client {
         self.send_pin(
             chat,
             key,
-            wa::message::pin_in_chat_message::Type::PinForAll,
+            wa::message::pin_in_chat_message::Type::PIN_FOR_ALL,
             duration.as_secs(),
         )
         .await
@@ -952,7 +956,7 @@ impl Client {
         self.send_pin(
             chat,
             key,
-            wa::message::pin_in_chat_message::Type::UnpinForAll,
+            wa::message::pin_in_chat_message::Type::UNPIN_FOR_ALL,
             0,
         )
         .await
@@ -966,12 +970,12 @@ impl Client {
         duration_secs: u32,
     ) -> Result<(), anyhow::Error> {
         let message = wa::Message {
-            pin_in_chat_message: Some(wa::message::PinInChatMessage {
-                key: Some(key),
-                r#type: Some(pin_type as i32),
+            pin_in_chat_message: buffa::MessageField::some(wa::message::PinInChatMessage {
+                key: buffa::MessageField::some(key),
+                r#type: Some(pin_type),
                 sender_timestamp_ms: Some(wacore::time::now_millis()),
             }),
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
                 message_add_on_duration_in_secs: Some(duration_secs),
                 ..Default::default()
             }),
@@ -1008,9 +1012,9 @@ impl Client {
         let (to, is_status_addon) = if to.is_status_broadcast() {
             let author = message
                 .reaction_message
-                .as_ref()
-                .and_then(|rm| rm.key.as_ref())
-                .and_then(|k| k.participant.as_ref())
+                .as_option()
+                .and_then(|rm| rm.key.as_option())
+                .and_then(|k| k.participant.as_deref())
                 .and_then(|p| p.parse::<Jid>().ok())
                 .filter(|jid| jid.is_pn() || jid.is_lid())
                 .ok_or_else(|| {
@@ -2059,8 +2063,8 @@ mod tests {
             .send_message(
                 to,
                 wa::Message {
-                    reaction_message: Some(wa::message::ReactionMessage {
-                        key: Some(wa::MessageKey {
+                    reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+                        key: buffa::MessageField::some(wa::MessageKey {
                             remote_jid: Some("status@broadcast".into()),
                             from_me: Some(false),
                             id: Some("ORIGID".into()),
@@ -2089,8 +2093,8 @@ mod tests {
             .send_message(
                 to,
                 wa::Message {
-                    reaction_message: Some(wa::message::ReactionMessage {
-                        key: Some(wa::MessageKey {
+                    reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+                        key: buffa::MessageField::some(wa::MessageKey {
                             remote_jid: Some("status@broadcast".into()),
                             from_me: Some(false),
                             id: Some("ORIGID".into()),
@@ -2167,8 +2171,8 @@ mod tests {
 
         let revoke_message = build_revoke_message(&to, from_me, message_id.clone(), participant);
 
-        let proto_msg = revoke_message.protocol_message.unwrap();
-        let key = proto_msg.key.unwrap();
+        let proto_msg = revoke_message.protocol_message.as_option().unwrap();
+        let key = proto_msg.key.as_option().unwrap();
         assert_eq!(key.from_me, Some(true));
         assert_eq!(key.participant, None);
         assert_eq!(key.id, Some(message_id));
@@ -2208,8 +2212,8 @@ mod tests {
         let revoke_message =
             build_revoke_message(&to, from_me, message_id.clone(), participant.clone());
 
-        let proto_msg = revoke_message.protocol_message.unwrap();
-        let key = proto_msg.key.unwrap();
+        let proto_msg = revoke_message.protocol_message.as_option().unwrap();
+        let key = proto_msg.key.as_option().unwrap();
         assert_eq!(key.from_me, Some(false));
         // Participant should be the original sender with device number stripped
         assert_eq!(key.participant, Some("236395184570386@lid".to_string()));
@@ -2741,7 +2745,9 @@ mod tests {
         #[test]
         fn pin_returns_edit_attribute() {
             let msg = wa::Message {
-                pin_in_chat_message: Some(wa::message::PinInChatMessage::default()),
+                pin_in_chat_message: buffa::MessageField::some(
+                    wa::message::PinInChatMessage::default(),
+                ),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2752,7 +2758,7 @@ mod tests {
         #[test]
         fn poll_creation_v3_returns_meta_node() {
             let msg = wa::Message {
-                poll_creation_message_v3: Some(Box::default()),
+                poll_creation_message_v3: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2769,7 +2775,7 @@ mod tests {
         #[test]
         fn event_returns_meta_node() {
             let msg = wa::Message {
-                event_message: Some(Box::default()),
+                event_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2793,7 +2799,7 @@ mod tests {
         #[test]
         fn poll_creation_v1_returns_meta_node() {
             let msg = wa::Message {
-                poll_creation_message: Some(Box::default()),
+                poll_creation_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2810,7 +2816,7 @@ mod tests {
         #[test]
         fn poll_creation_v2_returns_meta_node() {
             let msg = wa::Message {
-                poll_creation_message_v2: Some(Box::default()),
+                poll_creation_message_v2: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2827,8 +2833,8 @@ mod tests {
         #[test]
         fn poll_vote_returns_meta_node() {
             let msg = wa::Message {
-                poll_update_message: Some(wa::message::PollUpdateMessage {
-                    vote: Some(wa::message::PollEncValue::default()),
+                poll_update_message: buffa::MessageField::some(wa::message::PollUpdateMessage {
+                    vote: buffa::MessageField::some(wa::message::PollEncValue::default()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2844,7 +2850,7 @@ mod tests {
         #[test]
         fn event_response_returns_meta_node() {
             let msg = wa::Message {
-                enc_event_response_message: Some(Default::default()),
+                enc_event_response_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2861,8 +2867,7 @@ mod tests {
         #[test]
         fn poll_update_without_vote_returns_none() {
             let msg = wa::Message {
-                poll_update_message: Some(wa::message::PollUpdateMessage {
-                    vote: None,
+                poll_update_message: buffa::MessageField::some(wa::message::PollUpdateMessage {
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2875,7 +2880,7 @@ mod tests {
         #[test]
         fn revoked_reaction_returns_sender_revoke() {
             let msg = wa::Message {
-                reaction_message: Some(wa::message::ReactionMessage {
+                reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
                     text: Some(String::new()),
                     ..Default::default()
                 }),
@@ -2888,12 +2893,12 @@ mod tests {
         #[test]
         fn keep_in_chat_undo_returns_sender_revoke() {
             let msg = wa::Message {
-                keep_in_chat_message: Some(wa::message::KeepInChatMessage {
-                    key: Some(wa::MessageKey {
+                keep_in_chat_message: buffa::MessageField::some(wa::message::KeepInChatMessage {
+                    key: buffa::MessageField::some(wa::MessageKey {
                         from_me: Some(true),
                         ..Default::default()
                     }),
-                    keep_type: Some(wa::KeepType::UndoKeepForAll as i32),
+                    keep_type: Some(wa::KeepType::UNDO_KEEP_FOR_ALL),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2905,12 +2910,14 @@ mod tests {
         #[test]
         fn secret_encrypted_message_edit_returns_message_edit() {
             let msg = wa::Message {
-                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
-                    secret_enc_type: Some(
-                        wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
-                    ),
-                    ..Default::default()
-                }),
+                secret_encrypted_message: buffa::MessageField::some(
+                    wa::message::SecretEncryptedMessage {
+                        secret_enc_type: Some(
+                            wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT,
+                        ),
+                        ..Default::default()
+                    },
+                ),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -2922,12 +2929,14 @@ mod tests {
             // EVENT_EDIT is the one case where the edit attribute AND the
             // meta node both fire: `event_type=edit` meta + `edit="1"` attr.
             let msg = wa::Message {
-                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
-                    secret_enc_type: Some(
-                        wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32,
-                    ),
-                    ..Default::default()
-                }),
+                secret_encrypted_message: buffa::MessageField::some(
+                    wa::message::SecretEncryptedMessage {
+                        secret_enc_type: Some(
+                            wa::message::secret_encrypted_message::SecretEncType::EVENT_EDIT,
+                        ),
+                        ..Default::default()
+                    },
+                ),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2942,9 +2951,9 @@ mod tests {
         #[test]
         fn top_level_edited_message_returns_message_edit() {
             let msg = wa::Message {
-                edited_message: Some(Box::new(wa::message::FutureProofMessage {
-                    message: Some(Box::new(wa::Message::default())),
-                })),
+                edited_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                    message: buffa::MessageField::some(wa::Message::default()),
+                }),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -2956,7 +2965,8 @@ mod tests {
         use super::*;
         use std::str::FromStr;
         use wa::message::interactive_message::{
-            self, NativeFlowMessage, native_flow_message::NativeFlowButton,
+            InteractiveMessage as InteractiveMessageOneof, NativeFlowMessage,
+            native_flow_message::NativeFlowButton,
         };
 
         // Fixed unix seconds for deterministic privacy_mode_ts assertions.
@@ -2966,21 +2976,19 @@ mod tests {
 
         fn msg_with_native_flow_button(button_name: &str) -> wa::Message {
             wa::Message {
-                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
-                    interactive_message: Some(
-                        interactive_message::InteractiveMessage::NativeFlowMessage(
-                            NativeFlowMessage {
-                                buttons: vec![NativeFlowButton {
-                                    name: Some(button_name.to_string()),
-                                    button_params_json: None,
-                                }],
-                                message_version: Some(1),
-                                message_params_json: None,
-                            },
-                        ),
-                    ),
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
+                    interactiveMessage: Some(InteractiveMessageOneof::NativeFlowMessage(Box::new(
+                        NativeFlowMessage {
+                            buttons: vec![NativeFlowButton {
+                                name: Some(button_name.to_string()),
+                                ..Default::default()
+                            }],
+                            message_version: Some(1),
+                            ..Default::default()
+                        },
+                    ))),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             }
         }
@@ -3130,14 +3138,12 @@ mod tests {
         #[test]
         fn interactive_without_native_flow_returns_none() {
             let msg = wa::Message {
-                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
-                    interactive_message: Some(
-                        interactive_message::InteractiveMessage::CollectionMessage(
-                            Default::default(),
-                        ),
-                    ),
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
+                    interactiveMessage: Some(InteractiveMessageOneof::CollectionMessage(
+                        Box::default(),
+                    )),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
@@ -3147,18 +3153,16 @@ mod tests {
         #[test]
         fn native_flow_without_buttons_returns_none() {
             let msg = wa::Message {
-                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
-                    interactive_message: Some(
-                        interactive_message::InteractiveMessage::NativeFlowMessage(
-                            NativeFlowMessage {
-                                buttons: vec![],
-                                message_version: Some(1),
-                                message_params_json: None,
-                            },
-                        ),
-                    ),
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
+                    interactiveMessage: Some(InteractiveMessageOneof::NativeFlowMessage(Box::new(
+                        NativeFlowMessage {
+                            buttons: vec![],
+                            message_version: Some(1),
+                            ..Default::default()
+                        },
+                    ))),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
@@ -3168,21 +3172,19 @@ mod tests {
         #[test]
         fn button_without_name_returns_none() {
             let msg = wa::Message {
-                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
-                    interactive_message: Some(
-                        interactive_message::InteractiveMessage::NativeFlowMessage(
-                            NativeFlowMessage {
-                                buttons: vec![NativeFlowButton {
-                                    name: None,
-                                    button_params_json: None,
-                                }],
-                                message_version: Some(1),
-                                message_params_json: None,
-                            },
-                        ),
-                    ),
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
+                    interactiveMessage: Some(InteractiveMessageOneof::NativeFlowMessage(Box::new(
+                        NativeFlowMessage {
+                            buttons: vec![NativeFlowButton {
+                                name: None,
+                                ..Default::default()
+                            }],
+                            message_version: Some(1),
+                            ..Default::default()
+                        },
+                    ))),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
@@ -3193,27 +3195,27 @@ mod tests {
         #[test]
         fn document_with_caption_wrapper() {
             let inner = wa::Message {
-                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
-                    interactive_message: Some(
-                        interactive_message::InteractiveMessage::NativeFlowMessage(
-                            NativeFlowMessage {
-                                buttons: vec![NativeFlowButton {
-                                    name: Some("quick_reply".into()),
-                                    button_params_json: None,
-                                }],
-                                message_version: Some(1),
-                                message_params_json: None,
-                            },
-                        ),
-                    ),
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
+                    interactiveMessage: Some(InteractiveMessageOneof::NativeFlowMessage(Box::new(
+                        NativeFlowMessage {
+                            buttons: vec![NativeFlowButton {
+                                name: Some("quick_reply".into()),
+                                ..Default::default()
+                            }],
+                            message_version: Some(1),
+                            ..Default::default()
+                        },
+                    ))),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             let msg = wa::Message {
-                document_with_caption_message: Some(Box::new(wa::message::FutureProofMessage {
-                    message: Some(Box::new(inner)),
-                })),
+                document_with_caption_message: buffa::MessageField::some(
+                    wa::message::FutureProofMessage {
+                        message: buffa::MessageField::some(inner),
+                    },
+                ),
                 ..Default::default()
             };
             let biz = infer_biz_node(&msg, FIXED_NOW)
@@ -3536,8 +3538,8 @@ mod tests {
             .await;
     }
 
-    fn peer_test_account_proto() -> wa::AdvSignedDeviceIdentity {
-        wa::AdvSignedDeviceIdentity {
+    fn peer_test_account_proto() -> wa::ADVSignedDeviceIdentity {
+        wa::ADVSignedDeviceIdentity {
             details: Some(vec![0u8; 32]),
             account_signature_key: Some(vec![0u8; 32]),
             account_signature: Some(vec![0u8; 64]),
@@ -3596,18 +3598,18 @@ mod tests {
 
     fn pdo_request_message(request_type: wa::message::PeerDataOperationRequestType) -> wa::Message {
         wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
                 r#type: Some(
-                    wa::message::protocol_message::Type::PeerDataOperationRequestMessage as i32,
+                    wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE,
                 ),
-                peer_data_operation_request_message: Some(
+                peer_data_operation_request_message: buffa::MessageField::some(
                     wa::message::PeerDataOperationRequestMessage {
-                        peer_data_operation_request_type: Some(request_type as i32),
+                        peer_data_operation_request_type: Some(request_type),
                         ..Default::default()
                     },
                 ),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         }
     }
@@ -3622,7 +3624,7 @@ mod tests {
         let waiter = client
             .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
         let msg =
-            pdo_request_message(wa::message::PeerDataOperationRequestType::HistorySyncOnDemand);
+            pdo_request_message(wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND);
 
         let result = client
             .send_message_impl(
@@ -3675,7 +3677,7 @@ mod tests {
         let waiter = client
             .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
         let msg =
-            pdo_request_message(wa::message::PeerDataOperationRequestType::HistorySyncOnDemand);
+            pdo_request_message(wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND);
 
         // Poll is never the type for this message; it can only come from the override.
         let result = client

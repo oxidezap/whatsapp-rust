@@ -12,6 +12,7 @@ aes = { workspace = true }
 arrayref = "0.3.9"
 async-lock = { workspace = true }
 async-trait = { workspace = true }
+buffa = { workspace = true }
 bytes = { workspace = true }
 cbc = { version = "0.2", features = ["alloc"] }
 chrono = { workspace = true, features = ["now"] }
@@ -24,7 +25,6 @@ hex = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
 log = { workspace = true }
-prost = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["alloc"] }
 sha1 = { workspace = true }

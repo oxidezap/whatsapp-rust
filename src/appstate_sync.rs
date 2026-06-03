@@ -7,7 +7,7 @@ mod tests {
     use super::*;
     use async_lock::Mutex;
     use async_trait::async_trait;
-    use prost::Message;
+    use buffa::Message;
     use std::collections::HashMap;
     use std::sync::Arc;
     use wacore::appstate::WAPATCH_INTEGRITY;
@@ -291,15 +291,15 @@ mod tests {
         value_blob.extend_from_slice(&value_mac);
 
         wa::SyncdMutation {
-            operation: Some(op as i32),
-            record: Some(wa::SyncdRecord {
-                index: Some(wa::SyncdIndex {
+            operation: Some(op),
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
                     blob: Some(index_mac.to_vec()),
                 }),
-                value: Some(wa::SyncdValue {
+                value: buffa::MessageField::some(wa::SyncdValue {
                     blob: Some(value_blob),
                 }),
-                key_id: Some(wa::KeyId {
+                key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id_bytes.to_vec()),
                 }),
             }),
@@ -327,7 +327,7 @@ mod tests {
             .expect("test backend should accept sync key");
 
         let original_plaintext = wa::SyncActionData {
-            value: Some(wa::SyncActionValue {
+            value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(1000),
                 ..Default::default()
             }),
@@ -335,7 +335,7 @@ mod tests {
         }
         .encode_to_vec();
         let original_mutation = create_encrypted_mutation(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &original_plaintext,
             &keys,
@@ -356,8 +356,10 @@ mod tests {
 
         let original_value_blob = original_mutation
             .record
+            .into_option()
             .expect("mutation should have record")
             .value
+            .into_option()
             .expect("record should have value")
             .blob
             .expect("value should have blob");
@@ -375,7 +377,7 @@ mod tests {
             .expect("test backend should accept mutation MACs");
 
         let new_plaintext = wa::SyncActionData {
-            value: Some(wa::SyncActionValue {
+            value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(2000),
                 ..Default::default()
             }),
@@ -383,7 +385,7 @@ mod tests {
         }
         .encode_to_vec();
         let overwrite_mutation = create_encrypted_mutation(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &new_plaintext,
             &keys,
@@ -395,8 +397,8 @@ mod tests {
             has_more_patches: false,
             patches: vec![wa::SyncdPatch {
                 mutations: vec![overwrite_mutation.clone()],
-                version: Some(wa::SyncdVersion { version: Some(2) }),
-                key_id: Some(wa::KeyId {
+                version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
+                key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id_bytes),
                 }),
                 ..Default::default()
@@ -418,8 +420,10 @@ mod tests {
         let mut expected_state = initial_state.clone();
         let new_value_blob = overwrite_mutation
             .record
+            .into_option()
             .expect("mutation should have record")
             .value
+            .into_option()
             .expect("record should have value")
             .blob
             .expect("value should have blob");

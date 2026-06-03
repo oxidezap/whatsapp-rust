@@ -35,7 +35,7 @@ impl Default for ClientProfile {
 impl ClientProfile {
     pub fn web() -> Self {
         Self {
-            user_agent_platform: wa::client_payload::user_agent::Platform::Web,
+            user_agent_platform: wa::client_payload::user_agent::Platform::WEB,
             device: "Desktop".to_string(),
             os_version: "0.1.0".to_string(),
             manufacturer: String::new(),
@@ -49,7 +49,7 @@ impl ClientProfile {
 
     pub fn android(os_version: impl Into<String>) -> Self {
         Self {
-            user_agent_platform: wa::client_payload::user_agent::Platform::Android,
+            user_agent_platform: wa::client_payload::user_agent::Platform::ANDROID,
             device: "Smartphone".to_string(),
             os_version: os_version.into(),
             manufacturer: String::new(),
@@ -63,7 +63,7 @@ impl ClientProfile {
 
     pub fn smb_android(os_version: impl Into<String>) -> Self {
         Self {
-            user_agent_platform: wa::client_payload::user_agent::Platform::SmbAndroid,
+            user_agent_platform: wa::client_payload::user_agent::Platform::SMB_ANDROID,
             device: "Smartphone".to_string(),
             os_version: os_version.into(),
             manufacturer: String::new(),
@@ -77,7 +77,7 @@ impl ClientProfile {
 
     pub fn ios(os_version: impl Into<String>) -> Self {
         Self {
-            user_agent_platform: wa::client_payload::user_agent::Platform::Ios,
+            user_agent_platform: wa::client_payload::user_agent::Platform::IOS,
             device: "iPhone".to_string(),
             os_version: os_version.into(),
             manufacturer: "Apple".to_string(),
@@ -91,7 +91,7 @@ impl ClientProfile {
 
     pub fn macos(os_version: impl Into<String>) -> Self {
         Self {
-            user_agent_platform: wa::client_payload::user_agent::Platform::Macos,
+            user_agent_platform: wa::client_payload::user_agent::Platform::MACOS,
             device: "Desktop".to_string(),
             os_version: os_version.into(),
             manufacturer: "Apple".to_string(),
@@ -105,7 +105,7 @@ impl ClientProfile {
 
     pub fn windows(os_version: impl Into<String>) -> Self {
         Self {
-            user_agent_platform: wa::client_payload::user_agent::Platform::Windows,
+            user_agent_platform: wa::client_payload::user_agent::Platform::WINDOWS,
             device: "Desktop".to_string(),
             os_version: os_version.into(),
             manufacturer: String::new(),
@@ -127,7 +127,7 @@ mod tests {
         let p = ClientProfile::web();
         assert_eq!(
             p.user_agent_platform,
-            wa::client_payload::user_agent::Platform::Web
+            wa::client_payload::user_agent::Platform::WEB
         );
         assert_eq!(p.device, "Desktop");
         assert_eq!(p.os_version, "0.1.0");
@@ -140,7 +140,7 @@ mod tests {
         let p = ClientProfile::android("13");
         assert_eq!(
             p.user_agent_platform,
-            wa::client_payload::user_agent::Platform::Android
+            wa::client_payload::user_agent::Platform::ANDROID
         );
         assert_eq!(p.os_version, "13");
         assert!(!p.include_web_info);
@@ -151,7 +151,7 @@ mod tests {
         let p = ClientProfile::smb_android("14");
         assert_eq!(
             p.user_agent_platform,
-            wa::client_payload::user_agent::Platform::SmbAndroid
+            wa::client_payload::user_agent::Platform::SMB_ANDROID
         );
         assert!(!p.include_web_info);
     }
@@ -161,7 +161,7 @@ mod tests {
         let p = ClientProfile::ios("17.4");
         assert_eq!(
             p.user_agent_platform,
-            wa::client_payload::user_agent::Platform::Ios
+            wa::client_payload::user_agent::Platform::IOS
         );
         assert_eq!(p.manufacturer, "Apple");
         assert!(!p.include_web_info);

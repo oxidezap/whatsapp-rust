@@ -1,6 +1,6 @@
 use crate::hash::generate_content_mac;
 use crate::keys::ExpandedAppStateKeys;
-use prost::Message;
+use buffa::Message;
 use wacore_libsignal::crypto::{CryptographicMac, aes_256_cbc_encrypt_into};
 use waproto::whatsapp as wa;
 
@@ -23,7 +23,7 @@ pub fn encode_record(
     // 1. Build SyncActionData
     let action_data = wa::SyncActionData {
         index: Some(index.to_vec()),
-        value: Some(value.clone()),
+        value: buffa::MessageField::some(value.clone()),
         padding: Some(vec![]),
         version: Some(1),
     };
@@ -56,20 +56,20 @@ pub fn encode_record(
 
     // 7. Build the record
     let record = wa::SyncdRecord {
-        index: Some(wa::SyncdIndex {
+        index: buffa::MessageField::some(wa::SyncdIndex {
             blob: Some(index_mac),
         }),
-        value: Some(wa::SyncdValue {
+        value: buffa::MessageField::some(wa::SyncdValue {
             blob: Some(value_blob),
         }),
-        key_id: Some(wa::KeyId {
+        key_id: buffa::MessageField::some(wa::KeyId {
             id: Some(key_id.to_vec()),
         }),
     };
 
     let mutation = wa::SyncdMutation {
-        operation: Some(operation as i32),
-        record: Some(record),
+        operation: Some(operation),
+        record: buffa::MessageField::some(record),
     };
 
     (mutation, value_mac)
@@ -90,7 +90,7 @@ mod tests {
 
         let index = b"[\"setting_pushName\"]";
         let value = wa::SyncActionValue {
-            push_name_setting: Some(wa::sync_action_value::PushNameSetting {
+            push_name_setting: buffa::MessageField::some(wa::sync_action_value::PushNameSetting {
                 name: Some("Test User".to_string()),
             }),
             timestamp: Some(1234567890),
@@ -98,7 +98,7 @@ mod tests {
         };
 
         let (mutation, _value_mac) = encode_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             index,
             &value,
             &keys,
@@ -107,9 +107,9 @@ mod tests {
         );
 
         // Decode the encoded record
-        let record = mutation.record.as_ref().unwrap();
+        let record = &*mutation.record;
         let (decoded, _macs) = decode_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             record,
             &keys,
             key_id,
@@ -125,11 +125,11 @@ mod tests {
             decoded
                 .action_value
                 .as_ref()
-                .and_then(|v| v.push_name_setting.as_ref())
+                .and_then(|v| v.push_name_setting.as_option())
                 .and_then(|p| p.name.as_deref()),
             Some("Test User")
         );
         assert_eq!(decoded.index, vec!["setting_pushName"]);
-        assert_eq!(decoded.operation, wa::syncd_mutation::SyncdOperation::Set);
+        assert_eq!(decoded.operation, wa::syncd_mutation::SyncdOperation::SET);
     }
 }

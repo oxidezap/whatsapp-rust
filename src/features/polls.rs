@@ -58,31 +58,26 @@ impl<'a> Polls<'a> {
             .iter()
             .map(|name| wa::message::poll_creation_message::Option {
                 option_name: Some(name.clone()),
-                option_hash: None,
+                ..Default::default()
             })
             .collect();
 
         let poll_msg = wa::message::PollCreationMessage {
-            enc_key: None,
             name: Some(name.to_string()),
             options: poll_options,
             selectable_options_count: Some(selectable_count),
-            context_info: None,
-            poll_content_type: None,
-            poll_type: None,
-            correct_answer: None,
             ..Default::default()
         };
 
         // WA Web: v3 for single-select, v1 for multi-select (GeneratePollCreationMessageProto.js:39-41)
         let mut message = if selectable_count == 1 {
             wa::Message {
-                poll_creation_message_v3: Some(Box::new(poll_msg)),
+                poll_creation_message_v3: buffa::MessageField::some(poll_msg),
                 ..Default::default()
             }
         } else {
             wa::Message {
-                poll_creation_message: Some(Box::new(poll_msg)),
+                poll_creation_message: buffa::MessageField::some(poll_msg),
                 ..Default::default()
             }
         };
@@ -96,7 +91,7 @@ impl<'a> Polls<'a> {
             secret
         };
 
-        message.message_context_info = Some(wa::MessageContextInfo {
+        message.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(message_secret.clone()),
             ..Default::default()
         });
@@ -142,7 +137,7 @@ impl<'a> Polls<'a> {
         let from_me = my_base.is_same_user_as(poll_creator_jid);
 
         let poll_update = wa::message::PollUpdateMessage {
-            poll_creation_message_key: Some(wa::MessageKey {
+            poll_creation_message_key: buffa::MessageField::some(wa::MessageKey {
                 remote_jid: Some(chat_jid.to_string()),
                 from_me: Some(from_me),
                 id: Some(poll_msg_id.to_string()),
@@ -152,16 +147,16 @@ impl<'a> Polls<'a> {
                     None
                 },
             }),
-            vote: Some(wa::message::PollEncValue {
+            vote: buffa::MessageField::some(wa::message::PollEncValue {
                 enc_payload: Some(enc_payload),
                 enc_iv: Some(iv.to_vec()),
             }),
-            metadata: Some(wa::message::PollUpdateMessageMetadata {}),
+            metadata: buffa::MessageField::some(wa::message::PollUpdateMessageMetadata {}),
             sender_timestamp_ms: Some(wacore::time::now_millis()),
         };
 
         let message = wa::Message {
-            poll_update_message: Some(poll_update),
+            poll_update_message: buffa::MessageField::some(poll_update),
             ..Default::default()
         };
 
@@ -275,21 +270,18 @@ impl<'a> Polls<'a> {
         let creator_str = creator.to_string();
         let creator_alt = self.swapped_user(&creator).await;
 
-        // Keyed by canonical (LID-preferred) identity; value holds the
-        // as-received JID for the reported voters list. Last-vote-wins.
-        let mut latest_votes: HashMap<String, (String, Vec<Vec<u8>>)> =
+        // Keyed by canonical (LID-preferred) identity. The optional display JID
+        // is only stored when it differs from the key. Last-vote-wins.
+        let mut latest_votes: HashMap<String, (Option<String>, Vec<usize>)> =
             HashMap::with_capacity(votes.len());
         for (voter_jid, enc_payload, enc_iv) in votes {
             let voter = voter_jid.to_non_ad();
             let voter_str = voter.to_string();
             let voter_alt = self.swapped_user(&voter).await;
             let fallback = Self::build_fallback(&creator_alt, &voter_alt);
-            let canonical_voter = if voter.is_lid() {
-                voter_str.clone()
-            } else {
-                voter_alt.clone().unwrap_or_else(|| voter_str.clone())
-            };
-            match poll::decrypt_poll_vote_with_fallback(
+            let mut selected_count = 0usize;
+            let mut selected_indices = Vec::new();
+            match poll::visit_decrypted_poll_vote_with_fallback(
                 enc_payload,
                 enc_iv,
                 message_secret,
@@ -299,12 +291,27 @@ impl<'a> Polls<'a> {
                     voter_jid: &voter_str,
                 },
                 fallback,
+                |hash| {
+                    selected_count += 1;
+                    if let Ok(hash_arr) = <[u8; 32]>::try_from(hash)
+                        && let Some(idx) = option_hashes.iter().position(|(h, _)| *h == hash_arr)
+                    {
+                        selected_indices.push(idx);
+                    }
+                },
             ) {
-                Ok(selected_hashes) => {
-                    if selected_hashes.is_empty() {
-                        latest_votes.remove(&canonical_voter);
+                Ok(()) => {
+                    let (canonical_voter, display_jid) = if voter.is_lid() {
+                        (voter_str, None)
+                    } else if let Some(alt) = voter_alt {
+                        (alt, Some(voter_str))
                     } else {
-                        latest_votes.insert(canonical_voter, (voter_str, selected_hashes));
+                        (voter_str, None)
+                    };
+                    if selected_count == 0 {
+                        latest_votes.remove(canonical_voter.as_str());
+                    } else {
+                        latest_votes.insert(canonical_voter, (display_jid, selected_indices));
                     }
                 }
                 Err(e) => {
@@ -321,13 +328,13 @@ impl<'a> Polls<'a> {
             })
             .collect();
 
-        for (display_jid, selected_hashes) in latest_votes.values() {
-            for hash in selected_hashes {
-                if let Ok(hash_arr) = <[u8; 32]>::try_from(hash.as_slice())
-                    && let Some(idx) = option_hashes.iter().position(|(h, _)| *h == hash_arr)
-                {
-                    results[idx].voters.push(display_jid.clone());
+        for (canonical_jid, (display_jid, selected_indices)) in latest_votes {
+            let display_jid = display_jid.unwrap_or(canonical_jid);
+            if let Some((last_idx, prefix_indices)) = selected_indices.split_last() {
+                for idx in prefix_indices {
+                    results[*idx].voters.push(display_jid.clone());
                 }
+                results[*last_idx].voters.push(display_jid);
             }
         }
 

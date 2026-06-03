@@ -18,7 +18,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: never
   IAI_CALLGRIND_COLOR: never
-  PROTOC_VERSION: "3.25.3"
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
 
@@ -33,10 +32,10 @@ jobs:
         with:
           toolchain: nightly-2026-04-05
 
-      - name: Install tools (protoc, valgrind, iai-callgrind-runner)
+      - name: Install tools (valgrind, iai-callgrind-runner)
         uses: taiki-e/install-action@v2
         with:
-          tool: protoc@${{ env.PROTOC_VERSION }},valgrind,iai-callgrind-runner@0.16.1
+          tool: valgrind,iai-callgrind-runner@0.16.1
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9

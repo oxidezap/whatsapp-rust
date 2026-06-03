@@ -89,36 +89,35 @@ pub const fn companion_web_client_type_for_platform(
     use CompanionWebClientType as C;
     use wa::device_props::PlatformType as P;
     match pt {
-        P::Chrome => C::Chrome,
-        P::Firefox => C::Firefox,
-        P::Ie => C::Ie,
-        P::Opera => C::Opera,
-        P::Safari => C::Safari,
-        P::Edge => C::Edge,
-        P::Desktop => C::Electron,
-        P::Uwp => C::Uwp,
-        P::AndroidPhone | P::AndroidTablet | P::AndroidAmbiguous => C::Chrome,
-        P::Unknown
-        | P::Ipad
-        | P::Ohana
-        | P::Aloha
-        | P::Catalina
-        | P::TclTv
-        | P::IosPhone
-        | P::IosCatalyst
-        | P::WearOs
-        | P::ArWrist
-        | P::ArDevice
-        | P::Vr
-        | P::CloudApi
-        | P::Smartglasses => C::OtherWebClient,
+        P::CHROME => C::Chrome,
+        P::FIREFOX => C::Firefox,
+        P::IE => C::Ie,
+        P::OPERA => C::Opera,
+        P::SAFARI => C::Safari,
+        P::EDGE => C::Edge,
+        P::DESKTOP => C::Electron,
+        P::UWP => C::Uwp,
+        P::ANDROID_PHONE | P::ANDROID_TABLET | P::ANDROID_AMBIGUOUS => C::Chrome,
+        P::UNKNOWN
+        | P::IPAD
+        | P::OHANA
+        | P::ALOHA
+        | P::CATALINA
+        | P::TCL_TV
+        | P::IOS_PHONE
+        | P::IOS_CATALYST
+        | P::WEAR_OS
+        | P::AR_WRIST
+        | P::AR_DEVICE
+        | P::VR
+        | P::CLOUD_API
+        | P::SMARTGLASSES => C::OtherWebClient,
     }
 }
 
 pub fn companion_web_client_type_for_props(props: &wa::DeviceProps) -> CompanionWebClientType {
     props
         .platform_type
-        .and_then(|v| wa::device_props::PlatformType::try_from(v).ok())
         .map(companion_web_client_type_for_platform)
         .unwrap_or(CompanionWebClientType::OtherWebClient)
 }
@@ -187,14 +186,14 @@ mod tests {
         use CompanionWebClientType as C;
         use wa::device_props::PlatformType as P;
         for (pt, expected) in [
-            (P::Chrome, C::Chrome),
-            (P::Firefox, C::Firefox),
-            (P::Edge, C::Edge),
-            (P::Safari, C::Safari),
-            (P::Opera, C::Opera),
-            (P::Ie, C::Ie),
-            (P::Desktop, C::Electron),
-            (P::Uwp, C::Uwp),
+            (P::CHROME, C::Chrome),
+            (P::FIREFOX, C::Firefox),
+            (P::EDGE, C::Edge),
+            (P::SAFARI, C::Safari),
+            (P::OPERA, C::Opera),
+            (P::IE, C::Ie),
+            (P::DESKTOP, C::Electron),
+            (P::UWP, C::Uwp),
         ] {
             assert_eq!(
                 companion_web_client_type_for_platform(pt),
@@ -208,7 +207,7 @@ mod tests {
     fn android_platform_types_map_to_chrome() {
         use CompanionWebClientType as C;
         use wa::device_props::PlatformType as P;
-        for pt in [P::AndroidPhone, P::AndroidTablet, P::AndroidAmbiguous] {
+        for pt in [P::ANDROID_PHONE, P::ANDROID_TABLET, P::ANDROID_AMBIGUOUS] {
             assert_eq!(
                 companion_web_client_type_for_platform(pt),
                 C::Chrome,
@@ -222,19 +221,19 @@ mod tests {
         use CompanionWebClientType as C;
         use wa::device_props::PlatformType as P;
         for pt in [
-            P::Ipad,
-            P::IosPhone,
-            P::IosCatalyst,
-            P::WearOs,
-            P::ArWrist,
-            P::ArDevice,
-            P::Vr,
-            P::Ohana,
-            P::Aloha,
-            P::Catalina,
-            P::TclTv,
-            P::CloudApi,
-            P::Smartglasses,
+            P::IPAD,
+            P::IOS_PHONE,
+            P::IOS_CATALYST,
+            P::WEAR_OS,
+            P::AR_WRIST,
+            P::AR_DEVICE,
+            P::VR,
+            P::OHANA,
+            P::ALOHA,
+            P::CATALINA,
+            P::TCL_TV,
+            P::CLOUD_API,
+            P::SMARTGLASSES,
         ] {
             assert_eq!(
                 companion_web_client_type_for_platform(pt),
@@ -249,7 +248,7 @@ mod tests {
         use CompanionWebClientType as C;
         use wa::device_props::PlatformType as P;
         assert_eq!(
-            companion_web_client_type_for_platform(P::Unknown),
+            companion_web_client_type_for_platform(P::UNKNOWN),
             C::OtherWebClient,
         );
     }
@@ -264,7 +263,7 @@ mod tests {
     #[test]
     fn for_props_reads_platform_type() {
         let props = wa::DeviceProps {
-            platform_type: Some(wa::device_props::PlatformType::Chrome as i32),
+            platform_type: Some(wa::device_props::PlatformType::CHROME),
             ..Default::default()
         };
         assert_eq!(
@@ -284,10 +283,9 @@ mod tests {
 
     #[test]
     fn for_props_invalid_platform_type_is_other_web_client() {
-        let props = wa::DeviceProps {
-            platform_type: Some(9999),
-            ..Default::default()
-        };
+        use buffa::Message as _;
+
+        let props = wa::DeviceProps::decode_from_slice(&[0x18, 0x8f, 0x4e]).unwrap();
         assert_eq!(
             companion_web_client_type_for_props(&props),
             CompanionWebClientType::OtherWebClient,
