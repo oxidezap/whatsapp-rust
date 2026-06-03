@@ -36,6 +36,31 @@ pub(crate) mod stanza {
     pub const ENC_TYPE_MSG: &str = "msg";
     pub const ENC_TYPE_PKMSG: &str = "pkmsg";
     pub const ENC_TYPE_SKMSG: &str = "skmsg";
+    pub const MSG_TYPE_PAY: &str = "pay";
+}
+
+/// Type-safe `<message type="...">` value for the send-time override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StanzaType {
+    Text,
+    Media,
+    Reaction,
+    Poll,
+    Event,
+    Pay,
+}
+
+impl StanzaType {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Text => stanza::MSG_TYPE_TEXT,
+            Self::Media => stanza::MSG_TYPE_MEDIA,
+            Self::Reaction => stanza::MSG_TYPE_REACTION,
+            Self::Poll => stanza::MSG_TYPE_POLL,
+            Self::Event => stanza::MSG_TYPE_EVENT,
+            Self::Pay => stanza::MSG_TYPE_PAY,
+        }
+    }
 }
 
 /// Extract (enc_type, is_prekey, serialized) from a CiphertextMessage.
@@ -143,6 +168,14 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
         || msg.newsletter_follower_invite_message_v2.is_some()
         || msg.message_history_notice.is_some()
         || msg.album_message.is_some()
+        // Payment family. WA Web's typeAttributeFromProtobuf leaves these at the media
+        // default, but media-without-mediatype is dropped by the server (so is a bare
+        // "pay" stanza); text is what delivers and renders on Android.
+        || msg.request_payment_message.is_some()
+        || msg.send_payment_message.is_some()
+        || msg.payment_invite_message.is_some()
+        || msg.decline_payment_request_message.is_some()
+        || msg.cancel_payment_request_message.is_some()
     {
         return stanza::MSG_TYPE_TEXT;
     }
@@ -4279,21 +4312,34 @@ mod tests {
         }
 
         #[test]
-        fn request_payment_carries_no_mediatype_and_is_not_text() {
-            // request_payment_message is absent from WA Web's typeAttributeFromProtobuf
-            // (it only maps to the internal MSG_TYPE.PAYMENT enum, not the wire `type`)
-            // and carries no mediatype. WA Web's classifier defaults it to "media", but
-            // a media stanza without a `mediatype` attribute is dropped by the server,
-            // so WA Web does not send request_payment_message standalone through this
-            // path. Pin the two stable facts — no mediatype, and not misclassified as
-            // text (the bug this PR removes) — rather than hardening that droppable
-            // "media" wire shape as if it were a valid send.
-            let m = wa::Message {
-                request_payment_message: Some(Box::default()),
-                ..Default::default()
-            };
-            assert_eq!(media_type_from_message(&m), None);
-            assert_ne!(stanza_type_from_message(&m), stanza::MSG_TYPE_TEXT);
+        fn payment_family_is_text() {
+            // Payment family classifies as text; the media default would be dropped.
+            let cases = [
+                wa::Message {
+                    request_payment_message: Some(Box::default()),
+                    ..Default::default()
+                },
+                wa::Message {
+                    send_payment_message: Some(Box::default()),
+                    ..Default::default()
+                },
+                wa::Message {
+                    decline_payment_request_message: Some(Default::default()),
+                    ..Default::default()
+                },
+                wa::Message {
+                    cancel_payment_request_message: Some(Default::default()),
+                    ..Default::default()
+                },
+                wa::Message {
+                    payment_invite_message: Some(Default::default()),
+                    ..Default::default()
+                },
+            ];
+            for m in cases {
+                assert_eq!(media_type_from_message(&m), None);
+                assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_TEXT);
+            }
         }
 
         #[test]

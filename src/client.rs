@@ -3189,6 +3189,7 @@ impl Client {
             false,
             None,
             vec![],
+            None,
         )
         .await?;
         Ok(())
@@ -3823,6 +3824,7 @@ impl Client {
             false,
             Some(crate::types::message::EditAttribute::MessageEdit),
             vec![],
+            None,
         )
         .await?;
 

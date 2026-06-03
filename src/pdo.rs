@@ -243,6 +243,7 @@ impl Client {
             false, // is_retry
             None,
             vec![], // No extra stanza nodes for peer messages
+            None,
         )
         .await?;
 

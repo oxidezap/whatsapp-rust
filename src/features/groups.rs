@@ -811,7 +811,16 @@ impl<'a> Groups<'a> {
         }
         let msg = wacore::send::build_member_label_message(label.into(), wacore::time::now_secs());
         self.client
-            .send_message_impl(group_jid.clone(), &msg, None, false, false, None, vec![])
+            .send_message_impl(
+                group_jid.clone(),
+                &msg,
+                None,
+                false,
+                false,
+                None,
+                vec![],
+                None,
+            )
             .await
     }
 
