@@ -14,8 +14,9 @@
 //! continuation per cycle, just as WA Web's `$6` timer coalesces
 //! synchronously-arriving stanzas into one `$13` call.
 
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use log::{debug, warn};
