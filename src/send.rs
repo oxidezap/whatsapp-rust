@@ -3677,7 +3677,7 @@ mod tests {
         let waiter = client
             .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
         let msg =
-            pdo_request_message(wa::message::PeerDataOperationRequestType::HistorySyncOnDemand);
+            pdo_request_message(wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND);
 
         // Poll is never the type for this message; it can only come from the override.
         let result = client

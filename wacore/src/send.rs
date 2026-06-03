@@ -134,12 +134,8 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
     if msg.event_message.is_set() || msg.enc_event_response_message.is_set() {
         return stanza::MSG_TYPE_EVENT;
     }
-    if msg.secret_encrypted_message.is_set() {
+    if let Some(sec) = msg.secret_encrypted_message.as_option() {
         use wa::message::secret_encrypted_message::SecretEncType;
-        let sec = msg
-            .secret_encrypted_message
-            .as_option()
-            .expect("checked is_set");
         match sec.secret_enc_type {
             Some(SecretEncType::EVENT_EDIT) => return stanza::MSG_TYPE_EVENT,
             Some(SecretEncType::MESSAGE_EDIT) => return stanza::MSG_TYPE_TEXT,

@@ -1263,6 +1263,21 @@ impl Client {
             }
         };
 
+        // The handshake can take seconds; a concurrent `disconnect()` /
+        // `signal_shutdown_sync()` may have fired in that window. If so, bail
+        // before `reset_connection_shutdown()` (which would clobber the fresh
+        // shutdown signal) and before installing the socket — otherwise we'd
+        // resurrect a connection that was just torn down.
+        if !self.is_running.load(Ordering::Relaxed)
+            || self.expected_disconnect.load(Ordering::Relaxed)
+        {
+            debug!("Shutdown requested during handshake; aborting connect before socket install.");
+            transport.disconnect().await;
+            return Err(anyhow!(
+                "connect aborted: shutdown requested during handshake"
+            ));
+        }
+
         // Fresh per-connection shutdown so subscribers registered during this
         // connection see a clean signal; the previous notifier was already
         // fired on the prior cleanup_connection_state.

@@ -1334,7 +1334,14 @@ impl Client {
                                 .handle(client_clone, &enc_node_owned, &info_arc)
                                 .await
                             {
-                                log::warn!("Custom enc handler failed: {e:?}");
+                                // Read the type from the already-moved node so the
+                                // diagnostic keeps the enc type without an extra alloc.
+                                let enc_type = enc_node_owned
+                                    .attrs
+                                    .get("type")
+                                    .map(|v| v.as_str())
+                                    .unwrap_or(std::borrow::Cow::Borrowed("?"));
+                                log::warn!("Custom handler for enc type '{enc_type}' failed: {e:?}");
                             }
                         }))
                         .detach();

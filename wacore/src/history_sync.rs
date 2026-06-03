@@ -97,15 +97,13 @@ pub fn process_history_sync(
                 pos += vlen;
                 let end = checked_end(pos, len, buf.len(), "conversation")?;
 
-                // Best-effort: a malformed conversation must not abort the sync.
-                if let Ok(conversation) = wa::HsConversationExtractView::decode_view(&buf[pos..end])
+                // Best-effort per-message scan: a malformed conversation (or a
+                // single bad message inside it) must not abort the sync.
+                result.conversations_processed += 1;
+                if let Some(candidate) =
+                    extract_conversation_fields(&buf[pos..end], &mut result.msg_secret_records)
                 {
-                    result.conversations_processed += 1;
-                    if let Some(candidate) =
-                        extract_conversation_fields(&conversation, &mut result.msg_secret_records)
-                    {
-                        result.tc_token_candidates.push(candidate);
-                    }
+                    result.tc_token_candidates.push(candidate);
                 }
                 pos = end;
             }
@@ -208,17 +206,12 @@ fn process_history_sync_streaming(
                     match field_number {
                         // conversations (repeated)
                         2 => {
-                            // Best-effort: skip a malformed conversation (reader still advances).
-                            if let Ok(conversation) =
-                                wa::HsConversationExtractView::decode_view(value)
+                            // Best-effort per-message scan (reader still advances).
+                            result.conversations_processed += 1;
+                            if let Some(candidate) =
+                                extract_conversation_fields(value, &mut result.msg_secret_records)
                             {
-                                result.conversations_processed += 1;
-                                if let Some(candidate) = extract_conversation_fields(
-                                    &conversation,
-                                    &mut result.msg_secret_records,
-                                ) {
-                                    result.tc_token_candidates.push(candidate);
-                                }
+                                result.tc_token_candidates.push(candidate);
                             }
                         }
                         // pushnames (repeated) — only our own is needed
@@ -395,92 +388,170 @@ pub struct HistoryMsgSecretRecord {
     pub is_bot_invocation: bool,
 }
 
-/// Appends this conversation's message-secret records directly into `records`
-/// (no per-conversation Vec) and returns its tctoken candidate, if any.
+/// Scan one conversation's raw protobuf fields directly (HsConversationExtract
+/// tags: 1=id, 2=messages[], 21/22/28=tctoken) and decode each message (field 2)
+/// as a view ONE AT A TIME, appending its secret record into `records`. Returns
+/// the conversation's tctoken candidate, if any.
+///
+/// Best-effort, mirroring the pre-buffa per-message decode: a single malformed
+/// message is skipped without discarding the rest of the conversation OR its
+/// tctoken. Decoding the whole conversation as one view (all-or-nothing) would
+/// drop every record + the tctoken on any single bad message, and would also
+/// materialize the entire conversation tree at once.
 fn extract_conversation_fields(
-    conv: &wa::HsConversationExtractView<'_>,
+    data: &[u8],
     records: &mut Vec<HistoryMsgSecretRecord>,
 ) -> Option<TcTokenCandidate> {
-    extract_msg_secret_records(conv, records);
-    extract_tc_token_fields(conv)
-}
+    let mut pos = 0;
+    // Field 1 (id) precedes messages/tctoken in tag order, so it is captured
+    // before any message is processed.
+    let mut chat_id: &str = "";
+    let mut tc_token: &[u8] = &[];
+    let mut tc_token_timestamp: Option<u64> = None;
+    let mut tc_token_sender_timestamp: Option<u64> = None;
 
-/// Returns `None` for groups, newsletters, bots, or conversations without tctokens.
-fn extract_tc_token_fields(conv: &wa::HsConversationExtractView<'_>) -> Option<TcTokenCandidate> {
-    let id = conv.id;
-    if id.is_empty() {
+    while pos < data.len() {
+        let Ok((tag, br)) = read_varint(&data[pos..]) else {
+            break;
+        };
+        pos += br;
+        let field = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+        match (field, wt) {
+            (1, wire_type::LENGTH_DELIMITED) => {
+                let Ok((len, vl)) = read_varint(&data[pos..]) else {
+                    break;
+                };
+                pos += vl;
+                let Ok(end) = checked_end(pos, len, data.len(), "conv-id") else {
+                    break;
+                };
+                // A real conversation id is a JID (always UTF-8); a non-UTF-8
+                // id means the whole conversation is malformed, so skip it
+                // rather than push records under an empty chat id. Field 1
+                // precedes field 2, so nothing has been extracted yet.
+                let Ok(id) = std::str::from_utf8(&data[pos..end]) else {
+                    return None;
+                };
+                chat_id = id;
+                pos = end;
+            }
+            (2, wire_type::LENGTH_DELIMITED) => {
+                let Ok((len, vl)) = read_varint(&data[pos..]) else {
+                    break;
+                };
+                pos += vl;
+                let Ok(end) = checked_end(pos, len, data.len(), "conv-msg") else {
+                    break;
+                };
+                // Decode this single message as a view; skip best-effort on a
+                // malformed one without aborting the conversation.
+                if let Ok(history_msg) =
+                    wa::HsHistorySyncMsgExtractView::decode_view(&data[pos..end])
+                {
+                    push_msg_secret_record(chat_id, &history_msg, records);
+                }
+                pos = end;
+            }
+            (21, wire_type::LENGTH_DELIMITED) => {
+                let Ok((len, vl)) = read_varint(&data[pos..]) else {
+                    break;
+                };
+                pos += vl;
+                let Ok(end) = checked_end(pos, len, data.len(), "conv-tctoken") else {
+                    break;
+                };
+                tc_token = &data[pos..end];
+                pos = end;
+            }
+            (22, wire_type::VARINT) => {
+                let Ok((v, vl)) = read_varint(&data[pos..]) else {
+                    break;
+                };
+                tc_token_timestamp = Some(v);
+                pos += vl;
+            }
+            (28, wire_type::VARINT) => {
+                let Ok((v, vl)) = read_varint(&data[pos..]) else {
+                    break;
+                };
+                tc_token_sender_timestamp = Some(v);
+                pos += vl;
+            }
+            _ => match skip_field(wt, data, pos) {
+                Ok(np) => pos = np,
+                Err(_) => break,
+            },
+        }
+    }
+
+    if chat_id.is_empty() {
         return None;
     }
 
-    // Early-out for non-1:1 conversations
-    if let Some(parts) = wacore_binary::jid::parse_jid_fast(id)
+    // tctoken candidate: only for 1:1 chats that actually carry a token.
+    if let Some(parts) = wacore_binary::jid::parse_jid_fast(chat_id)
         && (parts.server == "g.us" || parts.server == "newsletter" || parts.server == "bot")
     {
         return None;
     }
-
-    let tc_token = conv.tc_token.filter(|t| !t.is_empty())?.to_vec();
-    let tc_token_timestamp = conv.tc_token_timestamp?;
-
+    if tc_token.is_empty() {
+        return None;
+    }
     Some(TcTokenCandidate {
-        id: id.to_string(),
-        tc_token,
-        tc_token_timestamp,
-        tc_token_sender_timestamp: conv.tc_token_sender_timestamp,
+        id: chat_id.to_string(),
+        tc_token: tc_token.to_vec(),
+        tc_token_timestamp: tc_token_timestamp?,
+        tc_token_sender_timestamp,
     })
 }
 
-fn extract_msg_secret_records(
-    conv: &wa::HsConversationExtractView<'_>,
+/// Append a single message's secret record (if any) into `records`.
+fn push_msg_secret_record(
+    chat_id: &str,
+    history_msg: &wa::HsHistorySyncMsgExtractView<'_>,
     records: &mut Vec<HistoryMsgSecretRecord>,
 ) {
-    let chat_id = conv.id;
-    if chat_id.is_empty() {
+    let Some(web_msg) = history_msg.message.as_option() else {
+        return;
+    };
+    let Some(key) = web_msg.key.as_option() else {
+        return;
+    };
+    let Some(msg_id) = key.id else {
+        return;
+    };
+    if web_msg
+        .message
+        .as_option()
+        .is_some_and(message_is_forwarded)
+    {
         return;
     }
-
-    for history_msg in &conv.messages {
-        let Some(web_msg) = history_msg.message.as_option() else {
-            continue;
-        };
-        let Some(key) = web_msg.key.as_option() else {
-            continue;
-        };
-        let Some(msg_id) = key.id else {
-            continue;
-        };
-        if web_msg
+    let Some(secret) = web_msg.message_secret.or_else(|| {
+        web_msg
             .message
             .as_option()
-            .is_some_and(message_is_forwarded)
-        {
-            continue;
-        }
-        let Some(secret) = web_msg.message_secret.or_else(|| {
-            web_msg
-                .message
-                .as_option()
-                .and_then(extract_message_context_secret)
-        }) else {
-            continue;
-        };
+            .and_then(extract_message_context_secret)
+    }) else {
+        return;
+    };
 
-        let inner = web_msg.message.as_option();
-        let is_poll_or_event = inner.is_some_and(message_is_poll_or_event);
-        let is_bot_invocation = inner.is_some_and(message_invokes_bot);
+    let inner = web_msg.message.as_option();
+    let is_poll_or_event = inner.is_some_and(message_is_poll_or_event);
+    let is_bot_invocation = inner.is_some_and(message_invokes_bot);
 
-        records.push(HistoryMsgSecretRecord {
-            chat_id: chat_id.to_string(),
-            from_me: key.from_me == Some(true),
-            key_participant: key.participant.map(str::to_string),
-            web_msg_participant: web_msg.participant.map(str::to_string),
-            msg_id: msg_id.to_string(),
-            secret: secret.to_vec(),
-            timestamp: web_msg.message_timestamp,
-            is_poll_or_event,
-            is_bot_invocation,
-        });
-    }
+    records.push(HistoryMsgSecretRecord {
+        chat_id: chat_id.to_string(),
+        from_me: key.from_me == Some(true),
+        key_participant: key.participant.map(str::to_string),
+        web_msg_participant: web_msg.participant.map(str::to_string),
+        msg_id: msg_id.to_string(),
+        secret: secret.to_vec(),
+        timestamp: web_msg.message_timestamp,
+        is_poll_or_event,
+        is_bot_invocation,
+    });
 }
 
 /// Walk wrapper layers (deviceSent/ephemeral/viewOnce/etc.) to the innermost
@@ -782,6 +853,116 @@ mod tests {
         assert_eq!(result.msg_secret_records[1].msg_id, "HIST_CONTEXT");
         assert!(result.msg_secret_records[1].from_me);
         assert_eq!(result.msg_secret_records[1].secret, context_secret);
+    }
+
+    /// Regression: a single malformed message inside a conversation must NOT
+    /// discard the conversation's other message secrets or its tctoken. The
+    /// pre-fix code decoded the whole conversation as one view (all-or-nothing),
+    /// so one bad message dropped everything.
+    #[test]
+    fn malformed_message_does_not_drop_conversation_secrets_or_tctoken() {
+        let chat = "5511777776666@s.whatsapp.net";
+        let secret = vec![0x44u8; 32];
+        let tc_token = vec![0x99u8; 16];
+
+        // Hand-build the conversation bytes: id (1), a valid message (2), a
+        // CORRUPT message (2) with a length-delimited subfield whose declared
+        // length runs past its own bytes, then tctoken (21) + ts (22).
+        fn write_tag(buf: &mut Vec<u8>, field: u32, wt: u32) {
+            let tag = (field << 3) | wt;
+            let mut v = tag as u64;
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v != 0 {
+                    buf.push(b | 0x80);
+                } else {
+                    buf.push(b);
+                    break;
+                }
+            }
+        }
+        fn write_len(buf: &mut Vec<u8>, mut n: u64) {
+            loop {
+                let b = (n & 0x7f) as u8;
+                n >>= 7;
+                if n != 0 {
+                    buf.push(b | 0x80);
+                } else {
+                    buf.push(b);
+                    break;
+                }
+            }
+        }
+        fn write_ld(buf: &mut Vec<u8>, field: u32, payload: &[u8]) {
+            write_tag(buf, field, 2);
+            write_len(buf, payload.len() as u64);
+            buf.extend_from_slice(payload);
+        }
+
+        // A valid HsHistorySyncMsgExtract (field 1 = WebMessageInfo with key+secret).
+        let valid_msg = wa::HistorySyncMsg {
+            message: buffa::MessageField::some(wa::WebMessageInfo {
+                key: buffa::MessageField::some(wa::MessageKey {
+                    remote_jid: Some(chat.to_string()),
+                    from_me: Some(false),
+                    id: Some("GOOD_MSG".to_string()),
+                    participant: None,
+                }),
+                message_secret: Some(secret.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        // Corrupt message: field 1 (LEN) claims 50 bytes but only 1 follows.
+        let corrupt_msg = {
+            let mut m = Vec::new();
+            write_tag(&mut m, 1, 2);
+            write_len(&mut m, 50);
+            m.push(0x00);
+            m
+        };
+
+        let mut conv = Vec::new();
+        write_ld(&mut conv, 1, chat.as_bytes()); // id
+        write_ld(&mut conv, 2, &corrupt_msg); // bad message FIRST (worst case)
+        write_ld(&mut conv, 2, &valid_msg); // good message after the bad one
+        write_ld(&mut conv, 21, &tc_token); // tctoken
+        write_tag(&mut conv, 22, 0); // tctoken timestamp (varint)
+        write_len(&mut conv, 1_700_000_000);
+
+        // Wrap conv as HistorySync.conversations[0] (field 2).
+        let mut hs_bytes = Vec::new();
+        write_tag(&mut hs_bytes, 1, 0); // sync_type (varint)
+        write_len(
+            &mut hs_bytes,
+            wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP as u64,
+        );
+        write_ld(&mut hs_bytes, 2, &conv);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs_bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Both paths (full retain + streaming) must keep the good secret + tctoken.
+        for retain in [true, false] {
+            let result = process_history_sync(compressed.clone(), None, retain, None).unwrap();
+            assert_eq!(
+                result.msg_secret_records.len(),
+                1,
+                "good message secret must survive a malformed sibling (retain={retain})"
+            );
+            assert_eq!(result.msg_secret_records[0].msg_id, "GOOD_MSG");
+            assert_eq!(result.msg_secret_records[0].secret, secret);
+            assert_eq!(
+                result.tc_token_candidates.len(),
+                1,
+                "tctoken must survive a malformed message (retain={retain})"
+            );
+            assert_eq!(result.tc_token_candidates[0].tc_token, tc_token);
+        }
     }
 
     #[test]

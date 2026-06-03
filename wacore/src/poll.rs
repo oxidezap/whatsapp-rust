@@ -274,6 +274,12 @@ where
         message_secret,
         &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
     )?;
+    // Validate the entire plaintext BEFORE emitting anything: `visit` has
+    // observable side effects in the caller and the caller has a fallback path
+    // that re-runs this on failure. Without the dry first pass, a parse error
+    // partway through would leave the caller with partial emissions plus a
+    // fallback re-emit (duplicated/corrupt votes). The first scan makes this
+    // visit all-or-nothing; the plaintext is small so the double pass is cheap.
     scan_selected_options(&plaintext, |_| {})?;
     scan_selected_options(&plaintext, visit)
 }

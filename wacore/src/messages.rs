@@ -22,10 +22,17 @@ impl MessageUtils {
     }
 
     /// Encode + pad in a single pre-sized allocation.
+    ///
+    /// Runs ONE `compute_size` pass over the message tree and reuses its
+    /// `SizeCache` for the write. The previous `encoded_len()` + `encode()`
+    /// ran `compute_size` twice (once to size the buffer, once inside `encode`)
+    /// over the whole tree on this per-recipient send hot path.
     pub fn encode_and_pad(msg: &wa::Message) -> Vec<u8> {
         let pad = Self::random_pad_len();
-        let mut buf = Vec::with_capacity(msg.encoded_len() as usize + pad as usize);
-        msg.encode(&mut buf);
+        let mut cache = buffa::SizeCache::new();
+        let size = msg.compute_size(&mut cache) as usize;
+        let mut buf = Vec::with_capacity(size + pad as usize);
+        msg.write_to(&mut cache, &mut buf);
         buf.resize(buf.len() + pad as usize, pad);
         buf
     }

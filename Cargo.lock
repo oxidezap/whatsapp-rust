@@ -217,7 +217,7 @@ dependencies = [
 [[package]]
 name = "buffa"
 version = "0.7.0"
-source = "git+https://github.com/jlucaso1/buffa?branch=feat%2Foneof-attribute#fa1c33b58d4944cde94776695d642e8cf13f23bd"
+source = "git+https://github.com/jlucaso1/buffa?rev=fa1c33b58d4944cde94776695d642e8cf13f23bd#fa1c33b58d4944cde94776695d642e8cf13f23bd"
 dependencies = [
  "base64",
  "bytes",
@@ -234,7 +234,7 @@ dependencies = [
 [[package]]
 name = "buffa-build"
 version = "0.7.0"
-source = "git+https://github.com/jlucaso1/buffa?branch=feat%2Foneof-attribute#fa1c33b58d4944cde94776695d642e8cf13f23bd"
+source = "git+https://github.com/jlucaso1/buffa?rev=fa1c33b58d4944cde94776695d642e8cf13f23bd#fa1c33b58d4944cde94776695d642e8cf13f23bd"
 dependencies = [
  "buffa",
  "buffa-codegen",
@@ -244,7 +244,7 @@ dependencies = [
 [[package]]
 name = "buffa-codegen"
 version = "0.7.0"
-source = "git+https://github.com/jlucaso1/buffa?branch=feat%2Foneof-attribute#fa1c33b58d4944cde94776695d642e8cf13f23bd"
+source = "git+https://github.com/jlucaso1/buffa?rev=fa1c33b58d4944cde94776695d642e8cf13f23bd#fa1c33b58d4944cde94776695d642e8cf13f23bd"
 dependencies = [
  "buffa",
  "buffa-descriptor",
@@ -258,7 +258,7 @@ dependencies = [
 [[package]]
 name = "buffa-descriptor"
 version = "0.7.0"
-source = "git+https://github.com/jlucaso1/buffa?branch=feat%2Foneof-attribute#fa1c33b58d4944cde94776695d642e8cf13f23bd"
+source = "git+https://github.com/jlucaso1/buffa?rev=fa1c33b58d4944cde94776695d642e8cf13f23bd#fa1c33b58d4944cde94776695d642e8cf13f23bd"
 dependencies = [
  "buffa",
  "serde",
@@ -733,7 +733,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1521,7 +1521,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1820,7 +1820,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
