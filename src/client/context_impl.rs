@@ -45,7 +45,7 @@ impl SendContextResolver for Client {
         self.groups().query_info(jid).await
     }
 
-    async fn get_lid_for_phone(&self, phone_user: &str) -> Option<String> {
+    async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {
         self.lid_pn_cache.get_current_lid(phone_user).await
     }
 }

@@ -231,6 +231,24 @@ pub trait AppSyncStore: Send + Sync {
     /// Get a mutation MAC by index.
     async fn get_mutation_mac(&self, name: &str, index_mac: &[u8]) -> Result<Option<Vec<u8>>>;
 
+    /// Batch variant of [`get_mutation_mac`]: fetch many previous-MAC values in a
+    /// single backend round-trip. The default delegates to per-item lookups;
+    /// backends with a set-membership query (SQL `IN (...)`) should override to
+    /// avoid an N+1 (one DB round-trip per mutation in appstate sync).
+    async fn get_mutation_macs(
+        &self,
+        name: &str,
+        index_macs: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+        let mut out = std::collections::HashMap::with_capacity(index_macs.len());
+        for index_mac in index_macs {
+            if let Some(mac) = self.get_mutation_mac(name, index_mac).await? {
+                out.insert(index_mac.clone(), mac);
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete mutation MACs by their index MACs.
     async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()>;
 

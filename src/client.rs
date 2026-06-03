@@ -2805,8 +2805,9 @@ impl Client {
             let mut pre_downloaded: std::collections::HashMap<String, Vec<u8>> =
                 std::collections::HashMap::new();
 
-            if let Ok(patch_lists) =
-                wacore::appstate::patch_decode::parse_patch_lists_ref(resp.get())
+            // Parse the response once here for pre-download; the same parsed
+            // lists are handed to the processor below (no second parse).
+            let patch_lists = wacore::appstate::patch_decode::parse_patch_lists_ref(resp.get())?;
             {
                 for pl in &patch_lists {
                     // Download external snapshot
@@ -2863,10 +2864,10 @@ impl Client {
                 }
             };
 
-            // Parse and process all collections from the response
+            // Process the already-parsed collections (no re-parse of the response).
             let proc = self.get_app_state_processor().await;
             let results = proc
-                .decode_multi_patch_list_ref(resp.get(), &download, true)
+                .process_patch_lists(patch_lists, &download, true)
                 .await?;
 
             let mut needs_refetch = Vec::new();
@@ -3024,7 +3025,10 @@ impl Client {
             let mut pre_downloaded: std::collections::HashMap<String, Vec<u8>> =
                 std::collections::HashMap::new();
 
-            if let Ok(pl) = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get()) {
+            // Parse the response once here for pre-download; the same parsed list
+            // is handed to the processor below (no second parse).
+            let pl = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get())?;
+            {
                 debug!(target: "Client/AppState", "Parsed patch list for {:?}: has_snapshot_ref={} has_more_patches={} patches_count={}",
                     name, pl.snapshot_ref.is_some(), pl.has_more_patches, pl.patches.len());
 
@@ -3081,9 +3085,8 @@ impl Client {
             };
 
             let proc = self.get_app_state_processor().await;
-            let (mutations, new_state, list) = proc
-                .decode_patch_list_ref(resp.get(), &download, true)
-                .await?;
+            let (mutations, new_state, list) =
+                proc.process_parsed_patch_list(pl, &download, true).await?;
             let decode_elapsed = _decode_start.elapsed();
             if decode_elapsed.as_millis() > 500 {
                 debug!(target: "Client/AppState", "Patch decode for {:?} took {:?}", name, decode_elapsed);
@@ -3186,6 +3189,7 @@ impl Client {
             false,
             None,
             vec![],
+            None,
         )
         .await?;
         Ok(())
@@ -3820,6 +3824,7 @@ impl Client {
             false,
             Some(crate::types::message::EditAttribute::MessageEdit),
             vec![],
+            None,
         )
         .await?;
 

@@ -985,8 +985,8 @@ impl Client {
         }
 
         debug!(
-            "Sending retry receipt #{} for message {} from {} (reason: {:?})",
-            retry_count, info.id, info.source.sender, reason
+            "Sending retry receipt #{} for message {} in chat {} from {} (reason: {:?})",
+            retry_count, info.id, info.source.chat, info.source.sender, reason
         );
 
         // Build the retry element with the error code (matches WhatsApp Web's format)

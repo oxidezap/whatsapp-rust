@@ -1186,9 +1186,10 @@ impl Client {
 
         if retry_count > HIGH_RETRY_COUNT_THRESHOLD {
             log::warn!(
-                "High retry count ({}) for message {} from {} [{:?}]",
+                "High retry count ({}) for message {} in chat {} from {} [{:?}]",
                 retry_count,
                 info.id,
+                info.source.chat,
                 info.source.sender,
                 reason
             );
@@ -1197,8 +1198,8 @@ impl Client {
         let retry_sent = match self.send_retry_receipt(info, retry_count, reason).await {
             Ok(()) => {
                 debug!(
-                    "Sent retry receipt #{} for message {} from {} [{:?}]",
-                    retry_count, info.id, info.source.sender, reason
+                    "Sent retry receipt #{} for message {} in chat {} from {} [{:?}]",
+                    retry_count, info.id, info.source.chat, info.source.sender, reason
                 );
                 true
             }
@@ -3107,8 +3108,12 @@ mod tests {
 
         // Cache learned the mapping in both directions.
         assert_eq!(
-            client.lid_pn_cache.get_current_lid(pn_user).await,
-            Some(lid_user.to_string()),
+            client
+                .lid_pn_cache
+                .get_current_lid(pn_user)
+                .await
+                .as_deref(),
+            Some(lid_user),
             "PN→LID lookup must hit"
         );
         assert_eq!(
@@ -3202,8 +3207,12 @@ mod tests {
         // Hosted variant must reach the cache; without it, learn_lid_pn_mapping
         // is skipped and the hosted-device fix is incomplete.
         assert_eq!(
-            client.lid_pn_cache.get_current_lid(pn_user).await,
-            Some(lid_user.to_string()),
+            client
+                .lid_pn_cache
+                .get_current_lid(pn_user)
+                .await
+                .as_deref(),
+            Some(lid_user),
             "PN→LID lookup must work for hosted family"
         );
         assert_eq!(
@@ -5951,8 +5960,8 @@ mod tests {
         // Verify the cache has the mapping
         let cached_lid = client.lid_pn_cache.get_current_lid(phone).await;
         assert_eq!(
-            cached_lid,
-            Some(lid.to_string()),
+            cached_lid.as_deref(),
+            Some(lid),
             "Cache should have the LID-PN mapping"
         );
 
@@ -6013,7 +6022,7 @@ mod tests {
             } else if let Some(lid_user) = client.lid_pn_cache.get_current_lid(&sender.user).await {
                 // Use the cached LID
                 Jid {
-                    user: lid_user.into(),
+                    user: lid_user,
                     server: wacore_binary::Server::Lid,
                     device: sender.device,
                     agent: sender.agent,
@@ -6128,7 +6137,7 @@ mod tests {
             } else if let Some(lid_user) = client.lid_pn_cache.get_current_lid(&sender.user).await {
                 // This is the path we're testing - fallback to cached LID
                 Jid {
-                    user: lid_user.into(),
+                    user: lid_user,
                     server: wacore_binary::Server::Lid,
                     device: sender.device,
                     agent: sender.agent,
@@ -6229,7 +6238,7 @@ mod tests {
                 }
             } else if let Some(lid_user) = client.lid_pn_cache.get_current_lid(&sender.user).await {
                 Jid {
-                    user: lid_user.into(),
+                    user: lid_user,
                     server: wacore_binary::Server::Lid,
                     device: sender.device,
                     agent: sender.agent,

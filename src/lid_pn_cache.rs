@@ -20,6 +20,8 @@
 
 use std::sync::Arc;
 
+use wacore_binary::CompactString;
+
 use crate::cache_config::{CacheConfig, CacheEntryConfig};
 use crate::cache_store::TypedCache;
 pub use wacore::types::{LearningSource, LidPnEntry};
@@ -101,8 +103,13 @@ impl LidPnCache {
     /// Get the current LID for a phone number.
     ///
     /// Returns the LID user part if a mapping exists, None otherwise.
-    pub async fn get_current_lid(&self, phone: &str) -> Option<String> {
-        self.pn_to_entry.get(phone).await.map(|e| e.lid.clone())
+    /// The cache holds `Arc<LidPnEntry>`; return the LID user as an (inline for
+    /// typical ~15-digit LIDs) `CompactString` instead of deep-cloning a `String`.
+    pub async fn get_current_lid(&self, phone: &str) -> Option<CompactString> {
+        self.pn_to_entry
+            .get(phone)
+            .await
+            .map(|e| e.lid.as_str().into())
     }
 
     /// Whether the learn fast path can skip re-recording `phone <-> lid`: the
@@ -257,8 +264,8 @@ mod tests {
 
         // Should be retrievable both ways
         assert_eq!(
-            cache.get_current_lid("559980000001").await,
-            Some("100000012345678".to_string())
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000012345678")
         );
         assert_eq!(
             cache.get_phone_number("100000012345678").await,
@@ -280,8 +287,8 @@ mod tests {
         cache.add(&old_entry).await;
 
         assert_eq!(
-            cache.get_current_lid("559980000001").await,
-            Some("100000012345678".to_string())
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000012345678")
         );
 
         // Add newer mapping for same phone (different LID)
@@ -295,8 +302,8 @@ mod tests {
 
         // Should return the newer LID for PN lookup
         assert_eq!(
-            cache.get_current_lid("559980000001").await,
-            Some("100000087654321".to_string())
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000087654321")
         );
 
         // Both LIDs should still be in the LID -> Entry map
@@ -334,8 +341,8 @@ mod tests {
 
         // PN -> LID should still return the newer one
         assert_eq!(
-            cache.get_current_lid("559980000001").await,
-            Some("100000087654321".to_string())
+            cache.get_current_lid("559980000001").await.as_deref(),
+            Some("100000087654321")
         );
     }
 
@@ -369,9 +376,9 @@ mod tests {
         assert_eq!(cache.lid_count().await, 3);
         assert_eq!(cache.pn_count().await, 3);
 
-        assert_eq!(cache.get_current_lid("pn1").await, Some("lid1".to_string()));
-        assert_eq!(cache.get_current_lid("pn2").await, Some("lid2".to_string()));
-        assert_eq!(cache.get_current_lid("pn3").await, Some("lid3".to_string()));
+        assert_eq!(cache.get_current_lid("pn1").await.as_deref(), Some("lid1"));
+        assert_eq!(cache.get_current_lid("pn2").await.as_deref(), Some("lid2"));
+        assert_eq!(cache.get_current_lid("pn3").await.as_deref(), Some("lid3"));
     }
 
     #[tokio::test]

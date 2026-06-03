@@ -350,7 +350,7 @@ impl Client {
         };
         match self.lid_pn_cache.get_current_lid(&target.user).await {
             Some(lid_user) => Jid {
-                user: lid_user.into(),
+                user: lid_user,
                 server: lid_server,
                 device: target.device,
                 agent: target.agent,
@@ -375,7 +375,7 @@ impl Client {
         } else if jid.is_pn() {
             let lid_user = self.lid_pn_cache.get_current_lid(&jid.user).await?;
             Some(Jid {
-                user: lid_user.into(),
+                user: lid_user,
                 server: wacore_binary::Server::Lid,
                 device: jid.device,
                 agent: jid.agent,

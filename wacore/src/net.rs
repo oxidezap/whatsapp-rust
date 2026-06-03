@@ -131,6 +131,11 @@ pub struct StreamingHttpResponse {
     pub body: Box<dyn std::io::Read + Send>,
 }
 
+/// A streaming request body: a reader whose total length is known up front, so
+/// the client can send an exact `Content-Length` (WhatsApp's CDN rejects chunked
+/// transfer-encoding on upload).
+pub type UploadBody = Box<dyn std::io::Read + Send>;
+
 /// Trait for executing HTTP requests in a runtime-agnostic way
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -148,6 +153,26 @@ pub trait HttpClient: Send + Sync {
     fn execute_streaming(&self, _request: HttpRequest) -> Result<StreamingHttpResponse> {
         Err(anyhow::anyhow!(
             "Streaming not supported by this HTTP client"
+        ))
+    }
+
+    /// Whether this client can stream a request body from a reader (upload).
+    fn supports_upload_streaming(&self) -> bool {
+        false
+    }
+
+    /// Synchronous streaming upload: send `body` (exactly `content_length` bytes)
+    /// as the request body. Implementations MUST set an explicit `Content-Length`
+    /// rather than chunked transfer-encoding. Any body set on `request` is
+    /// ignored. Must be called from a blocking context.
+    fn execute_upload(
+        &self,
+        _request: HttpRequest,
+        _body: UploadBody,
+        _content_length: u64,
+    ) -> Result<HttpResponse> {
+        Err(anyhow::anyhow!(
+            "Upload streaming not supported by this HTTP client"
         ))
     }
 }

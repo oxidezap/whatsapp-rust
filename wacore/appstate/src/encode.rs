@@ -108,7 +108,7 @@ mod tests {
 
         // Decode the encoded record
         let record = &*mutation.record;
-        let decoded = decode_record(
+        let (decoded, _macs) = decode_record(
             wa::syncd_mutation::SyncdOperation::SET,
             record,
             &keys,

@@ -180,9 +180,9 @@ name = "benchmark"
 required-features = ["danger-skip-tls-verify"]
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 debug = false
-lto = true
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true

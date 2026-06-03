@@ -80,7 +80,7 @@ impl Client {
         // Check if user is a PN (has a LID mapping)
         if let Some(lid) = self.lid_pn_cache.get_current_lid(user).await {
             return UserLookupKeys::PnWithLid {
-                lid: lid.into(),
+                lid,
                 pn: user.into(),
             };
         }

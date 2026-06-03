@@ -811,7 +811,16 @@ impl<'a> Groups<'a> {
         }
         let msg = wacore::send::build_member_label_message(label.into(), wacore::time::now_secs());
         self.client
-            .send_message_impl(group_jid.clone(), &msg, None, false, false, None, vec![])
+            .send_message_impl(
+                group_jid.clone(),
+                &msg,
+                None,
+                false,
+                false,
+                None,
+                vec![],
+                None,
+            )
             .await
     }
 
@@ -876,15 +885,19 @@ impl<'a> Groups<'a> {
 
     /// Resolve JID to tc_token store key. When `only_lid`, PN JIDs without a
     /// LID mapping return `None` instead of falling back to the PN user.
-    async fn resolve_token_key(&self, jid: &Jid, only_lid: bool) -> Option<String> {
+    async fn resolve_token_key(
+        &self,
+        jid: &Jid,
+        only_lid: bool,
+    ) -> Option<wacore_binary::CompactString> {
         if jid.is_lid() {
-            Some(jid.user.to_string())
+            Some(jid.user.clone())
         } else {
             let lid = self.client.lid_pn_cache.get_current_lid(&jid.user).await;
             if only_lid {
                 lid
             } else {
-                Some(lid.unwrap_or_else(|| jid.user.to_string()))
+                Some(lid.unwrap_or_else(|| jid.user.clone()))
             }
         }
     }

@@ -4,6 +4,7 @@ use anyhow::anyhow;
 use log::debug;
 use wacore::client::context::SendContextResolver;
 use wacore::libsignal::protocol::SignalProtocolError;
+use wacore::send::StanzaType;
 use wacore::types::jid::JidExt;
 use wacore::types::message::AddressingMode;
 #[cfg(test)]
@@ -25,6 +26,9 @@ pub struct SendOptions {
     /// message (WA Web `EProtoGenerator.js:183` parity).
     /// Common values: 86400 (24h), 604800 (7d), 7776000 (90d).
     pub ephemeral_expiration: Option<u32>,
+    /// Force the `<message type="...">` attribute instead of deriving it from
+    /// content. Escape hatch for a type the classifier can't infer.
+    pub stanza_type_override: Option<StanzaType>,
 }
 
 /// Result of a successfully sent message.
@@ -313,6 +317,7 @@ impl Client {
             }
         }
 
+        let stanza_type_override = options.stanza_type_override;
         let request_id = match options.message_id {
             Some(id) => id,
             None => self.generate_message_id().await,
@@ -327,7 +332,9 @@ impl Client {
         // Matches WA Web's OutMessagePublishNewsletterRequest + ContentType mixins.
         if to.is_newsletter() {
             use buffa::Message as _;
-            let stanza_type = wacore::send::stanza_type_from_message(&message);
+            let stanza_type = stanza_type_override
+                .map(StanzaType::as_wire)
+                .unwrap_or_else(|| wacore::send::stanza_type_from_message(&message));
             let (_, meta_node) = infer_stanza_metadata(&message);
             let mut plaintext_builder = NodeBuilder::new("plaintext");
             if let Some(mt) = wacore::send::media_type_from_message(&message) {
@@ -360,6 +367,7 @@ impl Client {
             false,
             edit,
             extra_nodes,
+            stanza_type_override,
         )
         .await?;
         Ok(result)
@@ -922,6 +930,7 @@ impl Client {
             force_skdm,
             Some(edit_attr),
             vec![],
+            None,
         )
         .await
     }
@@ -981,6 +990,7 @@ impl Client {
             false,
             Some(crate::types::message::EditAttribute::PinInChat),
             vec![],
+            None,
         )
         .await
     }
@@ -995,6 +1005,7 @@ impl Client {
         force_key_distribution: bool,
         edit: Option<crate::types::message::EditAttribute>,
         extra_stanza_nodes: Vec<Node>,
+        stanza_type_override: Option<StanzaType>,
     ) -> Result<(), anyhow::Error> {
         // status@broadcast reactions fan out pairwise to the author's devices;
         // status posts keep going through send_status_message (owns recipients).
@@ -1443,6 +1454,9 @@ impl Client {
         let mut stanza_to_send = stanza_to_send;
         if is_status_addon {
             stanza_to_send.attrs.insert("to", Jid::status_broadcast());
+        }
+        if let Some(t) = stanza_type_override {
+            stanza_to_send.attrs.insert("type", t.as_wire());
         }
 
         if let Err(e) = self.send_node(stanza_to_send).await {
@@ -1966,7 +1980,7 @@ impl Client {
         }
 
         if let Some(lid_user) = self.lid_pn_cache.get_current_lid(&jid.user).await {
-            Jid::new(&lid_user, Server::Lid)
+            Jid::new(lid_user, Server::Lid)
         } else {
             jid.to_non_ad()
         }
@@ -3621,6 +3635,7 @@ mod tests {
                 false,
                 None,
                 vec![],
+                None,
             )
             .await;
         assert!(
@@ -3649,6 +3664,46 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn stanza_type_override_sets_wire_type_attr() {
+        let client = crate::test_utils::create_test_client_with_name("stanza_type_override").await;
+        let peer: Jid = "100000000000003@s.whatsapp.net".parse().unwrap();
+        seed_peer_send_state(&client, &peer).await;
+
+        let request_id = "STANZA_TYPE_OVERRIDE_1";
+        let waiter = client
+            .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
+        let msg =
+            pdo_request_message(wa::message::PeerDataOperationRequestType::HistorySyncOnDemand);
+
+        // Poll is never the type for this message; it can only come from the override.
+        let result = client
+            .send_message_impl(
+                peer,
+                &msg,
+                Some(request_id.to_string()),
+                true,
+                false,
+                None,
+                vec![],
+                Some(wacore::send::StanzaType::Poll),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "test client has no socket; send should fail after stanza capture"
+        );
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("sent node should be captured")
+            .expect("sent node waiter should resolve");
+        assert_eq!(
+            node.attrs().optional_string("type").unwrap().as_ref(),
+            wacore::send::StanzaType::Poll.as_wire()
         );
     }
 

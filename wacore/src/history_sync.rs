@@ -74,9 +74,14 @@ pub fn process_history_sync(
         nct_salt: None,
         conversations_processed: 0,
         tc_token_candidates: Vec::new(),
-        // Pre-size from a count pass so the accumulator doesn't grow by doubling.
-        msg_secret_records: Vec::with_capacity(count_history_sync_messages(&buf)),
-        decompressed_bytes: if retain_blob { Some(buf.clone()) } else { None },
+        // Grown on demand (#691): a full pre-count pass scanned the whole blob
+        // just to size a Vec that only holds the secret-record subset (it
+        // over-allocated and cost ~2.5% of the decode); plain growth is cheaper.
+        msg_secret_records: Vec::new(),
+        // Always retained on this path: the `!retain_blob` case returned above
+        // and ran the streaming variant, so control only reaches here when the
+        // caller wants the blob.
+        decompressed_bytes: Some(buf.clone()),
     };
 
     while pos < buf.len() {
@@ -299,17 +304,29 @@ fn checked_end(
 
 #[inline]
 fn read_varint(data: &[u8]) -> Result<(u64, usize), HistorySyncError> {
-    let mut value: u64 = 0;
-    let mut shift = 0u32;
-    for (i, &byte) in data.iter().enumerate() {
-        if i == 9 && (byte & 0xFE) != 0 {
+    // Single-byte fast-path: most history-sync varints (tags, small lengths)
+    // fit in one byte (#686).
+    let Some(&first) = data.first() else {
+        return Err(HistorySyncError::MalformedProtobuf(
+            "unexpected end of data in varint".into(),
+        ));
+    };
+    if first < 0x80 {
+        return Ok((first as u64, 1));
+    }
+    let mut value = (first & 0x7F) as u64;
+    let mut shift = 7u32;
+    for (i, &byte) in data[1..].iter().enumerate() {
+        // The 10th overall byte (index 8 here; first byte consumed above) may
+        // only carry a single value bit, otherwise the varint overflows u64.
+        if i == 8 && (byte & 0xFE) != 0 {
             return Err(HistorySyncError::MalformedProtobuf(
                 "varint overflows u64".into(),
             ));
         }
         value |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
-            return Ok((value, i + 1));
+            return Ok((value, i + 2));
         }
         shift += 7;
         if shift >= 64 {
@@ -464,60 +481,6 @@ fn extract_msg_secret_records(
             is_bot_invocation,
         });
     }
-}
-
-/// Upper-bound count of message entries across all conversations, via an
-/// allocation-free wire scan. Used to pre-size the secret-record accumulator.
-fn count_history_sync_messages(buf: &[u8]) -> usize {
-    let mut pos = 0;
-    let mut total = 0;
-    while pos < buf.len() {
-        let Ok((tag, br)) = read_varint(&buf[pos..]) else {
-            break;
-        };
-        pos += br;
-        let field = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-        if field == 2 && wt == wire_type::LENGTH_DELIMITED {
-            let Ok((len, vl)) = read_varint(&buf[pos..]) else {
-                break;
-            };
-            pos += vl;
-            let Ok(end) = checked_end(pos, len, buf.len(), "conv-count") else {
-                break;
-            };
-            total += count_conversation_messages(&buf[pos..end]);
-            pos = end;
-        } else {
-            match skip_field(wt, buf, pos) {
-                Ok(np) => pos = np,
-                Err(_) => break,
-            }
-        }
-    }
-    total
-}
-
-/// Count field-2 (message) entries within a single conversation's bytes.
-fn count_conversation_messages(buf: &[u8]) -> usize {
-    let mut pos = 0;
-    let mut n = 0;
-    while pos < buf.len() {
-        let Ok((tag, br)) = read_varint(&buf[pos..]) else {
-            break;
-        };
-        pos += br;
-        let field = (tag >> 3) as u32;
-        let wt = (tag & 0x7) as u32;
-        if field == 2 && wt == wire_type::LENGTH_DELIMITED {
-            n += 1;
-        }
-        match skip_field(wt, buf, pos) {
-            Ok(np) => pos = np,
-            Err(_) => break,
-        }
-    }
-    n
 }
 
 /// Walk wrapper layers (deviceSent/ephemeral/viewOnce/etc.) to the innermost
