@@ -5,9 +5,7 @@
 //! - `label_edit`  (index `["label_edit", labelId]`)        -> `LabelEditAction`
 //! - `label_jid`   (index `["label_jid", labelId, chatJid]`) -> `LabelAssociationAction`
 //!
-//! Note: WA Web stamps `label_edit` with action version 3, but the syncd
-//! `SyncActionData.version` emitted by `encode_record` is a fixed `1` for every
-//! action (same as mute/pin/archive); kept consistent with the existing path.
+//! Both are stamped with action version 3, matching WhatsApp Web and whatsmeow.
 
 use crate::appstate_sync::Mutation;
 use crate::client::Client;
@@ -17,6 +15,9 @@ use wacore::appstate::patch_decode::WAPatchName;
 use wacore::types::events::{Event, LabelAssociationUpdate, LabelEditUpdate};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
+
+/// Action schema version for both label actions (matches WA Web / whatsmeow).
+const LABEL_ACTION_VERSION: i32 = 3;
 
 /// Dispatch inbound label mutations synced from a linked device.
 /// Returns `true` if handled, `false` if the mutation is not a label kind.
@@ -118,7 +119,7 @@ impl<'a> Labels<'a> {
             ..Default::default()
         };
         self.client
-            .send_app_state_mutation(WAPatchName::Regular, &index, &value)
+            .send_app_state_mutation(WAPatchName::Regular, &index, &value, LABEL_ACTION_VERSION)
             .await
     }
 
@@ -136,7 +137,7 @@ impl<'a> Labels<'a> {
             ..Default::default()
         };
         self.client
-            .send_app_state_mutation(WAPatchName::Regular, &index, &value)
+            .send_app_state_mutation(WAPatchName::Regular, &index, &value, LABEL_ACTION_VERSION)
             .await
     }
 
@@ -166,7 +167,7 @@ impl<'a> Labels<'a> {
             ..Default::default()
         };
         self.client
-            .send_app_state_mutation(WAPatchName::Regular, &index, &value)
+            .send_app_state_mutation(WAPatchName::Regular, &index, &value, LABEL_ACTION_VERSION)
             .await
     }
 }

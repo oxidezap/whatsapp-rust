@@ -19,13 +19,17 @@ pub fn encode_record(
     keys: &ExpandedAppStateKeys,
     key_id: &[u8],
     iv: &[u8; 16],
+    // Per-action schema version, mirroring whatsmeow's per-mutation `Version`.
+    // WA Web stamps each action with its own (e.g. label_edit/label_jid = 3);
+    // callers pass the value for the action they are encoding.
+    version: i32,
 ) -> (wa::SyncdMutation, [u8; 32]) {
     // 1. Build SyncActionData
     let action_data = wa::SyncActionData {
         index: Some(index.to_vec()),
         value: Some(value.clone()),
         padding: Some(vec![]),
-        version: Some(1),
+        version: Some(version),
     };
     let plaintext = action_data.encode_to_vec();
 
@@ -104,6 +108,7 @@ mod tests {
             &keys,
             key_id,
             &iv,
+            1,
         );
 
         // Decode the encoded record

@@ -153,6 +153,8 @@ impl<'a> Profile<'a> {
             &keys,
             &key_id,
             &iv,
+            // setting_pushName is action version 1 (matches whatsmeow).
+            1,
         );
 
         self.client
