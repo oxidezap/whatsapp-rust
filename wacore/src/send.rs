@@ -222,6 +222,13 @@ pub fn peer_message_options_from_message(msg: &wa::Message) -> PeerMessageOption
 /// Matches WAWebBackendJobsCommon.mediaTypeFromProtobuf + encodeMaybeMediaType.
 /// Returns `None` when the attribute should be omitted.
 pub fn media_type_from_message(msg: &wa::Message) -> Option<&'static str> {
+    // WA Web's mediaTypeFromProtobuf treats a top-level lottieStickerMessage as a
+    // terminal "sticker" and does NOT recurse into it (unlike typeAttributeFromProtobuf,
+    // which unwraps it via getUnwrappedProtobufMessage). Check before the shared unwrap.
+    if msg.lottie_sticker_message.is_some() {
+        return Some("sticker");
+    }
+
     let msg = unwrap_message(msg);
 
     if msg.image_message.is_some() {
@@ -279,6 +286,31 @@ pub fn media_type_from_message(msg: &wa::Message) -> Option<&'static str> {
     }
     if msg.group_invite_message.is_some() {
         return Some("url");
+    }
+    // Interactive / business message families. WA Web's mediaTypeFromProtobuf maps
+    // each to a concrete mediatype; without it the server drops the type="media"
+    // stanza. buttonsMessage is intentionally absent: WA Web maps it to
+    // EncMediaType.Button, which its string mapper drops (no attribute).
+    if msg.list_message.is_some() {
+        return Some("list");
+    }
+    if msg.list_response_message.is_some() {
+        return Some("list_response");
+    }
+    if msg.buttons_response_message.is_some() {
+        return Some("buttons_response");
+    }
+    if msg.order_message.is_some() {
+        return Some("order");
+    }
+    if msg.product_message.is_some() {
+        return Some("product");
+    }
+    if msg.interactive_response_message.is_some() {
+        return Some("native_flow_response");
+    }
+    if msg.message_history_bundle.is_some() {
+        return Some("group_history");
     }
     None
 }
@@ -4419,6 +4451,102 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(stanza_type_from_message(&url), stanza::MSG_TYPE_MEDIA);
+        }
+
+        #[test]
+        fn interactive_and_list_types_get_their_mediatype() {
+            // WA Web's mediaTypeFromProtobuf maps these to concrete mediatypes;
+            // omitting the attribute makes the server drop the type="media" stanza.
+            let list = wa::Message {
+                list_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(stanza_type_from_message(&list), stanza::MSG_TYPE_MEDIA);
+            assert_eq!(media_type_from_message(&list), Some("list"));
+
+            let list_response = wa::Message {
+                list_response_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(
+                media_type_from_message(&list_response),
+                Some("list_response")
+            );
+
+            let buttons_response = wa::Message {
+                buttons_response_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(
+                media_type_from_message(&buttons_response),
+                Some("buttons_response")
+            );
+
+            let order = wa::Message {
+                order_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(media_type_from_message(&order), Some("order"));
+
+            let product = wa::Message {
+                product_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(media_type_from_message(&product), Some("product"));
+
+            let interactive_response = wa::Message {
+                interactive_response_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(
+                media_type_from_message(&interactive_response),
+                Some("native_flow_response")
+            );
+
+            let history_bundle = wa::Message {
+                message_history_bundle: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(
+                media_type_from_message(&history_bundle),
+                Some("group_history")
+            );
+        }
+
+        #[test]
+        fn buttons_message_has_no_mediatype() {
+            // WA Web maps buttonsMessage to EncMediaType.Button, but its string
+            // mapper has no Button case (returns null/DROP_ATTR), so the attribute
+            // is omitted. Adding a "buttons" mediatype would diverge from WA Web.
+            let buttons = wa::Message {
+                buttons_message: Some(Box::default()),
+                ..Default::default()
+            };
+            assert_eq!(media_type_from_message(&buttons), None);
+        }
+
+        #[test]
+        fn ephemeral_wrapped_list_reaches_list_mediatype() {
+            let m = wa::Message {
+                ephemeral_message: Some(fpm(wa::Message {
+                    list_message: Some(Box::default()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            assert_eq!(media_type_from_message(&m), Some("list"));
+        }
+
+        #[test]
+        fn top_level_lottie_sticker_is_terminal_sticker() {
+            // WA Web's mediaTypeFromProtobuf treats a top-level lottieStickerMessage
+            // as a terminal "sticker" and does NOT recurse into it, unlike the
+            // stanza-type path which unwraps it.
+            let lottie = wa::Message {
+                lottie_sticker_message: Some(fpm(image_inner())),
+                ..Default::default()
+            };
+            assert_eq!(media_type_from_message(&lottie), Some("sticker"));
         }
     }
 
