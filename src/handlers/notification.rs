@@ -349,19 +349,28 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
     // path would otherwise eagerly fetch prekeys + X3DH to build a session we may
     // never use.
     //
-    // Check BOTH the resolved (preferred LID-or-PN) address and the original PN
-    // address. They diverge when a PN->LID mapping was learned from offline replay
-    // but the Signal-state migration hasn't run yet: the identity is still under the
-    // PN address while resolve_encryption_jid already points at the LID one. Reading
-    // only the resolved address would then false-negative and skip a real reset.
+    // Check every address the identity could be stored under, because PN/LID
+    // resolution can diverge from where the state actually lives:
+    //   - the resolved (preferred LID-or-PN) address from resolve_encryption_jid;
+    //   - the original PN address (state can still be under PN when a PN->LID
+    //     mapping was learned from offline replay but the migration hasn't run yet);
+    //   - the LID carried by the stanza itself (the local cache may be cold/evicted
+    //     so resolve falls back to PN, yet the state lives under the stanza LID).
+    // Reading only the resolved address would false-negative and skip a real reset.
     let resolved = client.resolve_encryption_jid(&from_jid).await;
-    let addr = resolved.to_protocol_address();
-    let original_addr = from_jid.to_protocol_address();
-    let mut reset_addrs = vec![addr.clone()];
-    if original_addr != addr {
-        reset_addrs.push(original_addr);
-    }
+    let stanza_lid = node.attrs().optional_jid("lid");
     let backend = client.persistence_manager.backend();
+
+    let mut reset_addrs = vec![resolved.to_protocol_address()];
+    for candidate in [Some(from_jid.clone()), stanza_lid.clone()]
+        .into_iter()
+        .flatten()
+    {
+        let cand_addr = candidate.to_protocol_address();
+        if !reset_addrs.contains(&cand_addr) {
+            reset_addrs.push(cand_addr);
+        }
+    }
 
     // Treat a backend read error as had-prior (fail-safe): run the reset rather
     // than silently skip it, matching the old always-reset behavior. Collapsing
@@ -452,7 +461,7 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
     client.core.event_bus.dispatch(Event::IdentityChange(
         crate::types::events::IdentityChange {
             user: from_jid.clone(),
-            lid_user: node.attrs().optional_jid("lid"),
+            lid_user: stanza_lid,
             implicit: false,
         },
     ));
@@ -2755,6 +2764,61 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the stale PN identity must be deleted by the reset"
+        );
+    }
+
+    /// Regression: a stanza can carry a `lid` attr while the local PN->LID cache is
+    /// cold, so resolve_encryption_jid falls back to PN. If the identity lives under
+    /// the stanza LID, the gate must still find it (via the stanza-LID candidate) and
+    /// run the reset rather than skip it.
+    #[tokio::test]
+    async fn test_identity_change_resets_identity_under_stanza_lid_with_cold_cache() {
+        use wacore::types::jid::JidExt;
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        // Cold cache: no PN->LID mapping, so resolve_encryption_jid(PN) returns PN.
+        let pn_jid: Jid = "5511444444444@s.whatsapp.net".parse().unwrap();
+        let resolved = client.resolve_encryption_jid(&pn_jid).await;
+        assert!(
+            !resolved.is_lid(),
+            "test setup: cache must be cold (resolve -> PN), got {resolved}"
+        );
+
+        // The identity lives under the LID carried by the stanza, not the PN.
+        let lid_jid: Jid = "100000000000066@lid".parse().unwrap();
+        let lid_addr = lid_jid.to_protocol_address();
+        client
+            .signal_cache
+            .put_identity(&lid_addr, &[7u8; 32])
+            .await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "encrypt")
+            .attr("from", "5511444444444@s.whatsapp.net")
+            .attr("lid", "100000000000066@lid")
+            .attr("id", "identity-change-stanzalid")
+            .children([NodeBuilder::new("identity").build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        assert!(
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::IdentityChange(_))),
+            "must dispatch IdentityChange when the identity is under the stanza LID"
+        );
+        let backend = client.persistence_manager.backend();
+        assert!(
+            client
+                .signal_cache
+                .get_identity(&lid_addr, backend.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "the stale stanza-LID identity must be deleted by the reset"
         );
     }
 }
