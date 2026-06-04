@@ -7050,22 +7050,30 @@ mod tests {
                 group_id: Some("group".into()),
                 axolotl_sender_key_distribution_message: Some(vec![1, 2, 3]),
             }),
-            message_context_info: Some(wa::MessageContextInfo::default()),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![9, 8, 7]),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
         assert!(is_sender_key_distribution_only(&mut msg));
 
+        // Pin the exact payloads, not just presence: a buggy restore that put back
+        // a fresh default (losing the original contents) must fail here.
         assert_eq!(
             msg.sender_key_distribution_message
                 .as_ref()
-                .and_then(|s| s.group_id.as_deref()),
-            Some("group"),
-            "sender_key_distribution_message must be restored"
+                .and_then(|s| s.axolotl_sender_key_distribution_message.as_deref()),
+            Some([1, 2, 3].as_slice()),
+            "sender_key_distribution_message payload must be restored unchanged"
         );
-        assert!(
-            msg.message_context_info.is_some(),
-            "message_context_info must be restored"
+        assert_eq!(
+            msg.message_context_info
+                .as_ref()
+                .and_then(|c| c.message_secret.as_deref()),
+            Some([9, 8, 7].as_slice()),
+            "message_context_info payload must be restored unchanged"
         );
     }
 
