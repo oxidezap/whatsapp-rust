@@ -10,6 +10,7 @@ use crate::hash::{HashState, generate_patch_mac};
 use crate::keys::ExpandedAppStateKeys;
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use waproto::whatsapp as wa;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,23 +195,26 @@ where
 
     state.version = patch_version;
 
-    // Update hash state - the closure handles finding previous values
+    // index_mac -> most-recent in-patch value MAC tail, filled as we iterate. Replaces a
+    // reverse scan over patch.mutations[..idx] (O(n^2) total) with an O(1) lookup, mirroring
+    // WA Web's WAWebSyncdAntiTampering Map. Recording the current value only after the lookup
+    // keeps the old strictly-prior semantics: a mutation never matches itself, and a SET that
+    // overwrites the same index earlier in the patch takes precedence over the DB value.
+    let mut in_patch: HashMap<&[u8], &[u8]> = HashMap::with_capacity(patch.mutations.len());
     let (hash_update_result, result) = state.update_hash(&patch.mutations, |index_mac, idx| {
-        // First check previous mutations in this patch (for overwrites within same patch)
-        for prev in patch.mutations[..idx].iter().rev() {
-            if let Some(rec) = &prev.record
-                && let Some(ind) = &rec.index
-                && let Some(b) = &ind.blob
-                && b == index_mac
-                && let Some(val) = &rec.value
-                && let Some(vb) = &val.blob
-                && vb.len() >= 32
-            {
-                return Ok(Some(vb[vb.len() - 32..].to_vec()));
-            }
+        let prev = if let Some(value_mac) = in_patch.get(index_mac) {
+            Some(value_mac.to_vec())
+        } else {
+            get_prev_value_mac(index_mac).map_err(|e| anyhow::anyhow!(e))?
+        };
+        if let Some(rec) = &patch.mutations[idx].record
+            && let Some(index) = rec.index.as_ref().and_then(|i| i.blob.as_deref())
+            && let Some(value) = rec.value.as_ref().and_then(|v| v.blob.as_deref())
+            && value.len() >= 32
+        {
+            in_patch.insert(index, &value[value.len() - 32..]);
         }
-        // Then check database via callback
-        get_prev_value_mac(index_mac).map_err(|e| anyhow::anyhow!(e))
+        Ok(prev)
     });
     result.map_err(|_| AppStateError::MismatchingLTHash)?;
 
@@ -640,6 +644,96 @@ mod tests {
         );
 
         assert_eq!(result.state.hash.as_slice(), expected_hash.as_slice());
+    }
+
+    /// Two SETs of the SAME index in one patch: the second must use the first SET's value
+    /// as its "previous value" (in-patch last-write-wins), NOT the DB. Locks the O(1) map
+    /// against a regression to a global last-write map (which would remove the wrong value
+    /// at position 0) or to no in-patch lookup at all (which would leave both values in the
+    /// ltHash). DB returns None here, so a correct run must still cancel the first value.
+    #[test]
+    fn test_process_patch_in_patch_overwrite_last_write_wins() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+        let index_mac = vec![1; 32];
+
+        let first = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &index_mac,
+            &keys,
+            &key_id,
+            1000,
+        );
+        let second = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &index_mac,
+            &keys,
+            &key_id,
+            2000,
+        );
+
+        let tail = |rec: &wa::SyncdRecord| {
+            let blob = rec.value.as_ref().unwrap().blob.as_ref().unwrap();
+            blob[blob.len() - 32..].to_vec()
+        };
+        let first_tail = tail(&first);
+        let second_tail = tail(&second);
+        assert_ne!(
+            first_tail, second_tail,
+            "distinct timestamps must yield distinct value MACs"
+        );
+
+        let patch = wa::SyncdPatch {
+            version: Some(wa::SyncdVersion { version: Some(1) }),
+            mutations: vec![
+                wa::SyncdMutation {
+                    operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
+                    record: Some(first),
+                },
+                wa::SyncdMutation {
+                    operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
+                    record: Some(second),
+                },
+            ],
+            key_id: Some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+
+        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_prev = |_: &[u8]| Ok(None);
+
+        // Fresh state -> had_no_prior_state skips version/MAC checks.
+        let mut state = HashState::default();
+        let result = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
+            .expect("two in-patch SETs should process");
+
+        assert_eq!(result.mutations.len(), 2);
+        assert_eq!(result.added_macs.len(), 2);
+
+        // Net: first value added then removed by the overwrite -> only the second remains.
+        const EMPTY: &[Vec<u8>] = &[];
+        let expected = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            EMPTY,
+            std::slice::from_ref(&second_tail),
+        );
+        assert_eq!(
+            result.state.hash.as_slice(),
+            expected.as_slice(),
+            "in-patch overwrite must leave only the second SET's value in the ltHash"
+        );
+
+        // Guard the exact regression: if both values stayed (no in-patch lookup), this differs.
+        let both_kept =
+            WAPATCH_INTEGRITY.subtract_then_add(&[0u8; 128], EMPTY, &[first_tail, second_tail]);
+        assert_ne!(
+            result.state.hash.as_slice(),
+            both_kept.as_slice(),
+            "both SET values must not remain: in-patch overwrite regressed"
+        );
     }
 
     /// WA Web: validatePatchVersion checks `localVersion !== patchVersion - 1`.
