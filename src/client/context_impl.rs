@@ -49,4 +49,8 @@ impl SendContextResolver for Client {
     async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {
         self.lid_pn_cache.get_current_lid(phone_user).await
     }
+
+    fn on_local_identity_change(&self, jid: &Jid) {
+        self.react_to_local_identity_change(jid);
+    }
 }

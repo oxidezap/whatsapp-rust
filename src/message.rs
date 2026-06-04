@@ -10,7 +10,8 @@ use wacore::libsignal::protocol::SenderKeyDistributionMessage;
 use wacore::libsignal::protocol::group_decrypt;
 use wacore::libsignal::protocol::process_sender_key_distribution_message;
 use wacore::libsignal::protocol::{
-    PreKeySignalMessage, SignalMessage, SignalProtocolError, UsePQRatchet, message_decrypt,
+    IdentityChange, PreKeySignalMessage, SignalMessage, SignalProtocolError, UsePQRatchet,
+    message_decrypt,
 };
 use wacore::libsignal::protocol::{
     PublicKey as SignalPublicKey, SENDERKEY_MESSAGE_CURRENT_VERSION,
@@ -1736,6 +1737,9 @@ impl Client {
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let mut outcome = SessionBatchOutcome::default();
+        // Local identity-change detection fires once per batch: the first pkmsg
+        // saves the new key (ReplacedExisting); the rest are NewOrUnchanged.
+        let mut local_identity_reacted = false;
 
         for payload in payloads {
             let ciphertext = &payload.ciphertext[..];
@@ -1840,7 +1844,14 @@ impl Client {
             .await;
 
             match decrypt_res {
-                Ok(padded_plaintext) => {
+                Ok(decrypted) => {
+                    if decrypted.identity_change == IdentityChange::ReplacedExisting
+                        && !local_identity_reacted
+                    {
+                        local_identity_reacted = true;
+                        self.react_to_local_identity_change(sender_encryption_jid);
+                    }
+                    let padded_plaintext = decrypted.plaintext;
                     match self
                         .clone()
                         .handle_decrypted_plaintext(
@@ -1933,12 +1944,13 @@ impl Client {
                         .await;
 
                         match retry_decrypt_res {
-                            Ok(padded_plaintext) => {
+                            Ok(decrypted) => {
                                 log::debug!(
                                     "[msg:{}] Successfully decrypted message from {} after handling untrusted identity",
                                     info.id,
                                     address
                                 );
+                                let padded_plaintext = decrypted.plaintext;
                                 match self
                                     .clone()
                                     .handle_decrypted_plaintext(
@@ -2600,12 +2612,16 @@ impl Client {
         )
         .await
         {
-            Ok(padded_plaintext) => {
+            // PN→LID migration re-addresses an existing peer; the LID address gets
+            // the identity for the first time (NewOrUnchanged), so no local
+            // identity-change reaction is warranted here.
+            Ok(decrypted) => {
                 log::info!(
                     "[msg:{}] Decrypted after PN→LID session migration for {}",
                     info.id,
                     info.source.sender
                 );
+                let padded_plaintext = decrypted.plaintext;
                 match self
                     .clone()
                     .handle_decrypted_plaintext(enc_type, &padded_plaintext, padding_version, info)

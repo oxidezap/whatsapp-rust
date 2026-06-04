@@ -314,6 +314,7 @@ fn receive(
             UsePQRatchet::No,
         )
         .await
+        .map(|d| d.plaintext)
     })
 }
 

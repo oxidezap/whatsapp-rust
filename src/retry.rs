@@ -928,7 +928,7 @@ impl Client {
 
         let mut adapter = self.signal_adapter().await;
 
-        process_prekey_bundle(
+        let identity_change = process_prekey_bundle(
             &signal_address,
             &mut adapter.session_store,
             &mut adapter.identity_store,
@@ -940,6 +940,10 @@ impl Client {
 
         // Flush after session establishment
         self.flush_signal_cache().await?;
+
+        if identity_change == wacore::libsignal::protocol::IdentityChange::ReplacedExisting {
+            self.react_to_local_identity_change(requester_jid);
+        }
 
         info!(
             "Processed key bundle from retry receipt for {}",

@@ -256,6 +256,29 @@ impl Client {
         Ok(())
     }
 
+    /// Spawn the local identity-change reaction off the current path so it runs
+    /// after any held session lock is released (the reaction acquires its own
+    /// locks and must not deadlock against an in-flight decrypt/encrypt batch).
+    ///
+    /// Triggered from both the inbound decrypt path and the outbound
+    /// session-establishment paths when `save_identity` reports
+    /// [`IdentityChange::ReplacedExisting`](wacore::libsignal::protocol::IdentityChange),
+    /// mirroring WA Web `saveIdentity` -> `handleNewIdentity`. Gating
+    /// (primary-device, skip-self) lives in [`handle_local_identity_change`].
+    ///
+    /// [`handle_local_identity_change`]: crate::handlers::notification::handle_local_identity_change
+    pub(crate) fn react_to_local_identity_change(&self, sender: &Jid) {
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let sender = sender.clone();
+        self.runtime
+            .spawn(Box::pin(async move {
+                crate::handlers::notification::handle_local_identity_change(&client, sender).await;
+            }))
+            .detach();
+    }
+
     /// Invalidate cached device data for a specific user.
     ///
     /// Removes all device registry cache entries (all LID/PN aliases) so the

@@ -58,10 +58,20 @@ use crate::protocol::ratchet::{ChainKey, UsePQRatchet};
 use crate::protocol::state::PreKeyId;
 use crate::protocol::state::SessionState;
 use crate::protocol::{
-    CiphertextMessage, CiphertextMessageType, Direction, IdentityKeyStore, KeyPair,
+    CiphertextMessage, CiphertextMessageType, Direction, IdentityChange, IdentityKeyStore, KeyPair,
     PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, Result, SessionRecord,
     SessionStore, SignalMessage, SignalProtocolError, SignedPreKeyStore, session,
 };
+
+/// Plaintext plus whether decrypting this message replaced a previously-stored
+/// identity key for the sender. A [`IdentityChange::ReplacedExisting`] is the
+/// local signal that the peer's identity changed (e.g. reinstall), letting the
+/// caller react without waiting for the server's `<identity/>` push.
+#[derive(Debug)]
+pub struct DecryptionResult {
+    pub plaintext: Vec<u8>,
+    pub identity_change: IdentityChange,
+}
 
 pub async fn message_encrypt(
     ptext: &[u8],
@@ -208,7 +218,7 @@ pub async fn message_decrypt<R: Rng + CryptoRng>(
     signed_pre_key_store: &dyn SignedPreKeyStore,
     csprng: &mut R,
     use_pq_ratchet: UsePQRatchet,
-) -> Result<Vec<u8>> {
+) -> Result<DecryptionResult> {
     match ciphertext {
         CiphertextMessage::SignalMessage(m) => {
             message_decrypt_signal(m, remote_address, session_store, identity_store, csprng).await
@@ -243,7 +253,7 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     signed_pre_key_store: &dyn SignedPreKeyStore,
     csprng: &mut R,
     use_pq_ratchet: UsePQRatchet,
-) -> Result<Vec<u8>> {
+) -> Result<DecryptionResult> {
     let existing = session_store.load_session(remote_address).await?;
     let had_session = existing.is_some();
     // Snapshot before process_prekey so a BadMac/InvalidMessage at the
@@ -283,13 +293,16 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
         session_store.store_session(remote_address, record).await?;
     }
 
-    let (plaintext, pre_key_used) = result?;
+    let (plaintext, pre_key_used, identity_change) = result?;
 
     if let Some(pre_key_id) = pre_key_used {
         pre_key_store.remove_pre_key(pre_key_id).await?;
     }
 
-    Ok(plaintext)
+    Ok(DecryptionResult {
+        plaintext,
+        identity_change,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -302,7 +315,7 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
     signed_pre_key_store: &dyn SignedPreKeyStore,
     csprng: &mut R,
     use_pq_ratchet: UsePQRatchet,
-) -> Result<(Vec<u8>, Option<PreKeyId>)> {
+) -> Result<(Vec<u8>, Option<PreKeyId>, IdentityChange)> {
     let process_prekey_result = session::process_prekey(
         ciphertext,
         remote_address,
@@ -340,14 +353,18 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
         csprng,
     )?;
 
-    identity_store
+    let identity_change = identity_store
         .save_identity(
             identity_to_save.remote_address,
             identity_to_save.their_identity_key,
         )
         .await?;
 
-    Ok((decrypt_result.plaintext, pre_key_used.pre_key_id))
+    Ok((
+        decrypt_result.plaintext,
+        pre_key_used.pre_key_id,
+        identity_change,
+    ))
 }
 
 pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
@@ -356,7 +373,7 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
     session_store: &mut dyn SessionStore,
     identity_store: &mut dyn IdentityKeyStore,
     csprng: &mut R,
-) -> Result<Vec<u8>> {
+) -> Result<DecryptionResult> {
     let mut session_record = session_store
         .load_session(remote_address)
         .await?
@@ -375,7 +392,11 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
         .store_session(remote_address, session_record)
         .await?;
 
-    result
+    let (plaintext, identity_change) = result?;
+    Ok(DecryptionResult {
+        plaintext,
+        identity_change,
+    })
 }
 
 async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
@@ -384,7 +405,7 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
     session_record: &mut SessionRecord,
     identity_store: &mut dyn IdentityKeyStore,
     csprng: &mut R,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, IdentityChange)> {
     // A record with no current state and no previous states is degenerate — treat
     // it as missing so the caller gets SessionNotFound and sends a proper retry
     // receipt (with error code 1) instead of attempting decryption that will always
@@ -424,14 +445,19 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
     // The previous session gets promoted to current via `promote_old_session`, so we need
     // to save its identity to avoid UntrustedIdentity errors on subsequent messages.
     // This handles out-of-order message delivery after an identity change gracefully.
-    if decrypt_result.used_previous_session {
+    let identity_change = if decrypt_result.used_previous_session {
         log::debug!(
             "Saving identity for {} from previous session (skipping trust check)",
             remote_address,
         );
+        // Re-saving an archived session's (older) identity for out-of-order
+        // delivery is not the peer's current identity changing, so never report
+        // it as a change. Doing so would fire a spurious local identity-change
+        // reaction and clobber the current identity.
         identity_store
             .save_identity(remote_address, &their_identity_key)
             .await?;
+        IdentityChange::NewOrUnchanged
     } else {
         if !identity_store
             .is_trusted_identity(remote_address, &their_identity_key, Direction::Receiving)
@@ -449,10 +475,10 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
 
         identity_store
             .save_identity(remote_address, &their_identity_key)
-            .await?;
-    }
+            .await?
+    };
 
-    Ok(decrypt_result.plaintext)
+    Ok((decrypt_result.plaintext, identity_change))
 }
 
 fn create_decryption_failure_log(
@@ -546,8 +572,9 @@ fn create_decryption_failure_log(
     Ok(lines.join("\n"))
 }
 
-/// Result of decrypting a message, including whether a previous session was used.
-struct DecryptionResult {
+/// Result of decrypting a message against a session record, including whether a
+/// previous session was used.
+struct RecordDecryptResult {
     plaintext: Vec<u8>,
     /// True if the message was decrypted using a previous (archived) session state
     /// rather than the current session. When true, the identity check should be
@@ -561,7 +588,7 @@ fn decrypt_message_with_record<R: Rng + CryptoRng>(
     ciphertext: &SignalMessage,
     original_message_type: CiphertextMessageType,
     csprng: &mut R,
-) -> Result<DecryptionResult> {
+) -> Result<RecordDecryptResult> {
     debug_assert!(matches!(
         original_message_type,
         CiphertextMessageType::Whisper | CiphertextMessageType::PreKey
@@ -607,7 +634,7 @@ fn decrypt_message_with_record<R: Rng + CryptoRng>(
                         .expect("successful decrypt always has a valid base key"),
                 );
                 record.set_session_state(current_state); // update the state
-                return Ok(DecryptionResult {
+                return Ok(RecordDecryptResult {
                     plaintext: ptext,
                     used_previous_session: false,
                 });
@@ -696,7 +723,7 @@ fn decrypt_message_with_record<R: Rng + CryptoRng>(
                 );
                 // Promote this session (it's already been removed by take_previous_session)
                 record.promote_state(previous);
-                return Ok(DecryptionResult {
+                return Ok(RecordDecryptResult {
                     plaintext: ptext,
                     used_previous_session: true,
                 });
@@ -1252,6 +1279,187 @@ mod tests {
             bob_addr,
             bob_sessions,
             bob_identity,
+        }
+    }
+
+    /// Builds Bob's prekey stores plus a self-signed `PreKeyBundle`, without
+    /// establishing any session. Each call uses a fresh identity, so two bundles
+    /// for the same address model a peer reinstall.
+    #[allow(clippy::type_complexity)]
+    fn fresh_bob(
+        rng: &mut rand::rngs::StdRng,
+    ) -> (
+        ProtocolAddress,
+        MemSessionStore,
+        MemIdentityStore,
+        MemPreKeyStore,
+        MemSignedPreKeyStore,
+        PreKeyBundle,
+    ) {
+        let bob_addr = ProtocolAddress::new("bob".to_string(), 1.into());
+        let bob_id = IdentityKeyPair::generate(rng);
+        let bob_identity_key = *bob_id.identity_key();
+
+        let prekey_id: PreKeyId = 1.into();
+        let prekey_pair = KeyPair::generate(rng);
+        let signed_id: SignedPreKeyId = 1.into();
+        let signed_pair = KeyPair::generate(rng);
+        let signed_sig = bob_id
+            .private_key()
+            .calculate_signature(&signed_pair.public_key.serialize(), rng)
+            .expect("signature");
+
+        let mut bob_prekeys = MemPreKeyStore::new();
+        let mut bob_signed = MemSignedPreKeyStore::new();
+        futures::executor::block_on(async {
+            bob_prekeys
+                .save_pre_key(prekey_id, &PreKeyRecord::new(prekey_id, &prekey_pair))
+                .await
+                .expect("save prekey");
+            bob_signed
+                .save_signed_pre_key(
+                    signed_id,
+                    &SignedPreKeyRecord::new(
+                        signed_id,
+                        Timestamp::from_epoch_millis(0),
+                        &signed_pair,
+                        &signed_sig,
+                    ),
+                )
+                .await
+                .expect("save signed prekey");
+        });
+
+        let bundle = PreKeyBundle::new(
+            2,
+            1.into(),
+            Some((prekey_id, prekey_pair.public_key)),
+            signed_id,
+            signed_pair.public_key,
+            signed_sig.to_vec(),
+            bob_identity_key,
+        )
+        .expect("valid bundle");
+
+        (
+            bob_addr,
+            MemSessionStore::new(),
+            MemIdentityStore::new(bob_id, 2),
+            bob_prekeys,
+            bob_signed,
+            bundle,
+        )
+    }
+
+    /// `process_prekey_bundle` must report `NewOrUnchanged` on first contact and
+    /// `ReplacedExisting` when a later bundle carries a different identity for the
+    /// same address (peer reinstall). This is the signal the high-level client
+    /// threads up to mirror WA Web `saveIdentity` -> `handleNewIdentity`.
+    #[test]
+    fn process_prekey_bundle_reports_identity_change() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let (bob_addr, _bs, _bi, _bp, _bsp, bundle1) = fresh_bob(&mut rng);
+        let (_bob_addr2, _bs2, _bi2, _bp2, _bsp2, bundle2) = fresh_bob(&mut rng);
+
+        let alice_id = IdentityKeyPair::generate(&mut rng);
+        let mut alice_sessions = MemSessionStore::new();
+        let mut alice_identity = MemIdentityStore::new(alice_id, 1);
+
+        futures::executor::block_on(async {
+            let first = process_prekey_bundle(
+                &bob_addr,
+                &mut alice_sessions,
+                &mut alice_identity,
+                &bundle1,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("first bundle");
+            assert_eq!(first, IdentityChange::NewOrUnchanged, "first contact");
+
+            let second = process_prekey_bundle(
+                &bob_addr,
+                &mut alice_sessions,
+                &mut alice_identity,
+                &bundle2,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("second bundle");
+            assert_eq!(
+                second,
+                IdentityChange::ReplacedExisting,
+                "different identity for same address"
+            );
+        });
+    }
+
+    /// `message_decrypt` of a pkmsg reports `NewOrUnchanged` on first contact and
+    /// `ReplacedExisting` when the sender's stored identity differs (reinstall),
+    /// while still returning the correct plaintext.
+    #[test]
+    fn decrypt_prekey_reports_identity_change() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+        for (preseed_stale, expected) in [
+            (false, IdentityChange::NewOrUnchanged),
+            (true, IdentityChange::ReplacedExisting),
+        ] {
+            let alice_addr = ProtocolAddress::new("alice".to_string(), 1.into());
+            let alice_id = IdentityKeyPair::generate(&mut rng);
+            let mut alice_sessions = MemSessionStore::new();
+            let mut alice_identity = MemIdentityStore::new(alice_id, 1);
+
+            let (bob_addr, mut bob_sessions, mut bob_identity, mut bob_prekeys, bob_signed, bundle) =
+                fresh_bob(&mut rng);
+
+            futures::executor::block_on(async {
+                if preseed_stale {
+                    // Bob already knows a different identity for Alice → reinstall.
+                    let stale = *IdentityKeyPair::generate(&mut rng).identity_key();
+                    bob_identity
+                        .save_identity(&alice_addr, &stale)
+                        .await
+                        .expect("seed stale identity");
+                }
+
+                process_prekey_bundle(
+                    &bob_addr,
+                    &mut alice_sessions,
+                    &mut alice_identity,
+                    &bundle,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("process bundle");
+
+                let ct =
+                    message_encrypt(b"hi", &bob_addr, &mut alice_sessions, &mut alice_identity)
+                        .await
+                        .expect("encrypt");
+                let pkmsg = CiphertextMessage::PreKeySignalMessage(
+                    PreKeySignalMessage::try_from(ct.serialize()).expect("parse pkmsg"),
+                );
+
+                let res = message_decrypt(
+                    &pkmsg,
+                    &alice_addr,
+                    &mut bob_sessions,
+                    &mut bob_identity,
+                    &mut bob_prekeys,
+                    &bob_signed,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("decrypt pkmsg");
+
+                assert_eq!(res.plaintext, b"hi".to_vec());
+                assert_eq!(res.identity_change, expected);
+            });
         }
     }
 

@@ -239,9 +239,14 @@ impl Client {
                 )
                 .await
                 {
-                    Ok(_) => {
+                    Ok(identity_change) => {
                         success_count += 1;
                         log::debug!("Successfully established session with {}", jid);
+                        if identity_change
+                            == wacore::libsignal::protocol::IdentityChange::ReplacedExisting
+                        {
+                            self.react_to_local_identity_change(jid);
+                        }
                     }
                     Err(e) => {
                         failed_count += 1;

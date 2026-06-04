@@ -460,6 +460,10 @@ pub struct IdentityChange {
     /// Optional LID for the user
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lid_user: Option<Jid>,
+    /// `true` when detected locally while saving a peer's new identity during
+    /// decrypt (mirrors WA Web `saveIdentity` -> `handleNewIdentity`), `false`
+    /// when triggered by the server's `<identity/>` notification.
+    pub implicit: bool,
 }
 
 /// Type of business status update.

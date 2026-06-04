@@ -8,9 +8,9 @@ use rand::{CryptoRng, Rng};
 use crate::protocol::state::GenericSignedPreKey;
 use crate::protocol::{AliceSignalProtocolParameters, BobSignalProtocolParameters};
 use crate::protocol::{
-    Direction, IdentityKey, IdentityKeyStore, KeyPair, PreKeyBundle, PreKeyId, PreKeySignalMessage,
-    PreKeyStore, ProtocolAddress, Result, SessionRecord, SessionStore, SignalProtocolError,
-    SignedPreKeyStore, ratchet,
+    Direction, IdentityChange, IdentityKey, IdentityKeyStore, KeyPair, PreKeyBundle, PreKeyId,
+    PreKeySignalMessage, PreKeyStore, ProtocolAddress, Result, SessionRecord, SessionStore,
+    SignalProtocolError, SignedPreKeyStore, ratchet,
 };
 
 #[derive(Default)]
@@ -148,7 +148,7 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
     bundle: &PreKeyBundle,
     mut csprng: &mut R,
     use_pq_ratchet: ratchet::UsePQRatchet,
-) -> Result<()> {
+) -> Result<IdentityChange> {
     let their_identity_key = bundle.identity_key()?;
 
     if !identity_store
@@ -199,7 +199,7 @@ async fn process_prekey_bundle_inner<R: Rng + CryptoRng>(
     their_identity_key: &IdentityKey,
     csprng: &mut R,
     use_pq_ratchet: ratchet::UsePQRatchet,
-) -> Result<()> {
+) -> Result<IdentityChange> {
     let our_base_key_pair = KeyPair::generate(csprng);
     let our_base_public_key = our_base_key_pair.public_key;
     let their_signed_prekey = bundle.signed_pre_key_public()?;
@@ -237,11 +237,11 @@ async fn process_prekey_bundle_inner<R: Rng + CryptoRng>(
     session.set_local_registration_id(identity_store.get_local_registration_id().await?);
     session.set_remote_registration_id(bundle.registration_id()?);
 
-    identity_store
+    let identity_change = identity_store
         .save_identity(remote_address, their_identity_key)
         .await?;
 
     session_record.promote_state(session);
 
-    Ok(())
+    Ok(identity_change)
 }

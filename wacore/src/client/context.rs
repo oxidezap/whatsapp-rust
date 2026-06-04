@@ -166,6 +166,16 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         let _ = phone_user;
         None
     }
+
+    /// Notify that establishing a session for `jid` replaced a previously-stored
+    /// identity key (local detection of a peer identity change on the send path).
+    ///
+    /// Default is a no-op; the high-level client reacts off-path (mirrors WA Web
+    /// `saveIdentity` -> `handleNewIdentity`). The resolver is the only handle
+    /// back to the client available inside `encrypt_for_devices`.
+    fn on_local_identity_change(&self, jid: &Jid) {
+        let _ = jid;
+    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 use crate::client::context::{GroupInfo, SendContextResolver};
 use crate::libsignal::protocol::{
-    CiphertextMessage, ProtocolAddress, SENDERKEY_MESSAGE_CURRENT_VERSION, SenderKeyMessage,
-    SenderKeyStore, SignalProtocolError, UsePQRatchet, message_encrypt, process_prekey_bundle,
+    CiphertextMessage, IdentityChange, ProtocolAddress, SENDERKEY_MESSAGE_CURRENT_VERSION,
+    SenderKeyMessage, SenderKeyStore, SignalProtocolError, UsePQRatchet, message_encrypt,
+    process_prekey_bundle,
 };
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::messages::MessageUtils;
@@ -798,7 +799,7 @@ where
                         "No pre-key bundle returned for device {}. This device will be skipped for encryption.",
                         addr
                     );
-                    return Ok::<(), anyhow::Error>(());
+                    return Ok::<Option<Jid>, anyhow::Error>(None);
                 };
 
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -815,7 +816,10 @@ where
                 )
                 .await
                 {
-                    Ok(_) => Ok(()),
+                    // Surface a replaced identity so the caller can react
+                    // (resolver has no 'static handle into this spawned task).
+                    Ok(IdentityChange::ReplacedExisting) => Ok(Some(encryption_jid)),
+                    Ok(IdentityChange::NewOrUnchanged) => Ok(None),
                     Err(e) => Err(anyhow::anyhow!(
                         "Failed to process pre-key bundle for {}: {:?}",
                         addr,
@@ -832,7 +836,10 @@ where
         }
         while let Some(spawn_result) = in_flight.next().await {
             match spawn_result {
-                Ok(Ok(())) => {}
+                // Some(jid) => establishing this session replaced a stored
+                // identity; notify the client so it can react off-path.
+                Ok(Ok(Some(changed_jid))) => resolver.on_local_identity_change(&changed_jid),
+                Ok(Ok(None)) => {}
                 Ok(Err(e)) => return Err(e),
                 Err(SpawnCanceled) => {
                     log::warn!(
@@ -2394,6 +2401,8 @@ mod tests {
         devices: Vec<Jid>,
         /// Phone number to LID mappings for testing LID session lookup
         phone_to_lid: HashMap<String, String>,
+        /// JIDs reported via `on_local_identity_change` (send-path detection).
+        identity_changes: std::sync::Mutex<Vec<Jid>>,
     }
 
     impl MockSendContextResolver {
@@ -2402,7 +2411,12 @@ mod tests {
                 prekey_bundles: HashMap::new(),
                 devices: Vec::new(),
                 phone_to_lid: HashMap::new(),
+                identity_changes: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn captured_identity_changes(&self) -> Vec<Jid> {
+            self.identity_changes.lock().unwrap().clone()
         }
 
         fn with_missing_bundle(mut self, jid: Jid) -> Self {
@@ -2469,6 +2483,10 @@ mod tests {
             phone_user: &str,
         ) -> Option<wacore_binary::CompactString> {
             self.phone_to_lid.get(phone_user).map(|s| s.as_str().into())
+        }
+
+        fn on_local_identity_change(&self, jid: &Jid) {
+            self.identity_changes.lock().unwrap().push(jid.clone());
         }
     }
 
@@ -5069,6 +5087,233 @@ mod tests {
                 build_group_phash_set(&with_hosted, &own),
                 build_group_phash_set(&without_hosted, &own),
                 "hosted devices must not affect the phash set"
+            );
+        }
+    }
+
+    mod local_identity_change_on_send {
+        use super::*;
+        use crate::libsignal::protocol::{
+            Direction, IdentityChange, IdentityKey, IdentityKeyStore, PreKeyId, PreKeyRecord,
+            PreKeyStore, ProtocolAddress, SenderKeyRecord, SessionRecord, SessionStore,
+            SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
+        };
+        use crate::runtime::{AbortHandle, Runtime};
+        use crate::types::jid::JidExt;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::time::Duration;
+
+        type SigResult<T> = crate::libsignal::protocol::error::Result<T>;
+
+        #[derive(Clone, Default)]
+        struct MemSessionStore(HashMap<ProtocolAddress, Vec<u8>>);
+        #[async_trait::async_trait]
+        impl SessionStore for MemSessionStore {
+            async fn load_session(&self, a: &ProtocolAddress) -> SigResult<Option<SessionRecord>> {
+                Ok(self
+                    .0
+                    .get(a)
+                    .and_then(|b| SessionRecord::deserialize(b).ok()))
+            }
+            async fn has_session(&self, a: &ProtocolAddress) -> SigResult<bool> {
+                Ok(self.0.contains_key(a))
+            }
+            async fn store_session(
+                &mut self,
+                a: &ProtocolAddress,
+                r: SessionRecord,
+            ) -> SigResult<()> {
+                self.0.insert(a.clone(), r.serialize()?);
+                Ok(())
+            }
+        }
+
+        /// Identity store that reports the real change (unlike the hardcoded
+        /// stub elsewhere), so a pre-seeded stale key surfaces as ReplacedExisting.
+        #[derive(Clone)]
+        struct MemIdentityStore {
+            pair: IdentityKeyPair,
+            known: HashMap<ProtocolAddress, IdentityKey>,
+        }
+        #[async_trait::async_trait]
+        impl IdentityKeyStore for MemIdentityStore {
+            async fn get_identity_key_pair(&self) -> SigResult<IdentityKeyPair> {
+                Ok(self.pair.clone())
+            }
+            async fn get_local_registration_id(&self) -> SigResult<u32> {
+                Ok(42)
+            }
+            async fn save_identity(
+                &mut self,
+                a: &ProtocolAddress,
+                id: &IdentityKey,
+            ) -> SigResult<IdentityChange> {
+                let changed = self.known.get(a).is_some_and(|k| k != id);
+                self.known.insert(a.clone(), *id);
+                Ok(IdentityChange::from_changed(changed))
+            }
+            async fn is_trusted_identity(
+                &self,
+                _: &ProtocolAddress,
+                _: &IdentityKey,
+                _: Direction,
+            ) -> SigResult<bool> {
+                Ok(true)
+            }
+            async fn get_identity(&self, a: &ProtocolAddress) -> SigResult<Option<IdentityKey>> {
+                Ok(self.known.get(a).copied())
+            }
+        }
+
+        struct UnusedPreKeyStore;
+        #[async_trait::async_trait]
+        impl PreKeyStore for UnusedPreKeyStore {
+            async fn get_pre_key(&self, _: PreKeyId) -> SigResult<PreKeyRecord> {
+                unreachable!()
+            }
+            async fn save_pre_key(&mut self, _: PreKeyId, _: &PreKeyRecord) -> SigResult<()> {
+                unreachable!()
+            }
+            async fn remove_pre_key(&mut self, _: PreKeyId) -> SigResult<()> {
+                unreachable!()
+            }
+        }
+        struct UnusedSignedPreKeyStore;
+        #[async_trait::async_trait]
+        impl SignedPreKeyStore for UnusedSignedPreKeyStore {
+            async fn get_signed_pre_key(&self, _: SignedPreKeyId) -> SigResult<SignedPreKeyRecord> {
+                unreachable!()
+            }
+            async fn save_signed_pre_key(
+                &mut self,
+                _: SignedPreKeyId,
+                _: &SignedPreKeyRecord,
+            ) -> SigResult<()> {
+                unreachable!()
+            }
+        }
+        #[derive(Default)]
+        struct MemSenderKeyStore(
+            HashMap<crate::libsignal::store::sender_key_name::SenderKeyName, SenderKeyRecord>,
+        );
+        #[async_trait::async_trait]
+        impl SenderKeyStore for MemSenderKeyStore {
+            async fn store_sender_key(
+                &mut self,
+                n: &crate::libsignal::store::sender_key_name::SenderKeyName,
+                r: SenderKeyRecord,
+            ) -> SigResult<()> {
+                self.0.insert(n.clone(), r);
+                Ok(())
+            }
+            async fn load_sender_key(
+                &self,
+                n: &crate::libsignal::store::sender_key_name::SenderKeyName,
+            ) -> SigResult<Option<SenderKeyRecord>> {
+                Ok(self.0.get(n).cloned())
+            }
+        }
+
+        struct TokioTestRuntime;
+        #[async_trait::async_trait]
+        impl Runtime for TokioTestRuntime {
+            fn spawn(
+                &self,
+                future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+            ) -> AbortHandle {
+                let handle = tokio::spawn(future);
+                AbortHandle::new(move || handle.abort())
+            }
+            fn sleep(&self, _d: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+            fn spawn_blocking(
+                &self,
+                f: Box<dyn FnOnce() + Send + 'static>,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async move {
+                    let _ = tokio::task::spawn_blocking(f).await;
+                })
+            }
+            fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+                None
+            }
+        }
+
+        /// The send path must report a replaced identity via the resolver when
+        /// establishing a session whose bundle carries a new identity key for an
+        /// address we already knew (peer reinstall). Mirrors WA Web saveIdentity
+        /// -> handleNewIdentity firing during outbound session setup.
+        #[tokio::test]
+        async fn encrypt_for_devices_reports_replaced_identity() {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+            // Receiver device D with a valid signed bundle.
+            let device: Jid = "5511777777777:0@s.whatsapp.net".parse().unwrap();
+            let receiver = IdentityKeyPair::generate(&mut rng);
+            let spk = KeyPair::generate(&mut rng);
+            let opk = KeyPair::generate(&mut rng);
+            let sig = receiver
+                .private_key()
+                .calculate_signature(&spk.public_key.serialize(), &mut rng)
+                .unwrap();
+            let bundle = PreKeyBundle::new(
+                1,
+                1u32.into(),
+                Some((1u32.into(), opk.public_key)),
+                1u32.into(),
+                spk.public_key,
+                sig.to_vec(),
+                *receiver.identity_key(),
+            )
+            .unwrap();
+
+            // Local stores: no session for D + a STALE identity pre-seeded for D's
+            // address, so establishing the session reports ReplacedExisting.
+            let sender = IdentityKeyPair::generate(&mut rng);
+            let stale = *IdentityKeyPair::generate(&mut rng).identity_key();
+            let mut known = HashMap::new();
+            known.insert(device.to_protocol_address(), stale);
+
+            let mut session_store = MemSessionStore::default();
+            let mut identity_store = MemIdentityStore {
+                pair: sender,
+                known,
+            };
+            let mut prekey_store = UnusedPreKeyStore;
+            let signed_prekey_store = UnusedSignedPreKeyStore;
+            let mut sender_key_store = MemSenderKeyStore::default();
+
+            let mut stores = SignalStores {
+                sender_key_store: &mut sender_key_store,
+                session_store: &mut session_store,
+                identity_store: &mut identity_store,
+                prekey_store: &mut prekey_store,
+                signed_prekey_store: &signed_prekey_store,
+            };
+
+            let resolver = MockSendContextResolver::new()
+                .with_bundle(device.clone(), bundle)
+                .with_devices(vec![device.clone()]);
+            let rt = TokioTestRuntime;
+
+            encrypt_for_devices(
+                &rt,
+                &mut stores,
+                &resolver,
+                std::slice::from_ref(&device),
+                b"hello",
+                false,
+                None,
+            )
+            .await
+            .expect("encrypt_for_devices");
+
+            assert_eq!(
+                resolver.captured_identity_changes(),
+                vec![device],
+                "replaced identity on the send path must be reported via the resolver"
             );
         }
     }

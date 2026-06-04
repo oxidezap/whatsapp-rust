@@ -380,6 +380,7 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
         crate::types::events::IdentityChange {
             user: from_jid,
             lid_user: node.attrs().optional_jid("lid"),
+            implicit: false,
         },
     ));
 
@@ -393,6 +394,72 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
             }
         }))
         .detach();
+}
+
+/// React to a locally-detected identity change.
+///
+/// Fires when decrypting a peer's message saved a new identity key that replaced
+/// a different one (`IdentityChange::ReplacedExisting`). Mirrors WA Web
+/// `ProtocolStoreUnifiedApi.saveIdentity` -> `handleNewIdentity`: clear the
+/// device-list/sender-key tracking, force a fresh usync, re-issue an active tc
+/// token, and emit `Event::IdentityChange { implicit: true }`.
+///
+/// Deliberately lighter than the server `<identity/>` push handler
+/// ([`handle_identity_change`]): it does NOT delete the primary session, rotate
+/// the status sender key, or re-establish sessions. The message that triggered
+/// this is establishing the new session right now, and the heavier reset is the
+/// server push's job (which reliably follows). This matches WA Web, where the
+/// local `handleNewIdentity` omits those steps that only the server-push
+/// `handleE2eIdentityChange` performs.
+pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: Jid) {
+    // Only a peer's primary-device identity change matters; companion devices
+    // carry their own identities (WA Web ignores them on this path).
+    if sender.device != 0 {
+        return;
+    }
+
+    // Self-identity changes use a separate flow; clearing our own record would
+    // break our sessions.
+    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+    let is_me = device_snapshot
+        .pn
+        .as_ref()
+        .is_some_and(|pn| pn.user == sender.user)
+        || device_snapshot
+            .lid
+            .as_ref()
+            .is_some_and(|lid| lid.user == sender.user);
+    if is_me {
+        return;
+    }
+
+    info!(
+        "Local identity change detected for {}: clearing device record",
+        sender.user
+    );
+
+    // Deletes non-primary sessions + all sender key device tracking.
+    if let Some(record) = client.load_device_record(&sender.user).await {
+        client
+            .clear_device_record(&sender.user, sender.server.as_str(), &record)
+            .await;
+    }
+
+    // Force a fresh usync on next send so we re-learn the peer's device list.
+    client.invalidate_device_cache(&sender.user).await;
+
+    // Re-issue an active trusted-contact token (no-op unless one is live).
+    if !sender.is_bot() && !sender.is_status_broadcast() {
+        client.reissue_tc_token_after_identity_change(&sender).await;
+    }
+
+    client.core.event_bus.dispatch(Event::IdentityChange(
+        crate::types::events::IdentityChange {
+            user: sender,
+            lid_user: None,
+            implicit: true,
+        },
+    ));
 }
 
 /// Handle device list change notifications.
@@ -2240,6 +2307,70 @@ mod tests {
             .children([NodeBuilder::new("identity").build()])
             .build();
         handle_notification_impl(&client, node_to_arc(node)).await;
+
+        assert!(
+            collector.events().is_empty(),
+            "companion device identity change should be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_identity_change_dispatches_implicit_event() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let sender: Jid = "5511777777777@s.whatsapp.net".parse().unwrap();
+        handle_local_identity_change(&client, sender).await;
+
+        let events = collector.events();
+        // The event is dispatched last (after clear_device_record +
+        // invalidate_device_cache), so observing it proves the handler ran to
+        // completion. invalidate_device_cache itself is covered by
+        // test_invalidate_device_cache_uses_correct_jid_types.
+        let ic = events
+            .iter()
+            .find_map(|e| match &**e {
+                Event::IdentityChange(ic) => Some(ic.clone()),
+                _ => None,
+            })
+            .expect("local detection should dispatch IdentityChange");
+        assert!(
+            ic.implicit,
+            "locally-detected identity change must set implicit=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_identity_change_skips_self() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        client
+            .persistence_manager
+            .modify_device(|d| {
+                d.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
+            })
+            .await;
+
+        let sender: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
+        handle_local_identity_change(&client, sender).await;
+
+        assert!(
+            collector.events().is_empty(),
+            "self identity change must never clear our own record"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_identity_change_skips_companion_device() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let sender: Jid = "5511777777777:5@s.whatsapp.net".parse().unwrap();
+        handle_local_identity_change(&client, sender).await;
 
         assert!(
             collector.events().is_empty(),

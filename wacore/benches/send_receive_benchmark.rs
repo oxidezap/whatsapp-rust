@@ -441,7 +441,7 @@ fn decrypt_dm(
             CiphertextMessage::SignalMessage(SignalMessage::try_from(ciphertext).unwrap())
         };
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let plaintext = message_decrypt(
+        let decrypted = message_decrypt(
             &parsed,
             sender_addr,
             &mut receiver.sessions,
@@ -454,7 +454,7 @@ fn decrypt_dm(
         .await
         .unwrap();
 
-        let unpadded = MessageUtils::unpad_message_ref(&plaintext, 2).unwrap();
+        let unpadded = MessageUtils::unpad_message_ref(&decrypted.plaintext, 2).unwrap();
         wa::Message::decode(unpadded).unwrap()
     })
 }
