@@ -52,8 +52,6 @@ pub struct SignalStoreCache {
     sessions: Mutex<SessionStoreState>,
     identities: Mutex<ByteStoreState>,
     sender_keys: Mutex<SenderKeyStoreState>,
-    /// Avoids per-flush Vec allocation on the hot path (called after every message).
-    flush_encode_buf: Mutex<Vec<u8>>,
     /// Per-(group, sender) locks serializing each sender-key chain advance.
     /// Coordination only (like the client session locks): never time-evicted.
     sender_key_locks: Mutex<HashMap<Arc<str>, Arc<Mutex<()>>>>,
@@ -272,7 +270,6 @@ impl SignalStoreCache {
             sessions: Mutex::new(SessionStoreState::new()),
             identities: Mutex::new(ByteStoreState::new()),
             sender_keys: Mutex::new(SenderKeyStoreState::new()),
-            flush_encode_buf: Mutex::new(Vec::with_capacity(4096)),
             sender_key_locks: Mutex::new(HashMap::new()),
             max_entries,
         }
@@ -542,22 +539,27 @@ impl SignalStoreCache {
     ///   mutations to the same store are blocked until the flush completes.
     /// - Dirty sets are cleared only after successful writes.
     pub async fn flush(&self, backend: &dyn SignalStore) -> Result<()> {
-        // Flush sessions
+        // Flush sessions: one batched write for all dirty puts instead of one
+        // backend call (and one SQLite transaction) per session.
         {
             let mut state = self.sessions.lock().await;
             let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
             let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
 
-            let mut encode_buf = self.flush_encode_buf.lock().await;
+            let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::new();
             for address in &dirty_keys {
                 match state.cache.get(address.as_ref()) {
                     Some(SessionEntry::Present(record)) => {
-                        record.serialize_into(&mut encode_buf);
-                        backend.put_session(address, &encode_buf).await?;
+                        let mut buf = Vec::new();
+                        record.serialize_into(&mut buf);
+                        batch.push((address.clone(), bytes::Bytes::from(buf)));
                     }
                     Some(SessionEntry::CheckedOut) => continue,
                     _ => {}
                 }
+            }
+            if !batch.is_empty() {
+                backend.put_sessions_batch(&batch).await?;
             }
             for address in &deleted_keys {
                 backend.delete_session(address).await?;
@@ -583,6 +585,7 @@ impl SignalStoreCache {
             let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
             let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
 
+            let mut batch: Vec<(Arc<str>, [u8; 32])> = Vec::new();
             for address in &dirty_keys {
                 if let Some(Some(data)) = state.cache.get(address.as_ref()) {
                     let key: [u8; 32] = data.as_ref().try_into().map_err(|_| {
@@ -591,8 +594,11 @@ impl SignalStoreCache {
                             data.len()
                         )
                     })?;
-                    backend.put_identity(address, key).await?;
+                    batch.push((address.clone(), key));
                 }
+            }
+            if !batch.is_empty() {
+                backend.put_identities_batch(&batch).await?;
             }
             for address in &deleted_keys {
                 backend.delete_identity(address).await?;
@@ -612,19 +618,23 @@ impl SignalStoreCache {
             let mut state = self.sender_keys.lock().await;
             let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
 
+            let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::new();
             for name in &dirty_keys {
                 match state.cache.get(name.as_ref()) {
                     Some(Some(record)) => {
                         let bytes = record
                             .serialize()
                             .map_err(|e| anyhow::anyhow!("sender key serialize for {name}: {e}"))?;
-                        backend.put_sender_key(name, &bytes).await?;
+                        batch.push((name.clone(), bytes::Bytes::from(bytes)));
                     }
                     Some(None) => {
                         backend.delete_sender_key(name).await?;
                     }
                     None => {}
                 }
+            }
+            if !batch.is_empty() {
+                backend.put_sender_keys_batch(&batch).await?;
             }
 
             for key in &dirty_keys {

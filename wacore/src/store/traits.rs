@@ -108,6 +108,20 @@ pub trait SignalStore: Send + Sync {
     /// Store an identity key for a remote address.
     async fn put_identity(&self, address: &str, key: [u8; 32]) -> Result<()>;
 
+    /// Store multiple identity keys in a single batch operation.
+    /// Default implementation falls back to individual `put_identity` calls.
+    /// Addresses are `Arc<str>` so callers (the flush path) pass shared keys
+    /// without allocating a `String` per entry.
+    async fn put_identities_batch(
+        &self,
+        identities: &[(std::sync::Arc<str>, [u8; 32])],
+    ) -> Result<()> {
+        for (address, key) in identities {
+            self.put_identity(address, *key).await?;
+        }
+        Ok(())
+    }
+
     /// Load an identity key for a remote address (always 32 bytes).
     async fn load_identity(&self, address: &str) -> Result<Option<[u8; 32]>>;
 
@@ -121,6 +135,15 @@ pub trait SignalStore: Send + Sync {
 
     /// Store an encrypted session.
     async fn put_session(&self, address: &str, session: &[u8]) -> Result<()>;
+
+    /// Store multiple encrypted sessions in a single batch operation.
+    /// Default implementation falls back to individual `put_session` calls.
+    async fn put_sessions_batch(&self, sessions: &[(std::sync::Arc<str>, Bytes)]) -> Result<()> {
+        for (address, session) in sessions {
+            self.put_session(address, session).await?;
+        }
+        Ok(())
+    }
 
     /// Delete a session.
     async fn delete_session(&self, address: &str) -> Result<()>;
@@ -194,6 +217,18 @@ pub trait SignalStore: Send + Sync {
 
     /// Store a sender key for group messaging.
     async fn put_sender_key(&self, address: &str, record: &[u8]) -> Result<()>;
+
+    /// Store multiple sender keys in a single batch operation.
+    /// Default implementation falls back to individual `put_sender_key` calls.
+    async fn put_sender_keys_batch(
+        &self,
+        sender_keys: &[(std::sync::Arc<str>, Bytes)],
+    ) -> Result<()> {
+        for (address, record) in sender_keys {
+            self.put_sender_key(address, record).await?;
+        }
+        Ok(())
+    }
 
     /// Get a sender key.
     async fn get_sender_key(&self, address: &str) -> Result<Option<Vec<u8>>>;

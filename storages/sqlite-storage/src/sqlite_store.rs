@@ -1261,6 +1261,73 @@ impl SignalStore for SqliteStore {
             .await
     }
 
+    async fn put_identities_batch(&self, identities: &[(Arc<str>, [u8; 32])]) -> Result<()> {
+        if identities.is_empty() {
+            return Ok(());
+        }
+
+        let pool = self.pool.clone();
+        let db_semaphore = self.db_semaphore.clone();
+        let device_id = self.device_id;
+        let identities: Vec<(Arc<str>, [u8; 32])> = identities.to_vec();
+
+        const MAX_RETRIES: u32 = 5;
+
+        for attempt in 0..=MAX_RETRIES {
+            let permit = db_semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+
+            let pool_clone = pool.clone();
+            let identities_clone = identities.clone();
+
+            let result =
+                tokio::task::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
+                    let mut conn = pool_clone
+                        .get()
+                        .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
+
+                    conn.transaction(|conn| {
+                        for (address, key) in &identities_clone {
+                            diesel::insert_into(identities::table)
+                                .values((
+                                    identities::address.eq(address.as_ref()),
+                                    identities::key.eq(&key[..]),
+                                    identities::device_id.eq(device_id),
+                                ))
+                                .on_conflict((identities::address, identities::device_id))
+                                .do_update()
+                                .set(identities::key.eq(&key[..]))
+                                .execute(conn)?;
+                        }
+                        Ok::<(), diesel::result::Error>(())
+                    })
+                    .map_err(DieselOrStore::Diesel)
+                })
+                .await;
+
+            drop(permit);
+
+            match result {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(DieselOrStore::Diesel(ref e)))
+                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
+                {
+                    let delay_ms = 10u64 * (1u64 << attempt.min(4));
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(e) => return Err(StoreError::Database(Box::new(e))),
+            }
+        }
+
+        Err(StoreError::RetriesExhausted {
+            op: "put_identities_batch".to_string(),
+        })
+    }
+
     async fn load_identity(&self, address: &str) -> Result<Option<[u8; 32]>> {
         let blob = self
             .load_identity_for_device(address, self.device_id)
@@ -1353,6 +1420,73 @@ impl SignalStore for SqliteStore {
     async fn put_session(&self, address: &str, session: &[u8]) -> Result<()> {
         self.put_session_for_device(address, session, self.device_id)
             .await
+    }
+
+    async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+
+        let pool = self.pool.clone();
+        let db_semaphore = self.db_semaphore.clone();
+        let device_id = self.device_id;
+        let sessions: Vec<(Arc<str>, Bytes)> = sessions.to_vec();
+
+        const MAX_RETRIES: u32 = 5;
+
+        for attempt in 0..=MAX_RETRIES {
+            let permit = db_semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+
+            let pool_clone = pool.clone();
+            let sessions_clone = sessions.clone();
+
+            let result =
+                tokio::task::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
+                    let mut conn = pool_clone
+                        .get()
+                        .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
+
+                    conn.transaction(|conn| {
+                        for (address, record) in &sessions_clone {
+                            diesel::insert_into(sessions::table)
+                                .values((
+                                    sessions::address.eq(address.as_ref()),
+                                    sessions::record.eq(record.as_ref()),
+                                    sessions::device_id.eq(device_id),
+                                ))
+                                .on_conflict((sessions::address, sessions::device_id))
+                                .do_update()
+                                .set(sessions::record.eq(record.as_ref()))
+                                .execute(conn)?;
+                        }
+                        Ok::<(), diesel::result::Error>(())
+                    })
+                    .map_err(DieselOrStore::Diesel)
+                })
+                .await;
+
+            drop(permit);
+
+            match result {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(DieselOrStore::Diesel(ref e)))
+                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
+                {
+                    let delay_ms = 10u64 * (1u64 << attempt.min(4));
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(e) => return Err(StoreError::Database(Box::new(e))),
+            }
+        }
+
+        Err(StoreError::RetriesExhausted {
+            op: "put_sessions_batch".to_string(),
+        })
     }
 
     async fn delete_session(&self, address: &str) -> Result<()> {
@@ -1769,6 +1903,73 @@ impl SignalStore for SqliteStore {
     async fn put_sender_key(&self, address: &str, record: &[u8]) -> Result<()> {
         self.put_sender_key_for_device(address, record, self.device_id)
             .await
+    }
+
+    async fn put_sender_keys_batch(&self, sender_keys: &[(Arc<str>, Bytes)]) -> Result<()> {
+        if sender_keys.is_empty() {
+            return Ok(());
+        }
+
+        let pool = self.pool.clone();
+        let db_semaphore = self.db_semaphore.clone();
+        let device_id = self.device_id;
+        let sender_keys: Vec<(Arc<str>, Bytes)> = sender_keys.to_vec();
+
+        const MAX_RETRIES: u32 = 5;
+
+        for attempt in 0..=MAX_RETRIES {
+            let permit = db_semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+
+            let pool_clone = pool.clone();
+            let sender_keys_clone = sender_keys.clone();
+
+            let result =
+                tokio::task::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
+                    let mut conn = pool_clone
+                        .get()
+                        .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
+
+                    conn.transaction(|conn| {
+                        for (address, record) in &sender_keys_clone {
+                            diesel::insert_into(sender_keys::table)
+                                .values((
+                                    sender_keys::address.eq(address.as_ref()),
+                                    sender_keys::record.eq(record.as_ref()),
+                                    sender_keys::device_id.eq(device_id),
+                                ))
+                                .on_conflict((sender_keys::address, sender_keys::device_id))
+                                .do_update()
+                                .set(sender_keys::record.eq(record.as_ref()))
+                                .execute(conn)?;
+                        }
+                        Ok::<(), diesel::result::Error>(())
+                    })
+                    .map_err(DieselOrStore::Diesel)
+                })
+                .await;
+
+            drop(permit);
+
+            match result {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(DieselOrStore::Diesel(ref e)))
+                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
+                {
+                    let delay_ms = 10u64 * (1u64 << attempt.min(4));
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(e) => return Err(StoreError::Database(Box::new(e))),
+            }
+        }
+
+        Err(StoreError::RetriesExhausted {
+            op: "put_sender_keys_batch".to_string(),
+        })
     }
 
     async fn get_sender_key(&self, address: &str) -> Result<Option<Vec<u8>>> {
@@ -2965,6 +3166,75 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_signal_batches_persist_and_upsert() {
+        use std::sync::Arc;
+        let store = create_test_store().await;
+
+        let sessions: Vec<(Arc<str>, Bytes)> = (0..5u8)
+            .map(|i| {
+                (
+                    Arc::from(format!("user{i}@s.whatsapp.net").as_str()),
+                    Bytes::from(vec![i; 8]),
+                )
+            })
+            .collect();
+        store.put_sessions_batch(&sessions).await.unwrap();
+        for (addr, bytes) in &sessions {
+            assert_eq!(
+                store.get_session(addr).await.unwrap().as_deref(),
+                Some(bytes.as_ref())
+            );
+        }
+
+        let identities: Vec<(Arc<str>, [u8; 32])> = (0..5u8)
+            .map(|i| {
+                (
+                    Arc::from(format!("user{i}@s.whatsapp.net").as_str()),
+                    [i; 32],
+                )
+            })
+            .collect();
+        store.put_identities_batch(&identities).await.unwrap();
+        for (addr, key) in &identities {
+            assert_eq!(store.load_identity(addr).await.unwrap(), Some(*key));
+        }
+
+        let sender_keys: Vec<(Arc<str>, Bytes)> = (0..5u8)
+            .map(|i| {
+                (
+                    Arc::from(format!("g@g.us::user{i}").as_str()),
+                    Bytes::from(vec![i; 16]),
+                )
+            })
+            .collect();
+        store.put_sender_keys_batch(&sender_keys).await.unwrap();
+        for (addr, bytes) in &sender_keys {
+            assert_eq!(
+                store.get_sender_key(addr).await.unwrap().as_deref(),
+                Some(bytes.as_ref())
+            );
+        }
+
+        // Re-batching the same addresses upserts (on_conflict do_update).
+        let updated: Vec<(Arc<str>, Bytes)> = sessions
+            .iter()
+            .map(|(addr, _)| (addr.clone(), Bytes::from(vec![0xAA; 8])))
+            .collect();
+        store.put_sessions_batch(&updated).await.unwrap();
+        for (addr, _) in &sessions {
+            assert_eq!(
+                store.get_session(addr).await.unwrap().as_deref(),
+                Some([0xAA; 8].as_slice())
+            );
+        }
+
+        // Empty batches short-circuit without error.
+        store.put_sessions_batch(&[]).await.unwrap();
+        store.put_identities_batch(&[]).await.unwrap();
+        store.put_sender_keys_batch(&[]).await.unwrap();
     }
 
     #[test]
