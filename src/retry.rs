@@ -1028,46 +1028,21 @@ impl Client {
             }
             drop(device_guard);
 
-            let identity_key_bytes = device_snapshot
-                .identity_key
-                .public_key
-                .public_key_bytes()
-                .to_vec();
-
-            let prekey_value_bytes = new_prekey_keypair.public_key.serialize().to_vec();
-
-            let skey_id = device_snapshot.signed_pre_key_id;
-            let skey_value_bytes = device_snapshot
-                .signed_pre_key
-                .public_key
-                .serialize()
-                .to_vec();
-            let skey_sig_bytes = device_snapshot.signed_pre_key_signature.to_vec();
-
             let device_identity_bytes = device_snapshot
                 .account
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Missing device account info for retry receipt"))?
                 .encode_to_vec();
 
-            let type_bytes = vec![5u8];
-
-            Some(
-                NodeBuilder::new("keys")
-                    .children([
-                        NodeBuilder::new("type").bytes(type_bytes).build(),
-                        NodeBuilder::new("identity")
-                            .bytes(identity_key_bytes)
-                            .build(),
-                        OneTimePreKeyNode::new(new_prekey_id, prekey_value_bytes).into_node(),
-                        SignedPreKeyNode::new(skey_id, skey_value_bytes, skey_sig_bytes)
-                            .into_node(),
-                        NodeBuilder::new("device-identity")
-                            .bytes(device_identity_bytes)
-                            .build(),
-                    ])
-                    .build(),
-            )
+            Some(wacore::protocol::retry::build_retry_keys_node(
+                &device_snapshot.identity_key.public_key,
+                new_prekey_id,
+                &new_prekey_keypair.public_key,
+                device_snapshot.signed_pre_key_id,
+                &device_snapshot.signed_pre_key.public_key,
+                device_snapshot.signed_pre_key_signature.to_vec(),
+                device_identity_bytes,
+            ))
         } else {
             None
         };
