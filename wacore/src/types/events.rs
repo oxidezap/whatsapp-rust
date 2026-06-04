@@ -325,9 +325,33 @@ impl EventHandler for ChannelEventHandler {
     }
 }
 
+/// Immutable snapshot of the registered handlers plus the OR of their
+/// interests. `dispatch` clones only the outer `Arc` (one refcount bump, no
+/// `Vec` allocation) and tests `aggregate` before touching anything else, so an
+/// event no handler wants costs nothing past the bitmask check.
+struct HandlerSnapshot {
+    handlers: Vec<Arc<dyn EventHandler>>,
+    /// OR of every handler's `interest()`, so `dispatch` can short-circuit an
+    /// ignored kind without scanning the handler list.
+    aggregate: EventInterest,
+}
+
+impl Default for HandlerSnapshot {
+    fn default() -> Self {
+        Self {
+            handlers: Vec::new(),
+            aggregate: EventInterest::none(),
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct CoreEventBus {
-    handlers: Arc<RwLock<Vec<Arc<dyn EventHandler>>>>,
+    // Copy-on-write: the snapshot is only swapped (under the lock) when a
+    // handler is added, which happens at startup. `dispatch` takes a cheap
+    // outer-Arc clone and then drops the lock, so a concurrent `add_handler`
+    // can never invalidate a snapshot a dispatch is iterating.
+    handlers: Arc<RwLock<Arc<HandlerSnapshot>>>,
 }
 
 impl CoreEventBus {
@@ -335,52 +359,54 @@ impl CoreEventBus {
         Self::default()
     }
 
-    pub fn add_handler(&self, handler: Arc<dyn EventHandler>) {
+    fn snapshot(&self) -> Arc<HandlerSnapshot> {
         self.handlers
-            .write()
+            .read()
             .expect("RwLock should not be poisoned")
-            .push(handler);
+            .clone()
+    }
+
+    pub fn add_handler(&self, handler: Arc<dyn EventHandler>) {
+        let mut guard = self
+            .handlers
+            .write()
+            .expect("RwLock should not be poisoned");
+        let current = &**guard;
+        let mut handlers = Vec::with_capacity(current.handlers.len() + 1);
+        handlers.extend(current.handlers.iter().cloned());
+        let aggregate = EventInterest(current.aggregate.0 | handler.interest().0);
+        handlers.push(handler);
+        *guard = Arc::new(HandlerSnapshot {
+            handlers,
+            aggregate,
+        });
     }
 
     /// Returns true if there are any event handlers registered.
     /// Useful for skipping expensive work when no one is listening.
     pub fn has_handlers(&self) -> bool {
-        !self
-            .handlers
-            .read()
-            .expect("RwLock should not be poisoned")
-            .is_empty()
+        !self.snapshot().handlers.is_empty()
     }
 
     /// Whether any registered handler is interested in `kind`. Lets callers
     /// skip producing an event nobody would receive (e.g. retaining a large
     /// `HistorySync` blob when only message-only handlers are registered).
     pub fn has_handler_for(&self, kind: EventKind) -> bool {
-        self.handlers
-            .read()
-            .expect("RwLock should not be poisoned")
-            .iter()
-            .any(|h| h.interest().wants(kind))
+        self.snapshot().aggregate.wants(kind)
     }
 
     pub fn dispatch(&self, event: Event) {
-        let handlers = self
-            .handlers
-            .read()
-            .expect("RwLock should not be poisoned")
-            .clone();
-        if handlers.is_empty() {
-            return;
-        }
+        let snapshot = self.snapshot();
         // Skip materializing the event (Arc) and invoking handlers whose
         // declared interest excludes this kind. A handler that subscribed to a
-        // few kinds never pays for boxing the events it ignores.
+        // few kinds never pays for boxing the events it ignores; the cached
+        // aggregate also short-circuits an ignored kind without scanning.
         let kind = event.kind();
-        if !handlers.iter().any(|h| h.interest().wants(kind)) {
+        if !snapshot.aggregate.wants(kind) {
             return;
         }
         let event = Arc::new(event);
-        for handler in &handlers {
+        for handler in &snapshot.handlers {
             if handler.interest().wants(kind) {
                 handler.handle_event(Arc::clone(&event));
             }
@@ -1467,5 +1493,111 @@ mod tests {
         bus2.add_handler(Arc::new(Counter));
         bus2.dispatch(Event::Connected(Connected));
         assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn aggregate_interest_and_has_handler_for() {
+        struct Narrow(EventInterest);
+        impl EventHandler for Narrow {
+            fn handle_event(&self, _: Arc<Event>) {}
+            fn interest(&self) -> EventInterest {
+                self.0
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        // Empty bus: nothing is wanted and there are no handlers.
+        assert!(!bus.has_handlers());
+        assert!(!bus.has_handler_for(EventKind::Message));
+        assert!(!bus.has_handler_for(EventKind::Receipt));
+
+        bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Message]))));
+        assert!(bus.has_handlers());
+        assert!(bus.has_handler_for(EventKind::Message));
+        assert!(!bus.has_handler_for(EventKind::Receipt));
+
+        // The aggregate is the OR of both handlers' interests.
+        bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Receipt]))));
+        assert!(bus.has_handler_for(EventKind::Message));
+        assert!(bus.has_handler_for(EventKind::Receipt));
+        assert!(!bus.has_handler_for(EventKind::Connected));
+    }
+
+    #[test]
+    fn dispatch_preserves_handler_ordering() {
+        use std::sync::Mutex;
+
+        struct Tagged {
+            id: u32,
+            log: Arc<Mutex<Vec<u32>>>,
+        }
+        impl EventHandler for Tagged {
+            fn handle_event(&self, _: Arc<Event>) {
+                self.log.lock().unwrap().push(self.id);
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        for id in 0..5u32 {
+            bus.add_handler(Arc::new(Tagged {
+                id,
+                log: log.clone(),
+            }));
+        }
+        bus.dispatch(Event::Connected(Connected));
+        // Copy-on-write rebuilds must keep registration order intact.
+        assert_eq!(*log.lock().unwrap(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn dispatch_is_reentrancy_safe_against_concurrent_add() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A handler that registers another handler while it is being dispatched.
+        // The snapshot taken by `dispatch` must outlive the swap, so the newly
+        // added handler is NOT invoked for the in-flight event and the iteration
+        // does not observe a mutated list.
+        struct AddsDuringDispatch {
+            bus: CoreEventBus,
+            invocations: Arc<AtomicUsize>,
+            added: Mutex<bool>,
+        }
+        impl EventHandler for AddsDuringDispatch {
+            fn handle_event(&self, _: Arc<Event>) {
+                self.invocations.fetch_add(1, Ordering::SeqCst);
+                let mut added = self.added.lock().unwrap();
+                if !*added {
+                    *added = true;
+                    struct Late(Arc<AtomicUsize>);
+                    impl EventHandler for Late {
+                        fn handle_event(&self, _: Arc<Event>) {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    self.bus
+                        .add_handler(Arc::new(Late(self.invocations.clone())));
+                }
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        bus.add_handler(Arc::new(AddsDuringDispatch {
+            bus: bus.clone(),
+            invocations: invocations.clone(),
+            added: Mutex::new(false),
+        }));
+
+        // First dispatch: only the original handler runs, even though it adds a
+        // second handler mid-flight.
+        bus.dispatch(Event::Connected(Connected));
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(bus.snapshot().handlers.len(), 2);
+
+        // Second dispatch sees both handlers (original adds nothing new now).
+        bus.dispatch(Event::Connected(Connected));
+        assert_eq!(invocations.load(Ordering::SeqCst), 3);
     }
 }
