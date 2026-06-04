@@ -87,9 +87,10 @@ impl<'a> Blocking<'a> {
 
         // Blocks are stored keyed by LID (block() always resolves the input to a LID), so a
         // PN-input query must resolve to its LID before comparing or it never matches a
-        // LID-keyed entry. Match against the raw user plus the resolved LID and PN; fall back
-        // to the raw user alone when no mapping exists.
-        let mapping = self.client.get_lid_pn_entry(&bare).await.ok().flatten();
+        // LID-keyed entry. Match against the raw user plus the resolved LID and PN. Propagate a
+        // backend failure (swallowing it would fall back to the raw user and re-introduce the
+        // false negative); a genuine absence (Ok(None), incl. a non-LID/PN input) falls back.
+        let mapping = self.client.get_lid_pn_entry(&bare).await?;
         let mut users: Vec<&str> = vec![bare.user.as_str()];
         if let Some(entry) = mapping.as_ref() {
             users.push(entry.lid.as_str());
