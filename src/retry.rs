@@ -1005,16 +1005,19 @@ impl Client {
             .build();
 
         let keys_node = if wacore::protocol::retry::should_include_keys(retry_count, reason) {
-            let device_store = self.persistence_manager.get_device_arc().await;
-            let device_guard = device_store.read().await;
-
-            let new_prekey_id = (rand::random::<u32>() % 16777215) + 1;
+            // Allocate the one-time prekey from the same monotonic NEXT_PK_ID counter as the
+            // upload path (WA Web's getOrGenSinglePreKey) so it can never overwrite a live pool
+            // key. Hold prekey_upload_lock to serialize the allocate+bump with uploads.
+            let prekey_guard = self.prekey_upload_lock.lock().await;
+            let new_prekey_id = self.allocate_next_one_time_prekey_id().await?;
             let new_prekey_keypair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
             let new_prekey_record = wacore::libsignal::store::record_helpers::new_pre_key_record(
                 new_prekey_id,
                 &new_prekey_keypair,
             );
             // This key is not uploaded to the server pool, so mark as false
+            let device_store = self.persistence_manager.get_device_arc().await;
+            let device_guard = device_store.read().await;
             if let Err(e) = device_guard
                 .store_prekey(new_prekey_id, new_prekey_record, false)
                 .await
@@ -1022,6 +1025,7 @@ impl Client {
                 warn!("Failed to store new prekey for retry receipt: {e:?}");
             }
             drop(device_guard);
+            drop(prekey_guard);
 
             let device_identity_bytes = device_snapshot
                 .account

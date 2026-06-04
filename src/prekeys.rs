@@ -35,6 +35,19 @@ fn should_upload_pre_keys(force: bool, server_count: usize) -> bool {
 /// WA Web uses 24-bit PreKey IDs (max 2^24 - 1); IDs wrap modulo this.
 const MAX_PREKEY_ID: u32 = 16_777_215;
 
+/// Next one-time prekey id to mint from the persistent monotonic counter, falling back to
+/// `max_store_id + 1` on migration (when the counter is unset) and wrapping into the 24-bit
+/// range. Shared by the batch upload path and the retry-receipt single-key allocation so both
+/// draw from the same `NEXT_PK_ID` namespace and never collide (matching WA Web).
+fn start_prekey_id(next_pre_key_id: u32, max_store_id: u32) -> u32 {
+    let raw = if next_pre_key_id > 0 {
+        std::cmp::max(next_pre_key_id as u64, max_store_id as u64 + 1)
+    } else {
+        max_store_id as u64 + 1
+    };
+    ((raw - 1) % MAX_PREKEY_ID as u64) as u32 + 1
+}
+
 /// The upload IQ encodes the pre-key `<list>` length as a u16
 /// (`Encoder::write_list_start`), so a larger batch fails to encode after the
 /// keys were already generated and stored. Well below MAX_PREKEY_ID, so a single
@@ -129,6 +142,30 @@ impl Client {
         self.upload_pre_keys_inner().await
     }
 
+    /// Allocate the next one-time prekey id from the persistent monotonic `NEXT_PK_ID` counter
+    /// (the same namespace as uploads) and advance it, so a retry-receipt prekey can never
+    /// collide with a live pool key. The caller must hold `prekey_upload_lock` to serialize the
+    /// allocate+bump with the upload path. Mirrors WA Web's `getOrGenSinglePreKey -> NEXT_PK_ID`.
+    pub(crate) async fn allocate_next_one_time_prekey_id(&self) -> Result<u32, anyhow::Error> {
+        let next_pre_key_id = self
+            .persistence_manager
+            .get_device_snapshot()
+            .await
+            .next_pre_key_id;
+        let backend = {
+            let device_store = self.persistence_manager.get_device_arc().await;
+            let guard = device_store.read().await;
+            guard.backend.clone()
+        };
+        let max_id = backend.get_max_prekey_id().await?;
+        let id = start_prekey_id(next_pre_key_id, max_id);
+        let next = (id as u64 % MAX_PREKEY_ID as u64) as u32 + 1;
+        self.persistence_manager
+            .process_command(DeviceCommand::SetNextPreKeyId(next))
+            .await;
+        Ok(id)
+    }
+
     /// Generate and upload the configured number of pre-keys (see
     /// [`Client::set_wanted_pre_key_count`]). Shared by `upload_pre_keys` and
     /// `upload_pre_keys_at_login` to avoid redundant server count queries.
@@ -142,22 +179,17 @@ impl Client {
         };
 
         // Use the persistent counter, falling back to max(store_id)+1 for migration.
-        // The counter is the source of truth after the first upload.
+        // The counter is the source of truth after the first upload; start_prekey_id wraps
+        // into the 24-bit range so lingering high-ID rows don't pin start_id above it.
         let max_id = backend.get_max_prekey_id().await?;
-        let raw_start = if device_snapshot.next_pre_key_id > 0 {
-            std::cmp::max(device_snapshot.next_pre_key_id, max_id + 1)
-        } else {
+        if device_snapshot.next_pre_key_id == 0 {
             log::info!(
                 "Migrating pre-key counter: MAX(key_id) in store = {}, starting from {}",
                 max_id,
                 max_id + 1
             );
-            max_id + 1
-        };
-
-        // Wrap into valid range so lingering high-ID rows don't pin start_id
-        // above the 24-bit boundary and cause repeated overwrites of low IDs.
-        let start_id = ((raw_start as u64 - 1) % MAX_PREKEY_ID as u64) as u32 + 1;
+        }
+        let start_id = start_prekey_id(device_snapshot.next_pre_key_id, max_id);
 
         let configured = self.wanted_pre_key_count.load(Ordering::Relaxed);
         let wanted = clamp_wanted_pre_key_count(configured);
@@ -445,8 +477,8 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_WANTED_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH, MIN_PRE_KEY_COUNT,
-        clamp_wanted_pre_key_count, should_upload_pre_keys,
+        DEFAULT_WANTED_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH, MAX_PREKEY_ID, MIN_PRE_KEY_COUNT,
+        clamp_wanted_pre_key_count, should_upload_pre_keys, start_prekey_id,
     };
 
     #[test]
@@ -477,6 +509,19 @@ mod tests {
             clamp_wanted_pre_key_count(usize::MAX),
             MAX_PRE_KEY_UPLOAD_BATCH
         );
+    }
+
+    #[test]
+    fn start_prekey_id_uses_counter_and_wraps() {
+        // Counter ahead of the store: use the counter (monotonic, never reuses an id).
+        assert_eq!(start_prekey_id(10, 5), 10);
+        // Store ahead of (or equal to) the counter: use max_store + 1.
+        assert_eq!(start_prekey_id(3, 100), 101);
+        // Migration (counter unset = 0): max_store + 1.
+        assert_eq!(start_prekey_id(0, 5), 6);
+        // Wraps into the 24-bit range instead of pinning above MAX_PREKEY_ID.
+        assert_eq!(start_prekey_id(MAX_PREKEY_ID + 1, 0), 1);
+        assert_eq!(start_prekey_id(MAX_PREKEY_ID, 0), MAX_PREKEY_ID);
     }
 
     #[test]
