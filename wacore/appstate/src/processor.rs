@@ -736,6 +736,81 @@ mod tests {
         );
     }
 
+    /// REMOVE carries a value blob (decode requires >= 48 bytes) and previous-value resolution
+    /// is operation-agnostic, like the reverse scan it replaces: a SET after a REMOVE on the
+    /// same index subtracts the REMOVE's tail, not the DB value.
+    #[test]
+    fn test_process_patch_set_after_remove_uses_remove_tail() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+        let index_mac = vec![3; 32];
+
+        let remove = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::Remove,
+            &index_mac,
+            &keys,
+            &key_id,
+            1000,
+        );
+        let set = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &index_mac,
+            &keys,
+            &key_id,
+            2000,
+        );
+
+        let tail = |rec: &wa::SyncdRecord| {
+            let blob = rec.value.as_ref().unwrap().blob.as_ref().unwrap();
+            blob[blob.len() - 32..].to_vec()
+        };
+        let remove_tail = tail(&remove);
+        let set_tail = tail(&set);
+
+        let patch = wa::SyncdPatch {
+            version: Some(wa::SyncdVersion { version: Some(1) }),
+            mutations: vec![
+                wa::SyncdMutation {
+                    operation: Some(wa::syncd_mutation::SyncdOperation::Remove as i32),
+                    record: Some(remove),
+                },
+                wa::SyncdMutation {
+                    operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
+                    record: Some(set),
+                },
+            ],
+            key_id: Some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+
+        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_prev = |_: &[u8]| Ok(None);
+
+        let mut state = HashState::default();
+        let result = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
+            .expect("remove-then-set should process");
+
+        // The SET's previous value is the in-patch REMOVE tail, so it gets subtracted.
+        const EMPTY: &[Vec<u8>] = &[];
+        let expected = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            std::slice::from_ref(&remove_tail),
+            std::slice::from_ref(&set_tail),
+        );
+        assert_eq!(result.state.hash.as_slice(), expected.as_slice());
+
+        // An op==Set guard would skip the REMOVE, dropping to the DB and leaving only +set_tail.
+        let if_remove_skipped = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            EMPTY,
+            std::slice::from_ref(&set_tail),
+        );
+        assert_ne!(result.state.hash.as_slice(), if_remove_skipped.as_slice());
+    }
+
     /// WA Web: validatePatchVersion checks `localVersion !== patchVersion - 1`.
     /// If the patch version is not exactly local_version + 1, it rejects with
     /// "syncd-version-check-error-local-version-{greater|less}-than-expected".
