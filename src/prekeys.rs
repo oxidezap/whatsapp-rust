@@ -25,6 +25,13 @@ pub(crate) const DEFAULT_WANTED_PRE_KEY_COUNT: usize = 812;
 
 const MIN_PRE_KEY_COUNT: usize = 5;
 
+/// Whether `upload_pre_keys` should upload, given the `force` flag and the server's
+/// reported pre-key count. The prekey-low path forces, matching WA Web's
+/// `handlePreKeyLow` which uploads unconditionally, so `force` bypasses the count guard.
+fn should_upload_pre_keys(force: bool, server_count: usize) -> bool {
+    force || server_count < MIN_PRE_KEY_COUNT
+}
+
 /// WA Web uses 24-bit PreKey IDs (max 2^24 - 1); IDs wrap modulo this.
 const MAX_PREKEY_ID: u32 = 16_777_215;
 
@@ -106,7 +113,7 @@ impl Client {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        if !force && server_count >= MIN_PRE_KEY_COUNT {
+        if !should_upload_pre_keys(force, server_count) {
             log::debug!("Server has {server_count} pre-keys, no upload needed.");
             return Ok(());
         }
@@ -432,7 +439,7 @@ impl Client {
 mod tests {
     use super::{
         DEFAULT_WANTED_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH, MIN_PRE_KEY_COUNT,
-        clamp_wanted_pre_key_count,
+        clamp_wanted_pre_key_count, should_upload_pre_keys,
     };
 
     #[test]
@@ -462,6 +469,21 @@ mod tests {
         assert_eq!(
             clamp_wanted_pre_key_count(usize::MAX),
             MAX_PRE_KEY_UPLOAD_BATCH
+        );
+    }
+
+    #[test]
+    fn force_upload_bypasses_count_guard() {
+        // WA Web's handlePreKeyLow uploads unconditionally, so the prekey-low path forces
+        // and the count guard must not apply.
+        assert!(should_upload_pre_keys(true, 1000), "force always uploads");
+        assert!(
+            !should_upload_pre_keys(false, MIN_PRE_KEY_COUNT),
+            "count guard skips when not forced and at/above threshold"
+        );
+        assert!(
+            should_upload_pre_keys(false, MIN_PRE_KEY_COUNT - 1),
+            "below threshold uploads even without force"
         );
     }
 }

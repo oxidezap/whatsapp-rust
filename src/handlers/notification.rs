@@ -252,7 +252,11 @@ async fn handle_prekey_low(client: &Arc<Client>) {
                 return;
             }
 
-            if let Err(e) = client_clone.upload_pre_keys_with_retry(false).await {
+            // WA Web's handlePreKeyLow uploads unconditionally (no server-count query).
+            // Force past the count guard: the server only emits prekey-low after crossing
+            // its own (higher) threshold, so re-querying and skipping when count >= 5 lets
+            // the pool keep draining.
+            if let Err(e) = client_clone.upload_pre_keys_with_retry(true).await {
                 warn!(
                     "Failed to upload pre-keys after prekey_low notification: {:?}",
                     e
