@@ -79,17 +79,77 @@ impl<'a> Blocking<'a> {
 
     /// Check if a contact is blocked.
     ///
-    /// Compares only the user part of the JID, ignoring device ID,
-    /// since blocking applies to the entire user account, not individual devices.
+    /// Compares only the user part of the JID, ignoring device ID, since blocking
+    /// applies to the entire user account, not individual devices.
     pub async fn is_blocked(&self, jid: &Jid) -> anyhow::Result<bool> {
         let blocklist = self.get_blocklist().await?;
-        Ok(blocklist.iter().any(|e| e.jid.user == jid.user))
+        let bare = jid.to_non_ad();
+
+        // Blocks are stored keyed by LID (block() always resolves the input to a LID), so a
+        // PN-input query must resolve to its LID before comparing or it never matches a
+        // LID-keyed entry. Match against the raw user plus the resolved LID and PN; fall back
+        // to the raw user alone when no mapping exists.
+        let mapping = self.client.get_lid_pn_entry(&bare).await.ok().flatten();
+        let mut users: Vec<&str> = vec![bare.user.as_str()];
+        if let Some(entry) = mapping.as_ref() {
+            users.push(entry.lid.as_str());
+            users.push(entry.phone_number.as_str());
+        }
+
+        Ok(blocklist_contains(&blocklist, &users))
     }
+}
+
+/// Whether any blocklist entry's user part matches one of `candidate_users`.
+///
+/// Blocks are stored keyed by LID, so the caller resolves the queried JID to its
+/// LID/PN pair and passes all of them (raw, LID, PN) to catch a LID-keyed entry from
+/// a PN-input query (and the reverse).
+fn blocklist_contains(blocklist: &[BlocklistEntry], candidate_users: &[&str]) -> bool {
+    blocklist
+        .iter()
+        .any(|e| candidate_users.contains(&e.jid.user.as_str()))
 }
 
 impl Client {
     /// Access blocking operations.
     pub fn blocking(&self) -> Blocking<'_> {
         Blocking::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lid_entry(user: &str) -> BlocklistEntry {
+        BlocklistEntry {
+            jid: Jid::lid(user.to_string()),
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn pn_query_matches_lid_keyed_block_only_when_resolved() {
+        // A block stored under the LID (modern WA) must be found once the PN query is
+        // resolved to that LID. Without resolution the LID-keyed block is missed (the bug).
+        let blocklist = vec![lid_entry("100000012345678")];
+
+        assert!(
+            blocklist_contains(&blocklist, &["559980000001", "100000012345678"]),
+            "resolved PN->LID candidate matches the LID-keyed block"
+        );
+        assert!(
+            !blocklist_contains(&blocklist, &["559980000001"]),
+            "raw PN alone misses the LID-keyed block (the false negative)"
+        );
+        assert!(
+            blocklist_contains(&blocklist, &["100000012345678"]),
+            "a LID query matches directly"
+        );
+        assert!(
+            !blocklist_contains(&blocklist, &["559981111111", "100000099999999"]),
+            "an unrelated contact is not blocked"
+        );
     }
 }
