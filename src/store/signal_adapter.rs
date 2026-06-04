@@ -223,10 +223,13 @@ impl PreKeyStore for PreKeyAdapter {
             .map_err(signal_err("backend"))
     }
     async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> Result<(), SignalProtocolError> {
-        let device = self.0.device.read().await;
-        WacorePreKeyStore::remove_prekey(&*device, prekey_id.into())
-            .await
-            .map_err(signal_err("backend"))
+        // Buffer the consumed prekey instead of deleting it from the backend now.
+        // The inbound pkmsg path has only put the promoted session into the
+        // volatile cache; flush_signal_cache() commits the session and this
+        // removal together (matching WAWebSignalProtocolStoreUnifiedApi), so the
+        // prekey is never durably gone while its session is still volatile.
+        self.0.cache.remove_prekey(prekey_id.into()).await;
+        Ok(())
     }
 }
 
@@ -288,5 +291,51 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
         sender_key_name: &SenderKeyName,
     ) -> std::sync::Arc<async_lock::Mutex<()>> {
         self.0.cache.sender_key_lock(sender_key_name).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Device;
+    use wacore::store::in_memory::InMemoryBackend;
+
+    const PREKEY_ID: u32 = 7777;
+
+    /// The decrypt path consumes a one-time prekey via the adapter's
+    /// `remove_pre_key`. It must NOT delete the prekey from the backend
+    /// synchronously: the promoted session is still volatile at that point, so an
+    /// eager backend delete would lose both on a crash. The removal must only be
+    /// committed during the session-bearing cache flush.
+    #[tokio::test]
+    async fn remove_pre_key_defers_backend_delete_to_flush() {
+        let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
+        backend
+            .store_prekey(PREKEY_ID, b"durable-prekey", false)
+            .await
+            .unwrap();
+
+        let device = Arc::new(RwLock::new(Device::new(backend.clone())));
+        let cache = Arc::new(SignalStoreCache::new());
+        let mut adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
+
+        adapter
+            .pre_key_store
+            .remove_pre_key(PREKEY_ID.into())
+            .await
+            .unwrap();
+
+        // Still durable: the removal was only buffered, not written to the backend.
+        assert!(
+            backend.load_prekey(PREKEY_ID).await.unwrap().is_some(),
+            "remove_pre_key must not delete from the backend before flush"
+        );
+
+        // The flush (run after the session put in the real path) commits it.
+        cache.flush(backend.as_ref()).await.unwrap();
+        assert!(
+            backend.load_prekey(PREKEY_ID).await.unwrap().is_none(),
+            "flush must commit the buffered prekey removal"
+        );
     }
 }
