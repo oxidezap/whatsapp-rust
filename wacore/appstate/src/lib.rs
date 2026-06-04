@@ -7,6 +7,7 @@ pub mod keys;
 pub mod lthash;
 pub mod patch_decode;
 pub mod processor;
+pub mod schemas;
 
 pub use decode::{Mutation, collect_key_ids_from_patch_list, decode_record};
 pub use encode::encode_record;

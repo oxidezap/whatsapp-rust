@@ -9,6 +9,7 @@ use crate::client::Client;
 use anyhow::Result;
 use log::debug;
 use wacore::appstate::patch_decode::WAPatchName;
+use wacore::appstate::schemas::{self, IndexPart, Schema};
 use wacore::types::events::{
     ArchiveUpdate, ContactUpdate, DeleteChatUpdate, DeleteMessageForMeUpdate, Event,
     MarkChatAsReadUpdate, MuteUpdate, PinUpdate, StarUpdate,
@@ -257,31 +258,66 @@ fn parse_message_key_fields(kind: &str, index: &[String]) -> Option<(String, boo
     Some((message_id, from_me, participant_jid))
 }
 
-/// Mirrors WAWebSyncdActionUtils.buildMessageKey.
-fn build_message_key_index(
-    action: &str,
+/// Validate and own only the index args that must outlive the call: the chat JID
+/// and (optional) participant JID. `messageId` and `fromMe` are passed through by
+/// the caller without copying. Mirrors WAWebSyncdActionUtils.buildMessageKey.
+fn message_key_owned(
     chat_jid: &Jid,
     participant_jid: Option<&Jid>,
-    message_id: &str,
     from_me: bool,
-) -> Result<Vec<u8>> {
+) -> Result<(String, Option<String>)> {
     // syncKeyToMsgKey rejects group non-fromMe without valid participant
     if chat_jid.is_group() && !from_me && participant_jid.is_none() {
+        anyhow::bail!("participant_jid is required for group messages not sent by us");
+    }
+    Ok((chat_jid.to_string(), participant_jid.map(|j| j.to_string())))
+}
+
+/// The `"1"`/`"0"` wire string for a `fromMe` flag (no allocation).
+#[inline]
+fn bool_str(b: bool) -> &'static str {
+    if b { "1" } else { "0" }
+}
+
+/// Assemble the JSON-array mutation index for `schema` from its non-literal index
+/// args (in `schema.index_parts` order). The arg count must match.
+pub(crate) fn build_action_index(schema: &Schema, args: &[&str]) -> Result<Vec<u8>> {
+    let non_literal = schema
+        .index_parts
+        .iter()
+        .filter(|p| !matches!(p, IndexPart::Literal { .. }))
+        .count();
+    if args.len() != non_literal {
         anyhow::bail!(
-            "participant_jid is required for group messages not sent by us (action: {action})"
+            "index args for action '{}': expected {non_literal}, got {}",
+            schema.name,
+            args.len()
         );
     }
-    let from_me_str = if from_me { "1" } else { "0" };
-    let participant = participant_jid
-        .map(|j| j.to_string())
-        .unwrap_or_else(|| "0".to_string());
-    Ok(serde_json::to_vec(&[
-        action,
-        &chat_jid.to_string(),
-        message_id,
-        from_me_str,
-        &participant,
-    ])?)
+    let mut parts: Vec<&str> = Vec::with_capacity(schema.index_parts.len());
+    let mut it = args.iter();
+    for part in schema.index_parts {
+        match part {
+            IndexPart::Literal { value } => parts.push(value),
+            _ => parts.push(it.next().expect("arg count checked above")),
+        }
+    }
+    Ok(serde_json::to_vec(&parts)?)
+}
+
+/// Map a generated `Collection` to our `WAPatchName`.
+pub(crate) fn collection_patch_name(c: schemas::Collection) -> Result<WAPatchName> {
+    use schemas::Collection;
+    Ok(match c {
+        Collection::Regular => WAPatchName::Regular,
+        Collection::RegularLow => WAPatchName::RegularLow,
+        Collection::RegularHigh => WAPatchName::RegularHigh,
+        Collection::CriticalBlock => WAPatchName::CriticalBlock,
+        // No action we send lives here (block/unblock go through the blocklist IQ).
+        Collection::CriticalUnblockLow => {
+            anyhow::bail!("critical_unblock_low collection is not supported for sending")
+        }
+    })
 }
 
 /// Access via `client.chat_actions()`.
@@ -386,7 +422,6 @@ impl<'a> ChatActions<'a> {
             "Marking chat {jid} as {}",
             if read { "read" } else { "unread" }
         );
-        let index = serde_json::to_vec(&["markChatAsRead", &jid.to_string()])?;
         let value = wa::SyncActionValue {
             mark_chat_as_read_action: Some(wa::sync_action_value::MarkChatAsReadAction {
                 read: Some(read),
@@ -395,7 +430,9 @@ impl<'a> ChatActions<'a> {
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
-        self.send_mutation(WAPatchName::RegularLow, &index, &value)
+        let jid = jid.to_string();
+        self.client
+            .send_app_state_action(&schemas::MARK_CHAT_AS_READ, &[jid.as_str()], &value)
             .await
     }
 
@@ -407,13 +444,18 @@ impl<'a> ChatActions<'a> {
     ) -> Result<()> {
         debug!("Deleting chat {jid}");
         let delete_media_str = if delete_media { "1" } else { "0" };
-        let index = serde_json::to_vec(&["deleteChat", &jid.to_string(), delete_media_str])?;
         let value = wa::SyncActionValue {
             delete_chat_action: Some(wa::sync_action_value::DeleteChatAction { message_range }),
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
-        self.send_mutation(WAPatchName::RegularHigh, &index, &value)
+        let jid = jid.to_string();
+        self.client
+            .send_app_state_action(
+                &schemas::DELETE_CHAT,
+                &[jid.as_str(), delete_media_str],
+                &value,
+            )
             .await
     }
 
@@ -429,13 +471,7 @@ impl<'a> ChatActions<'a> {
         message_timestamp: Option<i64>,
     ) -> Result<()> {
         debug!("Deleting message {message_id} for me in {chat_jid}");
-        let index = build_message_key_index(
-            "deleteMessageForMe",
-            chat_jid,
-            participant_jid,
-            message_id,
-            from_me,
-        )?;
+        let (chat, participant) = message_key_owned(chat_jid, participant_jid, from_me)?;
         let value = wa::SyncActionValue {
             delete_message_for_me_action: Some(wa::sync_action_value::DeleteMessageForMeAction {
                 delete_media: Some(delete_media),
@@ -444,7 +480,17 @@ impl<'a> ChatActions<'a> {
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
-        self.send_mutation(WAPatchName::RegularHigh, &index, &value)
+        self.client
+            .send_app_state_action(
+                &schemas::DELETE_MESSAGE_FOR_ME,
+                &[
+                    chat.as_str(),
+                    message_id,
+                    bool_str(from_me),
+                    participant.as_deref().unwrap_or("0"),
+                ],
+                &value,
+            )
             .await
     }
 
@@ -454,7 +500,6 @@ impl<'a> ChatActions<'a> {
         archived: bool,
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<()> {
-        let index = serde_json::to_vec(&["archive", &jid.to_string()])?;
         let value = wa::SyncActionValue {
             archive_chat_action: Some(wa::sync_action_value::ArchiveChatAction {
                 archived: Some(archived),
@@ -463,12 +508,13 @@ impl<'a> ChatActions<'a> {
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
-        self.send_mutation(WAPatchName::RegularLow, &index, &value)
+        let jid = jid.to_string();
+        self.client
+            .send_app_state_action(&schemas::ARCHIVE, &[jid.as_str()], &value)
             .await
     }
 
     async fn send_pin_mutation(&self, jid: &Jid, pinned: bool) -> Result<()> {
-        let index = serde_json::to_vec(&["pin_v1", &jid.to_string()])?;
         let value = wa::SyncActionValue {
             pin_action: Some(wa::sync_action_value::PinAction {
                 pinned: Some(pinned),
@@ -476,7 +522,9 @@ impl<'a> ChatActions<'a> {
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
-        self.send_mutation(WAPatchName::RegularLow, &index, &value)
+        let jid = jid.to_string();
+        self.client
+            .send_app_state_action(&schemas::PIN, &[jid.as_str()], &value)
             .await
     }
 
@@ -486,7 +534,6 @@ impl<'a> ChatActions<'a> {
         muted: bool,
         mute_end_timestamp_ms: i64,
     ) -> Result<()> {
-        let index = serde_json::to_vec(&["mute", &jid.to_string()])?;
         // -1 = indefinite, 0 = unmuted, positive = expiry ms
         let mute_end = if muted {
             Some(mute_end_timestamp_ms)
@@ -502,7 +549,9 @@ impl<'a> ChatActions<'a> {
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
-        self.send_mutation(WAPatchName::RegularHigh, &index, &value)
+        let jid = jid.to_string();
+        self.client
+            .send_app_state_action(&schemas::MUTE, &[jid.as_str()], &value)
             .await
     }
 
@@ -514,8 +563,7 @@ impl<'a> ChatActions<'a> {
         from_me: bool,
         starred: bool,
     ) -> Result<()> {
-        let index =
-            build_message_key_index("star", chat_jid, participant_jid, message_id, from_me)?;
+        let (chat, participant) = message_key_owned(chat_jid, participant_jid, from_me)?;
         let value = wa::SyncActionValue {
             star_action: Some(wa::sync_action_value::StarAction {
                 starred: Some(starred),
@@ -523,21 +571,17 @@ impl<'a> ChatActions<'a> {
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
-        self.send_mutation(WAPatchName::RegularHigh, &index, &value)
-            .await
-    }
-
-    async fn send_mutation(
-        &self,
-        collection: WAPatchName,
-        index: &[u8],
-        value: &wa::SyncActionValue,
-    ) -> Result<()> {
-        // Chat actions still emit action version 1 (their pre-existing behavior).
-        // whatsmeow uses per-action versions (mute=2, pin=5, archive=3, ...);
-        // aligning these is tracked as a follow-up.
         self.client
-            .send_app_state_mutation(collection, index, value, 1)
+            .send_app_state_action(
+                &schemas::STAR,
+                &[
+                    chat.as_str(),
+                    message_id,
+                    bool_str(from_me),
+                    participant.as_deref().unwrap_or("0"),
+                ],
+                &value,
+            )
             .await
     }
 }
@@ -584,5 +628,137 @@ impl Client {
 
         self.send_app_state_patch(collection.as_str(), vec![mutation])
             .await
+    }
+
+    /// Send any app-state (syncd) `Set` action, driven by a generated
+    /// [`Schema`](wacore::appstate::schemas::Schema) from
+    /// [`wacore::appstate::schemas`]. The collection, action version, and index
+    /// shape come from the registry; the caller only fills the typed
+    /// [`SyncActionValue`](wa::SyncActionValue) (its action sub-field, plus a
+    /// `timestamp`) and supplies the non-literal index args in `index_parts`
+    /// order. This is the generic escape hatch for actions without a dedicated
+    /// helper (e.g. `clear_chat`, `favorites`, `quick_reply`); the typed APIs
+    /// like [`ChatActions`] and [`Labels`](crate::Labels) wrap it.
+    ///
+    /// ```no_run
+    /// # async fn ex(client: &whatsapp_rust::Client) -> anyhow::Result<()> {
+    /// use whatsapp_rust::schemas;
+    /// use whatsapp_rust::waproto::whatsapp as wa;
+    /// let value = wa::SyncActionValue {
+    ///     clear_chat_action: Some(Default::default()),
+    ///     timestamp: Some(1_700_000_000_000), // a real epoch-ms timestamp
+    ///     ..Default::default()
+    /// };
+    /// client
+    ///     .send_app_state_action(&schemas::CLEAR_CHAT, &["123@s.whatsapp.net"], &value)
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn send_app_state_action(
+        &self,
+        schema: &Schema,
+        index_args: &[&str],
+        value: &wa::SyncActionValue,
+    ) -> Result<()> {
+        let index = build_action_index(schema, index_args)?;
+        let collection = collection_patch_name(schema.collection)?;
+        self.send_app_state_mutation(collection, &index, value, schema.version as i32)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn build_index_matches_legacy_shapes() {
+        let cases: &[(&Schema, &[&str], &[&str])] = &[
+            (
+                &schemas::ARCHIVE,
+                &["123@s.whatsapp.net"],
+                &["archive", "123@s.whatsapp.net"],
+            ),
+            (
+                &schemas::PIN,
+                &["123@s.whatsapp.net"],
+                &["pin_v1", "123@s.whatsapp.net"],
+            ),
+            (
+                &schemas::MUTE,
+                &["123@s.whatsapp.net"],
+                &["mute", "123@s.whatsapp.net"],
+            ),
+            (
+                &schemas::MARK_CHAT_AS_READ,
+                &["123@s.whatsapp.net"],
+                &["markChatAsRead", "123@s.whatsapp.net"],
+            ),
+            (
+                &schemas::DELETE_CHAT,
+                &["123@s.whatsapp.net", "1"],
+                &["deleteChat", "123@s.whatsapp.net", "1"],
+            ),
+            (&schemas::LABEL_EDIT, &["5"], &["label_edit", "5"]),
+            (
+                &schemas::LABEL_JID,
+                &["5", "123@s.whatsapp.net"],
+                &["label_jid", "5", "123@s.whatsapp.net"],
+            ),
+            (
+                &schemas::STAR,
+                &["123@g.us", "MSGID", "1", "0"],
+                &["star", "123@g.us", "MSGID", "1", "0"],
+            ),
+            (&schemas::SETTING_PUSH_NAME, &[], &["setting_pushName"]),
+        ];
+        for (schema, args, expected) in cases {
+            assert_eq!(
+                build_action_index(schema, args).unwrap(),
+                serde_json::to_vec(expected).unwrap(),
+                "index mismatch for {}",
+                schema.name
+            );
+        }
+    }
+
+    #[test]
+    fn build_index_rejects_arg_count_mismatch() {
+        assert!(build_action_index(&schemas::ARCHIVE, &[]).is_err());
+        assert!(build_action_index(&schemas::ARCHIVE, &["a", "b"]).is_err());
+        assert!(build_action_index(&schemas::SETTING_PUSH_NAME, &["x"]).is_err());
+    }
+
+    #[test]
+    fn registry_versions_match_whatsmeow() {
+        // Locks the per-action versions the migration relies on (vs whatsmeow);
+        // a regenerated registry that changes one will trip this for review.
+        assert_eq!(schemas::MUTE.version, 2);
+        assert_eq!(schemas::PIN.version, 5);
+        assert_eq!(schemas::ARCHIVE.version, 3);
+        assert_eq!(schemas::MARK_CHAT_AS_READ.version, 3);
+        assert_eq!(schemas::STAR.version, 2);
+        assert_eq!(schemas::DELETE_MESSAGE_FOR_ME.version, 3);
+        assert_eq!(schemas::LABEL_EDIT.version, 3);
+        assert_eq!(schemas::LABEL_JID.version, 3);
+        assert_eq!(schemas::SETTING_PUSH_NAME.version, 1);
+    }
+
+    #[test]
+    fn collection_mapping() {
+        use schemas::Collection;
+        assert_eq!(
+            collection_patch_name(Collection::Regular).unwrap(),
+            WAPatchName::Regular
+        );
+        assert_eq!(
+            collection_patch_name(Collection::RegularHigh).unwrap(),
+            WAPatchName::RegularHigh
+        );
+        assert_eq!(
+            collection_patch_name(Collection::CriticalBlock).unwrap(),
+            WAPatchName::CriticalBlock
+        );
+        assert!(collection_patch_name(Collection::CriticalUnblockLow).is_err());
     }
 }

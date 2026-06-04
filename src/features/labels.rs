@@ -5,19 +5,17 @@
 //! - `label_edit`  (index `["label_edit", labelId]`)        -> `LabelEditAction`
 //! - `label_jid`   (index `["label_jid", labelId, chatJid]`) -> `LabelAssociationAction`
 //!
-//! Both are stamped with action version 3, matching WhatsApp Web and whatsmeow.
+//! Collection, action version, and index shape all come from the generated
+//! `schemas::{LABEL_EDIT, LABEL_JID}` registry.
 
 use crate::appstate_sync::Mutation;
 use crate::client::Client;
 use anyhow::Result;
 use log::debug;
-use wacore::appstate::patch_decode::WAPatchName;
+use wacore::appstate::schemas;
 use wacore::types::events::{Event, LabelAssociationUpdate, LabelEditUpdate};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
-
-/// Action schema version for both label actions (matches WA Web / whatsmeow).
-const LABEL_ACTION_VERSION: i32 = 3;
 
 /// Dispatch inbound label mutations synced from a linked device.
 /// Returns `true` if handled, `false` if the mutation is not a label kind.
@@ -117,7 +115,6 @@ impl<'a> Labels<'a> {
             "Setting label {label_id} (name_len={}, color={color})",
             name.len()
         );
-        let index = serde_json::to_vec(&["label_edit", label_id])?;
         let value = wa::SyncActionValue {
             label_edit_action: Some(wa::sync_action_value::LabelEditAction {
                 name: Some(name.to_string()),
@@ -129,7 +126,7 @@ impl<'a> Labels<'a> {
             ..Default::default()
         };
         self.client
-            .send_app_state_mutation(WAPatchName::Regular, &index, &value, LABEL_ACTION_VERSION)
+            .send_app_state_action(&schemas::LABEL_EDIT, &[label_id], &value)
             .await
     }
 
@@ -140,7 +137,6 @@ impl<'a> Labels<'a> {
             anyhow::bail!("label_id cannot be empty");
         }
         debug!("Deleting label {label_id}");
-        let index = serde_json::to_vec(&["label_edit", label_id])?;
         let value = wa::SyncActionValue {
             label_edit_action: Some(wa::sync_action_value::LabelEditAction {
                 deleted: Some(true),
@@ -150,7 +146,7 @@ impl<'a> Labels<'a> {
             ..Default::default()
         };
         self.client
-            .send_app_state_mutation(WAPatchName::Regular, &index, &value, LABEL_ACTION_VERSION)
+            .send_app_state_action(&schemas::LABEL_EDIT, &[label_id], &value)
             .await
     }
 
@@ -174,7 +170,6 @@ impl<'a> Labels<'a> {
             if labeled { "to" } else { "from" },
         );
         let chat = chat_jid.to_string();
-        let index = serde_json::to_vec(&["label_jid", label_id, chat.as_str()])?;
         let value = wa::SyncActionValue {
             label_association_action: Some(wa::sync_action_value::LabelAssociationAction {
                 labeled: Some(labeled),
@@ -183,7 +178,7 @@ impl<'a> Labels<'a> {
             ..Default::default()
         };
         self.client
-            .send_app_state_mutation(WAPatchName::Regular, &index, &value, LABEL_ACTION_VERSION)
+            .send_app_state_action(&schemas::LABEL_JID, &[label_id, chat.as_str()], &value)
             .await
     }
 }

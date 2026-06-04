@@ -118,10 +118,9 @@ impl<'a> Profile<'a> {
 
     /// Build and send the `setting_pushName` app state mutation.
     async fn send_push_name_mutation(&self, name: &str) -> Result<()> {
-        use wacore::appstate::patch_decode::WAPatchName;
+        use wacore::appstate::schemas;
         use waproto::whatsapp as wa;
 
-        let index = serde_json::to_vec(&["setting_pushName"])?;
         let value = wa::SyncActionValue {
             push_name_setting: Some(wa::sync_action_value::PushNameSetting {
                 name: Some(name.to_string()),
@@ -129,9 +128,9 @@ impl<'a> Profile<'a> {
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
-        // setting_pushName is action version 1 (matches whatsmeow).
+        // setting_pushName's index has no args (collection/version come from the schema).
         self.client
-            .send_app_state_mutation(WAPatchName::CriticalBlock, &index, &value, 1)
+            .send_app_state_action(&schemas::SETTING_PUSH_NAME, &[], &value)
             .await
     }
 }
