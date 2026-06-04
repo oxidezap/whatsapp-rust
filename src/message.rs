@@ -7050,6 +7050,12 @@ mod tests {
                 group_id: Some("group".into()),
                 axolotl_sender_key_distribution_message: Some(vec![1, 2, 3]),
             }),
+            fast_ratchet_key_sender_key_distribution_message: Some(
+                wa::message::SenderKeyDistributionMessage {
+                    group_id: Some("group".into()),
+                    axolotl_sender_key_distribution_message: Some(vec![4, 5, 6]),
+                },
+            ),
             message_context_info: Some(wa::MessageContextInfo {
                 message_secret: Some(vec![9, 8, 7]),
                 ..Default::default()
@@ -7059,14 +7065,22 @@ mod tests {
 
         assert!(is_sender_key_distribution_only(&mut msg));
 
-        // Pin the exact payloads, not just presence: a buggy restore that put back
-        // a fresh default (losing the original contents) must fail here.
+        // Pin the exact payloads of all three taken/restored carrier fields, not
+        // just presence: a buggy restore that put back a fresh default (losing the
+        // original contents) must fail here.
         assert_eq!(
             msg.sender_key_distribution_message
                 .as_ref()
                 .and_then(|s| s.axolotl_sender_key_distribution_message.as_deref()),
             Some([1, 2, 3].as_slice()),
             "sender_key_distribution_message payload must be restored unchanged"
+        );
+        assert_eq!(
+            msg.fast_ratchet_key_sender_key_distribution_message
+                .as_ref()
+                .and_then(|s| s.axolotl_sender_key_distribution_message.as_deref()),
+            Some([4, 5, 6].as_slice()),
+            "fast_ratchet carrier payload must be restored unchanged"
         );
         assert_eq!(
             msg.message_context_info
