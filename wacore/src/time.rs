@@ -81,6 +81,7 @@ pub fn set_time_provider(provider: impl TimeProvider) -> Result<(), &'static str
 }
 
 /// Current time in milliseconds since Unix epoch.
+#[cfg(not(target_arch = "wasm32"))]
 #[inline]
 pub fn now_millis() -> i64 {
     TIME_PROVIDER
@@ -88,14 +89,21 @@ pub fn now_millis() -> i64 {
         .now_millis()
 }
 
+/// On wasm32 the epoch fallback is used transiently and never stored in the
+/// `OnceLock`, so a later `set_time_provider()` always wins even if an early
+/// timestamp already ran during initialization.
+#[cfg(target_arch = "wasm32")]
+#[inline]
+pub fn now_millis() -> i64 {
+    match TIME_PROVIDER.get() {
+        Some(provider) => provider.now_millis(),
+        None => UnsetWasmTimeProvider.now_millis(),
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn default_time_provider() -> Box<dyn TimeProvider> {
     Box::new(ChronoTimeProvider)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn default_time_provider() -> Box<dyn TimeProvider> {
-    Box::new(UnsetWasmTimeProvider)
 }
 
 /// Current time in seconds since Unix epoch.
