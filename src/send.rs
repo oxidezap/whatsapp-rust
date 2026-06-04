@@ -1156,9 +1156,13 @@ impl Client {
                 // a chain advances past a threshold. Captured-js doesn't show
                 // the value; 1000 mirrors common Signal hygiene defaults.
                 const SENDER_KEY_ROTATION_THRESHOLD: u32 = 1000;
+                // Read the chain iteration through the shared `Arc` without cloning
+                // the record: borrow the current state instead of `*_mut().cloned()`.
                 let needs_rotation = record
-                    .and_then(|mut r| r.sender_key_state_mut().ok().cloned())
-                    .and_then(|state| state.sender_chain_key().map(|ck| ck.iteration()))
+                    .as_ref()
+                    .and_then(|r| r.sender_key_state().ok())
+                    .and_then(|state| state.sender_chain_key())
+                    .map(|ck| ck.iteration())
                     .is_some_and(|iter| iter >= SENDER_KEY_ROTATION_THRESHOLD);
                 drop(device_guard);
 

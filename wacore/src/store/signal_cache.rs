@@ -142,7 +142,10 @@ impl SessionStoreState {
 // === Sender key object cache (same pattern as sessions) ===
 
 struct SenderKeyStoreState {
-    cache: HashMap<Arc<str>, Option<SenderKeyRecord>>,
+    // `Arc`-wrapped so a warm `get_sender_key` (the per-send peek reads and the
+    // per-decrypt load) bumps a refcount instead of deep-cloning the record's
+    // `VecDeque<SenderKeyState>` with up to `MAX_MESSAGE_KEYS` message keys each.
+    cache: HashMap<Arc<str>, Option<Arc<SenderKeyRecord>>>,
     dirty: HashSet<Arc<str>>,
 }
 
@@ -163,7 +166,7 @@ impl SenderKeyStoreState {
 
     fn put(&mut self, address: &str, record: SenderKeyRecord) {
         let addr = self.key_for(address);
-        self.cache.insert(addr.clone(), Some(record));
+        self.cache.insert(addr.clone(), Some(Arc::new(record)));
         self.dirty.insert(addr.clone());
     }
 
@@ -476,18 +479,22 @@ impl SignalStoreCache {
 
     // === Sender Keys ===
 
+    /// Returns a shared (`Arc`) handle to the cached sender-key record. A warm hit
+    /// is a refcount bump, not a deep clone of the message-key backlog. Callers
+    /// that need to mutate clone the inner record (e.g. via the trait
+    /// `load_sender_key`), so the cache copy is never mutated through this handle.
     pub async fn get_sender_key(
         &self,
         name: &SenderKeyName,
         backend: &dyn SignalStore,
-    ) -> Result<Option<SenderKeyRecord>> {
+    ) -> Result<Option<Arc<SenderKeyRecord>>> {
         let key = name.cache_key();
         let mut state = self.sender_keys.lock().await;
         if let Some(cached) = state.cache.get(key) {
             return Ok(cached.clone());
         }
         let record = match backend.get_sender_key(key).await? {
-            Some(bytes) => Some(SenderKeyRecord::deserialize(&bytes)?),
+            Some(bytes) => Some(Arc::new(SenderKeyRecord::deserialize(&bytes)?)),
             None => None,
         };
         state.cache.insert(Arc::from(key), record.clone());
@@ -679,5 +686,31 @@ mod sender_key_lock_tests {
         );
         drop(guard);
         assert!(lock.try_lock().is_some(), "released lock must reacquire");
+    }
+
+    #[tokio::test]
+    async fn warm_sender_key_hit_shares_arc_not_deep_clone() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+
+        let a = cache
+            .get_sender_key(&name, &backend)
+            .await
+            .unwrap()
+            .expect("warm hit");
+        let b = cache
+            .get_sender_key(&name, &backend)
+            .await
+            .unwrap()
+            .expect("warm hit");
+
+        // A warm sender-key hit returns a refcount bump of the same allocation,
+        // not a deep copy of the message-key backlog.
+        assert!(Arc::ptr_eq(&a, &b));
     }
 }

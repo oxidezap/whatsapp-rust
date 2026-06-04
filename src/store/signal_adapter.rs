@@ -272,10 +272,14 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
         Option<wacore::libsignal::protocol::SenderKeyRecord>,
     > {
         let device = self.0.device.read().await;
+        // group_decrypt mutates the loaded record (catch-up + ratchet) and stores
+        // it back, so the trait needs an owned copy. The cache keeps its `Arc`, so
+        // this clones the inner record (unchanged from the prior behavior).
         self.0
             .cache
             .get_sender_key(sender_key_name, &*device.backend)
             .await
+            .map(|opt| opt.map(std::sync::Arc::unwrap_or_clone))
             .map_err(signal_err("backend"))
     }
 
