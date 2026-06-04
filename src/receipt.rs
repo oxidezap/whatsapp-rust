@@ -153,6 +153,10 @@ impl Client {
             .unwrap_or_else(wacore::time::now_utc);
 
         let receipt_type = ReceiptType::parse(receipt_type_str);
+        // WA Web downgrades a delivery ack to "sent" (not delivered) when the receipt carries
+        // <error reason="lid" type="feature-incapable"> (the LID peer can't receive it).
+        let receipt_type =
+            wacore::stanza::receipt::downgrade_for_feature_incapable(nr, receipt_type);
         let is_view = receipt_type_str == "view";
         let is_group = from.is_group();
         let default_sender = if is_group {

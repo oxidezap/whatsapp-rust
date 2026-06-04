@@ -27,6 +27,10 @@ pub enum ChatPresenceMedia {
 #[serde(from = "String")]
 pub enum ReceiptType {
     Delivered,
+    /// Sent but NOT delivered: WA Web downgrades a delivery ack to this when the
+    /// receipt carries `<error reason="lid" type="feature-incapable">` (the LID peer
+    /// can't receive the message). Produced by the receipt parser, not sent by us.
+    Sent,
     Sender,
     Retry,
     /// VoIP call encryption re-keying retry.
@@ -55,6 +59,7 @@ impl ReceiptType {
     fn from_known(s: &str) -> Option<Self> {
         Some(match s {
             "" | "delivery" => Self::Delivered,
+            "sent" => Self::Sent,
             "sender" => Self::Sender,
             "retry" => Self::Retry,
             "enc_rekey_retry" => Self::EncRekeyRetry,
@@ -79,6 +84,7 @@ impl ReceiptType {
     pub fn as_wire_str(&self) -> &str {
         match self {
             Self::Delivered => "delivery",
+            Self::Sent => "sent",
             Self::Sender => "sender",
             Self::Retry => "retry",
             Self::EncRekeyRetry => "enc_rekey_retry",

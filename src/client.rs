@@ -4023,21 +4023,9 @@ impl Client {
         }
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
         if let Some(own_jid) = &device_snapshot.pn {
-            let type_str = match receipt_type {
-                crate::types::presence::ReceiptType::HistorySync => "hist_sync",
-                crate::types::presence::ReceiptType::Read => "read",
-                crate::types::presence::ReceiptType::ReadSelf => "read-self",
-                crate::types::presence::ReceiptType::Delivered => "delivery",
-                crate::types::presence::ReceiptType::Played => "played",
-                crate::types::presence::ReceiptType::PlayedSelf => "played-self",
-                crate::types::presence::ReceiptType::Inactive => "inactive",
-                crate::types::presence::ReceiptType::PeerMsg => "peer_msg",
-                crate::types::presence::ReceiptType::Sender => "sender",
-                crate::types::presence::ReceiptType::ServerError => "server-error",
-                crate::types::presence::ReceiptType::Retry => "retry",
-                crate::types::presence::ReceiptType::EncRekeyRetry => "enc_rekey_retry",
-                crate::types::presence::ReceiptType::Other(ref s) => s.as_str(),
-            };
+            // Single source of truth for the wire mapping (ReceiptType::Sent is a derived
+            // incoming-only state and is never sent by us).
+            let type_str = receipt_type.as_wire_str();
 
             let node = NodeBuilder::new("receipt")
                 .attrs([
