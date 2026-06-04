@@ -46,7 +46,7 @@ pub async fn process_prekey<'a>(
     pre_key_store: &dyn PreKeyStore,
     signed_prekey_store: &dyn SignedPreKeyStore,
     use_pq_ratchet: ratchet::UsePQRatchet,
-) -> Result<(PreKeysUsed, IdentityToSave<'a>)> {
+) -> Result<(PreKeysUsed, IdentityToSave<'a>, bool)> {
     let their_identity_key = message.identity_key();
 
     if !identity_store
@@ -58,7 +58,7 @@ pub async fn process_prekey<'a>(
         ));
     }
 
-    let pre_keys_used = process_prekey_impl(
+    let (pre_keys_used, reused_existing_session) = process_prekey_impl(
         message,
         remote_address,
         session_record,
@@ -74,7 +74,7 @@ pub async fn process_prekey<'a>(
         their_identity_key,
     };
 
-    Ok((pre_keys_used, identity_to_save))
+    Ok((pre_keys_used, identity_to_save, reused_existing_session))
 }
 
 async fn process_prekey_impl(
@@ -85,13 +85,16 @@ async fn process_prekey_impl(
     pre_key_store: &dyn PreKeyStore,
     identity_store: &dyn IdentityKeyStore,
     use_pq_ratchet: ratchet::UsePQRatchet,
-) -> Result<PreKeysUsed> {
+) -> Result<(PreKeysUsed, bool)> {
     if session_record.promote_matching_session(
         message.message_version() as u32,
         &message.base_key().serialize(),
     )? {
-        // We've already set up a session for this message, we can exit early.
-        return Ok(Default::default());
+        // We've already set up a session for this message (current or a promoted
+        // archived one), so this is a duplicate/out-of-order pkmsg. The `bool`
+        // signals the caller not to treat its (possibly stale) identity as a
+        // fresh rotation.
+        return Ok((Default::default(), true));
     }
 
     let our_signed_pre_key_pair = signed_prekey_store
@@ -138,7 +141,7 @@ async fn process_prekey_impl(
     let pre_keys_used = PreKeysUsed {
         pre_key_id: message.pre_key_id(),
     };
-    Ok(pre_keys_used)
+    Ok((pre_keys_used, false))
 }
 
 pub async fn process_prekey_bundle<R: Rng + CryptoRng>(

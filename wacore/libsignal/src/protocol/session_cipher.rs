@@ -327,7 +327,7 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
     )
     .await;
 
-    let (pre_key_used, identity_to_save) = match process_prekey_result {
+    let (pre_key_used, identity_to_save, reused_existing_session) = match process_prekey_result {
         Ok(result) => result,
         Err(e) => {
             let errs = [e];
@@ -353,12 +353,22 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
         csprng,
     )?;
 
-    let identity_change = identity_store
+    let saved = identity_store
         .save_identity(
             identity_to_save.remote_address,
             identity_to_save.their_identity_key,
         )
         .await?;
+
+    // A duplicate/out-of-order pkmsg that matched an existing session carries the
+    // identity from when that session was built, not a fresh rotation. Reporting
+    // it as a change would fire a spurious local identity-change reaction (mirrors
+    // the previous-session SignalMessage path).
+    let identity_change = if reused_existing_session {
+        IdentityChange::NewOrUnchanged
+    } else {
+        saved
+    };
 
     Ok((
         decrypt_result.plaintext,
@@ -1461,6 +1471,68 @@ mod tests {
                 assert_eq!(res.identity_change, expected);
             });
         }
+    }
+
+    /// `process_prekey` must signal session reuse when a pkmsg matches an
+    /// already-established session. The caller relies on this to avoid treating
+    /// a duplicate/out-of-order pkmsg's (possibly stale) identity as a fresh
+    /// rotation and firing a spurious local identity-change reaction.
+    #[test]
+    fn process_prekey_signals_reuse_for_established_session() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let alice_addr = ProtocolAddress::new("alice".to_string(), 1.into());
+        let alice_id = IdentityKeyPair::generate(&mut rng);
+        let mut alice_sessions = MemSessionStore::new();
+        let mut alice_identity = MemIdentityStore::new(alice_id, 1);
+
+        let (bob_addr, _bs, bob_identity, bob_prekeys, bob_signed, bundle) = fresh_bob(&mut rng);
+
+        futures::executor::block_on(async {
+            process_prekey_bundle(
+                &bob_addr,
+                &mut alice_sessions,
+                &mut alice_identity,
+                &bundle,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("process bundle");
+            let ct = message_encrypt(b"hi", &bob_addr, &mut alice_sessions, &mut alice_identity)
+                .await
+                .expect("encrypt");
+            let pkmsg = PreKeySignalMessage::try_from(ct.serialize()).expect("parse pkmsg");
+
+            let mut record = SessionRecord::new_fresh();
+            let (_used, _save, reused_first) = process_prekey(
+                &pkmsg,
+                &alice_addr,
+                &mut record,
+                &bob_identity,
+                &bob_prekeys,
+                &bob_signed,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("first process_prekey");
+            assert!(!reused_first, "first pkmsg establishes a new session");
+
+            let (_used2, _save2, reused_again) = process_prekey(
+                &pkmsg,
+                &alice_addr,
+                &mut record,
+                &bob_identity,
+                &bob_prekeys,
+                &bob_signed,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("second process_prekey");
+            assert!(
+                reused_again,
+                "re-processing the same pkmsg must signal session reuse"
+            );
+        });
     }
 
     /// P0: MAC verification failure must return `BadMac`, not `InvalidMessage`.
