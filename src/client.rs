@@ -3324,6 +3324,12 @@ impl Client {
             return;
         }
 
+        // Label mutations have their own index shape (labelId, not a chat JID at
+        // index[1]), so they are dispatched separately from chat actions.
+        if crate::features::labels::dispatch_label_mutation(&self.core.event_bus, m, full_sync) {
+            return;
+        }
+
         // Handle client-internal mutations that need persistence/presence access
         if m.index[0] == "setting_pushName"
             && let Some(val) = &m.action_value

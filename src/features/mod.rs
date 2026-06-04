@@ -4,6 +4,7 @@ mod chatstate;
 mod community;
 mod contacts;
 mod groups;
+pub(crate) mod labels;
 mod media_reupload;
 pub mod message_edit;
 mod mex;
@@ -35,6 +36,8 @@ pub use groups::{
     MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
     ParticipantType, PictureType,
 };
+
+pub use labels::Labels;
 
 pub use media_reupload::{MediaRetryResult, MediaReupload, MediaReuploadRequest};
 

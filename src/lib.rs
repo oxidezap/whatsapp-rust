@@ -72,7 +72,7 @@ pub use features::{
     CommunitySubgroup, Contacts, CreateCommunityOptions, CreateCommunityResult, CreateGroupResult,
     EncryptedEdit, GroupCreateOptions, GroupDescription, GroupJoinError, GroupMetadata,
     GroupParticipant, GroupParticipantOptions, GroupProfilePicture, GroupSubject, GroupType,
-    Groups, GrowthLockInfo, InviteInfoError, IsOnWhatsAppResult, JoinGroupResult,
+    Groups, GrowthLockInfo, InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels,
     LinkSubgroupsResult, MediaRetryResult, MediaReupload, MediaReuploadRequest, MemberAddMode,
     MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, Mex,
     MexError, MexErrorExtensions, MexRequest, MexResponse, Newsletter, NewsletterMessage,

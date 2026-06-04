@@ -533,10 +533,29 @@ impl<'a> ChatActions<'a> {
         index: &[u8],
         value: &wa::SyncActionValue,
     ) -> Result<()> {
+        self.client
+            .send_app_state_mutation(collection, index, value)
+            .await
+    }
+}
+
+impl Client {
+    pub fn chat_actions(&self) -> ChatActions<'_> {
+        ChatActions::new(self)
+    }
+
+    /// Encode a single `Set` app-state mutation and send it as a patch on
+    /// `collection`. Shared by the chat-action and label features.
+    pub(crate) async fn send_app_state_mutation(
+        &self,
+        collection: WAPatchName,
+        index: &[u8],
+        value: &wa::SyncActionValue,
+    ) -> Result<()> {
         use rand::Rng;
         use wacore::appstate::encode::encode_record;
 
-        let proc = self.client.get_app_state_processor().await;
+        let proc = self.get_app_state_processor().await;
         let key_id = proc
             .backend
             .get_latest_sync_key_id()
@@ -557,14 +576,7 @@ impl<'a> ChatActions<'a> {
             &iv,
         );
 
-        self.client
-            .send_app_state_patch(collection.as_str(), vec![mutation])
+        self.send_app_state_patch(collection.as_str(), vec![mutation])
             .await
-    }
-}
-
-impl Client {
-    pub fn chat_actions(&self) -> ChatActions<'_> {
-        ChatActions::new(self)
     }
 }

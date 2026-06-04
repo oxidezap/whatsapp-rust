@@ -231,6 +231,8 @@ pub enum EventKind {
     MarkChatAsReadUpdate,
     DeleteChatUpdate,
     DeleteMessageForMeUpdate,
+    LabelEditUpdate,
+    LabelAssociationUpdate,
     HistorySync,
     OfflineSyncPreview,
     OfflineSyncCompleted,
@@ -600,6 +602,8 @@ pub enum Event {
     MarkChatAsReadUpdate(MarkChatAsReadUpdate),
     DeleteChatUpdate(DeleteChatUpdate),
     DeleteMessageForMeUpdate(DeleteMessageForMeUpdate),
+    LabelEditUpdate(LabelEditUpdate),
+    LabelAssociationUpdate(LabelAssociationUpdate),
 
     HistorySync(Box<LazyHistorySync>),
     OfflineSyncPreview(OfflineSyncPreview),
@@ -685,6 +689,8 @@ impl Event {
             Event::MarkChatAsReadUpdate(_) => EventKind::MarkChatAsReadUpdate,
             Event::DeleteChatUpdate(_) => EventKind::DeleteChatUpdate,
             Event::DeleteMessageForMeUpdate(_) => EventKind::DeleteMessageForMeUpdate,
+            Event::LabelEditUpdate(_) => EventKind::LabelEditUpdate,
+            Event::LabelAssociationUpdate(_) => EventKind::LabelAssociationUpdate,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -1129,6 +1135,30 @@ pub struct DeleteMessageForMeUpdate {
     pub from_me: bool,
     pub timestamp: DateTime<Utc>,
     pub action: Box<wa::sync_action_value::DeleteMessageForMeAction>,
+    pub from_full_sync: bool,
+}
+
+/// A label was created, renamed/recolored, or deleted on a linked device.
+/// `action.deleted == Some(true)` means the label was removed.
+#[derive(Debug, Clone, Serialize)]
+pub struct LabelEditUpdate {
+    /// The label identifier (the index key, not a JID).
+    pub label_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::LabelEditAction>,
+    pub from_full_sync: bool,
+}
+
+/// A label was associated with or removed from a chat on a linked device.
+/// `action.labeled == Some(true)` means the label was added to the chat.
+#[derive(Debug, Clone, Serialize)]
+pub struct LabelAssociationUpdate {
+    /// The label identifier.
+    pub label_id: String,
+    /// The chat the label was associated with or removed from.
+    pub chat_jid: Jid,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::LabelAssociationAction>,
     pub from_full_sync: bool,
 }
 
