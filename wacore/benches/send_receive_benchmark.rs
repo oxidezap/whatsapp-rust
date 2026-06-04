@@ -14,6 +14,7 @@ use wacore::runtime::{AbortHandle, Runtime};
 use wacore::send::{SignalStores, prepare_group_stanza, prepare_peer_stanza};
 use wacore::types::jid::{JidExt, make_sender_key_name};
 use wacore::types::message::AddressingMode;
+use wacore_binary::JidExt as _;
 use wacore_binary::jid::Jid;
 use wacore_binary::marshal::marshal;
 use wacore_binary::node::{Node, NodeContent};
@@ -381,8 +382,14 @@ impl SendContextResolver for MockResolver {
     ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
         Ok(HashMap::new())
     }
-    async fn resolve_group_info(&self, _: &Jid) -> Result<GroupInfo, anyhow::Error> {
-        Ok(GroupInfo::new(self.0.clone(), AddressingMode::Pn))
+    async fn resolve_group_info(
+        &self,
+        _: &Jid,
+    ) -> Result<std::sync::Arc<GroupInfo>, anyhow::Error> {
+        Ok(std::sync::Arc::new(GroupInfo::new(
+            self.0.clone(),
+            AddressingMode::Pn,
+        )))
     }
 }
 
@@ -638,8 +645,7 @@ fn setup_group_recv() -> GrpRecvData {
     // (server strips <participants> before forwarding to recipients)
     let resolver = MockResolver(vec![bob.jid.clone()]);
     let own_jid = alice.jid.clone();
-    let mut group_info =
-        GroupInfo::new(vec![bob.jid.clone(), alice.jid.clone()], AddressingMode::Pn);
+    let group_info = GroupInfo::new(vec![bob.jid.clone(), alice.jid.clone()], AddressingMode::Pn);
 
     let mut stores = SignalStores {
         sender_key_store: &mut alice.sender_keys,
@@ -654,7 +660,7 @@ fn setup_group_recv() -> GrpRecvData {
         &runtime,
         &mut stores,
         &resolver,
-        &mut group_info,
+        &group_info,
         &own_jid,
         &own_jid,
         None,
@@ -719,6 +725,14 @@ fn run_group_send(d: &mut GrpSendData) {
     // itself and keeps None.
     let all_devices_for_phash = (!d.force_skdm).then(|| d.participants.clone());
     let mut group_info = GroupInfo::new(std::mem::take(&mut d.participants), AddressingMode::Pn);
+    let own_base = own_jid.to_non_ad();
+    if !group_info
+        .participants
+        .iter()
+        .any(|p| p.is_same_user_as(&own_base))
+    {
+        group_info.participants.push(own_base);
+    }
     let mut stores = SignalStores {
         sender_key_store: &mut d.alice.sender_keys,
         session_store: &mut d.alice.sessions,
@@ -731,7 +745,7 @@ fn run_group_send(d: &mut GrpSendData) {
         &d.runtime,
         &mut stores,
         &d.resolver,
-        &mut group_info,
+        &group_info,
         &own_jid,
         &own_jid,
         None,

@@ -1181,14 +1181,15 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
         match &action {
             GroupNotificationAction::Add { participants, .. } => {
                 let group_cache = client.get_group_cache().await;
-                if let Some(mut info) = group_cache.get(&notification.group_jid).await {
+                if let Some(info) = group_cache.get(&notification.group_jid).await {
+                    let mut info = Arc::unwrap_or_clone(info);
                     info.add_participants(
                         participants
                             .iter()
                             .map(|p| (&p.jid, p.phone_number.as_ref())),
                     );
                     group_cache
-                        .insert(notification.group_jid.clone(), info)
+                        .insert(notification.group_jid.clone(), Arc::new(info))
                         .await;
                     debug!(
                         target: "Client/Group",
@@ -1200,10 +1201,11 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
             GroupNotificationAction::Remove { participants, .. } => {
                 let users: Vec<&str> = participants.iter().map(|p| p.jid.user.as_str()).collect();
                 let group_cache = client.get_group_cache().await;
-                if let Some(mut info) = group_cache.get(&notification.group_jid).await {
+                if let Some(info) = group_cache.get(&notification.group_jid).await {
+                    let mut info = Arc::unwrap_or_clone(info);
                     info.remove_participants(&users);
                     group_cache
-                        .insert(notification.group_jid.clone(), info)
+                        .insert(notification.group_jid.clone(), Arc::new(info))
                         .await;
                     debug!(
                         target: "Client/Group",

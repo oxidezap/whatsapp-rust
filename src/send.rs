@@ -14,6 +14,26 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 
+/// Returns a `GroupInfo` whose participant list is guaranteed to contain our own
+/// sending JID, without deep-cloning the shared (cached) metadata in the common
+/// case where the server's participant list already includes us.
+fn ensure_self_in_group(
+    info: std::sync::Arc<wacore::client::context::GroupInfo>,
+    own_sending_jid: &Jid,
+) -> std::sync::Arc<wacore::client::context::GroupInfo> {
+    if info
+        .participants
+        .iter()
+        .any(|participant| participant.is_same_user_as(own_sending_jid))
+    {
+        info
+    } else {
+        let mut owned = (*info).clone();
+        owned.participants.push(own_sending_jid.to_non_ad());
+        std::sync::Arc::new(owned)
+    }
+}
+
 /// Options for [`Client::send_message_with_options`].
 #[derive(Debug, Clone, Default)]
 pub struct SendOptions {
@@ -481,6 +501,18 @@ impl Client {
                 .map(|(_all, needs)| needs)
         };
 
+        // prepare_group_stanza and ensure_status_participants both read the
+        // participant list and expect self present. Done after SKDM resolution
+        // to preserve the prior ordering (resolve ran without self appended).
+        let own_status_base = own_lid.to_non_ad();
+        if !group_info
+            .participants
+            .iter()
+            .any(|participant| participant.is_same_user_as(&own_status_base))
+        {
+            group_info.participants.push(own_status_base);
+        }
+
         // `<meta status_setting>` describes the POSTER's privacy on their own
         // status. Reactions go through WA Web's addon path and never visit
         // `WAWebEncryptAndSendStatusMsg`; attaching the meta on a reaction
@@ -499,7 +531,7 @@ impl Client {
             &*self.runtime,
             &mut stores,
             self,
-            &mut group_info,
+            &group_info,
             &own_jid,
             &own_lid,
             account_info.as_deref(),
@@ -544,7 +576,7 @@ impl Client {
                         &*self.runtime,
                         &mut stores_retry,
                         self,
-                        &mut group_info,
+                        &group_info,
                         &own_jid,
                         &own_lid,
                         account_info.as_deref(),
@@ -1080,7 +1112,7 @@ impl Client {
         } else if to.is_group() {
             // No send-level lock: encrypt_group_message serializes the
             // sender-key chain advance per (group, sender) at the cipher.
-            let mut group_info = self.groups().query_info(&to).await?;
+            let group_info = self.groups().query_info(&to).await?;
 
             let mut device_snapshot = self.persistence_manager.get_device_snapshot().await;
             let account_info = device_snapshot.account.take();
@@ -1104,13 +1136,9 @@ impl Client {
                 crate::types::message::AddressingMode::Pn => (own_jid.clone(), "pn"),
             };
 
-            if !group_info
-                .participants
-                .iter()
-                .any(|participant| participant.is_same_user_as(&own_sending_jid))
-            {
-                group_info.participants.push(own_sending_jid.to_non_ad());
-            }
+            // resolve_skdm_targets and prepare_group_stanza both read the
+            // participant list and expect self to be present.
+            let group_info = ensure_self_in_group(group_info, &own_sending_jid);
 
             let force_skdm = {
                 use wacore::libsignal::store::sender_key_name::SenderKeyName;
@@ -1182,7 +1210,7 @@ impl Client {
                 &*self.runtime,
                 &mut stores,
                 self,
-                &mut group_info,
+                &group_info,
                 &own_jid,
                 &own_lid,
                 account_info.as_deref(),
@@ -1230,7 +1258,7 @@ impl Client {
                             &*self.runtime,
                             &mut stores_retry,
                             self,
-                            &mut group_info,
+                            &group_info,
                             &own_jid,
                             &own_lid,
                             account_info.as_deref(),
@@ -2029,6 +2057,32 @@ pub(crate) fn is_self_dm_recipient(
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn ensure_self_in_group_shares_when_present_and_appends_when_absent() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let own: Jid = "999999999999@s.whatsapp.net".parse().unwrap();
+        let other: Jid = "111111111111@s.whatsapp.net".parse().unwrap();
+
+        // Self already a member (the common case): the shared Arc passes through
+        // untouched, with no deep clone of the participant list.
+        let with_self = std::sync::Arc::new(GroupInfo::new(
+            vec![other.to_non_ad(), own.to_non_ad()],
+            AddressingMode::Pn,
+        ));
+        let out = ensure_self_in_group(with_self.clone(), &own);
+        assert!(std::sync::Arc::ptr_eq(&with_self, &out));
+
+        // Self missing: a fresh GroupInfo is built with self appended.
+        let without_self =
+            std::sync::Arc::new(GroupInfo::new(vec![other.to_non_ad()], AddressingMode::Pn));
+        let out = ensure_self_in_group(without_self.clone(), &own);
+        assert!(!std::sync::Arc::ptr_eq(&without_self, &out));
+        assert_eq!(out.participants.len(), 2);
+        assert!(out.participants.iter().any(|p| p.is_same_user_as(&own)));
+    }
 
     #[tokio::test]
     async fn send_message_to_status_without_reaction_errors() {

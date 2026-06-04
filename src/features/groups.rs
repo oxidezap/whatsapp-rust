@@ -1,6 +1,7 @@
 use crate::client::Client;
 use crate::features::mex::{MexError, MexRequest};
 use std::collections::HashMap;
+use std::sync::Arc;
 use wacore::client::context::GroupInfo;
 use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
@@ -187,7 +188,7 @@ impl<'a> Groups<'a> {
         Self { client }
     }
 
-    pub async fn query_info(&self, jid: &Jid) -> Result<GroupInfo, anyhow::Error> {
+    pub async fn query_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, anyhow::Error> {
         if let Some(cached) = self.client.get_group_cache().await.get(jid).await {
             return Ok(cached);
         }
@@ -211,9 +212,9 @@ impl<'a> Groups<'a> {
             .await?
         {
             GroupInfoOutcome::NotModified => {
-                let info = persisted.ok_or_else(|| {
+                let info = Arc::new(persisted.ok_or_else(|| {
                     anyhow::anyhow!("server returned not-modified group but nothing was cached")
-                })?;
+                })?);
                 self.client
                     .get_group_cache()
                     .await
@@ -280,6 +281,7 @@ impl<'a> Groups<'a> {
             Err(e) => log::warn!("Failed to serialize group metadata for {jid}: {e}"),
         }
 
+        let info = Arc::new(info);
         self.client
             .get_group_cache()
             .await
@@ -406,14 +408,15 @@ impl<'a> Groups<'a> {
         let result = self.client.execute(iq).await?;
         if result.iter().any(|r| r.is_ok()) {
             let group_cache = self.client.get_group_cache().await;
-            if let Some(mut info) = group_cache.get(jid).await {
+            if let Some(info) = group_cache.get(jid).await {
+                let mut info = Arc::unwrap_or_clone(info);
                 info.add_participants(
                     result
                         .iter()
                         .filter(|r| r.is_ok())
                         .map(|r| (&r.jid, r.phone_number.as_ref())),
                 );
-                group_cache.insert(jid.clone(), info).await;
+                group_cache.insert(jid.clone(), Arc::new(info)).await;
             }
         }
         Ok(result)
@@ -435,9 +438,10 @@ impl<'a> Groups<'a> {
             .collect();
         if !accepted.is_empty() {
             let group_cache = self.client.get_group_cache().await;
-            if let Some(mut info) = group_cache.get(jid).await {
+            if let Some(info) = group_cache.get(jid).await {
+                let mut info = Arc::unwrap_or_clone(info);
                 info.remove_participants(&accepted);
-                group_cache.insert(jid.clone(), info).await;
+                group_cache.insert(jid.clone(), Arc::new(info)).await;
             }
             self.client
                 .rotate_sender_key_on_participant_remove(&jid.to_string(), &accepted)
@@ -1079,6 +1083,33 @@ mod tests {
         assert!(extract_invite_code("https://chat.whatsapp.com/invite/").is_none());
         assert!(extract_invite_code("whatsapp://chat/?code=").is_none());
         assert!(extract_invite_code("whatsapp://chat/?code=&other=1").is_none());
+    }
+
+    #[tokio::test]
+    async fn warm_group_cache_hit_shares_arc_not_deep_clone() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = crate::test_utils::create_test_client().await;
+        let group_jid: Jid = "123456789@g.us".parse().unwrap();
+
+        let info = GroupInfo::new(
+            vec![
+                "111111111111@s.whatsapp.net".parse().unwrap(),
+                "222222222222@s.whatsapp.net".parse().unwrap(),
+            ],
+            AddressingMode::Pn,
+        );
+        let cache = client.get_group_cache().await;
+        cache.insert(group_jid.clone(), Arc::new(info)).await;
+
+        let a = cache.get(&group_jid).await.expect("warm hit");
+        let b = cache.get(&group_jid).await.expect("warm hit");
+
+        // A warm group-cache hit returns a refcount bump of the same allocation,
+        // not a deep copy of the participant list and LID/PN maps.
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.participants.len(), 2);
     }
 
     // Protocol-level tests (node building, parsing, validation) are in wacore/src/iq/groups.rs

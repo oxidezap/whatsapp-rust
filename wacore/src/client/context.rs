@@ -2,6 +2,7 @@ use crate::libsignal::protocol::PreKeyBundle;
 use crate::types::message::AddressingMode;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 use wacore_binary::CompactString;
 use wacore_binary::Jid;
 
@@ -153,7 +154,7 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         jids: &[Jid],
     ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error>;
 
-    async fn resolve_group_info(&self, jid: &Jid) -> Result<GroupInfo, anyhow::Error>;
+    async fn resolve_group_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, anyhow::Error>;
 
     /// Get the LID (Linked ID) for a phone number, if known.
     /// This is used to find existing sessions that were established under a LID address

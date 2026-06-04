@@ -1441,7 +1441,9 @@ pub async fn prepare_group_stanza<
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'a, S, I, P, SP>,
     resolver: &dyn SendContextResolver,
-    group_info: &mut GroupInfo,
+    // Caller guarantees `own_base_jid` is already present in `participants`, so
+    // this reads the shared (Arc-backed) metadata without cloning it.
+    group_info: &GroupInfo,
     own_jid: &Jid,
     own_lid: &Jid,
     account: Option<&wa::AdvSignedDeviceIdentity>,
@@ -1475,13 +1477,6 @@ pub async fn prepare_group_stanza<
     };
 
     let own_base_jid = own_sending_jid.to_non_ad();
-    if !group_info
-        .participants
-        .iter()
-        .any(|participant| participant.is_same_user_as(&own_base_jid))
-    {
-        group_info.participants.push(own_base_jid.clone());
-    }
 
     let mut message_children: Vec<Node> = Vec::new();
     let mut includes_prekey_message = false;
@@ -2433,7 +2428,7 @@ mod tests {
             Ok(result)
         }
 
-        async fn resolve_group_info(&self, _jid: &Jid) -> Result<GroupInfo> {
+        async fn resolve_group_info(&self, _jid: &Jid) -> Result<std::sync::Arc<GroupInfo>> {
             unimplemented!("resolve_group_info not needed for send.rs tests")
         }
 
@@ -4817,7 +4812,7 @@ mod tests {
             let resolver = MockSendContextResolver::new();
             let rt = TokioTestRuntime;
 
-            let mut group_info = GroupInfo::new(
+            let group_info = GroupInfo::new(
                 vec![own_jid.to_non_ad(), a.to_non_ad(), b.to_non_ad()],
                 AddressingMode::Pn,
             );
@@ -4830,7 +4825,7 @@ mod tests {
                 &rt,
                 &mut stores,
                 &resolver,
-                &mut group_info,
+                &group_info,
                 &own_jid,
                 &own_lid,
                 None,

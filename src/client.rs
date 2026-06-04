@@ -132,6 +132,11 @@ use thiserror::Error;
 
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::client::context::GroupInfo;
+
+/// Group metadata cache. Values are `Arc`-wrapped so a warm `query_info` hit
+/// shares the metadata (refcount bump) instead of deep-cloning the participant
+/// list and LID/PN maps on every group send.
+type GroupCache = TypedCache<Jid, Arc<GroupInfo>>;
 use wacore::runtime::timeout as rt_timeout;
 use waproto::whatsapp as wa;
 
@@ -395,7 +400,7 @@ pub struct Client {
     pub(crate) lid_pn_cache: Arc<LidPnCache>,
     pub(crate) ab_props: Arc<wacore::store::ab_props::AbPropsCache>,
 
-    pub group_cache: async_lock::Mutex<Option<Arc<TypedCache<Jid, GroupInfo>>>>,
+    pub group_cache: async_lock::Mutex<Option<Arc<GroupCache>>>,
 
     pub(crate) expected_disconnect: Arc<AtomicBool>,
     /// Set by `reconnect()` to suppress the "Message loop exited with an error" warning.
@@ -935,7 +940,7 @@ impl Client {
         (arc, rx)
     }
 
-    pub(crate) async fn get_group_cache(&self) -> Arc<TypedCache<Jid, GroupInfo>> {
+    pub(crate) async fn get_group_cache(&self) -> Arc<GroupCache> {
         let mut guard = self.group_cache.lock().await;
         if let Some(cache) = guard.as_ref() {
             return cache.clone();
