@@ -106,6 +106,12 @@ impl<'a> Labels<'a> {
     /// this both creates a new label and renames/recolors an existing one.
     /// `color` is a WhatsApp color index.
     pub async fn create_label(&self, label_id: &str, name: &str, color: i32) -> Result<()> {
+        if label_id.is_empty() {
+            anyhow::bail!("label_id cannot be empty");
+        }
+        if name.is_empty() {
+            anyhow::bail!("label name cannot be empty");
+        }
         debug!("Setting label {label_id} (name={name:?}, color={color})");
         let index = serde_json::to_vec(&["label_edit", label_id])?;
         let value = wa::SyncActionValue {
@@ -126,6 +132,9 @@ impl<'a> Labels<'a> {
     /// Delete a label. Chats keep their association rows; WA Web prunes them
     /// from the local DB on receipt of the delete.
     pub async fn delete_label(&self, label_id: &str) -> Result<()> {
+        if label_id.is_empty() {
+            anyhow::bail!("label_id cannot be empty");
+        }
         debug!("Deleting label {label_id}");
         let index = serde_json::to_vec(&["label_edit", label_id])?;
         let value = wa::SyncActionValue {
@@ -152,6 +161,9 @@ impl<'a> Labels<'a> {
     }
 
     async fn send_association(&self, label_id: &str, chat_jid: &Jid, labeled: bool) -> Result<()> {
+        if label_id.is_empty() {
+            anyhow::bail!("label_id cannot be empty");
+        }
         debug!(
             "{} label {label_id} {} chat {chat_jid}",
             if labeled { "Adding" } else { "Removing" },
@@ -266,6 +278,28 @@ mod tests {
             }
             other => panic!("expected LabelAssociationUpdate, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn label_methods_reject_empty_id() {
+        // Validation fires before any network/app-state work, so a key-less test
+        // client still exercises the guard.
+        let client = crate::test_utils::create_test_client().await;
+        let jid: Jid = "15551112222@s.whatsapp.net".parse().unwrap();
+
+        let err = client
+            .labels()
+            .create_label("", "Work", 0)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("label_id cannot be empty"));
+
+        let err = client.labels().create_label("5", "", 0).await.unwrap_err();
+        assert!(err.to_string().contains("label name cannot be empty"));
+
+        assert!(client.labels().delete_label("").await.is_err());
+        assert!(client.labels().add_chat_label("", &jid).await.is_err());
+        assert!(client.labels().remove_chat_label("", &jid).await.is_err());
     }
 
     #[test]

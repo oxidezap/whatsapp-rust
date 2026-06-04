@@ -118,12 +118,10 @@ impl<'a> Profile<'a> {
 
     /// Build and send the `setting_pushName` app state mutation.
     async fn send_push_name_mutation(&self, name: &str) -> Result<()> {
-        use rand::Rng;
-        use wacore::appstate::encode::encode_record;
+        use wacore::appstate::patch_decode::WAPatchName;
         use waproto::whatsapp as wa;
 
         let index = serde_json::to_vec(&["setting_pushName"])?;
-
         let value = wa::SyncActionValue {
             push_name_setting: Some(wa::sync_action_value::PushNameSetting {
                 name: Some(name.to_string()),
@@ -131,37 +129,9 @@ impl<'a> Profile<'a> {
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
-
-        // Get the latest sync key for encryption
-        let proc = self.client.get_app_state_processor().await;
-        let key_id = proc
-            .backend
-            .get_latest_sync_key_id()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?
-            .ok_or_else(|| anyhow::anyhow!("No app state sync key available"))?;
-        let keys = proc.get_app_state_key(&key_id).await?;
-
-        // Generate random IV
-        let mut iv = [0u8; 16];
-        rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
-
-        let (mutation, _) = encode_record(
-            wa::syncd_mutation::SyncdOperation::Set,
-            &index,
-            &value,
-            &keys,
-            &key_id,
-            &iv,
-            // setting_pushName is action version 1 (matches whatsmeow).
-            1,
-        );
-
+        // setting_pushName is action version 1 (matches whatsmeow).
         self.client
-            .send_app_state_patch(
-                wacore::appstate::patch_decode::WAPatchName::CriticalBlock.as_str(),
-                vec![mutation],
-            )
+            .send_app_state_mutation(WAPatchName::CriticalBlock, &index, &value, 1)
             .await
     }
 }
