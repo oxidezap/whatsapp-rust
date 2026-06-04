@@ -142,7 +142,7 @@ pub fn unwrap_device_sent(mut msg: wa::Message) -> wa::Message {
 /// When sending a group message, WhatsApp includes the SKDM in a separate
 /// `pkmsg` enc node.  We must process it (store the sender key) but should
 /// not surface it as a user event.
-pub fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
+pub fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
     if msg.sender_key_distribution_message.is_none()
         && msg
             .fast_ratchet_key_sender_key_distribution_message
@@ -151,7 +151,7 @@ pub fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
         return false;
     }
 
-    // Fast path: most common user-visible fields (avoids clone for the typical case).
+    // Fast path: most common user-visible fields (avoids the slow path for the typical case).
     if msg.conversation.is_some()
         || msg.extended_text_message.is_some()
         || msg.image_message.is_some()
@@ -164,12 +164,20 @@ pub fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
         return false;
     }
 
-    // Slow path: clone and compare to default to catch all current and future fields.
-    let mut stripped = msg.clone();
-    stripped.sender_key_distribution_message = None;
-    stripped.fast_ratchet_key_sender_key_distribution_message = None;
-    stripped.message_context_info = None;
-    stripped == wa::Message::default()
+    // Slow path: temporarily take out the carrier fields and compare the rest to
+    // default to catch all current and future fields, then restore them. This
+    // avoids deep-cloning the whole Message just to clear three fields.
+    let skdm = msg.sender_key_distribution_message.take();
+    let fast = msg.fast_ratchet_key_sender_key_distribution_message.take();
+    let ctx = msg.message_context_info.take();
+
+    let only = *msg == wa::Message::default();
+
+    msg.sender_key_distribution_message = skdm;
+    msg.fast_ratchet_key_sender_key_distribution_message = fast;
+    msg.message_context_info = ctx;
+
+    only
 }
 
 /// Parse a message stanza into a `MessageInfo` struct.

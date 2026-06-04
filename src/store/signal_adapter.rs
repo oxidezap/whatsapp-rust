@@ -40,6 +40,15 @@ pub struct SignedPreKeyAdapter(SharedDevice);
 #[derive(Clone)]
 pub struct SenderKeyAdapter(SharedDevice);
 
+impl SenderKeyAdapter {
+    /// Build a standalone sender-key store without constructing the full
+    /// five-store [`SignalProtocolStoreAdapter`]. Used on the SKDM-processing
+    /// path, which only needs the sender-key store.
+    pub fn new(device: Arc<RwLock<Device>>, cache: Arc<SignalStoreCache>) -> Self {
+        Self(SharedDevice { device, cache })
+    }
+}
+
 #[derive(Clone)]
 pub struct SignalProtocolStoreAdapter {
     pub session_store: SessionAdapter,

@@ -2528,7 +2528,7 @@ impl Client {
         // (protocol-level key exchange) with no user-visible content.
         // These arrive as a separate pkmsg enc node alongside the actual
         // group message (skmsg) and would otherwise surface as "unknown".
-        if wacore::messages::is_sender_key_distribution_only(&msg) {
+        if wacore::messages::is_sender_key_distribution_only(&mut msg) {
             log::debug!(
                 "[msg:{}] Skipping event dispatch for sender key distribution message",
                 info.id
@@ -2863,14 +2863,13 @@ impl Client {
 
         // Route through the signal cache adapter so the sender key is immediately visible
         // in the cache for subsequent group_decrypt calls within the same message batch.
-        let mut adapter = self.signal_adapter().await;
+        // Only the sender-key store is needed here, so build it standalone instead of
+        // the full five-store adapter.
+        let mut sender_key_store = self.sender_key_adapter().await;
 
-        if let Err(e) = process_sender_key_distribution_message(
-            &sender_key_name,
-            &skdm,
-            &mut adapter.sender_key_store,
-        )
-        .await
+        if let Err(e) =
+            process_sender_key_distribution_message(&sender_key_name, &skdm, &mut sender_key_store)
+                .await
         {
             log::error!(
                 "Failed to process SenderKeyDistributionMessage from {}: {:?}",
@@ -2905,7 +2904,7 @@ fn unwrap_device_sent(msg: wa::Message) -> wa::Message {
 
 /// Re-export from wacore for backwards compatibility (used by tests via `super::*`).
 #[cfg(test)]
-fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
+fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
     wacore::messages::is_sender_key_distribution_only(msg)
 }
 
@@ -7006,40 +7005,68 @@ mod tests {
         };
 
         // Empty message → false (no SKDM)
-        assert!(!is_sender_key_distribution_only(&wa::Message::default()));
+        assert!(!is_sender_key_distribution_only(&mut wa::Message::default()));
 
         // SKDM only → true
-        assert!(is_sender_key_distribution_only(&wa::Message {
+        assert!(is_sender_key_distribution_only(&mut wa::Message {
             sender_key_distribution_message: Some(skdm.clone()),
             ..Default::default()
         }));
 
         // SKDM + message_context_info → still true (context_info is metadata)
-        assert!(is_sender_key_distribution_only(&wa::Message {
+        assert!(is_sender_key_distribution_only(&mut wa::Message {
             sender_key_distribution_message: Some(skdm.clone()),
             message_context_info: Some(wa::MessageContextInfo::default()),
             ..Default::default()
         }));
 
         // SKDM + sticker → false (has user content)
-        assert!(!is_sender_key_distribution_only(&wa::Message {
+        assert!(!is_sender_key_distribution_only(&mut wa::Message {
             sender_key_distribution_message: Some(skdm.clone()),
             sticker_message: Some(Box::new(wa::message::StickerMessage::default())),
             ..Default::default()
         }));
 
         // SKDM + text → false (has user content)
-        assert!(!is_sender_key_distribution_only(&wa::Message {
+        assert!(!is_sender_key_distribution_only(&mut wa::Message {
             sender_key_distribution_message: Some(skdm.clone()),
             conversation: Some("hello".into()),
             ..Default::default()
         }));
 
         // protocol_message only (no SKDM) → false
-        assert!(!is_sender_key_distribution_only(&wa::Message {
+        assert!(!is_sender_key_distribution_only(&mut wa::Message {
             protocol_message: Some(Box::new(wa::message::ProtocolMessage::default())),
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn skdm_only_detection_restores_carrier_fields() {
+        // The slow path takes the carrier fields out to compare the rest against
+        // default; it must restore them so callers still see the original message.
+        let mut msg = wa::Message {
+            sender_key_distribution_message: Some(wa::message::SenderKeyDistributionMessage {
+                group_id: Some("group".into()),
+                axolotl_sender_key_distribution_message: Some(vec![1, 2, 3]),
+            }),
+            message_context_info: Some(wa::MessageContextInfo::default()),
+            ..Default::default()
+        };
+
+        assert!(is_sender_key_distribution_only(&mut msg));
+
+        assert_eq!(
+            msg.sender_key_distribution_message
+                .as_ref()
+                .and_then(|s| s.group_id.as_deref()),
+            Some("group"),
+            "sender_key_distribution_message must be restored"
+        );
+        assert!(
+            msg.message_context_info.is_some(),
+            "message_context_info must be restored"
+        );
     }
 
     /// Test: unwrap_device_sent extracts a reaction from a DeviceSentMessage wrapper.
@@ -7060,7 +7087,7 @@ mod tests {
             ..Default::default()
         };
 
-        let unwrapped = unwrap_device_sent(wrapped);
+        let mut unwrapped = unwrap_device_sent(wrapped);
         assert!(
             unwrapped.device_sent_message.is_none(),
             "DSM wrapper should be removed"
@@ -7074,7 +7101,7 @@ mod tests {
             "reaction should be accessible after unwrapping"
         );
         assert!(
-            !is_sender_key_distribution_only(&unwrapped),
+            !is_sender_key_distribution_only(&mut unwrapped),
             "unwrapped reaction should not be filtered as SKDM-only"
         );
     }

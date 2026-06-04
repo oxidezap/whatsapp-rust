@@ -269,13 +269,13 @@ pub fn process_decrypted_plaintext(
     let has_invalid_dsm = original_msg.device_sent_message.is_some() && !is_from_me;
 
     // Unwrap DeviceSentMessage wrapper
-    let msg = crate::messages::unwrap_device_sent(original_msg);
+    let mut msg = crate::messages::unwrap_device_sent(original_msg);
 
     // Extract SKDM
     let skdm = msg.sender_key_distribution_message.clone();
 
     // Check if SKDM-only
-    let is_skdm_only = crate::messages::is_sender_key_distribution_only(&msg);
+    let is_skdm_only = crate::messages::is_sender_key_distribution_only(&mut msg);
 
     // Extract protocol message info
     let protocol_message = msg.protocol_message.as_ref().map(|pm| ProtocolMessageInfo {
