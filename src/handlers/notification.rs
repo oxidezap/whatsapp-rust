@@ -347,28 +347,47 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
     // group-only peer we never had a session with), skip the session delete/rebuild,
     // status sender-key rotation, tcToken reissue and the change notification — that
     // path would otherwise eagerly fetch prekeys + X3DH to build a session we may
-    // never use. Use the same `addr` the delete uses so read and delete agree.
+    // never use.
+    //
+    // Check BOTH the resolved (preferred LID-or-PN) address and the original PN
+    // address. They diverge when a PN->LID mapping was learned from offline replay
+    // but the Signal-state migration hasn't run yet: the identity is still under the
+    // PN address while resolve_encryption_jid already points at the LID one. Reading
+    // only the resolved address would then false-negative and skip a real reset.
     let resolved = client.resolve_encryption_jid(&from_jid).await;
     let addr = resolved.to_protocol_address();
+    let original_addr = from_jid.to_protocol_address();
+    let mut reset_addrs = vec![addr.clone()];
+    if original_addr != addr {
+        reset_addrs.push(original_addr);
+    }
     let backend = client.persistence_manager.backend();
+
     // Treat a backend read error as had-prior (fail-safe): run the reset rather
     // than silently skip it, matching the old always-reset behavior. Collapsing
     // an Err into "no prior identity" would be a fail-open regression on a
     // session-deletion path (see the same explicit-match rule in lid_pn.rs).
-    let had_prior_identity = match client
-        .signal_cache
-        .get_identity(&addr, backend.as_ref())
-        .await
-    {
-        Ok(identity) => identity.is_some(),
-        Err(e) => {
-            warn!(
-                "Identity change: failed reading stored identity for {}: {e}; proceeding with reset",
-                from_jid.user
-            );
-            true
+    let mut had_prior_identity = false;
+    for cand in &reset_addrs {
+        match client
+            .signal_cache
+            .get_identity(cand, backend.as_ref())
+            .await
+        {
+            Ok(Some(_)) => {
+                had_prior_identity = true;
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    "Identity change: failed reading stored identity for {cand}: {e}; proceeding with reset"
+                );
+                had_prior_identity = true;
+                break;
+            }
         }
-    };
+    }
 
     if !had_prior_identity {
         info!(
@@ -383,16 +402,19 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
         from_jid.user
     );
 
-    // Delete primary session + identity so a fresh session can be established,
-    // and rotate status sender key for forward secrecy. Single flush covers both.
+    // Delete the session + identity at every candidate address (resolved + the
+    // pre-migration PN one) so a fresh session can be established, and rotate the
+    // status sender key for forward secrecy. Single flush covers all of it.
     {
-        // Hold session lock while deleting to prevent concurrent encrypt/decrypt
-        // from recreating the stale session (mirrors Signal::delete_sessions)
-        let lock = client.session_lock_for(addr.as_str()).await;
-        let _guard = lock.lock().await;
-        client.signal_cache.delete_session(&addr).await;
-        client.signal_cache.delete_identity(&addr).await;
-        drop(_guard);
+        for cand in &reset_addrs {
+            // Hold the per-address session lock while deleting to prevent concurrent
+            // encrypt/decrypt from recreating the stale session (mirrors
+            // Signal::delete_sessions). One lock at a time, so no lock-ordering risk.
+            let lock = client.session_lock_for(cand.as_str()).await;
+            let _guard = lock.lock().await;
+            client.signal_cache.delete_session(cand).await;
+            client.signal_cache.delete_identity(cand).await;
+        }
 
         let status_group = "status@broadcast";
         for own_jid in device_snapshot.pn.iter().chain(device_snapshot.lid.iter()) {
@@ -2675,6 +2697,64 @@ mod tests {
                 .await
                 .unwrap(),
             "companion-device session must be cleared even on the no-prior path"
+        );
+    }
+
+    /// Regression: when a PN->LID mapping was learned offline (migration deferred),
+    /// the identity is still under the PN address while resolve_encryption_jid points
+    /// at the LID. The gate must check the original PN address too and still run the
+    /// reset (delete the stale PN identity + dispatch the event), not false-negative.
+    #[tokio::test]
+    async fn test_identity_change_resets_unmigrated_pn_identity_under_lid_resolve() {
+        use wacore::types::jid::JidExt;
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let pn = "5511555555555";
+        let lid = "100000000000055";
+        // Offline learn: records the PN->LID mapping in cache but skips the Signal
+        // migration, so resolve points at the LID while state stays under the PN.
+        client
+            .learn_lid_pn_mapping_fast(lid, pn, LearningSource::Other, true)
+            .await;
+
+        let pn_jid: Jid = "5511555555555@s.whatsapp.net".parse().unwrap();
+        // Confirm the setup actually diverges (resolve -> LID), else the test is moot.
+        let resolved = client.resolve_encryption_jid(&pn_jid).await;
+        assert!(
+            resolved.is_lid(),
+            "test setup: resolve_encryption_jid should return the LID, got {resolved}"
+        );
+
+        // Seed the identity under the PN address (not the LID).
+        let pn_addr = pn_jid.to_protocol_address();
+        client.signal_cache.put_identity(&pn_addr, &[7u8; 32]).await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "encrypt")
+            .attr("from", "5511555555555@s.whatsapp.net")
+            .attr("id", "identity-change-pnlid")
+            .children([NodeBuilder::new("identity").build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        assert!(
+            collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::IdentityChange(_))),
+            "must dispatch IdentityChange when the identity is under the unmigrated PN address"
+        );
+        let backend = client.persistence_manager.backend();
+        assert!(
+            client
+                .signal_cache
+                .get_identity(&pn_addr, backend.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "the stale PN identity must be deleted by the reset"
         );
     }
 }
