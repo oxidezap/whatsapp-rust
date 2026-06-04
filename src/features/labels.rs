@@ -112,7 +112,11 @@ impl<'a> Labels<'a> {
         if name.is_empty() {
             anyhow::bail!("label name cannot be empty");
         }
-        debug!("Setting label {label_id} (name={name:?}, color={color})");
+        // Don't log the label name (user content); the id/color are enough to trace.
+        debug!(
+            "Setting label {label_id} (name_len={}, color={color})",
+            name.len()
+        );
         let index = serde_json::to_vec(&["label_edit", label_id])?;
         let value = wa::SyncActionValue {
             label_edit_action: Some(wa::sync_action_value::LabelEditAction {
