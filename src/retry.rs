@@ -965,21 +965,16 @@ impl Client {
     ) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
 
-        // Bot message filtering (matches WhatsApp Web behavior):
-        // Don't send retry receipts to bot accounts from non-bot accounts.
-        // This prevents unnecessary retry traffic to automated systems.
-        let we_are_bot = device_snapshot
-            .pn
-            .as_ref()
-            .map(|our_pn| our_pn.is_bot())
-            .unwrap_or(false);
-        let sender_is_bot = info.source.sender.is_bot();
-
-        if !we_are_bot && sender_is_bot {
+        // WA Web's sendRetryReceipt aborts only when `!to.isBot() && participant.isBot()`,
+        // with participant null for DMs. A bot DM is chat == sender == bot, so it is NOT
+        // suppressed and the retry is sent; only a bot reply in a non-bot group is dropped.
+        // Same helper the ack and self-fanout paths already use.
+        if info.source.is_bot_authored_non_bot_chat() {
             log::debug!(
-                "Skipping retry receipt for message {} from bot {}: bots don't process retries",
+                "Skipping retry receipt for message {} from bot {} in non-bot chat {}",
                 info.id,
-                info.source.sender
+                info.source.sender,
+                info.source.chat
             );
             return Ok(());
         }
