@@ -327,28 +327,65 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
         return;
     }
 
-    info!(
-        "Identity change for user {}: clearing device record",
-        from_jid.user
-    );
+    use wacore::libsignal::store::sender_key_name::SenderKeyName;
+    use wacore::types::jid::JidExt;
 
-    // Deletes non-primary sessions + all sender key device tracking
+    // Always run the device-list cleanup, matching WA Web's
+    // clearDeviceRecordForIdentityChange (which runs BEFORE the had-prior-identity
+    // gate): drop companion device sessions + force a fresh usync of the peer's
+    // device list on the next send.
     if let Some(record) = client.load_device_record(&from_jid.user).await {
         client
             .clear_device_record(&from_jid.user, from_jid.server.as_str(), &record)
             .await;
     }
+    client.invalidate_device_cache(&from_jid.user).await;
+
+    // WA Web gates the heavy reset behind loadIdentityKey(addr) != null
+    // (WAWebHandleIdentityChange: `if (!isStringNullOrEmpty(t))`). Read the stored
+    // identity non-destructively BEFORE deleting it. With no prior identity (e.g. a
+    // group-only peer we never had a session with), skip the session delete/rebuild,
+    // status sender-key rotation, tcToken reissue and the change notification — that
+    // path would otherwise eagerly fetch prekeys + X3DH to build a session we may
+    // never use. Use the same `addr` the delete uses so read and delete agree.
+    let resolved = client.resolve_encryption_jid(&from_jid).await;
+    let addr = resolved.to_protocol_address();
+    let backend = client.persistence_manager.backend();
+    // Treat a backend read error as had-prior (fail-safe): run the reset rather
+    // than silently skip it, matching the old always-reset behavior. Collapsing
+    // an Err into "no prior identity" would be a fail-open regression on a
+    // session-deletion path (see the same explicit-match rule in lid_pn.rs).
+    let had_prior_identity = match client
+        .signal_cache
+        .get_identity(&addr, backend.as_ref())
+        .await
+    {
+        Ok(identity) => identity.is_some(),
+        Err(e) => {
+            warn!(
+                "Identity change: failed reading stored identity for {}: {e}; proceeding with reset",
+                from_jid.user
+            );
+            true
+        }
+    };
+
+    if !had_prior_identity {
+        info!(
+            "Identity change for {} (had_prior_identity=false): device record cleared, skipping session reset",
+            from_jid.user
+        );
+        return;
+    }
+
+    info!(
+        "Identity change for {} (had_prior_identity=true): resetting session",
+        from_jid.user
+    );
 
     // Delete primary session + identity so a fresh session can be established,
-    // and rotate status sender key for forward secrecy (clear_device_record only
-    // cleared device tracking, not the key itself). Single flush covers both.
+    // and rotate status sender key for forward secrecy. Single flush covers both.
     {
-        use wacore::libsignal::store::sender_key_name::SenderKeyName;
-        use wacore::types::jid::JidExt;
-
-        let resolved = client.resolve_encryption_jid(&from_jid).await;
-        let addr = resolved.to_protocol_address();
-
         // Hold session lock while deleting to prevent concurrent encrypt/decrypt
         // from recreating the stale session (mirrors Signal::delete_sessions)
         let lock = client.session_lock_for(addr.as_str()).await;
@@ -372,14 +409,10 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
             .await;
     }
 
-    // Force fresh usync on next send
-    client.invalidate_device_cache(&from_jid.user).await;
-
     // Re-issue an active trusted-contact token, matching WA Web
     // handleE2eIdentityChange -> sendTcTokenWhenDeviceIdentityChange. Spawned so
     // the notification handler doesn't block on an IQ; it no-ops unless a
-    // non-expired sender token already exists (so it only fires for a prior
-    // relationship, mirroring WA Web's "had old identity" guard).
+    // non-expired sender token already exists.
     if !from_jid.is_bot() && !from_jid.is_status_broadcast() {
         let tc_client = client.clone();
         let tc_jid = from_jid.clone();
@@ -393,25 +426,43 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
             .detach();
     }
 
-    let session_jid = from_jid.clone();
+    // = addSecurityCodeChangedNotifications, which WA Web fires inside the gate.
     client.core.event_bus.dispatch(Event::IdentityChange(
         crate::types::events::IdentityChange {
-            user: from_jid,
+            user: from_jid.clone(),
             lid_user: node.attrs().optional_jid("lid"),
             implicit: false,
         },
     ));
 
-    // Re-establish session in background (self-defers when offline)
-    let client_clone = client.clone();
-    client
-        .runtime
-        .spawn(Box::pin(async move {
-            if let Err(e) = client_clone.ensure_e2e_sessions(&[session_jid]).await {
-                warn!("Identity change: failed to re-establish session: {e}");
-            }
-        }))
-        .detach();
+    // Re-establish the session eagerly so the next send is fast (WA Web does this
+    // inside the gate too). Skip only while the offline backlog is still draining,
+    // matching WA Web's `C = !isEmpty(offline) && !isResumeFromRestartComplete()`:
+    // deferring every offline-tagged push would otherwise pile up a prekey-fetch
+    // burst when the resume completes. Deferral is safe because every send path
+    // re-establishes before encrypting (ensure_e2e_sessions in the DM/group send
+    // paths, plus encrypt_for_devices' own has_session->prekey-fetch fallback).
+    let arrived_during_resume = node.attrs().optional_string("offline").is_some()
+        && !client
+            .offline_sync_completed
+            .load(std::sync::atomic::Ordering::Relaxed);
+    if arrived_during_resume {
+        debug!(
+            "Identity change for {} arrived during offline resume; deferring session re-establishment to next send",
+            from_jid.user
+        );
+    } else {
+        let client_clone = client.clone();
+        let session_jid = from_jid;
+        client
+            .runtime
+            .spawn(Box::pin(async move {
+                if let Err(e) = client_clone.ensure_e2e_sessions(&[session_jid]).await {
+                    warn!("Identity change: failed to re-establish session: {e}");
+                }
+            }))
+            .detach();
+    }
 }
 
 /// React to a locally-detected identity change.
@@ -2253,6 +2304,17 @@ mod tests {
             .insert("5511999999999".into(), Arc::new(record))
             .await;
 
+        // Seed a stored identity so the had-prior-identity gate runs the full reset
+        // (delete + notify), matching WA Web's `if (!isEmpty(loadIdentityKey(addr)))`.
+        {
+            use wacore::types::jid::JidExt;
+            let target: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
+            client
+                .signal_cache
+                .put_identity(&target.to_protocol_address(), &[7u8; 32])
+                .await;
+        }
+
         // Simulate identity change notification: type="encrypt" with <identity/> child
         let node = NodeBuilder::new("notification")
             .attr("type", "encrypt")
@@ -2462,6 +2524,14 @@ mod tests {
             .put_sender_key(&sk_name, sk_record)
             .await;
 
+        // Seed a stored identity for the changed user so the had-prior-identity gate
+        // runs the reset (which rotates the status sender key).
+        let changed: Jid = "5511888888888@s.whatsapp.net".parse().unwrap();
+        client
+            .signal_cache
+            .put_identity(&changed.to_protocol_address(), &[7u8; 32])
+            .await;
+
         // Fire identity change for a different user
         let node = NodeBuilder::new("notification")
             .attr("type", "encrypt")
@@ -2485,9 +2555,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_identity_change_with_offline_attribute() {
+        use wacore::types::jid::JidExt;
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
         client.register_handler(collector.clone());
+
+        // Prior identity present so the gate runs (the offline attr only defers the
+        // eager session re-establishment, not the change notification).
+        let changed: Jid = "5511888888888@s.whatsapp.net".parse().unwrap();
+        client
+            .signal_cache
+            .put_identity(&changed.to_protocol_address(), &[7u8; 32])
+            .await;
 
         // Notification with offline attribute should still be processed
         let node = NodeBuilder::new("notification")
@@ -2505,6 +2584,97 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&**e, Event::IdentityChange(_))),
             "offline identity change should still dispatch event"
+        );
+    }
+
+    /// With no prior identity for the peer (e.g. a group-only member we never had a
+    /// session with), the had-prior-identity gate skips the heavy reset: no change
+    /// notification and no session/identity deletion. Only the device-list cleanup
+    /// runs. Mirrors WA Web `if (!isEmpty(loadIdentityKey(addr)))`.
+    #[tokio::test]
+    async fn test_identity_change_no_prior_identity_skips_reset() {
+        use wacore::types::jid::JidExt;
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let target: Jid = "5511666666666@s.whatsapp.net".parse().unwrap();
+        let addr = target.to_protocol_address();
+        // Seed a device-registry entry (with a companion device) so the always-on
+        // cleanup has something to do, but deliberately do NOT seed an identity.
+        client
+            .device_registry_cache
+            .insert(
+                "5511666666666".into(),
+                Arc::new(wacore::store::traits::DeviceListRecord {
+                    user: "5511666666666".into(),
+                    devices: vec![wacore::store::traits::DeviceInfo {
+                        device_id: 1,
+                        key_index: None,
+                    }],
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: Some(1),
+                }),
+            )
+            .await;
+
+        // Seed a companion-device (device 1) Signal session: clear_device_record
+        // runs even on the no-prior path, so this must be deleted afterward. Keyed
+        // the same way delete_sessions_for_devices builds the address.
+        let mut companion = wacore_binary::Jid::new("5511666666666", wacore_binary::Server::Pn);
+        companion.device = 1;
+        let companion_addr = companion.to_protocol_address();
+        client
+            .signal_cache
+            .put_session(
+                &companion_addr,
+                wacore::libsignal::protocol::SessionRecord::new_fresh(),
+            )
+            .await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "encrypt")
+            .attr("from", "5511666666666@s.whatsapp.net")
+            .attr("id", "identity-change-noprior")
+            .children([NodeBuilder::new("identity").build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        // No change notification for a peer we had no prior identity with.
+        assert!(
+            collector.events().is_empty(),
+            "no-prior-identity push must not dispatch IdentityChange, got: {:?}",
+            collector.events()
+        );
+        // But the always-on device-list cleanup still ran.
+        assert!(
+            client
+                .device_registry_cache
+                .get("5511666666666")
+                .await
+                .is_none(),
+            "device registry cache should still be invalidated on the no-prior path"
+        );
+        // And no identity was created by an (skipped) eager re-establishment.
+        let backend = client.persistence_manager.backend();
+        assert!(
+            client
+                .signal_cache
+                .get_identity(&addr, backend.as_ref())
+                .await
+                .unwrap()
+                .is_none(),
+            "no-prior path must not establish an identity"
+        );
+        // The always-on clear_device_record must still delete companion sessions.
+        assert!(
+            !client
+                .signal_cache
+                .has_session(&companion_addr, backend.as_ref())
+                .await
+                .unwrap(),
+            "companion-device session must be cleared even on the no-prior path"
         );
     }
 }
