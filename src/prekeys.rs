@@ -108,17 +108,24 @@ impl Client {
     /// Ensure the server has enough pre-keys, uploading if below threshold.
     /// When `force` is true, skips the count guard (used by digest key repair).
     pub(crate) async fn upload_pre_keys(&self, force: bool) -> Result<(), anyhow::Error> {
-        let server_count = self
-            .get_server_pre_key_count()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        // Decision is should_upload_pre_keys(force, count), but a forced upload short-circuits
+        // and skips the server-count IQ entirely: WA Web's handlePreKeyLow uploads
+        // unconditionally, so a stale or transiently-failing count must never block or delay
+        // the replenish. Only a non-forced caller queries the count and applies the guard.
+        if !force {
+            let server_count = self
+                .get_server_pre_key_count()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
 
-        if !should_upload_pre_keys(force, server_count) {
-            log::debug!("Server has {server_count} pre-keys, no upload needed.");
-            return Ok(());
+            if !should_upload_pre_keys(force, server_count) {
+                log::debug!("Server has {server_count} pre-keys, no upload needed.");
+                return Ok(());
+            }
+
+            log::debug!("Server has {server_count} pre-keys, uploading.");
         }
 
-        log::debug!("Server has {server_count} pre-keys, uploading.");
         self.upload_pre_keys_inner().await
     }
 
