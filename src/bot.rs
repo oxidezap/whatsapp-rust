@@ -118,6 +118,15 @@ impl MessageContext {
             .revoke_message(self.info.source.chat.clone(), message_id, revoke_type)
             .await
     }
+
+    /// React to the incoming message. An empty `emoji` removes a previous
+    /// reaction. The target key (including the group/status participant) is
+    /// taken from [`MessageContext::message_key`].
+    pub async fn react(&self, emoji: &str) -> Result<crate::send::SendResult, anyhow::Error> {
+        self.client
+            .send_reaction(&self.info.source.chat, self.message_key(), emoji)
+            .await
+    }
 }
 
 type EventHandlerCallback =
@@ -1212,5 +1221,92 @@ mod tests {
             MessageContext::from_arc(Arc::clone(&original), &MessageInfo::default(), bot.client());
 
         assert!(std::ptr::eq(Arc::as_ptr(&ctx.message), original_ptr));
+    }
+
+    async fn test_context_with_info(info: MessageInfo) -> MessageContext {
+        let backend = create_test_sqlite_backend().await;
+        let bot = Bot::builder()
+            .with_backend(backend)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+        MessageContext::from_arc(Arc::new(wa::Message::default()), &info, bot.client())
+    }
+
+    fn react_info(chat: &str, sender: &str, id: &str, is_group: bool) -> MessageInfo {
+        use crate::types::message::MessageSource;
+        MessageInfo {
+            id: id.to_string(),
+            source: MessageSource {
+                chat: chat.parse().expect("chat jid"),
+                sender: sender.parse().expect("sender jid"),
+                is_group,
+                is_from_me: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn react_target_key_carries_group_participant() {
+        let info = react_info(
+            "120363012345@g.us",
+            "15551230000@s.whatsapp.net",
+            "MSGID01",
+            true,
+        );
+        let ctx = test_context_with_info(info).await;
+        let key = ctx.message_key();
+
+        assert_eq!(key.remote_jid.as_deref(), Some("120363012345@g.us"));
+        assert_eq!(key.id.as_deref(), Some("MSGID01"));
+        assert_eq!(key.from_me, Some(false));
+        // Group reactions must attribute the original sender via participant.
+        assert_eq!(
+            key.participant.as_deref(),
+            Some("15551230000@s.whatsapp.net")
+        );
+    }
+
+    #[tokio::test]
+    async fn react_target_key_omits_participant_in_dm() {
+        let info = react_info(
+            "15559990000@s.whatsapp.net",
+            "15559990000@s.whatsapp.net",
+            "MSGID02",
+            false,
+        );
+        let ctx = test_context_with_info(info).await;
+        let key = ctx.message_key();
+
+        assert_eq!(
+            key.remote_jid.as_deref(),
+            Some("15559990000@s.whatsapp.net")
+        );
+        // DMs do not carry participant (matches WA Web message-key shape).
+        assert!(key.participant.is_none());
+    }
+
+    #[tokio::test]
+    async fn react_target_key_carries_status_author() {
+        let info = react_info(
+            "status@broadcast",
+            "15551112222@s.whatsapp.net",
+            "MSGID03",
+            false,
+        );
+        let ctx = test_context_with_info(info).await;
+        let key = ctx.message_key();
+
+        // status@broadcast reactions fan out to the author's devices, so the
+        // author must be present in participant for the send path to extract it.
+        assert_eq!(
+            key.participant.as_deref(),
+            Some("15551112222@s.whatsapp.net")
+        );
     }
 }
