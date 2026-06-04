@@ -375,6 +375,24 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
     // Force fresh usync on next send
     client.invalidate_device_cache(&from_jid.user).await;
 
+    // Re-issue an active trusted-contact token, matching WA Web
+    // handleE2eIdentityChange -> sendTcTokenWhenDeviceIdentityChange. Spawned so
+    // the notification handler doesn't block on an IQ; it no-ops unless a
+    // non-expired sender token already exists (so it only fires for a prior
+    // relationship, mirroring WA Web's "had old identity" guard).
+    if !from_jid.is_bot() && !from_jid.is_status_broadcast() {
+        let tc_client = client.clone();
+        let tc_jid = from_jid.clone();
+        client
+            .runtime
+            .spawn(Box::pin(async move {
+                tc_client
+                    .reissue_tc_token_after_identity_change(&tc_jid)
+                    .await;
+            }))
+            .detach();
+    }
+
     let session_jid = from_jid.clone();
     client.core.event_bus.dispatch(Event::IdentityChange(
         crate::types::events::IdentityChange {

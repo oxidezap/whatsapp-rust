@@ -415,6 +415,11 @@ impl Client {
     /// Matches WA Web's `clearDeviceRecord()` in `IdentityUpdateDeviceTableApi`:
     /// - Deletes Signal sessions for non-primary devices (stale identity)
     /// - Invalidates sender key device cache so SKDM will be redistributed
+    ///
+    /// The companion-device session wipe is intentionally not per-device locked
+    /// (matches WA Web's single-threaded model). A concurrent encrypt to one of
+    /// those companions can re-store a session right after the wipe, but that is
+    /// self-healing: the next send re-establishes it via `process_prekey_bundle`.
     pub(crate) async fn clear_device_record(
         &self,
         user: &str,

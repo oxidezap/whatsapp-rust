@@ -1950,6 +1950,16 @@ impl Client {
                                     info.id,
                                     address
                                 );
+                                // Normally NewOrUnchanged here (the untrusted
+                                // identity was deleted+flushed before the retry),
+                                // but mirror the main-decode gate so a concurrent
+                                // re-save can't drop the signal.
+                                if decrypted.identity_change == IdentityChange::ReplacedExisting
+                                    && !local_identity_reacted
+                                {
+                                    local_identity_reacted = true;
+                                    self.react_to_local_identity_change(sender_encryption_jid);
+                                }
                                 let padded_plaintext = decrypted.plaintext;
                                 match self
                                     .clone()
