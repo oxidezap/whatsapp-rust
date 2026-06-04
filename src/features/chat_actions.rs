@@ -305,19 +305,17 @@ pub(crate) fn build_action_index(schema: &Schema, args: &[&str]) -> Result<Vec<u
     Ok(serde_json::to_vec(&parts)?)
 }
 
-/// Map a generated `Collection` to our `WAPatchName`.
-pub(crate) fn collection_patch_name(c: schemas::Collection) -> Result<WAPatchName> {
+/// Map a generated `Collection` to our `WAPatchName` (total — every generated
+/// collection has a `WAPatchName` counterpart).
+pub(crate) fn collection_patch_name(c: schemas::Collection) -> WAPatchName {
     use schemas::Collection;
-    Ok(match c {
+    match c {
         Collection::Regular => WAPatchName::Regular,
         Collection::RegularLow => WAPatchName::RegularLow,
         Collection::RegularHigh => WAPatchName::RegularHigh,
         Collection::CriticalBlock => WAPatchName::CriticalBlock,
-        // No action we send lives here (block/unblock go through the blocklist IQ).
-        Collection::CriticalUnblockLow => {
-            anyhow::bail!("critical_unblock_low collection is not supported for sending")
-        }
-    })
+        Collection::CriticalUnblockLow => WAPatchName::CriticalUnblockLow,
+    }
 }
 
 /// Access via `client.chat_actions()`.
@@ -649,8 +647,14 @@ impl Client {
     ///     timestamp: Some(1_700_000_000_000), // a real epoch-ms timestamp
     ///     ..Default::default()
     /// };
+    /// // Args are the non-literal index parts in `schema.index_parts` order;
+    /// // CLEAR_CHAT is [chatJid, deleteStarred, deleteMedia].
     /// client
-    ///     .send_app_state_action(&schemas::CLEAR_CHAT, &["123@s.whatsapp.net"], &value)
+    ///     .send_app_state_action(
+    ///         &schemas::CLEAR_CHAT,
+    ///         &["123@s.whatsapp.net", "0", "0"],
+    ///         &value,
+    ///     )
     ///     .await?;
     /// # Ok(()) }
     /// ```
@@ -661,7 +665,7 @@ impl Client {
         value: &wa::SyncActionValue,
     ) -> Result<()> {
         let index = build_action_index(schema, index_args)?;
-        let collection = collection_patch_name(schema.collection)?;
+        let collection = collection_patch_name(schema.collection);
         self.send_app_state_mutation(collection, &index, value, schema.version as i32)
             .await
     }
@@ -747,18 +751,16 @@ mod registry_tests {
     #[test]
     fn collection_mapping() {
         use schemas::Collection;
-        assert_eq!(
-            collection_patch_name(Collection::Regular).unwrap(),
-            WAPatchName::Regular
-        );
-        assert_eq!(
-            collection_patch_name(Collection::RegularHigh).unwrap(),
-            WAPatchName::RegularHigh
-        );
-        assert_eq!(
-            collection_patch_name(Collection::CriticalBlock).unwrap(),
-            WAPatchName::CriticalBlock
-        );
-        assert!(collection_patch_name(Collection::CriticalUnblockLow).is_err());
+        // Every generated collection has a WAPatchName counterpart (total map).
+        for c in [
+            Collection::Regular,
+            Collection::RegularLow,
+            Collection::RegularHigh,
+            Collection::CriticalBlock,
+            Collection::CriticalUnblockLow,
+        ] {
+            // Round-trips through the wire name.
+            assert_eq!(collection_patch_name(c).as_str(), c.as_str());
+        }
     }
 }
