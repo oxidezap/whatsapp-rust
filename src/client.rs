@@ -506,7 +506,8 @@ pub struct Client {
     /// LRU cache for device registry (matches WhatsApp Web's 5000 entry limit).
     /// Maps user ID to DeviceListRecord for fast device existence checks.
     /// Backed by persistent storage.
-    pub(crate) device_registry_cache: TypedCache<String, wacore::store::traits::DeviceListRecord>,
+    pub(crate) device_registry_cache:
+        TypedCache<String, Arc<wacore::store::traits::DeviceListRecord>>,
 
     /// Router for dispatching stanzas to their appropriate handlers
     pub(crate) stanza_router: crate::handlers::router::StanzaRouter,

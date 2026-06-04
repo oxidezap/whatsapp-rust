@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use log::{debug, info, warn};
+use std::sync::Arc;
 use wacore_binary::Jid;
 
 use super::Client;
@@ -132,7 +133,7 @@ impl Client {
                     // in the backend), not lookup_keys[0] which is our guessed canonical key.
                     // This ensures consistency between the in-memory cache and the backend.
                     self.device_registry_cache
-                        .insert(record.user.clone(), record)
+                        .insert(record.user.clone(), Arc::new(record))
                         .await;
                     return has_device;
                 }
@@ -164,7 +165,7 @@ impl Client {
 
         // Use canonical_key directly as cache key (no extra clone)
         self.device_registry_cache
-            .insert(canonical_key.clone(), record_for_cache)
+            .insert(canonical_key.clone(), Arc::new(record_for_cache))
             .await;
 
         let backend = self.persistence_manager.backend();
@@ -222,7 +223,7 @@ impl Client {
 
             let record_for_cache = record.clone();
             self.device_registry_cache
-                .insert(canonical_key.clone(), record_for_cache)
+                .insert(canonical_key.clone(), Arc::new(record_for_cache))
                 .await;
 
             if canonical_key != original_user {
@@ -532,7 +533,8 @@ impl Client {
 
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
-                return Some(record);
+                // Cold load-modify-persist path: callers mutate the owned record.
+                return Some((*record).clone());
             }
         }
 
@@ -541,7 +543,7 @@ impl Client {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
                     self.device_registry_cache
-                        .insert(record.user.clone(), record.clone())
+                        .insert(record.user.clone(), Arc::new(record.clone()))
                         .await;
                     return Some(record);
                 }
@@ -583,7 +585,7 @@ impl Client {
                 Ok(Some(record)) => {
                     let devices = Self::reconstruct_device_jids(jid, &record);
                     self.device_registry_cache
-                        .insert(record.user.clone(), record)
+                        .insert(record.user.clone(), Arc::new(record))
                         .await;
                     return Some(devices);
                 }
@@ -658,7 +660,7 @@ impl Client {
                 }
 
                 self.device_registry_cache
-                    .insert(lid.to_string(), record)
+                    .insert(lid.to_string(), Arc::new(record))
                     .await;
 
                 // Drop the PN-keyed row in both cache and DB. Invalidate
@@ -713,8 +715,29 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert(user.into(), record)
+            .insert(user.into(), Arc::new(record))
             .await;
+    }
+
+    #[tokio::test]
+    async fn warm_registry_hit_shares_arc_not_deep_clone() {
+        let client = create_test_client().await;
+        setup_device_record(&client, "15551112222", &[1, 2]).await;
+
+        let a = client
+            .device_registry_cache
+            .get("15551112222")
+            .await
+            .expect("warm hit");
+        let b = client
+            .device_registry_cache
+            .get("15551112222")
+            .await
+            .expect("warm hit");
+
+        // A warm registry hit returns a refcount bump of the same allocation, not a deep copy.
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.devices.len(), 2);
     }
 
     #[tokio::test]
@@ -986,7 +1009,7 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert("15551234567".to_string(), record)
+            .insert("15551234567".to_string(), Arc::new(record))
             .await;
 
         // Patch: update device 3 key_index to 5
@@ -1288,7 +1311,7 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert("15551234567".into(), record)
+            .insert("15551234567".into(), Arc::new(record))
             .await;
 
         // Warm the sender key device cache
@@ -1541,7 +1564,10 @@ mod tests {
         backend.update_device_list(legacy.clone()).await.unwrap();
         // Warm cache under PN to simulate a reader that populated it before
         // the mapping was learned.
-        client.device_registry_cache.insert(pn.into(), legacy).await;
+        client
+            .device_registry_cache
+            .insert(pn.into(), Arc::new(legacy))
+            .await;
 
         setup_lid_pn(&client, lid, pn).await;
 

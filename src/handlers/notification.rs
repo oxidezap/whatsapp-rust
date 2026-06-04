@@ -2159,7 +2159,7 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert("5511999999999".into(), record)
+            .insert("5511999999999".into(), Arc::new(record))
             .await;
 
         // Simulate identity change notification: type="encrypt" with <identity/> child

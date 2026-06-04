@@ -2634,7 +2634,7 @@ mod tests {
             };
             client
                 .device_registry_cache
-                .insert((*user).into(), record)
+                .insert((*user).into(), Arc::new(record))
                 .await;
         }
 
