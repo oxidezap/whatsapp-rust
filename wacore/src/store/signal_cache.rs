@@ -13,9 +13,10 @@ use crate::store::traits::SignalStore;
 ///
 /// Amortized: the O(n) scan only runs once the map crosses the high watermark
 /// (`max_entries + slack`), then it trims back down to `max_entries`. Steady
-/// state over capacity therefore costs O(1) per insert because a fresh scan
-/// needs `slack` more growth inserts before it can fire again. The caller is
-/// responsible for only invoking this from write paths, so reads never scan.
+/// state over capacity therefore costs O(1) per call because a fresh scan needs
+/// `slack` more growth inserts before it can fire again. Call it from every path
+/// that grows the map, including read-populate (cache-miss) inserts, so the cache
+/// stays bounded even under unique-key read floods; the early-out keeps it cheap.
 fn evict_clean_entries<V>(
     cache: &mut HashMap<Arc<str>, Option<V>>,
     dirty: &HashSet<Arc<str>>,
@@ -66,8 +67,9 @@ fn high_watermark(max_entries: usize) -> usize {
 
 /// In-memory write-back cache for Signal protocol state.
 /// Keys use `Arc<str>` for O(1) clone. Sessions cached as objects (serialized on flush).
-/// Capacity-bounded: write paths evict non-dirty entries once the high watermark
-/// is crossed, trimming back to `max_entries` (amortized O(1)). Reads never evict.
+/// Capacity-bounded: every path that grows a store (writes and read-populate
+/// misses) evicts non-dirty entries once the high watermark is crossed, trimming
+/// back to `max_entries` (amortized O(1) thanks to the slack early-out).
 pub struct SignalStoreCache {
     sessions: Mutex<SessionStoreState>,
     identities: Mutex<ByteStoreState>,
@@ -358,11 +360,13 @@ impl SignalStoreCache {
                 }
                 let record = SessionRecord::deserialize(&bytes)?;
                 state.cache.insert(Arc::from(key), SessionEntry::CheckedOut);
+                state.evict_if_needed(self.max_entries);
                 Ok(Some(record))
             }
             None => {
                 if !state.cache.contains_key(key) {
                     state.cache.insert(Arc::from(key), SessionEntry::Absent);
+                    state.evict_if_needed(self.max_entries);
                 }
                 Ok(None)
             }
@@ -397,12 +401,14 @@ impl SignalStoreCache {
                         Arc::from(key),
                         SessionEntry::Present(Box::new(record.clone())),
                     );
+                    state.evict_if_needed(self.max_entries);
                 }
                 Ok(Some(record))
             }
             None => {
                 if !state.cache.contains_key(key) {
                     state.cache.insert(Arc::from(key), SessionEntry::Absent);
+                    state.evict_if_needed(self.max_entries);
                 }
                 Ok(None)
             }
@@ -442,6 +448,7 @@ impl SignalStoreCache {
             // Re-check: another task may have populated the cache
             if !state.cache.contains_key(key) {
                 state.cache.insert(Arc::from(key), SessionEntry::Absent);
+                state.evict_if_needed(self.max_entries);
             }
         }
         Ok(exists)
@@ -472,6 +479,7 @@ impl SignalStoreCache {
             return Ok(cached.clone());
         }
         state.cache.insert(Arc::from(key), arc_data.clone());
+        state.evict_if_needed(self.max_entries);
         Ok(arc_data)
     }
 
@@ -507,6 +515,7 @@ impl SignalStoreCache {
             None => None,
         };
         state.cache.insert(Arc::from(key), record.clone());
+        state.evict_if_needed(self.max_entries);
         Ok(record)
     }
 
@@ -785,7 +794,7 @@ mod eviction_tests {
     }
 
     #[tokio::test]
-    async fn read_over_capacity_does_not_evict() {
+    async fn read_over_capacity_stays_bounded() {
         let max = 64usize;
         let cache = SignalStoreCache::with_max_entries(max);
         let backend = InMemoryBackend::new();
@@ -799,17 +808,43 @@ mod eviction_tests {
         let before = cache.identities.lock().await.cache.len();
         assert_eq!(before, watermark, "setup should fill exactly to watermark");
 
-        // A read that adds a fresh negative-cache entry crosses the watermark but
-        // must NOT trigger an eviction scan: reads are off the eviction path.
+        // A read-populate (cache-miss) that crosses the watermark must trigger the
+        // amortized eviction too: read traffic populates the cache, so it cannot be
+        // allowed to grow it unbounded.
         let missing = addr(watermark + 1);
         let got = cache.get_identity(&missing, &backend).await.unwrap();
         assert!(got.is_none());
 
         let after = cache.identities.lock().await.cache.len();
-        assert_eq!(
-            after,
-            before + 1,
-            "a read over capacity must add its entry and never evict"
+        assert!(
+            after <= watermark,
+            "a read over capacity must stay bounded: after={after} watermark={watermark}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_flood_of_unique_keys_stays_bounded() {
+        let max = 64usize;
+        let cache = SignalStoreCache::with_max_entries(max);
+        let backend = InMemoryBackend::new();
+
+        // A flood of unique cache-miss reads each negative-cache a clean entry.
+        // Without read-path eviction this grew without bound; it must stay bounded.
+        for i in 0..(max * 8) {
+            assert!(
+                cache
+                    .get_identity(&addr(i), &backend)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let len = cache.identities.lock().await.cache.len();
+        assert!(
+            len <= high_watermark(max),
+            "unique-read flood must stay bounded: len={len} watermark={}",
+            high_watermark(max)
         );
     }
 
