@@ -302,6 +302,35 @@ fn build_revoke_message(
     }
 }
 
+/// Build a message edit in WA Web's wire shape: a top-level
+/// protocolMessage(type=MESSAGE_EDIT) carrying the new content under
+/// editedMessage, same as build_revoke_message and our own receive path. The
+/// top-level Message.editedMessage FutureProofMessage is the history/storage
+/// form, not what WA Web sends on the wire.
+pub(crate) fn build_edit_message(
+    remote_jid: &Jid,
+    message_id: String,
+    participant: Option<String>,
+    new_content: wa::Message,
+    timestamp_ms: i64,
+) -> wa::Message {
+    wa::Message {
+        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+            key: Some(wa::MessageKey {
+                remote_jid: Some(remote_jid.to_string()),
+                from_me: Some(true),
+                id: Some(message_id),
+                participant,
+            }),
+            r#type: Some(wa::message::protocol_message::Type::MessageEdit as i32),
+            edited_message: Some(Box::new(new_content)),
+            timestamp_ms: Some(timestamp_ms),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
 impl Client {
     /// Send a message to a user, group, or newsletter.
     ///
@@ -3007,6 +3036,54 @@ mod tests {
             };
             let (edit, _) = infer_stanza_metadata(&msg);
             assert_eq!(edit, Some(EditAttribute::MessageEdit));
+        }
+
+        #[test]
+        fn build_edit_message_uses_top_level_protocol_message() {
+            use std::str::FromStr;
+            let to = Jid::from_str("5511999999999@s.whatsapp.net").unwrap();
+            let new_content = wa::Message {
+                conversation: Some("edited".to_string()),
+                ..Default::default()
+            };
+            let msg = build_edit_message(
+                &to,
+                "ORIG_ID".to_string(),
+                None,
+                new_content,
+                1_700_000_000_000,
+            );
+
+            // Canonical WA Web shape: top-level protocolMessage(type=MESSAGE_EDIT),
+            // not the Message.editedMessage FutureProofMessage history wrapper.
+            assert!(
+                msg.edited_message.is_none(),
+                "edit must not use the FutureProofMessage wrapper"
+            );
+            let pm = msg
+                .protocol_message
+                .as_deref()
+                .expect("top-level protocol_message");
+            assert_eq!(
+                pm.r#type,
+                Some(wa::message::protocol_message::Type::MessageEdit as i32)
+            );
+            assert_eq!(
+                pm.key.as_ref().and_then(|k| k.id.as_deref()),
+                Some("ORIG_ID")
+            );
+            assert_eq!(pm.key.as_ref().and_then(|k| k.from_me), Some(true));
+            assert_eq!(
+                pm.edited_message
+                    .as_ref()
+                    .and_then(|m| m.conversation.as_deref()),
+                Some("edited")
+            );
+            // The send path still derives the edit attribute from this shape.
+            assert_eq!(
+                infer_stanza_metadata(&msg).0,
+                Some(EditAttribute::MessageEdit)
+            );
         }
     }
 

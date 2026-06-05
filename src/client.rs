@@ -3836,26 +3836,13 @@ impl Client {
             None
         };
 
-        let edit_container_message = wa::Message {
-            edited_message: Some(Box::new(wa::message::FutureProofMessage {
-                message: Some(Box::new(wa::Message {
-                    protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                        key: Some(wa::MessageKey {
-                            remote_jid: Some(to.to_string()),
-                            from_me: Some(true),
-                            id: Some(original_id.clone()),
-                            participant,
-                        }),
-                        r#type: Some(wa::message::protocol_message::Type::MessageEdit as i32),
-                        edited_message: Some(Box::new(new_content)),
-                        timestamp_ms: Some(wacore::time::now_millis()),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                })),
-            })),
-            ..Default::default()
-        };
+        let edit_container_message = crate::send::build_edit_message(
+            &to,
+            original_id.clone(),
+            participant,
+            new_content,
+            wacore::time::now_millis(),
+        );
 
         // Use a new stanza ID instead of reusing the original message ID.
         // The original message ID is already embedded in protocolMessage.key.id
