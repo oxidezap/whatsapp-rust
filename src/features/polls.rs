@@ -156,7 +156,7 @@ impl<'a> Polls<'a> {
                 enc_payload: Some(enc_payload),
                 enc_iv: Some(iv.to_vec()),
             }),
-            metadata: Some(wa::message::PollUpdateMessageMetadata {}),
+            metadata: Some(wa::message::PollUpdateMessageMetadata::default()),
             sender_timestamp_ms: Some(wacore::time::now_millis()),
         };
 

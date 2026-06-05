@@ -80,7 +80,7 @@ pub(crate) fn dispatch_label_mutation(
                     label_id,
                     chat_jid,
                     timestamp: time,
-                    action: Box::new(*act),
+                    action: Box::new(act.clone()),
                     from_full_sync: full_sync,
                 }));
             }
@@ -173,6 +173,7 @@ impl<'a> Labels<'a> {
         let value = wa::SyncActionValue {
             label_association_action: Some(wa::sync_action_value::LabelAssociationAction {
                 labeled: Some(labeled),
+                ..Default::default()
             }),
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
@@ -261,6 +262,7 @@ mod tests {
             wa::SyncActionValue {
                 label_association_action: Some(wa::sync_action_value::LabelAssociationAction {
                     labeled: Some(true),
+                    ..Default::default()
                 }),
                 timestamp: Some(1000),
                 ..Default::default()
@@ -321,6 +323,7 @@ mod tests {
             wa::SyncActionValue {
                 label_association_action: Some(wa::sync_action_value::LabelAssociationAction {
                     labeled: Some(true),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },

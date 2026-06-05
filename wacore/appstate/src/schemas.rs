@@ -1,4 +1,4 @@
-//! Auto-generated AppState (syncd) action schemas (WhatsApp 2.3000.1040832931). DO NOT EDIT.
+//! Auto-generated AppState (syncd) action schemas (WhatsApp 2.3000.1040878135). DO NOT EDIT.
 //!
 //! Typed registry of syncd actions: collection, version, scope, value proto type,
 //! enum fields, and the mutation-index parts. `const`/`&'static`, no deps.

@@ -359,7 +359,7 @@ impl Device {
             push_name: String::new(),
             app_version_primary: 2,
             app_version_secondary: 3000,
-            app_version_tertiary: 1035617621,
+            app_version_tertiary: 1040878135,
             app_version_last_fetched_ms: 0,
             device_props: Arc::new(DEVICE_PROPS.clone()),
             client_profile: ClientProfile::web(),
