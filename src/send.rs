@@ -1064,6 +1064,18 @@ impl Client {
         extra_stanza_nodes: Vec<Node>,
         stanza_type_override: Option<StanzaType>,
     ) -> Result<(), anyhow::Error> {
+        // Newsletters are plaintext channels; their only valid send is the
+        // <plaintext> branch in send_message_with_options, which returns before
+        // here. A newsletter JID reaching the E2E path is a mis-routed
+        // pin/edit/revoke, so reject it instead of building encrypted device
+        // fanout the channel can't process.
+        if to.is_newsletter() {
+            return Err(anyhow!(
+                "newsletter JIDs are not supported on the E2E send path \
+                 (pin/edit/revoke of channel messages is not implemented)"
+            ));
+        }
+
         // status@broadcast reactions fan out pairwise to the author's devices;
         // status posts keep going through send_status_message (owns recipients).
         let (to, is_status_addon) = if to.is_status_broadcast() {
@@ -3837,6 +3849,48 @@ mod tests {
         assert_eq!(
             node.attrs().optional_string("type").unwrap().as_ref(),
             wacore::send::StanzaType::Poll.as_wire()
+        );
+    }
+
+    /// Newsletter JIDs must be rejected at the E2E send path root (covers the
+    /// mis-routed pin/edit/revoke producers that call send_message_impl directly).
+    #[tokio::test]
+    async fn newsletter_jid_rejected_on_e2e_send_path() {
+        let client = crate::test_utils::create_test_client_with_name("newsletter_e2e_guard").await;
+        let channel: Jid = "120363000000000001@newsletter".parse().unwrap();
+        let msg = wa::Message {
+            conversation: Some("x".to_string()),
+            ..Default::default()
+        };
+        let err = client
+            .send_message_impl(channel, &msg, None, false, false, None, vec![], None)
+            .await
+            .expect_err("newsletter JID must be rejected on the E2E send path");
+        assert!(
+            err.to_string().to_lowercase().contains("newsletter"),
+            "error should name the newsletter mis-route, got: {err}"
+        );
+    }
+
+    /// The pin producer routes through send_message_impl, so a newsletter pin is
+    /// rejected rather than building an encrypted fanout against a channel.
+    #[tokio::test]
+    async fn pin_message_rejects_newsletter() {
+        let client = crate::test_utils::create_test_client_with_name("newsletter_pin_guard").await;
+        let channel: Jid = "120363000000000002@newsletter".parse().unwrap();
+        let key = wa::MessageKey {
+            remote_jid: Some(channel.to_string()),
+            from_me: Some(true),
+            id: Some("MID".to_string()),
+            participant: None,
+        };
+        let err = client
+            .pin_message(channel, key, PinDuration::Days7)
+            .await
+            .expect_err("pinning a newsletter message must be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("newsletter"),
+            "error should name the newsletter mis-route, got: {err}"
         );
     }
 
