@@ -112,6 +112,15 @@ impl<'a> Signal<'a> {
         )
         .await?;
 
+        // A pkmsg consumed prekey is reported, not deleted by the decrypt; buffer
+        // it so the flush below removes it atomically with the promoted session.
+        if let Some(prekey_id) = decrypted.consumed_prekey_id {
+            adapter
+                .pre_key_store
+                .buffer_consumed_prekey(prekey_id, &signal_addr)
+                .await;
+        }
+
         drop(_guard);
         self.client.flush_signal_cache().await?;
 

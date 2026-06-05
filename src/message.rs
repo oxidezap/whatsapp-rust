@@ -1845,6 +1845,16 @@ impl Client {
 
             match decrypt_res {
                 Ok(decrypted) => {
+                    // Buffer the prekey this pkmsg consumed: message_decrypt promoted
+                    // the session into the (volatile) cache but no longer deletes the
+                    // prekey itself. The post-loop flush deletes it only once that
+                    // session is durable, keeping a crash from orphaning the prekey.
+                    if let Some(prekey_id) = decrypted.consumed_prekey_id {
+                        adapter
+                            .pre_key_store
+                            .buffer_consumed_prekey(prekey_id, &signal_address)
+                            .await;
+                    }
                     if decrypted.identity_change == IdentityChange::ReplacedExisting
                         && !local_identity_reacted
                     {
@@ -1950,6 +1960,12 @@ impl Client {
                                     info.id,
                                     address
                                 );
+                                if let Some(prekey_id) = decrypted.consumed_prekey_id {
+                                    adapter
+                                        .pre_key_store
+                                        .buffer_consumed_prekey(prekey_id, &signal_address)
+                                        .await;
+                                }
                                 // Normally NewOrUnchanged here (the untrusted
                                 // identity was deleted+flushed before the retry),
                                 // but mirror the main-decode gate so a concurrent
@@ -2631,6 +2647,12 @@ impl Client {
                     info.id,
                     info.source.sender
                 );
+                if let Some(prekey_id) = decrypted.consumed_prekey_id {
+                    adapter
+                        .pre_key_store
+                        .buffer_consumed_prekey(prekey_id, signal_address)
+                        .await;
+                }
                 let padded_plaintext = decrypted.plaintext;
                 match self
                     .clone()

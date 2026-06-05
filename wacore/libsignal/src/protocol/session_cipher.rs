@@ -71,6 +71,13 @@ use crate::protocol::{
 pub struct DecryptionResult {
     pub plaintext: Vec<u8>,
     pub identity_change: IdentityChange,
+    /// The one-time pre-key a pkmsg consumed, if any. The decrypt does NOT delete
+    /// it: removing the prekey is the caller's responsibility, and only once the
+    /// promoted session is itself durable. A crash with the prekey already gone
+    /// but the session still volatile makes a redelivered pkmsg undecryptable, so
+    /// the caller buffers this id and deletes it alongside the session flush.
+    /// `None` for a SignalMessage decrypt or a pkmsg that reused an existing session.
+    pub consumed_prekey_id: Option<PreKeyId>,
 }
 
 pub async fn message_encrypt(
@@ -295,13 +302,13 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
 
     let (plaintext, pre_key_used, identity_change) = result?;
 
-    if let Some(pre_key_id) = pre_key_used {
-        pre_key_store.remove_pre_key(pre_key_id).await?;
-    }
-
+    // The consumed prekey is reported up, not deleted here: the promoted session
+    // is still volatile in the caller's cache, so the prekey must only be removed
+    // once that session is durable (see DecryptionResult::consumed_prekey_id).
     Ok(DecryptionResult {
         plaintext,
         identity_change,
+        consumed_prekey_id: pre_key_used,
     })
 }
 
@@ -406,6 +413,7 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
     Ok(DecryptionResult {
         plaintext,
         identity_change,
+        consumed_prekey_id: None,
     })
 }
 
