@@ -325,24 +325,13 @@ impl EventHandler for ChannelEventHandler {
     }
 }
 
-/// Immutable snapshot of the registered handlers plus the OR of their
-/// interests. `dispatch` clones only the outer `Arc` (one refcount bump, no
-/// `Vec` allocation) and tests `aggregate` before touching anything else, so an
-/// event no handler wants costs nothing past the bitmask check.
+/// Immutable snapshot of the registered handlers. `dispatch` clones only the
+/// outer `Arc` (one refcount bump, no `Vec` allocation), then drops the lock and
+/// iterates the snapshot. Handler interest is re-evaluated per dispatch so a
+/// handler whose `interest()` widens at runtime still receives the new kinds.
+#[derive(Default)]
 struct HandlerSnapshot {
     handlers: Vec<Arc<dyn EventHandler>>,
-    /// OR of every handler's `interest()`, so `dispatch` can short-circuit an
-    /// ignored kind without scanning the handler list.
-    aggregate: EventInterest,
-}
-
-impl Default for HandlerSnapshot {
-    fn default() -> Self {
-        Self {
-            handlers: Vec::new(),
-            aggregate: EventInterest::none(),
-        }
-    }
 }
 
 #[derive(Default, Clone)]
@@ -374,12 +363,8 @@ impl CoreEventBus {
         let current = &**guard;
         let mut handlers = Vec::with_capacity(current.handlers.len() + 1);
         handlers.extend(current.handlers.iter().cloned());
-        let aggregate = EventInterest(current.aggregate.0 | handler.interest().0);
         handlers.push(handler);
-        *guard = Arc::new(HandlerSnapshot {
-            handlers,
-            aggregate,
-        });
+        *guard = Arc::new(HandlerSnapshot { handlers });
     }
 
     /// Returns true if there are any event handlers registered.
@@ -392,17 +377,19 @@ impl CoreEventBus {
     /// skip producing an event nobody would receive (e.g. retaining a large
     /// `HistorySync` blob when only message-only handlers are registered).
     pub fn has_handler_for(&self, kind: EventKind) -> bool {
-        self.snapshot().aggregate.wants(kind)
+        self.snapshot()
+            .handlers
+            .iter()
+            .any(|h| h.interest().wants(kind))
     }
 
     pub fn dispatch(&self, event: Event) {
         let snapshot = self.snapshot();
-        // Skip materializing the event (Arc) and invoking handlers whose
-        // declared interest excludes this kind. A handler that subscribed to a
-        // few kinds never pays for boxing the events it ignores; the cached
-        // aggregate also short-circuits an ignored kind without scanning.
+        // Skip materializing the event (Arc) when no handler wants this kind. The
+        // interest is re-evaluated here (not read from a cached aggregate) so a
+        // handler whose interest() widens at runtime is never short-circuited out.
         let kind = event.kind();
-        if !snapshot.aggregate.wants(kind) {
+        if !snapshot.handlers.iter().any(|h| h.interest().wants(kind)) {
             return;
         }
         let event = Arc::new(event);
@@ -1496,6 +1483,50 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_respects_dynamically_widened_interest() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A handler whose interest() widens after registration. dispatch must
+        // re-read interest each time (never a stale cached aggregate), so the
+        // newly-wanted kind is delivered.
+        struct Dynamic {
+            interest: Mutex<EventInterest>,
+            hits: AtomicUsize,
+        }
+        impl EventHandler for Dynamic {
+            fn handle_event(&self, _: Arc<Event>) {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+            }
+            fn interest(&self) -> EventInterest {
+                *self.interest.lock().unwrap()
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let h = Arc::new(Dynamic {
+            interest: Mutex::new(EventInterest::of(&[EventKind::Message])),
+            hits: AtomicUsize::new(0),
+        });
+        bus.add_handler(h.clone());
+
+        // Not yet interested in Connected: dropped before materialization.
+        bus.dispatch(Event::Connected(Connected));
+        assert_eq!(h.hits.load(Ordering::SeqCst), 0);
+        assert!(!bus.has_handler_for(EventKind::Connected));
+
+        // Widen interest at runtime.
+        *h.interest.lock().unwrap() = EventInterest::ALL;
+        assert!(bus.has_handler_for(EventKind::Connected));
+        bus.dispatch(Event::Connected(Connected));
+        assert_eq!(
+            h.hits.load(Ordering::SeqCst),
+            1,
+            "a handler whose interest widened at runtime must receive the newly-wanted kind"
+        );
+    }
+
+    #[test]
     fn aggregate_interest_and_has_handler_for() {
         struct Narrow(EventInterest);
         impl EventHandler for Narrow {
@@ -1516,7 +1547,7 @@ mod tests {
         assert!(bus.has_handler_for(EventKind::Message));
         assert!(!bus.has_handler_for(EventKind::Receipt));
 
-        // The aggregate is the OR of both handlers' interests.
+        // has_handler_for is true once any registered handler wants the kind.
         bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Receipt]))));
         assert!(bus.has_handler_for(EventKind::Message));
         assert!(bus.has_handler_for(EventKind::Receipt));
