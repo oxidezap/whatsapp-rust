@@ -90,6 +90,9 @@ impl<'a> Profile<'a> {
     /// Sends a JPEG image as the new profile picture. The image should already
     /// be properly sized/cropped by the caller (WhatsApp typically uses 640x640).
     ///
+    /// Passing empty `image_data` **removes** the picture (matching WhatsApp Web);
+    /// call [`Profile::remove_profile_picture`] when removal is the intent.
+    ///
     /// ## Wire Format
     /// ```xml
     /// <iq type="set" xmlns="w:profile:picture" to="s.whatsapp.net">
@@ -100,10 +103,11 @@ impl<'a> Profile<'a> {
         &self,
         image_data: Vec<u8>,
     ) -> Result<SetProfilePictureResponse> {
+        // for_own routes empty bytes to the remove path, matching WA Web; no panic.
         debug!("Setting profile picture (size={} bytes)", image_data.len());
         Ok(self
             .client
-            .execute(SetProfilePictureSpec::set_own(image_data))
+            .execute(SetProfilePictureSpec::for_own(image_data))
             .await?)
     }
 

@@ -234,6 +234,16 @@ impl SetProfilePictureSpec {
         }
     }
 
+    /// Set or remove the own picture from caller-supplied bytes. Empty bytes mean
+    /// remove, matching WAWebSendProfilePictureJob (`a ? wap("picture",..) : null`).
+    pub fn for_own(image_data: Vec<u8>) -> Self {
+        if image_data.is_empty() {
+            Self::remove_own()
+        } else {
+            Self::set_own(image_data)
+        }
+    }
+
     /// Set a group's profile picture. Panics if `image_data` is empty (use `remove_group` instead).
     pub fn set_group(group_jid: &Jid, image_data: Vec<u8>) -> Self {
         assert!(
@@ -305,6 +315,20 @@ impl IqSpec for SetProfilePictureSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn for_own_routes_empty_to_remove() {
+        // WA Web treats empty bytes as a removal.
+        assert!(
+            SetProfilePictureSpec::for_own(Vec::new())
+                .image_data
+                .is_none()
+        );
+        assert_eq!(
+            SetProfilePictureSpec::for_own(vec![1, 2, 3]).image_data,
+            Some(vec![1, 2, 3])
+        );
+    }
 
     #[test]
     fn test_profile_picture_spec_preview() {
