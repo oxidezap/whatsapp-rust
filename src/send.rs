@@ -302,6 +302,49 @@ fn build_revoke_message(
     }
 }
 
+/// A newsletter (channel) admin op on an existing message: edit (with the
+/// replacement body) or revoke. Keeping content tied to the variant makes the
+/// invalid edit-without-body / revoke-with-body states unrepresentable.
+pub(crate) enum NewsletterEdit<'a> {
+    Edit(&'a wa::Message),
+    Revoke,
+}
+
+/// Build a newsletter (channel) plaintext edit/revoke stanza. The target is keyed
+/// by `message_id` (the original message's stanza id string, the wire `id`), NOT
+/// by `server_id`: WA Web (mergeNewsletterClientIDMixin -> `id`) and whatsmeow
+/// (sendNewsletter, req.ID = protocolMessage.key.id) both reference edit/revoke by
+/// the message id and emit no `server_id` (that attr is reaction-only).
+pub(crate) fn build_newsletter_edit_node(
+    to: &Jid,
+    message_id: &str,
+    op: NewsletterEdit<'_>,
+) -> Node {
+    use crate::types::message::EditAttribute;
+    use prost::Message as _;
+    let mut plaintext = NodeBuilder::new("plaintext");
+    let (edit, stanza_type, body) = match op {
+        NewsletterEdit::Edit(m) => {
+            if let Some(mt) = wacore::send::media_type_from_message(m) {
+                plaintext = plaintext.attr("mediatype", mt);
+            }
+            (
+                EditAttribute::AdminEdit,
+                wacore::send::stanza_type_from_message(m),
+                m.encode_to_vec(),
+            )
+        }
+        NewsletterEdit::Revoke => (EditAttribute::AdminRevoke, "text", Vec::new()),
+    };
+    NodeBuilder::new("message")
+        .attr("to", to)
+        .attr("id", message_id)
+        .attr("type", stanza_type)
+        .attr("edit", edit.to_string_val())
+        .children([plaintext.bytes(body).build()])
+        .build()
+}
+
 /// Build a message edit in WA Web's wire shape: a top-level
 /// protocolMessage(type=MESSAGE_EDIT) carrying the new content under
 /// editedMessage, same as build_revoke_message and our own receive path. The
@@ -1064,15 +1107,15 @@ impl Client {
         extra_stanza_nodes: Vec<Node>,
         stanza_type_override: Option<StanzaType>,
     ) -> Result<(), anyhow::Error> {
-        // Newsletters are plaintext channels; their only valid send is the
-        // <plaintext> branch in send_message_with_options, which returns before
-        // here. A newsletter JID reaching the E2E path is a mis-routed
-        // pin/edit/revoke, so reject it instead of building encrypted device
-        // fanout the channel can't process.
+        // Newsletters are plaintext channels and never use the E2E path. Text
+        // sends go through the <plaintext> branch in send_message_with_options;
+        // edit/revoke have dedicated plaintext methods (newsletter().edit_message
+        // / revoke_message). A newsletter JID here is a mis-routed pin/edit/revoke
+        // (pin is not a channel op), so reject it.
         if to.is_newsletter() {
             return Err(anyhow!(
-                "newsletter JIDs are not supported on the E2E send path \
-                 (pin/edit/revoke of channel messages is not implemented)"
+                "newsletter JIDs are not valid on the E2E send path; use \
+                 newsletter().edit_message/revoke_message (pin is unsupported on channels)"
             ));
         }
 
@@ -3892,6 +3935,178 @@ mod tests {
             err.to_string().to_lowercase().contains("newsletter"),
             "error should name the newsletter mis-route, got: {err}"
         );
+    }
+
+    /// Newsletter edit: plaintext `<message edit="3">` keyed by server_id, with the
+    /// new content in `<plaintext>`. Keyed by the message id STRING (not server_id),
+    /// and a text edit carries no mediatype.
+    #[test]
+    fn build_newsletter_edit_node_emits_plaintext_edit() {
+        use prost::Message as _;
+        let to: Jid = "120363000000000001@newsletter".parse().unwrap();
+        let content = wa::Message {
+            conversation: Some("edited text".to_string()),
+            ..Default::default()
+        };
+        let node =
+            build_newsletter_edit_node(&to, "3EB0EDITTARGET", NewsletterEdit::Edit(&content));
+
+        let mut a = node.attrs();
+        assert_eq!(a.optional_string("id").unwrap().as_ref(), "3EB0EDITTARGET");
+        assert_eq!(a.optional_string("type").unwrap().as_ref(), "text");
+        assert_eq!(a.optional_string("edit").unwrap().as_ref(), "3");
+
+        let pt = node
+            .get_optional_child("plaintext")
+            .expect("plaintext child");
+        assert!(
+            pt.attrs().optional_string("mediatype").is_none(),
+            "a text edit must not carry a mediatype attr"
+        );
+        let bytes = match pt.content.as_ref() {
+            Some(wacore_binary::NodeContent::Bytes(b)) => b.clone(),
+            other => panic!("expected plaintext bytes, got {other:?}"),
+        };
+        let decoded = wa::Message::decode(bytes.as_slice()).expect("decode plaintext");
+        assert_eq!(decoded.conversation.as_deref(), Some("edited text"));
+    }
+
+    /// Media newsletter edit: type="media" + `<plaintext mediatype="image">`.
+    #[test]
+    fn build_newsletter_edit_node_media_edit() {
+        let to: Jid = "120363000000000001@newsletter".parse().unwrap();
+        let content = wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                caption: Some("new caption".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let node = build_newsletter_edit_node(&to, "3EB0MEDIA", NewsletterEdit::Edit(&content));
+
+        let mut a = node.attrs();
+        assert_eq!(a.optional_string("id").unwrap().as_ref(), "3EB0MEDIA");
+        assert_eq!(a.optional_string("type").unwrap().as_ref(), "media");
+        assert_eq!(a.optional_string("edit").unwrap().as_ref(), "3");
+        let pt = node
+            .get_optional_child("plaintext")
+            .expect("plaintext child");
+        assert_eq!(
+            pt.attrs().optional_string("mediatype").unwrap().as_ref(),
+            "image"
+        );
+    }
+
+    /// Newsletter revoke: plaintext `<message type="text" edit="8">` keyed by the
+    /// message id STRING, with an empty `<plaintext>`.
+    #[test]
+    fn build_newsletter_edit_node_revoke_is_empty_plaintext() {
+        let to: Jid = "120363000000000002@newsletter".parse().unwrap();
+        let node = build_newsletter_edit_node(&to, "3EB0REVOKETARGET", NewsletterEdit::Revoke);
+
+        let mut a = node.attrs();
+        assert_eq!(
+            a.optional_string("id").unwrap().as_ref(),
+            "3EB0REVOKETARGET"
+        );
+        assert_eq!(a.optional_string("type").unwrap().as_ref(), "text");
+        assert_eq!(a.optional_string("edit").unwrap().as_ref(), "8");
+
+        let pt = node
+            .get_optional_child("plaintext")
+            .expect("plaintext child");
+        let empty = match pt.content.as_ref() {
+            None => true,
+            Some(wacore_binary::NodeContent::Bytes(b)) => b.is_empty(),
+            _ => false,
+        };
+        assert!(empty, "revoke must carry an empty plaintext");
+    }
+
+    /// The public newsletter().edit_message wrapper emits the plaintext edit stanza
+    /// keyed by the message id it was given.
+    #[tokio::test]
+    async fn newsletter_edit_message_wrapper_sends_plaintext_edit() {
+        let client = crate::test_utils::create_test_client_with_name("nl_edit_wrap").await;
+        let channel: Jid = "120363000000000001@newsletter".parse().unwrap();
+        let waiter =
+            client.wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("edit", "3"));
+        let content = wa::Message {
+            conversation: Some("edited".to_string()),
+            ..Default::default()
+        };
+        // No socket on the test client: send_node captures the node, then errors.
+        let _ = client
+            .newsletter()
+            .edit_message(&channel, "TARGETMID", content)
+            .await;
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("sent node captured")
+            .expect("waiter resolves");
+        let mut a = node.attrs();
+        assert_eq!(a.optional_string("id").unwrap().as_ref(), "TARGETMID");
+        assert_eq!(a.optional_string("edit").unwrap().as_ref(), "3");
+    }
+
+    /// The newsletter edit/revoke methods reject non-newsletter JIDs, so a misuse
+    /// cannot send plaintext content to a DM/group (it would not be E2E-encrypted).
+    #[tokio::test]
+    async fn newsletter_edit_revoke_reject_non_newsletter_jid() {
+        let client = crate::test_utils::create_test_client_with_name("nl_reject_nonchannel").await;
+        let dm: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
+        let group: Jid = "120363000000000009@g.us".parse().unwrap();
+
+        let e1 = client
+            .newsletter()
+            .edit_message(
+                &dm,
+                "MID",
+                wa::Message {
+                    conversation: Some("x".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("edit_message must reject a DM JID");
+        assert!(e1.to_string().to_lowercase().contains("newsletter"));
+
+        let e2 = client
+            .newsletter()
+            .revoke_message(&group, "MID")
+            .await
+            .expect_err("revoke_message must reject a group JID");
+        assert!(e2.to_string().to_lowercase().contains("newsletter"));
+    }
+
+    /// An empty message_id (NewsletterMessage.message_id may be empty if the server
+    /// omitted the id) is rejected rather than sending a target-less id="" stanza.
+    #[tokio::test]
+    async fn newsletter_edit_revoke_reject_empty_message_id() {
+        let client = crate::test_utils::create_test_client_with_name("nl_reject_empty_id").await;
+        let channel: Jid = "120363000000000001@newsletter".parse().unwrap();
+
+        let e1 = client
+            .newsletter()
+            .edit_message(
+                &channel,
+                "",
+                wa::Message {
+                    conversation: Some("x".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("edit_message must reject an empty message_id");
+        assert!(e1.to_string().to_lowercase().contains("message_id"));
+
+        let e2 = client
+            .newsletter()
+            .revoke_message(&channel, "")
+            .await
+            .expect_err("revoke_message must reject an empty message_id");
+        assert!(e2.to_string().to_lowercase().contains("message_id"));
     }
 
     #[tokio::test]

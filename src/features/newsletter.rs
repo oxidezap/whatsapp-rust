@@ -14,6 +14,7 @@ use wacore::iq::mex_ids::newsletter as newsletter_docs;
 use wacore::iq::newsletter::NEWSLETTER_XMLNS;
 use wacore::request::InfoQuery;
 use wacore_binary::Jid;
+use wacore_binary::JidExt as _;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 use waproto::whatsapp as wa;
@@ -94,6 +95,9 @@ pub struct NewsletterReactionCount {
 /// A message from a newsletter's history.
 #[derive(Debug, Clone)]
 pub struct NewsletterMessage {
+    /// Wire message id (the stanza `id`). This is what edit_message / revoke_message
+    /// key on (NOT `server_id`). Empty if the server omitted it.
+    pub message_id: String,
     /// Server-assigned message ID (monotonic, used for pagination cursors).
     pub server_id: u64,
     /// Message timestamp (Unix seconds).
@@ -380,6 +384,65 @@ impl<'a> Newsletter<'a> {
             .await
     }
 
+    /// Edit a message in a newsletter (channel). Channels are plaintext (not E2E).
+    ///
+    /// `message_id` is the target message's id (the `message_id` from
+    /// [`NewsletterMessage`] / the id returned when it was sent), NOT its
+    /// `server_id` (edit/revoke key on the message id, unlike reactions which use
+    /// `server_id`). `new_content` is the replacement body (e.g.
+    /// `wa::Message { conversation: Some(..), .. }`).
+    pub async fn edit_message(
+        &self,
+        jid: &Jid,
+        message_id: impl Into<String>,
+        new_content: wa::Message,
+    ) -> Result<(), anyhow::Error> {
+        if !jid.is_newsletter() {
+            return Err(anyhow::anyhow!(
+                "edit_message is only valid for newsletter (channel) JIDs; use Client::edit_message for DM/group"
+            ));
+        }
+        let id = message_id.into();
+        if id.is_empty() {
+            return Err(anyhow::anyhow!(
+                "newsletter edit needs a target message_id (NewsletterMessage.message_id is empty when the server omits the id)"
+            ));
+        }
+        let node = crate::send::build_newsletter_edit_node(
+            jid,
+            &id,
+            crate::send::NewsletterEdit::Edit(&new_content),
+        );
+        self.client.send_node(node).await?;
+        Ok(())
+    }
+
+    /// Revoke (delete) a message in a newsletter (channel).
+    ///
+    /// `message_id` is the target message's id (the `message_id` from
+    /// [`NewsletterMessage`]), NOT its `server_id`.
+    pub async fn revoke_message(
+        &self,
+        jid: &Jid,
+        message_id: impl Into<String>,
+    ) -> Result<(), anyhow::Error> {
+        if !jid.is_newsletter() {
+            return Err(anyhow::anyhow!(
+                "revoke_message is only valid for newsletter (channel) JIDs; use Client::revoke_message for DM/group"
+            ));
+        }
+        let id = message_id.into();
+        if id.is_empty() {
+            return Err(anyhow::anyhow!(
+                "newsletter revoke needs a target message_id (NewsletterMessage.message_id is empty when the server omits the id)"
+            ));
+        }
+        let node =
+            crate::send::build_newsletter_edit_node(jid, &id, crate::send::NewsletterEdit::Revoke);
+        self.client.send_node(node).await?;
+        Ok(())
+    }
+
     /// Fetch message history from a newsletter.
     ///
     /// Returns up to `count` messages. Use `before` with a `server_id` from a previous
@@ -549,6 +612,13 @@ fn parse_newsletter_messages_response(
             continue;
         };
 
+        // The wire `id` (string) is what edit/revoke key on; keep it alongside
+        // server_id (which is used for pagination/reactions).
+        let message_id = msg_node
+            .get_attr("id")
+            .map(|v| v.as_str().into_owned())
+            .unwrap_or_default();
+
         let timestamp = msg_node
             .get_attr("t")
             .map(|v| v.as_str())
@@ -577,6 +647,7 @@ fn parse_newsletter_messages_response(
         let reactions = parse_reaction_counts(msg_node);
 
         result.push(NewsletterMessage {
+            message_id,
             server_id,
             timestamp,
             message_type,
