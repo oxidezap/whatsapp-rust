@@ -621,30 +621,42 @@ impl SignalStoreCache {
             }
             state.evict_if_needed(self.max_entries);
 
-            // Delete a consumed one-time prekey only once its session is durable,
-            // which here means THIS flush just persisted it (its address is in
-            // `batch`). Gating on the persisted set, not on the live cache entry,
-            // is what makes it safe: a session that was checked out, deleted, or
-            // dropped by a concurrent clear() before its buffer insert landed is
-            // absent from `batch`, so its prekey is deferred instead of being
-            // durably deleted with no session behind it (which would make a
-            // redelivered pkmsg permanently undecryptable). Staying under the
-            // sessions lock keeps the session commit and the prekey delete atomic
-            // against a decrypt buffering its own prekey (it must take this same
-            // lock to store its session first), matching
-            // WAWebSignalProtocolStoreUnifiedApi (bulkPutSession + bulkRemovePreKey
-            // under one lock). The buffer is mutated only after each delete
-            // succeeds, so a failed flush leaves the IDs for the next attempt.
+            // Delete a consumed one-time prekey only once its session is durable.
+            // Durability is decided per session, not from a single flush's batch:
+            // a Present (clean at drain) entry is persisted (by this flush or an
+            // earlier one); a CheckedOut entry is the still-volatile promoted copy,
+            // so defer; an absent/deleted/evicted/cleared entry is ambiguous, so
+            // ask the backend. This covers a prekey buffered just after a
+            // concurrent flush already persisted its session (it would never
+            // re-enter a batch) and never deletes a prekey whose session was
+            // dropped before reaching the backend (which would make a redelivered
+            // pkmsg permanently undecryptable). Staying under the sessions lock
+            // keeps the session commit and the prekey delete atomic against a
+            // decrypt buffering its own prekey (it must take this same lock to
+            // store its session first), matching WAWebSignalProtocolStoreUnifiedApi
+            // (bulkPutSession + bulkRemovePreKey under one lock). The buffer is
+            // mutated only after each delete succeeds, so a failed flush leaves the
+            // IDs for the next attempt.
             {
-                let persisted: HashSet<&str> =
-                    batch.iter().map(|(addr, _)| addr.as_ref()).collect();
                 let mut removed = self.removed_prekeys.lock().await;
                 if !removed.is_empty() {
-                    let deletable: Vec<u32> = removed
-                        .iter()
-                        .filter(|(_, addr)| persisted.contains(addr.as_ref()))
-                        .map(|(id, _)| *id)
-                        .collect();
+                    let mut deletable: Vec<u32> = Vec::new();
+                    for (id, addr) in removed.iter() {
+                        // Resolve to an owned decision before any await so no cache
+                        // borrow is held across the backend roundtrip.
+                        let durable = match state.cache.get(addr.as_ref()) {
+                            Some(SessionEntry::Present(_)) => Some(true),
+                            Some(SessionEntry::CheckedOut) => Some(false),
+                            Some(SessionEntry::Absent) | None => None,
+                        };
+                        let durable = match durable {
+                            Some(d) => d,
+                            None => backend.has_session(addr.as_ref()).await?,
+                        };
+                        if durable {
+                            deletable.push(*id);
+                        }
+                    }
                     for id in &deletable {
                         backend.remove_prekey(*id).await?;
                     }
@@ -1011,31 +1023,58 @@ mod consumed_prekey_atomicity_tests {
         );
     }
 
-    /// A prekey buffered for a session this flush does not persist (its volatile
-    /// session was dropped before the buffer insert landed, e.g. a disconnect
-    /// clear() racing the consume path) must NOT be deleted: removing the durable
-    /// prekey with no persisted session behind it makes a redelivered pkmsg
-    /// permanently undecryptable. Only prekeys whose session is in the persisted
-    /// batch are removed.
+    /// A prekey buffered for a session that is not durable (its volatile session
+    /// was dropped before the buffer insert landed, e.g. a disconnect clear()
+    /// racing the consume path) must NOT be deleted: removing the durable prekey
+    /// with no session behind it makes a redelivered pkmsg permanently
+    /// undecryptable. The drain falls back to the backend, which has no session
+    /// here, so the prekey is deferred.
     #[tokio::test]
     async fn prekey_without_a_persisted_session_survives_flush() {
         let backend = InMemoryBackend::new();
         let cache = SignalStoreCache::new();
         let addr = seed(&backend).await;
 
-        // Buffer a prekey whose session is absent from the cache, so the flush
-        // persists no session for it.
+        // Buffer a prekey whose session is absent from the cache and the backend,
+        // so the flush has no durable session to tie it to.
         cache.remove_prekey(PREKEY_ID, addr.as_str()).await;
 
         cache.flush(&backend).await.unwrap();
 
         assert!(
             backend.load_prekey(PREKEY_ID).await.unwrap().is_some(),
-            "a prekey with no persisted session must survive the flush"
+            "a prekey with no durable session must survive the flush"
         );
         assert!(
             cache.removed_prekeys.lock().await.contains_key(&PREKEY_ID),
             "it stays buffered; a later clear() drops it, keeping the prekey durable"
+        );
+    }
+
+    /// A prekey buffered AFTER its session was already persisted (a concurrent
+    /// flush ran between the decrypt's session store and the receive path's buffer
+    /// insert) must still be deleted: the session is durable, so the one-time
+    /// prekey must not linger forever. The drain recognizes already-durable
+    /// sessions, not only those this flush persisted.
+    #[tokio::test]
+    async fn prekey_buffered_after_session_already_durable_is_deleted() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let addr = seed(&backend).await;
+
+        // A prior flush already persisted and cleaned the session, exactly as a
+        // concurrent flush would leave it before the prekey gets buffered.
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+        cache.flush(&backend).await.unwrap();
+        assert!(backend.get_session(addr.as_str()).await.unwrap().is_some());
+
+        // Only now does the receive path buffer the consumed prekey.
+        cache.remove_prekey(PREKEY_ID, addr.as_str()).await;
+
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            backend.load_prekey(PREKEY_ID).await.unwrap().is_none(),
+            "prekey of an already-durable session must be deleted on the next flush"
         );
     }
 
