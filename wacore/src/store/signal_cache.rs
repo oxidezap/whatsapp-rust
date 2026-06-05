@@ -568,6 +568,10 @@ impl SignalStoreCache {
             let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
 
             let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::new();
+            // True if a dirty (promoted-but-not-yet-durable) session is currently
+            // checked out by a concurrent reader, so this flush cannot persist it.
+            // When that happens we must NOT delete the consumed prekeys this round.
+            let mut dirty_session_checked_out = false;
             for address in &dirty_keys {
                 match state.cache.get(address.as_ref()) {
                     Some(SessionEntry::Present(record)) => {
@@ -575,7 +579,10 @@ impl SignalStoreCache {
                         record.serialize_into(&mut buf);
                         batch.push((address.clone(), bytes::Bytes::from(buf)));
                     }
-                    Some(SessionEntry::CheckedOut) => continue,
+                    Some(SessionEntry::CheckedOut) => {
+                        dirty_session_checked_out = true;
+                        continue;
+                    }
                     _ => {}
                 }
             }
@@ -613,14 +620,23 @@ impl SignalStoreCache {
             // so a flush can never delete a prekey whose session it did not persist.
             // Matches WAWebSignalProtocolStoreUnifiedApi holding all cache mutexes
             // across the flush so no putSession/removePreKey interleaves the commit.
-            let mut removed = self.removed_prekeys.lock().await;
-            if !removed.is_empty() {
-                let ids: Vec<u32> = removed.iter().copied().collect();
-                for id in &ids {
-                    backend.remove_prekey(*id).await?;
-                }
-                for id in &ids {
-                    removed.remove(id);
+            //
+            // If a dirty session was checked out by a concurrent reader (so it was
+            // skipped above and stays volatile), defer the whole prekey drain to a
+            // later flush. Otherwise we could delete the one-time prekey of a
+            // session that is not yet durable, recreating the crash-orphan window
+            // this change closes. The IDs stay buffered (bounded by consumed prekeys
+            // between flushes) and drain once every session is persisted.
+            if !dirty_session_checked_out {
+                let mut removed = self.removed_prekeys.lock().await;
+                if !removed.is_empty() {
+                    let ids: Vec<u32> = removed.iter().copied().collect();
+                    for id in &ids {
+                        backend.remove_prekey(*id).await?;
+                    }
+                    for id in &ids {
+                        removed.remove(id);
+                    }
                 }
             }
         }
@@ -829,6 +845,52 @@ mod consumed_prekey_atomicity_tests {
         assert!(
             backend.load_prekey(PREKEY_ID).await.unwrap().is_none(),
             "prekey must be deleted once the session it produced is durable"
+        );
+    }
+
+    /// If a dirty (promoted-but-not-yet-durable) session is checked out by a
+    /// concurrent reader at flush time, the flush cannot persist it, so the consumed
+    /// prekey must be DEFERRED rather than deleted. Deleting it here would recreate
+    /// the crash-orphan window. A later flush, once the session is back and durable,
+    /// commits both.
+    #[tokio::test]
+    async fn checked_out_session_defers_prekey_delete_until_durable() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let addr = seed(&backend).await;
+
+        // Decrypt path: session promoted (dirty, volatile) + prekey buffered.
+        cache.put_session(&addr, SessionRecord::new_fresh()).await;
+        cache.remove_prekey(PREKEY_ID).await;
+
+        // A concurrent reader checks the session out after the per-address lock was
+        // released (get_session leaves a CheckedOut marker; the dirty bit stays).
+        let taken = cache.get_session(&addr, &backend).await.unwrap();
+        assert!(taken.is_some(), "the promoted session should be readable");
+
+        // Flush while the session is checked out: it cannot be persisted, so the
+        // prekey must NOT be deleted.
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            backend.get_session(addr.as_str()).await.unwrap().is_none(),
+            "a checked-out session is not persisted by this flush"
+        );
+        assert!(
+            backend.load_prekey(PREKEY_ID).await.unwrap().is_some(),
+            "prekey must not be deleted while its session is checked out (still volatile)"
+        );
+
+        // The reader returns the session; a later flush persists it and now commits
+        // the deferred prekey deletion.
+        cache.put_session(&addr, taken.unwrap()).await;
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            backend.get_session(addr.as_str()).await.unwrap().is_some(),
+            "session is durable after the reader returned it"
+        );
+        assert!(
+            backend.load_prekey(PREKEY_ID).await.unwrap().is_none(),
+            "the deferred prekey deletion commits once the session is durable"
         );
     }
 
