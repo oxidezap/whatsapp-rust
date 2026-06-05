@@ -90,10 +90,9 @@ impl Client {
         UserLookupKeys::Unknown { user: user.into() }
     }
 
-    /// Get all possible lookup keys for a user (for bidirectional lookup).
-    /// Returns keys in order of preference: [canonical_key, fallback_key].
-    ///
-    /// Note: Prefer `resolve_lookup_keys` when you need type information.
+    /// Owned-key variant of `resolve_lookup_keys`. Test-only: production callers
+    /// use the borrowed `resolve_lookup_keys(..).all_keys()` to avoid the churn.
+    #[cfg(test)]
     pub(crate) async fn get_lookup_keys(&self, user: &str) -> Vec<String> {
         self.resolve_lookup_keys(user)
             .await
@@ -116,22 +115,24 @@ impl Client {
             return true;
         }
 
-        let lookup_keys = self.get_lookup_keys(user).await;
+        // Borrowed `&str` keys (like get_devices_from_registry), bound once so both
+        // loops share one Vec<&str>: avoids the per-message get_lookup_keys churn.
+        let lookup = self.resolve_lookup_keys(user).await;
+        let keys = lookup.all_keys();
 
-        for key in &lookup_keys {
+        for &key in &keys {
             if let Some(record) = self.device_registry_cache.get(key).await {
                 return record.devices.iter().any(|d| d.device_id == device_id);
             }
         }
 
         let backend = self.persistence_manager.backend();
-        for key in &lookup_keys {
+        for &key in &keys {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
                     let has_device = record.devices.iter().any(|d| d.device_id == device_id);
-                    // Cache under the record's actual user key (the key it was stored under
-                    // in the backend), not lookup_keys[0] which is our guessed canonical key.
-                    // This ensures consistency between the in-memory cache and the backend.
+                    // Cache under the record's actual stored key, not our guessed one,
+                    // to keep the cache and backend consistent.
                     self.device_registry_cache
                         .insert(record.user.clone(), Arc::new(record))
                         .await;
@@ -863,6 +864,26 @@ mod tests {
         assert!(client.has_device(lid, 1).await);
         // Non-existent device should return false
         assert!(!client.has_device(lid, 99).await);
+    }
+
+    /// has_device must iterate every lookup key: a record keyed under PN is found
+    /// when queried by LID (the fallback key), and vice versa. Guards the
+    /// borrowed-`all_keys()` iteration the churn fix preserves.
+    #[tokio::test]
+    async fn test_has_device_found_via_fallback_lookup_key() {
+        let client = create_test_client().await;
+        let lid = "100000000000009";
+        let pn = "15559998888";
+
+        setup_lid_pn(&client, lid, pn).await;
+        setup_device_record(&client, pn, &[2]).await;
+
+        assert!(
+            client.has_device(lid, 2).await,
+            "device keyed under PN must be found when queried by LID"
+        );
+        assert!(client.has_device(pn, 2).await);
+        assert!(!client.has_device(lid, 77).await);
     }
 
     /// Test that invalidate_device_cache clears registry cache entries for
