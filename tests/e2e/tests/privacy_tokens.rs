@@ -934,9 +934,21 @@ async fn test_pn_target_first_contact_uses_cstoken_after_lid_resolution() -> any
         .await
         .map_err(|_| anyhow::anyhow!("Timed out waiting for PN-target sent message node"))?
         .map_err(|_| anyhow::anyhow!("PN-target sent message waiter was canceled"))?;
-    assert_eq!(
-        sent.attrs.get("to").map(|v| v.to_string()),
-        Some(jid_a_pn.to_string())
+    // After LID resolution the DM is addressed by LID, matching the LID
+    // participants (WAWebSendMsgCreateFanoutStanza builds the stanza from one
+    // CHAT_JID). Pre-fix the outer `to` stayed the PN, producing the mixed
+    // PN-over-LID stanza the real server rejects with ack error 400 (issue #730).
+    let sent_to = sent
+        .attrs()
+        .optional_jid("to")
+        .expect("sent message must carry a to JID");
+    assert!(
+        sent_to.is_lid(),
+        "DM to a LID-mapped peer must be LID-addressed, got {sent_to}"
+    );
+    assert_ne!(
+        sent_to.user, jid_a_pn.user,
+        "outer to must not stay the PN once the peer resolves to a LID"
     );
     assert!(has_child(&sent, "cstoken"));
     assert!(!has_child(&sent, "tctoken"));
