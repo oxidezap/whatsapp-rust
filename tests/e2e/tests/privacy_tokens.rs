@@ -40,11 +40,13 @@ async fn send_message_and_expect_463_with_id(
     text: &str,
     msg_id: String,
 ) -> anyhow::Result<Arc<OwnedNodeRef>> {
+    // Match by the unique message id, not by `from`: once the peer resolves to a
+    // LID the nack comes back addressed by LID (the send is LID-addressed), so a
+    // PN `from` filter would never match. The id alone identifies this nack.
     let waiter = sender.client.wait_for_node(
         NodeFilter::tag("ack")
             .attr("id", msg_id.clone())
             .attr("class", "message")
-            .attr("from", recipient_jid.to_string())
             .attr("error", "463"),
     );
 
