@@ -2620,7 +2620,8 @@ impl Client {
     /// If an ack with an ID that matches a pending task in `response_waiters`,
     /// the task is resolved and the function returns `true`. Otherwise, returns `false`.
     pub(crate) async fn handle_ack_response(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
-        // Surface privacy-token nack codes for diagnosability
+        // Surface server nack codes for diagnosability. A nacked send still
+        // resolves Ok to the caller, so without this the failure is invisible.
         if let Some(error_code) = node.get_attr("error") {
             let code = error_code.as_str();
             let id = node.get_attr("id").map(|v| v.as_str().into_owned());
@@ -2642,7 +2643,15 @@ impl Client {
                         id
                     );
                 }
-                _ => {}
+                other => {
+                    warn!(
+                        target: "Client/Ack",
+                        "Received {other} nack for msg {:?}; the message was likely \
+                         not delivered (e.g. 400 = malformed stanza, 404 = recipient \
+                         not found, 503 = service unavailable).",
+                        id
+                    );
+                }
             }
         }
 

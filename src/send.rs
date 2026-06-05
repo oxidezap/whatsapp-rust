@@ -1429,6 +1429,18 @@ impl Client {
             let recipient_bare = self.resolve_encryption_jid(&to).await.into_non_ad();
             let recipient_is_lid = recipient_bare.is_lid();
 
+            // The outer `<message to>`, the DeviceSentMessage destinationJid, and
+            // the reporting-token remote jid must share the participants' namespace.
+            // WAWebSendMsgCreateFanoutStanza builds the whole stanza from one
+            // CHAT_JID, so for a LID-addressed peer the `to` is the resolved LID,
+            // not the caller's PN. A PN `to` over LID participants is rejected
+            // wholesale by the server with `ack error="400"`.
+            let stanza_to = if recipient_is_lid {
+                recipient_bare.clone()
+            } else {
+                to.clone()
+            };
+
             // Local registry first; network warm only on miss to avoid
             // unnecessary LID-migration side effects from get_user_devices
             let mut recipient_cached = self.get_devices_from_registry(&recipient_bare).await;
@@ -1536,7 +1548,7 @@ impl Client {
                 own_jid,
                 device_snapshot.lid.as_ref(),
                 device_snapshot.account.as_deref(),
-                to,
+                stanza_to,
                 message,
                 request_id,
                 edit,
@@ -3875,6 +3887,182 @@ mod tests {
             node.attrs().optional_string("type").unwrap().as_ref(),
             wacore::send::StanzaType::Poll.as_wire()
         );
+    }
+
+    /// Regression for #730: a DM to a LID-mapped peer must address the outer
+    /// `<message to>` by LID, matching the LID `<participants>`. Pre-fix the
+    /// outer `to` kept the caller's PN, so a PN-to over LID participants was
+    /// rejected wholesale by the server with `ack error="400"` and never
+    /// delivered (while the send still returned Ok). WAWebSendMsgCreateFanoutStanza
+    /// builds the whole stanza from one CHAT_JID (the LID after migration).
+    #[tokio::test]
+    async fn dm_to_lid_mapped_peer_addresses_outer_to_by_lid() {
+        use wacore::libsignal::protocol::{
+            IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
+            process_prekey_bundle,
+        };
+
+        let client = crate::test_utils::create_test_client_with_name("lid_dm_to").await;
+
+        // A LID-addressed DM requires the device's own PN and LID to be known.
+        let own_pn: Jid = "111111111111@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "222222222222@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(own_pn.clone())))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(own_lid)))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetAccount(Some(peer_test_account_proto())))
+            .await;
+
+        // The peer is LID-mapped: resolve_encryption_jid must switch PN to LID.
+        let peer_pn: Jid = "100000000000777@s.whatsapp.net".parse().unwrap();
+        let peer_lid: Jid = "555000000000777@lid".parse().unwrap();
+        client
+            .add_lid_pn_mapping(
+                peer_lid.user.as_str(),
+                peer_pn.user.as_str(),
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .expect("seed lid mapping");
+
+        // Pre-seed the device registry for the peer (LID) and self (PN) so the
+        // offline send resolves the fanout from cache instead of blocking on a
+        // network device-list fetch (which would time out with no socket).
+        for user in [peer_lid.user.to_string(), own_pn.user.to_string()] {
+            client
+                .update_device_list(wacore::store::traits::DeviceListRecord {
+                    user,
+                    devices: vec![wacore::store::traits::DeviceInfo {
+                        device_id: 0,
+                        key_index: None,
+                    }],
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                })
+                .await
+                .expect("seed device registry");
+        }
+
+        // The test client never connects, so the send's `ensure_e2e_sessions`
+        // would otherwise block on `wait_for_offline_delivery_end` until timeout.
+        client.complete_offline_sync(0);
+
+        // Seed a Signal session for the peer's LID device so the offline fanout
+        // can encrypt without fetching prekeys over the (absent) socket.
+        let lid_addr = peer_lid.to_non_ad();
+        let bundle =
+            tokio::task::spawn_blocking(|| -> Result<PreKeyBundle, SignalProtocolError> {
+                let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+                let receiver = IdentityKeyPair::generate(&mut rng);
+                let spk = KeyPair::generate(&mut rng);
+                let opk = KeyPair::generate(&mut rng);
+                let sig = receiver
+                    .private_key()
+                    .calculate_signature(&spk.public_key.serialize(), &mut rng)?;
+                PreKeyBundle::new(
+                    1,
+                    1u32.into(),
+                    Some((1u32.into(), opk.public_key)),
+                    1u32.into(),
+                    spk.public_key,
+                    sig.to_vec(),
+                    *receiver.identity_key(),
+                )
+            })
+            .await
+            .expect("prekey bundle task")
+            .expect("prekey bundle");
+        {
+            let mut adapter = client.signal_adapter().await;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            process_prekey_bundle(
+                &lid_addr.to_protocol_address(),
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &bundle,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("peer lid session");
+        }
+
+        let request_id = "LID_DM_TO_1";
+        let waiter = client
+            .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        // Caller passes the PN form; the resolved namespace must win on the wire.
+        let result = client
+            .send_message_impl(
+                peer_pn,
+                &msg,
+                Some(request_id.to_string()),
+                false,
+                false,
+                None,
+                vec![],
+                None,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "test client has no socket; send captures the stanza then errors"
+        );
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("sent node should be captured")
+            .expect("sent node waiter should resolve");
+
+        // The fix: outer `<message to>` is the LID, not the caller's PN.
+        let to_str = node
+            .attrs()
+            .optional_string("to")
+            .expect("message has a to")
+            .into_owned();
+        let to_jid: Jid = to_str.parse().expect("to parses");
+        assert!(
+            to_jid.is_lid(),
+            "outer <message to> must be LID to match the LID participants, got {to_str}"
+        );
+        assert_eq!(
+            to_jid.user.as_str(),
+            peer_lid.user.as_str(),
+            "outer to user must be the peer LID"
+        );
+
+        // Uniformity guard: every <participants>/<to> is LID too (no mix).
+        let participants = node
+            .get_optional_child("participants")
+            .expect("stanza has participants");
+        let entries = participants.children().expect("participants has children");
+        assert!(
+            !entries.is_empty(),
+            "fanout must target at least the recipient"
+        );
+        for entry in entries {
+            let pj: Jid = entry
+                .attrs()
+                .optional_string("jid")
+                .expect("participant jid")
+                .parse()
+                .expect("participant jid parses");
+            assert!(
+                pj.is_lid(),
+                "participant {pj} must be LID (uniform namespace)"
+            );
+        }
     }
 
     /// Newsletter JIDs must be rejected at the E2E send path root (covers the
