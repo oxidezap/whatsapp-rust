@@ -551,13 +551,14 @@ impl SignalStoreCache {
 
     /// Flush all dirty state to the backend.
     ///
-    /// Each store (sessions, identities, sender_keys) is flushed independently
-    /// under its own lock. This means:
-    /// - Only ONE store is locked during its I/O — the other two are free for
-    ///   concurrent encrypt/decrypt operations.
-    /// - No race between snapshot and clear — the lock is held throughout, so
-    ///   mutations to the same store are blocked until the flush completes.
-    /// - Dirty sets are cleared only after successful writes.
+    /// Identities and sender keys are flushed independently under their own lock,
+    /// so each is locked only during its own I/O while the others stay free for
+    /// concurrent encrypt/decrypt. Sessions and consumed pre-keys are committed
+    /// together under the single sessions lock: the prekey delete must be atomic
+    /// with the session put against concurrent buffering, so they cannot use
+    /// separate lock scopes. Within each scope the lock is held across snapshot,
+    /// I/O, and clear, so there is no race between snapshot and clear and dirty
+    /// sets are cleared only after successful writes.
     pub async fn flush(&self, backend: &dyn SignalStore) -> Result<()> {
         // Flush sessions: one batched write for all dirty puts instead of one
         // backend call (and one SQLite transaction) per session.
@@ -597,15 +598,21 @@ impl SignalStoreCache {
                 state.deleted.remove(key);
             }
             state.evict_if_needed(self.max_entries);
-        }
 
-        // Delete consumed one-time pre-keys only after the session batch above is
-        // durable. The session was promoted on the inbound pkmsg path; deleting
-        // the prekey before the session is committed risks losing both on a crash
-        // and making a redelivered pkmsg undecryptable. The buffer is drained
-        // under its lock and only cleared after every backend delete succeeds, so
-        // a failed flush leaves the IDs buffered for the next attempt.
-        {
+            // Delete consumed one-time pre-keys only after the session batch above
+            // is durable. The session was promoted on the inbound pkmsg path;
+            // deleting the prekey before the session is committed risks losing both
+            // on a crash and making a redelivered pkmsg undecryptable. The buffer is
+            // drained and only cleared after every backend delete succeeds, so a
+            // failed flush leaves the IDs buffered for the next attempt.
+            //
+            // This stays under the sessions lock so the session commit and the
+            // prekey delete are atomic against concurrent buffering: a sender whose
+            // decrypt promotes a session and buffers its prekey AFTER this snapshot
+            // is blocked from inserting into removed_prekeys until the lock frees,
+            // so a flush can never delete a prekey whose session it did not persist.
+            // Matches WAWebSignalProtocolStoreUnifiedApi holding all cache mutexes
+            // across the flush so no putSession/removePreKey interleaves the commit.
             let mut removed = self.removed_prekeys.lock().await;
             if !removed.is_empty() {
                 let ids: Vec<u32> = removed.iter().copied().collect();
@@ -990,6 +997,277 @@ mod consumed_prekey_atomicity_tests {
         assert!(
             cache.removed_prekeys.lock().await.contains(&PREKEY_ID),
             "buffered prekey removal must persist across a failed flush"
+        );
+    }
+
+    /// A decrypt racing a flush must never lose the session<->prekey atomicity.
+    ///
+    /// Sender A's flush holds the sessions lock across both the session commit AND
+    /// the consumed-prekey drain. While it is mid-flush, sender B's decrypt tries to
+    /// promote B's session and buffer B's consumed prekey. Because the prekey buffer
+    /// is drained under that same sessions lock, B cannot reach the buffer until A's
+    /// flush has fully committed and released the lock, so A's flush can never delete
+    /// B's prekey while B's session is still volatile. The buggy form (prekey drain
+    /// in a separate lock scope) releases the sessions lock first, leaving a window
+    /// where B buffers its prekey and A then durably deletes it with B's session
+    /// unflushed. The backend asserts the sessions lock is held at the moment the
+    /// prekey is deleted, which directly distinguishes the fixed and buggy forms.
+    #[tokio::test]
+    async fn concurrent_decrypt_does_not_lose_prekey_during_flush() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const PREKEY_A: u32 = 1001;
+        const PREKEY_B: u32 = 1002;
+
+        /// Wraps an InMemoryBackend. `put_sessions_batch` yields the executor many
+        /// times before doing the real write, so a concurrently spawned decrypt has
+        /// every chance to reach (and block on) the sessions lock while A's flush
+        /// holds it. `remove_prekey` records whether the sessions lock was actually
+        /// held (the core invariant the fix establishes) and flags any prekey delete
+        /// whose owning session is not yet durable.
+        struct GatedBackend {
+            inner: InMemoryBackend,
+            // The cache under flush, so the backend can probe the sessions lock.
+            cache: StdArc<SignalStoreCache>,
+            // Set if a prekey was deleted while the sessions lock was NOT held: that
+            // is the regression (prekey drain outside the sessions lock scope).
+            drained_without_sessions_lock: StdArc<AtomicBool>,
+            // Set if a prekey delete ever ran while its session was still volatile.
+            violation: StdArc<AtomicBool>,
+            addr_b: String,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl SignalStore for GatedBackend {
+            async fn put_sessions_batch(
+                &self,
+                sessions: &[(Arc<str>, bytes::Bytes)],
+            ) -> crate::store::error::Result<()> {
+                // A's flush holds the sessions lock here; yield repeatedly so B's
+                // spawned decrypt gets scheduled and blocks on that lock before the
+                // session commit (and the prekey drain) completes.
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+                self.inner.put_sessions_batch(sessions).await
+            }
+            async fn remove_prekey(&self, id: u32) -> crate::store::error::Result<()> {
+                // The fix drains prekeys under the sessions lock, so a try_lock here
+                // must fail while a flush is deleting. If it succeeds, the drain ran
+                // outside the sessions lock: the exact regression.
+                if self.cache.sessions.try_lock().is_some() {
+                    self.drained_without_sessions_lock
+                        .store(true, Ordering::SeqCst);
+                }
+                // B's prekey may only be deleted once B's session is durable.
+                if id == PREKEY_B
+                    && self
+                        .inner
+                        .get_session(&self.addr_b)
+                        .await
+                        .unwrap()
+                        .is_none()
+                {
+                    self.violation.store(true, Ordering::SeqCst);
+                }
+                self.inner.remove_prekey(id).await
+            }
+
+            async fn put_identity(
+                &self,
+                address: &str,
+                key: [u8; 32],
+            ) -> crate::store::error::Result<()> {
+                self.inner.put_identity(address, key).await
+            }
+            async fn load_identity(
+                &self,
+                address: &str,
+            ) -> crate::store::error::Result<Option<[u8; 32]>> {
+                self.inner.load_identity(address).await
+            }
+            async fn delete_identity(&self, address: &str) -> crate::store::error::Result<()> {
+                self.inner.delete_identity(address).await
+            }
+            async fn get_session(
+                &self,
+                address: &str,
+            ) -> crate::store::error::Result<Option<bytes::Bytes>> {
+                self.inner.get_session(address).await
+            }
+            async fn put_session(
+                &self,
+                address: &str,
+                session: &[u8],
+            ) -> crate::store::error::Result<()> {
+                self.inner.put_session(address, session).await
+            }
+            async fn delete_session(&self, address: &str) -> crate::store::error::Result<()> {
+                self.inner.delete_session(address).await
+            }
+            async fn store_prekey(
+                &self,
+                id: u32,
+                record: &[u8],
+                uploaded: bool,
+            ) -> crate::store::error::Result<()> {
+                self.inner.store_prekey(id, record, uploaded).await
+            }
+            async fn load_prekey(
+                &self,
+                id: u32,
+            ) -> crate::store::error::Result<Option<bytes::Bytes>> {
+                self.inner.load_prekey(id).await
+            }
+            async fn get_max_prekey_id(&self) -> crate::store::error::Result<u32> {
+                self.inner.get_max_prekey_id().await
+            }
+            async fn store_signed_prekey(
+                &self,
+                id: u32,
+                record: &[u8],
+            ) -> crate::store::error::Result<()> {
+                self.inner.store_signed_prekey(id, record).await
+            }
+            async fn load_signed_prekey(
+                &self,
+                id: u32,
+            ) -> crate::store::error::Result<Option<Vec<u8>>> {
+                self.inner.load_signed_prekey(id).await
+            }
+            async fn load_all_signed_prekeys(
+                &self,
+            ) -> crate::store::error::Result<Vec<(u32, Vec<u8>)>> {
+                self.inner.load_all_signed_prekeys().await
+            }
+            async fn remove_signed_prekey(&self, id: u32) -> crate::store::error::Result<()> {
+                self.inner.remove_signed_prekey(id).await
+            }
+            async fn put_sender_key(
+                &self,
+                address: &str,
+                record: &[u8],
+            ) -> crate::store::error::Result<()> {
+                self.inner.put_sender_key(address, record).await
+            }
+            async fn get_sender_key(
+                &self,
+                address: &str,
+            ) -> crate::store::error::Result<Option<Vec<u8>>> {
+                self.inner.get_sender_key(address).await
+            }
+            async fn delete_sender_key(&self, address: &str) -> crate::store::error::Result<()> {
+                self.inner.delete_sender_key(address).await
+            }
+        }
+
+        let inner = InMemoryBackend::new();
+        inner
+            .store_prekey(PREKEY_A, b"prekey-a", false)
+            .await
+            .unwrap();
+        inner
+            .store_prekey(PREKEY_B, b"prekey-b", false)
+            .await
+            .unwrap();
+
+        let addr_a = ProtocolAddress::new("alice".to_string(), 1.into());
+        let addr_b = ProtocolAddress::new("bob".to_string(), 1.into());
+
+        let cache = StdArc::new(SignalStoreCache::new());
+        let violation = StdArc::new(AtomicBool::new(false));
+        let drained_without_sessions_lock = StdArc::new(AtomicBool::new(false));
+
+        let backend = StdArc::new(GatedBackend {
+            inner,
+            cache: cache.clone(),
+            drained_without_sessions_lock: drained_without_sessions_lock.clone(),
+            violation: violation.clone(),
+            addr_b: addr_b.as_str().to_string(),
+        });
+
+        // Sender A's decrypt: promote A's session, buffer A's consumed prekey.
+        cache.put_session(&addr_a, SessionRecord::new_fresh()).await;
+        cache.remove_prekey(PREKEY_A).await;
+
+        // Sender B's decrypt races A's flush: it promotes B's session and buffers
+        // B's consumed prekey. put_session must take the sessions lock, so while A's
+        // flush holds it (yielding inside put_sessions_batch) B blocks here and can
+        // only buffer once A's flush has committed and released the lock.
+        let b_cache = cache.clone();
+        let addr_b_task = addr_b.clone();
+        let b_task = tokio::spawn(async move {
+            b_cache
+                .put_session(&addr_b_task, SessionRecord::new_fresh())
+                .await;
+            b_cache.remove_prekey(PREKEY_B).await;
+        });
+
+        // A's flush runs concurrently with B's spawned decrypt. It holds the
+        // sessions lock across its yielding I/O and the prekey drain, so B cannot
+        // insert into removed_prekeys until A is done: A can never delete B's prekey.
+        cache.flush(backend.as_ref()).await.unwrap();
+        b_task.await.unwrap();
+
+        // The core invariant: every prekey delete during the flush ran while the
+        // sessions lock was held, so no concurrent decrypt could have buffered a
+        // prekey into the same drain. This is what makes session+prekey atomic.
+        assert!(
+            !drained_without_sessions_lock.load(Ordering::SeqCst),
+            "prekey was drained without holding the sessions lock (regression)"
+        );
+
+        // The flush must never have deleted B's prekey while B's session was
+        // volatile.
+        assert!(
+            !violation.load(Ordering::SeqCst),
+            "flush deleted B's prekey while B's session was still volatile"
+        );
+
+        // A's commit is durable: its session is persisted and its prekey gone.
+        assert!(
+            backend
+                .get_session(addr_a.as_str())
+                .await
+                .unwrap()
+                .is_some(),
+            "sender A's session must be durable after its flush"
+        );
+        assert!(
+            backend.load_prekey(PREKEY_A).await.unwrap().is_none(),
+            "sender A's consumed prekey must be deleted with its session"
+        );
+
+        // B buffered its prekey only after A's flush completed, so B's prekey is
+        // still durable and still buffered for B's own next flush.
+        assert!(
+            backend.load_prekey(PREKEY_B).await.unwrap().is_some(),
+            "B's prekey must survive a concurrent flush that did not persist B's session"
+        );
+        assert!(
+            cache.removed_prekeys.lock().await.contains(&PREKEY_B),
+            "B's prekey removal stays buffered for B's own flush"
+        );
+
+        // B's own flush then commits B's session and B's prekey atomically.
+        cache.flush(backend.as_ref()).await.unwrap();
+        assert!(
+            backend
+                .get_session(addr_b.as_str())
+                .await
+                .unwrap()
+                .is_some(),
+            "B's session must be durable after B's flush"
+        );
+        assert!(
+            backend.load_prekey(PREKEY_B).await.unwrap().is_none(),
+            "B's prekey is deleted only once B's session is durable"
+        );
+        assert!(
+            !violation.load(Ordering::SeqCst),
+            "B's prekey delete must coincide with B's durable session"
         );
     }
 }
