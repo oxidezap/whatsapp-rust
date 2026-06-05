@@ -12,6 +12,7 @@ pub(crate) mod newsletter;
 mod polls;
 mod presence;
 mod profile;
+mod reaction;
 mod signal;
 pub(crate) mod status;
 mod tctoken;

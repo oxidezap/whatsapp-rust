@@ -615,6 +615,28 @@ pub fn build_quote_context_with_info(
     }
 }
 
+/// Builds a `reactionMessage` matching WA Web's `WAWebReactionsGenerateReactionMessageProto`
+/// (`{ key, text, senderTimestampMs }`).
+///
+/// `key` references the message being reacted to. An empty `emoji` is the
+/// remove-reaction form: the wire stays a `reactionMessage` with empty `text`,
+/// which the edit-attr classifier treats as a sender-revoke of the prior reaction.
+pub fn build_reaction_message(
+    key: wa::MessageKey,
+    emoji: impl Into<String>,
+    sender_timestamp_ms: i64,
+) -> wa::Message {
+    wa::Message {
+        reaction_message: Some(wa::message::ReactionMessage {
+            key: Some(key),
+            text: Some(emoji.into()),
+            sender_timestamp_ms: Some(sender_timestamp_ms),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Wraps a media message as an album child (WA Web `EProtoGenerator` parity).
 /// Lifts `message_context_info` to the outer message and adds the album association.
 pub fn wrap_as_album_child(
@@ -2185,5 +2207,71 @@ mod tests {
             ..Default::default()
         };
         assert!(!not_fwd.is_forwarded());
+    }
+
+    fn group_target_key() -> wa::MessageKey {
+        wa::MessageKey {
+            remote_jid: Some("120363012345@g.us".to_string()),
+            from_me: Some(false),
+            id: Some("ABCD1234".to_string()),
+            participant: Some("15551230000@s.whatsapp.net".to_string()),
+        }
+    }
+
+    #[test]
+    fn build_reaction_populates_key_text_and_timestamp() {
+        let key = group_target_key();
+        let ts = 1_700_000_000_000;
+        let msg = build_reaction_message(key.clone(), "👍", ts);
+
+        let react = msg
+            .reaction_message
+            .as_ref()
+            .expect("reaction_message must be set");
+        assert_eq!(react.key.as_ref(), Some(&key));
+        assert_eq!(react.text.as_deref(), Some("👍"));
+        assert_eq!(react.sender_timestamp_ms, Some(ts));
+        // Only the reaction field is populated.
+        assert!(msg.conversation.is_none());
+        assert!(react.grouping_key.is_none());
+    }
+
+    #[test]
+    fn build_reaction_preserves_participant_for_group_target() {
+        let key = group_target_key();
+        let msg = build_reaction_message(key, "❤️", 1);
+        let participant = msg
+            .reaction_message
+            .and_then(|r| r.key)
+            .and_then(|k| k.participant);
+        assert_eq!(participant.as_deref(), Some("15551230000@s.whatsapp.net"));
+    }
+
+    #[test]
+    fn build_reaction_empty_emoji_is_unreact_form() {
+        // Empty text stays a reaction with present-but-empty text (not None),
+        // which the edit-attr classifier maps to a sender-revoke.
+        let msg = build_reaction_message(group_target_key(), "", 1);
+        let text = msg
+            .reaction_message
+            .as_ref()
+            .and_then(|r| r.text.as_deref());
+        assert_eq!(text, Some(""));
+    }
+
+    #[test]
+    fn build_reaction_edit_attr_classification() {
+        use crate::types::message::EditAttribute;
+
+        // A non-empty reaction is a regular send, not an edit/revoke.
+        let react = build_reaction_message(group_target_key(), "🔥", 1);
+        assert_eq!(EditAttribute::infer_from_message(&react), None);
+
+        // An empty reaction is the sender-revoke of a previous reaction.
+        let unreact = build_reaction_message(group_target_key(), "", 1);
+        assert_eq!(
+            EditAttribute::infer_from_message(&unreact),
+            Some(EditAttribute::SenderRevoke)
+        );
     }
 }

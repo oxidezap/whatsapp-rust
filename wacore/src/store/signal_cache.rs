@@ -10,16 +10,23 @@ use crate::store::traits::SignalStore;
 
 /// Evict clean (non-dirty, non-deleted) entries from a cache HashMap.
 /// Negative entries (None values) are evicted first.
+///
+/// Amortized: the O(n) scan only runs once the map crosses the high watermark
+/// (`max_entries + slack`), then it trims back down to `max_entries`. Steady
+/// state over capacity therefore costs O(1) per call because a fresh scan needs
+/// `slack` more growth inserts before it can fire again. Call it from every path
+/// that grows the map, including read-populate (cache-miss) inserts, so the cache
+/// stays bounded even under unique-key read floods; the early-out keeps it cheap.
 fn evict_clean_entries<V>(
     cache: &mut HashMap<Arc<str>, Option<V>>,
     dirty: &HashSet<Arc<str>>,
     deleted: Option<&HashSet<Arc<str>>>,
     max_entries: usize,
 ) {
-    let overflow = cache.len().saturating_sub(max_entries);
-    if overflow == 0 {
+    if cache.len() <= high_watermark(max_entries) {
         return;
     }
+    let overflow = cache.len().saturating_sub(max_entries);
     let mut negative = Vec::with_capacity(overflow);
     let mut positive = Vec::with_capacity(overflow);
     for (k, v) in cache.iter() {
@@ -45,24 +52,33 @@ fn evict_clean_entries<V>(
 /// Default max entries per store before clean entry eviction triggers.
 const DEFAULT_MAX_CACHE_ENTRIES: usize = 2_000;
 
+/// Slack above `max_entries` the cache may grow to before an eviction scan
+/// fires, expressed as a divisor of `max_entries` (1/8th here). Trimming back
+/// to `max_entries` then amortizes the O(n) scan over this many inserts. A
+/// floor keeps the amortization meaningful when `max_entries` is tiny (tests).
+const EVICTION_SLACK_DIVISOR: usize = 8;
+const EVICTION_SLACK_FLOOR: usize = 16;
+
+/// The size the cache may reach before a scan is allowed to run. Eviction trims
+/// back to `max_entries`, so the strict in-memory bound is this value.
+fn high_watermark(max_entries: usize) -> usize {
+    max_entries.saturating_add((max_entries / EVICTION_SLACK_DIVISOR).max(EVICTION_SLACK_FLOOR))
+}
+
 /// In-memory write-back cache for Signal protocol state.
 /// Keys use `Arc<str>` for O(1) clone. Sessions cached as objects (serialized on flush).
-/// Capacity-bounded: evicts non-dirty entries when max_entries is exceeded.
+/// Capacity-bounded: every path that grows a store (writes and read-populate
+/// misses) evicts non-dirty entries once the high watermark is crossed, trimming
+/// back to `max_entries` (amortized O(1) thanks to the slack early-out).
 pub struct SignalStoreCache {
     sessions: Mutex<SessionStoreState>,
     identities: Mutex<ByteStoreState>,
     sender_keys: Mutex<SenderKeyStoreState>,
-    /// Consumed one-time pre-key IDs awaiting durable deletion, each mapped to the
-    /// address of the session whose pkmsg promotion consumed it. Buffered on the
-    /// inbound pkmsg path so the prekey is removed from the backend only in the
-    /// same flush that persists that session, never before it. Matches
-    /// WAWebSignalProtocolStoreUnifiedApi, which buffers removePreKey and commits
-    /// it alongside the session put under one storage lock. Without this the
-    /// prekey could be durably gone while the new session is still volatile, so a
-    /// crash in that window loses both and a redelivered pkmsg is undecryptable.
-    /// Keying by session address lets the flush delete a prekey as soon as ITS
-    /// session is durable while deferring only the prekeys of sessions still
-    /// checked out, rather than holding back the whole buffer.
+    /// Consumed one-time prekeys buffered for durable deletion, keyed by the
+    /// address of the session whose pkmsg promotion consumed each one. The flush
+    /// deletes a prekey only after that session is persisted, so a crash can never
+    /// lose both and leave a redelivered pkmsg undecryptable. Per-address (not a
+    /// global flag) so only the prekeys of still-volatile sessions are deferred.
     removed_prekeys: Mutex<HashMap<u32, Arc<str>>>,
     /// Per-(group, sender) locks serializing each sender-key chain advance.
     /// Coordination only (like the client session locks): never time-evicted.
@@ -127,10 +143,10 @@ impl SessionStoreState {
     }
 
     fn evict_if_needed(&mut self, max_entries: usize) {
-        let overflow = self.cache.len().saturating_sub(max_entries);
-        if overflow == 0 {
+        if self.cache.len() <= high_watermark(max_entries) {
             return;
         }
+        let overflow = self.cache.len().saturating_sub(max_entries);
         let mut negative = Vec::with_capacity(overflow);
         let mut positive = Vec::with_capacity(overflow);
         for (k, v) in self.cache.iter() {
@@ -415,7 +431,6 @@ impl SignalStoreCache {
     pub async fn delete_session(&self, address: &ProtocolAddress) {
         let mut state = self.sessions.lock().await;
         state.delete(address.as_str());
-        state.evict_if_needed(self.max_entries);
     }
 
     /// Non-destructive existence check (`CheckedOut` counts as present).
@@ -484,7 +499,6 @@ impl SignalStoreCache {
     pub async fn delete_identity(&self, address: &ProtocolAddress) {
         let mut state = self.identities.lock().await;
         state.delete(address.as_str());
-        state.evict_if_needed(self.max_entries);
     }
 
     // === Sender Keys ===
@@ -537,7 +551,6 @@ impl SignalStoreCache {
     pub async fn delete_sender_key(&self, cache_key: &str) {
         let mut state = self.sender_keys.lock().await;
         state.delete(cache_key);
-        state.evict_if_needed(self.max_entries);
     }
 
     // === Consumed pre-keys ===
@@ -608,42 +621,28 @@ impl SignalStoreCache {
             }
             state.evict_if_needed(self.max_entries);
 
-            // Delete consumed one-time pre-keys only after the session that consumed
-            // each one is durable. The session was promoted on the inbound pkmsg
-            // path; deleting the prekey before that session is committed risks
-            // losing both on a crash and making a redelivered pkmsg undecryptable.
-            //
-            // This stays under the sessions lock so the session commit and the
-            // prekey delete are atomic against concurrent buffering: a sender whose
-            // decrypt promotes a session and buffers its prekey AFTER this snapshot
-            // is blocked from inserting into removed_prekeys until the lock frees
-            // (it must take this same sessions lock to store its session first), so
-            // a flush can never delete a prekey whose session it did not persist.
-            // Matches WAWebSignalProtocolStoreUnifiedApi holding all cache mutexes
-            // across the flush so no putSession/removePreKey interleaves the commit.
-            //
-            // Each prekey is gated on ITS OWN session, not a global flag: a prekey
-            // whose session is still checked out by a reader (skipped above, still
-            // volatile) is deferred on its own, without holding back the prekeys of
-            // sessions this flush did persist. Deferring those persisted-session
-            // prekeys would leak them: a later clear() (disconnect) drops the buffer
-            // and they would stay durable forever despite their session being live.
-            // The buffer is only mutated after each backend delete succeeds, so a
-            // failed flush leaves the IDs buffered for the next attempt.
+            // Delete a consumed one-time prekey only once its session is durable,
+            // which here means THIS flush just persisted it (its address is in
+            // `batch`). Gating on the persisted set, not on the live cache entry,
+            // is what makes it safe: a session that was checked out, deleted, or
+            // dropped by a concurrent clear() before its buffer insert landed is
+            // absent from `batch`, so its prekey is deferred instead of being
+            // durably deleted with no session behind it (which would make a
+            // redelivered pkmsg permanently undecryptable). Staying under the
+            // sessions lock keeps the session commit and the prekey delete atomic
+            // against a decrypt buffering its own prekey (it must take this same
+            // lock to store its session first), matching
+            // WAWebSignalProtocolStoreUnifiedApi (bulkPutSession + bulkRemovePreKey
+            // under one lock). The buffer is mutated only after each delete
+            // succeeds, so a failed flush leaves the IDs for the next attempt.
             {
+                let persisted: HashSet<&str> =
+                    batch.iter().map(|(addr, _)| addr.as_ref()).collect();
                 let mut removed = self.removed_prekeys.lock().await;
                 if !removed.is_empty() {
                     let deletable: Vec<u32> = removed
                         .iter()
-                        .filter(|(_, addr)| {
-                            // Defer only while the consuming session is still
-                            // checked out (volatile). Present (persisted just now),
-                            // Absent (deleted), or evicted-clean all mean durable.
-                            !matches!(
-                                state.cache.get(addr.as_ref()),
-                                Some(SessionEntry::CheckedOut)
-                            )
-                        })
+                        .filter(|(_, addr)| persisted.contains(addr.as_ref()))
                         .map(|(id, _)| *id)
                         .collect();
                     for id in &deletable {
@@ -1009,6 +1008,34 @@ mod consumed_prekey_atomicity_tests {
         assert!(
             backend.load_prekey(PREKEY_ID).await.unwrap().is_some(),
             "cleared buffer must not delete the prekey on a later flush"
+        );
+    }
+
+    /// A prekey buffered for a session this flush does not persist (its volatile
+    /// session was dropped before the buffer insert landed, e.g. a disconnect
+    /// clear() racing the consume path) must NOT be deleted: removing the durable
+    /// prekey with no persisted session behind it makes a redelivered pkmsg
+    /// permanently undecryptable. Only prekeys whose session is in the persisted
+    /// batch are removed.
+    #[tokio::test]
+    async fn prekey_without_a_persisted_session_survives_flush() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let addr = seed(&backend).await;
+
+        // Buffer a prekey whose session is absent from the cache, so the flush
+        // persists no session for it.
+        cache.remove_prekey(PREKEY_ID, addr.as_str()).await;
+
+        cache.flush(&backend).await.unwrap();
+
+        assert!(
+            backend.load_prekey(PREKEY_ID).await.unwrap().is_some(),
+            "a prekey with no persisted session must survive the flush"
+        );
+        assert!(
+            cache.removed_prekeys.lock().await.contains_key(&PREKEY_ID),
+            "it stays buffered; a later clear() drops it, keeping the prekey durable"
         );
     }
 
@@ -1417,5 +1444,171 @@ mod consumed_prekey_atomicity_tests {
             !violation.load(Ordering::SeqCst),
             "B's prekey delete must coincide with B's durable session"
         );
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+    use crate::libsignal::protocol::{DeviceId, ProtocolAddress};
+    use crate::store::in_memory::InMemoryBackend;
+
+    fn addr(i: usize) -> ProtocolAddress {
+        ProtocolAddress::new(format!("user{i}@s.whatsapp.net"), DeviceId::new(0))
+    }
+
+    #[test]
+    fn high_watermark_is_above_max_and_amortizes() {
+        // The watermark must sit strictly above max_entries so a scan can fire
+        // only after `slack` extra inserts, otherwise the amortization is lost.
+        assert!(high_watermark(2_000) > 2_000);
+        assert_eq!(
+            high_watermark(2_000),
+            2_000 + 2_000 / EVICTION_SLACK_DIVISOR
+        );
+        // Tiny caps still get a meaningful slack via the floor.
+        assert_eq!(high_watermark(4), 4 + EVICTION_SLACK_FLOOR);
+    }
+
+    #[tokio::test]
+    async fn eviction_bounds_cache_over_many_inserts() {
+        let max = 64usize;
+        let cache = SignalStoreCache::with_max_entries(max);
+        let backend = InMemoryBackend::new();
+
+        // Flush after each put so the prior entry becomes clean (non-dirty) and
+        // therefore evictable on the next put; otherwise every entry is pinned.
+        for i in 0..(max * 4) {
+            cache.put_identity(&addr(i), &[0u8; 32]).await;
+            cache.flush(&backend).await.unwrap();
+        }
+
+        let len = cache.identities.lock().await.cache.len();
+        assert!(
+            len <= high_watermark(max),
+            "cache grew past the high watermark: len={len} watermark={}",
+            high_watermark(max)
+        );
+        // It must still be doing real work, not collapsing to empty.
+        assert!(
+            len >= max,
+            "eviction was too aggressive: len={len} max={max}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_over_capacity_stays_bounded() {
+        let max = 64usize;
+        let cache = SignalStoreCache::with_max_entries(max);
+        let backend = InMemoryBackend::new();
+
+        // Push the identity store right up to the watermark with clean entries.
+        let watermark = high_watermark(max);
+        for i in 0..watermark {
+            cache.put_identity(&addr(i), &[0u8; 32]).await;
+            cache.flush(&backend).await.unwrap();
+        }
+        let before = cache.identities.lock().await.cache.len();
+        assert_eq!(before, watermark, "setup should fill exactly to watermark");
+
+        // A read-populate (cache-miss) that crosses the watermark must trigger the
+        // amortized eviction too: read traffic populates the cache, so it cannot be
+        // allowed to grow it unbounded.
+        let missing = addr(watermark + 1);
+        let got = cache.get_identity(&missing, &backend).await.unwrap();
+        assert!(got.is_none());
+
+        let after = cache.identities.lock().await.cache.len();
+        assert!(
+            after <= watermark,
+            "a read over capacity must stay bounded: after={after} watermark={watermark}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_flood_of_unique_keys_stays_bounded() {
+        let max = 64usize;
+        let cache = SignalStoreCache::with_max_entries(max);
+        let backend = InMemoryBackend::new();
+
+        // A flood of unique cache-miss reads each negative-cache a clean entry.
+        // Without read-path eviction this grew without bound; it must stay bounded.
+        for i in 0..(max * 8) {
+            assert!(
+                cache
+                    .get_identity(&addr(i), &backend)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let len = cache.identities.lock().await.cache.len();
+        assert!(
+            len <= high_watermark(max),
+            "unique-read flood must stay bounded: len={len} watermark={}",
+            high_watermark(max)
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_entries_are_never_evicted() {
+        let max = 64usize;
+        let cache = SignalStoreCache::with_max_entries(max);
+
+        // Every put marks the key dirty and we never flush, so all entries are
+        // pinned. Even far past the watermark, none may be dropped.
+        let total = high_watermark(max) * 2;
+        for i in 0..total {
+            cache.put_identity(&addr(i), &[0u8; 32]).await;
+        }
+
+        let len = cache.identities.lock().await.cache.len();
+        assert_eq!(
+            len, total,
+            "dirty (unflushed) entries must never be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_out_sessions_are_never_evicted() {
+        let max = 64usize;
+        let cache = SignalStoreCache::with_max_entries(max);
+        let backend = InMemoryBackend::new();
+
+        // Persist one session, then check it out (get_session leaves a CheckedOut
+        // marker) so eviction must skip it.
+        let pinned = addr(0);
+        cache.put_session(&pinned, SessionRecord::new_fresh()).await;
+        cache.flush(&backend).await.unwrap();
+        let taken = cache.get_session(&pinned, &backend).await.unwrap();
+        assert!(taken.is_some(), "session should be present before checkout");
+
+        // Flood the session store with clean Absent markers (has_session misses)
+        // so the watermark is crossed, then trigger eviction via a put.
+        let watermark = high_watermark(max);
+        for i in 1..(watermark + 8) {
+            // has_session miss negative-caches an Absent entry (a read, no evict).
+            assert!(!cache.has_session(&addr(i), &backend).await.unwrap());
+        }
+        // A put fires the eviction scan; it must drop clean Absent markers but
+        // keep the CheckedOut session pinned.
+        cache
+            .put_session(&addr(99_999), SessionRecord::new_fresh())
+            .await;
+
+        {
+            let state = cache.sessions.lock().await;
+            let entry = state.cache.get(pinned.as_str());
+            assert!(
+                matches!(entry, Some(SessionEntry::CheckedOut)),
+                "checked-out session must survive eviction"
+            );
+            assert!(
+                state.cache.len() <= high_watermark(max) + 1,
+                "eviction must bound the session cache: len={}",
+                state.cache.len()
+            );
+        }
     }
 }
