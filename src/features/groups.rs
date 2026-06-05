@@ -1,5 +1,5 @@
 use crate::client::Client;
-use crate::features::mex::{MexError, MexRequest};
+use crate::features::mex::{MexError, mex_request};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wacore::client::context::GroupInfo;
@@ -14,6 +14,7 @@ use wacore::iq::groups::{
     SetGroupMembershipApprovalIq, SetGroupSubjectIq, SetMemberAddModeIq,
     SetNoFrequentlyForwardedIq, normalize_participants,
 };
+use wacore::iq::mex_operations::update_group_property;
 use wacore::types::message::AddressingMode;
 use wacore_binary::{Jid, JidExt as _};
 
@@ -24,6 +25,31 @@ pub use wacore::iq::groups::{
     MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
     MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
 };
+
+/// Typed `update` payload for the `update_group_property` mex mutation. The
+/// generated mirror types this op's `update` as a `String`, but it is a one-of
+/// object; this enum's `#[serde(rename_all = "snake_case")]` emits the exact
+/// wire keys with no `serde_json::Value`. Leaf values use the mex (uppercase)
+/// vocabulary, which differs from the lower-case `WireEnum` IQ values.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GroupPropertyUpdate {
+    MemberLinkMode(&'static str),
+    MemberShareGroupHistoryMode(&'static str),
+    LimitSharing(LimitSharingUpdate),
+}
+
+#[derive(serde::Serialize)]
+struct LimitSharingUpdate {
+    limit_sharing_enabled: bool,
+    limit_sharing_trigger: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct UpdateGroupPropertyVars {
+    group_id: String,
+    update: GroupPropertyUpdate,
+}
 
 /// Result for a single group in a batch query.
 #[derive(Debug, Clone)]
@@ -655,7 +681,7 @@ impl<'a> Groups<'a> {
             MemberLinkMode::AdminLink => "ADMIN_LINK",
             MemberLinkMode::AllMemberLink => "ALL_MEMBER_LINK",
         };
-        self.mex_update_group_property(jid, serde_json::json!({ "member_link_mode": value }))
+        self.mex_update_group_property(jid, GroupPropertyUpdate::MemberLinkMode(value))
             .await
     }
 
@@ -669,22 +695,17 @@ impl<'a> Groups<'a> {
             MemberShareHistoryMode::AdminShare => "ADMIN_SHARE",
             MemberShareHistoryMode::AllMemberShare => "ALL_MEMBER_SHARE",
         };
-        self.mex_update_group_property(
-            jid,
-            serde_json::json!({ "member_share_group_history_mode": value }),
-        )
-        .await
+        self.mex_update_group_property(jid, GroupPropertyUpdate::MemberShareGroupHistoryMode(value))
+            .await
     }
 
     /// Enable or disable limit sharing in the group (via MEX).
     pub async fn set_limit_sharing(&self, jid: &Jid, enabled: bool) -> Result<(), MexError> {
         self.mex_update_group_property(
             jid,
-            serde_json::json!({
-                "limit_sharing": {
-                    "limit_sharing_enabled": enabled,
-                    "limit_sharing_trigger": "CHAT_SETTING"
-                }
+            GroupPropertyUpdate::LimitSharing(LimitSharingUpdate {
+                limit_sharing_enabled: enabled,
+                limit_sharing_trigger: "CHAT_SETTING",
             }),
         )
         .await
@@ -769,18 +790,18 @@ impl<'a> Groups<'a> {
     async fn mex_update_group_property(
         &self,
         jid: &Jid,
-        update: serde_json::Value,
+        update: GroupPropertyUpdate,
     ) -> Result<(), MexError> {
         let resp = self
             .client
             .mex()
-            .mutate(MexRequest {
-                doc: wacore::iq::mex_ids::groups::UPDATE_GROUP_PROPERTY,
-                variables: serde_json::json!({
-                    "group_id": jid.to_string(),
-                    "update": update,
-                }),
-            })
+            .mutate(mex_request!(
+                update_group_property,
+                UpdateGroupPropertyVars {
+                    group_id: jid.to_string(),
+                    update,
+                }
+            ))
             .await?;
 
         let state = resp
@@ -1113,4 +1134,39 @@ mod tests {
     }
 
     // Protocol-level tests (node building, parsing, validation) are in wacore/src/iq/groups.rs
+
+    #[test]
+    fn group_property_update_serializes_to_wire() {
+        assert_eq!(
+            serde_json::to_value(UpdateGroupPropertyVars {
+                group_id: "123@g.us".to_string(),
+                update: GroupPropertyUpdate::MemberLinkMode("ADMIN_LINK"),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "group_id": "123@g.us",
+                "update": { "member_link_mode": "ADMIN_LINK" }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(GroupPropertyUpdate::MemberShareGroupHistoryMode(
+                "ALL_MEMBER_SHARE"
+            ))
+            .unwrap(),
+            serde_json::json!({ "member_share_group_history_mode": "ALL_MEMBER_SHARE" })
+        );
+        assert_eq!(
+            serde_json::to_value(GroupPropertyUpdate::LimitSharing(LimitSharingUpdate {
+                limit_sharing_enabled: true,
+                limit_sharing_trigger: "CHAT_SETTING",
+            }))
+            .unwrap(),
+            serde_json::json!({
+                "limit_sharing": {
+                    "limit_sharing_enabled": true,
+                    "limit_sharing_trigger": "CHAT_SETTING"
+                }
+            })
+        );
+    }
 }

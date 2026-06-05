@@ -28,7 +28,8 @@ use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 
 /// MEX persisted-query descriptor. Pairing `name` with `id` lets diagnostics
 /// surface a stable identifier when the numeric `id` rotates between WA Web
-/// bundle releases. Constants live in [`crate::iq::mex_ids`].
+/// bundle releases. Built from a [`crate::iq::mex_operations`] module's
+/// `NAME`/`DOC_ID` consts.
 #[derive(Debug, Clone, Copy)]
 pub struct MexDoc {
     pub name: &'static str,
@@ -106,20 +107,24 @@ impl MexResponse {
 }
 
 #[derive(Serialize)]
-struct MexPayload<'a> {
-    variables: &'a Value,
+struct MexPayload<'a, V> {
+    variables: &'a V,
 }
 
-/// MEX GraphQL query IQ specification.
+/// MEX GraphQL query IQ specification. The variables are serialized once at
+/// construction straight into the wire payload — no intermediate
+/// `serde_json::Value` tree — so a caller-side serialization error surfaces here
+/// rather than as a malformed (empty) request later in `build_iq`.
 #[derive(Debug, Clone)]
 pub struct MexQuerySpec {
     pub doc: MexDoc,
-    pub variables: Value,
+    payload: Vec<u8>,
 }
 
 impl MexQuerySpec {
-    pub fn new(doc: MexDoc, variables: Value) -> Self {
-        Self { doc, variables }
+    pub fn new<V: Serialize>(doc: MexDoc, variables: &V) -> Result<Self, serde_json::Error> {
+        let payload = serde_json::to_vec(&MexPayload { variables })?;
+        Ok(Self { doc, payload })
     }
 }
 
@@ -153,16 +158,9 @@ impl IqSpec for MexQuerySpec {
     type Response = MexResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        let payload = MexPayload {
-            variables: &self.variables,
-        };
-        // Safety: MexPayload wraps &serde_json::Value, and serde_json::to_vec
-        // cannot fail for Value (no custom serializers or non-string map keys).
-        let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
-
         let query_node = NodeBuilder::new("query")
             .attr("query_id", self.doc.id)
-            .bytes(payload_bytes)
+            .bytes(self.payload.clone())
             .build();
 
         InfoQuery::get(
@@ -189,7 +187,7 @@ impl IqSpec for MexQuerySpec {
                 warn!(
                     target: "Mex",
                     "MEX query '{}' (doc_id={}) looks like a stale persisted-query id: {}. \
-                     Refresh the id from the latest WA Web bundle in wacore::iq::mex_ids.",
+                     Refresh wacore::iq::mex_operations from the latest WA Web bundle.",
                     self.doc.name, self.doc.id, fatal.message
                 );
             }
@@ -220,11 +218,12 @@ mod tests {
     fn test_mex_query_spec_build_iq() {
         let spec = MexQuerySpec::new(
             TEST_DOC,
-            json!({
+            &json!({
                 "input": {"query_input": [{"jid": "1234@s.whatsapp.net"}]},
                 "include_username": true
             }),
-        );
+        )
+        .expect("serialize test variables");
         let iq = spec.build_iq();
 
         assert_eq!(iq.namespace, "w:mex");

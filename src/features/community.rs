@@ -6,14 +6,13 @@
 use crate::client::Client;
 use crate::features::groups::GroupMetadata;
 use crate::features::groups::GroupParticipant;
-use crate::features::mex::{MexError, MexRequest};
+use crate::features::mex::{MexError, mex_request};
 use log::warn;
-use serde_json::json;
 use wacore::iq::groups::{
     DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateIq, GroupCreateOptions,
     JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
-use wacore::iq::mex_ids::community as community_docs;
+use wacore::iq::mex_operations::{fetch_all_subgroups, query_subgroup_participant_count};
 use wacore_binary::Jid;
 
 // Types
@@ -230,12 +229,10 @@ impl<'a> Community<'a> {
         let response = self
             .client
             .mex()
-            .query(MexRequest {
-                doc: community_docs::FETCH_ALL_SUBGROUPS,
-                variables: json!({
-                    "group_id": community_jid.to_string()
-                }),
-            })
+            .query(mex_request!(fetch_all_subgroups {
+                group_id: Some(community_jid.to_string()),
+                ..Default::default()
+            }))
             .await?;
 
         let data = response
@@ -277,14 +274,12 @@ impl<'a> Community<'a> {
         let response = self
             .client
             .mex()
-            .query(MexRequest {
-                doc: community_docs::FETCH_SUBGROUP_PARTICIPANT_COUNT,
-                variables: json!({
-                    "input": {
-                        "group_jid": community_jid.to_string()
-                    }
+            .query(mex_request!(query_subgroup_participant_count {
+                input: Some(query_subgroup_participant_count::Input {
+                    group_jid: Some(community_jid.to_string()),
+                    ..Default::default()
                 }),
-            })
+            }))
             .await?;
 
         let data = response

@@ -7,10 +7,12 @@
 use wacore::WireEnum;
 
 use crate::client::Client;
-use crate::features::mex::{MexError, MexRequest};
+use crate::features::mex::{MexError, mex_request};
 use prost::Message as ProtoMessage;
-use serde_json::json;
-use wacore::iq::mex_ids::newsletter as newsletter_docs;
+use wacore::iq::mex_operations::{
+    create_newsletter, fetch_all_newsletters_metadata, fetch_newsletter, join_newsletter,
+    leave_newsletter, update_newsletter,
+};
 use wacore::iq::newsletter::NEWSLETTER_XMLNS;
 use wacore::request::InfoQuery;
 use wacore_binary::Jid;
@@ -127,10 +129,9 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .query(MexRequest {
-                doc: newsletter_docs::LIST_SUBSCRIBED,
-                variables: json!({}),
-            })
+            .query(mex_request!(fetch_all_newsletters_metadata {
+                ..Default::default()
+            }))
             .await?;
 
         let data = response
@@ -150,19 +151,17 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .query(MexRequest {
-                doc: newsletter_docs::FETCH_METADATA,
-                variables: json!({
-                    "input": {
-                        "key": jid.to_string(),
-                        "type": "JID",
-                        "view_role": "GUEST"
-                    },
-                    "fetch_viewer_metadata": true,
-                    "fetch_full_image": true,
-                    "fetch_creation_time": true
+            .query(mex_request!(fetch_newsletter {
+                input: Some(fetch_newsletter::Input {
+                    key: Some(jid.to_string()),
+                    r#type: Some("JID".into()),
+                    view_role: Some("GUEST".into()),
                 }),
-            })
+                fetch_viewer_metadata: Some(true),
+                fetch_full_image: Some(true),
+                fetch_creation_time: Some(true),
+                ..Default::default()
+            }))
             .await?;
 
         let data = response
@@ -186,18 +185,16 @@ impl<'a> Newsletter<'a> {
         name: &str,
         description: Option<&str>,
     ) -> Result<NewsletterMetadata, MexError> {
-        let mut input = json!({ "name": name });
-        if let Some(desc) = description {
-            input["description"] = json!(desc);
-        }
-
         let response = self
             .client
             .mex()
-            .mutate(MexRequest {
-                doc: newsletter_docs::CREATE,
-                variables: json!({ "input": input }),
-            })
+            .mutate(mex_request!(create_newsletter {
+                input: Some(create_newsletter::Input {
+                    name: Some(name.to_string()),
+                    description: description.map(str::to_string),
+                    picture: None,
+                }),
+            }))
             .await?;
 
         let data = response
@@ -219,12 +216,9 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .mutate(MexRequest {
-                doc: newsletter_docs::JOIN,
-                variables: json!({
-                    "newsletter_id": jid.to_string()
-                }),
-            })
+            .mutate(mex_request!(join_newsletter {
+                newsletter_id: Some(jid.to_string()),
+            }))
             .await?;
 
         let data = response
@@ -245,12 +239,9 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .mutate(MexRequest {
-                doc: newsletter_docs::LEAVE,
-                variables: json!({
-                    "newsletter_id": jid.to_string()
-                }),
-            })
+            .mutate(mex_request!(leave_newsletter {
+                newsletter_id: Some(jid.to_string()),
+            }))
             .await?;
 
         let data = response
@@ -272,24 +263,18 @@ impl<'a> Newsletter<'a> {
         name: Option<&str>,
         description: Option<&str>,
     ) -> Result<NewsletterMetadata, MexError> {
-        let mut updates = json!({});
-        if let Some(name) = name {
-            updates["name"] = json!(name);
-        }
-        if let Some(desc) = description {
-            updates["description"] = json!(desc);
-        }
-
         let response = self
             .client
             .mex()
-            .mutate(MexRequest {
-                doc: newsletter_docs::UPDATE,
-                variables: json!({
-                    "newsletter_id": jid.to_string(),
-                    "updates": updates
+            .mutate(mex_request!(update_newsletter {
+                newsletter_id: Some(jid.to_string()),
+                updates: Some(update_newsletter::Updates {
+                    name: name.map(str::to_string),
+                    description: description.map(str::to_string),
+                    picture: None,
+                    settings: None,
                 }),
-            })
+            }))
             .await?;
 
         let data = response
@@ -313,19 +298,17 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .query(MexRequest {
-                doc: newsletter_docs::FETCH_METADATA,
-                variables: json!({
-                    "input": {
-                        "key": invite_code,
-                        "type": "INVITE",
-                        "view_role": "GUEST"
-                    },
-                    "fetch_viewer_metadata": true,
-                    "fetch_full_image": true,
-                    "fetch_creation_time": true
+            .query(mex_request!(fetch_newsletter {
+                input: Some(fetch_newsletter::Input {
+                    key: Some(invite_code.to_string()),
+                    r#type: Some("INVITE".into()),
+                    view_role: Some("GUEST".into()),
                 }),
-            })
+                fetch_viewer_metadata: Some(true),
+                fetch_full_image: Some(true),
+                fetch_creation_time: Some(true),
+                ..Default::default()
+            }))
             .await?;
 
         let data = response

@@ -4,7 +4,7 @@
 
 use crate::client::Client;
 use crate::request::IqError;
-use serde_json::Value;
+use serde::Serialize;
 use thiserror::Error;
 use wacore::iq::mex::MexQuerySpec;
 use wacore_binary::jid::JidError;
@@ -33,15 +33,56 @@ pub enum MexError {
     Json(#[from] serde_json::Error),
 }
 
-/// MEX request with persisted-query descriptor and variables.
+/// MEX request: a persisted-query descriptor plus its typed variables.
+///
+/// Variables are serialized straight to the wire in the IQ spec (no intermediate
+/// `serde_json::Value`). Build one with the [`mex_request!`] macro, which pulls
+/// `NAME`/`DOC_ID` from a generated [`wacore::iq::mex_operations`] module so the
+/// op is named once.
 #[derive(Debug, Clone)]
-pub struct MexRequest {
-    /// GraphQL persisted-query descriptor (name + id), from
-    /// [`wacore::iq::mex_ids`].
+pub struct MexRequest<V> {
+    /// GraphQL persisted-query descriptor (name + id).
     pub doc: MexDoc,
-    /// Query variables.
-    pub variables: Value,
+    /// Typed query variables: a generated `Variables`, or any `Serialize` value
+    /// (e.g. a `json!` object) for inputs the generated mirror types too loosely.
+    pub variables: V,
 }
+
+impl<V> MexRequest<V> {
+    /// Pair a `(name, id)` from a generated op module with its variables.
+    /// Prefer the [`mex_request!`] macro, which names the op once.
+    pub fn new(name: &'static str, id: &'static str, variables: V) -> Self {
+        Self {
+            doc: MexDoc { name, id },
+            variables,
+        }
+    }
+}
+
+/// Build a [`MexRequest`] from a generated mex operation module, pulling its
+/// `NAME`/`DOC_ID` so the op is named once. Two forms:
+///
+/// ```ignore
+/// // typed Variables, struct-literal sugar:
+/// mex_request!(join_newsletter { newsletter_id: Some(jid.to_string()) })
+/// // explicit value (typed Variables value, or a json! for loosely-typed inputs):
+/// mex_request!(update_group_property, serde_json::json!({ "group_id": id }))
+/// ```
+macro_rules! mex_request {
+    ($op:path { $($body:tt)* }) => {{
+        use $op as __mex_op;
+        $crate::features::mex::MexRequest::new(
+            __mex_op::NAME,
+            __mex_op::DOC_ID,
+            __mex_op::Variables { $($body)* },
+        )
+    }};
+    ($op:path, $vars:expr $(,)?) => {{
+        use $op as __mex_op;
+        $crate::features::mex::MexRequest::new(__mex_op::NAME, __mex_op::DOC_ID, $vars)
+    }};
+}
+pub(crate) use mex_request;
 
 /// Feature handle for MEX GraphQL operations.
 pub struct Mex<'a> {
@@ -55,18 +96,29 @@ impl<'a> Mex<'a> {
 
     /// Execute a GraphQL query.
     #[inline]
-    pub async fn query(&self, request: MexRequest) -> Result<MexResponse, MexError> {
+    pub async fn query<V: Serialize>(
+        &self,
+        request: MexRequest<V>,
+    ) -> Result<MexResponse, MexError> {
         self.execute_request(request).await
     }
 
     /// Execute a GraphQL mutation.
     #[inline]
-    pub async fn mutate(&self, request: MexRequest) -> Result<MexResponse, MexError> {
+    pub async fn mutate<V: Serialize>(
+        &self,
+        request: MexRequest<V>,
+    ) -> Result<MexResponse, MexError> {
         self.execute_request(request).await
     }
 
-    async fn execute_request(&self, request: MexRequest) -> Result<MexResponse, MexError> {
-        let spec = MexQuerySpec::new(request.doc, request.variables);
+    async fn execute_request<V: Serialize>(
+        &self,
+        request: MexRequest<V>,
+    ) -> Result<MexResponse, MexError> {
+        // Serialize the variables here so a caller-side serialization error
+        // surfaces as MexError::Json instead of a malformed empty request.
+        let spec = MexQuerySpec::new(request.doc, &request.variables)?;
 
         let response = self.client.execute(spec).await?;
 
