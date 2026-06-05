@@ -146,6 +146,8 @@ impl Client {
         let receipt_type_cow = attrs.optional_string("type");
         let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
         let participant = attrs.optional_jid("participant");
+        // participant_pn -> sender_alt so the LID-PN cache warms from receipts too.
+        let participant_pn = attrs.optional_jid("participant_pn");
         let stanza_ts = attrs
             .optional_u64("t")
             .and_then(|t| i64::try_from(t).ok())
@@ -207,6 +209,7 @@ impl Client {
                     source: crate::types::message::MessageSource {
                         chat: from.clone(),
                         sender: user.jid,
+                        sender_alt: user.participant_pn,
                         ..Default::default()
                     },
                     timestamp: user_ts,
@@ -232,6 +235,7 @@ impl Client {
             source: crate::types::message::MessageSource {
                 chat: from,
                 sender: default_sender,
+                sender_alt: participant_pn,
                 ..Default::default()
             },
             timestamp: stanza_ts,
@@ -1433,6 +1437,77 @@ mod tests {
         assert_eq!(receipts[0].source.sender.user, "99000000000001");
         assert_eq!(receipts[1].r#type, ReceiptType::Read);
         assert_eq!(receipts[2].r#type, ReceiptType::Inactive);
+    }
+
+    /// participant_pn must land in the Receipt event's sender_alt on both shapes.
+    #[tokio::test]
+    async fn test_receipt_threads_participant_pn_into_sender_alt() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        // Aggregated shape: per-user participant_pn.
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "120363000000000001@g.us")
+                    .attr("id", "STANZA-PPN")
+                    .attr("t", "1700000000")
+                    .children([NodeBuilder::new("participants")
+                        .attr("message_id", "MSG-PPN")
+                        .children([NodeBuilder::new("user")
+                            .attr("jid", "99000000000001@lid")
+                            .attr("participant_pn", "15551234567@s.whatsapp.net")
+                            .attr("type", "read")
+                            .build()])
+                        .build()])
+                    .build(),
+            ))
+            .await;
+
+        // Simple shape: receipt-level participant_pn.
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "99000000000002@lid")
+                    .attr("id", "STANZA-PPN-SIMPLE")
+                    .attr("participant_pn", "15557654321@s.whatsapp.net")
+                    .attr("t", "1700000000")
+                    .build(),
+            ))
+            .await;
+
+        let events = collector.events();
+        let receipts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+
+        let agg = receipts
+            .iter()
+            .find(|r| r.message_ids.iter().any(|id| id == "MSG-PPN"))
+            .expect("aggregated receipt dispatched");
+        assert_eq!(
+            agg.source.sender_alt.as_ref().expect("sender_alt set").user,
+            "15551234567",
+            "aggregated receipt must thread per-user participant_pn into sender_alt"
+        );
+
+        let simple = receipts
+            .iter()
+            .find(|r| r.message_ids.iter().any(|id| id == "STANZA-PPN-SIMPLE"))
+            .expect("simple receipt dispatched");
+        assert_eq!(
+            simple
+                .source
+                .sender_alt
+                .as_ref()
+                .expect("sender_alt set")
+                .user,
+            "15557654321",
+            "simple receipt must thread receipt-level participant_pn into sender_alt"
+        );
     }
 
     /// Missing per-user `t`: the fan-out event's timestamp falls back to
