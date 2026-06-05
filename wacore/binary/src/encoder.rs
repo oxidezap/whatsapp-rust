@@ -1607,6 +1607,29 @@ mod tests {
         Ok(())
     }
 
+    /// `@call` must round-trip via JID_PAIR instead of failing the whole node decode.
+    #[test]
+    fn test_call_jid_round_trips_via_jid_pair() -> TestResult {
+        use crate::decoder::Decoder;
+
+        let node = NodeBuilder::new("call").attr("from", "12345@call").build();
+        let mut buffer = Vec::new();
+        let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+        encoder.write_node(&node)?;
+        assert!(
+            !buffer.contains(&token::AD_JID),
+            "AD_JID must not be emitted for @call (would lose the server)"
+        );
+
+        let decoded = Decoder::new(&buffer[1..]).read_node_ref()?.to_owned();
+        let from = decoded
+            .attrs
+            .get("from")
+            .expect("from attr must survive the round-trip");
+        assert_eq!(from.to_string(), "12345@call");
+        Ok(())
+    }
+
     /// Same invariant as above but exercised through the typed
     /// `NodeValue::Jid` path (write_jid_owned + size estimators), which
     /// previously ignored the server check and emitted AD_JID for any

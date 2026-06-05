@@ -177,6 +177,8 @@ pub enum Server {
     Interop = 8,
     Bot = 9,
     Legacy = 10,
+    /// `@call` call-signaling JID; not an AD server, so it round-trips via JID_PAIR.
+    Call = 11,
 }
 
 #[cfg(feature = "serde")]
@@ -209,6 +211,7 @@ impl Server {
             Self::Interop => "interop",
             Self::Bot => "bot",
             Self::Legacy => "c.us",
+            Self::Call => "call",
         }
     }
 
@@ -268,6 +271,7 @@ impl TryFrom<&str> for Server {
             "interop" => Ok(Self::Interop),
             "bot" => Ok(Self::Bot),
             "c.us" => Ok(Self::Legacy),
+            "call" => Ok(Self::Call),
             other => Err(JidError::InvalidFormat(format!("unknown server: {other}"))),
         }
     }
@@ -945,6 +949,9 @@ mod tests {
         // LID JID cases (critical for the bug)
         assert_jid_roundtrip("12345.6789@lid", "12345.6789", "lid", 0, 0);
         assert_jid_roundtrip("12345.6789:25@lid", "12345.6789", "lid", 25, 0);
+
+        // @call (call-signaling server) must parse and render, not be rejected.
+        assert_jid_roundtrip("12345@call", "12345", "call", 0, 0);
     }
 
     #[test]
