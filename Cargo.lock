@@ -2261,6 +2261,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wamex"
+version = "0.6.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "waproto"
 version = "0.6.0"
 dependencies = [

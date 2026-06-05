@@ -23,6 +23,7 @@ members = [
     "wacore/derive",
     "wacore/libsignal",
     "wacore/noise",
+    "wamex",
     "waproto",
 ]
 default-members = [
@@ -36,6 +37,7 @@ default-members = [
     "wacore/derive",
     "wacore/libsignal",
     "wacore/noise",
+    "wamex",
     "waproto",
 ]
 

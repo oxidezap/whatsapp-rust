@@ -1,0 +1,22 @@
+[package]
+name = "wamex"
+version = "0.6.0"
+edition = "2024"
+authors = ["João Lucas <jlucaso@hotmail.com>"]
+license = "MIT"
+repository = "https://github.com/jlucaso1/whatsapp-rust"
+description = "Typed WhatsApp mex (GraphQL persisted-query) operations, generated from the whatspec IR"
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+
+[build-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
