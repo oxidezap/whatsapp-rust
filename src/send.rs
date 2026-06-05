@@ -1779,7 +1779,7 @@ impl Client {
         // AB prop gates stanza inclusion only (not issuance scheduling)
         let token_send_enabled = self
             .ab_props
-            .is_enabled_or(web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES, false)
+            .is_enabled(web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES)
             .await;
 
         if token_send_enabled {
@@ -1795,7 +1795,7 @@ impl Client {
                     // cstoken fallback — gated by wa_nct_token_send_enabled
                     let nct_send_enabled = self
                         .ab_props
-                        .is_enabled_or(web::WA_NCT_TOKEN_SEND_ENABLED, false)
+                        .is_enabled(web::WA_NCT_TOKEN_SEND_ENABLED)
                         .await;
 
                     if nct_send_enabled
@@ -2056,25 +2056,13 @@ impl Client {
     /// Build tctoken timing config from AB props, falling back to defaults.
     pub(crate) async fn tc_token_config(&self) -> wacore::iq::tctoken::TcTokenConfig {
         use wacore::iq::abprops::web;
-        use wacore::iq::tctoken::{TC_TOKEN_BUCKET_DURATION, TC_TOKEN_NUM_BUCKETS, TcTokenConfig};
+        use wacore::iq::tctoken::TcTokenConfig;
 
         TcTokenConfig {
-            bucket_duration: self
-                .ab_props
-                .get_int(web::TCTOKEN_DURATION, TC_TOKEN_BUCKET_DURATION)
-                .await,
-            num_buckets: self
-                .ab_props
-                .get_int(web::TCTOKEN_NUM_BUCKETS, TC_TOKEN_NUM_BUCKETS)
-                .await,
-            sender_bucket_duration: self
-                .ab_props
-                .get_int(web::TCTOKEN_DURATION_SENDER, TC_TOKEN_BUCKET_DURATION)
-                .await,
-            sender_num_buckets: self
-                .ab_props
-                .get_int(web::TCTOKEN_NUM_BUCKETS_SENDER, TC_TOKEN_NUM_BUCKETS)
-                .await,
+            bucket_duration: self.ab_props.get_int(web::TCTOKEN_DURATION).await,
+            num_buckets: self.ab_props.get_int(web::TCTOKEN_NUM_BUCKETS).await,
+            sender_bucket_duration: self.ab_props.get_int(web::TCTOKEN_DURATION_SENDER).await,
+            sender_num_buckets: self.ab_props.get_int(web::TCTOKEN_NUM_BUCKETS_SENDER).await,
         }
         .clamped()
     }

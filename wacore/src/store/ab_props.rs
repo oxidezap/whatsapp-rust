@@ -1,8 +1,8 @@
 //! In-memory cache for server-side A/B experiment properties.
 //!
-//! Only stores props whose config_code appears in the interest set.
-//! Props not in the set are discarded during parsing, avoiding heap
-//! allocation for the ~1,200 props we never query.
+//! Only stores props whose code is in the interest set. Props not in the set
+//! are discarded during parsing, avoiding heap allocation for the thousands of
+//! server props we never query.
 //!
 //! Not persisted — props are fetched on every connect.
 
@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_lock::RwLock;
 use wacore_binary::CompactString;
 
-use crate::iq::abprops::AbProp;
+use crate::iq::abprops::{AbDefault, AbProp};
 use crate::iq::props::WATCHED;
 
 /// In-memory cache of AB experiment properties, populated on connect.
-/// Only materializes props whose config_code is in the interest set.
+/// Only materializes props whose code is in the interest set.
 /// Pre-populated with the `WATCHED` flags; extend via `watch()`.
 pub struct AbPropsCache {
     props: RwLock<HashMap<u32, CompactString>>,
@@ -53,7 +53,7 @@ impl AbPropsCache {
         self.seeded.load(Ordering::Acquire)
     }
 
-    /// Apply a props response, retaining only watched config codes.
+    /// Apply a props response, retaining only watched flag codes.
     pub async fn apply_props(
         &self,
         delta_update: bool,
@@ -81,26 +81,30 @@ impl AbPropsCache {
         self.props.read().await.get(&prop.code).cloned()
     }
 
-    /// True when the prop value is truthy (`"1"`, `"true"`, or `"enabled"`).
+    /// True when the cached value is truthy (`"1"`, `"true"`, or `"enabled"`),
+    /// falling back to the flag's registry default when the server didn't send
+    /// it. The registry is the single source of truth for the default.
     pub async fn is_enabled(&self, prop: AbProp) -> bool {
-        self.is_enabled_or(prop, false).await
-    }
-
-    pub async fn is_enabled_or(&self, prop: AbProp, default: bool) -> bool {
         match self.props.read().await.get(&prop.code) {
             Some(value) => {
                 value == "1"
                     || value.eq_ignore_ascii_case("true")
                     || value.eq_ignore_ascii_case("enabled")
             }
-            None => default,
+            None => matches!(prop.default, AbDefault::Bool(true)),
         }
     }
 
-    pub async fn get_int(&self, prop: AbProp, default: i64) -> i64 {
+    /// The cached int value, falling back to the flag's registry default when
+    /// the server didn't send it (or it's not an int flag).
+    pub async fn get_int(&self, prop: AbProp) -> i64 {
+        let fallback = match prop.default {
+            AbDefault::Int(n) => n,
+            _ => 0,
+        };
         match self.props.read().await.get(&prop.code) {
-            Some(value) => value.parse().unwrap_or(default),
-            None => default,
+            Some(value) => value.parse().unwrap_or(fallback),
+            None => fallback,
         }
     }
 }
@@ -231,8 +235,8 @@ mod tests {
                 .await
         );
         assert!(cache.is_enabled(web::WA_NCT_TOKEN_SEND_ENABLED).await);
-        assert_eq!(cache.get_int(web::TCTOKEN_DURATION, 0).await, 604800);
-        assert_eq!(cache.get_int(web::TCTOKEN_NUM_BUCKETS, 0).await, 4);
+        assert_eq!(cache.get_int(web::TCTOKEN_DURATION).await, 604800);
+        assert_eq!(cache.get_int(web::TCTOKEN_NUM_BUCKETS).await, 4);
         // Unwatched code should NOT be retained
         assert_eq!(cache.get(flag(99999)).await, None);
     }
@@ -251,6 +255,6 @@ mod tests {
             .await;
 
         assert!(cache.is_seeded());
-        assert_eq!(cache.get_int(web::TCTOKEN_DURATION, 0).await, 100);
+        assert_eq!(cache.get_int(web::TCTOKEN_DURATION).await, 100);
     }
 }
