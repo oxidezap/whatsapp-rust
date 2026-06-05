@@ -1718,7 +1718,7 @@ impl Client {
         to: &Jid,
         extra_nodes: &mut Vec<Node>,
     ) -> (bool, Option<String>) {
-        use wacore::iq::props::config_codes;
+        use wacore::iq::abprops::web;
         use wacore::iq::tctoken::{
             build_cs_token_node, build_tc_token_node, compute_cs_token, is_tc_token_expired_with,
             should_send_new_tc_token_with,
@@ -1779,7 +1779,7 @@ impl Client {
         // AB prop gates stanza inclusion only (not issuance scheduling)
         let token_send_enabled = self
             .ab_props
-            .is_enabled_or(config_codes::PRIVACY_TOKEN_ON_ALL_1_ON_1_MESSAGES, false)
+            .is_enabled_or(web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES, false)
             .await;
 
         if token_send_enabled {
@@ -1795,7 +1795,7 @@ impl Client {
                     // cstoken fallback — gated by wa_nct_token_send_enabled
                     let nct_send_enabled = self
                         .ab_props
-                        .is_enabled_or(config_codes::NCT_TOKEN_SEND_ENABLED, false)
+                        .is_enabled_or(web::WA_NCT_TOKEN_SEND_ENABLED, false)
                         .await;
 
                     if nct_send_enabled
@@ -2055,31 +2055,25 @@ impl Client {
 
     /// Build tctoken timing config from AB props, falling back to defaults.
     pub(crate) async fn tc_token_config(&self) -> wacore::iq::tctoken::TcTokenConfig {
-        use wacore::iq::props::config_codes;
+        use wacore::iq::abprops::web;
         use wacore::iq::tctoken::{TC_TOKEN_BUCKET_DURATION, TC_TOKEN_NUM_BUCKETS, TcTokenConfig};
 
         TcTokenConfig {
             bucket_duration: self
                 .ab_props
-                .get_int(config_codes::TCTOKEN_DURATION, TC_TOKEN_BUCKET_DURATION)
+                .get_int(web::TCTOKEN_DURATION, TC_TOKEN_BUCKET_DURATION)
                 .await,
             num_buckets: self
                 .ab_props
-                .get_int(config_codes::TCTOKEN_NUM_BUCKETS, TC_TOKEN_NUM_BUCKETS)
+                .get_int(web::TCTOKEN_NUM_BUCKETS, TC_TOKEN_NUM_BUCKETS)
                 .await,
             sender_bucket_duration: self
                 .ab_props
-                .get_int(
-                    config_codes::TCTOKEN_DURATION_SENDER,
-                    TC_TOKEN_BUCKET_DURATION,
-                )
+                .get_int(web::TCTOKEN_DURATION_SENDER, TC_TOKEN_BUCKET_DURATION)
                 .await,
             sender_num_buckets: self
                 .ab_props
-                .get_int(
-                    config_codes::TCTOKEN_NUM_BUCKETS_SENDER,
-                    TC_TOKEN_NUM_BUCKETS,
-                )
+                .get_int(web::TCTOKEN_NUM_BUCKETS_SENDER, TC_TOKEN_NUM_BUCKETS)
                 .await,
         }
         .clamped()
@@ -2101,12 +2095,12 @@ impl Client {
     /// Resolve the target JID for privacy token issuance.
     /// Gated by `lid_trusted_token_issue_to_lid` — LID when true, PN when false.
     async fn resolve_issuance_jid(&self, jid: &Jid) -> Jid {
-        use wacore::iq::props::config_codes;
+        use wacore::iq::abprops::web;
 
-        // Default true: issue to LID by default (safer — server accepts both)
+        // Matches the upstream default (false); the server overrides per-account.
         let issue_to_lid = self
             .ab_props
-            .is_enabled_or(config_codes::LID_TRUSTED_TOKEN_ISSUE_TO_LID, true)
+            .is_enabled(web::LID_TRUSTED_TOKEN_ISSUE_TO_LID)
             .await;
 
         let resolved = if issue_to_lid {

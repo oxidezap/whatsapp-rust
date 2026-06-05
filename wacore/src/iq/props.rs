@@ -34,48 +34,50 @@ use wacore_binary::{Node, NodeContent, NodeRef};
 /// IQ namespace for A/B props.
 pub const PROPS_NAMESPACE: &str = "abt";
 
-/// Well-known AB prop config codes from WhatsApp Web's ABPropConfigs.
-pub mod config_codes {
-    // --- Privacy token gating ---
-    pub const PRIVACY_TOKEN_ON_ALL_1_ON_1_MESSAGES: u32 = 10_518;
-    pub const PRIVACY_TOKEN_ON_GROUP_CREATE: u32 = 11_261;
-    pub const PRIVACY_TOKEN_ON_GROUP_PARTICIPANT_ADD: u32 = 11_262;
-    pub const PRIVACY_TOKEN_ONLY_CHECK_LID: u32 = 15_491;
+use crate::iq::abprops;
+
+/// AB props this client still references but which the current WA Web bundle no
+/// longer ships, so they are absent from the generated [`crate::iq::abprops`]
+/// registry. The server never sends them, so gating on them always falls to the
+/// callsite default. Kept as explicit consts to preserve that behavior and to
+/// flag them for removal if the gated feature is reworked.
+pub mod stale {
+    use crate::iq::abprops::{AbDefault, AbProp, AbPropType};
+
+    pub const PRIVACY_TOKEN_ONLY_CHECK_LID: AbProp = AbProp {
+        name: "privacy_token_only_check_lid",
+        code: 15_491,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+
     /// Gates tctoken inclusion in profile picture IQ requests.
-    pub const PROFILE_PIC_PRIVACY_TOKEN: u32 = 9_666;
-    /// When true, issue privacy tokens to LID JIDs instead of PN JIDs.
-    pub const LID_TRUSTED_TOKEN_ISSUE_TO_LID: u32 = 14_303;
-
-    // --- tctoken timing (int props, not booleans) ---
-    /// Receiver-side bucket duration in seconds (default 604800 = 7 days).
-    pub const TCTOKEN_DURATION: u32 = 865;
-    /// Sender-side bucket duration in seconds (default 604800 = 7 days).
-    pub const TCTOKEN_DURATION_SENDER: u32 = 996;
-    /// Receiver-side number of buckets in the rolling window (default 4).
-    pub const TCTOKEN_NUM_BUCKETS: u32 = 909;
-    /// Sender-side number of buckets (default 4).
-    pub const TCTOKEN_NUM_BUCKETS_SENDER: u32 = 997;
-
-    // --- NCT / cstoken ---
-    /// Gates cstoken (HMAC fallback) inclusion in outgoing messages.
-    pub const NCT_TOKEN_SEND_ENABLED: u32 = 24_941;
-
-    /// All production config codes. Must match DEFAULT_INTEREST in ab_props.rs.
-    /// When adding a new code above, add it here too.
-    pub const ALL: &[u32] = &[
-        PRIVACY_TOKEN_ON_ALL_1_ON_1_MESSAGES,
-        PRIVACY_TOKEN_ON_GROUP_CREATE,
-        PRIVACY_TOKEN_ON_GROUP_PARTICIPANT_ADD,
-        PRIVACY_TOKEN_ONLY_CHECK_LID,
-        PROFILE_PIC_PRIVACY_TOKEN,
-        LID_TRUSTED_TOKEN_ISSUE_TO_LID,
-        TCTOKEN_DURATION,
-        TCTOKEN_DURATION_SENDER,
-        TCTOKEN_NUM_BUCKETS,
-        TCTOKEN_NUM_BUCKETS_SENDER,
-        NCT_TOKEN_SEND_ENABLED,
-    ];
+    pub const PROFILE_PIC_PRIVACY_TOKEN: AbProp = AbProp {
+        name: "profile_pic_privacy_token",
+        code: 9_666,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(true),
+    };
 }
+
+/// AB props this client reads. Seeds the cache interest set so the other ~2090
+/// server props are discarded on `apply_props`. Add an entry when you start
+/// reading a new flag from [`crate::iq::abprops`]. Only these consts (and their
+/// name strings) materialize in the binary; the rest of the vendored registry is
+/// unreferenced and emitted nowhere.
+pub const WATCHED: &[abprops::AbProp] = &[
+    abprops::web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES,
+    abprops::web::PRIVACY_TOKEN_SENDING_ON_GROUP_CREATE,
+    abprops::web::PRIVACY_TOKEN_SENDING_ON_GROUP_PARTICIPANT_ADD,
+    abprops::web::LID_TRUSTED_TOKEN_ISSUE_TO_LID,
+    abprops::web::TCTOKEN_DURATION,
+    abprops::web::TCTOKEN_DURATION_SENDER,
+    abprops::web::TCTOKEN_NUM_BUCKETS,
+    abprops::web::TCTOKEN_NUM_BUCKETS_SENDER,
+    abprops::web::WA_NCT_TOKEN_SEND_ENABLED,
+    stale::PRIVACY_TOKEN_ONLY_CHECK_LID,
+    stale::PROFILE_PIC_PRIVACY_TOKEN,
+];
 
 /// Protocol version for props requests.
 pub const PROPS_PROTOCOL_VERSION: &str = "1";

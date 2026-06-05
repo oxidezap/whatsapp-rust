@@ -371,7 +371,7 @@ impl<'a> Groups<'a> {
         if self
             .client
             .ab_props()
-            .is_enabled(wacore::iq::props::config_codes::PRIVACY_TOKEN_ON_GROUP_CREATE)
+            .is_enabled(wacore::iq::abprops::web::PRIVACY_TOKEN_SENDING_ON_GROUP_CREATE)
             .await
         {
             self.attach_tokens_to_participants(&mut options.participants)
@@ -422,7 +422,7 @@ impl<'a> Groups<'a> {
         let iq = if self
             .client
             .ab_props()
-            .is_enabled(wacore::iq::props::config_codes::PRIVACY_TOKEN_ON_GROUP_PARTICIPANT_ADD)
+            .is_enabled(wacore::iq::abprops::web::PRIVACY_TOKEN_SENDING_ON_GROUP_PARTICIPANT_ADD)
             .await
         {
             let options = self.resolve_participant_tokens(participants).await;
@@ -904,7 +904,7 @@ impl<'a> Groups<'a> {
     async fn only_check_lid(&self) -> bool {
         self.client
             .ab_props()
-            .is_enabled(wacore::iq::props::config_codes::PRIVACY_TOKEN_ONLY_CHECK_LID)
+            .is_enabled(wacore::iq::props::stale::PRIVACY_TOKEN_ONLY_CHECK_LID)
             .await
     }
 

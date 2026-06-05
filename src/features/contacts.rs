@@ -149,10 +149,7 @@ impl<'a> Contacts<'a> {
             && self
                 .client
                 .ab_props
-                .is_enabled_or(
-                    wacore::iq::props::config_codes::PROFILE_PIC_PRIVACY_TOKEN,
-                    true,
-                )
+                .is_enabled_or(wacore::iq::props::stale::PROFILE_PIC_PRIVACY_TOKEN, true)
                 .await
             && let Some(token) = self.client.lookup_tc_token_for_jid(jid).await
         {
