@@ -1020,7 +1020,9 @@ pub async fn prepare_dm_stanza<
     extra_stanza_nodes: &[Node],
     all_devices: Vec<Jid>,
 ) -> Result<PreparedDmStanza> {
-    let reporting_result = generate_reporting_token(message, &request_id, &to_jid, &to_jid, None);
+    // sender is the author's own jid, remote is the chat jid (WAWebReportingTokenUtils:
+    // getSender vs e.to). Both previously used to_jid, conflating sender with remote.
+    let reporting_result = generate_reporting_token(message, &request_id, own_jid, &to_jid, None);
 
     let message_for_encryption = if let Some(ref result) = reporting_result {
         prepare_message_with_context(message, &result.message_secret)
