@@ -30,6 +30,10 @@ impl Client {
             .fetch_add(1, Ordering::SeqCst);
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.read_loop", level = "debug", skip_all, err(Debug))
+    )]
     pub(crate) async fn read_messages_loop(self: &Arc<Self>) -> Result<(), anyhow::Error> {
         debug!("Starting message processing loop...");
 
@@ -147,6 +151,10 @@ impl Client {
 
     /// Decrypt a frame and return the parsed node as a zero-copy OwnedNodeRef.
     /// This must be called sequentially due to noise protocol counter requirements.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.decrypt_frame", level = "trace", skip_all)
+    )]
     pub(crate) async fn decrypt_frame(
         self: &Arc<Self>,
         encrypted_frame: bytes::BytesMut,
@@ -197,6 +205,10 @@ impl Client {
     }
 
     /// Process a node wrapped in Arc. Handlers receive the Arc and can share/store it cheaply.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.node", level = "trace", skip_all, fields(tag = %node.get().tag.as_ref()))
+    )]
     pub(crate) async fn process_node(self: &Arc<Self>, node: Arc<wacore_binary::OwnedNodeRef>) {
         use wacore::xml::DisplayableNodeRef;
         let nr = node.get();
@@ -415,6 +427,10 @@ impl Client {
     }
 
     /// Build and send an <ack/> node corresponding to the given stanza.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.ack", level = "trace", skip_all, err(Debug))
+    )]
     pub(crate) async fn send_ack_for(
         &self,
         node: &wacore_binary::NodeRef<'_>,
@@ -495,6 +511,10 @@ impl Client {
         });
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.success", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_success(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) {
         // Skip processing if an expected disconnect is pending (e.g., 515 received).
         // This prevents race conditions where a spawned success handler runs after
@@ -547,7 +567,7 @@ impl Client {
                 let device_snapshot =
                     client_clone.persistence_manager.get_device_snapshot().await;
                 if device_snapshot.lid.as_ref() != Some(&lid) {
-                    debug!("Updating LID from server to '{lid}'");
+                    debug!("Updating LID from server to '{}'", lid.observe());
                     client_clone
                         .persistence_manager
                         .process_command(DeviceCommand::SetLid(Some(lid)))
@@ -879,6 +899,10 @@ impl Client {
     ///
     /// If an ack with an ID that matches a pending task in `response_waiters`,
     /// the task is resolved and the function returns `true`. Otherwise, returns `false`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.ack_response", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_ack_response(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         // Surface server nack codes for diagnosability. A nacked send still
         // resolves Ok to the caller, so without this the failure is invisible.
@@ -939,6 +963,10 @@ impl Client {
         false
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.stream_error", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_stream_error(&self, node: &wacore_binary::NodeRef<'_>) {
         // is_logged_in handling: opt-in branches (515/516/401/409/conflict) clear it
         // in the disconnect block below; 429/503 clear it inline because the server
@@ -1091,6 +1119,10 @@ impl Client {
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.connect_failure", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_connect_failure(&self, node: &wacore_binary::NodeRef<'_>) {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.notify_connection_shutdown();
@@ -1156,6 +1188,10 @@ impl Client {
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.iq_in", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_iq(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
         if node.get_attr("type").is_some_and(|s| s.as_str() == "get")
             && (node.get_optional_child("ping").is_some()

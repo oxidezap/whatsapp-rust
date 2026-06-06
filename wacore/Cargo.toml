@@ -12,6 +12,10 @@ default = ["simd"]
 simd = ["wacore-appstate/simd"]
 debug-diagnostics = []
 debug-snapshots = []
+# Optional observability: emit tracing spans/events. Off by default (no dep).
+tracing = ["dep:tracing"]
+# Render raw phone numbers in tracing fields instead of redacted tokens (debug only).
+tracing-pii = ["wacore-binary/tracing-pii"]
 # Disables XEdDSA verification of the server's Noise cert chain. Required
 # for the e2e mock server (self-signed certs). NEVER enable in prod.
 danger-skip-cert-chain-verify = ["wacore-noise/danger-skip-cert-chain-verify"]
@@ -39,6 +43,7 @@ hmac = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
 md5 = "0.8.0"
+tracing = { workspace = true, optional = true }
 portable-atomic = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }

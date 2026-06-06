@@ -8,6 +8,7 @@ use waproto::whatsapp as wa;
 use super::Client;
 
 impl Client {
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.set_sender_key_status", level = "debug", skip_all, fields(count = device_jids.len(), has_key = has_key), err(Debug)))]
     pub(crate) async fn set_sender_key_status_for_devices(
         &self,
         group_jid: &str,
@@ -57,6 +58,7 @@ impl Client {
     /// Mark device JIDs as needing fresh SKDM (has_key = false).
     /// Filters out our own devices (WA Web: `!isMeDevice(e)` check).
     /// Called from handle_retry_receipt for group/status messages.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.mark_forget_sender_key", level = "debug", skip_all, fields(count = device_jids.len()), err(Debug)))]
     pub(crate) async fn mark_forget_sender_key(
         &self,
         group_jid: &str,
@@ -73,6 +75,7 @@ impl Client {
     /// the group and wipe `sender_key_devices` so the next send takes the
     /// `force_skdm=true` path (`!key_exists`) and redistributes to all
     /// remaining participants.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.rotate_sender_key_on_remove", level = "debug", skip_all, fields(removed = removed_user_ids.len())))]
     pub(crate) async fn rotate_sender_key_on_participant_remove(
         &self,
         group_jid: &str,
@@ -141,6 +144,7 @@ impl Client {
     /// alternate PN/LID key, `alternate_chat` contains the namespace that
     /// matched -- the caller should use it for session operations instead of
     /// `resolve_encryption_jid` (which would map back to the primary).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.take_recent_message", level = "debug", skip_all, fields(peer = %to.observe())))]
     pub(crate) async fn take_recent_message(
         &self,
         to: &Jid,
@@ -164,9 +168,9 @@ impl Client {
         if let Some(alt_chat) = alt_chat {
             log::debug!(
                 "Primary key miss for {}:{}, trying alternate {}",
-                primary_key.chat,
+                primary_key.chat.observe(),
                 id,
-                alt_chat
+                alt_chat.observe()
             );
             let alt_key = ChatMessageId {
                 chat: alt_chat,
@@ -203,7 +207,7 @@ impl Client {
             }
             log::warn!(
                 "Failed to decode cached message for {}:{}, trying DB",
-                key.chat,
+                key.chat.observe(),
                 key.id
             );
         }
@@ -220,7 +224,7 @@ impl Client {
                 Err(e) => {
                     log::warn!(
                         "Failed to decode DB message for {}:{}: {}",
-                        key.chat,
+                        key.chat.observe(),
                         key.id,
                         e
                     );
@@ -231,7 +235,7 @@ impl Client {
             Err(e) => {
                 log::warn!(
                     "Failed to read sent message from DB for {}:{}: {}",
-                    key.chat,
+                    key.chat.observe(),
                     key.id,
                     e
                 );
@@ -244,6 +248,7 @@ impl Client {
     /// is enabled (capacity > 0) also stores in-memory for fast retrieval.
     /// In DB-only mode (capacity = 0), the DB write is awaited to guarantee persistence.
     /// With L1 cache, the DB write is backgrounded since the cache serves reads immediately.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.add_recent_message", level = "debug", skip_all, fields(peer = %to.observe())))]
     pub(crate) async fn add_recent_message(&self, to: &Jid, id: &str, msg: &wa::Message) {
         use prost::Message;
         let key = self.make_chat_message_id(to, id).await;

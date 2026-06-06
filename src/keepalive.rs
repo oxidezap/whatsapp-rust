@@ -50,6 +50,10 @@ impl Client {
     /// the pong's `t` attribute using RTT-adjusted midpoint calculation.
     ///
     /// WA Web: `sendPing` → `onClockSkewUpdate(Math.round((start + rtt/2) / 1000 - serverTime))`
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.keepalive.ping", level = "debug", skip_all)
+    )]
     async fn send_keepalive(&self) -> KeepaliveResult {
         if !self.is_connected() {
             return KeepaliveResult::FatalFailure;
@@ -92,6 +96,10 @@ impl Client {
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.keepalive", level = "debug", skip_all)
+    )]
     pub(crate) async fn keepalive_loop(self: Arc<Self>) {
         let mut error_count = 0u32;
         let mut cleanup_counter = 0u32;

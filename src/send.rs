@@ -389,6 +389,7 @@ impl Client {
     }
 
     /// Send a message with additional options.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn send_message_with_options(
         &self,
         to: Jid,
@@ -470,6 +471,7 @@ impl Client {
     /// `AddressingMode::Lid`; `prepare_group_stanza` signs with `own_lid`
     /// and emits `addressing_mode="lid"` on the stanza. Errors only if no
     /// recipient could be resolved.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.status", level = "debug", skip_all, fields(count = recipients.len()), err(Debug)))]
     pub(crate) async fn send_status_message(
         &self,
         message: wa::Message,
@@ -720,6 +722,7 @@ impl Client {
     /// For LID mode, uses `group_info.phone_jid_for_lid_user` to query devices
     /// via PN when available (LID usync is unreliable for own JID), then
     /// converts the result back to LID. Same fallback as `prepare_group_stanza`.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
     async fn resolve_skdm_targets(
         &self,
         group_jid: &str,
@@ -898,6 +901,7 @@ impl Client {
     /// Cold path of [`spawn_phash_validation`](Self::spawn_phash_validation): the
     /// server's phash disagreed with ours, so invalidate the relevant
     /// device/group caches and (for groups) force sender-key redistribution.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.phash_mismatch", level = "debug", skip_all, fields(jid = %jid.observe())))]
     async fn handle_phash_mismatch(
         &self,
         jid: &Jid,
@@ -906,7 +910,8 @@ impl Client {
         invalidate_group_cache: bool,
     ) {
         log::warn!(
-            "Phash mismatch for {jid}: ours={our_phash}, server={server_phash}. Invalidating caches."
+            "Phash mismatch for {}: ours={our_phash}, server={server_phash}. Invalidating caches.",
+            jid.observe()
         );
         // DM phash covers both recipient + own devices
         // (WA Web: syncDeviceListJob([recipient, me]))
@@ -974,6 +979,7 @@ impl Client {
     /// * `message_id` - The ID of the message to delete
     /// * `revoke_type` - Use `RevokeType::Sender` to delete your own message,
     ///   or `RevokeType::Admin { original_sender }` to delete another user's message as group admin
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.revoke", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn revoke_message(
         &self,
         to: Jid,
@@ -1062,6 +1068,7 @@ impl Client {
         .await
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.pin", level = "debug", skip_all, fields(chat = %chat.observe()), err(Debug)))]
     async fn send_pin(
         &self,
         chat: Jid,
@@ -1095,6 +1102,7 @@ impl Client {
         .await
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.impl", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_message_impl(
         &self,
@@ -1252,7 +1260,8 @@ impl Client {
 
                 if needs_rotation {
                     log::info!(
-                        "Periodic sender-key rotation for {to} (chain iteration ≥ {SENDER_KEY_ROTATION_THRESHOLD})"
+                        "Periodic sender-key rotation for {} (chain iteration ≥ {SENDER_KEY_ROTATION_THRESHOLD})",
+                        to.observe()
                     );
                     self.signal_cache
                         .delete_sender_key(sender_key_name.cache_key())
@@ -1327,7 +1336,10 @@ impl Client {
                     if let Some(SignalProtocolError::NoSenderKeyState(_)) =
                         e.downcast_ref::<SignalProtocolError>()
                     {
-                        log::warn!("No sender key for group {}, forcing distribution.", to);
+                        log::warn!(
+                            "No sender key for group {}, forcing distribution.",
+                            to.observe()
+                        );
 
                         if let Err(e) = self
                             .persistence_manager
@@ -1418,7 +1430,10 @@ impl Client {
                         }
                     }
                     Err(e) => {
-                        log::warn!("LID query failed for {}, falling back to PN: {e:?}", to);
+                        log::warn!(
+                            "LID query failed for {}, falling back to PN: {e:?}",
+                            to.observe()
+                        );
                     }
                 }
             }
@@ -1527,7 +1542,7 @@ impl Client {
                 }
             }
             if should_issue_tc_token_after_send {
-                debug!(target: "Client/TcToken", "Scheduled tc token issuance after send for {}", to);
+                debug!(target: "Client/TcToken", "Scheduled tc token issuance after send for {}", to.observe());
             }
 
             let lock_jids = self.build_session_lock_keys(&all_dm_jids).await;
@@ -1725,6 +1740,7 @@ impl Client {
     ///
     /// Returns whether we should issue a new tc token after send, and the cache key
     /// of the attached valid tc token when that token should be marked as used.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.maybe_tc_token", level = "debug", skip_all, fields(to = %to.observe())))]
     async fn maybe_include_tc_token(
         &self,
         to: &Jid,
@@ -1820,9 +1836,9 @@ impl Client {
                             wacore_binary::Jid::new(*lid_user, Server::Lid).to_string();
                         let cs_token = compute_cs_token(salt, &recipient_lid);
                         extra_nodes.push(build_cs_token_node(&cs_token));
-                        log::debug!(target: "Client/CsToken", "Attached cstoken for {} (NCT fallback)", to);
+                        log::debug!(target: "Client/CsToken", "Attached cstoken for {} (NCT fallback)", to.observe());
                     } else {
-                        log::debug!(target: "Client/CsToken", "No tctoken or NCT salt/LID available for {}", to);
+                        log::debug!(target: "Client/CsToken", "No tctoken or NCT salt/LID available for {}", to.observe());
                     }
                 }
             }
@@ -1832,6 +1848,7 @@ impl Client {
     }
 
     /// Returns `true` if the issuance IQ succeeded.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.issue_tc_token", level = "debug", skip_all, fields(to = %to.observe())))]
     async fn issue_tc_token_after_send(&self, to: &Jid) -> bool {
         use wacore::iq::tctoken::IssuePrivacyTokensSpec;
 
@@ -1847,7 +1864,7 @@ impl Client {
             )))
             .await
         else {
-            log::debug!(target: "Client/TcToken", "Failed to issue tc_token for {}", issuance_jid);
+            log::debug!(target: "Client/TcToken", "Failed to issue tc_token for {}", issuance_jid.observe());
             return false;
         };
 
@@ -1870,7 +1887,7 @@ impl Client {
         let mut any_stored = false;
         for received in tokens {
             if received.token.is_empty() {
-                log::warn!(target: "Client/TcToken", "Server returned empty tc_token for {}, skipping", received.jid);
+                log::warn!(target: "Client/TcToken", "Server returned empty tc_token for {}, skipping", received.jid.observe());
                 continue;
             }
 
@@ -1945,6 +1962,7 @@ impl Client {
     /// Re-issue tctoken after a contact's device identity changes.
     /// Only re-issues if we previously sent a token (sender_timestamp valid).
     /// Uses session_locks to deduplicate concurrent spawns for the same sender.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.reissue_tc_token", level = "debug", skip_all, fields(sender = %sender.observe())))]
     pub(crate) async fn reissue_tc_token_after_identity_change(&self, sender: &Jid) {
         use wacore::iq::tctoken::{IssuePrivacyTokensSpec, is_sender_tc_token_expired};
 
@@ -1994,14 +2012,14 @@ impl Client {
                 log::debug!(
                     target: "Client/TcToken",
                     "Re-issued tctoken after identity change for {}",
-                    sender
+                    sender.observe()
                 );
             }
             Err(e) => {
                 log::debug!(
                     target: "Client/TcToken",
                     "Failed to re-issue tctoken after identity change for {}: {e}",
-                    sender
+                    sender.observe()
                 );
             }
         }

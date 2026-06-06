@@ -7,6 +7,7 @@ impl Client {
     /// Newsletters are not E2E encrypted and use the <plaintext> tag directly.
     /// They never carry a `secret_encrypted_message`, so no messageSecret is
     /// stored or retained for newsletter chats (no newsletter retention class).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.newsletter", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), msg_id = %info.id)))]
     pub(crate) async fn handle_newsletter_message(
         self: &Arc<Self>,
         node: &NodeRef<'_>,
@@ -27,7 +28,7 @@ impl Client {
                     log::info!(
                         "[msg:{}] Received newsletter plaintext message from {}",
                         info.id,
-                        info.source.chat
+                        info.source.chat.observe()
                     );
                     self.dispatch_parsed_message(msg, info).await;
                 }
@@ -42,11 +43,15 @@ impl Client {
             log::debug!(
                 "[msg:{}] Newsletter <plaintext> node from {} had no content bytes; skipping decode",
                 info.id,
-                info.source.chat
+                info.source.chat.observe()
             );
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.appstate_key_share", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_app_state_sync_key_share(
         &self,
         keys: &wa::message::AppStateSyncKeyShare,
@@ -119,6 +124,7 @@ impl Client {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.skdm", level = "debug", skip_all, fields(group = %group_jid.observe(), sender = %sender_jid.observe())))]
     pub(crate) async fn handle_sender_key_distribution_message(
         self: &Arc<Self>,
         group_jid: &Jid,
@@ -137,7 +143,7 @@ impl Client {
                     ) else {
                         log::warn!(
                             "Go SKDM from {} missing required fields (signing_key={}, id={}, iteration={}, chain_key={})",
-                            sender_jid,
+                            sender_jid.observe(),
                             go_msg.signing_key.is_some(),
                             go_msg.id.is_some(),
                             go_msg.iteration.is_some(),
@@ -151,7 +157,7 @@ impl Client {
                             log::error!(
                                 "Invalid chain_key length {} from Go SKDM from {}",
                                 chain_key.len(),
-                                sender_jid
+                                sender_jid.observe()
                             );
                             return;
                         }
@@ -169,7 +175,7 @@ impl Client {
                                 Err(e) => {
                                     log::error!(
                                         "Failed to construct SKDM from Go format from {}: {:?} (original parse error: {:?})",
-                                        sender_jid,
+                                        sender_jid.observe(),
                                         e,
                                         e1
                                     );
@@ -180,7 +186,7 @@ impl Client {
                         Err(e) => {
                             log::error!(
                                 "Failed to parse public key from Go SKDM for {}: {:?} (original parse error: {:?})",
-                                sender_jid,
+                                sender_jid.observe(),
                                 e,
                                 e1
                             );
@@ -191,7 +197,7 @@ impl Client {
                 Err(e2) => {
                     log::error!(
                         "Failed to parse SenderKeyDistributionMessage (standard and Go fallback) from {}: primary: {:?}, fallback: {:?}",
-                        sender_jid,
+                        sender_jid.observe(),
                         e1,
                         e2
                     );
@@ -218,14 +224,14 @@ impl Client {
         {
             log::error!(
                 "Failed to process SenderKeyDistributionMessage from {}: {:?}",
-                sender_jid,
+                sender_jid.observe(),
                 e
             );
         } else {
             log::debug!(
                 "Successfully processed sender key distribution for group {} from {}",
-                group_jid,
-                sender_jid
+                group_jid.observe(),
+                sender_jid.observe()
             );
         }
     }

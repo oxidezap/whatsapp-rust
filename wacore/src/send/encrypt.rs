@@ -5,6 +5,10 @@ use super::*;
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
 /// across the surrounding SKDM creation + this encrypt, so a concurrent send
 /// can't split the key between the SKDM and the skmsg.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.send.encrypt_group", level = "debug", skip_all, err(Debug))
+)]
 pub async fn encrypt_group_message<S, R>(
     sender_key_store: &mut S,
     sender_key_name: &SenderKeyName,
@@ -284,6 +288,7 @@ fn push_encrypt_result(
 ///
 /// Callers must hold per-device session locks before calling this function —
 /// concurrent ratchet mutations will corrupt Signal session state.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
 pub async fn encrypt_for_devices<'a, S, I, P, SP>(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'a, S, I, P, SP>,
@@ -325,8 +330,8 @@ where
             if stores.session_store.has_session(&reusable_addr).await? {
                 log::debug!(
                     "Using LID session {} for PN {} (LID-first lookup)",
-                    lid_jid,
-                    device_jid
+                    lid_jid.observe(),
+                    device_jid.observe()
                 );
                 encryption_overrides[idx] = Some(lid_jid);
                 continue;
@@ -347,8 +352,8 @@ where
             let lid_jid = Jid::lid_device(lid_user, device_jid.device);
             log::debug!(
                 "Will create LID session {} for PN {} (no existing session)",
-                lid_jid,
-                device_jid
+                lid_jid.observe(),
+                device_jid.observe()
             );
             encryption_overrides[idx] = Some(lid_jid);
         }

@@ -17,6 +17,9 @@ crate-type = ["rlib"]
 default = ["simd"]
 simd = []
 serde = ["dep:serde", "compact_str/serde"]
+# Render raw phone numbers in `Jid::observe()` instead of the redacted `pn#<hash>`.
+# Local debugging only; never enable in production.
+tracing-pii = []
 
 [dependencies]
 bytes = { workspace = true }

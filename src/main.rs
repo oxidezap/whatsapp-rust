@@ -1,3 +1,7 @@
+// See the matching note in lib.rs: instrumented large async fns need a deeper
+// recursion limit when the `tracing` + `tracing-pii` paths combine.
+#![recursion_limit = "512"]
+
 use log::{error, info};
 use std::sync::Arc;
 use wacore::proto_helpers::MessageExt;

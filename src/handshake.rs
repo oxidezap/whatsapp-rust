@@ -152,6 +152,10 @@ fn should_persist_cert_chain(device: &wacore::store::Device) -> bool {
     device.is_registered()
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.conn.handshake", level = "debug", skip_all, err(Debug))
+)]
 pub async fn do_handshake(
     runtime: Arc<dyn Runtime>,
     persistence_manager: &PersistenceManager,
@@ -231,6 +235,10 @@ pub async fn do_handshake(
     }
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.conn.handshake.xx", level = "debug", skip_all, err(Debug))
+)]
 async fn run_xx_handshake(
     runtime: &Arc<dyn Runtime>,
     device: &wacore::store::Device,
@@ -268,6 +276,10 @@ async fn run_xx_handshake(
 
 /// `fallback_taken` is set to `true` once we pivot from IK to XXfallback,
 /// before any operation that could fail.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.conn.handshake.ik", level = "debug", skip_all, err(Debug))
+)]
 async fn run_ik_handshake(
     runtime: &Arc<dyn Runtime>,
     device: &wacore::store::Device,

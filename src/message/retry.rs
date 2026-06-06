@@ -11,6 +11,7 @@ impl Client {
     ///
     /// Returns `true` if this call dispatched the event, `false` if a
     /// previous call already did.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.undecryptable", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), msg_id = %info.id)))]
     pub(crate) async fn dispatch_undecryptable_event(
         &self,
         info: Arc<MessageInfo>,
@@ -61,6 +62,7 @@ impl Client {
     /// resulting duplicate ack.
     ///
     /// Returns `true` to be assigned to `dispatched_undecryptable` flag.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.decrypt_failure", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
     pub(crate) async fn handle_decrypt_failure(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
@@ -101,6 +103,7 @@ impl Client {
         true
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.plaintext_failure", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), msg_id = %info.id)))]
     pub(crate) async fn handle_plaintext_failure(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
@@ -205,6 +208,7 @@ impl Client {
     /// Returns whether the caller should send the ack: `false` when we intended
     /// to retry but the send failed (so the stanza stays queued for another try),
     /// `true` when the resend went out or we deliberately gave up at the cap.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.retry_receipt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
     async fn run_retry_receipt(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
@@ -219,7 +223,7 @@ impl Client {
                 "Max retries ({}) reached for message {} from {} [{:?}]. Sending immediate PDO request.",
                 MAX_DECRYPT_RETRIES,
                 info.id,
-                info.source.sender,
+                info.source.sender.observe(),
                 reason
             );
             // Capped: give up and clear the backlog regardless of PDO outcome.
@@ -232,8 +236,8 @@ impl Client {
                 "High retry count ({}) for message {} in chat {} from {} [{:?}]",
                 retry_count,
                 info.id,
-                info.source.chat,
-                info.source.sender,
+                info.source.chat.observe(),
+                info.source.sender.observe(),
                 reason
             );
         }
@@ -242,7 +246,11 @@ impl Client {
             Ok(()) => {
                 debug!(
                     "Sent retry receipt #{} for message {} in chat {} from {} [{:?}]",
-                    retry_count, info.id, info.source.chat, info.source.sender, reason
+                    retry_count,
+                    info.id,
+                    info.source.chat.observe(),
+                    info.source.sender.observe(),
+                    reason
                 );
                 true
             }

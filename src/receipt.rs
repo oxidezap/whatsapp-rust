@@ -132,6 +132,10 @@ impl Client {
             || info.source.is_self_fanout()
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.receipt.handle", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_receipt(self: &Arc<Self>, node: Arc<OwnedNodeRef>) {
         let nr = node.get();
         let mut attrs = nr.attrs();
@@ -180,8 +184,9 @@ impl Client {
                 .or_else(|| agg_key.clone())
                 .unwrap_or_else(|| stanza_id.clone());
             debug!(
-                "Aggregated receipt from {from}: stanza={stanza_id} \
+                "Aggregated receipt from {}: stanza={stanza_id} \
                  message_id={agg_msg_id:?} key={agg_key:?} users={}",
+                from.observe(),
                 users.len()
             );
             for user in users {
@@ -226,8 +231,9 @@ impl Client {
             wacore::stanza::receipt::collect_simple_message_ids(nr, &stanza_id, is_view);
 
         debug!(
-            "Received receipt type '{receipt_type:?}' for {} message(s) from {from}",
-            message_ids.len()
+            "Received receipt type '{receipt_type:?}' for {} message(s) from {}",
+            message_ids.len(),
+            from.observe()
         );
 
         let receipt = Receipt {
@@ -275,7 +281,7 @@ impl Client {
                         .optional_string("call-id")
                         .as_deref()
                         .unwrap_or_default(),
-                    receipt.source.chat,
+                    receipt.source.chat.observe(),
                     child_attrs
                         .optional_string("call-creator")
                         .as_deref()
@@ -305,6 +311,7 @@ impl Client {
     ///   `Send/DeliveryReceiptJob.js`); these are NOT skipped anymore.
     /// - Newsletters and messages without an ID are skipped (newsletters are
     ///   handled by the ack gate, not here).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_delivery", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn send_delivery_receipt(&self, info: &crate::types::message::MessageInfo) {
         if !Self::should_send_delivery_receipt(info) {
             return;
@@ -324,7 +331,7 @@ impl Client {
             ReceiptType::Delivered
         };
         debug!(target: "Client/Receipt", "Sending {} receipt for message {} to {}",
-            receipt_kind.as_wire_str(), info.id, info.source.sender);
+            receipt_kind.as_wire_str(), info.id, info.source.sender.observe());
 
         if let Err(e) = self.send_node(receipt_node).await
             && !matches!(e, crate::client::ClientError::NotConnected)
@@ -353,6 +360,7 @@ impl Client {
     /// Emits a nack so the server stops retransmitting an unrecoverable
     /// failure. Prefer [`Client::send_retry_receipt`] for recoverable
     /// errors (BadMac, NoSession, etc).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_nack", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
     pub(crate) async fn send_nack(
         &self,
         info: &MessageInfo,
@@ -374,7 +382,7 @@ impl Client {
         let nack = build_nack_node(info, &own_pn, reason, failure_reason);
         debug!(target: "Client/Receipt",
             "Sending nack (reason={:?}, code={}) for message {} from {}",
-            reason, reason.code(), info.id, info.source.sender);
+            reason, reason.code(), info.id, info.source.sender.observe());
 
         if let Err(e) = self.send_node(nack).await
             && !matches!(e, crate::client::ClientError::NotConnected)
@@ -387,6 +395,7 @@ impl Client {
     /// Sends read receipts for one or more messages.
     ///
     /// For group messages, pass the message sender as `sender`.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.mark_as_read", level = "debug", skip_all, fields(chat = %chat.observe()), err(Debug)))]
     pub async fn mark_as_read(
         &self,
         chat: &Jid,
@@ -420,7 +429,7 @@ impl Client {
 
         let node = builder.build();
 
-        debug!(target: "Client/Receipt", "Sending read receipt for {} message(s) to {}", message_ids.len(), chat);
+        debug!(target: "Client/Receipt", "Sending read receipt for {} message(s) to {}", message_ids.len(), chat.observe());
 
         self.send_node(node)
             .await

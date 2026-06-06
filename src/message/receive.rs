@@ -3,6 +3,10 @@
 use super::*;
 
 impl Client {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.incoming", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_incoming_message(self: Arc<Self>, node: Arc<OwnedNodeRef>) {
         // Phase 1: classify borrows the node tree, extracts owned payloads, returns quickly.
         // Phase 2: process_classified_message holds no node borrows across heavy .await points,
@@ -16,6 +20,10 @@ impl Client {
         self.process_classified_message(classified).await;
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.classify", level = "debug", skip_all)
+    )]
     pub(crate) async fn classify_incoming_message(
         self: &Arc<Self>,
         node: &OwnedNodeRef,
@@ -222,7 +230,7 @@ impl Client {
                 "[msg:{}] Protocol violation: skmsg is first in multi-enc message from {}. \
                  Expected pkmsg/msg first (containing SKDM).",
                 info.id,
-                info.source.sender
+                info.source.sender.observe()
             );
         }
 
@@ -263,6 +271,10 @@ impl Client {
     }
 
     /// Phase 2: acquire permit, decrypt payloads, flush. No node borrows.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.process", level = "debug", skip_all)
+    )]
     pub(crate) async fn process_classified_message(self: Arc<Self>, msg: ClassifiedMessage) {
         let ClassifiedMessage {
             info,
@@ -343,7 +355,7 @@ impl Client {
                 log::debug!(
                     "Skipping {} session messages from group sender {}",
                     session_payloads.len(),
-                    sender_encryption_jid
+                    sender_encryption_jid.observe()
                 );
             }
             SessionBatchOutcome::default()
@@ -388,8 +400,8 @@ impl Client {
                         log::warn!(
                             "[msg:{}] Batch group decrypt from {} in {} failed: {e:?}",
                             info.id,
-                            info.source.sender,
-                            info.source.chat
+                            info.source.sender.observe(),
+                            info.source.chat.observe()
                         );
                     }
                 }
@@ -400,14 +412,14 @@ impl Client {
                         log::debug!(
                             "[msg:{}] Silently dropping expired status from {}",
                             info.id,
-                            info.source.sender
+                            info.source.sender.observe()
                         );
                     } else {
                         log::log!(
                             decrypt_fail_log_level(decrypt_fail_mode),
                             "Skipping skmsg decryption for message {} from {} because pkmsg failed to decrypt.",
                             info.id,
-                            info.source.sender
+                            info.source.sender.observe()
                         );
                         if !session_dispatched_undecryptable {
                             self.dispatch_undecryptable_event(
@@ -438,7 +450,7 @@ impl Client {
                 decrypt_fail_log_level(decrypt_fail_mode),
                 "Message {} from {} failed to decrypt and has no group content. Dispatching UndecryptableMessage event.",
                 info.id,
-                info.source.sender
+                info.source.sender.observe()
             );
             // Dispatch UndecryptableMessage event for messages that failed to decrypt
             // (This should not cause double-dispatching since process_session_enc_batch
@@ -485,6 +497,7 @@ impl Client {
             .await;
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.session_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %sender_encryption_jid.observe(), msg_id = %info.id)))]
     pub(crate) async fn process_session_enc_batch(
         self: Arc<Self>,
         payloads: &[EncPayload],
@@ -534,7 +547,7 @@ impl Client {
                         log::error!(
                             "[msg:{}] Failed to parse PreKeySignalMessage from {}: {e:?}. Sending nack.",
                             info.id,
-                            info.source.sender
+                            info.source.sender.observe()
                         );
                         // |= so a later dedup'd return (false) can't clobber
                         // a true set by a prior iteration in this batch.
@@ -558,7 +571,7 @@ impl Client {
                         log::error!(
                             "[msg:{}] Failed to parse SignalMessage from {}: {e:?}. Sending nack.",
                             info.id,
-                            info.source.sender
+                            info.source.sender.observe()
                         );
                         outcome.had_failure = true;
                         outcome.undecryptable |= self
@@ -657,7 +670,7 @@ impl Client {
                             log::warn!(
                                 "[msg:{}] Failed processing plaintext from {}: {e:?}",
                                 info.id,
-                                info.source.sender
+                                info.source.sender.observe()
                             );
                             outcome.decrypted = true;
                             outcome.plaintext_failed = true;
@@ -672,7 +685,7 @@ impl Client {
                     if let SignalProtocolError::DuplicatedMessage(chain, counter) = e {
                         log::debug!(
                             "Skipping already-processed message from {} (chain {}, counter {}). This is normal during reconnection.",
-                            info.source.sender,
+                            info.source.sender.observe(),
                             chain,
                             counter
                         );
@@ -701,7 +714,10 @@ impl Client {
                         // Flush immediately so the backend is updated BEFORE the retry decrypt below.
                         // Device::is_trusted_identity reads from backend, not cache.
                         if let Err(e) = self.flush_signal_cache().await {
-                            log::warn!("Failed to flush identity deletion for {}: {e:?}", address);
+                            log::warn!(
+                                "Failed to flush identity deletion for {}: {e:?}",
+                                wacore::types::jid::observe_protocol_address(address)
+                            );
                             outcome.had_failure = true;
                             continue;
                         }
@@ -917,7 +933,9 @@ impl Client {
 
                         debug!(
                             "[msg:{}] No session found for {} message from {}. Sending retry receipt to request session establishment.",
-                            info.id, enc_type, info.source.sender
+                            info.id,
+                            enc_type,
+                            info.source.sender.observe()
                         );
                         outcome.had_failure = true;
                         outcome.undecryptable |= self
@@ -974,7 +992,7 @@ impl Client {
                              Sending retry receipt.",
                             info.id,
                             enc_type,
-                            info.source.sender
+                            info.source.sender.observe()
                         );
 
                         outcome.had_failure = true;
@@ -1024,7 +1042,7 @@ impl Client {
                              Sending retry receipt with fresh prekeys.",
                             info.id,
                             enc_type,
-                            info.source.sender
+                            info.source.sender.observe()
                         );
 
                         // Send retry receipt with fresh prekeys
@@ -1043,7 +1061,7 @@ impl Client {
                             "[msg:{}] Batch session decrypt failed (type: {}) from {}: {:?}. Sending nack.",
                             info.id,
                             enc_type,
-                            info.source.sender,
+                            info.source.sender.observe(),
                             e
                         );
                         outcome.had_failure = true;
@@ -1064,6 +1082,7 @@ impl Client {
         outcome
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.group_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id), err(Debug)))]
     async fn process_group_enc_batch(
         self: Arc<Self>,
         payloads: &[EncPayload],
@@ -1090,9 +1109,9 @@ impl Client {
 
             log::debug!(
                 "Looking up sender key for group {} with sender address {} (from sender JID: {})",
-                info.source.chat,
+                info.source.chat.observe(),
                 sender_address,
-                info.source.sender
+                info.source.sender.observe()
             );
 
             let decrypt_result =
@@ -1107,7 +1126,8 @@ impl Client {
                     if !self.is_from_known_device(&info.source.sender).await {
                         debug!(
                             "[msg:{}] Unknown device {}, triggering device sync",
-                            info.id, info.source.sender
+                            info.id,
+                            info.source.sender.observe()
                         );
                         self.handle_unknown_device_sync(info).await;
                     }
@@ -1128,8 +1148,8 @@ impl Client {
                 Err(SignalProtocolError::DuplicatedMessage(iteration, counter)) => {
                     log::debug!(
                         "Skipping already-processed sender key message from {} in group {} (iteration {}, counter {}). This is normal during reconnection.",
-                        info.source.sender,
-                        info.source.chat,
+                        info.source.sender.observe(),
+                        info.source.chat.observe(),
                         iteration,
                         counter
                     );
@@ -1145,7 +1165,7 @@ impl Client {
                         log::debug!(
                             "[msg:{}] Skipping retry for expired status from {}",
                             info.id,
-                            info.source.sender
+                            info.source.sender.observe()
                         );
                         continue;
                     }
@@ -1159,7 +1179,9 @@ impl Client {
 
                     debug!(
                         "No sender key state for group message [msg:{}] from {}: {}. Sending retry receipt.",
-                        info.id, info.source.sender, msg
+                        info.id,
+                        info.source.sender.observe(),
+                        msg
                     );
 
                     if is_unknown_device {
@@ -1174,7 +1196,7 @@ impl Client {
                         log::debug!(
                             "[msg:{}] Ignoring decrypt error for expired status from {}: {:?}",
                             info.id,
-                            info.source.sender,
+                            info.source.sender.observe(),
                             e
                         );
                         continue;
@@ -1208,6 +1230,7 @@ impl Client {
     }
 
     /// WA Web: online → `syncDeviceListJob`, offline → `OfflinePendingDeviceCache`.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.unknown_device_sync", level = "debug", skip_all, fields(sender = %info.source.sender.observe(), msg_id = %info.id)))]
     async fn handle_unknown_device_sync(self: &Arc<Self>, info: &MessageInfo) {
         let user_jid = info.source.sender.to_non_ad();
 
@@ -1217,9 +1240,15 @@ impl Client {
         }
 
         if info.is_offline {
-            log::debug!("Queueing {} for pending device sync (offline)", user_jid);
+            log::debug!(
+                "Queueing {} for pending device sync (offline)",
+                user_jid.observe()
+            );
         } else {
-            log::debug!("Triggering immediate device sync for {}", user_jid);
+            log::debug!(
+                "Triggering immediate device sync for {}",
+                user_jid.observe()
+            );
             let client = Arc::clone(self);
             self.runtime
                 .spawn(Box::pin(async move {
@@ -1232,6 +1261,7 @@ impl Client {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.handle_plaintext", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, enc_type = %enc_type), err(Debug)))]
     pub(crate) async fn handle_decrypted_plaintext(
         self: Arc<Self>,
         enc_type: &str,
@@ -1243,7 +1273,7 @@ impl Client {
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
             info.id,
-            info.source.sender,
+            info.source.sender.observe(),
             enc_type
         );
 
@@ -1252,7 +1282,8 @@ impl Client {
         if original_msg.device_sent_message.is_some() && !info.source.is_from_me {
             warn!(
                 "[msg:{}] DeviceSentMessage present but sender {} is not self",
-                info.id, info.source.sender,
+                info.id,
+                info.source.sender.observe(),
             );
         }
 
@@ -1303,7 +1334,8 @@ impl Client {
             } else {
                 warn!(
                     "[msg:{}] Dropping app_state_sync_key_share from non-self sender {}",
-                    info.id, info.source.sender
+                    info.id,
+                    info.source.sender.observe()
                 );
             }
         }
@@ -1333,7 +1365,8 @@ impl Client {
             } else {
                 warn!(
                     "[msg:{}] Dropping history_sync_notification from non-self sender {}",
-                    info.id, info.source.sender
+                    info.id,
+                    info.source.sender.observe()
                 );
             }
         }
@@ -1370,6 +1403,7 @@ impl Client {
     /// decrypt and replaces the caller's `session_guard` on the way out
     /// so the next payload in the batch stays serialized.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.pn_lid_migration_decrypt", level = "debug", skip_all, fields(sender = %sender_jid.observe(), msg_id = %info.id, enc_type = %enc_type)))]
     async fn try_pn_to_lid_migration_decrypt(
         self: &Arc<Self>,
         sender_jid: &Jid,
@@ -1421,7 +1455,7 @@ impl Client {
                 log::info!(
                     "[msg:{}] Decrypted after PN→LID session migration for {}",
                     info.id,
-                    info.source.sender
+                    info.source.sender.observe()
                 );
                 if let Some(prekey_id) = decrypted.consumed_prekey_id {
                     adapter

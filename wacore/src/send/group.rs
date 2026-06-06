@@ -5,6 +5,7 @@ use super::*;
 /// Pairwise-encrypted retry stanza for a single group participant.
 /// WA Web sends retries to the failing device only (RetryMsgJob.js:71),
 /// NOT as a sender-key broadcast to all participants.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.group_retry", level = "debug", skip_all, fields(group = %group_jid.observe()), err(Debug)))]
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_group_retry_stanza<S, I>(
     session_store: &mut S,
@@ -111,6 +112,7 @@ pub struct PreparedGroupStanza {
     pub sender_identity: Jid,
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.group_prepare", level = "debug", skip_all, fields(to = %to_jid.observe()), err(Debug)))]
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_group_stanza<
     'a,
@@ -183,7 +185,7 @@ pub async fn prepare_group_stanza<
             log::debug!(
                 "SKDM distribution to {} specific devices for group {}",
                 target_devices.len(),
-                to_jid
+                to_jid.observe()
             );
             Some(target_devices)
         }
@@ -202,8 +204,8 @@ pub async fn prepare_group_stanza<
                 {
                     log::debug!(
                         "Using phone number {} for LID {} device query",
-                        phone_jid,
-                        base_jid
+                        phone_jid.observe(),
+                        base_jid.observe()
                     );
                     return phone_jid.to_non_ad();
                 }
@@ -249,7 +251,7 @@ pub async fn prepare_group_stanza<
             log::debug!(
                 "Converted {} devices to LID addressing for group {}",
                 resolved_list.len(),
-                to_jid
+                to_jid.observe()
             );
         }
 
@@ -285,7 +287,7 @@ pub async fn prepare_group_stanza<
 
         log::debug!(
             "SKDM distribution list for {} resolved to {} devices",
-            to_jid,
+            to_jid.observe(),
             resolved_list.len(),
         );
 
@@ -312,13 +314,19 @@ pub async fn prepare_group_stanza<
             let phash_set = build_group_phash_set(src, &own_sending_jid);
             match MessageUtils::participant_list_hash(&phash_set) {
                 Ok(phash) => phash_for_stanza = Some(phash),
-                Err(e) => log::warn!("Failed to compute group phash for {}: {:?}", to_jid, e),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to compute group phash for {}: {:?}",
+                        to_jid.observe(),
+                        e
+                    )
+                }
             }
         }
     } else if let Some(ref distribution_list) = distribution_list {
         match MessageUtils::participant_list_hash(distribution_list) {
             Ok(phash) => phash_for_stanza = Some(phash),
-            Err(e) => log::warn!("Failed to compute phash for {}: {:?}", to_jid, e),
+            Err(e) => log::warn!("Failed to compute phash for {}: {:?}", to_jid.observe(), e),
         }
     }
 
@@ -383,7 +391,7 @@ pub async fn prepare_group_stanza<
             Err(e) => {
                 log::warn!(
                     "SKDM distribution failed for group {}, continuing without it: {e}",
-                    to_jid
+                    to_jid.observe()
                 );
                 if is_device_unregistered_error(&e) {
                     had_unregistered_devices = true;
@@ -527,6 +535,10 @@ pub(crate) fn collect_stale_device_users(
 
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
 /// across this creation + the matching skmsg encrypt (see `encrypt_group_message`).
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.send.skdm_create", level = "debug", skip_all, err(Debug))
+)]
 pub async fn create_sender_key_distribution_message_for_group(
     store: &mut (dyn SenderKeyStore + Send + Sync),
     sender_key_name: &SenderKeyName,

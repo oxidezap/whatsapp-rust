@@ -62,6 +62,7 @@ fn clamp_wanted_pre_key_count(n: usize) -> usize {
 }
 
 impl Client {
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.fetch_pre_keys", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     pub(crate) async fn fetch_pre_keys(
         &self,
         jids: &[Jid],
@@ -75,13 +76,22 @@ impl Client {
         let bundles = self.execute(spec).await?;
 
         for jid in bundles.keys() {
-            log::debug!("Successfully parsed pre-key bundle for {jid}");
+            log::debug!("Successfully parsed pre-key bundle for {}", jid.observe());
         }
 
         Ok(bundles)
     }
 
     /// Query the WhatsApp server for how many pre-keys it currently has for this device.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.server_pre_key_count",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn get_server_pre_key_count(&self) -> Result<usize, crate::request::IqError> {
         let response = self.execute(PreKeyCountSpec::new()).await?;
         Ok(response.count)
@@ -89,6 +99,15 @@ impl Client {
 
     /// Upload prekeys at login if the persisted flag indicates they're needed.
     /// Matches WA Web's PassiveTasks.js:30 which checks `getServerHasPreKeys()`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.upload_pre_keys_at_login",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn upload_pre_keys_at_login(&self) -> Result<(), anyhow::Error> {
         let has_prekeys = self
             .persistence_manager
@@ -120,6 +139,7 @@ impl Client {
 
     /// Ensure the server has enough pre-keys, uploading if below threshold.
     /// When `force` is true, skips the count guard (used by digest key repair).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.upload_pre_keys", level = "debug", skip_all, fields(force = force), err(Debug)))]
     pub(crate) async fn upload_pre_keys(&self, force: bool) -> Result<(), anyhow::Error> {
         // Decision is should_upload_pre_keys(force, count), but a forced upload short-circuits
         // and skips the server-count IQ entirely: WA Web's handlePreKeyLow uploads
@@ -146,6 +166,15 @@ impl Client {
     /// (the same namespace as uploads) and advance it, so a retry-receipt prekey can never
     /// collide with a live pool key. The caller must hold `prekey_upload_lock` to serialize the
     /// allocate+bump with the upload path. Mirrors WA Web's `getOrGenSinglePreKey -> NEXT_PK_ID`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.allocate_prekey_id",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn allocate_next_one_time_prekey_id(&self) -> Result<u32, anyhow::Error> {
         let next_pre_key_id = self
             .persistence_manager
@@ -169,6 +198,15 @@ impl Client {
     /// Generate and upload the configured number of pre-keys (see
     /// [`Client::set_wanted_pre_key_count`]). Shared by `upload_pre_keys` and
     /// `upload_pre_keys_at_login` to avoid redundant server count queries.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.upload_pre_keys_inner",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     async fn upload_pre_keys_inner(&self) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
         let device_store = self.persistence_manager.get_device_arc().await;
@@ -289,6 +327,7 @@ impl Client {
     /// Verified against WA Web JS: `{ algo: { type: "fibonacci", first: 1e3, second: 2e3 }, max: 61e4 }`
     ///
     /// When `force` is true, bypasses the count guard (used by digest repair path).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.upload_pre_keys_retry", level = "debug", skip_all, fields(force = force), err(Debug)))]
     pub(crate) async fn upload_pre_keys_with_retry(
         &self,
         force: bool,
@@ -338,6 +377,15 @@ impl Client {
     ///
     /// Acquires `prekey_upload_lock` for the duration so this force-upload
     /// cannot race on `start_id` with the count-based and digest-repair paths.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.refresh_pre_keys",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub async fn refresh_pre_keys(&self) -> Result<(), anyhow::Error> {
         let _guard = self.prekey_upload_lock.lock().await;
         self.upload_pre_keys_with_retry(true).await
@@ -353,6 +401,15 @@ impl Client {
     /// 5. If validation fails (regId mismatch, missing prekey, hash mismatch): logs warning,
     ///    does NOT re-upload — WA Web catches all `validateLocalKeyBundle` exceptions without
     ///    re-uploading; the normal `RotateKeyJob` will eventually refresh keys
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.validate_digest_key",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn validate_digest_key(&self) -> Result<(), anyhow::Error> {
         // Hold the lock across the whole pass so the 404 re-upload can't race with
         // `upload_pre_keys_at_login`, `handle_prekey_low`, or `refresh_pre_keys` on

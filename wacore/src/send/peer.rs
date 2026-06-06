@@ -30,6 +30,7 @@ where
     .await
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.peer_prepare", level = "debug", skip_all, fields(to = %transport_jid.observe()), err(Debug)))]
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_peer_stanza_with_options<S, I>(
     session_store: &mut S,

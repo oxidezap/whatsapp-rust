@@ -20,6 +20,10 @@ impl StanzaHandler for PresenceHandler {
         "presence"
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.presence", level = "debug", skip_all)
+    )]
     async fn handle(
         &self,
         client: Arc<Client>,
@@ -49,7 +53,7 @@ impl StanzaHandler for PresenceHandler {
         debug!(
             target: "PresenceHandler",
             "Received presence from {}: unavailable={}",
-            from_jid, unavailable
+            from_jid.observe(), unavailable
         );
 
         client

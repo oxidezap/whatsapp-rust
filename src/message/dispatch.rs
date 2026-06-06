@@ -4,6 +4,7 @@ use super::*;
 
 impl Client {
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.dispatch", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn dispatch_parsed_message(
         self: &Arc<Self>,
         msg: wa::Message,

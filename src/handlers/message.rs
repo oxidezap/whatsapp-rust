@@ -22,6 +22,10 @@ impl StanzaHandler for MessageHandler {
         "message"
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.message_enqueue", level = "debug", skip_all)
+    )]
     async fn handle(
         &self,
         client: Arc<Client>,

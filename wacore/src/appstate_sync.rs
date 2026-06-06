@@ -154,6 +154,7 @@ impl AppStateProcessor {
     /// Process an already-parsed single PatchList: download external blobs via
     /// `download`, then decode + apply. Lets a caller that parsed the response for
     /// pre-download avoid re-parsing it. See [`decode_patch_list_ref`].
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_parsed", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_parsed_patch_list<FDownload>(
         &self,
         mut pl: PatchList,
@@ -214,6 +215,7 @@ impl AppStateProcessor {
     /// Process already-parsed patch lists, downloading any external blobs via
     /// `download`. Lets callers that already parsed the IQ response (e.g. to
     /// pre-download blobs) avoid re-parsing it. See [`decode_multi_patch_list_ref`].
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_lists", level = "debug", skip_all, fields(count = patch_lists.len()), err(Debug)))]
     pub async fn process_patch_lists<FDownload>(
         &self,
         patch_lists: Vec<PatchList>,
@@ -242,6 +244,7 @@ impl AppStateProcessor {
         Ok(results)
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_list", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_patch_list(
         &self,
         pl: PatchList,
@@ -389,6 +392,7 @@ impl AppStateProcessor {
     /// Returns `(patch_bytes, base_version)` where `base_version` is the collection
     /// version before the patch (for the IQ `version` attribute). Does NOT persist
     /// state — the caller must only persist after the server acknowledges the patch.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.build_patch", level = "debug", skip_all, fields(name = %collection_name, count = mutations.len()), err(Debug)))]
     pub async fn build_patch(
         &self,
         collection_name: &str,
@@ -466,6 +470,7 @@ impl AppStateProcessor {
         Ok(missing)
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_collection", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
     pub async fn sync_collection<D, FDownload>(
         &self,
         driver: &D,

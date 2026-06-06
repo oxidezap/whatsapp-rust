@@ -232,6 +232,10 @@ impl Client {
     /// Only needed when you need the plaintext bytes (processing, transcoding,
     /// re-upload). To forward existing media unchanged, reuse the original
     /// message's CDN fields directly, no round-trip required.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.media.download", level = "debug", skip_all, err(Debug))
+    )]
     pub async fn download(&self, downloadable: &dyn Downloadable) -> Result<Vec<u8>> {
         download_media_with_retry(
             |force| self.prepare_requests(downloadable, force),
@@ -241,6 +245,15 @@ impl Client {
         .await
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.media.download_to_file",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub async fn download_to_file<W: Write + Seek + Send + Unpin>(
         &self,
         downloadable: &dyn Downloadable,
@@ -257,6 +270,15 @@ impl Client {
     /// Each returned [`wacore::sticker_pack::StickerPackItem`] is [`Downloadable`],
     /// so individual stickers can be fetched with [`Self::download`]. The locale
     /// only affects localized pack names; `"en"` mirrors whatsmeow's default.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.media.fetch_sticker_pack",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub async fn fetch_sticker_pack(
         &self,
         pack_id: &str,
@@ -278,6 +300,7 @@ impl Client {
     }
 
     /// Downloads and decrypts media from raw parameters without needing the original message.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.download_from_params", level = "debug", skip_all, fields(kind = ?media_type), err(Debug)))]
     pub async fn download_from_params(
         &self,
         direct_path: &str,
@@ -361,6 +384,15 @@ impl Client {
     /// blocking thread. The writer is seeked back to position 0 before returning.
     ///
     /// Memory usage: ~40KB regardless of file size (8KB read buffer + decrypt state).
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.media.download_to_writer",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub async fn download_to_writer<W: Write + Seek + Send + 'static>(
         &self,
         downloadable: &dyn Downloadable,
@@ -378,6 +410,7 @@ impl Client {
     /// Streaming variant of `download_from_params` that writes to a writer
     /// instead of buffering in memory.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.download_from_params_to_writer", level = "debug", skip_all, fields(kind = ?media_type), err(Debug)))]
     pub async fn download_from_params_to_writer<W: Write + Seek + Send + 'static>(
         &self,
         direct_path: &str,

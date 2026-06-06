@@ -8,6 +8,7 @@ use waproto::whatsapp::message::HistorySyncNotification;
 use crate::client::Client;
 
 impl Client {
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.history_sync", level = "debug", skip_all, fields(msg_id = %message_id)))]
     pub(crate) async fn handle_history_sync(
         self: &Arc<Self>,
         message_id: String,
@@ -60,6 +61,7 @@ impl Client {
     /// Process history sync: decompress, extract internal data (tctokens,
     /// pushname, nct_salt), then dispatch a single `Event::HistorySync`
     /// with the full decompressed blob for on-demand consumer decoding.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.history_sync_task", level = "debug", skip_all, fields(msg_id = %message_id)))]
     pub(crate) async fn process_history_sync_task(
         self: &Arc<Self>,
         message_id: String,
@@ -375,6 +377,7 @@ impl Client {
     /// download failure; the encrypted payload is the same `ServerErrorReceipt`
     /// used for media retries. Exposed for consumers that detect an undownloadable
     /// or unwanted history-sync chunk and want the phone to re-send it.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.history_sync_error_receipt", level = "debug", skip_all, fields(msg_id = %message_id), err(Debug)))]
     pub async fn send_history_sync_server_error_receipt(
         &self,
         message_id: &str,

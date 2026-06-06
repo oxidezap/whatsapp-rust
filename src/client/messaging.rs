@@ -21,6 +21,7 @@ impl Client {
         Ok(())
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.node", level = "debug", skip_all, fields(tag = %node.tag), err(Debug)))]
     pub async fn send_node(&self, node: Node) -> Result<(), ClientError> {
         debug!(target: "Client/Send", "{}", DisplayableNode(&node));
         if self.sent_node_waiter_count.load(Ordering::Acquire) > 0 {
@@ -35,6 +36,10 @@ impl Client {
         self.send_raw_bytes(plaintext_buf).await
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.send.unified_session", level = "debug", skip_all)
+    )]
     pub(crate) async fn send_unified_session(&self) {
         if !self.is_connected() {
             debug!(target: "Client/UnifiedSession", "Skipping: not connected");
@@ -51,6 +56,7 @@ impl Client {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn edit_message(
         &self,
         to: Jid,
@@ -104,6 +110,7 @@ impl Client {
     }
 
     /// Send a server-side reaction (used by both newsletter and status reactions).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.server_reaction", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub(crate) async fn send_server_reaction(
         &self,
         to: &Jid,
@@ -149,6 +156,10 @@ impl Client {
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.send.protocol_receipt", level = "debug", skip_all)
+    )]
     pub(crate) async fn send_protocol_receipt(
         &self,
         id: String,
@@ -194,6 +205,10 @@ impl Client {
     /// Dispatch a parsed chatstate stanza to registered handlers.
     ///
     /// Called by `ChatstateHandler` after parsing the incoming stanza.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.notif.chatstate", level = "debug", skip_all)
+    )]
     pub(crate) async fn dispatch_chatstate_event(
         &self,
         stanza: wacore::iq::chatstate::ChatstateStanza,

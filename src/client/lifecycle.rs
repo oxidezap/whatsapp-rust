@@ -253,10 +253,25 @@ impl Client {
         (arc, rx)
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.conn.run",
+            level = "info",
+            skip_all,
+            fields(account = tracing::field::Empty)
+        )
+    )]
     pub async fn run(self: &Arc<Self>) {
         if self.is_running.swap(true, Ordering::SeqCst) {
             warn!("Client `run` method called while already running.");
             return;
+        }
+        // Tag the session-root span with our own (pseudonymous) account id so
+        // connection-lifecycle traces are attributable per account.
+        #[cfg(feature = "tracing")]
+        if let Some(lid) = self.get_lid().await {
+            tracing::Span::current().record("account", tracing::field::display(lid.observe()));
         }
         while self.is_running.load(Ordering::Relaxed) {
             self.expected_disconnect.store(false, Ordering::Relaxed);
@@ -331,6 +346,10 @@ impl Client {
         info!("Client run loop has shut down.");
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.connect", level = "info", skip_all, err(Debug))
+    )]
     pub async fn connect(self: &Arc<Self>) -> Result<(), anyhow::Error> {
         if self.is_connecting.swap(true, Ordering::SeqCst) {
             return Err(ClientError::AlreadyConnected.into());
@@ -422,6 +441,10 @@ impl Client {
 
     /// Deregister this companion device and disconnect.
     /// Does NOT wipe stored keys. Delete the storage backend to fully clear credentials.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.logout", level = "info", skip_all, err(Debug))
+    )]
     pub async fn logout(self: &Arc<Self>) -> Result<()> {
         use wacore::iq::devices::RemoveCompanionDeviceSpec;
 
@@ -446,6 +469,10 @@ impl Client {
         Ok(())
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.disconnect", level = "info", skip_all)
+    )]
     pub async fn disconnect(self: &Arc<Self>) {
         info!("Disconnecting client intentionally.");
         self.expected_disconnect.store(true, Ordering::Relaxed);
@@ -490,6 +517,10 @@ impl Client {
     /// - Handling network changes (e.g., Wi-Fi → cellular)
     /// - Forcing a fresh server session
     /// - Testing offline message delivery
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.reconnect", level = "info", skip_all)
+    )]
     pub async fn reconnect(self: &Arc<Self>) {
         info!("Reconnecting: dropping transport for auto-reconnect.");
         self.intentional_reconnect.store(true, Ordering::Relaxed);
@@ -512,6 +543,10 @@ impl Client {
     /// Unlike [`reconnect`], which introduces a deliberate offline window,
     /// this method sets the `expected_disconnect` flag so the run loop
     /// skips the backoff delay and reconnects as fast as possible.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.reconnect_immediately", level = "info", skip_all)
+    )]
     pub async fn reconnect_immediately(self: &Arc<Self>) {
         info!("Reconnecting immediately (expected disconnect).");
         self.expected_disconnect.store(true, Ordering::Relaxed);
@@ -527,6 +562,10 @@ impl Client {
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
+    )]
     pub(crate) async fn cleanup_connection_state(&self) {
         // Note: node_waiters are intentionally NOT cleared here — they are
         // cross-connection (callers may register a waiter before an action that

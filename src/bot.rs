@@ -58,6 +58,7 @@ impl MessageContext {
         Some(Self::from_arc(Arc::clone(msg), info, client))
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.send_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
     pub async fn send_message(
         &self,
         message: wa::Message,
@@ -94,6 +95,7 @@ impl MessageContext {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.edit_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
     pub async fn edit_message(
         &self,
         original_message_id: impl Into<String>,
@@ -109,6 +111,7 @@ impl MessageContext {
     }
 
     /// Delete a message for everyone in the chat.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.revoke_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
     pub async fn revoke_message(
         &self,
         message_id: String,
@@ -122,6 +125,7 @@ impl MessageContext {
     /// React to the incoming message. An empty `emoji` removes a previous
     /// reaction. The target key (including the group/status participant) is
     /// taken from [`MessageContext::message_key`].
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.react", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
     pub async fn react(&self, emoji: &str) -> Result<crate::send::SendResult, anyhow::Error> {
         self.client
             .send_reaction(&self.info.source.chat, self.message_key(), emoji)
@@ -220,6 +224,10 @@ impl Bot {
         self.client.clone()
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.bot.run", level = "debug", skip_all, err(Debug))
+    )]
     pub async fn run(&mut self) -> Result<BotHandle> {
         if let Some(receiver) = self.sync_task_receiver.take() {
             let worker_client = Arc::downgrade(&self.client);
@@ -701,6 +709,10 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
 // ── build() — only available when all 4 required fields are Provided ─────
 
 impl BotBuilder<Provided, Provided, Provided, Provided> {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.bot.build", level = "debug", skip_all, err(Debug))
+    )]
     pub async fn build(self) -> std::result::Result<Bot, BotBuilderError> {
         // Destructure to extract required fields — typestate guarantees all are Some.
         let (Some(runtime), Some(backend), Some(transport_factory), Some(http_client)) = (
