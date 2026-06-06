@@ -400,6 +400,7 @@ impl Client {
         wacore::telemetry::send(match to.server {
             wacore_binary::Server::Group => "group",
             wacore_binary::Server::Broadcast => "status",
+            wacore_binary::Server::Newsletter => "newsletter",
             _ => "dm",
         });
         if let Some(exp) = options.ephemeral_expiration
@@ -490,6 +491,10 @@ impl Client {
         if recipients.is_empty() {
             return Err(anyhow!("Cannot send status with no recipients"));
         }
+
+        // Status posts don't go through send_message_with_options, so count them here.
+        let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
+        wacore::telemetry::send("status");
 
         let to = Jid::status_broadcast();
         let request_id = self.generate_message_id().await;

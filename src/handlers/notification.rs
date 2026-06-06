@@ -309,7 +309,6 @@ fn handle_digest_key(client: &Arc<Client>) {
     tracing::instrument(name = "wa.notif.identity_change", level = "debug", skip_all)
 )]
 async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
-    wacore::telemetry::identity_change();
     let from_jid = crate::require_from_jid!(node, "Identity change notification");
 
     // Only primary device identity changes matter
@@ -416,6 +415,9 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
         return;
     }
 
+    // Counted here, past the companion/self/no-prior gates, so it reflects actual
+    // session resets rather than every identity-change push received.
+    wacore::telemetry::identity_change();
     info!(
         "Identity change for {} (had_prior_identity=true): resetting session",
         from_jid.user

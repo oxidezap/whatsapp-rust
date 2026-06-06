@@ -215,7 +215,6 @@ impl Client {
         info: &Arc<MessageInfo>,
         reason: RetryReason,
     ) -> bool {
-        wacore::telemetry::retry_receipt(reason.as_str());
         let cache_key = self
             .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
             .await;
@@ -246,6 +245,7 @@ impl Client {
 
         let retry_sent = match self.send_retry_receipt(info, retry_count, reason).await {
             Ok(()) => {
+                wacore::telemetry::retry_receipt(reason.as_str());
                 debug!(
                     "Sent retry receipt #{} for message {} in chat {} from {} [{:?}]",
                     retry_count,

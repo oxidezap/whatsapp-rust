@@ -59,6 +59,8 @@ mod imp {
     pub fn appstate_mutations(n: u64) {
         counter!("wa_appstate_mutations_total").increment(n);
     }
+    /// Peer identity change that triggered a session reset (past the
+    /// companion/self/no-prior-identity gates).
     pub fn identity_change() {
         counter!("wa_identity_change_total").increment(1);
     }
@@ -69,9 +71,6 @@ mod imp {
     /// Connected state (1 while connected, 0 otherwise).
     pub fn set_connected(on: bool) {
         gauge!("wa_connected").set(if on { 1.0 } else { 0.0 });
-    }
-    pub fn set_pending_retries(n: u64) {
-        gauge!("wa_pending_retries").set(n as f64);
     }
 
     /// Records elapsed seconds into its histogram on drop.
@@ -140,7 +139,7 @@ mod imp {
         describe_counter!(
             "wa_identity_change_total",
             Unit::Count,
-            "Peer identity changes handled"
+            "Peer identity changes that triggered a session reset"
         );
         describe_counter!(
             "wa_prekey_upload_total",
@@ -165,7 +164,6 @@ mod imp {
             Unit::Count,
             "1 while the client is connected"
         );
-        describe_gauge!("wa_pending_retries", Unit::Count, "Messages awaiting retry");
     }
 
     use super::{
@@ -199,8 +197,6 @@ mod imp {
     pub fn prekey_upload(_outcome: &'static str) {}
     #[inline]
     pub fn set_connected(_on: bool) {}
-    #[inline]
-    pub fn set_pending_retries(_n: u64) {}
     /// Zero-sized no-op timer (reads no clock, records nothing).
     pub struct Timer;
     #[inline]

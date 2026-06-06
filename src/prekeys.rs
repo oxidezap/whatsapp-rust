@@ -134,7 +134,10 @@ impl Client {
         }
 
         log::info!("Server missing prekeys (persisted flag), uploading.");
-        self.upload_pre_keys_inner().await
+        // Operation-level outcome (the login path skips the retry wrapper).
+        let r = self.upload_pre_keys_inner().await;
+        wacore::telemetry::prekey_upload(if r.is_ok() { "ok" } else { "fail" });
+        r
     }
 
     /// Ensure the server has enough pre-keys, uploading if below threshold.
@@ -159,9 +162,7 @@ impl Client {
             log::debug!("Server has {server_count} pre-keys, uploading.");
         }
 
-        let r = self.upload_pre_keys_inner().await;
-        wacore::telemetry::prekey_upload(if r.is_ok() { "ok" } else { "fail" });
-        r
+        self.upload_pre_keys_inner().await
     }
 
     /// Allocate the next one-time prekey id from the persistent monotonic `NEXT_PK_ID` counter
@@ -342,6 +343,8 @@ impl Client {
             match self.upload_pre_keys(force).await {
                 Ok(()) => {
                     log::info!("Pre-key upload succeeded");
+                    // Operation-level outcome: one emit per logical upload, not per attempt.
+                    wacore::telemetry::prekey_upload("ok");
                     return Ok(());
                 }
                 Err(e) => {
@@ -354,6 +357,7 @@ impl Client {
 
                     // Bail if disconnected during retry wait
                     if !self.is_logged_in.load(Ordering::Relaxed) {
+                        wacore::telemetry::prekey_upload("fail");
                         return Err(anyhow::anyhow!(
                             "Connection lost during pre-key upload retry"
                         ));

@@ -600,6 +600,10 @@ impl Client {
         // is_connected==true with a cleared socket. send_node() independently
         // checks the socket, but this ordering avoids a confusing state window.
         self.is_connected.store(false, Ordering::Release);
+        // Authoritative point for the gauge: every disconnect (intentional or a
+        // run-loop drop/reconnect) funnels through here, so disconnect()'s early
+        // set is just a prompt redundant signal.
+        wacore::telemetry::set_connected(false);
         // Presence doesn't survive reconnects: demote presence-driven active
         // receipts (1 -> 0), leaving a forced value (2) untouched.
         let _ =

@@ -509,7 +509,6 @@ impl Client {
         if payloads.is_empty() {
             return SessionBatchOutcome::default();
         }
-        let _t = wacore::telemetry::timer(wacore::telemetry::DECRYPT_DURATION);
 
         // Acquire a per-sender session lock to prevent race conditions when
         // multiple messages from the same sender are processed concurrently.
@@ -523,6 +522,9 @@ impl Client {
         let session_mutex = self.session_lock_for(signal_address.as_str()).await;
         let mut session_guard: Option<async_lock::MutexGuardArc<()>> =
             Some(session_mutex.lock_arc().await);
+
+        // Started after the lock so the histogram is crypto-only, not lock/queue wait.
+        let _t = wacore::telemetry::timer(wacore::telemetry::DECRYPT_DURATION);
 
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();

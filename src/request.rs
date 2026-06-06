@@ -210,6 +210,7 @@ impl Client {
     {
         let _t = wacore::telemetry::timer(wacore::telemetry::IQ_DURATION);
         if !self.is_running.load(Ordering::Relaxed) {
+            wacore::telemetry::iq("error");
             return Err(IqError::NotConnected);
         }
 
@@ -225,11 +226,13 @@ impl Client {
 
         if !self.is_running.load(Ordering::Acquire) {
             self.response_waiters.lock().await.remove(&req_id);
+            wacore::telemetry::iq("error");
             return Err(IqError::NotConnected);
         }
 
         if let Err(e) = send_fn.await {
             self.response_waiters.lock().await.remove(&req_id);
+            wacore::telemetry::iq("error");
             return match e {
                 ClientError::Socket(s_err) => Err(IqError::Socket(s_err)),
                 ClientError::EncryptSend(es_err) => Err(IqError::EncryptSend(es_err)),

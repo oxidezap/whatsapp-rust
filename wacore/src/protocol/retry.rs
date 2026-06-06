@@ -339,4 +339,31 @@ mod tests {
             signed_prekey.public_key.public_key_bytes()
         );
     }
+
+    // These strings are metric label values; drift silently breaks dashboards.
+    #[test]
+    fn retry_reason_as_str_is_stable() {
+        let cases = [
+            (RetryReason::UnknownError, "unknown"),
+            (RetryReason::NoSession, "no_session"),
+            (RetryReason::InvalidKey, "invalid_key"),
+            (RetryReason::InvalidKeyId, "invalid_key_id"),
+            (RetryReason::InvalidMessage, "invalid_message"),
+            (RetryReason::InvalidSignature, "invalid_signature"),
+            (RetryReason::FutureMessage, "future_message"),
+            (RetryReason::BadMac, "bad_mac"),
+            (RetryReason::InvalidSession, "invalid_session"),
+            (RetryReason::InvalidMsgKey, "invalid_msg_key"),
+            (
+                RetryReason::BadBroadcastEphemeralSetting,
+                "bad_broadcast_ephemeral",
+            ),
+            (RetryReason::UnknownCompanionNoPrekey, "unknown_companion"),
+            (RetryReason::AdvFailure, "adv_failure"),
+            (RetryReason::StatusRevokeDelay, "status_revoke_delay"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(reason.as_str(), expected);
+        }
+    }
 }
