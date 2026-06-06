@@ -330,8 +330,8 @@ where
             if stores.session_store.has_session(&reusable_addr).await? {
                 log::debug!(
                     "Using LID session {} for PN {} (LID-first lookup)",
-                    lid_jid,
-                    device_jid
+                    lid_jid.observe(),
+                    device_jid.observe()
                 );
                 encryption_overrides[idx] = Some(lid_jid);
                 continue;
@@ -352,8 +352,8 @@ where
             let lid_jid = Jid::lid_device(lid_user, device_jid.device);
             log::debug!(
                 "Will create LID session {} for PN {} (no existing session)",
-                lid_jid,
-                device_jid
+                lid_jid.observe(),
+                device_jid.observe()
             );
             encryption_overrides[idx] = Some(lid_jid);
         }

@@ -641,7 +641,7 @@ impl Client {
         log::info!(
             "[msg:{}] Successfully decrypted msmsg bot reply from {}",
             info.id,
-            info.source.sender
+            info.source.sender.observe()
         );
         self.dispatch_parsed_message(msg, info).await;
     }

@@ -50,6 +50,16 @@ impl Client {
         *self.media_conn.write().await = None;
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.media.refresh_conn",
+            level = "debug",
+            skip_all,
+            fields(force),
+            err(Debug)
+        )
+    )]
     pub async fn refresh_media_conn(&self, force: bool) -> Result<MediaConn, IqError> {
         {
             let guard = self.media_conn.read().await;

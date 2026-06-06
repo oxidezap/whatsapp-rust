@@ -76,7 +76,7 @@ impl Client {
         let bundles = self.execute(spec).await?;
 
         for jid in bundles.keys() {
-            log::debug!("Successfully parsed pre-key bundle for {jid}");
+            log::debug!("Successfully parsed pre-key bundle for {}", jid.observe());
         }
 
         Ok(bundles)

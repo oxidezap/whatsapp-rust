@@ -9,6 +9,7 @@ use wacore::iq::usync::{DeviceListResponse, DeviceListSpec};
 use wacore_binary::Jid;
 
 impl Client {
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.usync.get_user_devices", level = "debug", skip_all, fields(users = jids.len()), err(Debug)))]
     pub(crate) async fn get_user_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
         let mut jids_to_fetch: HashSet<Jid> = HashSet::with_capacity(jids.len());
         let mut all_devices = Vec::with_capacity(jids.len() * 2);
@@ -49,6 +50,7 @@ impl Client {
     /// Users the server OMITS — unchanged ones, when we sent a `device_hash` — are
     /// simply absent here, so their cached records are left untouched (the
     /// merge-safe behavior the `device_hash` optimization depends on).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.usync.process_device_list", level = "debug", skip_all, fields(users = response.device_lists.len())))]
     async fn process_device_list_response(&self, response: &DeviceListResponse) -> Vec<Jid> {
         // Learn LID↔PN mappings via the same batched, guarded learner query_info
         // uses (one detached transaction, skipping already-durable pairs), so
@@ -206,6 +208,15 @@ impl Client {
     /// (by omitting the user) instead of returning the full list on every reconnect.
     /// On a changed list the server returns it and we update; omitted users keep
     /// their cache.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.usync.sync_own_device_list",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn sync_own_device_list(&self) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
 
@@ -241,6 +252,14 @@ impl Client {
     }
 
     /// WA Web: `doPendingDeviceSync()` — flush batched unknown-device users.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.usync.flush_pending_device_sync",
+            level = "debug",
+            skip_all
+        )
+    )]
     pub(crate) async fn flush_pending_device_sync(&self) {
         let pending = self.pending_device_sync.take_all().await;
         if pending.is_empty() {

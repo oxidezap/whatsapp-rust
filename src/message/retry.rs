@@ -223,7 +223,7 @@ impl Client {
                 "Max retries ({}) reached for message {} from {} [{:?}]. Sending immediate PDO request.",
                 MAX_DECRYPT_RETRIES,
                 info.id,
-                info.source.sender,
+                info.source.sender.observe(),
                 reason
             );
             // Capped: give up and clear the backlog regardless of PDO outcome.
@@ -236,8 +236,8 @@ impl Client {
                 "High retry count ({}) for message {} in chat {} from {} [{:?}]",
                 retry_count,
                 info.id,
-                info.source.chat,
-                info.source.sender,
+                info.source.chat.observe(),
+                info.source.sender.observe(),
                 reason
             );
         }
@@ -246,7 +246,11 @@ impl Client {
             Ok(()) => {
                 debug!(
                     "Sent retry receipt #{} for message {} in chat {} from {} [{:?}]",
-                    retry_count, info.id, info.source.chat, info.source.sender, reason
+                    retry_count,
+                    info.id,
+                    info.source.chat.observe(),
+                    info.source.sender.observe(),
+                    reason
                 );
                 true
             }

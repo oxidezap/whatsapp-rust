@@ -60,6 +60,7 @@ impl Client {
     /// # Returns
     /// * `Ok(())` if the request was sent successfully
     /// * `Err` if we couldn't send the request (e.g., not logged in)
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.placeholder_resend", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id), err(Debug)))]
     pub async fn send_pdo_placeholder_resend_request(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
@@ -100,7 +101,8 @@ impl Client {
         if self.pdo_pending_requests.get(&cache_key).await.is_some() {
             debug!(
                 "PDO request already pending for message {} from {}",
-                info.id, info.source.sender
+                info.id,
+                info.source.sender.observe()
             );
             return Ok(());
         }
@@ -149,7 +151,10 @@ impl Client {
 
         info!(
             "Sending PDO placeholder resend request for message {} from {} in {} to {}",
-            info.id, info.source.sender, info.source.chat, peer_target
+            info.id,
+            info.source.sender.observe(),
+            info.source.chat.observe(),
+            peer_target.observe()
         );
 
         if let Err(e) = self
@@ -174,6 +179,7 @@ impl Client {
     }
 
     /// Request on-demand message history from the primary phone via PDO.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.fetch_history", level = "debug", skip_all, fields(chat = %chat_jid.observe(), count), err(Debug)))]
     pub async fn fetch_message_history(
         self: &Arc<Self>,
         chat_jid: &Jid,
@@ -217,7 +223,9 @@ impl Client {
 
         info!(
             "Sending PDO history sync on-demand request for chat {} (count={}) to {}",
-            chat_jid, count, peer_target
+            chat_jid.observe(),
+            count,
+            peer_target.observe()
         );
 
         self.ensure_e2e_sessions(std::slice::from_ref(&peer_target))
@@ -227,6 +235,7 @@ impl Client {
 
     /// Sends a peer message (message to our own devices).
     /// This is used for PDO requests and similar device-to-device communication.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.send_peer_message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     async fn send_peer_message(
         self: &Arc<Self>,
         to: Jid,
@@ -256,6 +265,7 @@ impl Client {
     /// # Arguments
     /// * `response` - The PDO response message
     /// * `info` - The MessageInfo for the PDO response message itself
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.handle_response", level = "debug", skip_all, fields(sender = %pdo_msg_info.source.sender.observe())))]
     pub async fn handle_pdo_response(
         self: &Arc<Self>,
         response: &wa::message::PeerDataOperationRequestResponseMessage,
@@ -265,7 +275,7 @@ impl Client {
         if pdo_msg_info.source.sender.device != 0 {
             debug!(
                 "Ignoring PDO response from non-primary device {}",
-                pdo_msg_info.source.sender
+                pdo_msg_info.source.sender.observe()
             );
             return;
         }
@@ -365,7 +375,9 @@ impl Client {
 
         info!(
             "Dispatching PDO-recovered message {} from {} via phone (request_id={})",
-            message_info.id, message_info.source.sender, request_id
+            message_info.id,
+            message_info.source.sender.observe(),
+            request_id
         );
 
         self.core
@@ -462,6 +474,7 @@ impl Client {
     /// NOT ack, so the stanza stays in the offline queue for another attempt.
     /// Age-skip counts as a deliberate give-up (`true`), so ancient stanzas are
     /// still cleared.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.run_request", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn run_pdo_request(self: &Arc<Self>, info: &Arc<MessageInfo>) -> bool {
         // Skip ancient messages (14d, matching the AB prop), compared in seconds
         // like WA Web's `age_s > i`. Uses the wacore time primitive (mockable).
@@ -479,7 +492,9 @@ impl Client {
             Err(e) => {
                 warn!(
                     "Failed to send PDO request for message {} from {}: {:?}",
-                    info.id, info.source.sender, e
+                    info.id,
+                    info.source.sender.observe(),
+                    e
                 );
                 false
             }

@@ -169,6 +169,7 @@ impl Client {
     }
 
     /// Core session-check + prekey-fetch logic shared by both entry points.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_inner", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     async fn ensure_sessions_inner(&self, jids: Vec<Jid>) -> Result<()> {
         use wacore::types::jid::JidExt;
 
@@ -187,7 +188,7 @@ impl Client {
                 {
                     Ok(true) => {}
                     Ok(false) => jids_needing_sessions.push(jid),
-                    Err(e) => log::warn!("Failed to check session for {}: {}", jid, e),
+                    Err(e) => log::warn!("Failed to check session for {}: {}", jid.observe(), e),
                 }
             }
         }
@@ -244,7 +245,7 @@ impl Client {
                 {
                     Ok(identity_change) => {
                         success_count += 1;
-                        log::debug!("Successfully established session with {}", jid);
+                        log::debug!("Successfully established session with {}", jid.observe());
                         if identity_change
                             == wacore::libsignal::protocol::IdentityChange::ReplacedExisting
                         {
@@ -253,15 +254,18 @@ impl Client {
                     }
                     Err(e) => {
                         failed_count += 1;
-                        log::warn!("Failed to establish session with {}: {}", jid, e);
+                        log::warn!("Failed to establish session with {}: {}", jid.observe(), e);
                     }
                 }
             } else {
                 missing_count += 1;
                 if jid.device == 0 {
-                    log::warn!("Server did not return prekeys for primary phone {}", jid);
+                    log::warn!(
+                        "Server did not return prekeys for primary phone {}",
+                        jid.observe()
+                    );
                 } else {
-                    log::debug!("Server did not return prekeys for {}", jid);
+                    log::debug!("Server did not return prekeys for {}", jid.observe());
                 }
             }
         }
@@ -321,7 +325,7 @@ impl Client {
             .unwrap_or(false);
 
         match (lid_exists, pn_exists) {
-            (true, _) => log::debug!("LID session with {} exists", primary_phone_lid),
+            (true, _) => log::debug!("LID session with {} exists", primary_phone_lid.observe()),
             (false, true) => {
                 log::debug!("PN-only session for own device 0 — will migrate on first message")
             }

@@ -443,6 +443,10 @@ impl Client {
     /// (matches WA Web's single-threaded model). A concurrent encrypt to one of
     /// those companions can re-store a session right after the wipe, but that is
     /// self-healing: the next send re-establishes it via `process_prekey_bundle`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.session.clear_device_record", level = "debug", skip_all)
+    )]
     pub(crate) async fn clear_device_record(
         &self,
         user: &str,

@@ -126,6 +126,20 @@ impl JidExt for Jid {
     }
 }
 
+/// Privacy-aware rendering of a Signal [`ProtocolAddress`] for tracing/logs.
+///
+/// The address name embeds the peer JID (a phone number for PN peers) plus the
+/// device, so logging it directly leaks PII. This replaces the whole name with a
+/// keyed token (same per-process scheme as `Jid::observe`): stable per peer-device
+/// for correlation, but not reversible to the number. (The Signal `device_id` is
+/// always 0 here — the device lives inside the name — so it is not shown.)
+pub fn observe_protocol_address(addr: &ProtocolAddress) -> String {
+    format!(
+        "addr#{:016x}",
+        wacore_binary::jid::observe_token(addr.name())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

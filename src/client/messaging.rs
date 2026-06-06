@@ -36,6 +36,10 @@ impl Client {
         self.send_raw_bytes(plaintext_buf).await
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.send.unified_session", level = "debug", skip_all)
+    )]
     pub(crate) async fn send_unified_session(&self) {
         if !self.is_connected() {
             debug!(target: "Client/UnifiedSession", "Skipping: not connected");
@@ -201,6 +205,10 @@ impl Client {
     /// Dispatch a parsed chatstate stanza to registered handlers.
     ///
     /// Called by `ChatstateHandler` after parsing the incoming stanza.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.notif.chatstate", level = "debug", skip_all)
+    )]
     pub(crate) async fn dispatch_chatstate_event(
         &self,
         stanza: wacore::iq::chatstate::ChatstateStanza,

@@ -567,6 +567,7 @@ impl Client {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.request_keys", level = "debug", skip_all, fields(count = raw_key_ids.len()), err(Debug)))]
     async fn request_app_state_keys(&self, raw_key_ids: &[Vec<u8>]) -> Result<(), anyhow::Error> {
         if raw_key_ids.is_empty() {
             return Ok(());

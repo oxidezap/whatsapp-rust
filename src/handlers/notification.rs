@@ -48,6 +48,10 @@ impl StanzaHandler for NotificationHandler {
 
 /// Dispatch notification by type. Each arm calls a separate async fn so the
 /// compiler doesn't size this future for all arms simultaneously.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.notif.dispatch", level = "debug", skip_all)
+)]
 async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
@@ -300,6 +304,10 @@ fn handle_digest_key(client: &Arc<Client>) {
 ///
 /// WA Web defers this when offline. We process immediately because all cleanup
 /// is local-only, and `ensure_e2e_sessions` self-defers via `wait_for_offline_delivery_end`.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.notif.identity_change", level = "debug", skip_all)
+)]
 async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
     let from_jid = crate::require_from_jid!(node, "Identity change notification");
 
@@ -307,7 +315,7 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
     if from_jid.device != 0 {
         debug!(
             "Ignoring identity change from companion device {}",
-            from_jid
+            from_jid.observe()
         );
         return;
     }
@@ -390,7 +398,8 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
             Ok(None) => {}
             Err(e) => {
                 warn!(
-                    "Identity change: failed reading stored identity for {cand}: {e}; proceeding with reset"
+                    "Identity change: failed reading stored identity for {}: {e}; proceeding with reset",
+                    wacore::types::jid::observe_protocol_address(cand)
                 );
                 had_prior_identity = true;
                 break;
@@ -511,6 +520,7 @@ async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
 /// server push's job (which reliably follows). This matches WA Web, where the
 /// local `handleNewIdentity` omits those steps that only the server-push
 /// `handleE2eIdentityChange` performs.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.notif.local_identity_change", level = "debug", skip_all, fields(sender = %sender.observe())))]
 pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: Jid) {
     // Only a peer's primary-device identity change matters; companion devices
     // carry their own identities (WA Web ignores them on this path).
@@ -574,6 +584,10 @@ pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: J
 ///   </add/remove/update>
 /// </notification>
 /// ```
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.notif.devices", level = "debug", skip_all)
+)]
 async fn handle_devices_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
     let notification = match DeviceNotification::try_parse(node) {
         Ok(n) => n,
@@ -721,7 +735,7 @@ async fn handle_account_sync_devices(
         warn!(
             target: "Client/AccountSync",
             "Received account_sync devices for non-self user: {} (our PN: {:?}, LID: {:?})",
-            from_jid,
+            from_jid.observe(),
             own_pn.map(|j| j.user.as_str()),
             own_lid.map(|j| j.user.as_str())
         );
@@ -791,7 +805,7 @@ async fn handle_account_sync_devices(
         debug!(
             target: "Client/AccountSync",
             "  Device: {} (key-index: {:?})",
-            device.jid,
+            device.jid.observe(),
             device.key_index
         );
     }
@@ -810,6 +824,10 @@ async fn handle_account_sync_devices(
 ///   </tokens>
 /// </notification>
 /// ```
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.notif.privacy_token", level = "debug", skip_all)
+)]
 async fn handle_privacy_token_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
     use wacore::iq::tctoken::parse_privacy_token_notification;
     use wacore::store::traits::TcTokenEntry;
@@ -847,7 +865,7 @@ async fn handle_privacy_token_notification(client: &Arc<Client>, node: &NodeRef<
                     debug!(
                         target: "Client/TcToken",
                         "Cannot resolve LID for privacy_token sender {}, storing under PN",
-                        from
+                        from.observe()
                     );
                     &from.user
                 }
@@ -940,7 +958,7 @@ async fn handle_privacy_token_notification(client: &Arc<Client>, node: &NodeRef<
         && let Some(from) = &from_jid
         && let Err(e) = client.presence().re_subscribe_when_active(from).await
     {
-        debug!(target: "Client/TcToken", "Failed to re-subscribe presence for {from}: {e}");
+        debug!(target: "Client/TcToken", "Failed to re-subscribe presence for {}: {e}", from.observe());
     }
 }
 
@@ -957,7 +975,7 @@ async fn handle_business_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
     debug!(
         target: "Client/Business",
         "Business notification: from={}, type={}, jid={:?}",
-        notification.from,
+        notification.from.observe(),
         notification.notification_type,
         notification.jid
     );
@@ -986,7 +1004,7 @@ async fn handle_business_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
             info!(
                 target: "Client/Business",
                 "Contact {} is no longer a business account",
-                notification.from
+                notification.from.observe()
             );
         }
         wacore::stanza::business::BusinessNotificationType::VerifiedNameJid
@@ -999,7 +1017,7 @@ async fn handle_business_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
                 info!(
                     target: "Client/Business",
                     "Contact {} verified business name: {}",
-                    notification.from,
+                    notification.from.observe(),
                     name
                 );
             }
@@ -1009,7 +1027,7 @@ async fn handle_business_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
             debug!(
                 target: "Client/Business",
                 "Contact {} business profile updated (hash: {:?})",
-                notification.from,
+                notification.from.observe(),
                 notification.hash
             );
         }
@@ -1055,7 +1073,7 @@ fn handle_picture_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
             if set_node.attrs().optional_string("hash").is_some() {
                 debug!(
                     target: "Client/Picture",
-                    "Hash-based picture notification (no jid), using from={}", from
+                    "Hash-based picture notification (no jid), using from={}", from.observe()
                 );
             }
             from.clone()
@@ -1091,7 +1109,7 @@ fn handle_picture_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
                 .and_then(|c| c.first().map(|n| n.tag.as_ref()));
             debug!(
                 target: "Client/Picture",
-                "Ignoring picture notification with child {:?} from {}", child_tag, from
+                "Ignoring picture notification with child {:?} from {}", child_tag, from.observe()
             );
             return;
         }
@@ -1101,7 +1119,7 @@ fn handle_picture_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
         target: "Client/Picture",
         "Picture {}: jid={}, author={:?}, pic_id={:?}",
         if removed { "removed" } else { "updated" },
-        jid, author, picture_id
+        jid.observe(), author, picture_id
     );
 
     let event = Event::PictureUpdate(PictureUpdate {
@@ -1142,7 +1160,7 @@ fn handle_status_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
 
         debug!(
             target: "Client/Status",
-            "Status update from {} (length={})", from, status_text.len()
+            "Status update from {} (length={})", from.observe(), status_text.len()
         );
 
         let event = Event::UserAboutUpdate(UserAboutUpdate {
@@ -1154,7 +1172,7 @@ fn handle_status_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
     } else {
         debug!(
             target: "Client/Status",
-            "Status notification from {} without <set> child, ignoring", from
+            "Status notification from {} without <set> child, ignoring", from.observe()
         );
     }
 }
@@ -1193,7 +1211,7 @@ async fn learn_contact_modify_mappings(
                 warn!(
                     target: "Client/Contacts",
                     "Failed to add LID-PN mapping lid={} pn={}: {e}",
-                    lid, pn
+                    lid.observe(), pn.observe()
                 );
             }
         }
@@ -1201,7 +1219,7 @@ async fn learn_contact_modify_mappings(
         debug!(
             target: "Client/Contacts",
             "Contacts modify without old_lid/new_lid, skipping LID-PN mapping (old={}, new={})",
-            old_pn, new_pn
+            old_pn.observe(), new_pn.observe()
         );
     }
 }
@@ -1240,7 +1258,7 @@ async fn handle_contacts_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
                 return;
             };
 
-            debug!(target: "Client/Contacts", "Contact updated for {}", jid);
+            debug!(target: "Client/Contacts", "Contact updated for {}", jid.observe());
             client
                 .core
                 .event_bus
@@ -1272,7 +1290,7 @@ async fn handle_contacts_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
             debug!(
                 target: "Client/Contacts",
                 "Contact number changed: {} -> {} (old_lid={:?}, new_lid={:?})",
-                old_jid, new_jid, old_lid, new_lid
+                old_jid.observe(), new_jid.observe(), old_lid, new_lid
             );
             client
                 .core
@@ -1327,6 +1345,10 @@ async fn handle_contacts_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
 /// and dispatches typed `Event::GroupUpdate` events for each.
 ///
 /// Reference: WhatsApp Web `WAWebHandleGroupNotification` (Ri7Gf1BxhsX.js:12556-12962)
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.notif.group", level = "debug", skip_all)
+)]
 async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     let notification = match GroupNotification::try_from_node_ref(node.get()) {
         Some(n) => n,
@@ -1361,7 +1383,7 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: added {} participants",
-                        notification.group_jid, participants.len()
+                        notification.group_jid.observe(), participants.len()
                     );
                 }
             }
@@ -1377,7 +1399,7 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                     debug!(
                         target: "Client/Group",
                         "Patched group cache for {}: removed {} participants",
-                        notification.group_jid, participants.len()
+                        notification.group_jid.observe(), participants.len()
                     );
                 }
                 client
@@ -1393,7 +1415,7 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
         debug!(
             target: "Client/Group",
             "Group notification: group={}, action={}",
-            notification.group_jid, action.tag_name()
+            notification.group_jid.observe(), action.tag_name()
         );
 
         client
@@ -1595,7 +1617,9 @@ fn handle_disappearing_mode_notification(client: &Arc<Client>, node: &NodeRef<'_
 
     debug!(
         "Disappearing mode changed for {}: duration={}s, t={}",
-        from, duration, setting_timestamp
+        from.observe(),
+        duration,
+        setting_timestamp
     );
 
     client

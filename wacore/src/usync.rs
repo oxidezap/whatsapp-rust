@@ -98,7 +98,7 @@ pub fn parse_get_user_devices_response_with_phash(resp_node: &Node) -> Result<Ve
             let device_id: u16 = match device_id_str.parse() {
                 Ok(id) => id,
                 Err(_) => {
-                    log::warn!(target: "usync", "invalid device id '{device_id_str}' for user {user_jid}, skipping");
+                    log::warn!(target: "usync", "invalid device id '{device_id_str}' for user {}, skipping", user_jid.observe());
                     continue;
                 }
             };
@@ -119,7 +119,8 @@ pub fn parse_get_user_devices_response_with_phash(resp_node: &Node) -> Result<Ve
         if has_companion && key_index_bytes.is_none() {
             log::warn!(
                 target: "usync",
-                "User {user_jid} has companion devices but no signedKeyIndexBytes, skipping"
+                "User {} has companion devices but no signedKeyIndexBytes, skipping",
+                user_jid.observe()
             );
             continue;
         }

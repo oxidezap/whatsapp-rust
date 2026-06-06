@@ -185,7 +185,7 @@ pub async fn prepare_group_stanza<
             log::debug!(
                 "SKDM distribution to {} specific devices for group {}",
                 target_devices.len(),
-                to_jid
+                to_jid.observe()
             );
             Some(target_devices)
         }
@@ -204,8 +204,8 @@ pub async fn prepare_group_stanza<
                 {
                     log::debug!(
                         "Using phone number {} for LID {} device query",
-                        phone_jid,
-                        base_jid
+                        phone_jid.observe(),
+                        base_jid.observe()
                     );
                     return phone_jid.to_non_ad();
                 }
@@ -251,7 +251,7 @@ pub async fn prepare_group_stanza<
             log::debug!(
                 "Converted {} devices to LID addressing for group {}",
                 resolved_list.len(),
-                to_jid
+                to_jid.observe()
             );
         }
 
@@ -287,7 +287,7 @@ pub async fn prepare_group_stanza<
 
         log::debug!(
             "SKDM distribution list for {} resolved to {} devices",
-            to_jid,
+            to_jid.observe(),
             resolved_list.len(),
         );
 
@@ -314,13 +314,19 @@ pub async fn prepare_group_stanza<
             let phash_set = build_group_phash_set(src, &own_sending_jid);
             match MessageUtils::participant_list_hash(&phash_set) {
                 Ok(phash) => phash_for_stanza = Some(phash),
-                Err(e) => log::warn!("Failed to compute group phash for {}: {:?}", to_jid, e),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to compute group phash for {}: {:?}",
+                        to_jid.observe(),
+                        e
+                    )
+                }
             }
         }
     } else if let Some(ref distribution_list) = distribution_list {
         match MessageUtils::participant_list_hash(distribution_list) {
             Ok(phash) => phash_for_stanza = Some(phash),
-            Err(e) => log::warn!("Failed to compute phash for {}: {:?}", to_jid, e),
+            Err(e) => log::warn!("Failed to compute phash for {}: {:?}", to_jid.observe(), e),
         }
     }
 
@@ -385,7 +391,7 @@ pub async fn prepare_group_stanza<
             Err(e) => {
                 log::warn!(
                     "SKDM distribution failed for group {}, continuing without it: {e}",
-                    to_jid
+                    to_jid.observe()
                 );
                 if is_device_unregistered_error(&e) {
                     had_unregistered_devices = true;

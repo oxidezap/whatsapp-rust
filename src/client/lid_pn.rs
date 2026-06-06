@@ -590,7 +590,7 @@ impl Client {
             Err(e) => {
                 log::warn!(
                     "resolve_recipient_to_lid: LID lookup for {} failed: {:?}",
-                    jid,
+                    jid.observe(),
                     e
                 );
                 None

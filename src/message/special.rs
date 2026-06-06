@@ -28,7 +28,7 @@ impl Client {
                     log::info!(
                         "[msg:{}] Received newsletter plaintext message from {}",
                         info.id,
-                        info.source.chat
+                        info.source.chat.observe()
                     );
                     self.dispatch_parsed_message(msg, info).await;
                 }
@@ -43,7 +43,7 @@ impl Client {
             log::debug!(
                 "[msg:{}] Newsletter <plaintext> node from {} had no content bytes; skipping decode",
                 info.id,
-                info.source.chat
+                info.source.chat.observe()
             );
         }
     }
@@ -143,7 +143,7 @@ impl Client {
                     ) else {
                         log::warn!(
                             "Go SKDM from {} missing required fields (signing_key={}, id={}, iteration={}, chain_key={})",
-                            sender_jid,
+                            sender_jid.observe(),
                             go_msg.signing_key.is_some(),
                             go_msg.id.is_some(),
                             go_msg.iteration.is_some(),
@@ -157,7 +157,7 @@ impl Client {
                             log::error!(
                                 "Invalid chain_key length {} from Go SKDM from {}",
                                 chain_key.len(),
-                                sender_jid
+                                sender_jid.observe()
                             );
                             return;
                         }
@@ -175,7 +175,7 @@ impl Client {
                                 Err(e) => {
                                     log::error!(
                                         "Failed to construct SKDM from Go format from {}: {:?} (original parse error: {:?})",
-                                        sender_jid,
+                                        sender_jid.observe(),
                                         e,
                                         e1
                                     );
@@ -186,7 +186,7 @@ impl Client {
                         Err(e) => {
                             log::error!(
                                 "Failed to parse public key from Go SKDM for {}: {:?} (original parse error: {:?})",
-                                sender_jid,
+                                sender_jid.observe(),
                                 e,
                                 e1
                             );
@@ -197,7 +197,7 @@ impl Client {
                 Err(e2) => {
                     log::error!(
                         "Failed to parse SenderKeyDistributionMessage (standard and Go fallback) from {}: primary: {:?}, fallback: {:?}",
-                        sender_jid,
+                        sender_jid.observe(),
                         e1,
                         e2
                     );
@@ -224,14 +224,14 @@ impl Client {
         {
             log::error!(
                 "Failed to process SenderKeyDistributionMessage from {}: {:?}",
-                sender_jid,
+                sender_jid.observe(),
                 e
             );
         } else {
             log::debug!(
                 "Successfully processed sender key distribution for group {} from {}",
-                group_jid,
-                sender_jid
+                group_jid.observe(),
+                sender_jid.observe()
             );
         }
     }

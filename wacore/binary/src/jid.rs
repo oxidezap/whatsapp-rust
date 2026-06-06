@@ -874,8 +874,10 @@ impl Jid {
 /// Per-process keyed token for a sensitive string: a SipHash with a random key
 /// created once per process. Stable within a run (so the same value correlates
 /// across spans) but not precomputable from the input, so exported traces cannot
-/// be brute-forced back to the original (e.g. an E.164 phone number).
-fn observe_token(s: &str) -> u64 {
+/// be brute-forced back to the original (e.g. an E.164 phone number). Public so
+/// other layers can redact non-`Jid` identifiers (e.g. a Signal `ProtocolAddress`
+/// name, which embeds a phone number) with the same keyed scheme.
+pub fn observe_token(s: &str) -> u64 {
     use std::hash::BuildHasher;
     static KEY: std::sync::OnceLock<std::collections::hash_map::RandomState> =
         std::sync::OnceLock::new();
@@ -987,7 +989,15 @@ mod tests {
             ls.starts_with("pn#") && ls.ends_with("-1620000000@g.us"),
             "{ls}"
         );
-        assert_ne!(ls, legacy.to_string(), "legacy creator phone not redacted");
+        // Exact no-leak invariant: the creator phone must not appear anywhere.
+        assert!(!ls.contains("123456789"), "creator phone leaked: {ls}");
+        // The redacted prefix is the fixed-width keyed token, not the raw number.
+        let mid = &ls["pn#".len()..ls.find('-').unwrap()];
+        assert_eq!(mid.len(), 16, "token width: {ls}");
+        assert!(
+            mid.bytes().all(|b| b.is_ascii_hexdigit()),
+            "token hex: {ls}"
+        );
     }
 
     /// Helper function to test a full parsing and display round-trip.

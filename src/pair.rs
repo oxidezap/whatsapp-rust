@@ -342,7 +342,7 @@ async fn handle_pair_success<'a>(
 
             client.expected_disconnect.store(true, Ordering::Relaxed);
 
-            info!("Successfully paired {jid}");
+            info!("Successfully paired {}", jid.observe());
 
             let success_event = PairSuccess {
                 id: jid,

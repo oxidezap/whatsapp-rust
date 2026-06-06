@@ -168,9 +168,9 @@ impl Client {
         if let Some(alt_chat) = alt_chat {
             log::debug!(
                 "Primary key miss for {}:{}, trying alternate {}",
-                primary_key.chat,
+                primary_key.chat.observe(),
                 id,
-                alt_chat
+                alt_chat.observe()
             );
             let alt_key = ChatMessageId {
                 chat: alt_chat,
@@ -207,7 +207,7 @@ impl Client {
             }
             log::warn!(
                 "Failed to decode cached message for {}:{}, trying DB",
-                key.chat,
+                key.chat.observe(),
                 key.id
             );
         }
@@ -224,7 +224,7 @@ impl Client {
                 Err(e) => {
                     log::warn!(
                         "Failed to decode DB message for {}:{}: {}",
-                        key.chat,
+                        key.chat.observe(),
                         key.id,
                         e
                     );
@@ -235,7 +235,7 @@ impl Client {
             Err(e) => {
                 log::warn!(
                     "Failed to read sent message from DB for {}:{}: {}",
-                    key.chat,
+                    key.chat.observe(),
                     key.id,
                     e
                 );

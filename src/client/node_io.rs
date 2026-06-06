@@ -567,7 +567,7 @@ impl Client {
                 let device_snapshot =
                     client_clone.persistence_manager.get_device_snapshot().await;
                 if device_snapshot.lid.as_ref() != Some(&lid) {
-                    debug!("Updating LID from server to '{lid}'");
+                    debug!("Updating LID from server to '{}'", lid.observe());
                     client_clone
                         .persistence_manager
                         .process_command(DeviceCommand::SetLid(Some(lid)))
@@ -899,6 +899,10 @@ impl Client {
     ///
     /// If an ack with an ID that matches a pending task in `response_waiters`,
     /// the task is resolved and the function returns `true`. Otherwise, returns `false`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.ack_response", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_ack_response(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         // Surface server nack codes for diagnosability. A nacked send still
         // resolves Ok to the caller, so without this the failure is invisible.

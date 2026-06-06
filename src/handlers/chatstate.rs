@@ -53,6 +53,10 @@ impl StanzaHandler for ChatstateHandler {
         "chatstate"
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.chatstate", level = "debug", skip_all)
+    )]
     async fn handle(
         &self,
         client: Arc<Client>,

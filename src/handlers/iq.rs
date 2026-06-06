@@ -22,6 +22,10 @@ impl StanzaHandler for IqHandler {
         "iq"
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.iq", level = "debug", skip_all)
+    )]
     async fn handle(
         &self,
         client: Arc<Client>,

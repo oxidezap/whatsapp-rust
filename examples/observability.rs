@@ -20,6 +20,14 @@
 //! IMPORTANT: do NOT enable the `log` feature on the `tracing` crate together
 //! with a log->tracing bridge — that recurses. This crate already pins
 //! `tracing` with `default-features = false` so the hazard cannot happen.
+//!
+//! PII note: the bridged `log` lines surface alongside the redacted `wa.*` spans.
+//! The library renders JIDs in its log messages through `Jid::observe()` (phone
+//! numbers become `pn#<keyed-token>`), so they carry the same redaction as the
+//! span fields. If your own application code logs raw JIDs/phone numbers, those
+//! will still reach the trace exporter — scrub them with `Jid::observe()` too, or
+//! drop the `whatsapp_rust`/`wacore` `log` targets from your export layer. The
+//! `tracing-pii` cargo feature (off) renders raw numbers for local debugging only.
 
 fn main() {
     use tracing_subscriber::prelude::*;
