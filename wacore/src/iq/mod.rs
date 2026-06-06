@@ -5,6 +5,7 @@ pub mod chatstate;
 pub mod contacts;
 pub mod devices;
 pub mod dirty;
+pub mod generated;
 pub mod groups;
 pub mod keepalive;
 pub mod mediaconn;
