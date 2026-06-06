@@ -99,7 +99,7 @@ debug-diagnostics = ["wacore/debug-diagnostics"]
 debug-snapshots = ["wacore/debug-snapshots"]
 # Optional observability. Off by default: no `tracing` dep, zero overhead.
 # Emits tracing spans/events only; the application installs the subscriber
-# (and any OpenTelemetry bridge). See examples/otel.rs.
+# (and any OpenTelemetry bridge). See examples/observability.rs.
 tracing = ["dep:tracing", "wacore/tracing"]
 # Render raw phone numbers in tracing fields instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.

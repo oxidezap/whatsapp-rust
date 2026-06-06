@@ -849,9 +849,15 @@ impl fmt::Display for Jid {
 /// Pseudonymous (LID) and non-personal (group/broadcast/newsletter/bot/call)
 /// JIDs render in full, so the same peer/chat correlates across spans. JIDs whose
 /// `user` is a phone number ([`Server::carries_phone_number`]) render the user as
-/// a short stable `pn#<hash>` token instead — preserving correlation without
-/// leaking the number. Enable the `tracing-pii` feature to render raw numbers
-/// (local debugging only). The hash is FNV-1a, computed only while formatting an
+/// a `pn#<token>` instead — preserving correlation without leaking the number.
+///
+/// The token is a keyed hash (SipHash via a process-lifetime random key), not a
+/// plain digest of the number: the phone-number search space is small, so an
+/// unkeyed hash would be reversible by precomputation. The random key lives only
+/// in process memory, so exported traces cannot be brute-forced back to numbers.
+/// It is stable within a process run (correlation works) but not across restarts
+/// (a fresh key each start). Enable the `tracing-pii` feature to render raw
+/// numbers (local debugging only). The token is computed only while formatting an
 /// already-enabled span, so it costs nothing on disabled call sites.
 pub struct ObservedJid<'a>(&'a Jid);
 
@@ -872,13 +878,21 @@ impl fmt::Display for ObservedJid<'_> {
         if !redact {
             return fmt::Display::fmt(jid, f);
         }
-        // FNV-1a (32-bit) over the phone number: a stable, allocation-free token.
-        let mut hash: u32 = 0x811c_9dc5;
-        for b in jid.user.as_bytes() {
-            hash ^= u32::from(*b);
-            hash = hash.wrapping_mul(0x0100_0193);
+        // Keyed (SipHash) token over the phone number, with a per-process random
+        // key so the token is stable within a run but not precomputable from the
+        // number — an unkeyed digest of an E.164 number is trivially reversible.
+        use std::hash::BuildHasher;
+        static KEY: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+            std::sync::OnceLock::new();
+        let token = KEY
+            .get_or_init(std::collections::hash_map::RandomState::new)
+            .hash_one(jid.user.as_str());
+        write!(f, "pn#{token:016x}")?;
+        // Preserve agent where it is part of the identity (e.g. Interop/Messenger),
+        // mirroring the normal JID display so distinct IDs stay distinct.
+        if jid.agent > 0 && jid.server.renders_agent() {
+            write!(f, ".{}", jid.agent)?;
         }
-        write!(f, "pn#{hash:08x}")?;
         if jid.device > 0 {
             write!(f, ":{}", jid.device)?;
         }
@@ -915,6 +929,29 @@ impl TryFrom<String> for Jid {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// `observe()` must never leak a raw phone number, must keep pseudonymous /
+    /// non-personal JIDs intact for correlation, and must preserve device.
+    #[test]
+    #[cfg(not(feature = "tracing-pii"))]
+    fn observe_redacts_phone_but_not_lid_or_group() {
+        let pn = Jid::from_str("5511999998888:7@s.whatsapp.net").unwrap();
+        let shown = pn.observe().to_string();
+        assert!(shown.starts_with("pn#"), "{shown}");
+        assert!(
+            !shown.contains("5511999998888"),
+            "raw number leaked: {shown}"
+        );
+        assert!(shown.ends_with(":7@s.whatsapp.net"), "device lost: {shown}");
+        // Stable within the process so the same peer correlates across spans.
+        assert_eq!(shown, pn.observe().to_string());
+
+        // LID is pseudonymous and groups are non-personal: rendered in full.
+        let lid = Jid::from_str("123456789@lid").unwrap();
+        assert_eq!(lid.observe().to_string(), lid.to_string());
+        let group = Jid::from_str("120363012345678901@g.us").unwrap();
+        assert_eq!(group.observe().to_string(), group.to_string());
+    }
 
     /// Helper function to test a full parsing and display round-trip.
     fn assert_jid_roundtrip(
