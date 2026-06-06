@@ -18,6 +18,10 @@ impl Client {
     }
 
     /// Public entry point for processing [`MajorSyncTask`] from the sync channel.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.appstate.sync_task", level = "debug", skip_all)
+    )]
     pub async fn process_sync_task(self: &Arc<Self>, task: crate::sync_task::MajorSyncTask) {
         match task {
             crate::sync_task::MajorSyncTask::HistorySync {
@@ -36,6 +40,7 @@ impl Client {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.fetch", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
     pub(crate) async fn fetch_app_state_with_retry(&self, name: WAPatchName) -> anyhow::Result<()> {
         // In-flight dedup: skip if this collection is already being synced.
         // Matches WA Web's WAWebSyncdCollectionsStateMachine which tracks in-flight syncs
@@ -113,6 +118,7 @@ impl Client {
     /// Sync multiple collections in a single IQ request, re-fetching those with `has_more_patches`.
     /// Matches WA Web's `serverSync()` outer loop (`3JJWKHeu5-P.js:54278-54305`).
     /// Max 5 iterations (WA Web's `C=5` constant).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_batched", level = "debug", skip_all, fields(count = collections.len()), err(Debug)))]
     pub(crate) async fn sync_collections_batched(
         &self,
         collections: Vec<WAPatchName>,
@@ -359,6 +365,7 @@ impl Client {
         Ok(())
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync", level = "debug", skip_all, fields(name = ?name, full_sync = full_sync), err(Debug)))]
     pub(crate) async fn process_app_state_sync_task(
         &self,
         name: WAPatchName,
@@ -604,6 +611,7 @@ impl Client {
     /// Send an app state patch to the server for a given collection.
     ///
     /// Builds the IQ stanza and sends it. Returns the updated hash state.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.send_patch", level = "debug", skip_all, fields(name = %collection_name, count = mutations.len()), err(Debug)))]
     pub(crate) async fn send_app_state_patch(
         &self,
         collection_name: &str,
@@ -733,6 +741,7 @@ impl Client {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.clean_dirty", level = "debug", skip_all, fields(bit = ?bit), err(Debug)))]
     pub async fn clean_dirty_bits(
         &self,
         bit: wacore::iq::dirty::DirtyBit,

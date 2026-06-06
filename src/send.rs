@@ -389,6 +389,7 @@ impl Client {
     }
 
     /// Send a message with additional options.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn send_message_with_options(
         &self,
         to: Jid,
@@ -470,6 +471,7 @@ impl Client {
     /// `AddressingMode::Lid`; `prepare_group_stanza` signs with `own_lid`
     /// and emits `addressing_mode="lid"` on the stanza. Errors only if no
     /// recipient could be resolved.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.status", level = "debug", skip_all, fields(count = recipients.len()), err(Debug)))]
     pub(crate) async fn send_status_message(
         &self,
         message: wa::Message,
@@ -974,6 +976,7 @@ impl Client {
     /// * `message_id` - The ID of the message to delete
     /// * `revoke_type` - Use `RevokeType::Sender` to delete your own message,
     ///   or `RevokeType::Admin { original_sender }` to delete another user's message as group admin
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.revoke", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn revoke_message(
         &self,
         to: Jid,
@@ -1062,6 +1065,7 @@ impl Client {
         .await
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.pin", level = "debug", skip_all, fields(chat = %chat.observe()), err(Debug)))]
     async fn send_pin(
         &self,
         chat: Jid,
@@ -1095,6 +1099,7 @@ impl Client {
         .await
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.impl", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_message_impl(
         &self,

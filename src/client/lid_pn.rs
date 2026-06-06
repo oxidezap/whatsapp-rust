@@ -39,6 +39,15 @@ impl Client {
     /// Warm up the LID-PN cache from persistent storage.
     /// This is called during client initialization to populate the in-memory cache
     /// with previously learned LID-PN mappings.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.warm_up_lid_pn_cache",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn warm_up_lid_pn_cache(&self) -> Result<(), anyhow::Error> {
         let backend = self.persistence_manager.backend();
         let entries = backend.get_all_lid_mappings().await?;
@@ -56,6 +65,15 @@ impl Client {
 
     /// Awaits the persist + any device/session migrations. Hot paths should
     /// prefer [`learn_lid_pn_mapping_fast`].
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.add_lid_pn_mapping",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn add_lid_pn_mapping(
         &self,
         lid: &str,
@@ -90,6 +108,7 @@ impl Client {
     ///   record is gone
     /// - `migrate_signal_sessions_on_lid_discovery` no-ops after the sessions
     ///   are migrated
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.learn_lid_pn_fast", level = "trace", skip_all, fields(is_offline = is_offline)))]
     pub(crate) async fn learn_lid_pn_mapping_fast(
         self: &Arc<Self>,
         lid: &str,
@@ -140,6 +159,7 @@ impl Client {
     /// into the `LidPnEntry` stored in the cache, then (via `into_iter`) into
     /// the `LidPnMappingEntry` that's persisted — no clones on either step.
     /// The `Vec` itself is consumed, so no copy of the outer container either.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.learn_lid_pn_batch", level = "debug", skip_all, fields(count = mappings.len(), is_offline = is_offline)))]
     pub(crate) async fn learn_lid_pn_mappings_batch(
         self: &Arc<Self>,
         mappings: Vec<(String, String)>,
@@ -218,6 +238,7 @@ impl Client {
         (entry, is_new_mapping)
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.persist_migrate_lid_pn", level = "debug", skip_all, fields(is_new = is_new_mapping), err(Debug)))]
     async fn persist_and_migrate_lid_pn(
         &self,
         entry: LidPnEntry,
@@ -261,6 +282,7 @@ impl Client {
         Ok(())
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.persist_migrate_lid_pn_batch", level = "debug", skip_all, fields(count = entries.len()), err(Debug)))]
     async fn persist_and_migrate_lid_pn_batch(
         &self,
         entries: Vec<LidPnEntry>,
@@ -398,6 +420,14 @@ impl Client {
     /// Callers must NOT hold `session_lock_for(<lid_addr>)` for any device
     /// in [0, 100) — `async_lock::Mutex` is not reentrant. The decrypt path
     /// drops its address lock around the call (`try_pn_to_lid_migration_decrypt`).
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.migrate_signal_sessions",
+            level = "debug",
+            skip_all
+        )
+    )]
     pub(crate) async fn migrate_signal_sessions_on_lid_discovery(&self, pn: &str, lid: &str) {
         use log::{info, warn};
         use wacore::types::jid::JidExt;
@@ -510,6 +540,7 @@ impl Client {
     ///
     /// Backend errors are propagated — callers can distinguish "no mapping"
     /// (`Ok(None)`) from "lookup failed" (`Err(_)`).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.get_lid_pn_entry", level = "trace", skip_all, fields(peer = %jid.observe()), err(Debug)))]
     pub async fn get_lid_pn_entry(&self, jid: &Jid) -> Result<Option<LidPnEntry>> {
         let (hit, is_lid) = if jid.is_lid() {
             (self.lid_pn_cache.get_entry_by_lid(&jid.user).await, true)

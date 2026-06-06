@@ -132,6 +132,7 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.iq", level = "debug", skip_all, fields(ns = %query.namespace, kind = ?query.query_type), err(Debug)))]
     pub async fn send_iq(
         &self,
         query: InfoQuery<'_>,

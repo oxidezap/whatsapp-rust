@@ -5,6 +5,7 @@ use super::*;
 /// Pairwise-encrypted retry stanza for a single group participant.
 /// WA Web sends retries to the failing device only (RetryMsgJob.js:71),
 /// NOT as a sender-key broadcast to all participants.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.group_retry", level = "debug", skip_all, fields(group = %group_jid.observe()), err(Debug)))]
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_group_retry_stanza<S, I>(
     session_store: &mut S,
@@ -111,6 +112,7 @@ pub struct PreparedGroupStanza {
     pub sender_identity: Jid,
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.group_prepare", level = "debug", skip_all, fields(to = %to_jid.observe()), err(Debug)))]
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_group_stanza<
     'a,
@@ -527,6 +529,10 @@ pub(crate) fn collect_stale_device_users(
 
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
 /// across this creation + the matching skmsg encrypt (see `encrypt_group_message`).
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.send.skdm_create", level = "debug", skip_all, err(Debug))
+)]
 pub async fn create_sender_key_distribution_message_for_group(
     store: &mut (dyn SenderKeyStore + Send + Sync),
     sender_key_name: &SenderKeyName,

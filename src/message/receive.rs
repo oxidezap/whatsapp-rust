@@ -3,6 +3,10 @@
 use super::*;
 
 impl Client {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.incoming", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_incoming_message(self: Arc<Self>, node: Arc<OwnedNodeRef>) {
         // Phase 1: classify borrows the node tree, extracts owned payloads, returns quickly.
         // Phase 2: process_classified_message holds no node borrows across heavy .await points,
@@ -16,6 +20,10 @@ impl Client {
         self.process_classified_message(classified).await;
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.classify", level = "debug", skip_all)
+    )]
     pub(crate) async fn classify_incoming_message(
         self: &Arc<Self>,
         node: &OwnedNodeRef,
@@ -263,6 +271,10 @@ impl Client {
     }
 
     /// Phase 2: acquire permit, decrypt payloads, flush. No node borrows.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.process", level = "debug", skip_all)
+    )]
     pub(crate) async fn process_classified_message(self: Arc<Self>, msg: ClassifiedMessage) {
         let ClassifiedMessage {
             info,
@@ -485,6 +497,7 @@ impl Client {
             .await;
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.session_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %sender_encryption_jid.observe(), msg_id = %info.id)))]
     pub(crate) async fn process_session_enc_batch(
         self: Arc<Self>,
         payloads: &[EncPayload],
@@ -1064,6 +1077,7 @@ impl Client {
         outcome
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.group_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id), err(Debug)))]
     async fn process_group_enc_batch(
         self: Arc<Self>,
         payloads: &[EncPayload],

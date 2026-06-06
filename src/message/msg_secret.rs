@@ -5,6 +5,7 @@ use super::*;
 impl Client {
     /// Capture embedded `MessageContextInfo.message_secret` for add-on
     /// decrypts. Bot DMs keep the legacy LID key as a second entry.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.capture_secret", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), msg_id = %info.id)))]
     pub(crate) async fn maybe_capture_inbound_msg_secret(
         self: &Arc<Self>,
         msg: &wa::Message,
@@ -153,6 +154,7 @@ impl Client {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.decrypt_secret", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), msg_id = %info.id)))]
     pub(crate) async fn maybe_decrypt_secret_encrypted_message(
         self: &Arc<Self>,
         msg: &wa::Message,
@@ -407,6 +409,7 @@ impl Client {
     /// outbound `messageSecret` we persisted at send time and runs the
     /// dual-HKDF + AES-GCM open from [`wacore::bot_message`]. Failures
     /// (missing secret, GCM tag fail, malformed proto) nack with code 495.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.msmsg", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn handle_msmsg_payload(
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,

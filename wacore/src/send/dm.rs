@@ -45,6 +45,7 @@ pub struct PreparedDmStanza {
     pub message_secret: Option<[u8; crate::reporting_token::MESSAGE_SECRET_SIZE]>,
 }
 
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.dm_prepare", level = "debug", skip_all, fields(to = %to_jid.observe()), err(Debug)))]
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_dm_stanza<
     'a,
@@ -237,6 +238,7 @@ where
 /// `recipient_jid` is propagated verbatim from the retry receipt
 /// (`f && (k.recipient = f)` in `WAWebHandleRetryRequest`); pass `None`
 /// when the incoming receipt didn't carry it.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.dm_retry", level = "debug", skip_all, fields(to = %to_jid.observe()), err(Debug)))]
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_dm_retry_stanza<S, I>(
     session_store: &mut S,

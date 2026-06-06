@@ -349,6 +349,7 @@ impl Client {
     ///
     /// Only needed for new or modified media. To forward existing media unchanged,
     /// reuse the original message's CDN fields directly, no round-trip required.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.upload", level = "debug", skip_all, fields(kind = ?media_type, len = data.len()), err(Debug)))]
     pub async fn upload(
         &self,
         data: Vec<u8>,
@@ -400,6 +401,7 @@ impl Client {
     /// storage of your choice, then pass that storage as `source` plus the
     /// returned [`wacore::upload::EncryptedMediaInfo`]. The caller owns where the
     /// ciphertext lives (temp file, memory, …); this method never touches disk.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.upload_stream", level = "debug", skip_all, fields(kind = ?media_type), err(Debug)))]
     pub async fn upload_stream<S>(
         &self,
         source: S,

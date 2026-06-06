@@ -70,6 +70,7 @@ iai-callgrind = "0.16"
 itoa = "1"
 log = "0.4"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
+tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 prost = { version = "0.14.3", default-features = false, features = ["std"] }
 prost-build = { version = "0.14.3", default-features = false }
 rand = "0.10"
@@ -96,6 +97,13 @@ yoke = { version = "0.8", features = ["derive"] }
 [features]
 debug-diagnostics = ["wacore/debug-diagnostics"]
 debug-snapshots = ["wacore/debug-snapshots"]
+# Optional observability. Off by default: no `tracing` dep, zero overhead.
+# Emits tracing spans/events only; the application installs the subscriber
+# (and any OpenTelemetry bridge). See examples/otel.rs.
+tracing = ["dep:tracing", "wacore/tracing"]
+# Render raw phone numbers in tracing fields instead of the redacted `pn#<hash>`.
+# Local debugging only; never enable in production.
+tracing-pii = ["wacore-binary/tracing-pii"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
 danger-skip-cert-chain-verify = ["wacore/danger-skip-cert-chain-verify"]
 default = [
@@ -131,6 +139,7 @@ futures = { workspace = true, features = ["std"] }
 hex = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
+tracing = { workspace = true, optional = true }
 moka = { version = "0.12.12", features = ["future"], optional = true }
 portable-atomic = { workspace = true }
 prost = { workspace = true }
@@ -164,6 +173,7 @@ hkdf = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wacore-noise = { path = "./wacore/noise", features = [
     "test-util",
     "danger-skip-cert-chain-verify",
@@ -175,6 +185,10 @@ workspace = true
 [[example]]
 name = "benchmark"
 required-features = ["danger-skip-tls-verify"]
+
+[[example]]
+name = "observability"
+required-features = ["tracing"]
 
 [profile.release]
 opt-level = 3

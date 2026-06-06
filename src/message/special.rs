@@ -7,6 +7,7 @@ impl Client {
     /// Newsletters are not E2E encrypted and use the <plaintext> tag directly.
     /// They never carry a `secret_encrypted_message`, so no messageSecret is
     /// stored or retained for newsletter chats (no newsletter retention class).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.newsletter", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), msg_id = %info.id)))]
     pub(crate) async fn handle_newsletter_message(
         self: &Arc<Self>,
         node: &NodeRef<'_>,
@@ -47,6 +48,10 @@ impl Client {
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.appstate_key_share", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_app_state_sync_key_share(
         &self,
         keys: &wa::message::AppStateSyncKeyShare,
@@ -119,6 +124,7 @@ impl Client {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.skdm", level = "debug", skip_all, fields(group = %group_jid.observe(), sender = %sender_jid.observe())))]
     pub(crate) async fn handle_sender_key_distribution_message(
         self: &Arc<Self>,
         group_jid: &Jid,

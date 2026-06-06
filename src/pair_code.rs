@@ -108,6 +108,10 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.pair.code", level = "debug", skip_all, err(Debug))
+    )]
     pub async fn pair_with_code(
         self: &Arc<Self>,
         options: PairCodeOptions,
@@ -237,6 +241,10 @@ impl Client {
 ///
 /// This is called when the user enters the code on their phone. The notification
 /// contains the primary device's encrypted ephemeral public key and identity public key.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.pair.code_notification", level = "debug", skip_all)
+)]
 pub(crate) async fn handle_pair_code_notification(
     client: &Arc<Client>,
     node: &NodeRef<'_>,

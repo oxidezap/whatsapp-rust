@@ -146,6 +146,7 @@ impl Client {
 
     /// Ensure E2E sessions exist for the given device JIDs.
     /// Waits for offline delivery, resolves LID mappings, then batches prekey fetches.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure", level = "debug", skip_all, fields(count = device_jids.len()), err(Debug)))]
     pub(crate) async fn ensure_e2e_sessions(&self, device_jids: &[Jid]) -> Result<()> {
         if device_jids.is_empty() {
             return Ok(());
@@ -158,6 +159,7 @@ impl Client {
     /// Like `ensure_e2e_sessions` but skips `resolve_lid_mappings`. Use when the
     /// caller already resolved JIDs to the correct namespace (e.g., after
     /// alternate PN/LID key normalization in retry handling).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_resolved", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     pub(crate) async fn ensure_e2e_sessions_resolved(&self, jids: &[Jid]) -> Result<()> {
         if jids.is_empty() {
             return Ok(());
@@ -203,6 +205,7 @@ impl Client {
 
     /// Fetch prekeys and establish sessions for a batch of JIDs.
     /// Returns the number of sessions successfully established.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.fetch_establish", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     async fn fetch_and_establish_sessions(&self, jids: &[Jid]) -> Result<usize, anyhow::Error> {
         use wacore::libsignal::protocol::{UsePQRatchet, process_prekey_bundle};
         use wacore::types::jid::JidExt;
@@ -283,6 +286,15 @@ impl Client {
 
     /// Log primary phone (device 0) session state at login.
     /// Migration is lazy via try_pn_to_lid_migration_decrypt on first message.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.primary_phone_check",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn establish_primary_phone_session_immediate(&self) -> Result<()> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
 

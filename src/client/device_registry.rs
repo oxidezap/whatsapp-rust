@@ -150,6 +150,15 @@ impl Client {
 
     /// Update the device list for a user.
     /// Stores under LID when mapping is known, otherwise under PN.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.update_device_list",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn update_device_list(
         &self,
         mut record: wacore::store::traits::DeviceListRecord,
@@ -203,6 +212,7 @@ impl Client {
     /// collapses into a single transaction. Used by usync after fetching
     /// device lists for many users at once, where the per-row commit
     /// dominated wall-clock time on large groups.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.update_device_lists", level = "debug", skip_all, fields(count = records.len()), err(Debug)))]
     pub(crate) async fn update_device_lists(
         &self,
         records: Vec<wacore::store::traits::DeviceListRecord>,
@@ -284,6 +294,14 @@ impl Client {
     ///
     /// Removes all device registry cache entries (all LID/PN aliases) so the
     /// next lookup falls through to the database or network.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.invalidate_device_cache",
+            level = "debug",
+            skip_all
+        )
+    )]
     pub(crate) async fn invalidate_device_cache(&self, user: &str) {
         let lookup = self.resolve_lookup_keys(user).await;
 
@@ -312,6 +330,10 @@ impl Client {
     /// New devices need no explicit cache invalidation: `resolve_skdm_targets`
     /// queries the registry on each send and `device_has_key()` returns `None`
     /// for unseen device IDs, dropping them into `needs_skdm` automatically.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.session.patch_device_add", level = "debug", skip_all)
+    )]
     pub(crate) async fn patch_device_add(
         &self,
         user: &str,
@@ -452,6 +474,7 @@ impl Client {
     /// (`UpdateDeviceTableApi`): deletes Signal sessions for the device,
     /// then invalidates the sender key device cache so SKDM will be
     /// redistributed on the next group send.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.patch_device_remove", level = "debug", skip_all, fields(device_id = device_id)))]
     pub(crate) async fn patch_device_remove(&self, user: &str, device_id: u32) {
         if let Some(mut record) = self.load_device_record(user).await {
             let before = record.devices.len();
@@ -507,6 +530,7 @@ impl Client {
     /// Cache eviction runs only after the DB delete succeeds; on failure the
     /// error is propagated so the caller can leave both DB and cache in their
     /// pre-call state rather than half-applying the cleanup.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.delete_sender_key_rows", level = "debug", skip_all, fields(device_id = device_id), err(Debug)))]
     async fn delete_sender_key_rows_for_device(
         &self,
         user: &str,
@@ -536,6 +560,10 @@ impl Client {
     }
 
     /// Update key_index for a device in the registry.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.session.patch_device_update", level = "debug", skip_all)
+    )]
     pub(crate) async fn patch_device_update(
         &self,
         user: &str,
@@ -593,6 +621,7 @@ impl Client {
     ///
     /// This follows the same 2-tier pattern as [`has_device`]: registry cache first,
     /// then the backend database.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.get_devices_from_registry", level = "trace", skip_all, fields(peer = %jid.observe())))]
     pub(crate) async fn get_devices_from_registry(&self, jid: &Jid) -> Option<Vec<Jid>> {
         // Use the borrowed `&str` keys directly: both the moka cache and the
         // backend take `&str`, so going through `get_lookup_keys` (which re-owns
@@ -669,6 +698,14 @@ impl Client {
     }
 
     /// Migrate device registry entries from PN key to LID key.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.migrate_device_registry",
+            level = "debug",
+            skip_all
+        )
+    )]
     pub(crate) async fn migrate_device_registry_on_lid_discovery(&self, pn: &str, lid: &str) {
         let backend = self.persistence_manager.backend();
 

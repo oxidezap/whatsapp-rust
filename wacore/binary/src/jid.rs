@@ -236,6 +236,17 @@ impl Server {
     pub fn renders_agent(self) -> bool {
         !matches!(self, Self::Pn | Self::Lid | Self::Hosted | Self::HostedLid)
     }
+
+    /// Whether the `user` part is (or can be) a real phone number, i.e. PII that
+    /// must be redacted in tracing fields. LID-family/group/broadcast/newsletter/
+    /// bot/call users are pseudonymous or non-personal and are safe to render raw.
+    #[inline]
+    pub fn carries_phone_number(self) -> bool {
+        matches!(
+            self,
+            Self::Pn | Self::Hosted | Self::Legacy | Self::Messenger | Self::Interop
+        )
+    }
 }
 
 impl fmt::Display for Server {
@@ -830,6 +841,48 @@ pub fn push_jid_to_compact(
 impl fmt::Display for Jid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_jid!(fallible f, &*self.user, self.server, self.agent, self.device)
+    }
+}
+
+/// Privacy-aware [`Display`] wrapper for a [`Jid`], for use in tracing fields.
+///
+/// Pseudonymous (LID) and non-personal (group/broadcast/newsletter/bot/call)
+/// JIDs render in full, so the same peer/chat correlates across spans. JIDs whose
+/// `user` is a phone number ([`Server::carries_phone_number`]) render the user as
+/// a short stable `pn#<hash>` token instead — preserving correlation without
+/// leaking the number. Enable the `tracing-pii` feature to render raw numbers
+/// (local debugging only). The hash is FNV-1a, computed only while formatting an
+/// already-enabled span, so it costs nothing on disabled call sites.
+pub struct ObservedJid<'a>(&'a Jid);
+
+impl Jid {
+    /// Privacy-aware display for tracing spans/fields. See [`ObservedJid`].
+    #[inline]
+    pub fn observe(&self) -> ObservedJid<'_> {
+        ObservedJid(self)
+    }
+}
+
+impl fmt::Display for ObservedJid<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let jid = self.0;
+        let redact = jid.server.carries_phone_number()
+            && !jid.user.is_empty()
+            && !cfg!(feature = "tracing-pii");
+        if !redact {
+            return fmt::Display::fmt(jid, f);
+        }
+        // FNV-1a (32-bit) over the phone number: a stable, allocation-free token.
+        let mut hash: u32 = 0x811c_9dc5;
+        for b in jid.user.as_bytes() {
+            hash ^= u32::from(*b);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        write!(f, "pn#{hash:08x}")?;
+        if jid.device > 0 {
+            write!(f, ":{}", jid.device)?;
+        }
+        write!(f, "@{}", jid.server.as_str())
     }
 }
 

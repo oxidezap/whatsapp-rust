@@ -253,6 +253,10 @@ impl Client {
         (arc, rx)
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.run", level = "debug", skip_all)
+    )]
     pub async fn run(self: &Arc<Self>) {
         if self.is_running.swap(true, Ordering::SeqCst) {
             warn!("Client `run` method called while already running.");
@@ -331,6 +335,10 @@ impl Client {
         info!("Client run loop has shut down.");
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.connect", level = "debug", skip_all, err(Debug))
+    )]
     pub async fn connect(self: &Arc<Self>) -> Result<(), anyhow::Error> {
         if self.is_connecting.swap(true, Ordering::SeqCst) {
             return Err(ClientError::AlreadyConnected.into());
@@ -446,6 +454,10 @@ impl Client {
         Ok(())
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.disconnect", level = "debug", skip_all)
+    )]
     pub async fn disconnect(self: &Arc<Self>) {
         info!("Disconnecting client intentionally.");
         self.expected_disconnect.store(true, Ordering::Relaxed);
@@ -490,6 +502,10 @@ impl Client {
     /// - Handling network changes (e.g., Wi-Fi → cellular)
     /// - Forcing a fresh server session
     /// - Testing offline message delivery
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.reconnect", level = "debug", skip_all)
+    )]
     pub async fn reconnect(self: &Arc<Self>) {
         info!("Reconnecting: dropping transport for auto-reconnect.");
         self.intentional_reconnect.store(true, Ordering::Relaxed);
@@ -512,6 +528,10 @@ impl Client {
     /// Unlike [`reconnect`], which introduces a deliberate offline window,
     /// this method sets the `expected_disconnect` flag so the run loop
     /// skips the backoff delay and reconnects as fast as possible.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.reconnect_immediately", level = "debug", skip_all)
+    )]
     pub async fn reconnect_immediately(self: &Arc<Self>) {
         info!("Reconnecting immediately (expected disconnect).");
         self.expected_disconnect.store(true, Ordering::Relaxed);
@@ -527,6 +547,10 @@ impl Client {
         }
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
+    )]
     pub(crate) async fn cleanup_connection_state(&self) {
         // Note: node_waiters are intentionally NOT cleared here — they are
         // cross-connection (callers may register a waiter before an action that
