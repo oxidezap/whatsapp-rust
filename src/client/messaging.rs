@@ -163,18 +163,19 @@ impl Client {
             // incoming-only state and is never sent by us).
             let type_str = receipt_type.as_wire_str();
 
+            // Borrow `id` for the attr so it stays available for the error log
+            // below (the warn used to log self.unique_id, the client UUID, by
+            // mistake). Separate .attr calls avoid cloning into a homogeneous map.
             let node = NodeBuilder::new("receipt")
-                .attrs([
-                    ("id", id),
-                    ("type", type_str.to_string()),
-                    ("to", own_jid.to_non_ad_string()),
-                ])
+                .attr("id", id.as_str())
+                .attr("type", type_str)
+                .attr("to", own_jid.to_non_ad_string())
                 .build();
 
             if let Err(e) = self.send_node(node).await {
                 warn!(
                     "Failed to send protocol receipt of type {:?} for message ID {}: {:?}",
-                    receipt_type, self.unique_id, e
+                    receipt_type, id, e
                 );
             }
         }

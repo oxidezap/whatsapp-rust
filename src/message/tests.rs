@@ -349,6 +349,85 @@ async fn test_process_session_enc_batch_handles_session_not_found_gracefully() {
     );
 }
 
+/// Two undecryptable payloads sharing one `(chat, id)` must accumulate
+/// `undecryptable` across the batch (monotonic OR) and dispatch exactly one
+/// `UndecryptableMessage` event — the single-flight dedup that the accumulator
+/// exists to protect, exercised through the batch path with multiple payloads.
+#[tokio::test]
+async fn batch_accumulates_undecryptable_and_dispatches_once() {
+    let backend = Arc::new(
+        SqliteStore::new("file:memdb_batch_undec_once?mode=memory&cache=shared")
+            .await
+            .expect("Failed to create test backend"),
+    );
+    let pm = Arc::new(
+        PersistenceManager::new(backend)
+            .await
+            .expect("test backend should initialize"),
+    );
+    let (client, _sync_rx) = Client::new(
+        Arc::new(crate::runtime_impl::TokioRuntime),
+        pm,
+        mock_transport(),
+        mock_http_client(),
+        None,
+    )
+    .await;
+
+    let recorder = Arc::new(EventRecorder::default());
+    client.register_handler(recorder.clone());
+
+    let sender_jid: Jid = "1234567890@s.whatsapp.net"
+        .parse()
+        .expect("test JID should be valid");
+    let info = Arc::new(MessageInfo {
+        id: "BATCH_UNDEC_ONCE".to_string(),
+        source: crate::types::message::MessageSource {
+            sender: sender_jid.clone(),
+            chat: sender_jid.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    // Two enc payloads whose ciphertext does not parse as a Signal message, so
+    // each payload independently lands on an undecryptable path. Distinct bytes
+    // to avoid any incidental dedup on payload content.
+    let enc1 = NodeBuilder::new("enc")
+        .attr("type", "msg")
+        .bytes(vec![0xFF, 0x00, 0x01])
+        .build();
+    let enc2 = NodeBuilder::new("enc")
+        .attr("type", "msg")
+        .bytes(vec![0xFF, 0x00, 0x02])
+        .build();
+    let enc1_ref = enc1.as_node_ref();
+    let enc2_ref = enc2.as_node_ref();
+    let payloads: Vec<EncPayload> = vec![
+        EncPayload::from_node_ref(&enc1_ref).unwrap(),
+        EncPayload::from_node_ref(&enc2_ref).unwrap(),
+    ];
+
+    let outcome = client
+        .process_session_enc_batch(
+            &payloads,
+            &info,
+            &sender_jid,
+            crate::types::events::DecryptFailMode::Show,
+        )
+        .await;
+
+    assert!(
+        outcome.undecryptable,
+        "batch must stay undecryptable across both failed payloads"
+    );
+    assert_eq!(
+        recorder.undecryptable().len(),
+        1,
+        "same (chat, id) dispatches UndecryptableMessage exactly once across the batch"
+    );
+}
+
 /// P1: An empty session record (exists but no current/previous state) should be
 /// treated the same as SessionNotFound — the retry receipt gets error code 1 (NoSession)
 /// and includes keys early, instead of producing an unhelpful InvalidMessage error.

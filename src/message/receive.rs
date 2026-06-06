@@ -838,7 +838,7 @@ impl Client {
                                             address
                                         );
                                         outcome.had_failure = true;
-                                        outcome.undecryptable = self
+                                        outcome.undecryptable |= self
                                             .handle_decrypt_failure(
                                                 info,
                                                 RetryReason::InvalidKeyId,
@@ -856,7 +856,7 @@ impl Client {
                                     // Send retry receipt so the sender resends with a PreKeySignalMessage
                                     // to establish a new session with the new identity
                                     outcome.had_failure = true;
-                                    outcome.undecryptable = self
+                                    outcome.undecryptable |= self
                                         .handle_decrypt_failure(
                                             info,
                                             RetryReason::InvalidKey,
@@ -920,7 +920,7 @@ impl Client {
                             info.id, enc_type, info.source.sender
                         );
                         outcome.had_failure = true;
-                        outcome.undecryptable = self
+                        outcome.undecryptable |= self
                             .handle_decrypt_failure(info, RetryReason::NoSession, decrypt_fail_mode)
                             .await;
                         continue;
@@ -978,7 +978,7 @@ impl Client {
                         );
 
                         outcome.had_failure = true;
-                        outcome.undecryptable = self
+                        outcome.undecryptable |= self
                             .handle_decrypt_failure(info, reason, decrypt_fail_mode)
                             .await;
                         continue;
@@ -1029,7 +1029,7 @@ impl Client {
 
                         // Send retry receipt with fresh prekeys
                         outcome.had_failure = true;
-                        outcome.undecryptable = self
+                        outcome.undecryptable |= self
                             .handle_decrypt_failure(
                                 info,
                                 RetryReason::InvalidKeyId,

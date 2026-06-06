@@ -38,6 +38,12 @@ impl Client {
                     );
                 }
             }
+        } else {
+            log::debug!(
+                "[msg:{}] Newsletter <plaintext> node from {} had no content bytes; skipping decode",
+                info.id,
+                info.source.chat
+            );
         }
     }
 
