@@ -32,6 +32,7 @@ impl Client {
             .await;
         let was_fresh = fresh.load(std::sync::atomic::Ordering::Acquire);
         if was_fresh {
+            wacore::telemetry::recv("undecryptable");
             self.core.event_bus.dispatch(Event::UndecryptableMessage(
                 crate::types::events::UndecryptableMessage {
                     info,
@@ -214,6 +215,7 @@ impl Client {
         info: &Arc<MessageInfo>,
         reason: RetryReason,
     ) -> bool {
+        wacore::telemetry::retry_receipt(reason.as_str());
         let cache_key = self
             .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
             .await;

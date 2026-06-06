@@ -14,6 +14,8 @@ debug-diagnostics = []
 debug-snapshots = []
 # Optional observability: emit tracing spans/events. Off by default (no dep).
 tracing = ["dep:tracing"]
+# Optional metrics via the `metrics` facade. Off by default (no dep).
+metrics = ["dep:metrics"]
 # Render raw phone numbers in tracing fields instead of redacted tokens (debug only).
 tracing-pii = ["wacore-binary/tracing-pii"]
 # Disables XEdDSA verification of the server's Noise cert chain. Required
@@ -43,7 +45,7 @@ hmac = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
 md5 = "0.8.0"
-tracing = { workspace = true, optional = true }
+metrics = { workspace = true, optional = true }
 portable-atomic = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
@@ -54,6 +56,7 @@ sha1 = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true, optional = true }
 typed-builder = "0.23"
 wacore-appstate = { workspace = true }
 wacore-binary = { workspace = true, features = ["serde"] }

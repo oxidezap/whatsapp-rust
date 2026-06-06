@@ -968,6 +968,7 @@ impl Client {
         tracing::instrument(name = "wa.conn.stream_error", level = "debug", skip_all)
     )]
     pub(crate) async fn handle_stream_error(&self, node: &wacore_binary::NodeRef<'_>) {
+        wacore::telemetry::stream_error();
         // is_logged_in handling: opt-in branches (515/516/401/409/conflict) clear it
         // in the disconnect block below; 429/503 clear it inline because the server
         // explicitly rejected the session and outgoing sends should bail fast; the

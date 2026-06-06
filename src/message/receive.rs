@@ -509,6 +509,7 @@ impl Client {
         if payloads.is_empty() {
             return SessionBatchOutcome::default();
         }
+        let _t = wacore::telemetry::timer(wacore::telemetry::DECRYPT_DURATION);
 
         // Acquire a per-sender session lock to prevent race conditions when
         // multiple messages from the same sender are processed concurrently.

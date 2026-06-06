@@ -159,7 +159,9 @@ impl Client {
             log::debug!("Server has {server_count} pre-keys, uploading.");
         }
 
-        self.upload_pre_keys_inner().await
+        let r = self.upload_pre_keys_inner().await;
+        wacore::telemetry::prekey_upload(if r.is_ok() { "ok" } else { "fail" });
+        r
     }
 
     /// Allocate the next one-time prekey id from the persistent monotonic `NEXT_PK_ID` counter

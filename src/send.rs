@@ -396,6 +396,12 @@ impl Client {
         mut message: wa::Message,
         options: SendOptions,
     ) -> Result<SendResult, anyhow::Error> {
+        let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
+        wacore::telemetry::send(match to.server {
+            wacore_binary::Server::Group => "group",
+            wacore_binary::Server::Broadcast => "status",
+            _ => "dm",
+        });
         if let Some(exp) = options.ephemeral_expiration
             && exp > 0
         {

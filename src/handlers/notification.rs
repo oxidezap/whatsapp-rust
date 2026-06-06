@@ -309,6 +309,7 @@ fn handle_digest_key(client: &Arc<Client>) {
     tracing::instrument(name = "wa.notif.identity_change", level = "debug", skip_all)
 )]
 async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<'_>) {
+    wacore::telemetry::identity_change();
     let from_jid = crate::require_from_jid!(node, "Identity change notification");
 
     // Only primary device identity changes matter

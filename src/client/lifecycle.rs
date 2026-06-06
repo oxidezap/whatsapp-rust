@@ -61,6 +61,7 @@ impl Client {
     /// Dispatch the Connected event and notify waiters.
     pub(crate) fn dispatch_connected(&self) {
         self.is_ready.store(true, Ordering::Relaxed);
+        wacore::telemetry::set_connected(true);
         self.core
             .event_bus
             .dispatch(Event::Connected(crate::types::events::Connected));
@@ -277,6 +278,7 @@ impl Client {
             self.expected_disconnect.store(false, Ordering::Relaxed);
 
             if let Err(connect_err) = self.connect().await {
+                wacore::telemetry::connect("fail");
                 let is_transient = connect_err
                     .downcast_ref::<crate::handshake::HandshakeError>()
                     .is_some_and(|e| e.is_transient());
@@ -286,6 +288,7 @@ impl Client {
                     error!("Failed to connect: {connect_err:#}. Will retry...");
                 }
             } else {
+                wacore::telemetry::connect("ok");
                 let unexpected_disconnect = if self.read_messages_loop().await.is_err() {
                     // Check intentional_reconnect AFTER read loop exits — reconnect()
                     // sets this flag while the loop is running, so it must be read here.
@@ -362,6 +365,7 @@ impl Client {
         if self.is_connected() {
             return Err(ClientError::AlreadyConnected.into());
         }
+        let _t = wacore::telemetry::timer(wacore::telemetry::CONNECT_DURATION);
 
         // Reset login state for new connection attempt. This ensures that
         // handle_success will properly process the <success> stanza even if
@@ -475,6 +479,7 @@ impl Client {
     )]
     pub async fn disconnect(self: &Arc<Self>) {
         info!("Disconnecting client intentionally.");
+        wacore::telemetry::set_connected(false);
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
@@ -523,6 +528,7 @@ impl Client {
     )]
     pub async fn reconnect(self: &Arc<Self>) {
         info!("Reconnecting: dropping transport for auto-reconnect.");
+        wacore::telemetry::reconnect();
         self.intentional_reconnect.store(true, Ordering::Relaxed);
         self.auto_reconnect_errors
             .store(Self::RECONNECT_BACKOFF_STEP, Ordering::Relaxed);

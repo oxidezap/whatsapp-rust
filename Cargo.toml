@@ -69,8 +69,8 @@ hmac = { version = "0.13.0", default-features = false }
 iai-callgrind = "0.16"
 itoa = "1"
 log = "0.4"
+metrics = "0.24"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
-tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 prost = { version = "0.14.3", default-features = false, features = ["std"] }
 prost-build = { version = "0.14.3", default-features = false }
 rand = "0.10"
@@ -82,6 +82,7 @@ sha2 = { version = "0.11.0", default-features = false }
 subtle = { version = "2.6", default-features = false }
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 uuid = { version = "1", default-features = false }
 
 # Internal workspace crates
@@ -101,6 +102,10 @@ debug-snapshots = ["wacore/debug-snapshots"]
 # Emits tracing spans/events only; the application installs the subscriber
 # (and any OpenTelemetry bridge). See examples/observability.rs.
 tracing = ["dep:tracing", "wacore/tracing"]
+# Optional metrics (counters/histograms/gauges via the `metrics` facade). Off by
+# default: no dependency, zero overhead. Emits only; the application installs a
+# recorder (e.g. metrics-exporter-prometheus). See examples/metrics.rs.
+metrics = ["wacore/metrics"]
 # Render raw phone numbers in tracing fields instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.
 tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
@@ -139,7 +144,6 @@ futures = { workspace = true, features = ["std"] }
 hex = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
-tracing = { workspace = true, optional = true }
 moka = { version = "0.12.12", features = ["future"], optional = true }
 portable-atomic = { workspace = true }
 prost = { workspace = true }
@@ -149,6 +153,7 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"], optional = true }
+tracing = { workspace = true, optional = true }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
 waproto = { workspace = true }
@@ -171,9 +176,10 @@ cbc = { version = "0.2", features = ["alloc", "block-padding"] }
 flate2 = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
+metrics-exporter-prometheus = "0.16"
 sha2 = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { workspace = true, features = ["v4"] }
 wacore-noise = { path = "./wacore/noise", features = [
     "test-util",
     "danger-skip-cert-chain-verify",
@@ -189,6 +195,10 @@ required-features = ["danger-skip-tls-verify"]
 [[example]]
 name = "observability"
 required-features = ["tracing"]
+
+[[example]]
+name = "metrics"
+required-features = ["metrics"]
 
 [profile.release]
 opt-level = 3

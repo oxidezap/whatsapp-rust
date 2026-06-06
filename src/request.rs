@@ -208,6 +208,7 @@ impl Client {
     where
         F: std::future::Future<Output = Result<(), crate::client::ClientError>>,
     {
+        let _t = wacore::telemetry::timer(wacore::telemetry::IQ_DURATION);
         if !self.is_running.load(Ordering::Relaxed) {
             return Err(IqError::NotConnected);
         }
@@ -240,7 +241,7 @@ impl Client {
         }
 
         let request_utils = self.get_request_utils();
-        futures::select! {
+        let result = futures::select! {
             result = rt_timeout(&*self.runtime, timeout, rx).fuse() => {
                 match result {
                     Ok(Ok(response_node)) => match request_utils.parse_iq_response(response_node.get()) {
@@ -258,6 +259,12 @@ impl Client {
                 self.response_waiters.lock().await.remove(&req_id);
                 Err(IqError::NotConnected)
             }
-        }
+        };
+        wacore::telemetry::iq(match &result {
+            Ok(_) => "ok",
+            Err(IqError::Timeout) => "timeout",
+            Err(_) => "error",
+        });
+        result
     }
 }

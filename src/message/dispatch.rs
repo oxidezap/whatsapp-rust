@@ -11,6 +11,7 @@ impl Client {
         info: &Arc<MessageInfo>,
     ) {
         use wacore::proto_helpers::MessageExt;
+        wacore::telemetry::recv("decrypted");
 
         let mut info = Arc::clone(info);
         if info.ephemeral_expiration.is_none()

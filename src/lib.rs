@@ -5,6 +5,8 @@
 
 pub use wacore::appstate::schemas;
 pub use wacore::client_profile::ClientProfile;
+/// Optional metrics emission (the `metrics` feature). No-op when the feature is off.
+pub use wacore::telemetry;
 pub use wacore::{
     iq::privacy as privacy_settings, proto_helpers, sticker_pack, store::traits, webp,
 };

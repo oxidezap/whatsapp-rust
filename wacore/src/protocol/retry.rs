@@ -61,6 +61,28 @@ pub enum RetryReason {
     StatusRevokeDelay = 13,
 }
 
+impl RetryReason {
+    /// Stable, low-cardinality label for metrics and logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnknownError => "unknown",
+            Self::NoSession => "no_session",
+            Self::InvalidKey => "invalid_key",
+            Self::InvalidKeyId => "invalid_key_id",
+            Self::InvalidMessage => "invalid_message",
+            Self::InvalidSignature => "invalid_signature",
+            Self::FutureMessage => "future_message",
+            Self::BadMac => "bad_mac",
+            Self::InvalidSession => "invalid_session",
+            Self::InvalidMsgKey => "invalid_msg_key",
+            Self::BadBroadcastEphemeralSetting => "bad_broadcast_ephemeral",
+            Self::UnknownCompanionNoPrekey => "unknown_companion",
+            Self::AdvFailure => "adv_failure",
+            Self::StatusRevokeDelay => "status_revoke_delay",
+        }
+    }
+}
+
 /// Helper to extract bytes content from a Node.
 pub fn get_bytes_content(node: &Node) -> Option<&[u8]> {
     match &node.content {

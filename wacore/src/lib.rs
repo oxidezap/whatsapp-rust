@@ -42,6 +42,7 @@ pub mod sticker_pack;
 
 pub mod store;
 pub mod sync_marker;
+pub mod telemetry;
 pub mod time;
 pub mod types;
 pub mod upload;

@@ -62,6 +62,7 @@ impl Client {
     }
 
     async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> anyhow::Result<()> {
+        let _t = wacore::telemetry::timer(wacore::telemetry::APPSTATE_SYNC_DURATION);
         let mut attempt = 0u32;
         loop {
             attempt += 1;
@@ -70,7 +71,10 @@ impl Client {
             // Matches WA Web which only requests snapshot when version is undefined.
             let res = self.process_app_state_sync_task(name, false).await;
             match res {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    wacore::telemetry::appstate_sync("ok");
+                    return Ok(());
+                }
                 Err(e) => {
                     if e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
                         .is_some_and(|ase| {
