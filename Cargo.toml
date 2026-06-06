@@ -103,7 +103,7 @@ debug-snapshots = ["wacore/debug-snapshots"]
 tracing = ["dep:tracing", "wacore/tracing"]
 # Render raw phone numbers in tracing fields instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.
-tracing-pii = ["wacore-binary/tracing-pii"]
+tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
 danger-skip-cert-chain-verify = ["wacore/danger-skip-cert-chain-verify"]
 default = [

@@ -134,6 +134,9 @@ impl JidExt for Jid {
 /// for correlation, but not reversible to the number. (The Signal `device_id` is
 /// always 0 here — the device lives inside the name — so it is not shown.)
 pub fn observe_protocol_address(addr: &ProtocolAddress) -> String {
+    if cfg!(feature = "tracing-pii") {
+        return addr.name().to_string();
+    }
     format!(
         "addr#{:016x}",
         wacore_binary::jid::observe_token(addr.name())

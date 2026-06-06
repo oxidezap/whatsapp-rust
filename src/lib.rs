@@ -1,3 +1,8 @@
+// Instrumenting large async fns (e.g. process_sync_task) wraps them in deep
+// `Instrumented` future types; the default depth limit overflows when the
+// `tracing` + `tracing-pii` paths combine. Raise it (compile-time only).
+#![recursion_limit = "512"]
+
 pub use wacore::appstate::schemas;
 pub use wacore::client_profile::ClientProfile;
 pub use wacore::{

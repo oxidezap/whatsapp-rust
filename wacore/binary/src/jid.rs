@@ -885,6 +885,19 @@ pub fn observe_token(s: &str) -> u64 {
         .hash_one(s)
 }
 
+/// Privacy-aware redaction of a JID supplied as a string (e.g. a group jid `&str`
+/// in a span field). Parses it and applies [`Jid::observe`]; if it does not parse,
+/// falls back to a keyed token so a raw number can never leak. Honors `tracing-pii`.
+pub fn observe_str(s: &str) -> String {
+    if cfg!(feature = "tracing-pii") {
+        return s.to_string();
+    }
+    match s.parse::<Jid>() {
+        Ok(jid) => jid.observe().to_string(),
+        Err(_) => format!("?#{:016x}", observe_token(s)),
+    }
+}
+
 impl fmt::Display for ObservedJid<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let jid = self.0;

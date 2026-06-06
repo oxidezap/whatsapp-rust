@@ -22,12 +22,14 @@
 //! `tracing` with `default-features = false` so the hazard cannot happen.
 //!
 //! PII note: the bridged `log` lines surface alongside the redacted `wa.*` spans.
-//! The library renders JIDs in its log messages through `Jid::observe()` (phone
-//! numbers become `pn#<keyed-token>`), so they carry the same redaction as the
-//! span fields. If your own application code logs raw JIDs/phone numbers, those
-//! will still reach the trace exporter — scrub them with `Jid::observe()` too, or
-//! drop the `whatsapp_rust`/`wacore` `log` targets from your export layer. The
-//! `tracing-pii` cargo feature (off) renders raw numbers for local debugging only.
+//! The library renders JIDs and Signal addresses in its own log messages through
+//! `Jid::observe()` / `observe_protocol_address()` (phone numbers become
+//! `pn#<keyed-token>`), so the `whatsapp_rust`/`wacore` log lines carry the same
+//! redaction as the span fields. Your own application code is a separate leak
+//! path: any raw JID/phone you log reaches the exporter under your own targets,
+//! and dropping the library targets does nothing for it — scrub your app's logs
+//! with `Jid::observe()` too. The `tracing-pii` cargo feature (off) renders raw
+//! numbers for local debugging only.
 
 fn main() {
     use tracing_subscriber::prelude::*;

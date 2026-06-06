@@ -722,7 +722,7 @@ impl Client {
     /// For LID mode, uses `group_info.phone_jid_for_lid_user` to query devices
     /// via PN when available (LID usync is unreliable for own JID), then
     /// converts the result back to LID. Same fallback as `prepare_group_stanza`.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %group_jid)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
     async fn resolve_skdm_targets(
         &self,
         group_jid: &str,
