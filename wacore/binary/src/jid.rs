@@ -846,10 +846,12 @@ impl fmt::Display for Jid {
 
 /// Privacy-aware [`Display`] wrapper for a [`Jid`], for use in tracing fields.
 ///
-/// Pseudonymous (LID) and non-personal (group/broadcast/newsletter/bot/call)
+/// Pseudonymous (LID) and non-personal (newsletter/bot/call, modern group ids)
 /// JIDs render in full, so the same peer/chat correlates across spans. JIDs whose
 /// `user` is a phone number ([`Server::carries_phone_number`]) render the user as
 /// a `pn#<token>` instead — preserving correlation without leaking the number.
+/// Legacy group/broadcast ids of the form `<creator-phone>-<timestamp>` get only
+/// the numeric prefix redacted (`pn#<token>-<timestamp>`), keeping the timestamp.
 ///
 /// The token is a keyed hash (SipHash via a process-lifetime random key), not a
 /// plain digest of the number: the phone-number search space is small, so an
@@ -869,25 +871,50 @@ impl Jid {
     }
 }
 
+/// Per-process keyed token for a sensitive string: a SipHash with a random key
+/// created once per process. Stable within a run (so the same value correlates
+/// across spans) but not precomputable from the input, so exported traces cannot
+/// be brute-forced back to the original (e.g. an E.164 phone number).
+fn observe_token(s: &str) -> u64 {
+    use std::hash::BuildHasher;
+    static KEY: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    KEY.get_or_init(std::collections::hash_map::RandomState::new)
+        .hash_one(s)
+}
+
 impl fmt::Display for ObservedJid<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let jid = self.0;
-        let redact = jid.server.carries_phone_number()
-            && !jid.user.is_empty()
-            && !cfg!(feature = "tracing-pii");
-        if !redact {
+        if jid.user.is_empty() || cfg!(feature = "tracing-pii") {
             return fmt::Display::fmt(jid, f);
         }
-        // Keyed (SipHash) token over the phone number, with a per-process random
-        // key so the token is stable within a run but not precomputable from the
-        // number — an unkeyed digest of an E.164 number is trivially reversible.
-        use std::hash::BuildHasher;
-        static KEY: std::sync::OnceLock<std::collections::hash_map::RandomState> =
-            std::sync::OnceLock::new();
-        let token = KEY
-            .get_or_init(std::collections::hash_map::RandomState::new)
-            .hash_one(jid.user.as_str());
-        write!(f, "pn#{token:016x}")?;
+        // Decide the privacy-safe `user` rendering.
+        let redacted: Option<String> = if jid.server.carries_phone_number() {
+            // The whole user is a phone number.
+            Some(format!("pn#{:016x}", observe_token(jid.user.as_str())))
+        } else if matches!(jid.server, Server::Group | Server::Broadcast) {
+            // Legacy group/broadcast ids embed the creator phone as
+            // "<phone>-<timestamp>". Redact the numeric prefix and keep the
+            // timestamp (not PII) so the group still correlates across spans.
+            match jid.user.find('-') {
+                Some(i) if i > 0 && jid.user.as_bytes()[..i].iter().all(|b| b.is_ascii_digit()) => {
+                    Some(format!(
+                        "pn#{:016x}{}",
+                        observe_token(&jid.user[..i]),
+                        &jid.user[i..]
+                    ))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let Some(user) = redacted else {
+            // Pseudonymous (LID) or non-personal: safe to render in full.
+            return fmt::Display::fmt(jid, f);
+        };
+        f.write_str(&user)?;
         // Preserve agent where it is part of the identity (e.g. Interop/Messenger),
         // mirroring the normal JID display so distinct IDs stay distinct.
         if jid.agent > 0 && jid.server.renders_agent() {
@@ -946,11 +973,21 @@ mod tests {
         // Stable within the process so the same peer correlates across spans.
         assert_eq!(shown, pn.observe().to_string());
 
-        // LID is pseudonymous and groups are non-personal: rendered in full.
+        // LID is pseudonymous and modern group ids are non-personal: rendered in full.
         let lid = Jid::from_str("123456789@lid").unwrap();
         assert_eq!(lid.observe().to_string(), lid.to_string());
         let group = Jid::from_str("120363012345678901@g.us").unwrap();
         assert_eq!(group.observe().to_string(), group.to_string());
+
+        // Legacy group id embeds the creator phone ("<phone>-<ts>"): redact the
+        // numeric prefix, keep the timestamp.
+        let legacy = Jid::from_str("123456789-1620000000@g.us").unwrap();
+        let ls = legacy.observe().to_string();
+        assert!(
+            ls.starts_with("pn#") && ls.ends_with("-1620000000@g.us"),
+            "{ls}"
+        );
+        assert_ne!(ls, legacy.to_string(), "legacy creator phone not redacted");
     }
 
     /// Helper function to test a full parsing and display round-trip.
