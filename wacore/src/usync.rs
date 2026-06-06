@@ -67,7 +67,7 @@ pub fn parse_get_user_devices_response_with_phash(resp_node: &Node) -> Result<Ve
         let user_jid = user_node.attrs().jid("jid");
         let device_list_node = user_node
             .get_optional_child_by_tag(&["devices", "device-list"])
-            .ok_or_else(|| anyhow!("<device-list> not found for user {user_jid}"))?;
+            .ok_or_else(|| anyhow!("<device-list> not found for user {}", user_jid.observe()))?;
 
         // Extract phash from device-list node attributes
         let phash = device_list_node

@@ -346,7 +346,7 @@ impl Client {
         device_guard
             .contains_session(&signal_addr)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to check session for {}: {}", jid, e))
+            .map_err(|e| anyhow::anyhow!("Failed to check session for {}: {}", jid.observe(), e))
     }
 }
 
