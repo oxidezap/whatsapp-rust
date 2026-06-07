@@ -64,6 +64,7 @@ pub use wacore::pair_code::{PairCodeError, PairCodeOptions};
 /// Wraps `wacore::pair_code::PairCodeError` (validation, key derivation, bundle
 /// building) and adds the IQ transport layer via `RequestFailed`.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PairError {
     #[error(transparent)]
     PairCode(#[from] PairCodeError),

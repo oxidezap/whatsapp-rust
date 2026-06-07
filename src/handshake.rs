@@ -22,6 +22,7 @@ const NOISE_HANDSHAKE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 const IK_FAILURE_THRESHOLD: u32 = 1;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum HandshakeError {
     #[error("Transport error: {0}")]
     Transport(#[from] anyhow::Error),

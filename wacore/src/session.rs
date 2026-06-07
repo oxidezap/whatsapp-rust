@@ -24,6 +24,7 @@ pub type SessionResult = Result<(), SessionError>;
 
 /// Errors that can occur during session management
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SessionError {
     /// The prekey fetch operation failed
     FetchFailed(String),

@@ -8,6 +8,7 @@ use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum PresenceError {
     #[error("cannot send presence without a push name set")]
     PushNameEmpty,

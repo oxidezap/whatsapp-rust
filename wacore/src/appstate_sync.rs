@@ -79,6 +79,7 @@ where
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AppStateSyncError {
     #[error("app state key not found: {0}")]
     KeyNotFound(String),

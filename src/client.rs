@@ -274,6 +274,7 @@ impl std::fmt::Display for MemoryDiagnostics {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ClientError {
     #[error("client is not connected")]
     NotConnected,

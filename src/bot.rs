@@ -25,6 +25,7 @@ pub struct Missing;
 pub struct Provided;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum BotBuilderError {
     #[error(transparent)]
     Other(#[from] anyhow::Error),

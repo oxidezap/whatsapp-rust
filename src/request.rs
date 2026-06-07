@@ -12,6 +12,7 @@ use wacore_binary::Node;
 pub use wacore::request::{InfoQuery, InfoQueryType, RequestUtils};
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum IqError {
     #[error("IQ request timed out")]
     Timeout,
@@ -45,6 +46,9 @@ impl From<wacore::request::IqError> for IqError {
                 Self::ServerError { code, text }
             }
             wacore::request::IqError::InternalChannelClosed => Self::InternalChannelClosed,
+            // wacore::IqError is #[non_exhaustive]; a new upstream variant should
+            // get its own arm above. Until then treat it as an unexpected internal error.
+            _ => Self::InternalChannelClosed,
         }
     }
 }

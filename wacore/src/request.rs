@@ -79,6 +79,7 @@ impl<'a> InfoQuery<'a> {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum IqError {
     #[error("IQ request timed out")]
     Timeout,

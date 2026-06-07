@@ -3,6 +3,7 @@ use thiserror::Error;
 use wacore_binary::zlib_pool::{InflateReader, decompress_zlib_pooled};
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum HistorySyncError {
     #[error("Failed to decompress history sync data: {0}")]
     DecompressionError(#[from] std::io::Error),

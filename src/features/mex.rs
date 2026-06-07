@@ -14,6 +14,7 @@ pub use wacore::iq::mex::{MexDoc, MexErrorExtensions, MexGraphQLError, MexRespon
 
 /// Error types for MEX operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MexError {
     /// Payload missing or otherwise malformed in a way that has no underlying
     /// typed source (descriptive message only — e.g. "missing data").
