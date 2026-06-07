@@ -25,6 +25,7 @@ pub enum ChatPresenceMedia {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "String")]
+#[non_exhaustive]
 pub enum ReceiptType {
     Delivered,
     /// Sent but NOT delivered: WA Web downgrades a delivery ack to this when the
