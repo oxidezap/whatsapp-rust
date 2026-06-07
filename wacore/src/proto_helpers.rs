@@ -12,6 +12,7 @@ macro_rules! with_context_info_fields {
             extended_text_message,
             image_message,
             video_message,
+            ptv_message,
             audio_message,
             document_message,
             sticker_message,
@@ -2444,6 +2445,26 @@ mod tests {
             wrapped.get_base_message().conversation.as_deref(),
             Some("inner")
         );
+    }
+
+    #[test]
+    fn prepare_for_forward_marks_ptv_message() {
+        // ptv (video note) is a send-supported context-info carrier; forwarding
+        // it must still attach the forwarded marker.
+        let msg = wa::Message {
+            ptv_message: Some(Box::new(wa::message::VideoMessage::default())),
+            ..Default::default()
+        };
+        let fwd = msg.prepare_for_forward();
+        let ctx = fwd
+            .ptv_message
+            .as_ref()
+            .expect("ptv preserved")
+            .context_info
+            .as_ref()
+            .expect("context_info attached");
+        assert_eq!(ctx.is_forwarded, Some(true));
+        assert_eq!(ctx.forwarding_score, Some(0));
     }
 
     fn group_target_key() -> wa::MessageKey {
