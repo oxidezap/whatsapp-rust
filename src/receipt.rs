@@ -1861,6 +1861,12 @@ mod tests {
             node.attrs.get("type").map(|v| v.as_str()).as_deref(),
             Some("played")
         );
-        assert!(node.attrs.get("participant").is_some());
+        assert_eq!(
+            node.attrs
+                .get("participant")
+                .and_then(|v| v.to_jid().map(|j| j.to_string()))
+                .as_deref(),
+            Some("456@s.whatsapp.net")
+        );
     }
 }
