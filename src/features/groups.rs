@@ -3,7 +3,10 @@ use crate::features::mex::{MexError, mex_request};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wacore::client::context::GroupInfo;
-use wacore::iq::contacts::{SetProfilePictureResponse, SetProfilePictureSpec};
+use wacore::iq::contacts::SetProfilePictureSpec;
+// Returned by set/remove_profile_picture; re-exported so callers don't reach
+// into wacore directly (consistent with GroupProfilePicture below).
+pub use wacore::iq::contacts::SetProfilePictureResponse;
 use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
     BatchGetGroupInfoIq, CancelMembershipRequestsIq, DemoteParticipantsIq, GetGroupInviteInfoIq,
