@@ -263,6 +263,16 @@ impl SetProfilePictureSpec {
             image_data: None,
         }
     }
+
+    /// Set or remove a group's picture from caller-supplied bytes. Empty bytes
+    /// mean remove, mirroring [`Self::for_own`].
+    pub fn for_group(group_jid: &Jid, image_data: Vec<u8>) -> Self {
+        if image_data.is_empty() {
+            Self::remove_group(group_jid)
+        } else {
+            Self::set_group(group_jid, image_data)
+        }
+    }
 }
 
 impl IqSpec for SetProfilePictureSpec {
@@ -328,6 +338,18 @@ mod tests {
             SetProfilePictureSpec::for_own(vec![1, 2, 3]).image_data,
             Some(vec![1, 2, 3])
         );
+    }
+
+    #[test]
+    fn for_group_routes_empty_to_remove() {
+        let group_jid: Jid = "123456789@g.us".parse().unwrap();
+        let removed = SetProfilePictureSpec::for_group(&group_jid, Vec::new());
+        assert!(removed.image_data.is_none());
+        assert_eq!(removed.target.as_ref(), Some(&group_jid));
+
+        let set = SetProfilePictureSpec::for_group(&group_jid, vec![1, 2, 3]);
+        assert_eq!(set.image_data, Some(vec![1, 2, 3]));
+        assert_eq!(set.target.as_ref(), Some(&group_jid));
     }
 
     #[test]
