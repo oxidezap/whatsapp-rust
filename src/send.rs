@@ -388,6 +388,24 @@ impl Client {
             .await
     }
 
+    /// Forward an existing message to a chat.
+    ///
+    /// Builds a forward-ready copy of `message` (sets `is_forwarded`, bumps the
+    /// forwarding score, strips the reply/quote chain, and drops the source
+    /// `message_secret`) via [`MessageExt::prepare_for_forward`], then sends it.
+    /// `message` may be a received body or a wrapper (ephemeral/view-once); the
+    /// inner content is unwrapped before forwarding. Existing media is relayed
+    /// from the same CDN blob rather than re-uploaded.
+    pub async fn forward_message(
+        &self,
+        to: Jid,
+        message: &wa::Message,
+    ) -> Result<SendResult, anyhow::Error> {
+        use wacore::proto_helpers::MessageExt;
+        let body = *message.get_base_message().prepare_for_forward();
+        self.send_message(to, body).await
+    }
+
     /// Send a message with additional options.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn send_message_with_options(

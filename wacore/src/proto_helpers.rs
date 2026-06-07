@@ -121,6 +121,19 @@ pub trait MessageExt {
     /// ```
     fn prepare_for_quote(&self) -> Box<wa::Message>;
 
+    /// Prepares a copy of this message to be forwarded.
+    ///
+    /// Mirrors WA Web `WAWebChatForwardMessage` + `getMsgForwardingScoreWhenForwarded`:
+    /// strips the reply/quote chain and mentions, sets `context_info.is_forwarded`,
+    /// bumps `forwarding_score` (source score plus 1 if the source was already shown
+    /// as forwarded, jumping to the `127` frequently-forwarded sentinel at `>= 5`),
+    /// and drops `message_context_info` so the send path mints a fresh
+    /// `message_secret` instead of reusing the source's.
+    ///
+    /// Forwards the message body as-is, so existing media is relayed from the same
+    /// CDN blob (mediaKey/url are carried over) rather than re-uploaded.
+    fn prepare_for_forward(&self) -> Box<wa::Message>;
+
     /// Sets context_info on the first supported message field.
     ///
     /// Returns `true` if context was set, otherwise `false`.
@@ -324,6 +337,55 @@ impl MessageExt for wa::Message {
     fn prepare_for_quote(&self) -> Box<wa::Message> {
         let mut msg = self.clone();
         strip_nested_context_info(&mut msg);
+        Box::new(msg)
+    }
+
+    fn prepare_for_forward(&self) -> Box<wa::Message> {
+        // WA Web's `FREQUENTLY_FORWARDED_SENTINEL` (Constants/Deprecated): the
+        // score saturates by jumping here at the >= 5 threshold, not at 5.
+        const FREQUENTLY_FORWARDED_SENTINEL: u32 = 127;
+
+        let mut msg = self.clone();
+        // Reuse the quote/mention stripping; forwarding also breaks the chain.
+        strip_nested_context_info(&mut msg);
+        // WA Web forward omits messageSecret; the send path generates a fresh one.
+        msg.message_context_info = None;
+
+        macro_rules! set_forward {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if let Some(ref mut m) = msg.$field {
+                        let ctx = m
+                            .context_info
+                            .get_or_insert_with(|| Box::new(wa::ContextInfo::default()));
+                        let n = ctx.forwarding_score.unwrap_or(0)
+                            + u32::from(ctx.is_forwarded.unwrap_or(false));
+                        ctx.forwarding_score = Some(if n >= 5 {
+                            FREQUENTLY_FORWARDED_SENTINEL
+                        } else {
+                            n
+                        });
+                        ctx.is_forwarded = Some(true);
+                        return Box::new(msg);
+                    }
+                )+
+            };
+        }
+        with_context_info_fields!(set_forward!());
+
+        // Bare conversation carries no context_info; promote it like the other
+        // setters do so the forward marker can attach.
+        if let Some(text) = msg.conversation.take() {
+            msg.extended_text_message = Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some(text),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    is_forwarded: Some(true),
+                    forwarding_score: Some(0),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }));
+        }
         Box::new(msg)
     }
 
@@ -2207,6 +2269,112 @@ mod tests {
             ..Default::default()
         };
         assert!(!not_fwd.is_forwarded());
+    }
+
+    #[test]
+    fn prepare_for_forward_marks_fresh_conversation() {
+        let msg = wa::Message {
+            conversation: Some("hello".into()),
+            ..Default::default()
+        };
+        let fwd = msg.prepare_for_forward();
+        // A bare conversation is promoted to extended_text_message so the marker
+        // can attach.
+        let etm = fwd
+            .extended_text_message
+            .as_ref()
+            .expect("conversation promoted to extended_text_message");
+        assert_eq!(etm.text.as_deref(), Some("hello"));
+        let ctx = etm.context_info.as_ref().expect("context_info present");
+        assert_eq!(ctx.is_forwarded, Some(true));
+        assert_eq!(ctx.forwarding_score, Some(0));
+    }
+
+    #[test]
+    fn prepare_for_forward_bumps_score_when_source_already_forwarded() {
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("hi".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    is_forwarded: Some(true),
+                    forwarding_score: Some(0),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let fwd = msg.prepare_for_forward();
+        let ctx = fwd
+            .extended_text_message
+            .as_ref()
+            .unwrap()
+            .context_info
+            .as_ref()
+            .unwrap();
+        assert_eq!(ctx.is_forwarded, Some(true));
+        // n = score(0) + already_forwarded(1) = 1.
+        assert_eq!(ctx.forwarding_score, Some(1));
+    }
+
+    #[test]
+    fn prepare_for_forward_jumps_to_sentinel_at_threshold() {
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("hi".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    is_forwarded: Some(true),
+                    // n = 4 + 1 = 5 -> frequently-forwarded sentinel, not 5.
+                    forwarding_score: Some(4),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let fwd = msg.prepare_for_forward();
+        let ctx = fwd
+            .extended_text_message
+            .as_ref()
+            .unwrap()
+            .context_info
+            .as_ref()
+            .unwrap();
+        assert_eq!(ctx.forwarding_score, Some(127));
+    }
+
+    #[test]
+    fn prepare_for_forward_strips_quote_chain() {
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("reply".into()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    stanza_id: Some("QUOTED".into()),
+                    participant: Some("123@s.whatsapp.net".into()),
+                    quoted_message: Some(Box::new(wa::Message {
+                        conversation: Some("orig".into()),
+                        ..Default::default()
+                    })),
+                    mentioned_jid: vec!["456@s.whatsapp.net".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let fwd = msg.prepare_for_forward();
+        let ctx = fwd
+            .extended_text_message
+            .as_ref()
+            .unwrap()
+            .context_info
+            .as_ref()
+            .unwrap();
+        assert!(ctx.stanza_id.is_none());
+        assert!(ctx.quoted_message.is_none());
+        assert!(ctx.participant.is_none());
+        assert!(ctx.mentioned_jid.is_empty());
+        assert_eq!(ctx.is_forwarded, Some(true));
     }
 
     fn group_target_key() -> wa::MessageKey {
