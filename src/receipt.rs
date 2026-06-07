@@ -1827,4 +1827,40 @@ mod tests {
             .expect("extra ids must produce a <list>");
         assert_eq!(list.children().map(|c| c.len()).unwrap_or(0), 2);
     }
+
+    #[test]
+    fn played_receipt_status_broadcast_carries_participant() {
+        let node = build_played_receipt_node(
+            &jid("status@broadcast"),
+            Some(&jid("456@s.whatsapp.net")),
+            &["M1".to_string()],
+            "100",
+        );
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played")
+        );
+        assert_eq!(
+            node.attrs
+                .get("participant")
+                .and_then(|v| v.to_jid().map(|j| j.to_string()))
+                .as_deref(),
+            Some("456@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn played_receipt_broadcast_list_carries_participant() {
+        let node = build_played_receipt_node(
+            &jid("120363000000000001@broadcast"),
+            Some(&jid("456@s.whatsapp.net")),
+            &["M1".to_string()],
+            "100",
+        );
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played")
+        );
+        assert!(node.attrs.get("participant").is_some());
+    }
 }
