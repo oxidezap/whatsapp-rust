@@ -1052,6 +1052,27 @@ impl Client {
         .await
     }
 
+    /// Keep (or un-keep) a message in a disappearing chat for everyone.
+    ///
+    /// Sends a `keepInChatMessage` add-on (WA Web `WAWebKeepInChatMsgAction`):
+    /// `keep = true` requests `KEEP_FOR_ALL`, `keep = false` requests
+    /// `UNDO_KEEP_FOR_ALL`. `key` is the target (kept) message's key; the keep
+    /// message itself is sent with a fresh id. The send path classifies this as a
+    /// text add-on and maps the undo case to a sender-revoke edit attribute.
+    pub async fn keep_message(
+        &self,
+        chat: Jid,
+        key: wa::MessageKey,
+        keep: bool,
+    ) -> Result<SendResult, anyhow::Error> {
+        let message = wacore::proto_helpers::build_keep_in_chat_message(
+            key,
+            keep,
+            wacore::time::now_millis(),
+        );
+        self.send_message(chat, message).await
+    }
+
     /// Pin a message in a chat for all participants.
     pub async fn pin_message(
         &self,

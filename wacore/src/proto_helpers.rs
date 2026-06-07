@@ -430,6 +430,34 @@ impl MessageExt for wa::Message {
     }
 }
 
+/// Builds a `keepInChatMessage` body that keeps (or un-keeps) a message in a
+/// disappearing chat for everyone.
+///
+/// Mirrors WA Web `WAWebGenerateKeepInChatMessageProto`: the body carries the
+/// kept message's `key`, the keep type (`keep = true` -> `KEEP_FOR_ALL`,
+/// `false` -> `UNDO_KEEP_FOR_ALL`), and `timestamp_ms` = the *send* time (not
+/// the kept message's). The keep message itself is sent with a fresh
+/// `MessageKey` by the send path, so only the target key goes in the body.
+pub fn build_keep_in_chat_message(
+    key: wa::MessageKey,
+    keep: bool,
+    timestamp_ms: i64,
+) -> wa::Message {
+    let keep_type = if keep {
+        wa::KeepType::KeepForAll
+    } else {
+        wa::KeepType::UndoKeepForAll
+    };
+    wa::Message {
+        keep_in_chat_message: Some(wa::message::KeepInChatMessage {
+            key: Some(key),
+            keep_type: Some(keep_type as i32),
+            timestamp_ms: Some(timestamp_ms),
+        }),
+        ..Default::default()
+    }
+}
+
 /// Strips nested context_info fields to match WhatsApp Web.
 ///
 /// Clears quote-chain fields plus `mentioned_jid`/`group_mentions` to avoid
@@ -2207,6 +2235,35 @@ mod tests {
             ..Default::default()
         };
         assert!(!not_fwd.is_forwarded());
+    }
+
+    #[test]
+    fn build_keep_in_chat_message_keep_for_all() {
+        let key = wa::MessageKey {
+            id: Some("MID".into()),
+            from_me: Some(false),
+            ..Default::default()
+        };
+        let msg = build_keep_in_chat_message(key, true, 12345);
+        let k = msg
+            .keep_in_chat_message
+            .as_ref()
+            .expect("keep_in_chat_message set");
+        assert_eq!(k.keep_type, Some(wa::KeepType::KeepForAll as i32));
+        assert_eq!(k.timestamp_ms, Some(12345));
+        assert_eq!(
+            k.key.as_ref().and_then(|key| key.id.as_deref()),
+            Some("MID")
+        );
+    }
+
+    #[test]
+    fn build_keep_in_chat_message_undo() {
+        let msg = build_keep_in_chat_message(wa::MessageKey::default(), false, 1);
+        assert_eq!(
+            msg.keep_in_chat_message.unwrap().keep_type,
+            Some(wa::KeepType::UndoKeepForAll as i32)
+        );
     }
 
     fn group_target_key() -> wa::MessageKey {
