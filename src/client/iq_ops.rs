@@ -118,6 +118,22 @@ impl Client {
             .await
     }
 
+    /// Turn disappearing messages on or off for a 1:1 chat (`duration` in
+    /// seconds; `0` disables).
+    ///
+    /// Sends an `EPHEMERAL_SETTING` protocol message, mirroring WA Web's
+    /// `WAWebUpdateEphemeralSettingChatAction`. For groups use
+    /// [`Groups::set_ephemeral`](crate::Groups::set_ephemeral); for the account
+    /// default use [`Client::set_default_disappearing_mode`].
+    pub async fn set_chat_disappearing_timer(
+        &self,
+        chat: wacore_binary::Jid,
+        duration: u32,
+    ) -> Result<crate::send::SendResult, anyhow::Error> {
+        let msg = build_ephemeral_setting_message(duration, wacore::time::now_secs_u64() as i64);
+        self.send_message(chat, msg).await
+    }
+
     /// Get business profile for a WhatsApp Business account.
     pub async fn get_business_profile(
         &self,
@@ -192,5 +208,62 @@ impl Client {
         self.persistence_manager
             .process_command(DeviceCommand::SetClientProfile(profile))
             .await;
+    }
+}
+
+/// Builds the `EPHEMERAL_SETTING` protocol message that turns a 1:1 chat's
+/// disappearing timer on/off. The timer data lives directly on `ProtocolMessage`
+/// (`ephemeral_expiration`, `ephemeral_setting_timestamp`, `disappearing_mode`);
+/// there is no `ephemeral_setting` field. Timestamp is unix seconds. Mirrors
+/// WA Web's `MsgChatActionUtils` (`disappearingModeInitiator: ChangedInChat`,
+/// `disappearingModeTrigger: Unknown`).
+fn build_ephemeral_setting_message(duration: u32, now_secs: i64) -> waproto::whatsapp::Message {
+    use waproto::whatsapp as wa;
+    wa::Message {
+        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::EphemeralSetting as i32),
+            ephemeral_expiration: Some(duration),
+            ephemeral_setting_timestamp: Some(now_secs),
+            disappearing_mode: Some(wa::DisappearingMode {
+                initiator: Some(wa::disappearing_mode::Initiator::ChangedInChat as i32),
+                trigger: Some(wa::disappearing_mode::Trigger::Unknown as i32),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_ephemeral_setting_message;
+    use waproto::whatsapp as wa;
+
+    #[test]
+    fn ephemeral_setting_message_shape() {
+        let msg = build_ephemeral_setting_message(86400, 1_700_000_000);
+        let pm = msg.protocol_message.expect("protocol_message set");
+        assert_eq!(
+            pm.r#type,
+            Some(wa::message::protocol_message::Type::EphemeralSetting as i32)
+        );
+        assert_eq!(pm.ephemeral_expiration, Some(86400));
+        assert_eq!(pm.ephemeral_setting_timestamp, Some(1_700_000_000));
+        let dm = pm.disappearing_mode.expect("disappearing_mode set");
+        assert_eq!(
+            dm.initiator,
+            Some(wa::disappearing_mode::Initiator::ChangedInChat as i32)
+        );
+        assert_eq!(
+            dm.trigger,
+            Some(wa::disappearing_mode::Trigger::Unknown as i32)
+        );
+    }
+
+    #[test]
+    fn ephemeral_setting_disable_uses_zero_duration() {
+        let msg = build_ephemeral_setting_message(0, 1);
+        assert_eq!(msg.protocol_message.unwrap().ephemeral_expiration, Some(0));
     }
 }
