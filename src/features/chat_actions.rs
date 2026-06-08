@@ -12,7 +12,7 @@ use wacore::appstate::patch_decode::WAPatchName;
 use wacore::appstate::schemas::{self, IndexPart, Schema};
 use wacore::types::events::{
     ArchiveUpdate, ClearChatUpdate, ContactUpdate, DeleteChatUpdate, DeleteMessageForMeUpdate,
-    Event, MarkChatAsReadUpdate, MuteUpdate, PinUpdate, StarUpdate,
+    Event, MarkChatAsReadUpdate, MuteUpdate, PinUpdate, StarUpdate, UserStatusMuteUpdate,
 };
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
@@ -80,6 +80,7 @@ pub(crate) fn dispatch_chat_mutation(
             | "markChatAsRead"
             | "deleteChat"
             | "clearChat"
+            | "userStatusMute"
             | "deleteMessageForMe"
     ) {
         return false;
@@ -223,6 +224,20 @@ pub(crate) fn dispatch_chat_mutation(
                     delete_media,
                     timestamp: time,
                     action: Box::new(act.clone()),
+                    from_full_sync: full_sync,
+                }));
+            }
+            true
+        }
+        "userStatusMute" => {
+            if let Some(val) = &m.action_value
+                && let Some(act) = &val.user_status_mute_action
+            {
+                event_bus.dispatch(Event::UserStatusMuteUpdate(UserStatusMuteUpdate {
+                    jid,
+                    muted: act.muted.unwrap_or(false),
+                    timestamp: time,
+                    action: Box::new(*act),
                     from_full_sync: full_sync,
                 }));
             }
@@ -515,6 +530,23 @@ impl<'a> ChatActions<'a> {
             .await
     }
 
+    /// Mute or unmute a contact/group/newsletter's status updates across devices
+    /// (WA Web's userStatusMute). `muted = true` hides their status.
+    pub async fn set_user_status_mute(&self, jid: &Jid, muted: bool) -> Result<()> {
+        debug!("Setting userStatusMute for {jid} -> {muted}");
+        let value = wa::SyncActionValue {
+            user_status_mute_action: Some(wa::sync_action_value::UserStatusMuteAction {
+                muted: Some(muted),
+            }),
+            timestamp: Some(wacore::time::now_millis()),
+            ..Default::default()
+        };
+        let jid = jid.to_string();
+        self.client
+            .send_app_state_action(&schemas::USER_STATUS_MUTE, &[jid.as_str()], &value)
+            .await
+    }
+
     /// Deletes locally only (not for everyone).
     /// `participant_jid`: required for group messages from others, `None` otherwise.
     pub async fn delete_message_for_me(
@@ -804,6 +836,11 @@ mod registry_tests {
                 &schemas::CLEAR_CHAT,
                 &["123@s.whatsapp.net", "0", "1"],
                 &["clearChat", "123@s.whatsapp.net", "0", "1"],
+            ),
+            (
+                &schemas::USER_STATUS_MUTE,
+                &["123@s.whatsapp.net"],
+                &["userStatusMute", "123@s.whatsapp.net"],
             ),
             (&schemas::LABEL_EDIT, &["5"], &["label_edit", "5"]),
             (

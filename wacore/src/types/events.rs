@@ -232,6 +232,7 @@ pub enum EventKind {
     MarkChatAsReadUpdate,
     DeleteChatUpdate,
     ClearChatUpdate,
+    UserStatusMuteUpdate,
     DeleteMessageForMeUpdate,
     LabelEditUpdate,
     LabelAssociationUpdate,
@@ -634,6 +635,7 @@ pub enum Event {
     MarkChatAsReadUpdate(MarkChatAsReadUpdate),
     DeleteChatUpdate(DeleteChatUpdate),
     ClearChatUpdate(ClearChatUpdate),
+    UserStatusMuteUpdate(UserStatusMuteUpdate),
     DeleteMessageForMeUpdate(DeleteMessageForMeUpdate),
     LabelEditUpdate(LabelEditUpdate),
     LabelAssociationUpdate(LabelAssociationUpdate),
@@ -722,6 +724,7 @@ impl Event {
             Event::MarkChatAsReadUpdate(_) => EventKind::MarkChatAsReadUpdate,
             Event::DeleteChatUpdate(_) => EventKind::DeleteChatUpdate,
             Event::ClearChatUpdate(_) => EventKind::ClearChatUpdate,
+            Event::UserStatusMuteUpdate(_) => EventKind::UserStatusMuteUpdate,
             Event::DeleteMessageForMeUpdate(_) => EventKind::DeleteMessageForMeUpdate,
             Event::LabelEditUpdate(_) => EventKind::LabelEditUpdate,
             Event::LabelAssociationUpdate(_) => EventKind::LabelAssociationUpdate,
@@ -1171,6 +1174,18 @@ pub struct ClearChatUpdate {
     pub delete_media: bool,
     pub timestamp: DateTime<Utc>,
     pub action: Box<wa::sync_action_value::ClearChatAction>,
+    pub from_full_sync: bool,
+}
+
+/// A contact/group/newsletter's status updates were muted/unmuted on a linked device.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserStatusMuteUpdate {
+    /// The entity whose status was (un)muted.
+    pub jid: Jid,
+    /// `true` = status muted, `false` = unmuted.
+    pub muted: bool,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::UserStatusMuteAction>,
     pub from_full_sync: bool,
 }
 
