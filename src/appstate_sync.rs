@@ -32,6 +32,8 @@ mod tests {
         macs: MockMacMap,
         keys: Arc<Mutex<HashMap<Vec<u8>, AppStateSyncKey>>>,
         latest_key_id: Arc<Mutex<Option<Vec<u8>>>>,
+        // Fault injection: when set, clear_mutation_macs fails (transient store error).
+        fail_clear_macs: Arc<Mutex<bool>>,
     }
 
     // Implement SignalStore - Signal protocol cryptographic operations
@@ -143,7 +145,13 @@ mod tests {
         async fn delete_mutation_macs(&self, _: &str, _: &[Vec<u8>]) -> StoreResult<()> {
             Ok(())
         }
-        async fn clear_mutation_macs(&self, _: &str) -> StoreResult<()> {
+        async fn clear_mutation_macs(&self, name: &str) -> StoreResult<()> {
+            if *self.fail_clear_macs.lock().await {
+                return Err(wacore::store::error::StoreError::Io(std::io::Error::other(
+                    "injected clear_mutation_macs failure",
+                )));
+            }
+            self.macs.lock().await.retain(|(n, _), _| n != name);
             Ok(())
         }
         async fn get_latest_sync_key_id(&self) -> StoreResult<Option<Vec<u8>>> {
@@ -441,6 +449,140 @@ mod tests {
         assert_eq!(
             final_state.version, 2,
             "The version should be updated to that of the patch."
+        );
+    }
+
+    /// Builds a snapshot resync (incoming v2 over persisted v1) that carries one
+    /// record, after seeding an unrelated stale MAC at v1. Returns the backend,
+    /// processor, the patch list, and the stale index MAC that the resync must drop.
+    async fn snapshot_resync_scenario() -> (Arc<MockBackend>, AppStateProcessor, PatchList, Vec<u8>)
+    {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let collection_name = WAPatchName::Regular;
+        let key_id_bytes = b"snap_key_id".to_vec();
+        let master_key = [9u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+
+        backend
+            .set_sync_key(
+                &key_id_bytes,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept sync key");
+
+        backend
+            .set_version(
+                collection_name.as_str(),
+                HashState {
+                    version: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept version");
+
+        let stale_index_mac = vec![0xAB; 32];
+        backend
+            .put_mutation_macs(
+                collection_name.as_str(),
+                1,
+                &[AppStateMutationMAC {
+                    index_mac: stale_index_mac.clone(),
+                    value_mac: vec![0xCD; 32],
+                }],
+            )
+            .await
+            .expect("test backend should accept mutation MACs");
+
+        let plaintext = wa::SyncActionData {
+            value: Some(wa::SyncActionValue {
+                timestamp: Some(2000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let record = create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &[0x11; 32],
+            &plaintext,
+            &keys,
+            &key_id_bytes,
+        )
+        .record
+        .expect("mutation should carry a record");
+
+        let patch_list = PatchList {
+            name: collection_name,
+            has_more_patches: false,
+            patches: vec![],
+            snapshot: Some(wa::SyncdSnapshot {
+                version: Some(wa::SyncdVersion { version: Some(2) }),
+                records: vec![record],
+                key_id: Some(wa::KeyId {
+                    id: Some(key_id_bytes),
+                }),
+                ..Default::default()
+            }),
+            snapshot_ref: None,
+            error: None,
+        };
+
+        (backend, processor, patch_list, stale_index_mac)
+    }
+
+    #[tokio::test]
+    async fn snapshot_resync_drops_stale_mutation_macs() {
+        let (backend, processor, patch_list, stale_index_mac) = snapshot_resync_scenario().await;
+
+        processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("snapshot resync should succeed");
+
+        assert_eq!(
+            backend
+                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
+                .await
+                .unwrap(),
+            None,
+            "stale MAC from the old baseline must be cleared by the snapshot resync"
+        );
+        assert_eq!(
+            backend
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .unwrap()
+                .version,
+            2
+        );
+    }
+
+    /// Guards the write-ahead ordering: if clearing MACs fails, the version must
+    /// stay at the old baseline so the retry reapplies the snapshot instead of
+    /// skipping it as stale.
+    #[tokio::test]
+    async fn snapshot_resync_keeps_old_version_when_clear_fails() {
+        let (backend, processor, patch_list, _) = snapshot_resync_scenario().await;
+        *backend.fail_clear_macs.lock().await = true;
+
+        let err = processor.process_patch_list(patch_list, false).await;
+        assert!(err.is_err(), "clear failure must abort the resync");
+
+        assert_eq!(
+            backend
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .unwrap()
+                .version,
+            1,
+            "version must not advance when the MAC reset fails"
         );
     }
 }

@@ -309,13 +309,13 @@ impl AppStateProcessor {
 
             new_mutations.extend(snapshot_result.mutations);
 
-            // Persist state and MACs. A snapshot is a fresh baseline, so wipe the
-            // collection's prior mutation MACs first (unconditionally, even if the
-            // snapshot has none) — leftover index->value entries would corrupt the
-            // next patch's ltHash.
-            self.backend
-                .set_version(collection_name, state.clone())
-                .await?;
+            // A snapshot is a fresh baseline, so wipe the collection's prior mutation
+            // MACs first (unconditionally, even if the snapshot has none) — leftover
+            // index->value entries would corrupt the next patch's ltHash.
+            //
+            // Commit the version LAST. If clear/put fails on a transient store error,
+            // an already-advanced version would make the retry treat this same snapshot
+            // as stale (snapshot_is_stale) and skip it, stranding the old MACs forever.
             self.backend.clear_mutation_macs(collection_name).await?;
             if !snapshot_result.mutation_macs.is_empty() {
                 self.backend
@@ -326,6 +326,9 @@ impl AppStateProcessor {
                     )
                     .await?;
             }
+            self.backend
+                .set_version(collection_name, state.clone())
+                .await?;
         }
 
         // Snapshot the key cache once for all patches (prefetch_keys already populated it)
