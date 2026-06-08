@@ -109,6 +109,62 @@ impl Client {
         Ok(original_id)
     }
 
+    /// Edit a message via the message-secret encrypted path (`secret_encrypted_message`
+    /// with `secret_enc_type = MESSAGE_EDIT`), instead of the plaintext protocolMessage
+    /// edit. This is the form Community Announcement Group / channel edits require, and
+    /// what WA Web sends when `message_edit_to_message_secret_sender_enabled` is on.
+    ///
+    /// `message_secret` is the *original* message's 32-byte secret (you generated it when
+    /// you sent that message). You can only edit your own messages, so the original
+    /// sender and the editor are both you.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit_encrypted", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
+    pub async fn edit_message_encrypted(
+        &self,
+        to: Jid,
+        original_id: impl Into<String>,
+        message_secret: &[u8],
+        new_content: wa::Message,
+    ) -> Result<String, anyhow::Error> {
+        let original_id = original_id.into();
+
+        let self_jid = if to.is_group() {
+            self.get_own_jid_for_group(&to).await?.to_non_ad()
+        } else {
+            self.get_pn()
+                .await
+                .ok_or_else(|| anyhow::Error::from(ClientError::NotLoggedIn))?
+                .to_non_ad()
+        };
+        let participant = if to.is_group() {
+            Some(self_jid.to_string())
+        } else {
+            None
+        };
+
+        let envelope = build_secret_message_edit(
+            &to,
+            &original_id,
+            participant,
+            &self_jid.to_string(),
+            message_secret,
+            new_content,
+        )?;
+
+        self.send_message_impl(
+            to,
+            &envelope,
+            None,
+            false,
+            false,
+            Some(crate::types::message::EditAttribute::MessageEdit),
+            vec![],
+            None,
+        )
+        .await?;
+
+        Ok(original_id)
+    }
+
     /// Send a server-side reaction (used by both newsletter and status reactions).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.server_reaction", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub(crate) async fn send_server_reaction(
@@ -289,5 +345,142 @@ impl Client {
         let _ =
             self.send_active_receipts
                 .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// Build the outgoing `secret_encrypted_message` (MESSAGE_EDIT) envelope: encrypt the
+/// protocolMessage(MESSAGE_EDIT) under the original message's secret and wrap it with
+/// `messageContextInfo.messageSecret`, matching WAWebGenerateSecretMessageEditProto.
+fn build_secret_message_edit(
+    to: &Jid,
+    original_id: &str,
+    participant: Option<String>,
+    self_jid_str: &str,
+    message_secret: &[u8],
+    new_content: wa::Message,
+) -> Result<wa::Message, anyhow::Error> {
+    let inner = crate::send::build_edit_message(
+        to,
+        original_id.to_string(),
+        participant.clone(),
+        new_content,
+        wacore::time::now_millis(),
+    );
+
+    // You can only edit your own message, so original-sender == editor == self.
+    let ctx = wacore::message_edit::MessageEditContext {
+        original_msg_id: original_id,
+        original_sender_jid: self_jid_str,
+        editor_jid: self_jid_str,
+    };
+    let (enc_payload, iv) =
+        wacore::message_edit::encrypt_message_edit(&inner, message_secret, &ctx)?;
+
+    Ok(wa::Message {
+        secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            target_message_key: Some(wa::MessageKey {
+                remote_jid: Some(to.to_string()),
+                from_me: Some(true),
+                id: Some(original_id.to_string()),
+                participant,
+            }),
+            enc_payload: Some(enc_payload),
+            enc_iv: Some(iv.to_vec()),
+            secret_enc_type: Some(
+                wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
+            ),
+            remote_key_id: None,
+        }),
+        message_context_info: Some(wa::MessageContextInfo {
+            message_secret: Some(message_secret.to_vec()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
+mod secret_message_edit_tests {
+    use super::*;
+
+    #[test]
+    fn secret_message_edit_roundtrip() {
+        let secret = [0x33u8; 32];
+        let to: Jid = "5511777777777@s.whatsapp.net".parse().unwrap();
+        let self_str = "5511999999999@s.whatsapp.net";
+        let new_content = wa::Message {
+            conversation: Some("edited!".into()),
+            ..Default::default()
+        };
+
+        let envelope =
+            build_secret_message_edit(&to, "ORIGID", None, self_str, &secret, new_content).unwrap();
+
+        let sem = envelope.secret_encrypted_message.as_ref().unwrap();
+        assert_eq!(
+            sem.secret_enc_type,
+            Some(wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32)
+        );
+        // The envelope carries the original secret (WAWebGenerateSecretMessageEditProto).
+        assert_eq!(
+            envelope
+                .message_context_info
+                .as_ref()
+                .and_then(|c| c.message_secret.as_deref()),
+            Some(&secret[..])
+        );
+
+        // The recipient decrypts with the original message's secret + same ctx.
+        let ctx = wacore::message_edit::MessageEditContext {
+            original_msg_id: "ORIGID",
+            original_sender_jid: self_str,
+            editor_jid: self_str,
+        };
+        let inner = wacore::message_edit::decrypt_message_edit(
+            sem.enc_payload.as_deref().unwrap(),
+            sem.enc_iv.as_deref().unwrap(),
+            &secret,
+            &ctx,
+        )
+        .unwrap();
+        let edited = inner
+            .protocol_message
+            .and_then(|pm| pm.edited_message)
+            .and_then(|m| m.conversation);
+        assert_eq!(edited.as_deref(), Some("edited!"));
+    }
+
+    #[test]
+    fn secret_message_edit_wrong_secret_fails_to_decrypt() {
+        let secret = [0x33u8; 32];
+        let to: Jid = "5511777777777@s.whatsapp.net".parse().unwrap();
+        let self_str = "5511999999999@s.whatsapp.net";
+        let envelope = build_secret_message_edit(
+            &to,
+            "ORIGID",
+            None,
+            self_str,
+            &secret,
+            wa::Message {
+                conversation: Some("edited!".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let sem = envelope.secret_encrypted_message.as_ref().unwrap();
+        let ctx = wacore::message_edit::MessageEditContext {
+            original_msg_id: "ORIGID",
+            original_sender_jid: self_str,
+            editor_jid: self_str,
+        };
+        assert!(
+            wacore::message_edit::decrypt_message_edit(
+                sem.enc_payload.as_deref().unwrap(),
+                sem.enc_iv.as_deref().unwrap(),
+                &[0x00u8; 32],
+                &ctx,
+            )
+            .is_err()
+        );
     }
 }
