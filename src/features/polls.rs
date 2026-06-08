@@ -33,49 +33,35 @@ impl<'a> Polls<'a> {
         options: &[String],
         selectable_count: u32,
     ) -> Result<(SendResult, Vec<u8>)> {
-        if options.len() < 2 {
-            return Err(anyhow!("Poll must have at least 2 options"));
-        }
-        if options.len() > 12 {
-            return Err(anyhow!("Polls can have a maximum of 12 options"));
-        }
-        if selectable_count < 1 || selectable_count > options.len() as u32 {
-            return Err(anyhow!(
-                "selectable_count must be between 1 and {} (got {selectable_count})",
-                options.len()
-            ));
-        }
+        self.create_inner(to, name, options, selectable_count, None)
+            .await
+    }
 
-        // Duplicate names would produce identical SHA-256 hashes, making votes indistinguishable
-        let mut seen = std::collections::HashSet::new();
-        for opt in options {
-            if !seen.insert(opt) {
-                return Err(anyhow!("Duplicate option name: {opt}"));
-            }
-        }
+    /// Create a quiz poll: a single-select poll with exactly one correct option.
+    ///
+    /// `correct_index` is the 0-based index into `options` of the right answer.
+    /// Quizzes are inherently single-select (WA Web forces `selectableOptionsCount=1`),
+    /// so the count is fixed at 1. Returns the `message_secret` needed to decrypt votes.
+    pub async fn create_quiz(
+        &self,
+        to: &Jid,
+        name: &str,
+        options: &[String],
+        correct_index: usize,
+    ) -> Result<(SendResult, Vec<u8>)> {
+        self.create_inner(to, name, options, 1, Some(correct_index))
+            .await
+    }
 
-        let poll_options: Vec<wa::message::poll_creation_message::Option> = options
-            .iter()
-            .map(|name| wa::message::poll_creation_message::Option {
-                option_name: Some(name.clone()),
-                option_hash: None,
-            })
-            .collect();
-
-        let poll_msg = wa::message::PollCreationMessage {
-            enc_key: None,
-            name: Some(name.to_string()),
-            options: poll_options,
-            selectable_options_count: Some(selectable_count),
-            context_info: None,
-            // WA Web's GeneratePollCreationMessageProto always sets pollContentType
-            // (TEXT=1 for a normal poll); omitting it drops a field the real client
-            // always emits. poll_type=POLL is 0 (proto default) so None is wire-equal.
-            poll_content_type: Some(wa::message::PollContentType::Text as i32),
-            poll_type: None,
-            correct_answer: None,
-            ..Default::default()
-        };
+    async fn create_inner(
+        &self,
+        to: &Jid,
+        name: &str,
+        options: &[String],
+        selectable_count: u32,
+        correct_index: Option<usize>,
+    ) -> Result<(SendResult, Vec<u8>)> {
+        let poll_msg = build_poll_creation_message(name, options, selectable_count, correct_index)?;
 
         // WA Web: v3 for single-select, v1 for multi-select (GeneratePollCreationMessageProto.js:39-41)
         let mut message = if selectable_count == 1 {
@@ -346,6 +332,81 @@ impl Client {
     }
 }
 
+/// Validate inputs and build a `PollCreationMessage`. A `Some(correct_index)`
+/// produces a QUIZ; `None` produces a regular poll. Mirrors WA Web's
+/// `GeneratePollCreationMessageProto` + `validatePollCreationMessage`, which require
+/// `correctAnswer` iff `pollType == QUIZ`, with the chosen option carrying BOTH its
+/// name and hash (even for text polls).
+fn build_poll_creation_message(
+    name: &str,
+    options: &[String],
+    selectable_count: u32,
+    correct_index: Option<usize>,
+) -> Result<wa::message::PollCreationMessage> {
+    if options.len() < 2 {
+        return Err(anyhow!("Poll must have at least 2 options"));
+    }
+    if options.len() > 12 {
+        return Err(anyhow!("Polls can have a maximum of 12 options"));
+    }
+    if selectable_count < 1 || selectable_count > options.len() as u32 {
+        return Err(anyhow!(
+            "selectable_count must be between 1 and {} (got {selectable_count})",
+            options.len()
+        ));
+    }
+
+    // Duplicate names would produce identical SHA-256 hashes, making votes indistinguishable
+    let mut seen = std::collections::HashSet::new();
+    for opt in options {
+        if !seen.insert(opt) {
+            return Err(anyhow!("Duplicate option name: {opt}"));
+        }
+    }
+
+    let (poll_type, correct_answer) = match correct_index {
+        Some(idx) => {
+            let correct = options.get(idx).ok_or_else(|| {
+                anyhow!(
+                    "correct_index {idx} out of range (poll has {} options)",
+                    options.len()
+                )
+            })?;
+            let answer = wa::message::poll_creation_message::Option {
+                option_name: Some(correct.clone()),
+                // optionHash is the lowercase hex of SHA-256(name), matching WA Web's
+                // createOptionHashHexFromString (the proto field is a string, not bytes).
+                option_hash: Some(hex::encode(poll::compute_option_hash(correct))),
+            };
+            (Some(wa::message::PollType::Quiz as i32), Some(answer))
+        }
+        None => (None, None),
+    };
+
+    let poll_options: Vec<wa::message::poll_creation_message::Option> = options
+        .iter()
+        .map(|name| wa::message::poll_creation_message::Option {
+            option_name: Some(name.clone()),
+            option_hash: None,
+        })
+        .collect();
+
+    Ok(wa::message::PollCreationMessage {
+        enc_key: None,
+        name: Some(name.to_string()),
+        options: poll_options,
+        selectable_options_count: Some(selectable_count),
+        context_info: None,
+        // WA Web's GeneratePollCreationMessageProto always sets pollContentType
+        // (TEXT=1 for a normal poll); omitting it drops a field the real client
+        // always emits.
+        poll_content_type: Some(wa::message::PollContentType::Text as i32),
+        poll_type,
+        correct_answer,
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +414,44 @@ mod tests {
     use crate::store::commands::DeviceCommand;
     use crate::test_utils::create_test_client;
     use std::sync::Arc;
+
+    // poll/quiz message construction (build_poll_creation_message)
+
+    #[test]
+    fn regular_poll_has_no_quiz_fields() {
+        let options = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let msg = build_poll_creation_message("Q?", &options, 2, None).unwrap();
+        assert_eq!(msg.poll_type, None);
+        assert!(msg.correct_answer.is_none());
+        assert_eq!(msg.selectable_options_count, Some(2));
+        assert_eq!(
+            msg.poll_content_type,
+            Some(wa::message::PollContentType::Text as i32)
+        );
+        assert_eq!(msg.options.len(), 3);
+        assert!(msg.options.iter().all(|o| o.option_hash.is_none()));
+    }
+
+    #[test]
+    fn quiz_sets_poll_type_and_correct_answer() {
+        let options = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let msg = build_poll_creation_message("Q?", &options, 1, Some(1)).unwrap();
+        assert_eq!(msg.poll_type, Some(wa::message::PollType::Quiz as i32));
+        let answer = msg
+            .correct_answer
+            .expect("quiz must carry a correct answer");
+        // WA Web sets BOTH name and hash on the chosen option, even for text polls;
+        // the hash is the lowercase hex of SHA-256(name).
+        assert_eq!(answer.option_name.as_deref(), Some("B"));
+        let expected_hash = hex::encode(poll::compute_option_hash("B"));
+        assert_eq!(answer.option_hash.as_deref(), Some(expected_hash.as_str()));
+    }
+
+    #[test]
+    fn quiz_rejects_out_of_range_correct_index() {
+        let options = vec!["A".to_string(), "B".to_string()];
+        assert!(build_poll_creation_message("Q?", &options, 1, Some(5)).is_err());
+    }
 
     // encrypt-side voter selection (resolve_voter_jid)
 
