@@ -5,14 +5,13 @@
 //! the CDN/crypto fields (url, direct_path, media_key, file_sha256, file_enc_sha256,
 //! file_length, media_key_timestamp, streaming_sidecar) every time. Mirrors WA Web's
 //! send-media path, which builds the proto from the upload result internally.
+//! The resulting [`wa::Message`] is sent with `client.send_message(to, msg)`.
 //!
 //! ```no_run
-//! # async fn f(client: &whatsapp_rust::Client, to: whatsapp_rust::Jid, bytes: Vec<u8>) -> anyhow::Result<()> {
+//! # fn build(upload: whatsapp_rust::upload::UploadResponse) {
 //! use whatsapp_rust::media::{self, ImageOptions};
-//! let upload = client.upload(&bytes, "image/jpeg").await?;
-//! let msg = media::image_message(upload, ImageOptions { caption: Some("hi".into()), ..Default::default() });
-//! client.send_message(to, msg).await?;
-//! # Ok(()) }
+//! let _msg = media::image_message(upload, ImageOptions { caption: Some("hi".into()), ..Default::default() });
+//! # }
 //! ```
 
 use crate::upload::UploadResponse;
