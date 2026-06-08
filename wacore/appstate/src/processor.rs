@@ -350,12 +350,11 @@ pub fn validate_patch_macs(
     had_no_prior_state: bool,
     has_missing_remove: bool,
 ) -> Result<(), AppStateError> {
-    // Skip ALL MAC validation if we had no prior state.
-    // When we receive patches without a snapshot for a never-synced collection,
-    // WhatsApp Web throws a retryable "empty lthash" error. We can't properly validate
-    // either the snapshotMac (computed from wrong baseline) or the patchMac (which
-    // includes the snapshotMac). Instead, we process the mutations and rely on
-    // future syncs with snapshots to correct the state.
+    // Skip ALL MAC validation only for the genesis patch (version 1) seeding an
+    // empty baseline: there is no prior snapshotMac/patchMac baseline to validate
+    // against. The empty + non-genesis case (a patch without a snapshot that can't
+    // anchor the ltHash) is rejected upstream in `process_patch_list` as a retryable
+    // resync, so it never reaches here.
     if had_no_prior_state {
         return Ok(());
     }

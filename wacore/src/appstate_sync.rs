@@ -543,6 +543,10 @@ impl AppStateProcessor {
         FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
     {
         let mut all = Vec::new();
+        // Bound re-fetches so a server that keeps returning a retryable collection
+        // (e.g. an empty-ltHash patch without a snapshot) can't loop forever.
+        const MAX_RETRIES: usize = 5;
+        let mut retries = 0;
         loop {
             let state = self.backend.get_version(name.as_str()).await?;
             let node = driver.fetch_collection(name, state.version).await?;
@@ -550,6 +554,21 @@ impl AppStateProcessor {
                 .decode_patch_list(&node, &download, validate_macs)
                 .await?;
             all.append(&mut muts);
+            // A retryable error (or conflict-with-more) left the version unadvanced;
+            // re-fetch (now requesting a snapshot, since the version is still 0)
+            // rather than reporting success. Mirrors the batched path's needs_refetch.
+            // Fatal / conflict-without-more fall through and end the loop.
+            if matches!(
+                list.error,
+                Some(CollectionSyncError::Retry { .. })
+                    | Some(CollectionSyncError::Conflict { has_more: true })
+            ) {
+                retries += 1;
+                if retries >= MAX_RETRIES {
+                    break;
+                }
+                continue;
+            }
             if !list.has_more_patches {
                 break;
             }
