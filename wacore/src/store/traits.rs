@@ -287,6 +287,11 @@ pub trait AppSyncStore: Send + Sync {
     /// Delete mutation MACs by their index MACs.
     async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()>;
 
+    /// Delete every mutation MAC for a collection. Called on snapshot re-sync so the
+    /// MAC store is rebuilt from the snapshot, matching the ltHash baseline; leftover
+    /// entries would corrupt the next patch's ltHash.
+    async fn clear_mutation_macs(&self, name: &str) -> Result<()>;
+
     /// Get the most recently stored app state sync key ID.
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>>;
 }

@@ -1935,6 +1935,24 @@ impl AppSyncStore for SqliteStore {
             .await
     }
 
+    async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
+        let device_id = self.device_id;
+        let name = name.to_string();
+        self.with_retry("clear_mutation_macs", || {
+            let name = name.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::delete(
+                    app_state_mutation_macs::table
+                        .filter(app_state_mutation_macs::name.eq(&name))
+                        .filter(app_state_mutation_macs::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>> {
         self.get_latest_app_state_sync_key_id_for_device(self.device_id)
             .await
@@ -3088,6 +3106,40 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_mutation_macs_wipes_only_named_collection() {
+        let store = create_test_store().await;
+        let mac = |i: u8| AppStateMutationMAC {
+            index_mac: vec![i; 32],
+            value_mac: vec![i; 32],
+        };
+        store
+            .put_mutation_macs("regular", 1, &[mac(1)])
+            .await
+            .unwrap();
+        store
+            .put_mutation_macs("critical", 1, &[mac(2)])
+            .await
+            .unwrap();
+
+        store.clear_mutation_macs("regular").await.unwrap();
+
+        assert!(
+            store
+                .get_mutation_mac("regular", &[1; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_mutation_mac("critical", &[2; 32])
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

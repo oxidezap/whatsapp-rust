@@ -342,6 +342,15 @@ impl AppSyncStore for InMemoryBackend {
         Ok(())
     }
 
+    async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
+        self.state
+            .lock()
+            .await
+            .mutation_macs
+            .retain(|(n, _), _| n != name);
+        Ok(())
+    }
+
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>> {
         Ok(self.state.lock().await.latest_sync_key_id.clone())
     }
@@ -738,6 +747,38 @@ mod tests {
         // Delete drops the blob so the next query re-fetches in full.
         backend.delete_group_metadata(jid).await.unwrap();
         assert!(backend.get_group_metadata(jid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_mutation_macs_wipes_only_named_collection() {
+        use crate::store::traits::AppSyncStore;
+        let backend = InMemoryBackend::new();
+        let mac = |i: u8, v: u8| AppStateMutationMAC {
+            index_mac: vec![i],
+            value_mac: vec![v],
+        };
+        backend
+            .put_mutation_macs("regular", 1, &[mac(1, 10)])
+            .await
+            .unwrap();
+        backend
+            .put_mutation_macs("critical", 1, &[mac(2, 20)])
+            .await
+            .unwrap();
+
+        backend.clear_mutation_macs("regular").await.unwrap();
+
+        assert!(
+            backend
+                .get_mutation_mac("regular", &[1])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            backend.get_mutation_mac("critical", &[2]).await.unwrap(),
+            Some(vec![20])
+        );
     }
 
     #[tokio::test]

@@ -143,6 +143,9 @@ mod tests {
         async fn delete_mutation_macs(&self, _: &str, _: &[Vec<u8>]) -> StoreResult<()> {
             Ok(())
         }
+        async fn clear_mutation_macs(&self, _: &str) -> StoreResult<()> {
+            Ok(())
+        }
         async fn get_latest_sync_key_id(&self) -> StoreResult<Option<Vec<u8>>> {
             Ok(self.latest_key_id.lock().await.clone())
         }
