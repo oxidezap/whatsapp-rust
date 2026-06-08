@@ -15,6 +15,7 @@ use wacore_binary::{Jid, JidExt};
 // Re-export types from wacore
 pub use wacore::iq::contacts::ProfilePicture;
 pub use wacore::iq::usync::{IsOnWhatsAppResult, UserInfo};
+pub use wacore::stanza::business::VerifiedName;
 
 pub struct Contacts<'a> {
     client: &'a Client,

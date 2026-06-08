@@ -53,6 +53,7 @@
 use crate::WireEnum;
 use crate::iq::spec::IqSpec;
 use crate::request::InfoQuery;
+use crate::stanza::business::VerifiedName;
 use anyhow::anyhow;
 use log::warn;
 use std::collections::HashMap;
@@ -138,6 +139,17 @@ struct ParsedUserFields {
     lid: Option<Jid>,
     is_business: bool,
     status: Option<String>,
+    verified_name: Option<VerifiedName>,
+}
+
+/// Parses the `<business><verified_name>` certificate that usync returns for
+/// business accounts (the `name` lives inside the cert protobuf). Mirrors
+/// WAWebUsyncBusiness `businessParser`.
+fn parse_verified_name(user_node: &NodeRef<'_>) -> Option<VerifiedName> {
+    user_node
+        .get_optional_child("business")
+        .and_then(|business| business.get_optional_child("verified_name"))
+        .and_then(|vn| VerifiedName::try_from_node(vn).ok())
 }
 
 /// Parse common fields from a usync `<user>` node.
@@ -163,12 +175,14 @@ fn parse_user_common_fields(user_node: &NodeRef<'_>) -> Option<ParsedUserFields>
         });
 
     let is_business = user_node.get_optional_child("business").is_some();
+    let verified_name = parse_verified_name(user_node);
 
     Some(ParsedUserFields {
         jid,
         lid,
         is_business,
         status,
+        verified_name,
     })
 }
 
@@ -196,6 +210,8 @@ pub struct IsOnWhatsAppResult {
     pub pn_jid: Option<Jid>,
     pub is_registered: bool,
     pub is_business: bool,
+    /// Verified business name (decoded from `<business><verified_name>`), if any.
+    pub verified_name: Option<VerifiedName>,
 }
 
 /// User information from usync.
@@ -206,6 +222,8 @@ pub struct UserInfo {
     pub status: Option<String>,
     pub picture_id: Option<String>,
     pub is_business: bool,
+    /// Verified business name (decoded from `<business><verified_name>`), if any.
+    pub verified_name: Option<VerifiedName>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +360,7 @@ impl IqSpec for IsOnWhatsAppSpec {
             };
 
             let is_business = user_node.get_optional_child("business").is_some();
+            let verified_name = parse_verified_name(user_node);
 
             results.push(IsOnWhatsAppResult {
                 jid,
@@ -349,6 +368,7 @@ impl IqSpec for IsOnWhatsAppSpec {
                 pn_jid,
                 is_registered,
                 is_business,
+                verified_name,
             });
         }
 
@@ -437,6 +457,7 @@ impl IqSpec for UserInfoSpec {
                         status: fields.status,
                         picture_id: parse_picture_id_string(user_node),
                         is_business: fields.is_business,
+                        verified_name: fields.verified_name,
                     },
                 );
             }

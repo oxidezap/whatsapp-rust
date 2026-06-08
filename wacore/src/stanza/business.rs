@@ -3,6 +3,7 @@
 //! Reference: WhatsApp Web `WAWebHandleBusinessNotification`
 
 use anyhow::{Result, anyhow};
+use prost::Message as _;
 use serde::Serialize;
 use wacore_binary::Jid;
 use wacore_binary::NodeRef;
@@ -58,11 +59,12 @@ impl VerifiedName {
                     })
             });
 
-        let serial = node
+        let mut name = name;
+        let mut serial = node
             .attrs()
             .optional_string("serial")
             .map(|s| s.into_owned());
-        let issuer = node
+        let mut issuer = node
             .attrs()
             .optional_string("issuer")
             .map(|s| s.into_owned());
@@ -70,6 +72,20 @@ impl VerifiedName {
             Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
             _ => None,
         };
+
+        // usync's `<verified_name>` carries no `name`/`serial` attrs; the name
+        // lives only inside the certificate protobuf (content bytes). Decode it
+        // to fill the missing fields, matching WAWebCommonParsersVerifiedName.
+        if let Some(cert_bytes) = certificate.as_deref()
+            && let Ok(cert) = waproto::whatsapp::VerifiedNameCertificate::decode(cert_bytes)
+            && let Some(details_bytes) = cert.details.as_deref()
+            && let Ok(details) =
+                waproto::whatsapp::verified_name_certificate::Details::decode(details_bytes)
+        {
+            name = name.or(details.verified_name);
+            serial = serial.or_else(|| details.serial.map(|s| s.to_string()));
+            issuer = issuer.or(details.issuer);
+        }
 
         Ok(Self {
             name,
@@ -391,6 +407,39 @@ mod tests {
         assert_eq!(parsed.stanza_id, "123456");
         assert!(parsed.jid.is_some());
         assert!(parsed.is_business_removed());
+    }
+
+    #[test]
+    fn verified_name_decodes_certificate_content_bytes() {
+        // usync's <verified_name> has no name/serial attrs; the name lives inside
+        // the certificate protobuf carried as content bytes.
+        let details = waproto::whatsapp::verified_name_certificate::Details {
+            verified_name: Some("Acme Inc".to_string()),
+            serial: Some(42),
+            ..Default::default()
+        };
+        let cert = waproto::whatsapp::VerifiedNameCertificate {
+            details: Some(details.encode_to_vec()),
+            ..Default::default()
+        };
+        let node = NodeBuilder::new("verified_name")
+            .bytes(cert.encode_to_vec())
+            .build();
+        let vn = VerifiedName::try_from_node(&node.as_node_ref()).expect("parse");
+        assert_eq!(vn.name.as_deref(), Some("Acme Inc"));
+        assert_eq!(vn.serial.as_deref(), Some("42"));
+        assert!(vn.certificate.is_some());
+    }
+
+    #[test]
+    fn verified_name_prefers_attr_name_over_certificate() {
+        let node = NodeBuilder::new("verified_name")
+            .attr("name", "Attr Name")
+            .attr("serial", "7")
+            .build();
+        let vn = VerifiedName::try_from_node(&node.as_node_ref()).expect("parse");
+        assert_eq!(vn.name.as_deref(), Some("Attr Name"));
+        assert_eq!(vn.serial.as_deref(), Some("7"));
     }
 
     #[test]

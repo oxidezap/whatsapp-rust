@@ -28,7 +28,7 @@ pub use community::{
 
 pub use chatstate::{ChatStateType, Chatstate};
 
-pub use contacts::{Contacts, IsOnWhatsAppResult, ProfilePicture, UserInfo};
+pub use contacts::{Contacts, IsOnWhatsAppResult, ProfilePicture, UserInfo, VerifiedName};
 
 pub use groups::{
     BatchGroupResult, CreateGroupResult, GroupCreateOptions, GroupDescription, GroupJoinError,
