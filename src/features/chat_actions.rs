@@ -492,6 +492,43 @@ impl<'a> ChatActions<'a> {
             .await
     }
 
+    /// Save or rename a contact, syncing the name to the user's other linked devices.
+    ///
+    /// Writes a `contact` app-state SET mutation (WAWebContactSync.getContactSyncMutation)
+    /// to the `critical_unblock_low` collection with index `["contact", jid]`.
+    /// `full_name`/`first_name` are sent verbatim; an absent `first_name` is omitted
+    /// (WA Web derives no short-name default). `save_on_primary_addressbook` controls
+    /// whether it is saved to the phone's address book.
+    ///
+    /// The contact id must be a phone-number JID: WA Web refuses to send a contact
+    /// mutation keyed by a LID (LID contacts use a separate path), so a LID is rejected.
+    pub async fn save_contact(
+        &self,
+        jid: &Jid,
+        full_name: Option<String>,
+        first_name: Option<String>,
+        save_on_primary_addressbook: bool,
+    ) -> Result<()> {
+        if jid.is_lid() {
+            anyhow::bail!("save_contact: contact id must be a phone-number JID, not a LID");
+        }
+        debug!("Saving contact {jid}");
+        let value = wa::SyncActionValue {
+            contact_action: Some(wa::sync_action_value::ContactAction {
+                full_name,
+                first_name,
+                save_on_primary_addressbook: Some(save_on_primary_addressbook),
+                ..Default::default()
+            }),
+            timestamp: Some(wacore::time::now_millis()),
+            ..Default::default()
+        };
+        let jid_str = jid.to_string();
+        self.client
+            .send_app_state_action(&schemas::CONTACT, &[jid_str.as_str()], &value)
+            .await
+    }
+
     async fn send_archive_mutation(
         &self,
         jid: &Jid,
@@ -762,5 +799,20 @@ mod registry_tests {
             // Round-trips through the wire name.
             assert_eq!(collection_patch_name(c).as_str(), c.as_str());
         }
+    }
+
+    #[test]
+    fn contact_action_index_and_collection() {
+        // WAWebContactSync writes ["contact", jid] to critical_unblock_low.
+        let index = build_action_index(&schemas::CONTACT, &["5511999@s.whatsapp.net"]).unwrap();
+        let parts: Vec<String> = serde_json::from_slice(&index).unwrap();
+        assert_eq!(
+            parts,
+            vec!["contact".to_string(), "5511999@s.whatsapp.net".to_string()]
+        );
+        assert_eq!(
+            collection_patch_name(schemas::CONTACT.collection),
+            WAPatchName::CriticalUnblockLow
+        );
     }
 }
