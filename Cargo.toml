@@ -144,7 +144,6 @@ futures = { workspace = true, features = ["std"] }
 hex = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
-moka = { version = "0.12.12", features = ["future"], optional = true }
 portable-atomic = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
@@ -169,6 +168,13 @@ whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version 
 # selected via `--cfg getrandom_backend="wasm_js"` in RUSTFLAGS; no native effect.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, features = ["wasm_js"] }
+
+# moka is thread-based (crossbeam/uuid) and does not build on wasm32, so it is
+# scoped to non-wasm targets. The `moka-cache` feature can still be enabled on
+# wasm32 (it stays in `default`); `dep:moka` is simply inert there and the cache
+# falls back to PortableCache via the target gate in src/cache.rs.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+moka = { version = "0.12.12", features = ["future"], optional = true }
 
 [dev-dependencies]
 aes = { workspace = true }
