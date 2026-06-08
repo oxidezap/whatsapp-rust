@@ -32,7 +32,7 @@ use wacore_binary::OwnedNodeRef;
 fn build_played_receipt_node(
     chat: &Jid,
     sender: Option<&Jid>,
-    message_ids: &[String],
+    message_ids: &[&str],
     timestamp: &str,
 ) -> wacore_binary::Node {
     let receipt_type = if chat.is_newsletter() {
@@ -44,7 +44,7 @@ fn build_played_receipt_node(
     let mut builder = NodeBuilder::new("receipt")
         .attr("to", chat)
         .attr("type", receipt_type.as_wire_str())
-        .attr("id", &message_ids[0])
+        .attr("id", message_ids[0])
         .attr("t", timestamp);
 
     if (chat.is_group() || chat.is_status_broadcast() || chat.is_broadcast_list())
@@ -56,7 +56,7 @@ fn build_played_receipt_node(
     if message_ids.len() > 1 {
         let items: Vec<wacore_binary::Node> = message_ids[1..]
             .iter()
-            .map(|id| NodeBuilder::new("item").attr("id", id).build())
+            .map(|id| NodeBuilder::new("item").attr("id", *id).build())
             .collect();
         builder = builder.children(vec![NodeBuilder::new("list").children(items).build()]);
     }
@@ -72,7 +72,7 @@ fn build_played_receipt_node(
 fn build_read_receipt_node(
     chat: &Jid,
     sender: Option<&Jid>,
-    message_ids: &[String],
+    message_ids: &[&str],
     timestamp: &str,
     peer_participant_pn: Option<&Jid>,
 ) -> wacore_binary::Node {
@@ -85,7 +85,7 @@ fn build_read_receipt_node(
     let mut builder = NodeBuilder::new("receipt")
         .attr("to", chat)
         .attr("type", receipt_type.as_wire_str())
-        .attr("id", &message_ids[0])
+        .attr("id", message_ids[0])
         .attr("t", timestamp);
 
     if let Some(sender) = sender {
@@ -102,7 +102,7 @@ fn build_read_receipt_node(
     if message_ids.len() > 1 {
         let items: Vec<wacore_binary::Node> = message_ids[1..]
             .iter()
-            .map(|id| NodeBuilder::new("item").attr("id", id).build())
+            .map(|id| NodeBuilder::new("item").attr("id", *id).build())
             .collect();
         builder = builder.children(vec![NodeBuilder::new("list").children(items).build()]);
     }
@@ -485,7 +485,7 @@ impl Client {
         &self,
         chat: &Jid,
         sender: Option<&Jid>,
-        message_ids: Vec<String>,
+        message_ids: &[&str],
     ) -> Result<(), anyhow::Error> {
         if message_ids.is_empty() {
             return Ok(());
@@ -511,7 +511,7 @@ impl Client {
         let node = build_read_receipt_node(
             chat,
             sender,
-            &message_ids,
+            message_ids,
             &timestamp,
             peer_participant_pn.as_ref(),
         );
@@ -535,14 +535,14 @@ impl Client {
         &self,
         chat: &Jid,
         sender: Option<&Jid>,
-        message_ids: Vec<String>,
+        message_ids: &[&str],
     ) -> Result<(), anyhow::Error> {
         if message_ids.is_empty() {
             return Ok(());
         }
 
         let timestamp = wacore::time::now_secs_u64().to_string();
-        let node = build_played_receipt_node(chat, sender, &message_ids, &timestamp);
+        let node = build_played_receipt_node(chat, sender, message_ids, &timestamp);
 
         debug!(target: "Client/Receipt", "Sending played receipt for {} message(s) to {}", message_ids.len(), chat.observe());
 
@@ -1818,7 +1818,7 @@ mod tests {
         let node = build_played_receipt_node(
             &jid("123@g.us"),
             Some(&jid("456@s.whatsapp.net")),
-            &["M1".to_string()],
+            &["M1"],
             "100",
         );
         assert_eq!(node.tag, "receipt");
@@ -1838,8 +1838,7 @@ mod tests {
     #[test]
     fn played_receipt_dm_is_played_without_participant() {
         // WA Web drops `participant` in DMs (PlayedReceiptJob `r.isUser() ? null`).
-        let node =
-            build_played_receipt_node(&jid("456@s.whatsapp.net"), None, &["M1".to_string()], "100");
+        let node = build_played_receipt_node(&jid("456@s.whatsapp.net"), None, &["M1"], "100");
         assert_eq!(
             node.attrs.get("type").map(|v| v.as_str()).as_deref(),
             Some("played")
@@ -1849,8 +1848,7 @@ mod tests {
 
     #[test]
     fn played_receipt_newsletter_is_played_self() {
-        let node =
-            build_played_receipt_node(&jid("123@newsletter"), None, &["M1".to_string()], "100");
+        let node = build_played_receipt_node(&jid("123@newsletter"), None, &["M1"], "100");
         assert_eq!(
             node.attrs.get("type").map(|v| v.as_str()).as_deref(),
             Some("played-self")
@@ -1860,12 +1858,8 @@ mod tests {
 
     #[test]
     fn played_receipt_extra_ids_go_into_list() {
-        let node = build_played_receipt_node(
-            &jid("456@s.whatsapp.net"),
-            None,
-            &["M1".to_string(), "M2".to_string(), "M3".to_string()],
-            "100",
-        );
+        let node =
+            build_played_receipt_node(&jid("456@s.whatsapp.net"), None, &["M1", "M2", "M3"], "100");
         assert_eq!(
             node.attrs.get("id").map(|v| v.as_str()).as_deref(),
             Some("M1")
@@ -1881,7 +1875,7 @@ mod tests {
         let node = build_played_receipt_node(
             &jid("status@broadcast"),
             Some(&jid("456@s.whatsapp.net")),
-            &["M1".to_string()],
+            &["M1"],
             "100",
         );
         assert_eq!(
@@ -1902,7 +1896,7 @@ mod tests {
         let node = build_played_receipt_node(
             &jid("120363000000000001@broadcast"),
             Some(&jid("456@s.whatsapp.net")),
-            &["M1".to_string()],
+            &["M1"],
             "100",
         );
         assert_eq!(
@@ -1920,13 +1914,7 @@ mod tests {
 
     #[test]
     fn read_receipt_dm_is_read_without_context() {
-        let node = build_read_receipt_node(
-            &jid("456@s.whatsapp.net"),
-            None,
-            &["M1".to_string()],
-            "100",
-            None,
-        );
+        let node = build_read_receipt_node(&jid("456@s.whatsapp.net"), None, &["M1"], "100", None);
         assert_eq!(
             node.attrs.get("type").map(|v| v.as_str()).as_deref(),
             Some("read")
@@ -1937,13 +1925,7 @@ mod tests {
 
     #[test]
     fn read_receipt_newsletter_is_read_self() {
-        let node = build_read_receipt_node(
-            &jid("123@newsletter"),
-            None,
-            &["M1".to_string()],
-            "100",
-            None,
-        );
+        let node = build_read_receipt_node(&jid("123@newsletter"), None, &["M1"], "100", None);
         assert_eq!(
             node.attrs.get("type").map(|v| v.as_str()).as_deref(),
             Some("read-self")
@@ -1956,7 +1938,7 @@ mod tests {
         let node = build_read_receipt_node(
             &jid("status@broadcast"),
             Some(&jid("100000012345678@lid")),
-            &["M1".to_string()],
+            &["M1"],
             "100",
             Some(&pn),
         );

@@ -74,7 +74,7 @@ async fn test_read_receipt_online() -> anyhow::Result<()> {
 
     client_b
         .client
-        .mark_as_read(&jid_a, None, vec![msg_id.clone()])
+        .mark_as_read(&jid_a, None, &[msg_id.as_str()])
         .await?;
     info!("B marked message as read");
 
@@ -191,7 +191,7 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
 
     client_b
         .client
-        .mark_as_read(&jid_a, None, vec![msg_id.clone()])
+        .mark_as_read(&jid_a, None, &[msg_id.as_str()])
         .await?;
     info!("B marked message as read (A is offline)");
 

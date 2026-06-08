@@ -115,7 +115,7 @@ impl MessageContext {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.revoke_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
     pub async fn revoke_message(
         &self,
-        message_id: String,
+        message_id: impl Into<String>,
         revoke_type: crate::send::RevokeType,
     ) -> Result<(), anyhow::Error> {
         self.client
