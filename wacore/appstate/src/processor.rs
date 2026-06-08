@@ -543,7 +543,6 @@ mod tests {
             records: vec![record],
             mac: Some(vec![9u8; 32]),
             key_id: None,
-            ..Default::default()
         };
         let get_keys = |_: &[u8]| Ok(keys.clone());
         let mut state = HashState::default();
