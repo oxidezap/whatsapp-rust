@@ -1,11 +1,8 @@
-//! Unified cache type that dispatches to moka or the portable implementation.
+//! Unified cache type backed by moka or [`PortableCache`](crate::portable_cache::PortableCache).
 //!
-//! Selection is both feature- and target-aware: [`Cache`] is `moka::future::Cache`
-//! only when the `moka-cache` feature is on AND the target is not wasm32. On wasm32
-//! (or with `moka-cache` off) it is [`PortableCache`](crate::portable_cache::PortableCache).
-//! moka is thread-based (it pulls crossbeam/uuid) and does not compile on
-//! wasm32-unknown-unknown, so a defaults-based wasm32 build falls back here rather than
-//! failing deep inside moka's dependency tree.
+//! The selection below is target-gated, not just feature-gated, because moka is
+//! thread-based (crossbeam/uuid) and can't build on wasm32: a defaults-based wasm32
+//! build must fall back to PortableCache instead of failing deep inside moka's deps.
 
 #[cfg(all(feature = "moka-cache", not(target_arch = "wasm32")))]
 mod inner {
