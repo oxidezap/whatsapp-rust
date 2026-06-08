@@ -68,7 +68,10 @@ impl<'a> Polls<'a> {
             options: poll_options,
             selectable_options_count: Some(selectable_count),
             context_info: None,
-            poll_content_type: None,
+            // WA Web's GeneratePollCreationMessageProto always sets pollContentType
+            // (TEXT=1 for a normal poll); omitting it drops a field the real client
+            // always emits. poll_type=POLL is 0 (proto default) so None is wire-equal.
+            poll_content_type: Some(wa::message::PollContentType::Text as i32),
             poll_type: None,
             correct_answer: None,
             ..Default::default()
@@ -156,7 +159,9 @@ impl<'a> Polls<'a> {
                 enc_payload: Some(enc_payload),
                 enc_iv: Some(iv.to_vec()),
             }),
-            metadata: Some(wa::message::PollUpdateMessageMetadata::default()),
+            // WA Web's GeneratePollVoteMessageProto never sets metadata; a Some(empty)
+            // submessage emits a stray `1A 00` (tag 3) on the wire. Omit it.
+            metadata: None,
             sender_timestamp_ms: Some(wacore::time::now_millis()),
         };
 
