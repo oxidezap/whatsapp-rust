@@ -307,13 +307,9 @@ impl AppStateProcessor {
             let (snapshot_result, snapshot_state) = result;
             state = snapshot_state;
 
-            // The snapshot carries the whole collection, so its decoded Vec<Mutation>
-            // is the largest single allocation of a bootstrap. new_mutations was just
-            // initialized empty above and the snapshot branch runs before the patch
-            // loop, so move the Vec in instead of allocating a second buffer and
-            // copying every Mutation (extend on an empty Vec reallocates + memcpy with
-            // the source still live, doubling the peak). The is_empty guard keeps it
-            // correct if a future change ever pushes before this point.
+            // Snapshot owns the whole collection: move its Vec into the empty
+            // accumulator rather than extend, which would allocate + copy a second
+            // collection-sized buffer at the memory peak. is_empty falls back to extend.
             if new_mutations.is_empty() {
                 new_mutations = snapshot_result.mutations;
             } else {
