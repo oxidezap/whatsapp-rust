@@ -234,6 +234,9 @@ pub struct UserInfo {
     pub is_business: bool,
     /// Verified business name (decoded from `<business><verified_name>`), if any.
     pub verified_name: Option<VerifiedName>,
+    /// Device IDs from the `<devices version="2">` sublist the same usync query
+    /// returns (device 0 is the primary). Empty if the server omitted it.
+    pub devices: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,6 +471,7 @@ impl IqSpec for UserInfoSpec {
                         picture_id: parse_picture_id_string(user_node),
                         is_business: fields.is_business,
                         verified_name: fields.verified_name,
+                        devices: parse_user_device_ids(user_node),
                     },
                 );
             }
@@ -475,6 +479,18 @@ impl IqSpec for UserInfoSpec {
 
         Ok(results)
     }
+}
+
+/// Device IDs from a `<user>`'s `<devices><device-list><device id="N"/>` sublist.
+/// Returns empty when the server omitted the sublist or every id is malformed.
+fn parse_user_device_ids(user_node: &NodeRef<'_>) -> Vec<u16> {
+    let Some(device_list) = user_node.get_optional_child_by_tag(&["devices", "device-list"]) else {
+        return Vec::new();
+    };
+    device_list
+        .get_children_by_tag("device")
+        .filter_map(|d| d.attrs().optional_string("id").and_then(|s| s.parse().ok()))
+        .collect()
 }
 
 // Re-export types from wacore::usync for convenience
@@ -1044,6 +1060,15 @@ mod tests {
                                 .build(),
                             NodeBuilder::new("picture").attr("id", "123456789").build(),
                             NodeBuilder::new("business").build(),
+                            NodeBuilder::new("devices")
+                                .attr("version", "2")
+                                .children([NodeBuilder::new("device-list")
+                                    .children([
+                                        NodeBuilder::new("device").attr("id", "0").build(),
+                                        NodeBuilder::new("device").attr("id", "1").build(),
+                                    ])
+                                    .build()])
+                                .build(),
                         ])
                         .build()])
                     .build()])
@@ -1058,6 +1083,8 @@ mod tests {
         assert_eq!(info.status, Some("Hello World".to_string()));
         assert_eq!(info.picture_id, Some("123456789".to_string()));
         assert!(info.lid.is_some());
+        // The <devices> sublist the same query returns is now surfaced, not dropped.
+        assert_eq!(info.devices, vec![0, 1]);
     }
 
     #[test]
