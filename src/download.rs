@@ -267,26 +267,6 @@ impl Client {
         .await
     }
 
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            name = "wa.media.download_to_file",
-            level = "debug",
-            skip_all,
-            err(Debug)
-        )
-    )]
-    pub async fn download_to_file<W: Write + Seek + Send + Unpin>(
-        &self,
-        downloadable: &dyn Downloadable,
-        mut writer: W,
-    ) -> Result<()> {
-        let data = self.download(downloadable).await?;
-        writer.seek(SeekFrom::Start(0))?;
-        writer.write_all(&data)?;
-        Ok(())
-    }
-
     /// Fetch a first-party sticker pack's metadata and sticker list from the CDN.
     ///
     /// Each returned [`wacore::sticker_pack::StickerPackItem`] is [`Downloadable`],
