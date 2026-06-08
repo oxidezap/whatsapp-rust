@@ -130,6 +130,14 @@ impl Client {
         chat: wacore_binary::Jid,
         duration: u32,
     ) -> Result<crate::send::SendResult, anyhow::Error> {
+        // 1:1 only: groups use Groups::set_ephemeral (a separate IQ). Sending the
+        // EPHEMERAL_SETTING body to a group/status/newsletter would produce a
+        // message that does not change the chat's timer, so fail fast instead.
+        if !(chat.is_pn() || chat.is_lid()) {
+            anyhow::bail!(
+                "set_chat_disappearing_timer is 1:1-only; use Groups::set_ephemeral for groups"
+            );
+        }
         let msg = build_ephemeral_setting_message(duration, wacore::time::now_secs_u64() as i64);
         self.send_message(chat, msg).await
     }
