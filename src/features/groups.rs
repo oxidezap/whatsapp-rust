@@ -404,7 +404,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: &Jid,
         description: Option<GroupDescription>,
-        prev: Option<String>,
+        prev: Option<&str>,
     ) -> Result<(), anyhow::Error> {
         Ok(self
             .client
