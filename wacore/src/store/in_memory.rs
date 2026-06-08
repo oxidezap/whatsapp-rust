@@ -517,6 +517,11 @@ impl ProtocolStore for InMemoryBackend {
         Ok(())
     }
 
+    async fn delete_group_metadata(&self, group_jid: &str) -> Result<()> {
+        self.state.lock().await.group_metadata.remove(group_jid);
+        Ok(())
+    }
+
     // --- TcToken Storage ---
 
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>> {
@@ -730,6 +735,9 @@ mod tests {
             backend.get_group_metadata(jid).await.unwrap().as_deref(),
             Some(&b"blob-v2"[..])
         );
+        // Delete drops the blob so the next query re-fetches in full.
+        backend.delete_group_metadata(jid).await.unwrap();
+        assert!(backend.get_group_metadata(jid).await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -1380,6 +1380,9 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                             .iter()
                             .map(|p| (&p.jid, p.phone_number.as_ref())),
                     );
+                    client
+                        .persist_group_metadata(&notification.group_jid, &info)
+                        .await;
                     group_cache
                         .insert(notification.group_jid.clone(), Arc::new(info))
                         .await;
@@ -1396,6 +1399,9 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                 if let Some(info) = group_cache.get(&notification.group_jid).await {
                     let mut info = Arc::unwrap_or_clone(info);
                     info.remove_participants(&users);
+                    client
+                        .persist_group_metadata(&notification.group_jid, &info)
+                        .await;
                     group_cache
                         .insert(notification.group_jid.clone(), Arc::new(info))
                         .await;

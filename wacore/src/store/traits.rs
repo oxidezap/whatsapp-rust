@@ -398,6 +398,13 @@ pub trait ProtocolStore: Send + Sync {
         Ok(())
     }
 
+    /// Remove the persisted group metadata blob for `group_jid` (e.g. on leave),
+    /// so the next query re-fetches in full instead of comparing a stale phash.
+    /// No-op by default.
+    async fn delete_group_metadata(&self, _group_jid: &str) -> Result<()> {
+        Ok(())
+    }
+
     // --- TcToken Storage ---
 
     /// Get a trusted contact token for a JID (stored under LID).

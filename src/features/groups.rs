@@ -415,6 +415,17 @@ impl<'a> Groups<'a> {
     pub async fn leave(&self, jid: &Jid) -> Result<(), anyhow::Error> {
         self.client.execute(LeaveGroupIq::new(jid)).await?;
         self.client.get_group_cache().await.invalidate(jid).await;
+        // Drop the persisted blob too: we're no longer in the group, so a stale
+        // phash from it would only force a needless full re-query if ever read.
+        if let Err(e) = self
+            .client
+            .persistence_manager
+            .backend()
+            .delete_group_metadata(&jid.to_string())
+            .await
+        {
+            log::warn!("Failed to delete persisted group metadata for {jid}: {e}");
+        }
         Ok(())
     }
 
@@ -446,6 +457,7 @@ impl<'a> Groups<'a> {
                         .filter(|r| r.is_ok())
                         .map(|r| (&r.jid, r.phone_number.as_ref())),
                 );
+                self.client.persist_group_metadata(jid, &info).await;
                 group_cache.insert(jid.clone(), Arc::new(info)).await;
             }
         }
@@ -471,6 +483,7 @@ impl<'a> Groups<'a> {
             if let Some(info) = group_cache.get(jid).await {
                 let mut info = Arc::unwrap_or_clone(info);
                 info.remove_participants(&accepted);
+                self.client.persist_group_metadata(jid, &info).await;
                 group_cache.insert(jid.clone(), Arc::new(info)).await;
             }
             self.client
@@ -993,6 +1006,23 @@ impl<'a> Groups<'a> {
 impl Client {
     pub fn groups(&self) -> Groups<'_> {
         Groups::new(self)
+    }
+
+    /// Re-serialize and persist a group's metadata after a local membership change
+    /// so the phash fast-path stays consistent: the in-memory cache expires after
+    /// ~1h, after which a stale persisted blob would force a needless full re-query
+    /// (or be compared against the server as an out-of-date phash). Shared by the
+    /// participant-mutation API and the inbound group-notification handler.
+    pub(crate) async fn persist_group_metadata(&self, jid: &Jid, info: &GroupInfo) {
+        let backend = self.persistence_manager.backend();
+        match serde_json::to_vec(info) {
+            Ok(blob) => {
+                if let Err(e) = backend.put_group_metadata(&jid.to_string(), &blob).await {
+                    log::warn!("Failed to persist group metadata for {jid}: {e}");
+                }
+            }
+            Err(e) => log::warn!("Failed to serialize group metadata for {jid}: {e}"),
+        }
     }
 }
 
