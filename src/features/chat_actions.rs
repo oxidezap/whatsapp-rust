@@ -281,6 +281,13 @@ fn bool_str(b: bool) -> &'static str {
 
 /// Assemble the JSON-array mutation index for `schema` from its non-literal index
 /// args (in `schema.index_parts` order). The arg count must match.
+/// A `contact` app-state mutation is keyed by a bare phone-number JID. Reject
+/// LIDs (a separate WA Web path), group/status/broadcast/newsletter JIDs, and
+/// AD/device JIDs (e.g. `123:4@s.whatsapp.net`) that would form an invalid index.
+fn is_valid_contact_id(jid: &Jid) -> bool {
+    jid.is_pn() && jid.device == 0
+}
+
 pub(crate) fn build_action_index(schema: &Schema, args: &[&str]) -> Result<Vec<u8>> {
     let non_literal = schema
         .index_parts
@@ -509,10 +516,7 @@ impl<'a> ChatActions<'a> {
         first_name: Option<String>,
         save_on_primary_addressbook: bool,
     ) -> Result<()> {
-        // The contact index must be a bare phone-number JID. Reject LIDs (separate
-        // path in WA Web), group/status/broadcast/newsletter JIDs, and AD/device
-        // JIDs (e.g. 123:4@s.whatsapp.net) that would form an invalid contact index.
-        if !jid.is_pn() || jid.device != 0 {
+        if !is_valid_contact_id(jid) {
             anyhow::bail!(
                 "save_contact: contact id must be a bare phone-number JID (not a LID, group, or device-specific JID)"
             );
@@ -784,6 +788,7 @@ mod registry_tests {
         assert_eq!(schemas::ARCHIVE.version, 3);
         assert_eq!(schemas::MARK_CHAT_AS_READ.version, 3);
         assert_eq!(schemas::STAR.version, 2);
+        assert_eq!(schemas::CONTACT.version, 2);
         assert_eq!(schemas::DELETE_MESSAGE_FOR_ME.version, 3);
         assert_eq!(schemas::LABEL_EDIT.version, 3);
         assert_eq!(schemas::LABEL_JID.version, 3);
@@ -819,5 +824,20 @@ mod registry_tests {
             collection_patch_name(schemas::CONTACT.collection),
             WAPatchName::CriticalUnblockLow
         );
+    }
+
+    #[test]
+    fn contact_id_validation_accepts_only_bare_pn() {
+        let valid = |s: &str| is_valid_contact_id(&s.parse::<Jid>().expect("test JID"));
+        // bare PN -> accepted
+        assert!(valid("5511999@s.whatsapp.net"));
+        // AD/device-specific PN -> rejected (would form an invalid contact index)
+        assert!(!valid("5511999:4@s.whatsapp.net"));
+        // LID -> rejected (separate WA Web path)
+        assert!(!valid("100000012345678@lid"));
+        // group / newsletter / status -> rejected
+        assert!(!valid("120363012345@g.us"));
+        assert!(!valid("123@newsletter"));
+        assert!(!valid("status@broadcast"));
     }
 }
