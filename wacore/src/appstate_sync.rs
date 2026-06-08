@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use async_lock::Mutex;
 use async_trait::async_trait;
 use prost::Message;
@@ -10,8 +10,8 @@ use thiserror::Error;
 use crate::appstate::hash::HashState;
 use crate::appstate::keys::ExpandedAppStateKeys;
 use crate::appstate::patch_decode::{
-    PatchList, WAPatchName, parse_patch_list, parse_patch_list_ref, parse_patch_lists,
-    parse_patch_lists_ref,
+    CollectionSyncError, PatchList, WAPatchName, parse_patch_list, parse_patch_list_ref,
+    parse_patch_lists, parse_patch_lists_ref,
 };
 use crate::appstate::{
     collect_key_ids_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
@@ -39,9 +39,14 @@ fn lookup_app_state_key(
 }
 
 /// Download and inline any external snapshot/mutation blobs referenced by `pl`,
-/// resolving each reference via `download`. Best-effort: download/decode failures
-/// are logged and skipped (matches WhatsApp Web).
-fn download_external_blobs<FDownload>(pl: &mut PatchList, download: &FDownload)
+/// resolving each reference via `download`.
+///
+/// A download/decode failure for a referenced blob is propagated as an error, not
+/// swallowed: WA Web (WAWebSyncdCollectionHandler `Fe()`) throws on a failed
+/// external fetch and lets the collection error out, rather than applying an empty
+/// patch and advancing the version. Swallowing it here would silently drop the
+/// blob's mutations and still persist the new version, losing that data permanently.
+fn download_external_blobs<FDownload>(pl: &mut PatchList, download: &FDownload) -> Result<()>
 where
     FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>>,
 {
@@ -49,35 +54,24 @@ where
     if pl.snapshot.is_none()
         && let Some(ext) = &pl.snapshot_ref
     {
-        match download(ext) {
-            Ok(data) => match wa::SyncdSnapshot::decode(data.as_slice()) {
-                Ok(snapshot) => pl.snapshot = Some(snapshot),
-                Err(e) => {
-                    log::warn!(target: "AppState", "Failed to decode external snapshot for {name:?}: {e}")
-                }
-            },
-            Err(e) => {
-                log::warn!(target: "AppState", "Failed to download external snapshot for {name:?}: {e}")
-            }
-        }
+        let data =
+            download(ext).with_context(|| format!("download external snapshot for {name:?}"))?;
+        let snapshot = wa::SyncdSnapshot::decode(data.as_slice())
+            .with_context(|| format!("decode external snapshot for {name:?}"))?;
+        pl.snapshot = Some(snapshot);
     }
 
     for patch in &mut pl.patches {
         if let Some(ext) = &patch.external_mutations {
             let v = patch.version.as_ref().and_then(|x| x.version).unwrap_or(0);
-            match download(ext) {
-                Ok(data) => match wa::SyncdMutations::decode(data.as_slice()) {
-                    Ok(ext_mutations) => patch.mutations = ext_mutations.mutations,
-                    Err(e) => {
-                        log::warn!(target: "AppState", "Failed to decode external mutations for {name:?} v{v}: {e}")
-                    }
-                },
-                Err(e) => {
-                    log::warn!(target: "AppState", "Failed to download external mutations for {name:?} v{v}: {e}")
-                }
-            }
+            let data = download(ext)
+                .with_context(|| format!("download external mutations for {name:?} v{v}"))?;
+            let ext_mutations = wa::SyncdMutations::decode(data.as_slice())
+                .with_context(|| format!("decode external mutations for {name:?} v{v}"))?;
+            patch.mutations = ext_mutations.mutations;
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -167,7 +161,7 @@ impl AppStateProcessor {
     where
         FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
     {
-        download_external_blobs(&mut pl, &download);
+        download_external_blobs(&mut pl, &download)?;
         self.process_patch_list(pl, validate_macs).await
     }
 
@@ -238,7 +232,19 @@ impl AppStateProcessor {
                 continue;
             }
 
-            download_external_blobs(&mut pl, download);
+            // A failed external-blob fetch must not advance the version with an empty
+            // patch (silent data loss). Mark the collection retryable and skip it, so
+            // the caller re-fetches it instead of persisting partial state.
+            if let Err(e) = download_external_blobs(&mut pl, download) {
+                log::warn!(target: "AppState", "External blob fetch failed for {:?}, will refetch: {e:#}", pl.name);
+                pl.error = Some(CollectionSyncError::Retry {
+                    code: 0,
+                    text: e.to_string(),
+                });
+                let state = self.backend.get_version(pl.name.as_str()).await?;
+                results.push((Vec::new(), state, pl));
+                continue;
+            }
 
             let (mutations, state, pl) = self.process_patch_list(pl, validate_macs).await?;
             results.push((mutations, state, pl));
@@ -554,5 +560,42 @@ mod snapshot_guard_tests {
         assert!(snapshot_is_stale(5, 5));
         assert!(snapshot_is_stale(5, 3));
         assert!(snapshot_is_stale(5, 0));
+    }
+}
+
+#[cfg(test)]
+mod external_blob_tests {
+    use super::*;
+
+    fn pl_with_snapshot_ref(snapshot_ref: Option<wa::ExternalBlobReference>) -> PatchList {
+        PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches: Vec::new(),
+            snapshot: None,
+            snapshot_ref,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn external_snapshot_download_failure_propagates() {
+        // A referenced blob that fails to download must error, not be swallowed
+        // (which would apply an empty patch and advance the version).
+        let mut pl = pl_with_snapshot_ref(Some(wa::ExternalBlobReference {
+            direct_path: Some("/blob".into()),
+            ..Default::default()
+        }));
+        let download = |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+            Err(anyhow!("simulated failure"))
+        };
+        assert!(download_external_blobs(&mut pl, &download).is_err());
+    }
+
+    #[test]
+    fn no_external_refs_is_ok() {
+        let mut pl = pl_with_snapshot_ref(None);
+        let download = |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> { Ok(Vec::new()) };
+        assert!(download_external_blobs(&mut pl, &download).is_ok());
     }
 }
