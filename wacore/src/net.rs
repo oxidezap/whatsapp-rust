@@ -39,6 +39,30 @@ impl std::fmt::Display for DisconnectReason {
     }
 }
 
+impl DisconnectReason {
+    /// Whether this is a benign, server-initiated stream recycle (the normal
+    /// WhatsApp reconnect path) rather than a transport-level error.
+    ///
+    /// Used only to pick a log level: a clean shutdown is logged quietly (the
+    /// reconnect is routine), while everything else stays loud so a genuine
+    /// transport failure is never hidden behind reconnect noise. Deliberately
+    /// conservative — anything ambiguous returns `false` (stays loud): a read/IO
+    /// error, an abnormal close code, or an unreported reason.
+    pub fn is_clean_shutdown(&self) -> bool {
+        match self {
+            // EOF with no Close frame is how the WA server recycles a connection.
+            Self::StreamEnded => true,
+            // A Close frame with a normal / going-away / no code is graceful; any
+            // other code (protocol/server error, restart, etc.) stays loud.
+            Self::ServerClose { code, .. } => matches!(code, None | Some(1000) | Some(1001)),
+            // A transport read/IO error is a real failure — never quiet.
+            Self::ReadError(_) => false,
+            // Unknown reason: stay loud, don't assume it was benign.
+            Self::Unknown => false,
+        }
+    }
+}
+
 /// An event produced by the transport layer.
 #[derive(Debug, Clone)]
 pub enum TransportEvent {
@@ -174,5 +198,57 @@ pub trait HttpClient: Send + Sync {
         Err(anyhow::anyhow!(
             "Upload streaming not supported by this HTTP client"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DisconnectReason;
+
+    // Happy paths: benign server-initiated recycles must classify as clean so
+    // their reconnect is logged quietly.
+    #[test]
+    fn clean_shutdowns_are_classified_clean() {
+        assert!(DisconnectReason::StreamEnded.is_clean_shutdown());
+        assert!(
+            DisconnectReason::ServerClose {
+                code: Some(1000),
+                reason: String::new()
+            }
+            .is_clean_shutdown()
+        );
+        assert!(
+            DisconnectReason::ServerClose {
+                code: Some(1001),
+                reason: "going away".to_string()
+            }
+            .is_clean_shutdown()
+        );
+        assert!(
+            DisconnectReason::ServerClose {
+                code: None,
+                reason: String::new()
+            }
+            .is_clean_shutdown()
+        );
+    }
+
+    // Bad paths: a real transport error, an abnormal close code, or an unreported
+    // reason must NOT be classified clean — they have to stay loud so genuine
+    // failures are never hidden behind reconnect noise.
+    #[test]
+    fn real_errors_are_never_classified_clean() {
+        assert!(!DisconnectReason::ReadError("connection reset".to_string()).is_clean_shutdown());
+        assert!(!DisconnectReason::Unknown.is_clean_shutdown());
+        for code in [1002u16, 1006, 1011, 1012, 1013, 3000, 4000] {
+            assert!(
+                !DisconnectReason::ServerClose {
+                    code: Some(code),
+                    reason: String::new()
+                }
+                .is_clean_shutdown(),
+                "close code {code} must not be treated as a clean shutdown"
+            );
+        }
     }
 }

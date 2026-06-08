@@ -123,7 +123,14 @@ impl Client {
                             },
                             Ok(crate::transport::TransportEvent::Disconnected(reason)) => {
                                 if !self.expected_disconnect.load(Ordering::Relaxed) {
-                                    debug!("Transport disconnected unexpectedly: {reason}");
+                                    // Classify the level: a routine server recycle (clean EOF /
+                                    // normal close) is logged quietly, but a real transport error
+                                    // stays at WARN so it's never hidden behind reconnect noise.
+                                    if reason.is_clean_shutdown() {
+                                        info!("Connection closed by server ({reason}); reconnecting.");
+                                    } else {
+                                        warn!("Transport disconnected: {reason}; reconnecting.");
+                                    }
                                     return Err(anyhow::anyhow!("Transport disconnected: {reason}"));
                                 } else {
                                     debug!("Transport disconnected as expected: {reason}");
@@ -330,7 +337,9 @@ impl Client {
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 debug!("Received <xmlstreamend/>, expected disconnect.");
             } else {
-                warn!("Received <xmlstreamend/>, treating as disconnect.");
+                // A bare <xmlstreamend/> is the server cleanly ending the stream
+                // (a recycle). We reconnect, so this is routine, not an error.
+                info!("Received <xmlstreamend/> (server stream end); reconnecting.");
             }
             self.notify_connection_shutdown();
             return;

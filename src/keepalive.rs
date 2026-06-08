@@ -90,7 +90,19 @@ impl Client {
             }
             Err(e) => {
                 let result = classify_keepalive_error(&e);
-                warn!(target: "Client/Keepalive", "Keepalive ping failed: {e:?}");
+                // A fatal-classified error means the connection is already gone
+                // (e.g. NotConnected): the disconnect is being handled elsewhere, so
+                // this ping failure is benign teardown collateral, not a keepalive
+                // problem. A transient failure (timeout, unexpected server response)
+                // is a real keepalive issue and stays loud.
+                match result {
+                    KeepaliveResult::FatalFailure => {
+                        debug!(target: "Client/Keepalive", "Keepalive skipped, connection already closing: {e:?}");
+                    }
+                    KeepaliveResult::TransientFailure | KeepaliveResult::Ok => {
+                        warn!(target: "Client/Keepalive", "Keepalive ping failed: {e:?}");
+                    }
+                }
                 result
             }
         }

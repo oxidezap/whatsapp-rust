@@ -289,7 +289,8 @@ impl Client {
                 }
             } else {
                 wacore::telemetry::connect("ok");
-                let unexpected_disconnect = if self.read_messages_loop().await.is_err() {
+                let loop_result = self.read_messages_loop().await;
+                let unexpected_disconnect = if let Err(e) = loop_result {
                     // Check intentional_reconnect AFTER read loop exits — reconnect()
                     // sets this flag while the loop is running, so it must be read here.
                     if self.expected_disconnect.load(Ordering::Relaxed)
@@ -298,9 +299,12 @@ impl Client {
                         debug!("Message loop exited during expected disconnect.");
                         false
                     } else {
-                        warn!(
-                            "Message loop exited with an error. Will attempt to reconnect if enabled."
-                        );
+                        // read_messages_loop already logged the cause at the right level
+                        // (info for a clean server recycle, warn for a real transport
+                        // error), so keep this at debug to avoid re-flagging a benign
+                        // reconnect as an error. Still treated as an unexpected
+                        // disconnect for the event dispatch + reconnect below.
+                        debug!("Message loop exited, will reconnect if enabled: {e:#}");
                         true
                     }
                 } else if self.expected_disconnect.load(Ordering::Relaxed) {
