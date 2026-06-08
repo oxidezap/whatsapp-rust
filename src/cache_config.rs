@@ -160,7 +160,8 @@ impl CacheStores {
 pub struct CacheConfig {
     /// Group metadata cache (time_to_live). Default: 1h TTL, 250 entries.
     pub group_cache: CacheEntryConfig,
-    /// Device registry cache (time_to_live). Default: 1h TTL, 1000 entries.
+    /// Device registry cache (time_to_live). Default: 1h TTL, 5000 entries
+    /// (holds a large group's per-member device set; a near-max group is ~1024).
     pub device_registry_cache: CacheEntryConfig,
     /// LID-to-phone cache. WAWebLidPnCache uses plain Maps with no expiry
     /// and no size cap; evicting a still-valid mapping silently downgrades
@@ -301,7 +302,9 @@ impl Default for CacheConfig {
 
         Self {
             group_cache: CacheEntryConfig::new(one_hour, 250),
-            device_registry_cache: CacheEntryConfig::new(one_hour, 1_000),
+            // One entry per group member; 1000 was below a near-max (~1024) group,
+            // so large-group warm sends thrashed to the serial per-user DB path.
+            device_registry_cache: CacheEntryConfig::new(one_hour, 5_000),
             lid_pn_cache: CacheEntryConfig::new(None, u64::MAX),
             recent_messages: CacheEntryConfig::new(five_min, 0),
             // 1h so the MAX_DECRYPT_RETRIES cap survives spaced redeliveries; a
