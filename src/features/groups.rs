@@ -321,14 +321,14 @@ impl<'a> Groups<'a> {
         Ok(info)
     }
 
-    pub async fn get_participating(&self) -> Result<HashMap<String, GroupMetadata>, anyhow::Error> {
+    pub async fn get_participating(&self) -> Result<HashMap<Jid, GroupMetadata>, anyhow::Error> {
         let response = self.client.execute(GroupParticipatingIq::new()).await?;
 
         let result = response
             .groups
             .into_iter()
             .map(|group| {
-                let key = group.id.to_string();
+                let key = group.id.clone();
                 let metadata = GroupMetadata::from(group);
                 (key, metadata)
             })
