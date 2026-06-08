@@ -64,6 +64,52 @@ fn build_played_receipt_node(
     builder.build()
 }
 
+/// Pure builder for the read `<receipt>` node. Mirrors WA Web
+/// `WAWebSendReadReceiptJob` + `sendAggregateReceipts`: newsletters use
+/// `read-self`, everything else `read`; status reads carry `context="status"`
+/// and, for a LID author, `peer_participant_pn` (the resolved LID->PN). The DM
+/// `read`-vs-`read-self` read-receipts-privacy gating is not modeled here.
+fn build_read_receipt_node(
+    chat: &Jid,
+    sender: Option<&Jid>,
+    message_ids: &[String],
+    timestamp: &str,
+    peer_participant_pn: Option<&Jid>,
+) -> wacore_binary::Node {
+    let receipt_type = if chat.is_newsletter() {
+        ReceiptType::ReadSelf
+    } else {
+        ReceiptType::Read
+    };
+
+    let mut builder = NodeBuilder::new("receipt")
+        .attr("to", chat)
+        .attr("type", receipt_type.as_wire_str())
+        .attr("id", &message_ids[0])
+        .attr("t", timestamp);
+
+    if let Some(sender) = sender {
+        builder = builder.attr("participant", sender);
+    }
+
+    if chat.is_status_broadcast() {
+        builder = builder.attr("context", "status");
+        if let Some(pn) = peer_participant_pn {
+            builder = builder.attr("peer_participant_pn", pn);
+        }
+    }
+
+    if message_ids.len() > 1 {
+        let items: Vec<wacore_binary::Node> = message_ids[1..]
+            .iter()
+            .map(|id| NodeBuilder::new("item").attr("id", id).build())
+            .collect();
+        builder = builder.children(vec![NodeBuilder::new("list").children(items).build()]);
+    }
+
+    builder.build()
+}
+
 fn build_delivery_receipt_node(
     info: &crate::types::message::MessageInfo,
     active: bool,
@@ -447,26 +493,28 @@ impl Client {
 
         let timestamp = wacore::time::now_secs_u64().to_string();
 
-        let mut builder = NodeBuilder::new("receipt")
-            .attr("to", chat)
-            .attr("type", "read")
-            .attr("id", &message_ids[0])
-            .attr("t", &timestamp);
+        // Status reads from a LID author carry peer_participant_pn (the resolved
+        // LID->PN), matching WA Web's LidMigrationUtils.toPn.
+        let peer_participant_pn = if chat.is_status_broadcast()
+            && let Some(sender) = sender
+            && sender.is_lid()
+        {
+            self.get_lid_pn_entry(sender)
+                .await
+                .ok()
+                .flatten()
+                .map(|e| Jid::new(&e.phone_number, wacore_binary::Server::Pn))
+        } else {
+            None
+        };
 
-        if let Some(sender) = sender {
-            builder = builder.attr("participant", sender);
-        }
-
-        // Additional message IDs go into <list><item id="..."/></list>
-        if message_ids.len() > 1 {
-            let items: Vec<wacore_binary::Node> = message_ids[1..]
-                .iter()
-                .map(|id| NodeBuilder::new("item").attr("id", id).build())
-                .collect();
-            builder = builder.children(vec![NodeBuilder::new("list").children(items).build()]);
-        }
-
-        let node = builder.build();
+        let node = build_read_receipt_node(
+            chat,
+            sender,
+            &message_ids,
+            &timestamp,
+            peer_participant_pn.as_ref(),
+        );
 
         debug!(target: "Client/Receipt", "Sending read receipt for {} message(s) to {}", message_ids.len(), chat.observe());
 
@@ -1867,6 +1915,65 @@ mod tests {
                 .and_then(|v| v.to_jid().map(|j| j.to_string()))
                 .as_deref(),
             Some("456@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn read_receipt_dm_is_read_without_context() {
+        let node = build_read_receipt_node(
+            &jid("456@s.whatsapp.net"),
+            None,
+            &["M1".to_string()],
+            "100",
+            None,
+        );
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("read")
+        );
+        assert!(node.attrs.get("context").is_none());
+        assert!(node.attrs.get("peer_participant_pn").is_none());
+    }
+
+    #[test]
+    fn read_receipt_newsletter_is_read_self() {
+        let node = build_read_receipt_node(
+            &jid("123@newsletter"),
+            None,
+            &["M1".to_string()],
+            "100",
+            None,
+        );
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("read-self")
+        );
+    }
+
+    #[test]
+    fn read_receipt_status_carries_context_and_peer_pn() {
+        let pn = jid("559980000001@s.whatsapp.net");
+        let node = build_read_receipt_node(
+            &jid("status@broadcast"),
+            Some(&jid("100000012345678@lid")),
+            &["M1".to_string()],
+            "100",
+            Some(&pn),
+        );
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("read")
+        );
+        assert_eq!(
+            node.attrs.get("context").map(|v| v.as_str()).as_deref(),
+            Some("status")
+        );
+        assert_eq!(
+            node.attrs
+                .get("peer_participant_pn")
+                .and_then(|v| v.to_jid().map(|j| j.to_string()))
+                .as_deref(),
+            Some("559980000001@s.whatsapp.net")
         );
     }
 }
