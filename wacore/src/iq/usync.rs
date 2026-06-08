@@ -146,10 +146,20 @@ struct ParsedUserFields {
 /// business accounts (the `name` lives inside the cert protobuf). Mirrors
 /// WAWebUsyncBusiness `businessParser`.
 fn parse_verified_name(user_node: &NodeRef<'_>) -> Option<VerifiedName> {
-    user_node
-        .get_optional_child("business")
-        .and_then(|business| business.get_optional_child("verified_name"))
-        .and_then(|vn| VerifiedName::try_from_node(vn).ok())
+    let vn_node = user_node
+        .get_optional_child("business")?
+        .get_optional_child("verified_name")?;
+    // Treat an <error> child or an empty marker (no name, no cert) as absent,
+    // mirroring the status/picture parsers, so `verified_name.is_some()` means a
+    // real verified name was returned.
+    if vn_node.get_optional_child("error").is_some() {
+        return None;
+    }
+    let parsed = VerifiedName::try_from_node(vn_node).ok()?;
+    if parsed.name.is_none() && parsed.certificate.is_none() {
+        return None;
+    }
+    Some(parsed)
 }
 
 /// Parse common fields from a usync `<user>` node.
@@ -1297,5 +1307,40 @@ mod tests {
         assert_eq!(result.lid_mappings.len(), 1);
         assert_eq!(result.lid_mappings[0].phone_number, "1234567890");
         assert_eq!(result.lid_mappings[0].lid, "100000012345678");
+    }
+
+    #[test]
+    fn parse_verified_name_skips_error_and_empty() {
+        let user = |vn: Node| {
+            NodeBuilder::new("user")
+                .children([NodeBuilder::new("business").children([vn]).build()])
+                .build()
+        };
+
+        // <verified_name><error/></verified_name> -> absent
+        let err = user(
+            NodeBuilder::new("verified_name")
+                .children([NodeBuilder::new("error").attr("code", "404").build()])
+                .build(),
+        );
+        assert!(parse_verified_name(&err.as_node_ref()).is_none());
+
+        // empty <verified_name/> (no attrs, no cert) -> absent
+        let empty = user(NodeBuilder::new("verified_name").build());
+        assert!(parse_verified_name(&empty.as_node_ref()).is_none());
+
+        // real name attr -> present
+        let real = user(
+            NodeBuilder::new("verified_name")
+                .attr("name", "Acme")
+                .build(),
+        );
+        assert_eq!(
+            parse_verified_name(&real.as_node_ref())
+                .expect("real name")
+                .name
+                .as_deref(),
+            Some("Acme")
+        );
     }
 }

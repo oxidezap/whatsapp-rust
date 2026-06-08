@@ -89,7 +89,7 @@ pub use features::{
     PictureType, Presence, PresenceError, PresenceStatus, Profile, ProfilePicture, SecretEncKind,
     SecretEncrypted, SetProfilePictureResponse, Signal, Status, StatusPrivacySetting,
     StatusSendOptions, SyncActionMessageRange, TcToken, UnlinkSubgroupsResult, UserInfo,
-    group_type, message_key, message_range,
+    VerifiedName, group_type, message_key, message_range,
 };
 
 pub mod bot;
