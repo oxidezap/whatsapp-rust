@@ -260,8 +260,25 @@ impl AppStateProcessor {
         let mut new_mutations: Vec<Mutation> = Vec::new();
         let collection_name = pl.name.as_str();
 
-        // Process snapshot if present
-        if let Some(snapshot) = &pl.snapshot {
+        // Process snapshot if present, unless it is stale. WA Web's
+        // WAWebSyncdCollectionHandler (ot()/CollectionVersionStore) applies a snapshot only
+        // when it is strictly newer than the persisted version; a stale or replayed snapshot
+        // (persisted >= incoming) is discarded ("skip applying syncd old version") so it can't
+        // roll the collection backward. No-op on the benign first-sync path, where snapshots
+        // are requested only at version 0.
+        let snapshot_to_apply = pl.snapshot.as_ref().filter(|snapshot| {
+            let snapshot_version = snapshot.version.as_ref().and_then(|v| v.version).unwrap_or(0);
+            if snapshot_is_stale(state.version, snapshot_version) {
+                log::warn!(
+                    target: "AppState",
+                    "Skipping stale snapshot for {collection_name}: incoming v{snapshot_version} <= persisted v{}",
+                    state.version
+                );
+                return false;
+            }
+            true
+        });
+        if let Some(snapshot) = snapshot_to_apply {
             let keys_map = self.key_cache.lock().await.clone();
             let snapshot_clone = snapshot.clone();
             let collection_name_owned = collection_name.to_string();
@@ -505,4 +522,37 @@ impl AppStateProcessor {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait AppStateSyncDriver {
     async fn fetch_collection(&self, name: WAPatchName, after_version: u64) -> Result<Node>;
+}
+
+/// A snapshot is stale when the collection already holds a version at or beyond the
+/// incoming snapshot's; WA Web discards it ("skip applying syncd old version") rather
+/// than rolling the collection backward. The `persisted_version > 0` guard keeps the
+/// benign first-sync path (snapshots are requested only at version 0) unaffected.
+fn snapshot_is_stale(persisted_version: u64, snapshot_version: u64) -> bool {
+    persisted_version > 0 && snapshot_version <= persisted_version
+}
+
+#[cfg(test)]
+mod snapshot_guard_tests {
+    use super::snapshot_is_stale;
+
+    #[test]
+    fn first_sync_is_never_stale() {
+        // Benign path: nothing persisted yet (version 0), so any snapshot applies.
+        assert!(!snapshot_is_stale(0, 1));
+        assert!(!snapshot_is_stale(0, 0));
+    }
+
+    #[test]
+    fn newer_snapshot_applies() {
+        assert!(!snapshot_is_stale(5, 6));
+    }
+
+    #[test]
+    fn equal_or_older_snapshot_is_stale() {
+        // WA Web's `a.version >= t` skips equal versions too.
+        assert!(snapshot_is_stale(5, 5));
+        assert!(snapshot_is_stale(5, 3));
+        assert!(snapshot_is_stale(5, 0));
+    }
 }
