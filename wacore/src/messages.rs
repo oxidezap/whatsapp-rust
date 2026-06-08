@@ -30,6 +30,69 @@ impl MessageUtils {
         buf
     }
 
+    /// Build both DM plaintexts (recipient and own-device DeviceSentMessage) from a
+    /// single encode of the shared message content.
+    ///
+    /// The recipient plaintext and the DSM inner carry the same message, so the
+    /// previous path encoded it twice (once for the recipient, once inside
+    /// `wrap_device_sent` + `encode_and_pad`) and boxed a whole `Message` per send.
+    /// Here the content is encoded once and spliced into both: the recipient appends
+    /// `message_context_info` out of tag order (protobuf decoders accept any field
+    /// order), and the DSM frames the content as `device_sent_message.message` with
+    /// the hoisted `message_context_info` on the outer message. Equivalent to
+    /// `encode_and_pad(message)` and `encode_and_pad(wrap_device_sent(message, jid))`
+    /// after decode (locked by the `splice_*` differential tests).
+    pub fn encode_dm_plaintexts(mut message: wa::Message, destination_jid: &str) -> DmPlaintexts {
+        // Padding is uniform 1..=16, so reserving 16 lets both buffers hold their
+        // worst-case pad without reallocating.
+        const MAX_PAD: usize = 16;
+
+        // Hoist message_context_info onto the wrapper (as wrap_device_sent does) so the
+        // remaining content is identical for both plaintexts and encoded once. Keep the
+        // mci struct (not a temp Vec): it is small and encoded straight into each buffer.
+        let mci = message.message_context_info.take();
+        let mci_field_len = mci.as_ref().map_or(0, |m| {
+            len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, m.encoded_len())
+        });
+        let content_len = message.encoded_len();
+        let dest = destination_jid.as_bytes();
+
+        // recipient = content (encoded once) + its message_context_info field. Pre-size
+        // for content + the appended mci field + padding so it never reallocates; the
+        // content bytes are then spliced into the own-device buffer below.
+        let mut recipient = Vec::with_capacity(content_len + mci_field_len + MAX_PAD);
+        message
+            .encode(&mut recipient)
+            .expect("encode into pre-sized Vec");
+
+        // own-device plaintext = Message { device_sent_message { destination_jid,
+        // message }, [message_context_info] }. The DeviceSentMessage length is
+        // pre-computed so the spliced content goes straight in, and the buffer is sized
+        // exactly (device_sent_message field + mci field + padding): one allocation, no
+        // reallocation regardless of whether message_context_info is present.
+        let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest.len())
+            + len_delimited_len(TAG_DSM_MESSAGE, content_len);
+        let own_cap = len_delimited_len(TAG_DEVICE_SENT_MESSAGE, dsm_len) + mci_field_len + MAX_PAD;
+        let mut own_devices = Vec::with_capacity(own_cap);
+        push_varint((TAG_DEVICE_SENT_MESSAGE << 3) | 2, &mut own_devices); // field 31 key
+        push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
+        push_len_delimited(TAG_DSM_DESTINATION_JID, dest, &mut own_devices);
+        push_len_delimited(TAG_DSM_MESSAGE, &recipient[..content_len], &mut own_devices);
+        if let Some(mci) = &mci {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, mci, &mut own_devices);
+        }
+
+        // Finish the recipient now that its content has been spliced into own_devices.
+        if let Some(mci) = &mci {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, mci, &mut recipient);
+        }
+
+        DmPlaintexts {
+            recipient: Self::pad_message_v2(recipient),
+            own_devices: Self::pad_message_v2(own_devices),
+        }
+    }
+
     pub fn participant_list_hash<'a>(
         devices: impl IntoIterator<Item = &'a wacore_binary::Jid>,
     ) -> Result<String> {
@@ -97,6 +160,72 @@ pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<
     let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
     wa::Message::decode(plaintext_slice)
         .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
+}
+
+/// The two padded plaintexts a DM send needs, built from a single encode of the
+/// shared message content. See [`MessageUtils::encode_dm_plaintexts`].
+pub struct DmPlaintexts {
+    /// Plaintext encrypted to the recipient's devices (the message itself).
+    pub recipient: Vec<u8>,
+    /// Plaintext encrypted to our own other devices (the message wrapped in a
+    /// DeviceSentMessage), equivalent to `encode_and_pad(wrap_device_sent(..))`.
+    pub own_devices: Vec<u8>,
+}
+
+// Protobuf field numbers spliced by `encode_dm_plaintexts`. A wrong tag changes
+// the decoded result, so the `splice_*` differential tests pin them against prost.
+const TAG_DEVICE_SENT_MESSAGE: u64 = 31; // Message.device_sent_message
+const TAG_MESSAGE_CONTEXT_INFO: u64 = 35; // Message.message_context_info
+const TAG_DSM_DESTINATION_JID: u64 = 1; // DeviceSentMessage.destination_jid
+const TAG_DSM_MESSAGE: u64 = 2; // DeviceSentMessage.message
+
+/// Append a base-128 varint (protobuf wire format).
+#[inline]
+fn push_varint(mut v: u64, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// Append a length-delimited protobuf field (wire type 2): a string field, or a
+/// nested message field carrying already-encoded `bytes`. The latter is the splice
+/// point that lets the shared content be reused without re-encoding it.
+#[inline]
+fn push_len_delimited(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
+    push_varint((field << 3) | 2, out); // wire type 2 = length-delimited
+    push_varint(bytes.len() as u64, out);
+    out.extend_from_slice(bytes);
+}
+
+/// Bytes a base-128 varint occupies.
+#[inline]
+fn varint_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+/// Encoded size of the length-delimited field `field` carrying `payload_len`
+/// bytes (key + length varint + payload). Mirrors what `push_len_delimited`
+/// writes, so a nested field's length can be pre-computed without a temp buffer.
+#[inline]
+fn len_delimited_len(field: u64, payload_len: usize) -> usize {
+    varint_len((field << 3) | 2) + varint_len(payload_len as u64) + payload_len
+}
+
+/// Append a prost message as a nested length-delimited field, encoding it
+/// straight into `out` (no intermediate `Vec`). Used for the small
+/// `message_context_info` field on both plaintexts.
+#[inline]
+fn push_message_field<M: ProtoMessage>(field: u64, msg: &M, out: &mut Vec<u8>) {
+    push_varint((field << 3) | 2, out);
+    push_varint(msg.encoded_len() as u64, out);
+    msg.encode(out).expect("encode into Vec is infallible");
 }
 
 /// Wrap a message into a DeviceSentMessage for own-device sync, hoisting
@@ -848,6 +977,174 @@ mod device_sent_tests {
                 .and_then(|c| c.message_secret)
                 .as_deref(),
             Some(secret.as_slice())
+        );
+    }
+
+    // Unpad (v2) + prost-decode a padded plaintext.
+    fn decode_padded(b: &[u8]) -> wa::Message {
+        wa::Message::decode(MessageUtils::unpad_message_ref(b, 2).unwrap()).unwrap()
+    }
+
+    /// The spliced plaintexts must decode to exactly what the prost-based path
+    /// produces: recipient == encode(message), own_devices == encode(wrap_device_sent).
+    fn assert_splice_matches(message: wa::Message, dest: &str) {
+        let recipient_old = decode_padded(&MessageUtils::encode_and_pad(&message));
+        let dsm_old = decode_padded(&MessageUtils::encode_and_pad(&wrap_device_sent(
+            message.clone(),
+            dest.to_string(),
+        )));
+
+        let DmPlaintexts {
+            recipient,
+            own_devices,
+        } = MessageUtils::encode_dm_plaintexts(message, dest);
+
+        assert_eq!(
+            decode_padded(&recipient),
+            recipient_old,
+            "recipient mismatch"
+        );
+        assert_eq!(
+            decode_padded(&own_devices),
+            dsm_old,
+            "own-device DSM mismatch"
+        );
+    }
+
+    #[test]
+    fn splice_matches_prost_across_message_shapes() {
+        let dest = "5511999998888:3@s.whatsapp.net";
+
+        // plain conversation text
+        assert_splice_matches(
+            wa::Message {
+                conversation: Some("ping".into()),
+                ..Default::default()
+            },
+            dest,
+        );
+        // unicode + long text (multi-byte content, larger than one varint length)
+        assert_splice_matches(
+            wa::Message {
+                conversation: Some("héllo 🚀 ".repeat(500)),
+                ..Default::default()
+            },
+            dest,
+        );
+        // with message_context_info (reporting-token path: secret hoisted to wrapper)
+        assert_splice_matches(msg_with_secret(&[42u8; 32]), dest);
+        // extended text + nested context_info (forwarded) AND top-level mci
+        assert_splice_matches(
+            wa::Message {
+                extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                    text: Some("quoted".into()),
+                    context_info: Some(Box::new(wa::ContextInfo {
+                        is_forwarded: Some(true),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+                message_context_info: Some(wa::MessageContextInfo {
+                    message_secret: Some(vec![1, 2, 3, 4]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            dest,
+        );
+        // media message (refs/keys), no mci
+        assert_splice_matches(
+            wa::Message {
+                image_message: Some(Box::new(wa::message::ImageMessage {
+                    url: Some("https://mmg.example/abc".into()),
+                    media_key: Some(vec![9u8; 32]),
+                    file_sha256: Some(vec![8u8; 32]),
+                    mimetype: Some("image/jpeg".into()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            dest,
+        );
+        // empty message (no content, no mci)
+        assert_splice_matches(wa::Message::default(), dest);
+        // mci-only (no content body)
+        assert_splice_matches(
+            wa::Message {
+                message_context_info: Some(wa::MessageContextInfo {
+                    message_secret: Some(vec![7u8; 32]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            dest,
+        );
+        // empty destination_jid (degenerate but must still match)
+        assert_splice_matches(
+            wa::Message {
+                conversation: Some("x".into()),
+                ..Default::default()
+            },
+            "",
+        );
+    }
+
+    /// Pin the spliced field numbers to the prost-generated schema: encode a probe
+    /// with only the relevant field set and read the first protobuf key. If the
+    /// .proto ever renumbers one of these fields, prost regenerates and this fails
+    /// with a precise message, so the hand-written framing cannot silently drift.
+    #[test]
+    fn splice_tags_match_prost_schema() {
+        fn first_field_number(bytes: &[u8]) -> u64 {
+            let (mut key, mut shift) = (0u64, 0u32);
+            for &b in bytes {
+                key |= u64::from(b & 0x7f) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            key >> 3
+        }
+
+        let outer_dsm = wa::Message {
+            device_sent_message: Some(Box::new(wa::message::DeviceSentMessage::default())),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&outer_dsm.encode_to_vec()),
+            TAG_DEVICE_SENT_MESSAGE,
+            "Message.device_sent_message tag drifted from the .proto"
+        );
+
+        let outer_mci = wa::Message {
+            message_context_info: Some(wa::MessageContextInfo::default()),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&outer_mci.encode_to_vec()),
+            TAG_MESSAGE_CONTEXT_INFO,
+            "Message.message_context_info tag drifted from the .proto"
+        );
+
+        let dsm_dest = wa::message::DeviceSentMessage {
+            destination_jid: Some("x".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&dsm_dest.encode_to_vec()),
+            TAG_DSM_DESTINATION_JID,
+            "DeviceSentMessage.destination_jid tag drifted from the .proto"
+        );
+
+        let dsm_msg = wa::message::DeviceSentMessage {
+            message: Some(Box::new(wa::Message::default())),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&dsm_msg.encode_to_vec()),
+            TAG_DSM_MESSAGE,
+            "DeviceSentMessage.message tag drifted from the .proto"
         );
     }
 }

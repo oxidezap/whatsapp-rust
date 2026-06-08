@@ -87,7 +87,13 @@ pub async fn prepare_dm_stanza<
         message.clone()
     };
 
-    let recipient_plaintext = MessageUtils::encode_and_pad(&message_for_encryption);
+    // Encode the shared content once and splice it into both the recipient
+    // plaintext and the own-device DeviceSentMessage plaintext, instead of encoding
+    // the message twice (recipient + DSM) and boxing it via wrap_device_sent.
+    let crate::messages::DmPlaintexts {
+        recipient: recipient_plaintext,
+        own_devices: own_devices_plaintext,
+    } = MessageUtils::encode_dm_plaintexts(message_for_encryption, &to_jid.to_string());
 
     // Partition first so phash reflects the actual sent set (sender excluded)
     let total_devices = all_devices.len();
@@ -98,10 +104,6 @@ pub async fn prepare_dm_stanza<
         recipient_devices.iter().chain(own_other_devices.iter()),
     )
     .ok();
-
-    let dsm = crate::messages::wrap_device_sent(message_for_encryption, to_jid.to_string());
-
-    let own_devices_plaintext = MessageUtils::encode_and_pad(&dsm);
 
     let mut participant_nodes = Vec::with_capacity(total_devices);
     let mut includes_prekey_message = false;
