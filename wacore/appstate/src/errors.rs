@@ -32,6 +32,10 @@ pub enum AppStateError {
     PatchMACMismatch,
     #[error("patch version mismatch: expected {expected}, got {got}")]
     PatchVersionMismatch { expected: u64, got: u64 },
+    // WA Web (WAWebSyncdValidateMutations) reports SAME_INDEX_FOR_MULTIPLE_MUTATIONS_IN_PATCH
+    // and throws a fatal error: a repeated index within one patch is a tampering signal.
+    #[error("duplicate index within a single patch")]
+    DuplicateIndexInPatch,
 }
 
 pub type Result<T> = std::result::Result<T, AppStateError>;
