@@ -3,6 +3,7 @@ pub(crate) mod chat_actions;
 mod chatstate;
 mod community;
 mod contacts;
+mod events;
 mod groups;
 pub(crate) mod labels;
 mod media_reupload;
@@ -29,6 +30,8 @@ pub use community::{
 pub use chatstate::{ChatStateType, Chatstate};
 
 pub use contacts::{Contacts, IsOnWhatsAppResult, ProfilePicture, UserInfo, VerifiedName};
+
+pub use events::{EventCreationParams, EventResponseType, Events};
 
 pub use groups::{
     BatchGroupResult, CreateGroupResult, GroupCreateOptions, GroupDescription, GroupJoinError,
