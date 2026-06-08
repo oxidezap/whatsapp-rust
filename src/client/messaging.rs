@@ -125,6 +125,18 @@ impl Client {
         message_secret: &[u8],
         new_content: wa::Message,
     ) -> Result<String, anyhow::Error> {
+        // Newsletters/channels are plaintext (no message-secret addon crypto) and the
+        // E2E send path rejects them, so an encrypted edit can't apply there; fail with
+        // a clear boundary error instead of the cryptic downstream rejection.
+        anyhow::ensure!(
+            !to.is_newsletter(),
+            "edit_message_encrypted is not valid for newsletters/channels; use edit_message"
+        );
+        anyhow::ensure!(
+            message_secret.len() == 32,
+            "message_secret must be exactly 32 bytes, got {}",
+            message_secret.len()
+        );
         let original_id = original_id.into();
 
         let self_jid = if to.is_group() {
