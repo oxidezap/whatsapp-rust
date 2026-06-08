@@ -1222,6 +1222,38 @@ mod tests {
         assert_eq!(a.participants.len(), 2);
     }
 
+    #[tokio::test]
+    async fn invalidate_persisted_group_metadata_drops_blob() {
+        // The cache-miss branch of add/remove/leave relies on this to drop a now-stale
+        // persisted blob so the next query re-fetches fresh instead of sending a stale phash.
+        let client = crate::test_utils::create_test_client().await;
+        let backend = client.persistence_manager.backend();
+        let group_jid: Jid = "123456789@g.us".parse().unwrap();
+
+        backend
+            .put_group_metadata(&group_jid.to_string(), b"stale-blob")
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .get_group_metadata(&group_jid.to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        client.invalidate_persisted_group_metadata(&group_jid).await;
+
+        assert!(
+            backend
+                .get_group_metadata(&group_jid.to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "invalidation must delete the persisted blob"
+        );
+    }
+
     // Protocol-level tests (node building, parsing, validation) are in wacore/src/iq/groups.rs
 
     #[test]

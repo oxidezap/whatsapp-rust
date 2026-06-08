@@ -1393,6 +1393,11 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                     );
                 } else {
                     // Cache expired: can't patch in place, so drop the now-stale blob.
+                    debug!(
+                        target: "Client/Group",
+                        "Group cache expired for {}: invalidating persisted metadata (add)",
+                        notification.group_jid.observe()
+                    );
                     client
                         .invalidate_persisted_group_metadata(&notification.group_jid)
                         .await;
@@ -1417,6 +1422,11 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                     );
                 } else {
                     // Cache expired: can't patch in place, so drop the now-stale blob.
+                    debug!(
+                        target: "Client/Group",
+                        "Group cache expired for {}: invalidating persisted metadata (remove)",
+                        notification.group_jid.observe()
+                    );
                     client
                         .invalidate_persisted_group_metadata(&notification.group_jid)
                         .await;
