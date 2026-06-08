@@ -628,6 +628,34 @@ mod tests {
     }
 
     #[test]
+    fn reporting_token_reuses_existing_message_secret() {
+        // A caller-provided secret (e.g. a poll's) must survive the send path: the
+        // reporting token derives from it rather than minting a fresh one that would
+        // overwrite messageContextInfo.message_secret. Matches WA Web (`p ?? e.messageSecret`),
+        // and is what lets a poll creator decrypt later votes with the returned secret.
+        let secret = [0x42u8; MESSAGE_SECRET_SIZE];
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(secret.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let to: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
+        let result = generate_reporting_token(&msg, "MID", &to, &to, extract_message_secret(&msg))
+            .expect("a text message produces a reporting token");
+        assert_eq!(
+            result.message_secret, secret,
+            "existing secret must be reused"
+        );
+
+        // The prepared (wire) message keeps that same secret.
+        let prepared = prepare_message_with_context(&msg, &result.message_secret);
+        assert_eq!(extract_message_secret(&prepared), Some(secret.as_slice()));
+    }
+
+    #[test]
     fn test_derive_reporting_token_key() {
         let secret = [0x42u8; MESSAGE_SECRET_SIZE];
         let stanza_id = "3EB0E0E5F2D4F618589C0B";

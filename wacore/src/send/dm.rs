@@ -69,7 +69,17 @@ pub async fn prepare_dm_stanza<
 ) -> Result<PreparedDmStanza> {
     // sender is the author's own jid, remote is the chat jid (WAWebReportingTokenUtils:
     // getSender vs e.to). Both previously used to_jid, conflating sender with remote.
-    let reporting_result = generate_reporting_token(message, &request_id, own_jid, &to_jid, None);
+    // Reuse the message's own secret when the caller set one (e.g. polls), instead of
+    // minting a fresh one that would overwrite it: WA Web derives the reporting token
+    // from the message's existing messageSecret (`p ?? e.messageSecret`), and a poll's
+    // creator must keep the secret that ends up on the wire to decrypt later votes.
+    let reporting_result = generate_reporting_token(
+        message,
+        &request_id,
+        own_jid,
+        &to_jid,
+        crate::reporting_token::extract_message_secret(message),
+    );
 
     let message_for_encryption = if let Some(ref result) = reporting_result {
         prepare_message_with_context(message, &result.message_secret)
