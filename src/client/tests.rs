@@ -1675,6 +1675,38 @@ async fn test_handle_iq_ping_with_both_child_and_xmlns() {
 }
 
 #[tokio::test]
+async fn test_handle_iq_ping_without_type_attr() {
+    // WA Web pongs for any xmlns="urn:xmpp:ping" regardless of (or absent) type.
+    // A ping with no type attr must still be answered, not dropped.
+    let backend = crate::test_utils::create_test_backend().await;
+    let pm = Arc::new(
+        PersistenceManager::new(backend)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let (client, _rx) = Client::new(
+        Arc::new(crate::runtime_impl::TokioRuntime),
+        pm,
+        Arc::new(crate::transport::mock::MockTransportFactory::new()),
+        Arc::new(MockHttpClient),
+        None,
+    )
+    .await;
+
+    let ping_node = NodeBuilder::new("iq")
+        .attr("from", SERVER_JID)
+        .attr("id", "ping-notype-1")
+        .attr("xmlns", "urn:xmpp:ping")
+        .build();
+
+    let handled = client.handle_iq(&ping_node.as_node_ref()).await;
+    assert!(
+        handled,
+        "handle_iq must pong a urn:xmpp:ping IQ even without a type attribute"
+    );
+}
+
+#[tokio::test]
 async fn test_handle_iq_non_ping_returns_false() {
     // A type="get" IQ without ping child or xmlns should NOT be handled as ping.
     let backend = crate::test_utils::create_test_backend().await;

@@ -1194,12 +1194,17 @@ impl Client {
         tracing::instrument(name = "wa.conn.iq_in", level = "debug", skip_all)
     )]
     pub(crate) async fn handle_iq(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
-        if node.get_attr("type").is_some_and(|s| s.as_str() == "get")
+        // Pong a server-initiated ping (a request: type="get" or, like WA Web's
+        // type-agnostic handleIq, an absent type), but not a type="result"/"error"
+        // ping — that's a response to our own ping, and ponging it back is wrong.
+        // The previous gate required type=="get" exactly, dropping an absent-type
+        // ping and risking a keepalive timeout/disconnect.
+        let is_ping_request = node.get_attr("type").is_none_or(|s| s.as_str() == "get")
             && (node.get_optional_child("ping").is_some()
                 || node
                     .get_attr("xmlns")
-                    .is_some_and(|s| s.as_str() == "urn:xmpp:ping"))
-        {
+                    .is_some_and(|s| s.as_str() == "urn:xmpp:ping"));
+        if is_ping_request {
             debug!("Received ping, sending pong.");
             let mut parser = node.attrs();
             let from_jid = parser.jid("from");
