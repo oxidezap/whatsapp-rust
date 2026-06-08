@@ -2511,6 +2511,7 @@ mod tests {
             message_ids: vec!["MSG001".to_string()],
             timestamp: wacore::time::now_utc(),
             r#type: crate::types::presence::ReceiptType::Retry,
+            offline: false,
         }
     }
 
@@ -2626,6 +2627,7 @@ mod tests {
             message_ids: vec!["MSG001".to_string()],
             timestamp: wacore::time::now_utc(),
             r#type: crate::types::presence::ReceiptType::Retry,
+            offline: false,
         };
         let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
 

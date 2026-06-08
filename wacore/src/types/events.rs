@@ -970,6 +970,10 @@ pub struct Receipt {
     pub message_ids: Vec<MessageId>,
     pub timestamp: DateTime<Utc>,
     pub r#type: ReceiptType,
+    /// True when the receipt carried the `offline` attribute, i.e. it was drained
+    /// from the server's offline queue on reconnect rather than delivered live.
+    /// Mirrors WA Web `incomingMsgReceiptParser` (`offline: maybeAttrString`).
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

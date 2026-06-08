@@ -242,6 +242,8 @@ impl Client {
         let participant = attrs.optional_jid("participant");
         // participant_pn -> sender_alt so the LID-PN cache warms from receipts too.
         let participant_pn = attrs.optional_jid("participant_pn");
+        // Present when this receipt was drained from the offline queue on reconnect.
+        let offline = attrs.optional_string("offline").is_some();
         let stanza_ts = attrs
             .optional_u64("t")
             .and_then(|t| i64::try_from(t).ok())
@@ -309,6 +311,7 @@ impl Client {
                     },
                     timestamp: user_ts,
                     r#type: effective_type,
+                    offline,
                 };
                 self.core.event_bus.dispatch(Event::Receipt(r));
             }
@@ -336,6 +339,7 @@ impl Client {
             },
             timestamp: stanza_ts,
             r#type: receipt_type,
+            offline,
         };
 
         if receipt.r#type == ReceiptType::Retry {
@@ -1645,6 +1649,61 @@ mod tests {
                 .user,
             "15557654321",
             "simple receipt must thread receipt-level participant_pn into sender_alt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_receipt_offline_attr_propagated() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        // Drained from the offline queue: carries the `offline` attr.
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "15551234567@s.whatsapp.net")
+                    .attr("id", "OFFLINE-RCPT")
+                    .attr("offline", "1")
+                    .attr("t", "1700000000")
+                    .build(),
+            ))
+            .await;
+
+        // Live delivery: no `offline` attr.
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "15551234567@s.whatsapp.net")
+                    .attr("id", "LIVE-RCPT")
+                    .attr("t", "1700000000")
+                    .build(),
+            ))
+            .await;
+
+        let events = collector.events();
+        let receipts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+
+        let offline = receipts
+            .iter()
+            .find(|r| r.message_ids.iter().any(|id| id == "OFFLINE-RCPT"))
+            .expect("offline receipt dispatched");
+        assert!(
+            offline.offline,
+            "receipt with the offline attr sets offline=true"
+        );
+
+        let live = receipts
+            .iter()
+            .find(|r| r.message_ids.iter().any(|id| id == "LIVE-RCPT"))
+            .expect("live receipt dispatched");
+        assert!(
+            !live.offline,
+            "receipt without the offline attr sets offline=false"
         );
     }
 
