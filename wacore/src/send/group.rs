@@ -160,12 +160,14 @@ pub async fn prepare_group_stanza<
         crate::reporting_token::extract_message_secret(message),
     );
 
-    // Prepare message with MessageContextInfo containing the message secret
-    let message_for_encryption = if let Some(ref result) = reporting_result {
-        prepare_message_with_context(message, &result.message_secret)
-    } else {
-        message.clone()
-    };
+    // The reporting token's MessageContextInfo (message_secret + version) is spliced
+    // onto the encoded plaintext instead of deep-cloning the whole message via
+    // prepare_message_with_context just to attach two fields.
+    let reporting_context = reporting_result.as_ref().map(|result| wa::MessageContextInfo {
+        message_secret: Some(result.message_secret.to_vec()),
+        reporting_token_version: Some(crate::reporting_token::REPORTING_TOKEN_VERSION),
+        ..Default::default()
+    });
 
     let own_base_jid = own_sending_jid.to_non_ad();
 
@@ -408,7 +410,7 @@ pub async fn prepare_group_stanza<
         }
     }
 
-    let plaintext = MessageUtils::encode_and_pad(&message_for_encryption);
+    let plaintext = MessageUtils::encode_and_pad_with_context(message, reporting_context.as_ref());
     let skmsg = encrypt_group_message(
         stores.sender_key_store,
         &sender_key_name,

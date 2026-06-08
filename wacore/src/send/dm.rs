@@ -81,11 +81,14 @@ pub async fn prepare_dm_stanza<
         crate::reporting_token::extract_message_secret(message),
     );
 
-    let message_for_encryption = if let Some(ref result) = reporting_result {
-        prepare_message_with_context(message, &result.message_secret)
-    } else {
-        message.clone()
-    };
+    // The reporting token's MessageContextInfo (message_secret + version) is spliced
+    // straight onto the encoded plaintexts instead of deep-cloning the whole message
+    // via prepare_message_with_context just to attach two fields.
+    let extra_context = reporting_result.as_ref().map(|result| wa::MessageContextInfo {
+        message_secret: Some(result.message_secret.to_vec()),
+        reporting_token_version: Some(crate::reporting_token::REPORTING_TOKEN_VERSION),
+        ..Default::default()
+    });
 
     // Encode the shared content once and splice it into both the recipient
     // plaintext and the own-device DeviceSentMessage plaintext, instead of encoding
@@ -93,7 +96,7 @@ pub async fn prepare_dm_stanza<
     let crate::messages::DmPlaintexts {
         recipient: recipient_plaintext,
         own_devices: own_devices_plaintext,
-    } = MessageUtils::encode_dm_plaintexts(message_for_encryption, &to_jid.to_string());
+    } = MessageUtils::encode_dm_plaintexts(message, extra_context.as_ref(), &to_jid.to_string());
 
     // Partition first so phash reflects the actual sent set (sender excluded)
     let total_devices = all_devices.len();
