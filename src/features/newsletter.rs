@@ -11,7 +11,7 @@ use crate::features::mex::{MexError, mex_request};
 use prost::Message as ProtoMessage;
 use wacore::iq::mex_operations::{
     create_newsletter, fetch_all_newsletters_metadata, fetch_newsletter, join_newsletter,
-    leave_newsletter, update_newsletter,
+    leave_newsletter, update_newsletter, update_newsletter_user_setting,
 };
 use wacore::iq::newsletter::NEWSLETTER_XMLNS;
 use wacore::request::InfoQuery;
@@ -288,6 +288,46 @@ impl<'a> Newsletter<'a> {
             )));
         }
         parse_newsletter_metadata(newsletter)
+    }
+
+    /// Mute or unmute a newsletter's follower-activity notifications
+    /// (WA Web's `MUTE_FOLLOWER_ACTIVITY`). `muted = true` silences them.
+    pub async fn set_follower_mute(&self, jid: &Jid, muted: bool) -> Result<(), MexError> {
+        self.set_user_setting_mute(jid, "MUTE_FOLLOWER_ACTIVITY", muted)
+            .await
+    }
+
+    /// Mute or unmute a newsletter's admin-activity notifications
+    /// (WA Web's `MUTE_ADMIN_ACTIVITY`). Only meaningful for owners/admins.
+    pub async fn set_admin_mute(&self, jid: &Jid, muted: bool) -> Result<(), MexError> {
+        self.set_user_setting_mute(jid, "MUTE_ADMIN_ACTIVITY", muted)
+            .await
+    }
+
+    async fn set_user_setting_mute(
+        &self,
+        jid: &Jid,
+        mute_type: &str,
+        muted: bool,
+    ) -> Result<(), MexError> {
+        let response = self
+            .client
+            .mex()
+            .mutate(mex_request!(
+                update_newsletter_user_setting,
+                mute_user_setting_variables(jid, mute_type, muted)
+            ))
+            .await?;
+
+        let data = response
+            .data
+            .ok_or_else(|| MexError::PayloadParsing("missing data".into()))?;
+        if data["xwa2_newsletter_update_user_setting"].is_null() {
+            return Err(MexError::PayloadParsing(format!(
+                "failed to update newsletter user setting: {jid}"
+            )));
+        }
+        Ok(())
     }
 
     /// Fetch metadata for a newsletter by its invite code.
@@ -643,10 +683,38 @@ fn parse_newsletter_messages_response(
     Ok(result)
 }
 
+/// Build the MEX variables for `update_newsletter_user_setting`. WA Web
+/// (WAWebNewsletterUpdateUserSettingJob) sends `{ input: { newsletter_id, type, value } }`
+/// with value ON/OFF; the mute-expiration is local DB state, never on the wire. The
+/// generated op's input type is opaque (a bare string), so the structured object is
+/// passed directly as variables.
+fn mute_user_setting_variables(jid: &Jid, mute_type: &str, muted: bool) -> serde_json::Value {
+    serde_json::json!({
+        "input": {
+            "newsletter_id": jid.to_string(),
+            "type": mute_type,
+            "value": if muted { "ON" } else { "OFF" },
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wacore_binary::builder::NodeBuilder;
+
+    #[test]
+    fn mute_variables_match_wa_web_shape() {
+        let jid: Jid = "111222333@newsletter".parse().unwrap();
+        let on = mute_user_setting_variables(&jid, "MUTE_FOLLOWER_ACTIVITY", true);
+        assert_eq!(on["input"]["newsletter_id"], "111222333@newsletter");
+        assert_eq!(on["input"]["type"], "MUTE_FOLLOWER_ACTIVITY");
+        assert_eq!(on["input"]["value"], "ON");
+
+        let off = mute_user_setting_variables(&jid, "MUTE_ADMIN_ACTIVITY", false);
+        assert_eq!(off["input"]["type"], "MUTE_ADMIN_ACTIVITY");
+        assert_eq!(off["input"]["value"], "OFF");
+    }
 
     #[test]
     fn test_missing_type_attribute_defaults_to_text() {
