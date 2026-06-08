@@ -17,7 +17,9 @@ pub use wacore_binary::{Jid, Server};
 pub use waproto;
 
 pub mod cache;
-#[cfg(not(feature = "moka-cache"))]
+// Available whenever the cache falls back to PortableCache: moka off, or wasm32
+// (where moka can't build) even if `moka-cache` is enabled. Mirrors src/cache.rs.
+#[cfg(any(not(feature = "moka-cache"), target_arch = "wasm32"))]
 pub mod portable_cache;
 
 pub mod cache_config;
