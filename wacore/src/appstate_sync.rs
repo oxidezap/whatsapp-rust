@@ -256,7 +256,7 @@ impl AppStateProcessor {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_list", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_patch_list(
         &self,
-        pl: PatchList,
+        mut pl: PatchList,
         validate_macs: bool,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         // Pre-fetch all keys we'll need
@@ -329,6 +329,33 @@ impl AppStateProcessor {
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;
+        }
+
+        // WA Web AntiTampering: an unsynced collection (empty ltHash) can only be
+        // seeded by a snapshot or the genesis patch (version 1). If no snapshot was
+        // applied and the first patch is non-genesis, applying it would anchor the
+        // aggregate ltHash to nothing and persist unverified mutations, then advance
+        // the version so the next sync no longer requests a snapshot. Mark the
+        // collection retryable instead; the version stays 0, so the refetch re-requests
+        // a snapshot. (whatsmeow/WA Web force a snapshot re-sync here.)
+        if state.version == 0 && state.hash == [0u8; 128] {
+            let first_version = pl
+                .patches
+                .first()
+                .and_then(|p| p.version.as_ref())
+                .and_then(|v| v.version)
+                .unwrap_or(0);
+            if !pl.patches.is_empty() && first_version != 1 {
+                log::warn!(
+                    target: "AppState",
+                    "Collection {collection_name} has empty ltHash and a non-genesis first patch v{first_version} without a snapshot; will refetch"
+                );
+                pl.error = Some(CollectionSyncError::Retry {
+                    code: 0,
+                    text: "empty lthash".to_string(),
+                });
+                return Ok((new_mutations, state, pl));
+            }
         }
 
         // Snapshot the key cache once for all patches (prefetch_keys already populated it)

@@ -14,7 +14,7 @@ mod tests {
     use wacore::appstate::hash::HashState;
     use wacore::appstate::hash::generate_content_mac;
     use wacore::appstate::keys::expand_app_state_keys;
-    use wacore::appstate::patch_decode::{PatchList, WAPatchName};
+    use wacore::appstate::patch_decode::{CollectionSyncError, PatchList, WAPatchName};
     use wacore::appstate::processor::AppStateMutationMAC;
     use wacore::libsignal::crypto::aes_256_cbc_encrypt_into;
     use wacore::store::error::Result as StoreResult;
@@ -584,5 +584,40 @@ mod tests {
             1,
             "version must not advance when the MAC reset fails"
         );
+    }
+
+    #[tokio::test]
+    async fn non_genesis_patch_on_empty_collection_is_retried() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+
+        // Empty collection (version 0), patches without a snapshot, first patch v5.
+        let patch_list = PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches: vec![wa::SyncdPatch {
+                version: Some(wa::SyncdVersion { version: Some(5) }),
+                ..Default::default()
+            }],
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+
+        let (mutations, state, pl) = processor
+            .process_patch_list(patch_list, true)
+            .await
+            .expect("guard returns Ok with a retryable error, not a hard failure");
+
+        assert!(
+            mutations.is_empty(),
+            "the unanchored patch must not be applied"
+        );
+        assert_eq!(
+            state.version, 0,
+            "version stays 0 so the refetch re-requests a snapshot"
+        );
+        assert!(matches!(pl.error, Some(CollectionSyncError::Retry { .. })));
     }
 }

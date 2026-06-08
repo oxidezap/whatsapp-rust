@@ -334,11 +334,11 @@ fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<()
 /// * `state` - The hash state AFTER applying the patch mutations
 /// * `keys` - The expanded app state keys for MAC computation
 /// * `collection_name` - The collection name
-/// * `had_no_prior_state` - If true, skip ALL MAC validation. This should be true
-///   when processing patches without a prior local state (e.g., first sync without snapshot).
-///   WhatsApp Web handles this case by throwing a retryable error ("empty lthash"), but we
-///   can safely skip validation and process the mutations for usability. The state will be
-///   corrected on the next proper sync with a snapshot.
+/// * `had_no_prior_state` - If true, skip ALL MAC validation. On an empty collection
+///   this is only reached for the genesis patch (version 1), which has no prior baseline
+///   to validate against. The empty + non-genesis case (a patch without a snapshot that
+///   can't anchor the ltHash) is rejected upstream in `process_patch_list`, which marks
+///   the collection retryable so it re-syncs via snapshot, matching WhatsApp Web.
 /// * `has_missing_remove` - If true, a REMOVE mutation was missing its previous value.
 ///   WhatsApp Web tracks this and makes MAC validation failures non-fatal in this case,
 ///   because the ltHash is expected to diverge when we can't subtract a value we don't have.
