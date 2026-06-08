@@ -509,8 +509,13 @@ impl<'a> ChatActions<'a> {
         first_name: Option<String>,
         save_on_primary_addressbook: bool,
     ) -> Result<()> {
-        if jid.is_lid() {
-            anyhow::bail!("save_contact: contact id must be a phone-number JID, not a LID");
+        // The contact index must be a bare phone-number JID. Reject LIDs (separate
+        // path in WA Web), group/status/broadcast/newsletter JIDs, and AD/device
+        // JIDs (e.g. 123:4@s.whatsapp.net) that would form an invalid contact index.
+        if !jid.is_pn() || jid.device != 0 {
+            anyhow::bail!(
+                "save_contact: contact id must be a bare phone-number JID (not a LID, group, or device-specific JID)"
+            );
         }
         debug!("Saving contact {jid}");
         let value = wa::SyncActionValue {
