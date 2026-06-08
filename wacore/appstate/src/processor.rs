@@ -439,7 +439,7 @@ pub fn validate_snapshot_mac(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::generate_content_mac;
+    use crate::hash::{generate_content_mac, generate_index_mac};
     use crate::keys::expand_app_state_keys;
     use crate::lthash::WAPATCH_INTEGRITY;
     use prost::Message;
@@ -452,7 +452,10 @@ mod tests {
         key_id: &[u8],
         timestamp: i64,
     ) -> wa::SyncdRecord {
+        // The `index_mac` arg is the index identity bytes; the stored index blob is
+        // their HMAC, so the record stays valid under unconditional index-MAC checks.
         let action_data = wa::SyncActionData {
+            index: Some(index_mac.to_vec()),
             value: Some(wa::SyncActionValue {
                 timestamp: Some(timestamp),
                 ..Default::default()
@@ -474,7 +477,7 @@ mod tests {
 
         wa::SyncdRecord {
             index: Some(wa::SyncdIndex {
-                blob: Some(index_mac.to_vec()),
+                blob: Some(generate_index_mac(index_mac, &keys.index)),
             }),
             value: Some(wa::SyncdValue {
                 blob: Some(value_blob),
@@ -519,7 +522,10 @@ mod tests {
         assert_eq!(result.mutations.len(), 1);
         assert_eq!(result.mutation_macs.len(), 1);
         // Exact MAC bytes (not just counts): catches empty/swapped MACs.
-        assert_eq!(result.mutation_macs[0].index_mac, index_mac);
+        assert_eq!(
+            result.mutation_macs[0].index_mac,
+            generate_index_mac(&index_mac, &keys.index)
+        );
         assert!(!result.mutation_macs[0].value_mac.is_empty());
         assert_ne!(
             result.mutation_macs[0].index_mac,
@@ -626,7 +632,10 @@ mod tests {
         assert_eq!(result.mutations.len(), 1);
         assert_eq!(result.added_macs.len(), 1);
         // Exact MAC bytes (not just counts): catches empty/swapped MACs.
-        assert_eq!(result.added_macs[0].index_mac, index_mac);
+        assert_eq!(
+            result.added_macs[0].index_mac,
+            generate_index_mac(&index_mac, &keys.index)
+        );
         assert!(!result.added_macs[0].value_mac.is_empty());
         assert_ne!(
             result.added_macs[0].index_mac,
@@ -812,9 +821,10 @@ mod tests {
         };
 
         let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
-        // Return the previous value MAC when asked
+        // process_patch looks up by the stored index MAC (HMAC of the index bytes).
+        let stored_index_mac = generate_index_mac(&index_mac, &keys.index);
         let get_prev = |idx: &[u8]| {
-            if idx == index_mac.as_slice() {
+            if idx == stored_index_mac.as_slice() {
                 Ok(Some(initial_value_mac.clone()))
             } else {
                 Ok(None)

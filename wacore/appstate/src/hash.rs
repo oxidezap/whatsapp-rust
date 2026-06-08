@@ -171,18 +171,19 @@ pub fn generate_content_mac(
     result
 }
 
+pub fn generate_index_mac(index_json_bytes: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    let mut mac =
+        CryptographicMac::new("HmacSha256", key).expect("HmacSha256 is a valid algorithm");
+    mac.update(index_json_bytes);
+    mac.finalize()
+}
+
 pub fn validate_index_mac(
     index_json_bytes: &[u8],
     expected_mac: &[u8],
     key: &[u8; 32],
 ) -> Result<(), AppStateError> {
-    let computed = {
-        let mut mac =
-            CryptographicMac::new("HmacSha256", key).expect("HmacSha256 is a valid algorithm");
-        mac.update(index_json_bytes);
-        mac.finalize()
-    };
-    if computed.as_slice() != expected_mac {
+    if generate_index_mac(index_json_bytes, key).as_slice() != expected_mac {
         Err(AppStateError::MismatchingIndexMAC)
     } else {
         Ok(())
