@@ -314,6 +314,8 @@ mod tests {
         let iq = IqError::ServerError {
             code: 404,
             text: "not-found".into(),
+            error_type: None,
+            backoff: None,
         };
         let me: MexError = iq.into();
         let src = std::error::Error::source(&me).expect("source preserved");

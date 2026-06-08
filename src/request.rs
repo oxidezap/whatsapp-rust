@@ -27,7 +27,14 @@ pub enum IqError {
     #[error("received disconnect node during IQ wait: {0:?}")]
     Disconnected(Node),
     #[error("received a server error response: code={code}, text='{text}'")]
-    ServerError { code: u16, text: String },
+    ServerError {
+        code: u16,
+        text: String,
+        /// XMPP error class from the `type` attr; `None` if absent.
+        error_type: Option<String>,
+        /// Server-directed retry delay in seconds from the `backoff` attr; `None` if absent.
+        backoff: Option<u32>,
+    },
     #[error("internal channel closed unexpectedly")]
     InternalChannelClosed,
     #[error("failed to encode IQ request")]
@@ -42,9 +49,17 @@ impl From<wacore::request::IqError> for IqError {
             wacore::request::IqError::Timeout => Self::Timeout,
             wacore::request::IqError::NotConnected => Self::NotConnected,
             wacore::request::IqError::Disconnected(node) => Self::Disconnected(node),
-            wacore::request::IqError::ServerError { code, text } => {
-                Self::ServerError { code, text }
-            }
+            wacore::request::IqError::ServerError {
+                code,
+                text,
+                error_type,
+                backoff,
+            } => Self::ServerError {
+                code,
+                text,
+                error_type,
+                backoff,
+            },
             wacore::request::IqError::InternalChannelClosed => Self::InternalChannelClosed,
             // wacore::IqError is #[non_exhaustive]; a new upstream variant should
             // get its own arm above. Until then treat it as an unexpected internal error.

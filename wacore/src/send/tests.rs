@@ -2529,6 +2529,8 @@ mod device_unregistered_tests {
         let err = anyhow::Error::new(ServerErrorCode {
             code: 406,
             text: "not-acceptable".to_string(),
+            error_type: None,
+            backoff: None,
         });
         assert!(is_device_unregistered_error(&err));
     }
@@ -2538,6 +2540,8 @@ mod device_unregistered_tests {
         let err = anyhow::Error::new(ServerErrorCode {
             code: 404,
             text: "not-found".to_string(),
+            error_type: None,
+            backoff: None,
         });
         assert!(!is_device_unregistered_error(&err));
     }
@@ -2556,6 +2560,8 @@ mod device_unregistered_tests {
         let err = anyhow::Error::new(crate::request::IqError::ServerError {
             code: 406,
             text: "not-acceptable".to_string(),
+            error_type: None,
+            backoff: None,
         });
         // This would only match if we also checked IqError (we don't — we use ServerErrorCode)
         // The SendContextResolver impl is responsible for wrapping in ServerErrorCode

@@ -297,7 +297,9 @@ mod tests {
         assert_eq!(
             classify_keepalive_error(&IqError::ServerError {
                 code: 500,
-                text: "internal".to_string()
+                text: "internal".to_string(),
+                error_type: None,
+                backoff: None,
             }),
             KeepaliveResult::TransientFailure,
             "ServerError should be transient — server may recover"

@@ -400,6 +400,8 @@ mod tests {
         let iq = IqError::ServerError {
             code: 400,
             text: "bad-request".into(),
+            error_type: None,
+            backoff: None,
         };
         let pe: PairError = iq.into();
         let src = std::error::Error::source(&pe).expect("source preserved");

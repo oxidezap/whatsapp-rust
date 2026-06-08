@@ -30,12 +30,18 @@ impl SendContextResolver for Client {
             .map_err(|e| {
                 // Re-wrap server errors as wacore::ServerErrorCode so
                 // encrypt_for_devices can downcast across crate boundaries
-                if let Some(crate::request::IqError::ServerError { code, text }) =
-                    e.downcast_ref::<crate::request::IqError>()
+                if let Some(crate::request::IqError::ServerError {
+                    code,
+                    text,
+                    error_type,
+                    backoff,
+                }) = e.downcast_ref::<crate::request::IqError>()
                 {
                     return anyhow::Error::new(wacore::request::ServerErrorCode {
                         code: *code,
                         text: text.clone(),
+                        error_type: error_type.clone(),
+                        backoff: *backoff,
                     });
                 }
                 e
