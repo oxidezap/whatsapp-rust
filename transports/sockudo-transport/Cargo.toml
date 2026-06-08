@@ -17,7 +17,7 @@ async-channel = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 log = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "sync", "net", "io-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "net", "io-util", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 webpki-roots = "1.0.4"

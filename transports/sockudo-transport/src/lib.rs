@@ -17,6 +17,7 @@ use log::{debug, warn};
 use sockudo_ws::client::WebSocketClient;
 use sockudo_ws::{Config, Http1, Message, SplitReader, SplitWriter, WebSocketStream};
 use std::sync::{Arc, Once};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -244,6 +245,39 @@ async fn read_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let _ = tx.send(TransportEvent::Disconnected(reason)).await;
 }
 
+/// How often the writer is flushed to drain queued control responses (pongs,
+/// close acks) while no application data is being sent. Well under the seconds-
+/// to-tens-of-seconds a peer waits for a pong before closing an idle connection.
+const CONTROL_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Periodically flushes the split writer so control responses the reader queued
+/// (pongs in particular) are actually written on otherwise-idle connections. The
+/// hot send path already drains the queue on every `send`; this only matters when
+/// there is no application traffic. Exits on shutdown, when the writer has been
+/// taken by `disconnect`, or when a flush fails (the read pump reports the cause).
+async fn control_flush_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    writer: Arc<Mutex<Option<SplitWriter<S>>>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            _ = tokio::time::sleep(CONTROL_FLUSH_INTERVAL) => {
+                let mut guard = writer.lock().await;
+                match guard.as_mut() {
+                    Some(w) => {
+                        if w.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
 /// Wraps an already-upgraded sockudo [`WebSocketStream`] into a [`Transport`] +
 /// event channel. Splits into independent read/write halves (sockudo uses
 /// `tokio::io::split` under the hood, no shared mutex on the socket).
@@ -257,13 +291,23 @@ where
     let (event_tx, event_rx) = async_channel::bounded(EVENT_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    let writer = Arc::new(Mutex::new(Some(writer)));
+    let flush_shutdown = shutdown_tx.subscribe();
+
     let transport = Arc::new(SockudoTransport {
-        writer: Arc::new(Mutex::new(Some(writer))),
+        writer: Arc::clone(&writer),
         shutdown_tx,
     });
 
     // Enqueue Connected before spawning so it precedes any DataReceived.
     let _ = event_tx.try_send(TransportEvent::Connected);
+
+    // Drive the split writer's control queue. sockudo's SplitReader only QUEUES
+    // pong/close responses (it never writes); the SplitWriter drains them on
+    // send/flush. With no application traffic an idle connection would never flush
+    // a queued pong, so the server would drop it. This task flushes the writer
+    // periodically to answer pings even when nothing is being sent.
+    tokio::task::spawn(control_flush_pump(Arc::clone(&writer), flush_shutdown));
 
     tokio::task::spawn(read_pump(reader, event_tx, shutdown_rx));
 
