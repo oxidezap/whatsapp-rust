@@ -110,36 +110,48 @@ pub enum RevokeType {
 /// `polltype=vote` meta; an event edit sets both `event_type=edit` meta and
 /// `edit="1"` attribute).
 fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>, Option<Node>) {
+    use wacore::proto_helpers::MessageExt;
     let edit = EditAttribute::infer_from_message(msg);
 
-    let meta = if msg.poll_creation_message.is_some()
+    // genMetaNode builds a single <meta> carrying every applicable attr together,
+    // so accumulate onto one node instead of emitting at most one attr.
+    let mut meta = NodeBuilder::new("meta");
+    let mut has_attr = false;
+
+    if msg.poll_creation_message.is_some()
         || msg.poll_creation_message_v2.is_some()
         || msg.poll_creation_message_v3.is_some()
     {
-        Some(meta_node("polltype", "creation"))
+        meta = meta.attr("polltype", "creation");
+        has_attr = true;
     } else if let Some(ref poll_update) = msg.poll_update_message
         && poll_update.vote.is_some()
     {
-        Some(meta_node("polltype", "vote"))
+        meta = meta.attr("polltype", "vote");
+        has_attr = true;
         // TODO: polltype="result_snapshot" for poll_result_snapshot_message (gated behind AB flag)
     } else if msg.event_message.is_some() {
-        Some(meta_node("event_type", "creation"))
+        meta = meta.attr("event_type", "creation");
+        has_attr = true;
     } else if msg.enc_event_response_message.is_some() {
-        Some(meta_node("event_type", "response"))
+        meta = meta.attr("event_type", "response");
+        has_attr = true;
     } else if let Some(ref sec) = msg.secret_encrypted_message
         && sec.secret_enc_type
             == Some(wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32)
     {
-        Some(meta_node("event_type", "edit"))
-    } else {
-        None
-    };
+        meta = meta.attr("event_type", "edit");
+        has_attr = true;
+    }
 
-    (edit, meta)
-}
+    // genMetaNode: `view_once="true"` whenever the media is view-once (wrapper or
+    // inline flag). Detection covers both via MessageExt::is_view_once.
+    if msg.is_view_once() {
+        meta = meta.attr("view_once", "true");
+        has_attr = true;
+    }
 
-fn meta_node(key: &'static str, value: &'static str) -> Node {
-    NodeBuilder::new("meta").attr(key, value).build()
+    (edit, has_attr.then(|| meta.build()))
 }
 
 /// Offset subtracted from the current unix timestamp to produce the
@@ -3043,6 +3055,33 @@ mod tests {
             assert_eq!(node.tag, "meta");
             let mut attrs = node.attrs();
             assert_eq!(attrs.optional_string("polltype").unwrap().as_ref(), "vote");
+        }
+
+        #[test]
+        fn view_once_image_emits_view_once_meta() {
+            let msg = wa::Message {
+                image_message: Some(Box::new(wa::message::ImageMessage {
+                    view_once: Some(true),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let (_, node) = infer_stanza_metadata(&msg);
+            let node = node.expect("view-once image should emit meta");
+            assert_eq!(node.tag, "meta");
+            assert_eq!(
+                node.attrs().optional_string("view_once").unwrap().as_ref(),
+                "true"
+            );
+        }
+
+        #[test]
+        fn plain_image_emits_no_meta() {
+            let msg = wa::Message {
+                image_message: Some(Box::new(wa::message::ImageMessage::default())),
+                ..Default::default()
+            };
+            assert!(infer_stanza_metadata(&msg).1.is_none());
         }
 
         #[test]
