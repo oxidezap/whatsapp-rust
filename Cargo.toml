@@ -17,6 +17,9 @@ members = [
     "tests/bench-integration",
     "tests/e2e",
     "transports/tokio-transport",
+    # PoC transport, kept out of default-members so the heavy sockudo-ws git
+    # dependency is only built when the benchmark client pulls it in.
+    "transports/sockudo-transport",
     "wacore",
     "wacore/appstate",
     "wacore/binary",
