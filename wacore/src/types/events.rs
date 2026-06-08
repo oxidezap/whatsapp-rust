@@ -198,6 +198,7 @@ impl Serialize for LazyHistorySync {
 /// be at most 64 kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum EventKind {
     Connected,
     Disconnected,
@@ -247,7 +248,20 @@ pub enum EventKind {
     NewsletterLiveUpdate,
     RawNode,
     MexNotification,
+    // When adding a variant, mind the 64-kind ceiling below (EventInterest packs
+    // each discriminant as a bit in a u64) and keep the guard pointing at the
+    // last variant.
 }
+
+impl EventKind {
+    /// Bit-index ceiling: [`EventInterest`] packs each kind's discriminant into a
+    /// `u64`, so there can be at most 64 kinds.
+    pub const CAPACITY: u8 = 64;
+}
+
+// Build-time tripwire: a new variant that would overflow EventInterest's bitmask
+// fails compilation instead of silently corrupting the mask at runtime.
+const _: () = assert!((EventKind::MexNotification as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. The event bus skips
 /// materializing and dispatching events whose kind no handler wants, so a

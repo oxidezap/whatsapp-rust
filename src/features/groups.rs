@@ -3,6 +3,10 @@ use crate::features::mex::{MexError, mex_request};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wacore::client::context::GroupInfo;
+use wacore::iq::contacts::SetProfilePictureSpec;
+// Returned by set/remove_profile_picture; re-exported so callers don't reach
+// into wacore directly (consistent with GroupProfilePicture below).
+pub use wacore::iq::contacts::SetProfilePictureResponse;
 use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
     BatchGetGroupInfoIq, CancelMembershipRequestsIq, DemoteParticipantsIq, GetGroupInviteInfoIq,
@@ -784,6 +788,40 @@ impl<'a> Groups<'a> {
         Ok(self
             .client
             .execute(GetGroupProfilePicturesIq::with_type(groups))
+            .await?)
+    }
+
+    /// Set a group's profile picture (admin operation).
+    ///
+    /// Sends a JPEG; the caller should size/crop it (WhatsApp uses 640x640).
+    /// Passing empty `image_data` removes the picture, mirroring the own-picture
+    /// API; prefer [`Groups::remove_profile_picture`] when removal is the intent.
+    ///
+    /// ## Wire Format
+    /// ```xml
+    /// <iq type="set" xmlns="w:profile:picture" to="{group}@g.us">
+    ///   <picture type="image">{jpeg bytes}</picture>
+    /// </iq>
+    /// ```
+    pub async fn set_profile_picture(
+        &self,
+        group_jid: &Jid,
+        image_data: Vec<u8>,
+    ) -> Result<SetProfilePictureResponse, anyhow::Error> {
+        Ok(self
+            .client
+            .execute(SetProfilePictureSpec::for_group(group_jid, image_data))
+            .await?)
+    }
+
+    /// Remove a group's profile picture (admin operation).
+    pub async fn remove_profile_picture(
+        &self,
+        group_jid: &Jid,
+    ) -> Result<SetProfilePictureResponse, anyhow::Error> {
+        Ok(self
+            .client
+            .execute(SetProfilePictureSpec::remove_group(group_jid))
             .await?)
     }
 

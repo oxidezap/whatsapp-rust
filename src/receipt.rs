@@ -25,6 +25,45 @@ use wacore_binary::OwnedNodeRef;
 /// The server's offline queue only drops a self-fanout on this sender receipt;
 /// a bare transport `<ack>` is ignored and the stanza is replayed until a
 /// ~50min GC closes the stream.
+/// Builds a `<receipt type="played"|"played-self">` for voice/video notes,
+/// mirroring WA Web `WAWebSendPlayedReceiptJob`: newsletters use `played-self`,
+/// everything else `played`. The `participant` attr is set only for
+/// group/broadcast chats; in DMs WA Web drops it (`r.isUser() ? null : author`).
+fn build_played_receipt_node(
+    chat: &Jid,
+    sender: Option<&Jid>,
+    message_ids: &[String],
+    timestamp: &str,
+) -> wacore_binary::Node {
+    let receipt_type = if chat.is_newsletter() {
+        ReceiptType::PlayedSelf
+    } else {
+        ReceiptType::Played
+    };
+
+    let mut builder = NodeBuilder::new("receipt")
+        .attr("to", chat)
+        .attr("type", receipt_type.as_wire_str())
+        .attr("id", &message_ids[0])
+        .attr("t", timestamp);
+
+    if (chat.is_group() || chat.is_status_broadcast() || chat.is_broadcast_list())
+        && let Some(sender) = sender
+    {
+        builder = builder.attr("participant", sender);
+    }
+
+    if message_ids.len() > 1 {
+        let items: Vec<wacore_binary::Node> = message_ids[1..]
+            .iter()
+            .map(|id| NodeBuilder::new("item").attr("id", id).build())
+            .collect();
+        builder = builder.children(vec![NodeBuilder::new("list").children(items).build()]);
+    }
+
+    builder.build()
+}
+
 fn build_delivery_receipt_node(
     info: &crate::types::message::MessageInfo,
     active: bool,
@@ -434,6 +473,34 @@ impl Client {
         self.send_node(node)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send read receipt: {}", e))
+    }
+
+    /// Marks one or more voice/video notes as played (`<receipt type="played">`).
+    ///
+    /// Mirrors WA Web `WAWebSendPlayedReceiptJob`. For group/broadcast chats pass
+    /// the message sender as `sender` so the receipt carries `participant`; in DMs
+    /// pass `None`. Newsletters emit `played-self`. The DM `played`-vs-`played-self`
+    /// privacy gating (read-receipts off) is not applied here, matching
+    /// [`mark_as_read`](Self::mark_as_read).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.mark_as_played", level = "debug", skip_all, fields(chat = %chat.observe()), err(Debug)))]
+    pub async fn mark_as_played(
+        &self,
+        chat: &Jid,
+        sender: Option<&Jid>,
+        message_ids: Vec<String>,
+    ) -> Result<(), anyhow::Error> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+
+        let timestamp = wacore::time::now_secs_u64().to_string();
+        let node = build_played_receipt_node(chat, sender, &message_ids, &timestamp);
+
+        debug!(target: "Client/Receipt", "Sending played receipt for {} message(s) to {}", message_ids.len(), chat.observe());
+
+        self.send_node(node)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send played receipt: {}", e))
     }
 }
 
@@ -1692,5 +1759,114 @@ mod tests {
             participant_attr
         );
         assert_eq!(participant_attr.to_jid().unwrap(), sender_jid);
+    }
+
+    fn jid(s: &str) -> Jid {
+        s.parse().expect("test JID")
+    }
+
+    #[test]
+    fn played_receipt_group_is_played_with_participant() {
+        let node = build_played_receipt_node(
+            &jid("123@g.us"),
+            Some(&jid("456@s.whatsapp.net")),
+            &["M1".to_string()],
+            "100",
+        );
+        assert_eq!(node.tag, "receipt");
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played")
+        );
+        assert_eq!(
+            node.attrs
+                .get("participant")
+                .and_then(|v| v.to_jid().map(|j| j.to_string()))
+                .as_deref(),
+            Some("456@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn played_receipt_dm_is_played_without_participant() {
+        // WA Web drops `participant` in DMs (PlayedReceiptJob `r.isUser() ? null`).
+        let node =
+            build_played_receipt_node(&jid("456@s.whatsapp.net"), None, &["M1".to_string()], "100");
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played")
+        );
+        assert!(node.attrs.get("participant").is_none());
+    }
+
+    #[test]
+    fn played_receipt_newsletter_is_played_self() {
+        let node =
+            build_played_receipt_node(&jid("123@newsletter"), None, &["M1".to_string()], "100");
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played-self")
+        );
+        assert!(node.attrs.get("participant").is_none());
+    }
+
+    #[test]
+    fn played_receipt_extra_ids_go_into_list() {
+        let node = build_played_receipt_node(
+            &jid("456@s.whatsapp.net"),
+            None,
+            &["M1".to_string(), "M2".to_string(), "M3".to_string()],
+            "100",
+        );
+        assert_eq!(
+            node.attrs.get("id").map(|v| v.as_str()).as_deref(),
+            Some("M1")
+        );
+        let list = node
+            .get_optional_child("list")
+            .expect("extra ids must produce a <list>");
+        assert_eq!(list.children().map(|c| c.len()).unwrap_or(0), 2);
+    }
+
+    #[test]
+    fn played_receipt_status_broadcast_carries_participant() {
+        let node = build_played_receipt_node(
+            &jid("status@broadcast"),
+            Some(&jid("456@s.whatsapp.net")),
+            &["M1".to_string()],
+            "100",
+        );
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played")
+        );
+        assert_eq!(
+            node.attrs
+                .get("participant")
+                .and_then(|v| v.to_jid().map(|j| j.to_string()))
+                .as_deref(),
+            Some("456@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn played_receipt_broadcast_list_carries_participant() {
+        let node = build_played_receipt_node(
+            &jid("120363000000000001@broadcast"),
+            Some(&jid("456@s.whatsapp.net")),
+            &["M1".to_string()],
+            "100",
+        );
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played")
+        );
+        assert_eq!(
+            node.attrs
+                .get("participant")
+                .and_then(|v| v.to_jid().map(|j| j.to_string()))
+                .as_deref(),
+            Some("456@s.whatsapp.net")
+        );
     }
 }
