@@ -110,18 +110,15 @@ impl FrameDecoder {
             return None;
         }
 
+        // The 3-byte length caps frame_len at 0xFFFFFF (= FRAME_MAX_SIZE - 1), so an
+        // oversize read is structurally impossible; the size limit is enforced on
+        // send (encode_frame_into) and WA Web's convertBufferedToFrames likewise
+        // trusts the decoded length. A previous `frame_len > FRAME_MAX_SIZE` branch
+        // here was dead, and its handling (advancing only the 3 length bytes, leaving
+        // the payload to be misread as the next length) would have desynced the stream.
         let frame_len = ((self.buffer[0] as usize) << 16)
             | ((self.buffer[1] as usize) << 8)
             | (self.buffer[2] as usize);
-
-        if frame_len > FRAME_MAX_SIZE {
-            trace!(
-                "Frame length {} exceeds maximum size {}, dropping invalid frame",
-                frame_len, FRAME_MAX_SIZE
-            );
-            self.buffer.advance(FRAME_LENGTH_SIZE);
-            return None;
-        }
 
         if self.buffer.len() >= FRAME_LENGTH_SIZE + frame_len {
             self.buffer.advance(FRAME_LENGTH_SIZE);
