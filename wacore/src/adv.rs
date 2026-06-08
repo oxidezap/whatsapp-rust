@@ -5,8 +5,67 @@
 //!
 //! Reference: WAWebHandleAdvDeviceNotificationUtils.decodeSignedKeyIndexBytes()
 
+use crate::libsignal::protocol::PublicKey;
 use crate::store::traits::DeviceInfo;
 use prost::Message;
+
+// ADV signature prefixes (WAWebAdvSignatureConstants). The hosted ([6,5]/[6,6])
+// variants apply to business-hosted companion devices.
+const ADV_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 0];
+const ADV_PREFIX_DEVICE_SIGNATURE: &[u8] = &[6, 1];
+const ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 5];
+const ADV_HOSTED_PREFIX_DEVICE_SIGNATURE: &[u8] = &[6, 6];
+
+/// Verify a fetched companion device's `ADVSignedDeviceIdentity` binds the
+/// fetched identity key to the account's ADV chain, mirroring WA Web
+/// `WAWebAdvSignatureApi.validateADVwithIdentityKey`.
+///
+/// Two checks must both hold under one prefix family: the account signature over
+/// `prefix || details || identity`, and the device signature (made with the
+/// fetched identity key) over `prefix || details || identity || accountKey`. The
+/// device signature is what binds the fetched identity to the account, so a relay
+/// that substitutes a fabricated identity key is rejected. We try the E2EE then
+/// the hosted prefix set rather than replicating WA Web's `bizHostedDevicesEnabled`
+/// gating: the prefix is only a domain separator, so accepting whichever the
+/// signer used stays sound (an attacker still can't forge the account signature).
+pub fn validate_adv_with_identity_key(
+    device_identity_bytes: &[u8],
+    fetched_identity_key: &[u8; 32],
+) -> bool {
+    let Ok(signed) = waproto::whatsapp::AdvSignedDeviceIdentity::decode(device_identity_bytes)
+    else {
+        return false;
+    };
+    let (Some(details), Some(account_key), Some(account_sig), Some(device_sig)) = (
+        signed.details.as_deref(),
+        signed.account_signature_key.as_deref(),
+        signed.account_signature.as_deref(),
+        signed.device_signature.as_deref(),
+    ) else {
+        return false;
+    };
+    let (Ok(account_pub), Ok(device_pub)) = (
+        PublicKey::from_djb_public_key_bytes(account_key),
+        PublicKey::from_djb_public_key_bytes(fetched_identity_key),
+    ) else {
+        return false;
+    };
+
+    [
+        (ADV_PREFIX_ACCOUNT_SIGNATURE, ADV_PREFIX_DEVICE_SIGNATURE),
+        (
+            ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE,
+            ADV_HOSTED_PREFIX_DEVICE_SIGNATURE,
+        ),
+    ]
+    .into_iter()
+    .any(|(account_prefix, device_prefix)| {
+        let account_msg = [account_prefix, details, fetched_identity_key].concat();
+        let device_msg = [device_prefix, details, fetched_identity_key, account_key].concat();
+        account_pub.verify_signature(&account_msg, account_sig)
+            && device_pub.verify_signature(&device_msg, device_sig)
+    })
+}
 
 /// Decoded fields from `ADVKeyIndexList` protobuf.
 #[derive(Debug, Clone)]
@@ -222,5 +281,105 @@ mod tests {
         assert_eq!(decoded.timestamp, 1000);
         assert_eq!(decoded.current_index, 5);
         assert_eq!(decoded.valid_indexes, vec![3, 5, 7]);
+    }
+
+    use crate::libsignal::protocol::KeyPair;
+
+    fn signed_identity(
+        account: &KeyPair,
+        device: &KeyPair,
+        details: &[u8],
+        hosted: bool,
+    ) -> Vec<u8> {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let identity = device.public_key.public_key_bytes();
+        let account_key = account.public_key.public_key_bytes();
+        let (acct_prefix, dev_prefix): (&[u8], &[u8]) = if hosted {
+            (
+                ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE,
+                ADV_HOSTED_PREFIX_DEVICE_SIGNATURE,
+            )
+        } else {
+            (ADV_PREFIX_ACCOUNT_SIGNATURE, ADV_PREFIX_DEVICE_SIGNATURE)
+        };
+        let account_sig = account
+            .private_key
+            .calculate_signature(&[acct_prefix, details, identity].concat(), &mut rng)
+            .unwrap()
+            .to_vec();
+        let device_sig = device
+            .private_key
+            .calculate_signature(
+                &[dev_prefix, details, identity, account_key].concat(),
+                &mut rng,
+            )
+            .unwrap()
+            .to_vec();
+        waproto::whatsapp::AdvSignedDeviceIdentity {
+            details: Some(details.to_vec()),
+            account_signature_key: Some(account_key.to_vec()),
+            account_signature: Some(account_sig),
+            device_signature: Some(device_sig),
+        }
+        .encode_to_vec()
+    }
+
+    fn id32(kp: &KeyPair) -> [u8; 32] {
+        kp.public_key.public_key_bytes().try_into().unwrap()
+    }
+
+    #[test]
+    fn adv_chain_valid_accepted() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let bytes = signed_identity(&account, &device, b"details", false);
+        assert!(validate_adv_with_identity_key(&bytes, &id32(&device)));
+    }
+
+    #[test]
+    fn adv_chain_hosted_prefix_accepted() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let bytes = signed_identity(&account, &device, b"hosted-details", true);
+        assert!(validate_adv_with_identity_key(&bytes, &id32(&device)));
+    }
+
+    #[test]
+    fn adv_chain_rejects_substituted_identity() {
+        // A relay swaps the bundle's <identity> to its own key, but the signed
+        // device-identity still binds the real one: validation must fail.
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let attacker = KeyPair::generate(&mut rng);
+        let bytes = signed_identity(&account, &device, b"details", false);
+        assert!(!validate_adv_with_identity_key(&bytes, &id32(&attacker)));
+    }
+
+    #[test]
+    fn adv_chain_rejects_missing_device_signature() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let no_dev_sig = waproto::whatsapp::AdvSignedDeviceIdentity {
+            details: Some(b"details".to_vec()),
+            account_signature_key: Some(account.public_key.public_key_bytes().to_vec()),
+            account_signature: Some(vec![0u8; 64]),
+            device_signature: None,
+        }
+        .encode_to_vec();
+        assert!(!validate_adv_with_identity_key(&no_dev_sig, &id32(&device)));
+    }
+
+    #[test]
+    fn adv_chain_rejects_garbage() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let device = KeyPair::generate(&mut rng);
+        assert!(!validate_adv_with_identity_key(
+            &[1, 2, 3, 4],
+            &id32(&device)
+        ));
     }
 }

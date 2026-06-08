@@ -914,6 +914,28 @@ impl Client {
             .ok_or_else(|| anyhow::anyhow!("Missing identity key in retry receipt"))?;
         let identity_key = PublicKey::from_djb_public_key_bytes(identity_bytes)?;
 
+        // Companion devices ADV-bind the fetched identity via <device-identity>;
+        // reject a present-but-invalid one so a relay can't swap in a forged key.
+        // Mirrors the prekey-fetch path; a missing one is logged, not fatal.
+        if requester_jid.device != 0
+            && let Some(device_identity) = keys_node
+                .get_optional_child("device-identity")
+                .and_then(get_bytes_content_ref)
+        {
+            let fetched_identity: [u8; 32] = identity_bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("identity key in retry receipt is not 32 bytes"))?;
+            if !wacore::adv::validate_adv_with_identity_key(device_identity, &fetched_identity) {
+                return Err(anyhow::anyhow!(
+                    "device-identity ADV validation failed for companion {requester_jid}"
+                ));
+            }
+        } else if requester_jid.device != 0 {
+            log::warn!(
+                "retry key bundle for companion {requester_jid} omits <device-identity>; proceeding without ADV validation"
+            );
+        }
+
         // Extract prekey (optional in some cases).
         let prekey_data = if let Some(key_ref) = keys_node.get_optional_child("key") {
             let prekey_node = OneTimePreKeyNode::try_from_node_ref(key_ref)?;

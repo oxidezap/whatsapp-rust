@@ -270,6 +270,35 @@ impl PreKeyUtils {
             identity_key,
         )?;
 
+        // Companion devices (device != 0) carry a <device-identity> that ADV-binds
+        // the fetched identity key to the account, so a relay can't substitute a
+        // fabricated identity. Matches WA Web SessionApi.createSignalSession. When
+        // present-but-invalid we reject the bundle (the loop skips that device); a
+        // missing one is logged but not fatal, since the live/mock server set that
+        // omits it is unverified (WA Web throws here).
+        if jid.device != 0 {
+            let device_identity = node
+                .get_optional_child("device-identity")
+                .or_else(|| keys_node.get_optional_child("device-identity"))
+                .and_then(|n| match n.content.as_deref() {
+                    Some(NodeContentRef::Bytes(b)) => Some(b),
+                    _ => None,
+                });
+            match device_identity {
+                Some(di)
+                    if !crate::adv::validate_adv_with_identity_key(di, &identity_key_array) =>
+                {
+                    return Err(anyhow::anyhow!(
+                        "device-identity ADV validation failed for companion {jid}"
+                    ));
+                }
+                Some(_) => {}
+                None => log::warn!(
+                    "prekey bundle for companion {jid} omits <device-identity>; proceeding without ADV validation"
+                ),
+            }
+        }
+
         Ok(bundle)
     }
 
@@ -412,5 +441,35 @@ mod tests {
         assert_eq!(parsed_jid.user, base_jid.user);
         assert_eq!(parsed_jid.device, base_jid.device);
         assert_eq!(parsed_jid.agent, 0);
+    }
+
+    fn parse_one(jid: Jid, device_identity: Option<Vec<u8>>) -> HashMap<Jid, PreKeyBundle> {
+        let bundle = create_mock_bundle(jid.device as u32);
+        let user_node = PreKeyBundleUserNode::from_bundle(jid, &bundle, device_identity)
+            .expect("build bundle node")
+            .into_node();
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("list").children([user_node]).build()])
+            .build();
+        PreKeyUtils::parse_prekeys_response(&response.as_node_ref()).expect("parse bundles")
+    }
+
+    #[test]
+    fn parse_skips_companion_bundle_with_invalid_device_identity() {
+        let companion = Jid::lid_device("100000012345678", 33);
+        let bundles = parse_one(companion.clone(), Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert!(
+            !bundles.contains_key(&companion),
+            "companion bundle with an unverifiable device-identity must be dropped"
+        );
+    }
+
+    #[test]
+    fn parse_keeps_primary_bundle_ignoring_device_identity() {
+        // device 0 is the account's primary: ADV validation does not apply, so a
+        // junk device-identity must not get it dropped.
+        let primary = Jid::lid_device("100000012345678", 0);
+        let bundles = parse_one(primary.clone(), Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert!(bundles.contains_key(&primary));
     }
 }
