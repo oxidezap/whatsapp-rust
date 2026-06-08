@@ -86,13 +86,17 @@ where
         hex::encode(&initial_state.hash[120..])
     );
 
-    // Validate snapshot MAC if requested
-    if validate_macs
-        && let (Some(mac_expected), Some(key_id)) = (
+    // Validate snapshot MAC if requested. A snapshot that omits `mac`/`key_id` is
+    // treated as a validation FAILURE, not skipped: WA Web's anti-tampering
+    // compares against the (possibly undefined) mac and fires the recovery path on
+    // mismatch, so a missing mac must not silently accept unverified records.
+    if validate_macs {
+        let (Some(mac_expected), Some(key_id)) = (
             snapshot.mac.as_ref(),
             snapshot.key_id.as_ref().and_then(|k| k.id.as_ref()),
-        )
-    {
+        ) else {
+            return Err(AppStateError::SnapshotMACMismatch);
+        };
         let keys = get_keys(key_id)?;
         let computed = initial_state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
         trace!(
@@ -383,11 +387,14 @@ pub fn validate_snapshot_mac(
     keys: &ExpandedAppStateKeys,
     collection_name: &str,
 ) -> Result<(), AppStateError> {
-    if let Some(mac_expected) = snapshot.mac.as_ref() {
-        let computed = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
-        if computed != *mac_expected {
-            return Err(AppStateError::SnapshotMACMismatch);
-        }
+    // A missing snapshot mac is a validation failure, not a skip (matches WA Web
+    // and process_snapshot's enforced gate).
+    let Some(mac_expected) = snapshot.mac.as_ref() else {
+        return Err(AppStateError::SnapshotMACMismatch);
+    };
+    let computed = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
+    if computed != *mac_expected {
+        return Err(AppStateError::SnapshotMACMismatch);
     }
     Ok(())
 }
@@ -488,6 +495,34 @@ mod tests {
                 .and_then(|v| v.timestamp),
             Some(1234567890)
         );
+    }
+
+    #[test]
+    fn process_snapshot_rejects_missing_mac_when_validating() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+        let record = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &[1u8; 32],
+            &keys,
+            &key_id,
+            1234567890,
+        );
+        // Snapshot WITHOUT a `mac` field — must fail validation, not be accepted.
+        let snapshot = wa::SyncdSnapshot {
+            version: Some(wa::SyncdVersion { version: Some(1) }),
+            records: vec![record],
+            key_id: Some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let mut state = HashState::default();
+        let err = process_snapshot(&snapshot, &mut state, get_keys, true, "regular")
+            .expect_err("missing snapshot mac must fail when validating");
+        assert!(matches!(err, AppStateError::SnapshotMACMismatch));
     }
 
     #[test]
