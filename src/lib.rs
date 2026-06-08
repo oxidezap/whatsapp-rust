@@ -59,6 +59,7 @@ pub use wacore::runtime::Runtime;
 pub mod send;
 pub use send::{PinDuration, RevokeType, SendOptions, SendResult};
 pub use wacore::send::StanzaType;
+pub mod media;
 pub mod session;
 pub mod socket;
 pub mod store;

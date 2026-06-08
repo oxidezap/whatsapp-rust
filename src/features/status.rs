@@ -79,21 +79,14 @@ impl<'a> Status<'a> {
         recipients: &[Jid],
         options: StatusSendOptions,
     ) -> Result<SendResult, anyhow::Error> {
-        let message = wa::Message {
-            image_message: Some(Box::new(wa::message::ImageMessage {
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key.to_vec()),
-                file_sha256: Some(upload.file_sha256.to_vec()),
-                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
-                file_length: Some(upload.file_length),
-                mimetype: Some("image/jpeg".to_string()),
-                jpeg_thumbnail: Some(thumbnail),
+        let message = crate::media::image_message(
+            upload,
+            crate::media::ImageOptions {
                 caption: caption.map(|c| c.to_string()),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
+                jpeg_thumbnail: Some(thumbnail),
+                mimetype: None,
+            },
+        );
 
         self.client
             .send_status_message(message, recipients, options)
@@ -113,22 +106,16 @@ impl<'a> Status<'a> {
         recipients: &[Jid],
         options: StatusSendOptions,
     ) -> Result<SendResult, anyhow::Error> {
-        let message = wa::Message {
-            video_message: Some(Box::new(wa::message::VideoMessage {
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key.to_vec()),
-                file_sha256: Some(upload.file_sha256.to_vec()),
-                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
-                file_length: Some(upload.file_length),
-                mimetype: Some("video/mp4".to_string()),
-                jpeg_thumbnail: Some(thumbnail),
-                seconds: Some(duration_seconds),
+        let message = crate::media::video_message(
+            upload,
+            crate::media::VideoOptions {
                 caption: caption.map(|c| c.to_string()),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
+                jpeg_thumbnail: Some(thumbnail),
+                duration_seconds: Some(duration_seconds),
+                mimetype: None,
+                gif_playback: None,
+            },
+        );
 
         self.client
             .send_status_message(message, recipients, options)

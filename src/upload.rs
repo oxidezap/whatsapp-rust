@@ -290,19 +290,6 @@ impl From<UploadResponse> for wacore::sticker_pack::MediaUploadInfo {
     }
 }
 
-impl UploadResponse {
-    /// Convert crypto fields to `Vec<u8>` for protobuf message construction.
-    pub fn media_key_vec(&self) -> Vec<u8> {
-        self.media_key.to_vec()
-    }
-    pub fn file_sha256_vec(&self) -> Vec<u8> {
-        self.file_sha256.to_vec()
-    }
-    pub fn file_enc_sha256_vec(&self) -> Vec<u8> {
-        self.file_enc_sha256.to_vec()
-    }
-}
-
 #[derive(Deserialize)]
 struct RawUploadResponse {
     url: String,
