@@ -604,6 +604,19 @@ pub fn prepare_message_with_context(
     new_message
 }
 
+/// Build the `MessageContextInfo` carrying a generated reporting token's fields
+/// (message_secret + reporting_token_version). Single source of truth for what the
+/// send path splices onto the wire plaintext, so the DM and group paths can't drift
+/// from each other. Sets exactly the fields [`prepare_message_with_context`] does;
+/// the `splice_with_reporting_context_matches_prepare` test pins the two together.
+pub fn reporting_context_info(result: &ReportingTokenResult) -> wa::MessageContextInfo {
+    wa::MessageContextInfo {
+        message_secret: Some(result.message_secret.to_vec()),
+        reporting_token_version: Some(REPORTING_TOKEN_VERSION),
+        ..Default::default()
+    }
+}
+
 /// Extract message secret from a message's MessageContextInfo
 pub fn extract_message_secret(message: &wa::Message) -> Option<&[u8]> {
     message

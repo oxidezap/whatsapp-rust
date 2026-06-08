@@ -163,11 +163,7 @@ pub async fn prepare_group_stanza<
     // The reporting token's MessageContextInfo (message_secret + version) is spliced
     // onto the encoded plaintext instead of deep-cloning the whole message via
     // prepare_message_with_context just to attach two fields.
-    let reporting_context = reporting_result.as_ref().map(|result| wa::MessageContextInfo {
-        message_secret: Some(result.message_secret.to_vec()),
-        reporting_token_version: Some(crate::reporting_token::REPORTING_TOKEN_VERSION),
-        ..Default::default()
-    });
+    let reporting_context = reporting_result.as_ref().map(reporting_context_info);
 
     let own_base_jid = own_sending_jid.to_non_ad();
 
