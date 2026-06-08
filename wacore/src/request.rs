@@ -227,7 +227,10 @@ impl RequestUtils {
                 // WA Web's parseIqResponse also keeps errorType + errorBackoff; the
                 // backoff is the server's directed retry delay (seconds).
                 let error_type = parser.optional_string("type").map(|s| s.into_owned());
-                let backoff = parser.optional_u64("backoff").map(|b| b as u32);
+                // Drop an out-of-range backoff rather than wrapping it to a wrong delay.
+                let backoff = parser
+                    .optional_u64("backoff")
+                    .and_then(|b| u32::try_from(b).ok());
                 return Err(IqError::ServerError {
                     code,
                     text,
