@@ -78,7 +78,7 @@ pub struct HttpRequest {
     pub url: String,
     pub method: String, // "GET" or "POST"
     pub headers: HashMap<String, String>,
-    pub body: Option<Vec<u8>>,
+    pub body: Option<Bytes>,
 }
 
 impl HttpRequest {
@@ -105,8 +105,8 @@ impl HttpRequest {
         self
     }
 
-    pub fn with_body(mut self, body: Vec<u8>) -> Self {
-        self.body = Some(body);
+    pub fn with_body(mut self, body: impl Into<Bytes>) -> Self {
+        self.body = Some(body.into());
         self
     }
 }

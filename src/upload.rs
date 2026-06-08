@@ -363,7 +363,9 @@ impl Client {
             file_enc_sha256: enc.file_enc_sha256,
             streaming_sidecar: enc.streaming_sidecar,
         };
-        let ciphertext = enc.data_to_upload;
+        // Bytes so each retry/resume attempt slices with a refcount bump instead of
+        // copying the whole (multi-MB) ciphertext per attempt.
+        let ciphertext = bytes::Bytes::from(enc.data_to_upload);
 
         upload_media_with_retry(
             crypto,
@@ -375,7 +377,7 @@ impl Client {
             || async { self.invalidate_media_conn().await },
             |request| async move { self.http_client.execute(request).await },
             |request, offset, _remaining| {
-                let body = ciphertext[offset as usize..].to_vec();
+                let body = ciphertext.slice(offset as usize..);
                 async move { self.http_client.execute(request.with_body(body)).await }
             },
         )
