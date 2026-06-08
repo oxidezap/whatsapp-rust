@@ -526,6 +526,33 @@ mod tests {
     }
 
     #[test]
+    fn process_snapshot_rejects_missing_key_id_when_validating() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+        let record = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &[1u8; 32],
+            &keys,
+            &key_id,
+            1234567890,
+        );
+        // mac present but top-level key_id absent — the other branch of the gate.
+        let snapshot = wa::SyncdSnapshot {
+            version: Some(wa::SyncdVersion { version: Some(1) }),
+            records: vec![record],
+            mac: Some(vec![9u8; 32]),
+            key_id: None,
+            ..Default::default()
+        };
+        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let mut state = HashState::default();
+        let err = process_snapshot(&snapshot, &mut state, get_keys, true, "regular")
+            .expect_err("missing snapshot key_id must fail when validating");
+        assert!(matches!(err, AppStateError::SnapshotMACMismatch));
+    }
+
+    #[test]
     fn test_process_patch_basic() {
         let master_key = [7u8; 32];
         let keys = expand_app_state_keys(&master_key);
