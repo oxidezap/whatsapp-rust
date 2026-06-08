@@ -260,21 +260,28 @@ impl Client {
                 .remove(&processing_key);
         });
 
-        let (original_msg, alt_chat) = match self.take_recent_message(&info.chat, &message_id).await
+        // Peek keeps the message in the cache, so we avoid the decode + re-encode
+        // and the background DB delete + re-store that take + re-add did on every
+        // retry (pure churn during retry storms). Fall back to the consuming take +
+        // re-add only on an L1 miss (DB-only mode, or after eviction), where peek
+        // can't serve it; that path still re-adds so other devices can retry.
+        let (original_msg, alt_chat) = match self.peek_recent_message(&info.chat, &message_id).await
         {
             Some(result) => result,
-            None => {
-                log::debug!(
-                    "Ignoring retry for message {message_id}: already handled or not found in cache."
-                );
-                return Ok(());
-            }
+            None => match self.take_recent_message(&info.chat, &message_id).await {
+                Some(result) => {
+                    self.add_recent_message(&info.chat, &message_id, &result.0)
+                        .await;
+                    result
+                }
+                None => {
+                    log::debug!(
+                        "Ignoring retry for message {message_id}: already handled or not found in cache."
+                    );
+                    return Ok(());
+                }
+            },
         };
-
-        // take_recent_message consumes the cached message; re-add it so other
-        // devices for the same chat can still request a retry.
-        self.add_recent_message(&info.chat, &message_id, &original_msg)
-            .await;
 
         // When message was found via alternate PN<->LID key, the Signal session
         // lives in the stored message's namespace (not the receipt's). Build the
@@ -1269,6 +1276,47 @@ mod tests {
         // Second take should return None
         let taken_again = client.take_recent_message(&chat, &msg_id).await;
         assert!(taken_again.is_none());
+    }
+
+    #[tokio::test]
+    async fn peek_recent_message_does_not_consume() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        let mut config = crate::cache_config::CacheConfig::default();
+        config.recent_messages.capacity = 1_000;
+        let (client, _sync_rx) = Client::new_with_cache_config(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm.clone(),
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+            config,
+        )
+        .await;
+
+        let chat: Jid = "120363021033254949@g.us".parse().unwrap();
+        let msg_id = "PEEK1".to_string();
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        client.add_recent_message(&chat, &msg_id, &msg).await;
+
+        // Peeking twice both return the message and leave it in the cache...
+        for _ in 0..2 {
+            let peeked = client.peek_recent_message(&chat, &msg_id).await;
+            let (m, alt) = peeked.expect("peek should find the cached message");
+            assert!(alt.is_none());
+            assert_eq!(m.conversation.as_deref(), Some("hi"));
+        }
+        // ...so a subsequent take still finds it (peek didn't remove it).
+        assert!(client.take_recent_message(&chat, &msg_id).await.is_some());
     }
 
     #[test]

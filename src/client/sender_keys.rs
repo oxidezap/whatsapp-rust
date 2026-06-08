@@ -244,6 +244,63 @@ impl Client {
         }
     }
 
+    /// Non-consuming variant of [`Self::take_recent_message`]: returns the cached
+    /// message (and the alternate-namespace chat it matched, if any) WITHOUT
+    /// removing it from L1 or touching the DB. The retry handler uses this so a
+    /// resend doesn't decode-then-re-encode the message and churn the DB (delete +
+    /// re-store) on every retry. Returns `None` on an L1 miss (including DB-only
+    /// mode, capacity 0); the caller falls back to take + re-add there.
+    pub(crate) async fn peek_recent_message(
+        &self,
+        to: &Jid,
+        id: &str,
+    ) -> Option<(wa::Message, Option<Jid>)> {
+        let primary_key = self.make_chat_message_id(to, id).await;
+        if let Some(msg) = self.peek_by_key(&primary_key).await {
+            return Some((msg, None));
+        }
+
+        let alt_chat = if primary_key.chat.server != to.server {
+            Some(to.clone())
+        } else {
+            self.swap_pn_lid_namespace(&primary_key.chat).await
+        };
+
+        if let Some(alt_chat) = alt_chat {
+            let alt_key = ChatMessageId {
+                chat: alt_chat,
+                id: primary_key.id,
+            };
+            if let Some(msg) = self.peek_by_key(&alt_key).await {
+                return Some((msg, Some(alt_key.chat)));
+            }
+        }
+
+        None
+    }
+
+    /// L1-only, non-consuming lookup. Returns `None` when L1 is disabled
+    /// (capacity 0) or misses; the DB is intentionally not read here so the caller
+    /// can fall back to the consuming take + re-add path.
+    async fn peek_by_key(&self, key: &ChatMessageId) -> Option<wa::Message> {
+        use prost::Message;
+        if self.cache_config.recent_messages.capacity == 0 {
+            return None;
+        }
+        let bytes = self.recent_messages.get(key).await?;
+        match wa::Message::decode(bytes.as_slice()) {
+            Ok(msg) => Some(msg),
+            Err(e) => {
+                log::warn!(
+                    "Failed to decode cached message for {}:{}: {e}",
+                    key.chat.observe(),
+                    key.id
+                );
+                None
+            }
+        }
+    }
+
     /// Store a sent message for retry handling. Always writes to DB; when L1 cache
     /// is enabled (capacity > 0) also stores in-memory for fast retrieval.
     /// In DB-only mode (capacity = 0), the DB write is awaited to guarantee persistence.
