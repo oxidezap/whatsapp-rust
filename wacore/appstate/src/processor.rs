@@ -519,7 +519,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let mut state = HashState::default();
         let err = process_snapshot(&snapshot, &mut state, get_keys, true, "regular")
             .expect_err("missing snapshot mac must fail when validating");
@@ -545,7 +545,7 @@ mod tests {
             mac: Some(vec![9u8; 32]),
             key_id: None,
         };
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let mut state = HashState::default();
         let err = process_snapshot(&snapshot, &mut state, get_keys, true, "regular")
             .expect_err("missing snapshot key_id must fail when validating");
