@@ -593,6 +593,42 @@ mod external_blob_tests {
     }
 
     #[test]
+    fn external_snapshot_decode_failure_propagates() {
+        // Download succeeds but the bytes aren't a valid SyncdSnapshot: the decode
+        // error must propagate too, not just download errors.
+        let mut pl = pl_with_snapshot_ref(Some(wa::ExternalBlobReference {
+            direct_path: Some("/blob".into()),
+            ..Default::default()
+        }));
+        let download =
+            |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> { Ok(vec![0xFF, 0xFF, 0xFF]) };
+        assert!(download_external_blobs(&mut pl, &download).is_err());
+    }
+
+    #[test]
+    fn external_mutation_download_failure_propagates() {
+        // The patch-level external_mutations path must propagate failures as well.
+        let mut pl = PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches: vec![wa::SyncdPatch {
+                external_mutations: Some(wa::ExternalBlobReference {
+                    direct_path: Some("/mutations".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+        let download = |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+            Err(anyhow!("simulated failure"))
+        };
+        assert!(download_external_blobs(&mut pl, &download).is_err());
+    }
+
+    #[test]
     fn no_external_refs_is_ok() {
         let mut pl = pl_with_snapshot_ref(None);
         let download = |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> { Ok(Vec::new()) };
