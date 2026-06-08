@@ -11,8 +11,8 @@ use log::debug;
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::appstate::schemas::{self, IndexPart, Schema};
 use wacore::types::events::{
-    ArchiveUpdate, ContactUpdate, DeleteChatUpdate, DeleteMessageForMeUpdate, Event,
-    MarkChatAsReadUpdate, MuteUpdate, PinUpdate, StarUpdate,
+    ArchiveUpdate, ClearChatUpdate, ContactUpdate, DeleteChatUpdate, DeleteMessageForMeUpdate,
+    Event, MarkChatAsReadUpdate, MuteUpdate, PinUpdate, StarUpdate,
 };
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
@@ -79,6 +79,7 @@ pub(crate) fn dispatch_chat_mutation(
             | "mark_chat_as_read"
             | "markChatAsRead"
             | "deleteChat"
+            | "clearChat"
             | "deleteMessageForMe"
     ) {
         return false;
@@ -199,6 +200,26 @@ pub(crate) fn dispatch_chat_mutation(
                 let delete_media = m.index.get(2).is_none_or(|v| v != "0");
                 event_bus.dispatch(Event::DeleteChatUpdate(DeleteChatUpdate {
                     jid,
+                    delete_media,
+                    timestamp: time,
+                    action: Box::new(act.clone()),
+                    from_full_sync: full_sync,
+                }));
+            }
+            true
+        }
+        "clearChat" => {
+            if let Some(val) = &m.action_value
+                && let Some(act) = &val.clear_chat_action
+            {
+                // deleteStarred/deleteMedia live in the index (index[2]/index[3]),
+                // not in ClearChatAction (which only has messageRange). WA Web's send
+                // builder encodes both as "1"/"0".
+                let delete_starred = m.index.get(2).is_some_and(|v| v == "1");
+                let delete_media = m.index.get(3).is_some_and(|v| v == "1");
+                event_bus.dispatch(Event::ClearChatUpdate(ClearChatUpdate {
+                    jid,
+                    delete_starred,
                     delete_media,
                     timestamp: time,
                     action: Box::new(act.clone()),
@@ -459,6 +480,36 @@ impl<'a> ChatActions<'a> {
             .send_app_state_action(
                 &schemas::DELETE_CHAT,
                 &[jid.as_str(), delete_media_str],
+                &value,
+            )
+            .await
+    }
+
+    /// Clears a chat's messages while keeping the chat (WA Web's clearChat).
+    ///
+    /// `delete_starred` also removes starred messages; `delete_media` also removes
+    /// downloaded media. Both flags live only in the mutation index, not the proto.
+    pub async fn clear_chat(
+        &self,
+        jid: &Jid,
+        delete_starred: bool,
+        delete_media: bool,
+        message_range: Option<SyncActionMessageRange>,
+    ) -> Result<()> {
+        debug!("Clearing chat {jid}");
+        // WA Web's $ClearChatSync$p_3 encodes both flags as "1"/"0".
+        let delete_starred_str = if delete_starred { "1" } else { "0" };
+        let delete_media_str = if delete_media { "1" } else { "0" };
+        let value = wa::SyncActionValue {
+            clear_chat_action: Some(wa::sync_action_value::ClearChatAction { message_range }),
+            timestamp: Some(wacore::time::now_millis()),
+            ..Default::default()
+        };
+        let jid = jid.to_string();
+        self.client
+            .send_app_state_action(
+                &schemas::CLEAR_CHAT,
+                &[jid.as_str(), delete_starred_str, delete_media_str],
                 &value,
             )
             .await
@@ -748,6 +799,11 @@ mod registry_tests {
                 &schemas::DELETE_CHAT,
                 &["123@s.whatsapp.net", "1"],
                 &["deleteChat", "123@s.whatsapp.net", "1"],
+            ),
+            (
+                &schemas::CLEAR_CHAT,
+                &["123@s.whatsapp.net", "0", "1"],
+                &["clearChat", "123@s.whatsapp.net", "0", "1"],
             ),
             (&schemas::LABEL_EDIT, &["5"], &["label_edit", "5"]),
             (

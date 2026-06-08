@@ -231,6 +231,7 @@ pub enum EventKind {
     StarUpdate,
     MarkChatAsReadUpdate,
     DeleteChatUpdate,
+    ClearChatUpdate,
     DeleteMessageForMeUpdate,
     LabelEditUpdate,
     LabelAssociationUpdate,
@@ -632,6 +633,7 @@ pub enum Event {
     StarUpdate(StarUpdate),
     MarkChatAsReadUpdate(MarkChatAsReadUpdate),
     DeleteChatUpdate(DeleteChatUpdate),
+    ClearChatUpdate(ClearChatUpdate),
     DeleteMessageForMeUpdate(DeleteMessageForMeUpdate),
     LabelEditUpdate(LabelEditUpdate),
     LabelAssociationUpdate(LabelAssociationUpdate),
@@ -719,6 +721,7 @@ impl Event {
             Event::StarUpdate(_) => EventKind::StarUpdate,
             Event::MarkChatAsReadUpdate(_) => EventKind::MarkChatAsReadUpdate,
             Event::DeleteChatUpdate(_) => EventKind::DeleteChatUpdate,
+            Event::ClearChatUpdate(_) => EventKind::ClearChatUpdate,
             Event::DeleteMessageForMeUpdate(_) => EventKind::DeleteMessageForMeUpdate,
             Event::LabelEditUpdate(_) => EventKind::LabelEditUpdate,
             Event::LabelAssociationUpdate(_) => EventKind::LabelAssociationUpdate,
@@ -1154,6 +1157,20 @@ pub struct DeleteChatUpdate {
     pub delete_media: bool,
     pub timestamp: DateTime<Utc>,
     pub action: Box<wa::sync_action_value::DeleteChatAction>,
+    pub from_full_sync: bool,
+}
+
+/// A chat's messages were cleared (kept) on a linked device.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClearChatUpdate {
+    /// The chat being cleared.
+    pub jid: Jid,
+    /// From the index, not the proto — ClearChatAction only has messageRange.
+    pub delete_starred: bool,
+    /// From the index, not the proto.
+    pub delete_media: bool,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::ClearChatAction>,
     pub from_full_sync: bool,
 }
 
