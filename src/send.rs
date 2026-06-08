@@ -109,7 +109,7 @@ pub enum RevokeType {
 /// from `genMetaNode(...)`. A message can carry both (e.g. a poll vote sets
 /// `polltype=vote` meta; an event edit sets both `event_type=edit` meta and
 /// `edit="1"` attribute).
-fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>, Option<Node>) {
+pub(crate) fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>, Option<Node>) {
     use wacore::proto_helpers::MessageExt;
     let edit = EditAttribute::infer_from_message(msg);
 

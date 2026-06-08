@@ -892,6 +892,11 @@ impl<'a> Groups<'a> {
             ));
         }
         let msg = wacore::send::build_member_label_message(label.into(), wacore::time::now_secs());
+        // This low-level send bypasses send_message_with_options (no reporting
+        // token for a protocol message), so compute the <meta> here and pass it
+        // as an extra node — otherwise the member_label appdata/tag_reason attrs
+        // never reach the wire.
+        let (_edit, meta) = crate::send::infer_stanza_metadata(&msg);
         self.client
             .send_message_impl(
                 group_jid.clone(),
@@ -900,7 +905,7 @@ impl<'a> Groups<'a> {
                 false,
                 false,
                 None,
-                vec![],
+                meta.into_iter().collect(),
                 None,
             )
             .await
