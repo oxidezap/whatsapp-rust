@@ -8,7 +8,7 @@
 
 use async_lock::{Mutex as AsyncMutex, RwLock};
 use std::borrow::Borrow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +17,8 @@ struct CacheEntry<V> {
     value: V,
     inserted_at: i64,
     last_accessed_at: i64,
+    /// FIFO sequence number; the key for this entry in `CacheInner::order`.
+    seq: u64,
 }
 
 /// Portable, runtime-agnostic in-process cache.
@@ -35,8 +37,12 @@ pub struct PortableCache<K, V> {
 
 struct CacheInner<K, V> {
     map: HashMap<K, CacheEntry<V>>,
-    /// FIFO eviction order. VecDeque for O(1) pop_front.
-    insertion_order: VecDeque<K>,
+    /// FIFO eviction order keyed by monotonic sequence. `seq -> key`, so eviction
+    /// is `pop_first()` (O(log n)) and a targeted `remove_key` is O(log n) via the
+    /// entry's stored `seq` — instead of an O(n) scan over an insertion list.
+    order: BTreeMap<u64, K>,
+    /// Next FIFO sequence to assign.
+    next_seq: u64,
 }
 
 impl<K, V> CacheInner<K, V>
@@ -46,14 +52,44 @@ where
     fn new() -> Self {
         Self {
             map: HashMap::new(),
-            insertion_order: VecDeque::new(),
+            order: BTreeMap::new(),
+            next_seq: 0,
         }
     }
 
     fn remove_key(&mut self, key: &K) -> Option<CacheEntry<V>> {
         let entry = self.map.remove(key)?;
-        self.insertion_order.retain(|ik| ik != key);
+        self.order.remove(&entry.seq);
         Some(entry)
+    }
+
+    /// Insert a brand-new entry (the caller has already confirmed the key is
+    /// absent), evicting the oldest entries first if at capacity. Assigns and
+    /// records the FIFO sequence.
+    fn insert_new(&mut self, key: K, value: V, now_ms: i64, max_capacity: Option<u64>) {
+        if let Some(cap) = max_capacity {
+            while self.map.len() as u64 >= cap {
+                match self.order.pop_first() {
+                    Some((_, oldest_key)) => {
+                        self.map.remove(&oldest_key);
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.order.insert(seq, key.clone());
+        self.map.insert(
+            key,
+            CacheEntry {
+                value,
+                inserted_at: now_ms,
+                last_accessed_at: now_ms,
+                seq,
+            },
+        );
     }
 }
 
@@ -118,15 +154,15 @@ where
     }
 
     fn is_expired(&self, entry: &CacheEntry<V>, now_ms: i64) -> bool {
-        if let Some(ttl_ms) = self.ttl_ms {
-            if now_ms - entry.inserted_at >= ttl_ms {
-                return true;
-            }
+        if let Some(ttl_ms) = self.ttl_ms
+            && now_ms - entry.inserted_at >= ttl_ms
+        {
+            return true;
         }
-        if let Some(tti_ms) = self.tti_ms {
-            if now_ms - entry.last_accessed_at >= tti_ms {
-                return true;
-            }
+        if let Some(tti_ms) = self.tti_ms
+            && now_ms - entry.last_accessed_at >= tti_ms
+        {
+            return true;
         }
         false
     }
@@ -154,10 +190,10 @@ where
                 let owned_key = Self::find_key(&guard, key)?;
                 drop(guard);
                 let mut wguard = self.inner.write().await;
-                if let Some(e) = wguard.map.get(key) {
-                    if self.is_expired(e, now_ms) {
-                        wguard.remove_key(&owned_key);
-                    }
+                if let Some(e) = wguard.map.get(key)
+                    && self.is_expired(e, now_ms)
+                {
+                    wguard.remove_key(&owned_key);
                 }
                 return None;
             }
@@ -191,25 +227,7 @@ where
             return;
         }
 
-        if let Some(cap) = self.max_capacity {
-            while guard.map.len() as u64 >= cap {
-                if let Some(oldest_key) = guard.insertion_order.pop_front() {
-                    guard.map.remove(&oldest_key);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        guard.insertion_order.push_back(key.clone());
-        guard.map.insert(
-            key,
-            CacheEntry {
-                value,
-                inserted_at: now_ms,
-                last_accessed_at: now_ms,
-            },
-        );
+        guard.insert_new(key, value, now_ms, self.max_capacity);
     }
 
     /// Insert and return a clone of the value in one write lock.
@@ -229,26 +247,8 @@ where
             return value;
         }
 
-        if let Some(cap) = self.max_capacity {
-            while guard.map.len() as u64 >= cap {
-                if let Some(oldest_key) = guard.insertion_order.pop_front() {
-                    guard.map.remove(&oldest_key);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        guard.insertion_order.push_back(key.clone());
         let ret = value.clone();
-        guard.map.insert(
-            key,
-            CacheEntry {
-                value,
-                inserted_at: now_ms,
-                last_accessed_at: now_ms,
-            },
-        );
+        guard.insert_new(key, value, now_ms, self.max_capacity);
         ret
     }
 
@@ -284,7 +284,7 @@ where
         for _ in 0..64 {
             if let Some(mut guard) = self.inner.try_write() {
                 guard.map.clear();
-                guard.insertion_order.clear();
+                guard.order.clear();
                 return;
             }
             std::hint::spin_loop();
@@ -390,13 +390,10 @@ where
 
         guard.map.retain(|_, entry| !self.is_expired(entry, now_ms));
 
-        // Rebuild insertion_order to only contain live keys.
+        // Drop order entries whose keys were just expired out of the map.
         // Borrow fields separately to satisfy the borrow checker.
-        let CacheInner {
-            map,
-            insertion_order,
-        } = &mut *guard;
-        insertion_order.retain(|k| map.contains_key(k));
+        let CacheInner { map, order, .. } = &mut *guard;
+        order.retain(|_, k| map.contains_key(k));
 
         drop(guard);
 
@@ -465,6 +462,29 @@ mod tests {
         assert!(cache.get("a").await.is_none());
         assert_eq!(cache.get("b").await, Some(2));
         assert_eq!(cache.get("d").await, Some(4));
+    }
+
+    #[tokio::test]
+    async fn test_remove_then_eviction_preserves_fifo_order() {
+        // A removed key must leave the FIFO `order` consistent: eviction must skip
+        // it (no stale order entry) and still evict the genuinely-oldest survivor.
+        let cache: PortableCache<String, u32> = PortableCache::builder().max_capacity(3).build();
+        cache.insert("a".into(), 1).await;
+        cache.insert("b".into(), 2).await;
+        cache.insert("c".into(), 3).await;
+
+        // Remove the oldest, then fill back to capacity.
+        assert_eq!(cache.remove("a").await, Some(1));
+        cache.insert("d".into(), 4).await; // count = 3 (b, c, d), no eviction
+        assert_eq!(cache.entry_count(), 3);
+
+        // Next insert evicts the now-oldest survivor (b), not the removed "a".
+        cache.insert("e".into(), 5).await;
+        assert_eq!(cache.entry_count(), 3);
+        assert!(cache.get("b").await.is_none(), "b was the oldest survivor");
+        assert_eq!(cache.get("c").await, Some(3));
+        assert_eq!(cache.get("d").await, Some(4));
+        assert_eq!(cache.get("e").await, Some(5));
     }
 
     #[tokio::test]
