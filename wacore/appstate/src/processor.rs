@@ -11,6 +11,7 @@ use crate::keys::ExpandedAppStateKeys;
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use waproto::whatsapp as wa;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +66,7 @@ pub fn process_snapshot<F>(
     collection_name: &str,
 ) -> Result<ProcessedSnapshot, AppStateError>
 where
-    F: FnMut(&[u8]) -> Result<ExpandedAppStateKeys, AppStateError>,
+    F: FnMut(&[u8]) -> Result<Arc<ExpandedAppStateKeys>, AppStateError>,
 {
     let version = snapshot
         .version
@@ -167,7 +168,7 @@ pub fn process_patch<F, G>(
     collection_name: &str,
 ) -> Result<PatchProcessingResult, AppStateError>
 where
-    F: FnMut(&[u8]) -> Result<ExpandedAppStateKeys, AppStateError>,
+    F: FnMut(&[u8]) -> Result<Arc<ExpandedAppStateKeys>, AppStateError>,
     G: FnMut(&[u8]) -> Result<Option<Vec<u8>>, AppStateError>,
 {
     // Capture original state before modification - needed for MAC validation logic
@@ -465,7 +466,7 @@ mod tests {
             ..Default::default()
         };
 
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
 
         let mut state = HashState::default();
         let result = process_snapshot(&snapshot, &mut state, get_keys, false, "regular")
@@ -517,7 +518,7 @@ mod tests {
             ..Default::default()
         };
 
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| Ok(None);
 
         let mut state = HashState::default();
@@ -571,7 +572,7 @@ mod tests {
             ..Default::default()
         };
 
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let mut snapshot_state = HashState::default();
         let snapshot_result =
             process_snapshot(&snapshot, &mut snapshot_state, get_keys, false, "regular")
@@ -598,7 +599,7 @@ mod tests {
             ..Default::default()
         };
 
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         // Return the previous value MAC when asked
         let get_prev = |idx: &[u8]| {
             if idx == index_mac.as_slice() {
@@ -702,7 +703,7 @@ mod tests {
             ..Default::default()
         };
 
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| Ok(None);
 
         // Fresh state -> had_no_prior_state skips version/MAC checks.
@@ -786,7 +787,7 @@ mod tests {
             ..Default::default()
         };
 
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| Ok(None);
 
         let mut state = HashState::default();
@@ -848,7 +849,7 @@ mod tests {
             ..Default::default()
         };
 
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| -> Result<Option<Vec<u8>>, AppStateError> { Ok(None) };
 
         let err = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
@@ -902,7 +903,7 @@ mod tests {
             ..Default::default()
         };
 
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| -> Result<Option<Vec<u8>>, AppStateError> { Ok(None) };
 
         let err = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
@@ -955,7 +956,7 @@ mod tests {
             ..Default::default()
         };
 
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| -> Result<Option<Vec<u8>>, AppStateError> { Ok(None) };
 
         let result = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
@@ -997,7 +998,7 @@ mod tests {
             ..Default::default()
         };
 
-        let get_keys = |_: &[u8]| Ok(keys.clone());
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| -> Result<Option<Vec<u8>>, AppStateError> { Ok(None) };
 
         let result = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
