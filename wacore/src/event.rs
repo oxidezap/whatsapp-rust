@@ -3,13 +3,14 @@
 //! Thin wrapper over [`secret_enc_addon`] specialised for the
 //! `EventResponseMessage` proto and the `"Event Response"` use-case.
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use prost::Message;
 use waproto::whatsapp::message::EventResponseMessage;
 
 use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
 
 const GCM_IV_SIZE: usize = 12;
+const MESSAGE_SECRET_SIZE: usize = 32;
 
 fn event_response_addon_ctx<'a>(
     stanza_id: &'a str,
@@ -33,6 +34,11 @@ pub fn encrypt_event_response_with_secret(
     event_creator_jid: &str,
     responder_jid: &str,
 ) -> Result<(Vec<u8>, [u8; GCM_IV_SIZE])> {
+    ensure!(
+        message_secret.len() == MESSAGE_SECRET_SIZE,
+        "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
+        message_secret.len()
+    );
     let plaintext = response.encode_to_vec();
     encrypt_addon(
         &plaintext,
@@ -53,6 +59,12 @@ pub fn decrypt_event_response_with_secret(
     event_creator_jid: &str,
     responder_jid: &str,
 ) -> Result<EventResponseMessage> {
+    // The IV length is validated downstream by decrypt_addon (try_into [u8; 12]).
+    ensure!(
+        message_secret.len() == MESSAGE_SECRET_SIZE,
+        "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
+        message_secret.len()
+    );
     let plaintext = decrypt_addon(
         enc_payload,
         iv,
