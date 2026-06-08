@@ -50,7 +50,7 @@ fn spawn_qr_autoresponder_http(
                     url: url.clone(),
                     method: "POST".into(),
                     headers: HashMap::new(),
-                    body: Some(code.as_bytes().to_vec()),
+                    body: Some(code.as_bytes().to_vec().into()),
                 };
                 match http.execute(req).await {
                     Ok(resp) if (200..300).contains(&resp.status_code) => return,
