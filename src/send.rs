@@ -142,6 +142,23 @@ fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>, Option<No
     {
         meta = meta.attr("event_type", "edit");
         has_attr = true;
+    } else if let Some(ml) = msg
+        .protocol_message
+        .as_ref()
+        .and_then(|pm| pm.member_label.as_ref())
+    {
+        // genMetaNode (MsgMetaNode `d`/`p`): a member_label protocol message carries
+        // appdata="member_tag" and tag_reason="user_delete" when the label is cleared
+        // (empty/absent), "user_update" otherwise.
+        let tag_reason = if ml.label.as_deref().unwrap_or("").is_empty() {
+            "user_delete"
+        } else {
+            "user_update"
+        };
+        meta = meta
+            .attr("appdata", "member_tag")
+            .attr("tag_reason", tag_reason);
+        has_attr = true;
     }
 
     // genMetaNode: `view_once="true"` whenever the media is view-once (wrapper or
@@ -3004,6 +3021,39 @@ mod tests {
             let (edit, node) = infer_stanza_metadata(&wa::Message::default());
             assert!(edit.is_none());
             assert!(node.is_none());
+        }
+
+        #[test]
+        fn member_label_set_returns_member_tag_user_update() {
+            let msg = wacore::send::build_member_label_message("VIP".to_string(), 1_700_000_000);
+            let (_, node) = infer_stanza_metadata(&msg);
+            let node = node.expect("member_label should have meta node");
+            let mut attrs = node.attrs();
+            assert_eq!(
+                attrs.optional_string("appdata").unwrap().as_ref(),
+                "member_tag"
+            );
+            assert_eq!(
+                attrs.optional_string("tag_reason").unwrap().as_ref(),
+                "user_update"
+            );
+        }
+
+        #[test]
+        fn member_label_clear_returns_user_delete() {
+            // Empty label = clearing the tag → tag_reason "user_delete".
+            let msg = wacore::send::build_member_label_message(String::new(), 1_700_000_000);
+            let (_, node) = infer_stanza_metadata(&msg);
+            let node = node.expect("member_label should have meta node");
+            let mut attrs = node.attrs();
+            assert_eq!(
+                attrs.optional_string("appdata").unwrap().as_ref(),
+                "member_tag"
+            );
+            assert_eq!(
+                attrs.optional_string("tag_reason").unwrap().as_ref(),
+                "user_delete"
+            );
         }
 
         #[test]
