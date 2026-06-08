@@ -11,6 +11,11 @@ use wacore_binary::{Jid, JidExt as _};
 
 use wacore_binary::OwnedNodeRef;
 
+/// Max message ids per read/played `<receipt>` stanza. WA Web's
+/// `sendAggregateReceipts` splices ids into chunks of 256 and emits one receipt
+/// per chunk, so a large catch-up doesn't produce one oversized stanza.
+const MAX_RECEIPT_IDS_PER_STANZA: usize = 256;
+
 /// Pure builder for the delivery `<receipt>` node. Extracted so unit tests
 /// can assert wire shape without spinning a transport. Mirrors WA Web's
 /// `Send/DeliveryReceiptJob.js` — the participant gate there is
@@ -508,19 +513,24 @@ impl Client {
             None
         };
 
-        let node = build_read_receipt_node(
-            chat,
-            sender,
-            message_ids,
-            &timestamp,
-            peer_participant_pn.as_ref(),
-        );
-
         debug!(target: "Client/Receipt", "Sending read receipt for {} message(s) to {}", message_ids.len(), chat.observe());
 
-        self.send_node(node)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send read receipt: {}", e))
+        // WA Web's sendAggregateReceipts caps each <receipt> at 256 ids (one <list>
+        // per chunk), so a large catch-up read (post-reconnect / history scroll)
+        // doesn't emit one oversized stanza the server may reject.
+        for chunk in message_ids.chunks(MAX_RECEIPT_IDS_PER_STANZA) {
+            let node = build_read_receipt_node(
+                chat,
+                sender,
+                chunk,
+                &timestamp,
+                peer_participant_pn.as_ref(),
+            );
+            self.send_node(node)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send read receipt: {}", e))?;
+        }
+        Ok(())
     }
 
     /// Marks one or more voice/video notes as played (`<receipt type="played">`).
@@ -542,13 +552,17 @@ impl Client {
         }
 
         let timestamp = wacore::time::now_secs_u64().to_string();
-        let node = build_played_receipt_node(chat, sender, message_ids, &timestamp);
 
         debug!(target: "Client/Receipt", "Sending played receipt for {} message(s) to {}", message_ids.len(), chat.observe());
 
-        self.send_node(node)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send played receipt: {}", e))
+        // Same 256-id cap per stanza as read receipts (WA Web sendAggregateReceipts).
+        for chunk in message_ids.chunks(MAX_RECEIPT_IDS_PER_STANZA) {
+            let node = build_played_receipt_node(chat, sender, chunk, &timestamp);
+            self.send_node(node)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send played receipt: {}", e))?;
+        }
+        Ok(())
     }
 }
 
