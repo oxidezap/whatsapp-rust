@@ -459,6 +459,9 @@ impl<'a> Groups<'a> {
                 );
                 self.client.persist_group_metadata(jid, &info).await;
                 group_cache.insert(jid.clone(), Arc::new(info)).await;
+            } else {
+                // Cache expired: can't patch in place, so drop the now-stale blob.
+                self.client.invalidate_persisted_group_metadata(jid).await;
             }
         }
         Ok(result)
@@ -485,6 +488,9 @@ impl<'a> Groups<'a> {
                 info.remove_participants(&accepted);
                 self.client.persist_group_metadata(jid, &info).await;
                 group_cache.insert(jid.clone(), Arc::new(info)).await;
+            } else {
+                // Cache expired: can't patch in place, so drop the now-stale blob.
+                self.client.invalidate_persisted_group_metadata(jid).await;
             }
             self.client
                 .rotate_sender_key_on_participant_remove(&jid.to_string(), &accepted)
@@ -1022,6 +1028,21 @@ impl Client {
                 }
             }
             Err(e) => log::warn!("Failed to serialize group metadata for {jid}: {e}"),
+        }
+    }
+
+    /// Drop the persisted group metadata on a membership change we can't patch in
+    /// place (the in-memory cache had already expired), so the next query re-fetches
+    /// fresh instead of comparing a now-stale phash. Without this, persisting only on
+    /// a cache hit would miss the exact post-expiry case this fix targets.
+    pub(crate) async fn invalidate_persisted_group_metadata(&self, jid: &Jid) {
+        if let Err(e) = self
+            .persistence_manager
+            .backend()
+            .delete_group_metadata(&jid.to_string())
+            .await
+        {
+            log::warn!("Failed to invalidate persisted group metadata for {jid}: {e}");
         }
     }
 }

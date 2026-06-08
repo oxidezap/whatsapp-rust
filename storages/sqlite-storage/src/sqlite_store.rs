@@ -3670,6 +3670,10 @@ mod tests {
             store.get_group_metadata(jid).await.unwrap().as_deref(),
             Some(&b"blob-v2"[..])
         );
+
+        // Delete drops the blob so the next query re-fetches in full.
+        store.delete_group_metadata(jid).await.unwrap();
+        assert!(store.get_group_metadata(jid).await.unwrap().is_none());
     }
 
     #[tokio::test]

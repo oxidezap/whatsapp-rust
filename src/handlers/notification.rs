@@ -1391,6 +1391,11 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                         "Patched group cache for {}: added {} participants",
                         notification.group_jid.observe(), participants.len()
                     );
+                } else {
+                    // Cache expired: can't patch in place, so drop the now-stale blob.
+                    client
+                        .invalidate_persisted_group_metadata(&notification.group_jid)
+                        .await;
                 }
             }
             GroupNotificationAction::Remove { participants, .. } => {
@@ -1410,6 +1415,11 @@ async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>
                         "Patched group cache for {}: removed {} participants",
                         notification.group_jid.observe(), participants.len()
                     );
+                } else {
+                    // Cache expired: can't patch in place, so drop the now-stale blob.
+                    client
+                        .invalidate_persisted_group_metadata(&notification.group_jid)
+                        .await;
                 }
                 client
                     .rotate_sender_key_on_participant_remove(
