@@ -54,7 +54,7 @@ pub use newsletter::{
     NewsletterReactionCount, NewsletterRole, NewsletterState, NewsletterVerification,
 };
 
-pub use polls::{PollOptionResult, Polls};
+pub use polls::{PollOptionResult, PollVoteCiphertext, Polls};
 
 pub use presence::{Presence, PresenceError, PresenceStatus};
 

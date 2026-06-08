@@ -10,6 +10,8 @@ use waproto::whatsapp as wa;
 use crate::client::Client;
 use crate::send::SendResult;
 
+pub use wacore::poll::PollVoteCiphertext;
+
 #[derive(Debug, Clone)]
 pub struct PollOptionResult {
     pub name: String,
@@ -189,8 +191,7 @@ impl<'a> Polls<'a> {
     /// the LID migration still open. Mirrors WA Web `WAWebAddonEncryption`.
     pub async fn decrypt_vote(
         &self,
-        enc_payload: &[u8],
-        enc_iv: &[u8],
+        ciphertext: poll::PollVoteCiphertext<'_>,
         message_secret: &[u8],
         poll_msg_id: &str,
         poll_creator_jid: &Jid,
@@ -206,8 +207,7 @@ impl<'a> Polls<'a> {
         let fallback = Self::build_fallback(&creator_alt, &voter_alt);
 
         poll::decrypt_poll_vote_with_fallback(
-            enc_payload,
-            enc_iv,
+            ciphertext,
             message_secret,
             poll_msg_id,
             poll::PollVoteAddressing {
@@ -251,7 +251,7 @@ impl<'a> Polls<'a> {
     pub async fn aggregate_votes(
         &self,
         poll_options: &[String],
-        votes: &[(&Jid, &[u8], &[u8])], // (voter_jid, enc_payload, enc_iv)
+        votes: &[(&Jid, poll::PollVoteCiphertext<'_>)],
         message_secret: &[u8],
         poll_msg_id: &str,
         poll_creator_jid: &Jid,
@@ -270,7 +270,7 @@ impl<'a> Polls<'a> {
         // as-received JID for the reported voters list. Last-vote-wins.
         let mut latest_votes: HashMap<String, (String, Vec<Vec<u8>>)> =
             HashMap::with_capacity(votes.len());
-        for (voter_jid, enc_payload, enc_iv) in votes {
+        for (voter_jid, ciphertext) in votes {
             let voter = voter_jid.to_non_ad();
             let voter_str = voter.to_string();
             let voter_alt = self.swapped_user(&voter).await;
@@ -281,8 +281,7 @@ impl<'a> Polls<'a> {
                 voter_alt.clone().unwrap_or_else(|| voter_str.clone())
             };
             match poll::decrypt_poll_vote_with_fallback(
-                enc_payload,
-                enc_iv,
+                *ciphertext,
                 message_secret,
                 poll_msg_id,
                 poll::PollVoteAddressing {
@@ -541,8 +540,10 @@ mod tests {
         let out = client
             .polls()
             .decrypt_vote(
-                &enc,
-                &iv,
+                poll::PollVoteCiphertext {
+                    enc_payload: &enc,
+                    enc_iv: &iv,
+                },
                 &secret,
                 stanza_id,
                 &Jid::lid(creator_lid),
@@ -573,8 +574,10 @@ mod tests {
         let res = client
             .polls()
             .decrypt_vote(
-                &enc,
-                &iv,
+                poll::PollVoteCiphertext {
+                    enc_payload: &enc,
+                    enc_iv: &iv,
+                },
                 &secret,
                 stanza_id,
                 &Jid::lid("111000111000111"),
@@ -615,7 +618,13 @@ mod tests {
         .unwrap();
 
         let voter_lid_jid = Jid::lid(voter_lid);
-        let votes: Vec<(&Jid, &[u8], &[u8])> = vec![(&voter_lid_jid, &enc, &iv)];
+        let votes: Vec<(&Jid, poll::PollVoteCiphertext)> = vec![(
+            &voter_lid_jid,
+            poll::PollVoteCiphertext {
+                enc_payload: &enc,
+                enc_iv: &iv,
+            },
+        )];
 
         let results = client
             .polls()
@@ -672,9 +681,21 @@ mod tests {
 
         let voter_pn_jid = Jid::pn(voter_pn);
         let voter_lid_jid = Jid::lid(voter_lid);
-        let votes: Vec<(&Jid, &[u8], &[u8])> = vec![
-            (&voter_pn_jid, &enc_pn, &iv_pn),
-            (&voter_lid_jid, &enc_lid, &iv_lid),
+        let votes: Vec<(&Jid, poll::PollVoteCiphertext)> = vec![
+            (
+                &voter_pn_jid,
+                poll::PollVoteCiphertext {
+                    enc_payload: &enc_pn,
+                    enc_iv: &iv_pn,
+                },
+            ),
+            (
+                &voter_lid_jid,
+                poll::PollVoteCiphertext {
+                    enc_payload: &enc_lid,
+                    enc_iv: &iv_lid,
+                },
+            ),
         ];
 
         let results = client
@@ -731,9 +752,21 @@ mod tests {
 
         let voter_pn_jid = Jid::pn(voter_pn);
         let voter_lid_jid = Jid::lid(voter_lid);
-        let votes: Vec<(&Jid, &[u8], &[u8])> = vec![
-            (&voter_pn_jid, &enc_pn, &iv_pn),
-            (&voter_lid_jid, &enc_clear, &iv_clear),
+        let votes: Vec<(&Jid, poll::PollVoteCiphertext)> = vec![
+            (
+                &voter_pn_jid,
+                poll::PollVoteCiphertext {
+                    enc_payload: &enc_pn,
+                    enc_iv: &iv_pn,
+                },
+            ),
+            (
+                &voter_lid_jid,
+                poll::PollVoteCiphertext {
+                    enc_payload: &enc_clear,
+                    enc_iv: &iv_clear,
+                },
+            ),
         ];
 
         let results = client
