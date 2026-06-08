@@ -10,7 +10,7 @@ use crate::hash::{HashState, generate_patch_mac};
 use crate::keys::ExpandedAppStateKeys;
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use waproto::whatsapp as wa;
 
@@ -246,6 +246,14 @@ where
         )?;
     }
 
+    // Anti-tampering parity: a repeated index within the same operation of one patch
+    // is fatal in WA Web (validateNoSameIndexForMultipleMutations -> SyncdFatalError),
+    // and the cryptographic patch/snapshot MACs above don't catch it (a duplicate-index
+    // patch still MACs correctly). Runs only on the validated inbound path.
+    if validate_macs {
+        detect_duplicate_index_in_patch(&patch.mutations)?;
+    }
+
     // Decode all mutations and collect MACs in a single pass
     let mut mutations = Vec::with_capacity(patch.mutations.len());
     let mut added_macs = Vec::with_capacity(patch.mutations.len());
@@ -287,6 +295,34 @@ where
         added_macs,
         removed_index_macs,
     })
+}
+
+/// Reject a patch that repeats an index within the same operation.
+///
+/// Mirrors WA Web `WAWebSyncdValidateMutations.validateNoSameIndexForMultipleMutations`,
+/// which keeps one Set per operation (SET, REMOVE) and throws a fatal
+/// `SAME_INDEX_FOR_MULTIPLE_MUTATIONS_IN_PATCH` when an index reappears in the same one.
+/// WA Web keys on the decrypted index; the raw index_mac blob is a deterministic
+/// function of that index, so keying on it is equivalent for detection.
+fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<(), AppStateError> {
+    let mut seen_set: HashSet<&[u8]> = HashSet::new();
+    let mut seen_remove: HashSet<&[u8]> = HashSet::new();
+    for m in mutations {
+        let Some(rec) = &m.record else { continue };
+        let Some(index_mac) = rec.index.as_ref().and_then(|i| i.blob.as_deref()) else {
+            continue;
+        };
+        let op = wa::syncd_mutation::SyncdOperation::try_from(m.operation.unwrap_or(0))
+            .unwrap_or(wa::syncd_mutation::SyncdOperation::Set);
+        let seen = match op {
+            wa::syncd_mutation::SyncdOperation::Set => &mut seen_set,
+            wa::syncd_mutation::SyncdOperation::Remove => &mut seen_remove,
+        };
+        if !seen.insert(index_mac) {
+            return Err(AppStateError::DuplicateIndexInPatch);
+        }
+    }
+    Ok(())
 }
 
 /// Validate the snapshot and patch MACs for a patch.
@@ -597,6 +633,121 @@ mod tests {
             result.added_macs[0].value_mac
         );
         assert!(result.removed_index_macs.is_empty());
+    }
+
+    #[test]
+    fn process_patch_rejects_duplicate_set_index() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+        let index_mac = vec![1u8; 32];
+
+        // Two SET mutations colliding on the same index within one patch.
+        let mk = |ts| wa::SyncdMutation {
+            operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
+            record: Some(create_encrypted_record(
+                wa::syncd_mutation::SyncdOperation::Set,
+                &index_mac,
+                &keys,
+                &key_id,
+                ts,
+            )),
+        };
+        let patch = wa::SyncdPatch {
+            version: Some(wa::SyncdVersion { version: Some(1) }),
+            mutations: vec![mk(1), mk(2)],
+            key_id: Some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
+        let get_prev = |_: &[u8]| Ok(None);
+        let mut state = HashState::default();
+        let err = process_patch(&patch, &mut state, get_keys, get_prev, true, "regular")
+            .expect_err("duplicate SET index must be rejected when validating");
+        assert!(matches!(err, AppStateError::DuplicateIndexInPatch));
+    }
+
+    #[test]
+    fn process_patch_allows_same_index_across_set_and_remove() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+        let index_mac = vec![2u8; 32];
+
+        // SET and REMOVE share an index legitimately: WA Web tracks the two
+        // operations in separate sets, so this is not tampering.
+        let set = wa::SyncdMutation {
+            operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
+            record: Some(create_encrypted_record(
+                wa::syncd_mutation::SyncdOperation::Set,
+                &index_mac,
+                &keys,
+                &key_id,
+                1,
+            )),
+        };
+        let remove = wa::SyncdMutation {
+            operation: Some(wa::syncd_mutation::SyncdOperation::Remove as i32),
+            record: Some(create_encrypted_record(
+                wa::syncd_mutation::SyncdOperation::Remove,
+                &index_mac,
+                &keys,
+                &key_id,
+                2,
+            )),
+        };
+        let patch = wa::SyncdPatch {
+            version: Some(wa::SyncdVersion { version: Some(1) }),
+            mutations: vec![set, remove],
+            key_id: Some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
+        let get_prev = |_: &[u8]| Ok(None);
+        let mut state = HashState::default();
+        let result = process_patch(&patch, &mut state, get_keys, get_prev, true, "regular");
+        assert!(
+            result.is_ok(),
+            "SET+REMOVE on the same index must be allowed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn process_patch_allows_distinct_indices_when_validating() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"test_key_id".to_vec();
+
+        let mk = |index: &[u8], ts| wa::SyncdMutation {
+            operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
+            record: Some(create_encrypted_record(
+                wa::syncd_mutation::SyncdOperation::Set,
+                index,
+                &keys,
+                &key_id,
+                ts,
+            )),
+        };
+        let patch = wa::SyncdPatch {
+            version: Some(wa::SyncdVersion { version: Some(1) }),
+            mutations: vec![mk(&[3u8; 32], 1), mk(&[4u8; 32], 2)],
+            key_id: Some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+
+        let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
+        let get_prev = |_: &[u8]| Ok(None);
+        let mut state = HashState::default();
+        let result = process_patch(&patch, &mut state, get_keys, get_prev, true, "regular");
+        assert!(result.is_ok(), "distinct indices must pass: {result:?}");
     }
 
     #[test]
