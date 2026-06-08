@@ -45,6 +45,22 @@ fn classify_keepalive_error(e: &IqError) -> KeepaliveResult {
     }
 }
 
+/// Whether a keepalive ping error is just collateral of a teardown already
+/// being handled elsewhere (the connection is gone, so the ping had nowhere to
+/// go) rather than a genuine failure the keepalive surfaced first.
+///
+/// Used ONLY to pick the log level. It must stay narrower than the
+/// `FatalFailure` set: Socket/EncryptSend/ClientState/EncodeError are also
+/// fatal for control flow, but they mean the socket or send pipeline broke
+/// while we still believed we were connected — a real failure that the
+/// keepalive may be the first (or only) thing to observe, so it must stay loud.
+fn is_benign_teardown(e: &IqError) -> bool {
+    matches!(
+        e,
+        IqError::NotConnected | IqError::Disconnected(_) | IqError::InternalChannelClosed
+    )
+}
+
 impl Client {
     /// Sends a keepalive ping and updates the server time offset from
     /// the pong's `t` attribute using RTT-adjusted midpoint calculation.
@@ -90,18 +106,16 @@ impl Client {
             }
             Err(e) => {
                 let result = classify_keepalive_error(&e);
-                // A fatal-classified error means the connection is already gone
-                // (e.g. NotConnected): the disconnect is being handled elsewhere, so
-                // this ping failure is benign teardown collateral, not a keepalive
-                // problem. A transient failure (timeout, unexpected server response)
-                // is a real keepalive issue and stays loud.
-                match result {
-                    KeepaliveResult::FatalFailure => {
-                        debug!(target: "Client/Keepalive", "Keepalive skipped, connection already closing: {e:?}");
-                    }
-                    KeepaliveResult::TransientFailure | KeepaliveResult::Ok => {
-                        warn!(target: "Client/Keepalive", "Keepalive ping failed: {e:?}");
-                    }
+                // Log level is keyed on benign-teardown, NOT on FatalFailure: only
+                // an already-gone connection (NotConnected/Disconnected/channel
+                // closed, handled elsewhere) is quiet collateral. A broken
+                // socket/send pipeline is also fatal for control flow but is a real
+                // failure the keepalive may see first, so it stays loud — as do all
+                // transient failures.
+                if is_benign_teardown(&e) {
+                    debug!(target: "Client/Keepalive", "Keepalive skipped, connection already closing: {e:?}");
+                } else {
+                    warn!(target: "Client/Keepalive", "Keepalive ping failed: {e:?}");
                 }
                 result
             }
@@ -259,7 +273,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::socket::error::SocketError;
+    use crate::socket::error::{EncryptSendError, SocketError};
     use wacore_binary::builder::NodeBuilder;
 
     #[test]
@@ -325,6 +339,44 @@ mod tests {
             KeepaliveResult::TransientFailure,
             "ParseError should be transient — bad response, not a dead connection"
         );
+    }
+
+    // Happy path: the connection was already gone, so a failed ping is just
+    // teardown collateral and is logged quietly.
+    #[test]
+    fn benign_teardown_errors_are_quiet() {
+        assert!(is_benign_teardown(&IqError::NotConnected));
+        assert!(is_benign_teardown(&IqError::InternalChannelClosed));
+        let node = NodeBuilder::new("disconnect").build();
+        assert!(is_benign_teardown(&IqError::Disconnected(node)));
+    }
+
+    // Bad path: a broken socket/send pipeline or an encode failure is fatal for
+    // control flow but is a REAL failure (we still thought we were connected), so
+    // it must NOT be treated as benign — it has to stay loud. Transient failures
+    // stay loud too. This is the guard against the keepalive ping silently
+    // swallowing the first sign of a real connection/send break.
+    #[test]
+    fn real_failures_are_never_treated_as_benign() {
+        assert!(!is_benign_teardown(&IqError::Socket(
+            SocketError::SocketClosed
+        )));
+        assert!(!is_benign_teardown(&IqError::EncryptSend(
+            EncryptSendError::transport(anyhow::anyhow!("broken pipe"))
+        )));
+        assert!(!is_benign_teardown(&IqError::EncodeError(anyhow::anyhow!(
+            "encode failed"
+        ))));
+        assert!(!is_benign_teardown(&IqError::Timeout));
+        assert!(!is_benign_teardown(&IqError::ParseError(anyhow::anyhow!(
+            "bad response"
+        ))));
+        assert!(!is_benign_teardown(&IqError::ServerError {
+            code: 500,
+            text: "internal".to_string(),
+            error_type: None,
+            backoff: None,
+        }));
     }
 
     // ms_since, is_dead_socket, and constants tests live in wacore::protocol::keepalive

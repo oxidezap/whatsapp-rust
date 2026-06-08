@@ -138,12 +138,12 @@ impl Client {
                                 }
                             }
                             // Event channel closed (no DisconnectReason available) — the
-                            // transport task ended. Reconnect-equivalent, so info (not a
-                            // silent debug): no reason means we can't prove it was clean,
-                            // but it's also not a transport read error.
+                            // transport task ended without reporting why. No reason means we
+                            // can't prove it was a clean recycle, so it stays loud (WARN),
+                            // matching the conservative `Unknown` rule in is_clean_shutdown.
                             Err(_) => {
                                 if !self.expected_disconnect.load(Ordering::Relaxed) {
-                                    info!("Transport event channel closed; reconnecting.");
+                                    warn!("Transport event channel closed; reconnecting.");
                                     return Err(anyhow::anyhow!("Transport event channel closed"));
                                 } else {
                                     return Ok(());
