@@ -348,6 +348,16 @@ fn build_member_label_message_preserves_unicode() {
     assert_eq!(ml.label.as_deref(), Some("🚀 BOT"));
 }
 
+/// Probe installed by chain-lock tests: records whether the sender-key chain
+/// lock was held while `fetch_prekeys_for_identity_check` ran (it must not be
+/// — the fetch is network I/O hoisted out of the chain critical section).
+#[derive(Clone, Default)]
+struct ChainLockProbe {
+    lock: std::sync::Arc<async_lock::Mutex<()>>,
+    fetched_under_lock: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fetch_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
 /// Mock implementation of SendContextResolver for testing
 struct MockSendContextResolver {
     /// Pre-key bundles to return: JID -> Option<PreKeyBundle>
@@ -358,6 +368,7 @@ struct MockSendContextResolver {
     phone_to_lid: HashMap<String, String>,
     /// JIDs reported via `on_local_identity_change` (send-path detection).
     identity_changes: std::sync::Mutex<Vec<Jid>>,
+    chain_lock_probe: Option<ChainLockProbe>,
 }
 
 impl MockSendContextResolver {
@@ -367,7 +378,13 @@ impl MockSendContextResolver {
             devices: Vec::new(),
             phone_to_lid: HashMap::new(),
             identity_changes: std::sync::Mutex::new(Vec::new()),
+            chain_lock_probe: None,
         }
+    }
+
+    fn with_chain_lock_probe(mut self, probe: ChainLockProbe) -> Self {
+        self.chain_lock_probe = Some(probe);
+        self
     }
 
     fn captured_identity_changes(&self) -> Vec<Jid> {
@@ -417,6 +434,16 @@ impl SendContextResolver for MockSendContextResolver {
         &self,
         jids: &[Jid],
     ) -> Result<HashMap<Jid, PreKeyBundle>> {
+        if let Some(probe) = &self.chain_lock_probe {
+            probe
+                .fetch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if probe.lock.try_lock().is_none() {
+                probe
+                    .fetched_under_lock
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         let mut result = HashMap::new();
         for jid in jids {
             if let Some(bundle_opt) = self.prekey_bundles.get(jid)
@@ -2706,8 +2733,12 @@ mod mark_full_distribution_list {
 
     type SigResult<T> = crate::libsignal::protocol::error::Result<T>;
 
+    // Clones share state (Arc), mirroring production stores: the encrypt
+    // fan-out spawns tasks over store clones and their writes must be
+    // visible to the original ("the shared cache provides interior
+    // mutability").
     #[derive(Clone, Default)]
-    struct MemSessionStore(HashMap<ProtocolAddress, Vec<u8>>);
+    struct MemSessionStore(std::sync::Arc<std::sync::Mutex<HashMap<ProtocolAddress, Vec<u8>>>>);
     #[async_trait::async_trait]
     impl SessionStore for MemSessionStore {
         async fn load_session(
@@ -2716,18 +2747,20 @@ mod mark_full_distribution_list {
         ) -> SigResult<Option<crate::libsignal::protocol::SessionRecord>> {
             Ok(self
                 .0
+                .lock()
+                .unwrap()
                 .get(a)
                 .and_then(|b| crate::libsignal::protocol::SessionRecord::deserialize(b).ok()))
         }
         async fn has_session(&self, a: &ProtocolAddress) -> SigResult<bool> {
-            Ok(self.0.contains_key(a))
+            Ok(self.0.lock().unwrap().contains_key(a))
         }
         async fn store_session(
             &mut self,
             a: &ProtocolAddress,
             r: crate::libsignal::protocol::SessionRecord,
         ) -> SigResult<()> {
-            self.0.insert(a.clone(), r.serialize()?);
+            self.0.lock().unwrap().insert(a.clone(), r.serialize()?);
             Ok(())
         }
     }
@@ -2736,7 +2769,7 @@ mod mark_full_distribution_list {
     struct MemIdentityStore {
         pair: IdentityKeyPair,
         reg_id: u32,
-        known: HashMap<ProtocolAddress, IdentityKey>,
+        known: std::sync::Arc<std::sync::Mutex<HashMap<ProtocolAddress, IdentityKey>>>,
     }
     #[async_trait::async_trait]
     impl IdentityKeyStore for MemIdentityStore {
@@ -2751,7 +2784,7 @@ mod mark_full_distribution_list {
             a: &ProtocolAddress,
             id: &IdentityKey,
         ) -> SigResult<IdentityChange> {
-            self.known.insert(a.clone(), *id);
+            self.known.lock().unwrap().insert(a.clone(), *id);
             Ok(IdentityChange::from_changed(false))
         }
         async fn is_trusted_identity(
@@ -2763,12 +2796,17 @@ mod mark_full_distribution_list {
             Ok(true)
         }
         async fn get_identity(&self, a: &ProtocolAddress) -> SigResult<Option<IdentityKey>> {
-            Ok(self.known.get(a).copied())
+            Ok(self.known.lock().unwrap().get(a).copied())
         }
     }
 
     #[derive(Default)]
-    struct MemSenderKeyStore(HashMap<SenderKeyName, SenderKeyRecord>);
+    struct MemSenderKeyStore {
+        records: HashMap<SenderKeyName, SenderKeyRecord>,
+        // Shared per-name locks (like production stores override it), so tests
+        // can observe whether the chain lock is held during resolver calls.
+        locks: std::sync::Mutex<HashMap<SenderKeyName, std::sync::Arc<async_lock::Mutex<()>>>>,
+    }
     #[async_trait::async_trait]
     impl SenderKeyStore for MemSenderKeyStore {
         async fn store_sender_key(
@@ -2776,11 +2814,22 @@ mod mark_full_distribution_list {
             n: &SenderKeyName,
             r: SenderKeyRecord,
         ) -> SigResult<()> {
-            self.0.insert(n.clone(), r);
+            self.records.insert(n.clone(), r);
             Ok(())
         }
         async fn load_sender_key(&self, n: &SenderKeyName) -> SigResult<Option<SenderKeyRecord>> {
-            Ok(self.0.get(n).cloned())
+            Ok(self.records.get(n).cloned())
+        }
+        async fn sender_key_lock(
+            &self,
+            n: &SenderKeyName,
+        ) -> std::sync::Arc<async_lock::Mutex<()>> {
+            self.locks
+                .lock()
+                .unwrap()
+                .entry(n.clone())
+                .or_default()
+                .clone()
         }
     }
 
@@ -2866,7 +2915,7 @@ mod mark_full_distribution_list {
         let mut is = MemIdentityStore {
             pair: sender,
             reg_id: 42,
-            known: HashMap::new(),
+            known: Default::default(),
         };
         process_prekey_bundle(
             &a.to_protocol_address(),
@@ -2962,6 +3011,118 @@ mod mark_full_distribution_list {
         assert!(
             prepared.node.attrs().optional_string("phash").is_some(),
             "a key-distributing group send must carry a phash"
+        );
+    }
+
+    /// Regression: the prekey fetch (network RTT) must run BEFORE the
+    /// sender-key chain lock is taken, so concurrent sends to the same group
+    /// don't serialize behind a slow fetch. The probe try_locks the actual
+    /// chain lock from inside the resolver's fetch and records a violation.
+    #[tokio::test]
+    async fn prekey_fetch_runs_outside_chain_lock() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let group: Jid = "120363000000000002@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000000@lid".parse().unwrap();
+        // B has no session but its bundle IS available — forces the prekey
+        // fetch + X3DH path on this send.
+        let b: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let chain_name =
+            crate::types::jid::make_sender_key_name(&group, &own_jid.to_protocol_address());
+        let probe = ChainLockProbe {
+            lock: sks.sender_key_lock(&chain_name).await,
+            ..Default::default()
+        };
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        // Verifiable bundle (create_mock_bundle's zeroed signature fails X3DH).
+        let receiver = IdentityKeyPair::generate(&mut rng);
+        let spk = KeyPair::generate(&mut rng);
+        let opk = KeyPair::generate(&mut rng);
+        let sig = receiver
+            .private_key()
+            .calculate_signature(&spk.public_key.serialize(), &mut rng)
+            .unwrap();
+        let bundle = PreKeyBundle::new(
+            1,
+            1u32.into(),
+            Some((1u32.into(), opk.public_key)),
+            1u32.into(),
+            spk.public_key,
+            sig.to_vec(),
+            *receiver.identity_key(),
+        )
+        .unwrap();
+
+        let resolver = MockSendContextResolver::new()
+            .with_bundle(b.clone(), bundle)
+            .with_chain_lock_probe(probe.clone());
+        let rt = TokioTestRuntime;
+
+        let group_info =
+            GroupInfo::new(vec![own_jid.to_non_ad(), b.to_non_ad()], AddressingMode::Pn);
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_group_stanza(
+            &rt,
+            &mut stores,
+            &resolver,
+            &group_info,
+            &own_jid,
+            &own_lid,
+            None,
+            group,
+            &msg,
+            "TESTREQID2".into(),
+            false,
+            Some(vec![b.clone()]),
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("prepare_group_stanza should succeed");
+
+        assert!(
+            probe.fetch_calls.load(SeqCst) >= 1,
+            "test must exercise the prekey fetch path"
+        );
+        assert!(
+            !probe.fetched_under_lock.load(SeqCst),
+            "prekey fetch must not run under the sender-key chain lock"
+        );
+
+        // End-to-end: the session established before the lock produced a
+        // pairwise SKDM for B under the lock.
+        let participants = prepared
+            .node
+            .get_optional_child("participants")
+            .expect("participants node with the SKDM fan-out");
+        assert_eq!(
+            participants.children().map(|c| c.len()).unwrap_or(0),
+            1,
+            "B must receive a pairwise SKDM via the pre-established session"
         );
     }
 }

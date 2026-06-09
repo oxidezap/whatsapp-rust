@@ -286,9 +286,14 @@ fn push_encrypt_result(
 /// by [`ENCRYPT_FANOUT_CONCURRENCY`]. Each task clones the store handles
 /// (Arc bumps under the hood); the shared cache provides interior mutability.
 ///
+/// Composition of [`ensure_sessions_for_devices`] (network: prekey fetch +
+/// X3DH for missing sessions) and [`encrypt_for_devices_with_sessions`]
+/// (CPU: the pairwise encrypt fan-out). Callers that must not hold a lock
+/// across network I/O (the group sender-key chain lock) call the two phases
+/// directly with the lock taken only around the second.
+///
 /// Callers must hold per-device session locks before calling this function —
 /// concurrent ratchet mutations will corrupt Signal session state.
-#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
 pub async fn encrypt_for_devices<'a, S, I, P, SP>(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'a, S, I, P, SP>,
@@ -298,6 +303,46 @@ pub async fn encrypt_for_devices<'a, S, I, P, SP>(
     hide_decrypt_fail: bool,
     mediatype: Option<&str>,
 ) -> Result<EncryptResult>
+where
+    S: crate::libsignal::protocol::SessionStore + Clone + Send + Sync + 'static,
+    I: crate::libsignal::protocol::IdentityKeyStore + Clone + Send + Sync + 'static,
+    P: crate::libsignal::protocol::PreKeyStore + Send + Sync,
+    SP: crate::libsignal::protocol::SignedPreKeyStore + Send + Sync,
+{
+    let plan = ensure_sessions_for_devices(runtime, stores, resolver, devices).await?;
+    encrypt_for_devices_with_sessions(
+        runtime,
+        stores,
+        devices,
+        plaintext_to_encrypt,
+        hide_decrypt_fail,
+        mediatype,
+        plan,
+    )
+    .await
+}
+
+/// Session material prepared for one encrypt fan-out: per-index LID
+/// encryption overrides (mirroring the `devices` slice it was built from)
+/// plus whether any device 406'd during prekey fetch. Produced only by
+/// [`ensure_sessions_for_devices`]; consumed by
+/// [`encrypt_for_devices_with_sessions`] over the same `devices` slice.
+pub struct SessionPlan {
+    encryption_overrides: Vec<Option<Jid>>,
+    pub had_unregistered_device: bool,
+}
+
+/// Resolve LID overrides and establish missing Signal sessions (prekey
+/// fetch + X3DH) for `devices`. This is the network half of the encrypt
+/// fan-out and touches only session/identity state — never a sender-key
+/// chain — so group sends run it before taking the chain lock.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.ensure_sessions", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
+pub async fn ensure_sessions_for_devices<'a, S, I, P, SP>(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'a, S, I, P, SP>,
+    resolver: &dyn SendContextResolver,
+    devices: &[Jid],
+) -> Result<SessionPlan>
 where
     S: crate::libsignal::protocol::SessionStore + Clone + Send + Sync + 'static,
     I: crate::libsignal::protocol::IdentityKeyStore + Clone + Send + Sync + 'static,
@@ -489,6 +534,44 @@ where
         }
     }
 
+    Ok(SessionPlan {
+        encryption_overrides,
+        had_unregistered_device: had_406,
+    })
+}
+
+/// CPU half of the encrypt fan-out: pairwise-encrypt `plaintext_to_encrypt`
+/// for each device using sessions prepared by [`ensure_sessions_for_devices`]
+/// over the same `devices` slice. No resolver, no network — safe to run
+/// under locks that must not span I/O. A device whose session is still
+/// missing (e.g. its bundle was absent) fails its encrypt and is skipped,
+/// matching the combined path's behavior.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
+pub async fn encrypt_for_devices_with_sessions<'a, S, I, P, SP>(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'a, S, I, P, SP>,
+    devices: &[Jid],
+    plaintext_to_encrypt: &[u8],
+    hide_decrypt_fail: bool,
+    mediatype: Option<&str>,
+    plan: SessionPlan,
+) -> Result<EncryptResult>
+where
+    S: crate::libsignal::protocol::SessionStore + Clone + Send + Sync + 'static,
+    I: crate::libsignal::protocol::IdentityKeyStore + Clone + Send + Sync + 'static,
+    P: crate::libsignal::protocol::PreKeyStore + Send + Sync,
+    SP: crate::libsignal::protocol::SignedPreKeyStore + Send + Sync,
+{
+    debug_assert_eq!(
+        plan.encryption_overrides.len(),
+        devices.len(),
+        "SessionPlan built for a different device list"
+    );
+    let SessionPlan {
+        encryption_overrides,
+        had_unregistered_device,
+    } = plan;
+
     let mut participant_nodes = Vec::with_capacity(devices.len());
     let mut includes_prekey_message = false;
     let mut encrypted_devices = Vec::with_capacity(devices.len());
@@ -502,8 +585,9 @@ where
         // a FuturesUnordered, and two store clones), with no parallelism to gain.
         // Encrypt inline.
         let device_jid = devices[0].clone();
-        let addr = encryption_overrides[0]
-            .as_ref()
+        let addr = encryption_overrides
+            .first()
+            .and_then(|o| o.as_ref())
             .unwrap_or(&devices[0])
             .to_protocol_address();
         let res = encrypt_one_device(
@@ -536,8 +620,9 @@ where
             // The encryption JID is only needed to build the Signal address, so
             // derive it here from a borrow rather than cloning the whole Jid into
             // the task (device_jid is still cloned because it's returned).
-            let addr = encryption_overrides[idx]
-                .as_ref()
+            let addr = encryption_overrides
+                .get(idx)
+                .and_then(|o| o.as_ref())
                 .unwrap_or(&devices[idx])
                 .to_protocol_address();
             let plaintext = plaintext_arc.clone();
@@ -587,6 +672,6 @@ where
         participant_nodes,
         includes_prekey_message,
         encrypted_devices,
-        had_unregistered_device: had_406,
+        had_unregistered_device,
     })
 }
