@@ -260,6 +260,19 @@ impl Client {
                 .remove(&processing_key);
         });
 
+        // A retry from a device missing from our registry signals a stale device
+        // list for this user, so refresh it (rate-limited, dedup'd) to learn the
+        // device for the next send. Done before the message-cache lookup so an
+        // evicted retry still triggers it.
+        let sender_device_id = info.requester.device() as u32;
+        let device_known = self
+            .has_device(&info.requester.user, sender_device_id)
+            .await;
+        if !device_known {
+            self.schedule_unknown_device_sync(info.requester.to_non_ad(), receipt.offline)
+                .await;
+        }
+
         // Peek keeps the message in the cache, so we avoid the decode + re-encode
         // and the background DB delete + re-store that take + re-add did on every
         // retry (pure churn during retry storms). Fall back to the consuming take +
@@ -306,11 +319,7 @@ impl Client {
             self.resolve_encryption_jid(&info.requester).await
         };
 
-        let sender_device_id = info.requester.device() as u32;
         let keys_node_present = nr.get_optional_child("keys").is_some();
-        let device_known = self
-            .has_device(&info.requester.user, sender_device_id)
-            .await;
         if wacore::protocol::retry::should_drop_unknown_device_retry(
             keys_node_present,
             device_known,
