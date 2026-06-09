@@ -2942,8 +2942,8 @@ mod tests {
         client
             .lid_pn_cache
             .add(&wacore::types::lid_pn::LidPnEntry {
-                lid: lid_jid.user.to_string(),
-                phone_number: pn_jid.user.to_string(),
+                lid: lid_jid.user.as_str().into(),
+                phone_number: pn_jid.user.as_str().into(),
                 created_at: 0,
                 learning_source: wacore::types::lid_pn::LearningSource::Usync,
             })
@@ -2991,8 +2991,8 @@ mod tests {
         client
             .lid_pn_cache
             .add(&wacore::types::lid_pn::LidPnEntry {
-                lid: lid_jid.user.to_string(),
-                phone_number: pn_jid.user.to_string(),
+                lid: lid_jid.user.as_str().into(),
+                phone_number: pn_jid.user.as_str().into(),
                 created_at: 0,
                 learning_source: wacore::types::lid_pn::LearningSource::Usync,
             })
@@ -3059,8 +3059,8 @@ mod tests {
         client
             .lid_pn_cache
             .add(&wacore::types::lid_pn::LidPnEntry {
-                lid: lid_jid.user.to_string(),
-                phone_number: pn_jid.user.to_string(),
+                lid: lid_jid.user.as_str().into(),
+                phone_number: pn_jid.user.as_str().into(),
                 created_at: 0,
                 learning_source: wacore::types::lid_pn::LearningSource::Usync,
             })
@@ -3157,8 +3157,8 @@ mod tests {
         client
             .lid_pn_cache
             .add(&wacore::types::lid_pn::LidPnEntry {
-                lid: lid_jid.user.to_string(),
-                phone_number: pn_jid.user.to_string(),
+                lid: lid_jid.user.as_str().into(),
+                phone_number: pn_jid.user.as_str().into(),
                 created_at: 0,
                 learning_source: wacore::types::lid_pn::LearningSource::Usync,
             })

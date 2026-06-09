@@ -39,10 +39,13 @@ const NS_PN: &str = "lid_pn_by_pn";
 /// The cache is thread-safe and can be shared across async tasks.
 pub struct LidPnCache {
     /// LID -> Entry mapping. `Arc` so the hot `get_*` lookups clone a refcount,
-    /// not the entry's two `String`s; only the owned-`LidPnEntry` accessors deep-clone.
-    lid_to_entry: TypedCache<String, Arc<LidPnEntry>>,
+    /// not the entry's strings; only the owned-`LidPnEntry` accessors deep-clone.
+    /// Keys are `Arc<str>` sharing the entry's own allocations — each identifier
+    /// is stored once per mapping, not once as key and again inside the entry
+    /// (this cache is unbounded by design, so per-entry bytes compound).
+    lid_to_entry: TypedCache<Arc<str>, Arc<LidPnEntry>>,
     /// Phone number -> Entry mapping (stores the most recent LID for that PN)
-    pn_to_entry: TypedCache<String, Arc<LidPnEntry>>,
+    pn_to_entry: TypedCache<Arc<str>, Arc<LidPnEntry>>,
     /// PN -> the LID this process durably persisted for it. Lets the learn hot
     /// path skip a re-persist without swallowing the first live persist of a
     /// mapping an offline replay only warmed in memory. Keyed by the pair so a
@@ -50,7 +53,7 @@ pub struct LidPnCache {
     /// LID, never a newer un-persisted one. `Arc<str>` value: the hot-path check
     /// clones a refcount and compares in place, no payload copy. In-memory only;
     /// cold after restart just replays the idempotent upsert.
-    persisted: TypedCache<String, Arc<str>>,
+    persisted: TypedCache<Arc<str>, Arc<str>>,
 }
 
 impl Default for LidPnCache {
@@ -109,7 +112,7 @@ impl LidPnCache {
         self.pn_to_entry
             .get(phone)
             .await
-            .map(|e| e.lid.as_str().into())
+            .map(|e| CompactString::from(&*e.lid))
     }
 
     /// Whether the learn fast path can skip re-recording `phone <-> lid`: the
@@ -125,12 +128,12 @@ impl LidPnCache {
                 .pn_to_entry
                 .get(phone)
                 .await
-                .is_some_and(|e| e.lid == lid)
+                .is_some_and(|e| &*e.lid == lid)
             && self
                 .lid_to_entry
                 .get(lid)
                 .await
-                .is_some_and(|e| e.phone_number == phone)
+                .is_some_and(|e| &*e.phone_number == phone)
     }
 
     /// Get the phone number for a LID.
@@ -140,7 +143,7 @@ impl LidPnCache {
         self.lid_to_entry
             .get(lid)
             .await
-            .map(|e| e.phone_number.clone())
+            .map(|e| e.phone_number.to_string())
     }
 
     /// Get the full entry for a LID.
@@ -164,21 +167,22 @@ impl LidPnCache {
     /// number can race. This is acceptable because the cache is best-effort
     /// and backed by persistent storage for correctness.
     pub async fn add(&self, entry: &LidPnEntry) {
-        let should_update_pn = match self.pn_to_entry.get(entry.phone_number.as_str()).await {
+        let should_update_pn = match self.pn_to_entry.get(&*entry.phone_number).await {
             Some(existing) => existing.created_at <= entry.created_at,
             None => true,
         };
 
-        // One heap copy of the entry, shared by both maps via the Arc refcount.
+        // One shared copy of the entry; the keys clone the entry's own
+        // Arc<str> allocations, so each identifier lives once per mapping.
         let shared = Arc::new(entry.clone());
         self.lid_to_entry
-            .insert(entry.lid.clone(), Arc::clone(&shared))
+            .insert(shared.lid.clone(), Arc::clone(&shared))
             .await;
 
         // Update PN -> Entry map (only if newer or equal timestamp)
         if should_update_pn {
             self.pn_to_entry
-                .insert(entry.phone_number.clone(), shared)
+                .insert(shared.phone_number.clone(), shared)
                 .await;
         }
     }
@@ -195,7 +199,7 @@ impl LidPnCache {
 
     pub(crate) async fn mark_persisted(&self, phone: &str, lid: &str) {
         self.persisted
-            .insert(phone.to_string(), Arc::from(lid))
+            .insert(Arc::from(phone), Arc::from(lid))
             .await;
     }
 

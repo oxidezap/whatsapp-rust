@@ -761,8 +761,8 @@ async fn test_query_info_populates_lid_pn_cache_for_participants() -> anyhow::Re
         .get_lid_pn_entry(&jid_b_lid)
         .await?
         .expect("lid_pn_cache must have B's mapping after query_info");
-    assert_eq!(entry.lid, jid_b_lid.user);
-    assert_eq!(entry.phone_number, jid_b_pn.user);
+    assert_eq!(&*entry.lid, jid_b_lid.user.as_str());
+    assert_eq!(&*entry.phone_number, jid_b_pn.user.as_str());
 
     client_a.disconnect().await;
     client_b.disconnect().await;

@@ -39,9 +39,9 @@ impl<'a> Blocking<'a> {
                 ))
             })?;
         Ok(if bare.is_lid() {
-            (bare, Jid::pn(entry.phone_number))
+            (bare, Jid::pn(&*entry.phone_number))
         } else {
-            (Jid::lid(entry.lid), bare)
+            (Jid::lid(&*entry.lid), bare)
         })
     }
 
@@ -93,8 +93,8 @@ impl<'a> Blocking<'a> {
         let mapping = self.client.get_lid_pn_entry(&bare).await?;
         let mut users: Vec<&str> = vec![bare.user.as_str()];
         if let Some(entry) = mapping.as_ref() {
-            users.push(entry.lid.as_str());
-            users.push(entry.phone_number.as_str());
+            users.push(&*entry.lid);
+            users.push(&*entry.phone_number);
         }
 
         Ok(blocklist_contains(&blocklist, &users))

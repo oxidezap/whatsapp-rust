@@ -11,6 +11,8 @@
 //! When multiple LIDs exist for the same phone number (rare), the most recent one
 //! (by `created_at` timestamp) is considered "current".
 
+use std::sync::Arc;
+
 /// The source from which a LID-PN mapping was learned.
 /// Different sources have different trust levels and handling for identity changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
@@ -61,10 +63,13 @@ impl LearningSource {
 /// An entry in the LID-PN cache containing the full mapping information.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LidPnEntry {
-    /// The LID user part (e.g., "100000012345678")
-    pub lid: String,
+    /// The LID user part (e.g., "100000012345678").
+    /// `Arc<str>`: the cache stores each mapping under both directions, so the
+    /// identifier strings are shared between the entry and the cache keys
+    /// instead of re-allocated per copy (this cache is unbounded by design).
+    pub lid: Arc<str>,
     /// The phone number user part (e.g., "559980000001")
-    pub phone_number: String,
+    pub phone_number: Arc<str>,
     /// Unix timestamp when the mapping was first learned
     pub created_at: i64,
     /// The source from which this mapping was learned
@@ -73,12 +78,16 @@ pub struct LidPnEntry {
 
 impl LidPnEntry {
     /// Create a new entry with the current timestamp
-    pub fn new(lid: String, phone_number: String, learning_source: LearningSource) -> Self {
+    pub fn new(
+        lid: impl Into<Arc<str>>,
+        phone_number: impl Into<Arc<str>>,
+        learning_source: LearningSource,
+    ) -> Self {
         let now = crate::time::now_secs();
 
         Self {
-            lid,
-            phone_number,
+            lid: lid.into(),
+            phone_number: phone_number.into(),
             created_at: now,
             learning_source,
         }
@@ -86,14 +95,14 @@ impl LidPnEntry {
 
     /// Create an entry with a specific timestamp
     pub fn with_timestamp(
-        lid: String,
-        phone_number: String,
+        lid: impl Into<Arc<str>>,
+        phone_number: impl Into<Arc<str>>,
         created_at: i64,
         learning_source: LearningSource,
     ) -> Self {
         Self {
-            lid,
-            phone_number,
+            lid: lid.into(),
+            phone_number: phone_number.into(),
             created_at,
             learning_source,
         }
@@ -137,8 +146,8 @@ mod tests {
             LearningSource::Usync,
         );
 
-        assert_eq!(entry.lid, "100000012345678");
-        assert_eq!(entry.phone_number, "559980000001");
+        assert_eq!(&*entry.lid, "100000012345678");
+        assert_eq!(&*entry.phone_number, "559980000001");
         assert_eq!(entry.learning_source, LearningSource::Usync);
         assert!(entry.created_at > 0);
     }
@@ -152,8 +161,8 @@ mod tests {
             LearningSource::Pairing,
         );
 
-        assert_eq!(entry.lid, "100000012345678");
-        assert_eq!(entry.phone_number, "559980000001");
+        assert_eq!(&*entry.lid, "100000012345678");
+        assert_eq!(&*entry.phone_number, "559980000001");
         assert_eq!(entry.created_at, 1234567890);
         assert_eq!(entry.learning_source, LearningSource::Pairing);
     }

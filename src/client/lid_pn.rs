@@ -247,8 +247,8 @@ impl Client {
         use anyhow::anyhow;
 
         let storage_entry = LidPnMappingEntry {
-            lid: entry.lid,
-            phone_number: entry.phone_number,
+            lid: entry.lid.to_string(),
+            phone_number: entry.phone_number.to_string(),
             created_at: entry.created_at,
             updated_at: entry.created_at,
             learning_source: entry.learning_source.as_str().to_string(),
@@ -296,8 +296,8 @@ impl Client {
         let storage: Vec<LidPnMappingEntry> = entries
             .into_iter()
             .map(|entry| LidPnMappingEntry {
-                lid: entry.lid,
-                phone_number: entry.phone_number,
+                lid: entry.lid.to_string(),
+                phone_number: entry.phone_number.to_string(),
                 created_at: entry.created_at,
                 updated_at: entry.created_at,
                 learning_source: entry.learning_source.as_str().to_string(),
@@ -585,7 +585,7 @@ impl Client {
             return None;
         }
         match self.get_lid_pn_entry(jid).await {
-            Ok(Some(entry)) => Some(Jid::new(entry.lid, wacore_binary::Server::Lid)),
+            Ok(Some(entry)) => Some(Jid::new(&*entry.lid, wacore_binary::Server::Lid)),
             Ok(None) => None,
             Err(e) => {
                 log::warn!(
@@ -723,8 +723,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(entry.lid, lid);
-        assert_eq!(entry.phone_number, pn);
+        assert_eq!(&*entry.lid, lid);
+        assert_eq!(&*entry.phone_number, pn);
     }
 
     #[tokio::test]
@@ -751,8 +751,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(entry.lid, lid);
-        assert_eq!(entry.phone_number, pn);
+        assert_eq!(&*entry.lid, lid);
+        assert_eq!(&*entry.phone_number, pn);
     }
 
     /// Cache-aside fallback: if the in-memory cache is missing an entry the
@@ -783,8 +783,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(entry.lid, lid);
-        assert_eq!(entry.phone_number, pn);
+        assert_eq!(&*entry.lid, lid);
+        assert_eq!(&*entry.phone_number, pn);
 
         // Subsequent lookup served from cache.
         let entry = client
@@ -792,7 +792,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(entry.lid, lid);
+        assert_eq!(&*entry.lid, lid);
     }
 
     /// `learn_lid_pn_mapping_fast` must leave the in-memory cache populated
@@ -957,7 +957,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .lid,
-            lid
+            lid.into()
         );
     }
 

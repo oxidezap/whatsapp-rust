@@ -512,7 +512,7 @@ impl Client {
                 .await
                 .ok()
                 .flatten()
-                .map(|e| Jid::new(&e.phone_number, wacore_binary::Server::Pn))
+                .map(|e| Jid::new(&*e.phone_number, wacore_binary::Server::Pn))
         } else {
             None
         };

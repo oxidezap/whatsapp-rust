@@ -364,7 +364,7 @@ impl<'a> Groups<'a> {
                     .ok_or_else(|| {
                         anyhow::anyhow!("Missing phone number mapping for LID {}", participant.jid)
                     })?;
-                participant.with_phone_number(Jid::pn(entry.phone_number))
+                participant.with_phone_number(Jid::pn(&*entry.phone_number))
             } else {
                 participant
             };
