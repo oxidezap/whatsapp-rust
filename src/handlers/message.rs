@@ -7,6 +7,15 @@ use std::sync::Arc;
 /// WA Web: `WAWebMessageQueue` uses `promiseTimeout(r(), 2e4)` per queued handler.
 const MAX_MESSAGE_DELAY_MS: u64 = 20_000;
 
+/// Per-chat queue depth. The deepest legitimate burst is offline resume,
+/// which is server-paced at 200 stanzas per `<offline_batch>` request
+/// (`offline_resume`), so even a backlog landing entirely in one chat stays
+/// a few hundred deep. Each queued entry keeps its decoded frame buffer
+/// alive, so an unbounded queue turns a flood into unbounded memory; above
+/// this depth the enqueue fails, the ack is cancelled, and the server
+/// redelivers the stanza instead.
+const CHAT_LANE_QUEUE_DEPTH: usize = 2048;
+
 /// Handler for `<message>` stanzas.
 ///
 /// Messages are processed sequentially per-chat using a mailbox pattern to prevent
@@ -53,8 +62,10 @@ impl StanzaHandler for MessageHandler {
         let _guard = lane.enqueue_lock.lock().await;
 
         if let Err(e) = lane.queue_tx.try_send(node) {
+            // Full (lane backlogged past CHAT_LANE_QUEUE_DEPTH) or closed
+            // (stale lane racing a disconnect) — either way, cancel the ack
+            // so the server redelivers instead of buffering without bound.
             warn!("Failed to enqueue message for processing: {e}");
-            // Cancel ack so server redelivers
             *cancelled = true;
         }
 
@@ -65,7 +76,8 @@ impl StanzaHandler for MessageHandler {
 /// Construct a ChatLane with a spawned worker task. Extracted to keep the
 /// init closure passed to `get_with_by_ref` small.
 fn create_chat_lane(client: &Arc<Client>) -> ChatLane {
-    let (tx, rx) = async_channel::unbounded::<Arc<wacore_binary::OwnedNodeRef>>();
+    let (tx, rx) =
+        async_channel::bounded::<Arc<wacore_binary::OwnedNodeRef>>(CHAT_LANE_QUEUE_DEPTH);
 
     let client_for_worker = client.clone();
     let spawn_generation = client
