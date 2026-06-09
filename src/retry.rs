@@ -260,15 +260,10 @@ impl Client {
                 .remove(&processing_key);
         });
 
-        // A retry from a device missing from our registry is itself the signal that
-        // our device list for this user is stale: the device can receive our group
-        // skmsg yet never got a sender key. Refresh the list (rate-limited, dedup'd)
-        // so the device is learned and the next send includes it, whether or not this
-        // retry carries a <keys> bundle. Done before the message-cache lookup so an
-        // evicted or already-handled message still triggers the refresh. The
-        // 406-driven reconciliation during send never fires for this device, since it
-        // is not in the set we send to. An offline-drained retry batches like an
-        // offline unknown-device message instead of forcing an immediate usync.
+        // A retry from a device missing from our registry signals a stale device
+        // list for this user, so refresh it (rate-limited, dedup'd) to learn the
+        // device for the next send. Done before the message-cache lookup so an
+        // evicted retry still triggers it.
         let sender_device_id = info.requester.device() as u32;
         let device_known = self
             .has_device(&info.requester.user, sender_device_id)
