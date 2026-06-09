@@ -389,6 +389,19 @@ impl Client {
             self.append_device_if_new(&mut record, device_id, device.key_index);
         }
 
+        // WA Web `AdvDeviceNotificationApi.handleDeviceAddNotification` re-adds the
+        // primary (device 0) to the rebuilt list unconditionally, so a raw_id
+        // mismatch (which clears the list) never drops it. `filter_devices_by_key_index`
+        // only keeps device 0 when it is already in the input, so after a clear the
+        // primary would otherwise be lost, leaving a record with no device 0 (or an
+        // empty list) that suppresses the usync re-fetch forever.
+        if !record.devices.iter().any(|d| d.device_id == 0) {
+            record.devices.push(wacore::store::traits::DeviceInfo {
+                device_id: 0,
+                key_index: Some(0),
+            });
+        }
+
         // New devices are picked up automatically by `resolve_skdm_targets`:
         // unknown device → `device_has_key()` returns `None` → falls into
         // `needs_skdm`. No global cache invalidation needed.
@@ -1028,7 +1041,7 @@ mod tests {
     async fn test_patch_device_add_deduplicates() {
         let client = create_test_client().await;
 
-        setup_device_record(&client, "15551234567", &[3]).await;
+        setup_device_record(&client, "15551234567", &[0, 3]).await;
 
         // Patch: add device 3 again — should not duplicate
         let elem = make_device_element(3, None);
@@ -1039,7 +1052,12 @@ mod tests {
             .get("15551234567")
             .await
             .unwrap();
-        assert_eq!(updated.devices.len(), 1);
+        assert_eq!(
+            updated.devices.iter().filter(|d| d.device_id == 3).count(),
+            1
+        );
+        assert!(updated.devices.iter().any(|d| d.device_id == 0));
+        assert_eq!(updated.devices.len(), 2);
     }
 
     #[tokio::test]
@@ -1134,6 +1152,134 @@ mod tests {
         assert_eq!(updated.devices.len(), 2);
         let dev3 = updated.devices.iter().find(|d| d.device_id == 3).unwrap();
         assert_eq!(dev3.key_index, Some(2));
+    }
+
+    /// Encode an `ADVSignedKeyIndexList` whose decoded `raw_id`/`valid_indexes`
+    /// drive `patch_device_add` (the signature is not verified locally; the
+    /// notification arrives over the authenticated Noise channel).
+    fn make_signed_key_index_bytes(
+        raw_id: u32,
+        current_index: u32,
+        valid_indexes: Vec<u32>,
+    ) -> Vec<u8> {
+        use prost::Message;
+        let details = waproto::whatsapp::AdvKeyIndexList {
+            raw_id: Some(raw_id),
+            timestamp: Some(100),
+            current_index: Some(current_index),
+            valid_indexes,
+            account_type: None,
+        }
+        .encode_to_vec();
+        waproto::whatsapp::AdvSignedKeyIndexList {
+            details: Some(details),
+            account_signature: None,
+            account_signature_key: None,
+        }
+        .encode_to_vec()
+    }
+
+    fn record_with_raw_id(
+        user: &str,
+        device_ids: &[u32],
+        raw_id: u32,
+    ) -> wacore::store::traits::DeviceListRecord {
+        wacore::store::traits::DeviceListRecord {
+            user: user.into(),
+            devices: device_ids
+                .iter()
+                .map(|&id| wacore::store::traits::DeviceInfo {
+                    device_id: id,
+                    key_index: if id == 0 { None } else { Some(7) },
+                })
+                .collect(),
+            timestamp: 1000,
+            phash: None,
+            raw_id: Some(raw_id),
+        }
+    }
+
+    // raw_id mismatch clears the list and rebuilds from the notification; the
+    // primary (device 0) must survive. Regression guard for a record that would
+    // otherwise persist without device 0 (and then suppress usync forever).
+    #[tokio::test]
+    async fn test_patch_device_add_raw_id_mismatch_preserves_primary() {
+        let client = create_test_client().await;
+
+        client
+            .device_registry_cache
+            .insert(
+                "15551234567".to_string(),
+                Arc::new(record_with_raw_id("15551234567", &[0, 5], 1)),
+            )
+            .await;
+
+        // New raw_id (2) != stored (1) → clear + rebuild. Notified device 19 has a
+        // valid key index, so the rebuilt list is the companion plus the primary.
+        let signed = make_signed_key_index_bytes(2, 0, vec![7]);
+        let key_index_info = wacore::stanza::devices::KeyIndexInfo {
+            timestamp: 100,
+            signed_bytes: Some(signed),
+        };
+        let elem = make_device_element(19, Some(7));
+        client
+            .patch_device_add("15551234567", &elem, Some(&key_index_info))
+            .await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        assert!(
+            updated.devices.iter().any(|d| d.device_id == 0),
+            "primary (device 0) must survive a raw_id mismatch clear, got {:?}",
+            updated.devices
+        );
+        assert!(updated.devices.iter().any(|d| d.device_id == 19));
+        // Stale companion from the old identity is dropped by the clear.
+        assert!(!updated.devices.iter().any(|d| d.device_id == 5));
+    }
+
+    // Same mismatch but the notified device's key index is rejected, so the
+    // rebuilt list would be empty without the primary re-seed. Guards the `[]`
+    // record that otherwise leaves the user with zero devices.
+    #[tokio::test]
+    async fn test_patch_device_add_raw_id_mismatch_rejected_device_keeps_primary() {
+        let client = create_test_client().await;
+
+        client
+            .device_registry_cache
+            .insert(
+                "15551234567".to_string(),
+                Arc::new(record_with_raw_id("15551234567", &[0, 5], 1)),
+            )
+            .await;
+
+        // current_index 10, empty valid set → notified key index 3 is invalid
+        // (not in valid set, not > current_index), so no companion is added.
+        let signed = make_signed_key_index_bytes(2, 10, vec![]);
+        let key_index_info = wacore::stanza::devices::KeyIndexInfo {
+            timestamp: 100,
+            signed_bytes: Some(signed),
+        };
+        let elem = make_device_element(19, Some(3));
+        client
+            .patch_device_add("15551234567", &elem, Some(&key_index_info))
+            .await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.devices.len(),
+            1,
+            "expected only the primary, got {:?}",
+            updated.devices
+        );
+        assert_eq!(updated.devices[0].device_id, 0);
     }
 
     #[tokio::test]
