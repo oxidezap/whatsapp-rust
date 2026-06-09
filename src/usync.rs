@@ -15,8 +15,15 @@ impl Client {
         let mut all_devices = Vec::with_capacity(jids.len() * 2);
 
         for jid in jids.iter().map(|j| j.to_non_ad()) {
-            // Device registry (in-memory cache + DB) is the single source of truth
-            if let Some(devices) = self.get_devices_from_registry(&jid).await {
+            // Device registry (in-memory cache + DB) is the single source of truth.
+            // An empty list is never a valid device set: WA Web always keeps the
+            // primary (device 0) in a user's device list, so an empty record is local
+            // corruption. Treating it as authoritative would leave the user
+            // permanently unreachable, since a present record otherwise suppresses
+            // the usync re-fetch forever. Fall through to the network instead.
+            if let Some(devices) = self.get_devices_from_registry(&jid).await
+                && !devices.is_empty()
+            {
                 all_devices.extend(devices);
                 continue;
             }
@@ -391,6 +398,32 @@ mod tests {
         let devices = client.get_user_devices(&[user_jid]).await.unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].device, 5);
+    }
+
+    // A present-but-empty device record is local corruption and must not be
+    // treated as authoritative: get_user_devices falls through to the network so
+    // the list can self-heal. Offline, that surfaces as an error, which proves the
+    // fetch was attempted (the old behavior returned Ok([]) with no fetch).
+    #[tokio::test]
+    async fn test_empty_device_record_falls_through_to_network() {
+        let client = create_test_client().await;
+
+        let user_jid: Jid = "5551230000@s.whatsapp.net".parse().unwrap();
+
+        let record = DeviceListRecord {
+            user: "5551230000".into(),
+            devices: vec![],
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+            raw_id: None,
+        };
+        client.update_device_list(record).await.unwrap();
+
+        let result = client.get_user_devices(&[user_jid]).await;
+        assert!(
+            result.is_err(),
+            "empty record must fall through to the network, got {result:?}"
+        );
     }
 
     #[tokio::test]
