@@ -6,17 +6,17 @@ use std::sync::Arc;
 use wacore_binary::CompactString;
 use wacore_binary::Jid;
 
-fn build_pn_to_lid_map(lid_to_pn_map: &HashMap<CompactString, Jid>) -> HashMap<CompactString, Jid> {
+fn build_pn_to_lid_map(
+    lid_to_pn_map: &HashMap<CompactString, Jid>,
+) -> HashMap<CompactString, CompactString> {
     lid_to_pn_map
         .iter()
-        .map(|(lid_user, phone_jid)| {
-            let lid_jid = Jid::lid(lid_user.clone());
-            (phone_jid.user.clone(), lid_jid)
-        })
+        .map(|(lid_user, phone_jid)| (phone_jid.user.clone(), lid_user.clone()))
         .collect()
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(from = "GroupInfoDe")]
 pub struct GroupInfo {
     pub participants: Vec<Jid>,
     pub addressing_mode: AddressingMode,
@@ -24,9 +24,29 @@ pub struct GroupInfo {
     /// corresponding phone-number JID. This is used for device queries since
     /// LID usync requests may not work reliably.
     lid_to_pn_map: HashMap<CompactString, Jid>,
-    /// Reverse mapping: phone number (user part) to LID JID.
-    /// This is used to convert device JIDs back to LID format after device resolution.
-    pn_to_lid_map: HashMap<CompactString, Jid>,
+    /// Reverse index: phone user → LID user. Derived from `lid_to_pn_map`
+    /// (the LID jid is reconstructed on demand), so it is neither persisted
+    /// nor stores Jids — for a large LID group that halves the map bytes in
+    /// memory and in the serialized `group_metadata` blob.
+    #[serde(skip)]
+    pn_to_lid_map: HashMap<CompactString, CompactString>,
+}
+
+/// Deserialization shadow: rebuilds the derived reverse index. Old blobs
+/// carrying the previously-persisted `pn_to_lid_map` field still decode —
+/// serde_json ignores unknown fields.
+#[derive(serde::Deserialize)]
+struct GroupInfoDe {
+    participants: Vec<Jid>,
+    addressing_mode: AddressingMode,
+    #[serde(default)]
+    lid_to_pn_map: HashMap<CompactString, Jid>,
+}
+
+impl From<GroupInfoDe> for GroupInfo {
+    fn from(d: GroupInfoDe) -> Self {
+        Self::with_lid_to_pn_map(d.participants, d.addressing_mode, d.lid_to_pn_map)
+    }
 }
 
 impl GroupInfo {
@@ -66,18 +86,13 @@ impl GroupInfo {
         self.lid_to_pn_map = lid_to_pn_map;
     }
 
-    /// Access the LID-to-phone mapping.
-    pub fn lid_to_pn_map(&self) -> &HashMap<CompactString, Jid> {
-        &self.lid_to_pn_map
-    }
-
     /// Look up the mapped phone-number JID for a given LID user identifier.
     pub fn phone_jid_for_lid_user(&self, lid_user: &str) -> Option<&Jid> {
         self.lid_to_pn_map.get(lid_user)
     }
 
-    /// Look up the mapped LID JID for a given phone number (user part).
-    pub fn lid_jid_for_phone_user(&self, phone_user: &str) -> Option<&Jid> {
+    /// Look up the mapped LID user for a given phone number (user part).
+    pub fn lid_user_for_phone_user(&self, phone_user: &str) -> Option<&CompactString> {
         self.pn_to_lid_map.get(phone_user)
     }
 
@@ -98,8 +113,7 @@ impl GroupInfo {
             if self.addressing_mode == AddressingMode::Lid
                 && let Some(pn) = phone_number
             {
-                self.pn_to_lid_map
-                    .insert(pn.user.clone(), Jid::lid(jid.user.clone()));
+                self.pn_to_lid_map.insert(pn.user.clone(), jid.user.clone());
                 self.lid_to_pn_map.insert(jid.user.clone(), pn.clone());
             }
 
@@ -121,8 +135,8 @@ impl GroupInfo {
                 self.pn_to_lid_map.remove(&pn_jid.user);
             }
             // Also try reverse: user might be a PN
-            if let Some(lid_jid) = self.pn_to_lid_map.remove(*user) {
-                self.lid_to_pn_map.remove(&lid_jid.user);
+            if let Some(lid_user) = self.pn_to_lid_map.remove(*user) {
+                self.lid_to_pn_map.remove(&lid_user);
             }
         }
     }
@@ -131,9 +145,9 @@ impl GroupInfo {
     /// consuming the JID. If no mapping exists, returns it unchanged.
     pub fn phone_device_jid_into_lid(&self, phone_device_jid: Jid) -> Jid {
         if phone_device_jid.is_pn()
-            && let Some(lid_base) = self.lid_jid_for_phone_user(&phone_device_jid.user)
+            && let Some(lid_user) = self.lid_user_for_phone_user(&phone_device_jid.user)
         {
-            return Jid::lid_device(lid_base.user.clone(), phone_device_jid.device);
+            return Jid::lid_device(lid_user.clone(), phone_device_jid.device);
         }
         phone_device_jid
     }
@@ -222,8 +236,7 @@ mod tests {
             Some("bob_pn")
         );
         assert_eq!(
-            info.lid_jid_for_phone_user("bob_pn")
-                .map(|j| j.user.as_str()),
+            info.lid_user_for_phone_user("bob_pn").map(|u| u.as_str()),
             Some("lid_bob")
         );
     }
@@ -252,13 +265,13 @@ mod tests {
         );
 
         assert!(info.phone_jid_for_lid_user("lid_bob").is_some());
-        assert!(info.lid_jid_for_phone_user("bob_pn").is_some());
+        assert!(info.lid_user_for_phone_user("bob_pn").is_some());
 
         info.remove_participants(&["lid_bob"]);
 
         assert_eq!(info.participants.len(), 1);
         assert!(info.phone_jid_for_lid_user("lid_bob").is_none());
-        assert!(info.lid_jid_for_phone_user("bob_pn").is_none());
+        assert!(info.lid_user_for_phone_user("bob_pn").is_none());
         assert!(info.phone_jid_for_lid_user("lid_alice").is_some());
     }
 
@@ -287,9 +300,49 @@ mod tests {
             Some("bob_pn")
         );
         assert_eq!(
-            info.lid_jid_for_phone_user("bob_pn")
-                .map(|j| j.user.as_str()),
+            info.lid_user_for_phone_user("bob_pn").map(|u| u.as_str()),
             Some("lid_bob")
+        );
+    }
+
+    /// Old persisted blobs carried a `pn_to_lid_map` field; the reverse index
+    /// is now derived and skipped during serialization. Both directions must
+    /// hold: old-format JSON still decodes (unknown field ignored) with the
+    /// index rebuilt, and the new format omits the field entirely.
+    #[test]
+    fn serde_reverse_index_is_derived_not_persisted() {
+        let mut map = HashMap::new();
+        map.insert(CompactString::from("lid_bob"), pn("bob_pn"));
+        let info = GroupInfo::with_lid_to_pn_map(vec![lid("lid_bob")], AddressingMode::Lid, map);
+
+        let json = serde_json::to_string(&info).expect("serialize");
+        assert!(
+            !json.contains("pn_to_lid_map"),
+            "derived index must not be persisted: {json}"
+        );
+
+        let round: GroupInfo = serde_json::from_str(&json).expect("deserialize new format");
+        assert_eq!(
+            round.lid_user_for_phone_user("bob_pn").map(|u| u.as_str()),
+            Some("lid_bob")
+        );
+
+        // Old format: same payload plus the previously-persisted reverse map
+        // (its contents are irrelevant — unknown fields are ignored).
+        let mut legacy_json: serde_json::Value = serde_json::from_str(&json).expect("value");
+        legacy_json["pn_to_lid_map"] = serde_json::json!({ "bob_pn": "lid_bob@lid" });
+        // Jid's Deserialize borrows from the input, so go through a string.
+        let legacy_str = serde_json::to_string(&legacy_json).expect("legacy json");
+        let legacy: GroupInfo = serde_json::from_str(&legacy_str).expect("deserialize old format");
+        assert_eq!(
+            legacy.lid_user_for_phone_user("bob_pn").map(|u| u.as_str()),
+            Some("lid_bob")
+        );
+        assert_eq!(
+            legacy
+                .phone_jid_for_lid_user("lid_bob")
+                .map(|j| j.user.as_str()),
+            Some("bob_pn")
         );
     }
 }
