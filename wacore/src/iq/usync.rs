@@ -380,10 +380,20 @@ fn build_business_query_node() -> Node {
 
 /// Check `<usync><result>` for per-protocol errors.
 fn check_usync_result_errors(usync: &NodeRef<'_>) -> Result<(), anyhow::Error> {
+    check_usync_result_errors_for(
+        usync,
+        &["contact", "lid", "business", "status", "picture", "devices"],
+    )
+}
+
+fn check_usync_result_errors_for(
+    usync: &NodeRef<'_>,
+    tags: &[&'static str],
+) -> Result<(), anyhow::Error> {
     let Some(result_node) = usync.get_optional_child("result") else {
         return Ok(());
     };
-    for tag in ["contact", "lid", "business", "status", "picture", "devices"] {
+    for &tag in tags {
         if let Some(protocol_node) = result_node.get_optional_child(tag)
             && let Some(error) = parse_subprotocol_error(protocol_node)
         {
@@ -391,6 +401,19 @@ fn check_usync_result_errors(usync: &NodeRef<'_>) -> Result<(), anyhow::Error> {
         }
     }
     Ok(())
+}
+
+fn warn_usync_result_error(usync: &NodeRef<'_>, tag: &'static str) {
+    if let Some(result_node) = usync.get_optional_child("result")
+        && let Some(protocol_node) = result_node.get_optional_child(tag)
+        && let Some(error) = parse_subprotocol_error(protocol_node)
+    {
+        warn!(
+            target: "usync",
+            "{}; continuing with returned users",
+            usync_subprotocol_error_message(tag, &error)
+        );
+    }
 }
 
 impl IqSpec for IsOnWhatsAppSpec {
@@ -718,7 +741,8 @@ impl IqSpec for DeviceListSpec {
         let usync = response
             .get_optional_child("usync")
             .ok_or_else(|| anyhow!("<usync> not found in usync response"))?;
-        check_usync_result_errors(usync)?;
+        check_usync_result_errors_for(usync, &["contact", "lid", "business", "status", "picture"])?;
+        warn_usync_result_error(usync, "devices");
         let list_node = usync
             .get_optional_child("list")
             .ok_or_else(|| anyhow!("<list> not found in usync response"))?;
@@ -734,10 +758,12 @@ impl IqSpec for DeviceListSpec {
             if let Some(devices_node) = user_node.get_optional_child("devices")
                 && let Some(error) = parse_subprotocol_error(devices_node)
             {
-                return Err(anyhow!(
-                    "{} for {user_jid}",
+                warn!(
+                    target: "usync",
+                    "{} for {user_jid}; skipping user",
                     usync_subprotocol_error_message("devices", &error)
-                ));
+                );
+                continue;
             }
 
             // Extract LID mapping if present
@@ -907,10 +933,12 @@ impl IqSpec for LidQuerySpec {
             if let Some(lid_node) = user_node.get_optional_child("lid")
                 && let Some(error) = parse_subprotocol_error(lid_node)
             {
-                return Err(anyhow!(
-                    "{} for {user_jid}",
+                warn!(
+                    target: "usync",
+                    "{} for {user_jid}; skipping user",
                     usync_subprotocol_error_message("lid", &error)
-                ));
+                );
+                continue;
             }
         }
 
@@ -1520,61 +1548,126 @@ mod tests {
     }
 
     #[test]
-    fn device_list_devices_error_is_rejected() {
+    fn device_list_devices_error_skips_only_that_user() {
+        let jid1: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let jid2: Jid = "9876543210@s.whatsapp.net".parse().unwrap();
+        let spec = DeviceListSpec::new(vec![jid1, jid2], "test-sid");
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([
+                        NodeBuilder::new("user")
+                            .attr("jid", "1234567890@s.whatsapp.net")
+                            .children([NodeBuilder::new("devices")
+                                .children([NodeBuilder::new("error")
+                                    .attr("code", "500")
+                                    .attr("text", "server")
+                                    .build()])
+                                .build()])
+                            .build(),
+                        NodeBuilder::new("user")
+                            .attr("jid", "9876543210@s.whatsapp.net")
+                            .children([NodeBuilder::new("devices")
+                                .children([
+                                    NodeBuilder::new("device-list")
+                                        .attr("hash", "2:ok")
+                                        .children([NodeBuilder::new("device")
+                                            .attr("id", "0")
+                                            .build()])
+                                        .build(),
+                                    build_test_key_index_list_node(&[0]),
+                                ])
+                                .build()])
+                            .build(),
+                    ])
+                    .build()])
+                .build()])
+            .build();
+
+        let result = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(result.device_lists.len(), 1);
+        assert_eq!(result.device_lists[0].user.user, "9876543210");
+    }
+
+    #[test]
+    fn device_list_result_devices_error_is_warn_only() {
         let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
         let spec = DeviceListSpec::new(vec![jid], "test-sid");
 
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
             .children([NodeBuilder::new("usync")
-                .children([NodeBuilder::new("list")
-                    .children([NodeBuilder::new("user")
-                        .attr("jid", "1234567890@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("result")
                         .children([NodeBuilder::new("devices")
                             .children([NodeBuilder::new("error")
                                 .attr("code", "500")
                                 .attr("text", "server")
                                 .build()])
                             .build()])
-                        .build()])
-                    .build()])
+                        .build(),
+                    NodeBuilder::new("list")
+                        .children([NodeBuilder::new("user")
+                            .attr("jid", "1234567890@s.whatsapp.net")
+                            .children([NodeBuilder::new("devices")
+                                .children([
+                                    NodeBuilder::new("device-list")
+                                        .attr("hash", "2:ok")
+                                        .children([NodeBuilder::new("device")
+                                            .attr("id", "0")
+                                            .build()])
+                                        .build(),
+                                    build_test_key_index_list_node(&[0]),
+                                ])
+                                .build()])
+                            .build()])
+                        .build(),
+                ])
                 .build()])
             .build();
 
-        let err = spec.parse_response(&response.as_node_ref()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("usync devices error 500: server for 1234567890@s.whatsapp.net")
-        );
+        let result = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(result.device_lists.len(), 1);
+        assert_eq!(result.device_lists[0].user.user, "1234567890");
     }
 
     #[test]
-    fn lid_query_lid_error_is_rejected() {
-        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
-        let spec = LidQuerySpec::new(vec![jid], "test-sid");
+    fn lid_query_lid_error_skips_only_that_user() {
+        let jid1: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let jid2: Jid = "9876543210@s.whatsapp.net".parse().unwrap();
+        let spec = LidQuerySpec::new(vec![jid1, jid2], "test-sid");
 
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
             .children([NodeBuilder::new("usync")
                 .children([NodeBuilder::new("list")
-                    .children([NodeBuilder::new("user")
-                        .attr("jid", "1234567890@s.whatsapp.net")
-                        .children([NodeBuilder::new("lid")
-                            .children([NodeBuilder::new("error")
-                                .attr("code", "404")
-                                .attr("text", "missing")
+                    .children([
+                        NodeBuilder::new("user")
+                            .attr("jid", "1234567890@s.whatsapp.net")
+                            .children([NodeBuilder::new("lid")
+                                .children([NodeBuilder::new("error")
+                                    .attr("code", "404")
+                                    .attr("text", "missing")
+                                    .build()])
                                 .build()])
-                            .build()])
-                        .build()])
+                            .build(),
+                        NodeBuilder::new("user")
+                            .attr("jid", "9876543210@s.whatsapp.net")
+                            .children([NodeBuilder::new("lid")
+                                .attr("val", "100000000000987@lid")
+                                .build()])
+                            .build(),
+                    ])
                     .build()])
                 .build()])
             .build();
 
-        let err = spec.parse_response(&response.as_node_ref()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("usync lid error 404: missing for 1234567890@s.whatsapp.net")
-        );
+        let result = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(result.lid_mappings.len(), 1);
+        assert_eq!(result.lid_mappings[0].phone_number, "9876543210");
+        assert_eq!(result.lid_mappings[0].lid, "100000000000987");
     }
 
     #[test]
