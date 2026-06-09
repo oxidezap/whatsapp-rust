@@ -297,7 +297,7 @@ impl Client {
                     "Pending device sync failed, re-enqueueing {} users: {e:?}",
                     pending.len()
                 );
-                for jid in pending {
+                for jid in &pending {
                     self.pending_device_sync.add(jid).await;
                 }
             }

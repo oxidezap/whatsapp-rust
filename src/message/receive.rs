@@ -1251,7 +1251,7 @@ impl Client {
         is_offline: bool,
     ) {
         // Dedup: skip if we already have a sync pending/in-flight for this user
-        if !self.pending_device_sync.add(user_jid.clone()).await {
+        if !self.pending_device_sync.add(&user_jid).await {
             return;
         }
 
