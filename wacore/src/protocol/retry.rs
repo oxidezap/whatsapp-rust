@@ -128,6 +128,20 @@ pub fn should_include_keys(retry_count: u8, reason: RetryReason) -> bool {
     retry_count >= MIN_RETRY_COUNT_FOR_KEYS || include_keys_early
 }
 
+/// Whether a retry from a device that is not in our device registry must be
+/// dropped instead of resent.
+///
+/// WA Web (`WAWebHandleRetryRequest`) bails on an unknown device, but that is
+/// safe only because it keeps participant device lists fresh via a pre-send
+/// sync, so a legitimate requester is already known. When the retry carries a
+/// `<keys>` bundle the requester's ADV-signed identity and prekeys are in hand,
+/// so the session can be re-established and the message resent without a registry
+/// entry. whatsmeow builds the session straight from the receipt bundle the same
+/// way. Only drop when there is no bundle to recover from.
+pub fn should_drop_unknown_device_retry(keys_present: bool, device_known: bool) -> bool {
+    !keys_present && !device_known
+}
+
 /// Builds the `<keys>` bundle embedded in a retry receipt (type, identity, one-time prekey,
 /// signed prekey, device identity) so a peer can re-establish the Signal session.
 ///
@@ -290,6 +304,18 @@ mod tests {
     fn should_include_keys_retry_3_any_reason() {
         assert!(should_include_keys(3, RetryReason::InvalidMessage));
         assert!(should_include_keys(3, RetryReason::UnknownError));
+    }
+
+    #[test]
+    fn drop_unknown_device_retry_only_without_bundle() {
+        // The regression this guards: a retry that carries a <keys> bundle from a
+        // device missing from our registry must be recovered, not dropped.
+        assert!(!should_drop_unknown_device_retry(true, false));
+        // No bundle and unknown device: nothing to recover from, so drop.
+        assert!(should_drop_unknown_device_retry(false, false));
+        // A known device is always handled, bundle or not.
+        assert!(!should_drop_unknown_device_retry(true, true));
+        assert!(!should_drop_unknown_device_retry(false, true));
     }
 
     #[test]

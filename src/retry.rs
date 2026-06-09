@@ -307,10 +307,14 @@ impl Client {
         };
 
         let sender_device_id = info.requester.device() as u32;
-        if !self
+        let keys_node_present = nr.get_optional_child("keys").is_some();
+        let device_known = self
             .has_device(&info.requester.user, sender_device_id)
-            .await
-        {
+            .await;
+        if wacore::protocol::retry::should_drop_unknown_device_retry(
+            keys_node_present,
+            device_known,
+        ) {
             warn!(
                 "handle_retry_receipt: device not found for device={}, user={}",
                 sender_device_id, info.requester.user
