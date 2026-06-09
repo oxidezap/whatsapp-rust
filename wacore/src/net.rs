@@ -78,7 +78,7 @@ pub enum TransportEvent {
 /// The transport is a dumb pipe for bytes with no knowledge of WhatsApp framing.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait Transport: Send + Sync {
+pub trait Transport: crate::sync_marker::MaybeSendSync {
     /// Sends raw data to the server.
     async fn send(&self, data: Bytes) -> Result<(), anyhow::Error>;
 
@@ -89,7 +89,7 @@ pub trait Transport: Send + Sync {
 /// A factory responsible for creating new transport instances.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait TransportFactory: Send + Sync {
+pub trait TransportFactory: crate::sync_marker::MaybeSendSync {
     /// Creates a new transport and returns it, along with a stream of events.
     async fn create_transport(
         &self,
@@ -163,7 +163,7 @@ pub type UploadBody = Box<dyn std::io::Read + Send>;
 /// Trait for executing HTTP requests in a runtime-agnostic way
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait HttpClient: Send + Sync {
+pub trait HttpClient: crate::sync_marker::MaybeSendSync {
     /// Executes a given HTTP request and returns the response.
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse>;
 
