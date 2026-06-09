@@ -91,7 +91,9 @@ pub struct SignalStoreCache {
 /// Cache entry tracking whether a session is present, absent, or checked out
 /// by an encrypt/decrypt operation.
 enum SessionEntry {
-    Present(Box<SessionRecord>),
+    // `Arc` so `peek_session` (retry / LID-migration checks) bumps a refcount
+    // instead of deep-cloning the record (KBs with archived states).
+    Present(Arc<SessionRecord>),
     Absent,
     /// Taken by load_session; has_session treats as present, flush/eviction skip.
     CheckedOut,
@@ -124,7 +126,7 @@ impl SessionStoreState {
     fn put(&mut self, address: &str, record: SessionRecord) {
         let addr = self.key_for(address);
         self.cache
-            .insert(addr.clone(), SessionEntry::Present(Box::new(record)));
+            .insert(addr.clone(), SessionEntry::Present(Arc::new(record)));
         self.dirty.insert(addr.clone());
         self.deleted.remove(&addr);
     }
@@ -349,7 +351,11 @@ impl SignalStoreCache {
                     else {
                         unreachable!()
                     };
-                    return Ok(Some(*record));
+                    // Unique unless a peek's Arc is still alive (short-lived
+                    // inspection paths), so this is a move, not a clone.
+                    return Ok(Some(
+                        Arc::try_unwrap(record).unwrap_or_else(|arc| (*arc).clone()),
+                    ));
                 }
                 return Ok(None);
             }
@@ -386,13 +392,13 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<Option<SessionRecord>> {
+    ) -> Result<Option<Arc<SessionRecord>>> {
         let key = address.as_str();
         {
             let state = self.sessions.lock().await;
             if let Some(entry) = state.cache.get(key) {
                 return match entry {
-                    SessionEntry::Present(record) => Ok(Some((**record).clone())),
+                    SessionEntry::Present(record) => Ok(Some(record.clone())),
                     _ => Ok(None),
                 };
             }
@@ -402,12 +408,11 @@ impl SignalStoreCache {
         let mut state = self.sessions.lock().await;
         match backend_result {
             Some(bytes) => {
-                let record = SessionRecord::deserialize(&bytes)?;
+                let record = Arc::new(SessionRecord::deserialize(&bytes)?);
                 if !state.cache.contains_key(key) {
-                    state.cache.insert(
-                        Arc::from(key),
-                        SessionEntry::Present(Box::new(record.clone())),
-                    );
+                    state
+                        .cache
+                        .insert(Arc::from(key), SessionEntry::Present(record.clone()));
                     state.evict_if_needed(self.max_entries);
                 }
                 Ok(Some(record))
