@@ -102,6 +102,12 @@ struct RetryChatInfo {
     recipient: Option<Jid>,
     /// True if the requester is a bot JID (skip namespace normalization).
     is_bot: bool,
+    /// WA Web's `bot_retry` parser path: only primary `@bot` JIDs, not legacy PN bots.
+    is_fbid_bot_retry: bool,
+}
+
+fn is_fbid_bot_retry_jid(jid: &Jid) -> bool {
+    jid.server == wacore_binary::Server::Bot && jid.device() == 0
 }
 
 /// Resolve the chat and requester JIDs from a retry receipt, separating
@@ -118,10 +124,10 @@ fn resolve_retry_chat_info(
     if from.is_group() || from.is_status_broadcast() {
         // Groups/status: chat is already the group/broadcast JID.
         // Requester is the participant attr (the actual retrying device).
-        let requester = node
-            .attrs()
-            .optional_jid("participant")
-            .unwrap_or_else(|| receipt.source.sender.clone());
+        let participant = node.attrs().optional_jid("participant");
+        let is_fbid_bot_retry =
+            from.is_group() && participant.as_ref().is_some_and(is_fbid_bot_retry_jid);
+        let requester = participant.unwrap_or_else(|| receipt.source.sender.clone());
         let is_bot = requester.is_bot();
         Some(RetryChatInfo {
             chat: from.clone(),
@@ -129,6 +135,7 @@ fn resolve_retry_chat_info(
             original_from: from.clone(),
             recipient: node.attrs().optional_jid("recipient"),
             is_bot,
+            is_fbid_bot_retry,
         })
     } else {
         // DM: resolve chat target via getTargetChat logic.
@@ -169,8 +176,19 @@ fn resolve_retry_chat_info(
             original_from: from.clone(),
             recipient,
             is_bot,
+            is_fbid_bot_retry: is_fbid_bot_retry_jid(from),
         })
     }
+}
+
+fn validate_retry_prekey_presence(
+    keys_node: &NodeRef<'_>,
+    is_fbid_bot_retry: bool,
+) -> Result<(), anyhow::Error> {
+    if !is_fbid_bot_retry && keys_node.get_optional_child("key").is_none() {
+        anyhow::bail!("regular retry key bundle missing one-time prekey");
+    }
+    Ok(())
 }
 
 // No retry_count in the key: concurrent receipts for the same participant must
@@ -418,15 +436,19 @@ impl Client {
         // Mirror WAWebUpdateLocalSignalSession for all chat types: markForgetSenderKey
         // (group/status) + processKeyBundle + regId-mismatch delete + base-key logic.
         // Must run before ensureE2ESessions so any session deletion here is rebuilt there.
-        self.update_local_signal_session(
-            &info,
-            &resolved_jid,
-            &message_id,
-            retry_count,
-            nr,
-            is_peer,
-        )
-        .await;
+        if !self
+            .update_local_signal_session(
+                &info,
+                &resolved_jid,
+                &message_id,
+                retry_count,
+                nr,
+                is_peer,
+            )
+            .await
+        {
+            return Ok(());
+        }
 
         // Whatsmeow parity (`retry.go:284`). WA Web's regId/base-key check
         // doesn't catch silently-diverged sessions; this fallback does.
@@ -581,7 +603,7 @@ impl Client {
         retry_count: u8,
         node: &NodeRef<'_>,
         is_peer: bool,
-    ) {
+    ) -> bool {
         // 1. markForgetSenderKey (WA Web L33-38). Rust unifies group and status
         //    under a single storage (chat JID as the key) — markForgetSenderKey
         //    handles both `@g.us` and `status@broadcast` as opaque group_jid.
@@ -617,7 +639,7 @@ impl Client {
         //    `!is_status_broadcast()`; WA Web runs it unconditionally.
         let keys_node_present = node.get_optional_child("keys").is_some();
         let key_bundle_result = self
-            .process_retry_key_bundle(node, resolved_jid, is_peer)
+            .process_retry_key_bundle(node, resolved_jid, is_peer, info.is_fbid_bot_retry)
             .await;
         let key_bundle_processed = key_bundle_result.is_ok();
 
@@ -627,10 +649,11 @@ impl Client {
         //    doesn't trigger destructive session deletion as a side effect.
         if !key_bundle_processed && keys_node_present {
             log::warn!(
-                "Key bundle present but rejected for {}: {:?} — skipping regId mismatch deletion",
+                "Key bundle present but rejected for {}: {:?} — aborting retry resend",
                 resolved_jid.observe(),
                 key_bundle_result.as_ref().err()
             );
+            return false;
         }
         if !key_bundle_processed && !keys_node_present {
             if let Err(ref e) = key_bundle_result {
@@ -687,10 +710,10 @@ impl Client {
             .flatten();
 
         let Some(session) = session else {
-            return;
+            return true;
         };
         let Ok(current_base_key) = session.alice_base_key() else {
-            return;
+            return true;
         };
 
         let addr_str = signal_address.as_str();
@@ -712,7 +735,7 @@ impl Client {
                     e
                 ),
             }
-            return;
+            return true;
         }
 
         if retry_count > MIN_RETRY_FOR_BASE_KEY_CHECK {
@@ -762,6 +785,7 @@ impl Client {
                 }
             }
         }
+        true
     }
 
     /// Mirrors whatsmeow's `shouldRecreateSession`. Returns `Some(reason)`
@@ -842,16 +866,18 @@ impl Client {
     /// * `node` - The retry receipt node containing the key bundle
     /// * `requester_jid` - The JID of the device requesting the retry
     /// * `is_peer` - Whether this is a peer device (our own device)
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.process_key_bundle", level = "debug", skip_all, fields(peer = %requester_jid.observe(), is_peer), err(Debug)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.process_key_bundle", level = "debug", skip_all, fields(peer = %requester_jid.observe(), is_peer, is_fbid_bot_retry), err(Debug)))]
     async fn process_retry_key_bundle(
         &self,
         node: &NodeRef<'_>,
         requester_jid: &wacore_binary::Jid,
         is_peer: bool,
+        is_fbid_bot_retry: bool,
     ) -> Result<(), anyhow::Error> {
         let keys_node = node
             .get_optional_child("keys")
             .ok_or_else(|| anyhow::anyhow!("<keys> child missing from retry receipt"))?;
+        validate_retry_prekey_presence(keys_node, is_fbid_bot_retry)?;
 
         let registration_node = node.get_optional_child("registration");
 
@@ -1839,6 +1865,7 @@ mod tests {
             original_from: resolved_jid.clone(),
             recipient: None,
             is_bot: false,
+            is_fbid_bot_retry: false,
         }
     }
 
@@ -2062,6 +2089,7 @@ mod tests {
             original_from: group_chat,
             recipient: None,
             is_bot: false,
+            is_fbid_bot_retry: false,
         };
 
         let node = build_retry_receipt_without_keys();
@@ -2281,7 +2309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_key_bundle_allows_signed_prekey_without_one_time_prekey() {
+    async fn retry_key_bundle_requires_one_time_prekey_except_fbid_bot() {
         let backend = crate::test_utils::create_test_backend().await;
         let pm = Arc::new(
             PersistenceManager::new(backend)
@@ -2305,7 +2333,7 @@ mod tests {
             .calculate_signature(&signed_prekey.public_key.serialize(), &mut rng)
             .expect("signed prekey signature should be valid");
 
-        let requester = Jid::pn_device("559922223333", 1);
+        let regular_requester = Jid::pn_device("559922223333", 1);
         let keys = NodeBuilder::new("keys")
             .children([
                 NodeBuilder::new("type").bytes(vec![5]).build(),
@@ -2335,15 +2363,28 @@ mod tests {
             ])
             .build();
 
-        client
-            .process_retry_key_bundle(&receipt.as_node_ref(), &requester, false)
+        let err = client
+            .process_retry_key_bundle(&receipt.as_node_ref(), &regular_requester, false, false)
             .await
-            .expect("signed-prekey-only retry bundle should establish a session");
+            .expect_err("regular retry without one-time prekey must be rejected");
+        assert!(
+            err.to_string()
+                .contains("regular retry key bundle missing one-time prekey")
+        );
+
+        let fbid_bot_requester = Jid::new("200000000000002", wacore_binary::Server::Bot);
+        client
+            .process_retry_key_bundle(&receipt.as_node_ref(), &fbid_bot_requester, false, true)
+            .await
+            .expect("fbid bot retry without one-time prekey should establish a session");
 
         let snapshot = client.persistence_manager.get_device_snapshot();
         let session = client
             .signal_cache
-            .peek_session(&requester.to_protocol_address(), &*snapshot.backend)
+            .peek_session(
+                &fbid_bot_requester.to_protocol_address(),
+                &*snapshot.backend,
+            )
             .await
             .expect("session lookup should succeed");
         assert!(session.is_some());
@@ -2788,7 +2829,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_retry_chat_info_group_bot_participant_marks_bot_retry() {
+    fn resolve_retry_chat_info_group_bot_device_marks_bot_namespace_only() {
         use wacore_binary::builder::NodeBuilder;
 
         let node = NodeBuilder::new("receipt")
@@ -2810,6 +2851,33 @@ mod tests {
 
         assert!(info.chat.is_group());
         assert!(info.is_bot);
+        assert!(!info.is_fbid_bot_retry);
+    }
+
+    #[test]
+    fn resolve_retry_chat_info_group_primary_fbid_bot_marks_bot_retry() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt")
+            .attr("participant", "somebot@bot")
+            .build();
+        let receipt = Receipt {
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "somebot@bot".parse().unwrap(),
+                ..Default::default()
+            },
+            message_ids: vec!["MSG001".to_string()],
+            timestamp: wacore::time::now_utc(),
+            r#type: crate::types::presence::ReceiptType::Retry,
+            offline: false,
+        };
+
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        assert!(info.chat.is_group());
+        assert!(info.is_bot);
+        assert!(info.is_fbid_bot_retry);
     }
 
     #[test]
@@ -3322,6 +3390,10 @@ mod tests {
         let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
 
         assert!(info.is_bot, "bot JID should be detected");
+        assert!(
+            !info.is_fbid_bot_retry,
+            "legacy PN bots use the regular retry parser"
+        );
         // Chat should be the recipient
         assert_eq!(info.chat.user, "5522888888888");
         assert_eq!(info.chat.device(), 0);
@@ -3338,8 +3410,25 @@ mod tests {
         let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
 
         assert!(info.is_bot);
+        assert!(!info.is_fbid_bot_retry);
         // Without recipient, falls to from.to_non_ad()
         assert_eq!(info.chat.user, "131355500001");
+    }
+
+    #[test]
+    fn resolve_retry_chat_info_fbid_bot_dm_marks_bot_retry() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt")
+            .attr("recipient", "5522888888888@s.whatsapp.net")
+            .build();
+        let receipt = make_test_receipt("200000000000002@bot");
+
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        assert!(info.is_bot);
+        assert!(info.is_fbid_bot_retry);
+        assert_eq!(info.chat.user, "5522888888888");
     }
 
     #[test]
