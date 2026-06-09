@@ -241,7 +241,7 @@ impl Client {
         to: Jid,
         msg: &wa::Message,
     ) -> Result<String, anyhow::Error> {
-        let msg_id = self.generate_message_id().await;
+        let msg_id = self.generate_message_id();
 
         // Send with peer category and high priority
         self.send_message_impl(

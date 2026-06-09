@@ -464,7 +464,7 @@ impl Client {
         let stanza_type_override = options.stanza_type_override;
         let request_id = match options.message_id {
             Some(id) => id,
-            None => self.generate_message_id().await,
+            None => self.generate_message_id(),
         };
         // Both paths below consume `to` and `request_id`, so save copies for the result.
         let result = SendResult {
@@ -545,7 +545,7 @@ impl Client {
         wacore::telemetry::send("status");
 
         let to = Jid::status_broadcast();
-        let request_id = self.generate_message_id().await;
+        let request_id = self.generate_message_id();
 
         // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
         let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -1232,7 +1232,7 @@ impl Client {
         // Generate request ID early (doesn't need lock)
         let request_id = match request_id_override {
             Some(id) => id,
-            None => self.generate_message_id().await,
+            None => self.generate_message_id(),
         };
         // `request_id` is moved into the branch-specific stanza builders below;
         // keep a copy for the post-send messageSecret persistence (the secret

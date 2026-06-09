@@ -605,7 +605,7 @@ impl Client {
         self.send_message_impl(
             own_jid,
             &msg,
-            Some(self.generate_message_id().await),
+            Some(self.generate_message_id()),
             true,
             false,
             None,

@@ -184,7 +184,7 @@ impl Client {
         server_id: u64,
         reaction: &str,
     ) -> Result<(), anyhow::Error> {
-        let request_id = self.generate_message_id().await;
+        let request_id = self.generate_message_id();
 
         let stanza = NodeBuilder::new("message")
             .attr("to", to)

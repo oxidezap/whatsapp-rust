@@ -1032,27 +1032,29 @@ async fn test_badmac_preserves_session() {
     let (bob_bundle, _) = bobs_prekey_bundle(&client).await;
     alice
         .install_bob_session(
-            &client
-                .persistence_manager
-                .get_device_snapshot()
-                .lid
-                .clone()
-                .or(client.persistence_manager.get_device_snapshot().pn.clone())
-                .expect("own jid")
-                .to_protocol_address(),
+            &{
+                let snapshot = client.persistence_manager.get_device_snapshot();
+                snapshot
+                    .lid
+                    .as_ref()
+                    .or(snapshot.pn.as_ref())
+                    .expect("own jid")
+                    .to_protocol_address()
+            },
             &bob_bundle,
         )
         .await;
 
     // First message: pkmsg lands on Bob and installs Bob's reciprocal session.
-    let bob_addr = client
-        .persistence_manager
-        .get_device_snapshot()
-        .lid
-        .clone()
-        .or(client.persistence_manager.get_device_snapshot().pn.clone())
-        .expect("own jid")
-        .to_protocol_address();
+    let bob_addr = {
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        snapshot
+            .lid
+            .as_ref()
+            .or(snapshot.pn.as_ref())
+            .expect("own jid")
+            .to_protocol_address()
+    };
     let pkmsg = alice.encrypt_text(&bob_addr, "hello").await;
     let (s1, _, _, still1) = submit_and_check_session(&client, &alice.jid, &pkmsg).await;
     assert!(s1, "pkmsg should establish session and decrypt");
@@ -1198,14 +1200,15 @@ async fn test_prod_scenario_pkmsg_archives_old_session_after_badmac() {
 
     // X3DH round 1 — Alice initiates with Bob's bundle, sends pkmsg.
     let (bundle_v1, _) = bobs_prekey_bundle(&client).await;
-    let bob_addr = client
-        .persistence_manager
-        .get_device_snapshot()
-        .lid
-        .clone()
-        .or(client.persistence_manager.get_device_snapshot().pn.clone())
-        .expect("own jid")
-        .to_protocol_address();
+    let bob_addr = {
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        snapshot
+            .lid
+            .as_ref()
+            .or(snapshot.pn.as_ref())
+            .expect("own jid")
+            .to_protocol_address()
+    };
     alice.install_bob_session(&bob_addr, &bundle_v1).await;
     let pkmsg_v1 = alice.encrypt_text(&bob_addr, "v1").await;
     let (s1, _, _, _) = submit_and_check_session(&client, &alice.jid, &pkmsg_v1).await;
