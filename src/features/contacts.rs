@@ -90,7 +90,11 @@ impl<'a> Contacts<'a> {
                     known_lid: None,
                 });
             } else {
-                unreachable!("validated is_on_whatsapp JID type at entry");
+                debug_assert!(
+                    jid.is_pn() || jid.is_lid(),
+                    "validated is_on_whatsapp JID type"
+                );
+                continue;
             }
         }
 
