@@ -39,9 +39,10 @@ fn classify_keepalive_error(e: &IqError) -> KeepaliveResult {
         | IqError::EncodeError(_) => KeepaliveResult::FatalFailure,
         // Exhaustive: forces a compile error when new IqError variants are added
         // so the developer must decide the classification.
-        IqError::Timeout | IqError::ServerError { .. } | IqError::ParseError(_) => {
-            KeepaliveResult::TransientFailure
-        }
+        IqError::Timeout
+        | IqError::ServerError { .. }
+        | IqError::UnexpectedResponseType { .. }
+        | IqError::ParseError(_) => KeepaliveResult::TransientFailure,
     }
 }
 
@@ -341,6 +342,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_classify_unexpected_response_type_is_transient() {
+        assert_eq!(
+            classify_keepalive_error(&IqError::UnexpectedResponseType {
+                got: Some("get".to_string()),
+            }),
+            KeepaliveResult::TransientFailure,
+        );
+    }
+
     // Happy path: the connection was already gone, so a failed ping is just
     // teardown collateral and is logged quietly.
     #[test]
@@ -376,6 +387,9 @@ mod tests {
             text: "internal".to_string(),
             error_type: None,
             backoff: None,
+        }));
+        assert!(!is_benign_teardown(&IqError::UnexpectedResponseType {
+            got: Some("get".to_string()),
         }));
     }
 

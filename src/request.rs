@@ -35,6 +35,8 @@ pub enum IqError {
         /// Server-directed retry delay in seconds from the `backoff` attr; `None` if absent.
         backoff: Option<u32>,
     },
+    #[error("received unexpected IQ response type: {got:?}")]
+    UnexpectedResponseType { got: Option<String> },
     #[error("internal channel closed unexpectedly")]
     InternalChannelClosed,
     #[error("failed to encode IQ request")]
@@ -60,10 +62,30 @@ impl From<wacore::request::IqError> for IqError {
                 error_type,
                 backoff,
             },
+            wacore::request::IqError::UnexpectedResponseType { got } => {
+                Self::UnexpectedResponseType { got }
+            }
             wacore::request::IqError::InternalChannelClosed => Self::InternalChannelClosed,
             // wacore::IqError is #[non_exhaustive]; a new upstream variant should
             // get its own arm above. Until then treat it as an unexpected internal error.
             _ => Self::InternalChannelClosed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IqError;
+
+    #[test]
+    fn converts_unexpected_response_type() {
+        let err = IqError::from(wacore::request::IqError::UnexpectedResponseType {
+            got: Some("get".to_string()),
+        });
+
+        match err {
+            IqError::UnexpectedResponseType { got } => assert_eq!(got.as_deref(), Some("get")),
+            other => panic!("expected UnexpectedResponseType, got {other:?}"),
         }
     }
 }
