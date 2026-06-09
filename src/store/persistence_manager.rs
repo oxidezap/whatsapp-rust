@@ -98,6 +98,11 @@ impl PersistenceManager {
         let mut device_guard = self.device.write().await;
         let result = modifier(&mut device_guard);
 
+        // Dirty BEFORE the snapshot rebuild: a shutdown flush racing this
+        // window must see the store dirty, or it would exit clean and drop
+        // the committed mutation (the clone below is not free).
+        self.dirty.store(true, Ordering::Relaxed);
+
         // Rebuild while still holding the write guard so no reader can
         // observe post-mutation effects with a pre-mutation snapshot.
         *self
@@ -106,7 +111,6 @@ impl PersistenceManager {
             .unwrap_or_else(|p| p.into_inner()) = Arc::new(device_guard.clone());
         drop(device_guard);
 
-        self.dirty.store(true, Ordering::Relaxed);
         self.save_notify.notify(1);
 
         result

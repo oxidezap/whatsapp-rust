@@ -82,7 +82,7 @@ impl<'a> MediaReupload<'a> {
 
         // Build and send the receipt node
         let receipt_node = build_media_retry_receipt(
-            &own_jid,
+            own_jid,
             req.msg_id,
             req.chat_jid,
             req.is_from_me,

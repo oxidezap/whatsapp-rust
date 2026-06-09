@@ -593,7 +593,7 @@ impl Client {
         }
         lid_to_pn_map.insert(own_lid.user.clone(), own_jid.to_non_ad());
 
-        let participants = wacore::send::assemble_status_participants(resolved, &own_lid)?;
+        let participants = wacore::send::assemble_status_participants(resolved, own_lid)?;
         let mut group_info =
             GroupInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn_map);
 
@@ -629,7 +629,7 @@ impl Client {
         let skdm_target_devices: Option<Vec<Jid>> = if force_skdm {
             None
         } else {
-            self.resolve_skdm_targets(&to_str, &group_info, &own_lid)
+            self.resolve_skdm_targets(&to_str, &group_info, own_lid)
                 .await
                 .map(|(_all, needs)| needs)
         };
@@ -665,8 +665,8 @@ impl Client {
             &mut stores,
             self,
             &group_info,
-            &own_jid,
-            &own_lid,
+            own_jid,
+            own_lid,
             account_info.as_deref(),
             to.clone(),
             &message,
@@ -710,8 +710,8 @@ impl Client {
                         &mut stores_retry,
                         self,
                         &group_info,
-                        &own_jid,
-                        &own_lid,
+                        own_jid,
+                        own_lid,
                         account_info.as_deref(),
                         to.clone(),
                         &message,
@@ -1387,8 +1387,8 @@ impl Client {
                 &mut stores,
                 self,
                 &group_info,
-                &own_jid,
-                &own_lid,
+                own_jid,
+                own_lid,
                 account_info.as_deref(),
                 to.clone(),
                 message,
@@ -1438,8 +1438,8 @@ impl Client {
                             &mut stores_retry,
                             self,
                             &group_info,
-                            &own_jid,
-                            &own_lid,
+                            own_jid,
+                            own_lid,
                             account_info.as_deref(),
                             to,
                             message,
