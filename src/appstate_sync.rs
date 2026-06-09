@@ -537,6 +537,69 @@ mod tests {
         (backend, processor, patch_list, stale_index_mac)
     }
 
+    /// Locks the move-and-restore handoff: the snapshot and each patch move into
+    /// blocking closures (instead of being deep-cloned for the 'static bound) and
+    /// must come back on the returned PatchList, because the caller reads
+    /// pl.snapshot/pl.patches afterwards (get_missing_key_ids, has_more bookkeeping).
+    #[tokio::test]
+    async fn process_patch_list_returns_snapshot_and_patches_to_caller() {
+        let (_backend, processor, mut patch_list, _) = snapshot_resync_scenario().await;
+
+        let key_id_bytes = b"snap_key_id".to_vec();
+        let master_key = [9u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let plaintext = wa::SyncActionData {
+            value: Some(wa::SyncActionValue {
+                timestamp: Some(3000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mutation = create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &[0x22; 32],
+            &plaintext,
+            &keys,
+            &key_id_bytes,
+        );
+        patch_list.patches.push(wa::SyncdPatch {
+            mutations: vec![mutation],
+            version: Some(wa::SyncdVersion { version: Some(3) }),
+            key_id: Some(wa::KeyId {
+                id: Some(key_id_bytes),
+            }),
+            ..Default::default()
+        });
+
+        let (mutations, state, pl) = processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("snapshot + patch should process");
+
+        assert_eq!(state.version, 3);
+        assert_eq!(mutations.len(), 2, "snapshot record + patch mutation");
+        assert!(
+            pl.snapshot.is_some(),
+            "snapshot must be handed back to the caller"
+        );
+        assert_eq!(
+            pl.patches.len(),
+            1,
+            "patches must be handed back to the caller"
+        );
+        assert_eq!(
+            pl.patches[0].version.as_ref().and_then(|v| v.version),
+            Some(3),
+            "patch content/order preserved through the handoff"
+        );
+        assert_eq!(
+            pl.patches[0].mutations.len(),
+            1,
+            "patch mutations preserved through the handoff"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_resync_drops_stale_mutation_macs() {
         let (backend, processor, patch_list, stale_index_mac) = snapshot_resync_scenario().await;
