@@ -226,6 +226,7 @@ pub struct IsOnWhatsAppResult {
 
 /// User information from usync.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UserInfo {
     pub jid: Jid,
     pub lid: Option<Jid>,
@@ -739,6 +740,7 @@ impl LidQuerySpec {
 
 /// Response: just the LID mappings learned.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LidQueryResponse {
     pub lid_mappings: Vec<UsyncLidMapping>,
 }

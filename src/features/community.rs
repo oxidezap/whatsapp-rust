@@ -60,12 +60,14 @@ impl CreateCommunityOptions {
 
 /// Result of creating a community.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CreateCommunityResult {
     pub metadata: GroupMetadata,
 }
 
 /// A subgroup within a community.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CommunitySubgroup {
     pub id: Jid,
     pub subject: String,
@@ -76,6 +78,7 @@ pub struct CommunitySubgroup {
 
 /// Result of linking subgroups to a community.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LinkSubgroupsResult {
     pub linked_jids: Vec<Jid>,
     pub failed_groups: Vec<(Jid, u32)>,
@@ -83,6 +86,7 @@ pub struct LinkSubgroupsResult {
 
 /// Result of unlinking subgroups from a community.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct UnlinkSubgroupsResult {
     pub unlinked_jids: Vec<Jid>,
     pub failed_groups: Vec<(Jid, u32)>,

@@ -49,6 +49,7 @@ fn node_text(node: &NodeRef<'_>) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
+#[non_exhaustive]
 pub struct BusinessProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wid: Option<Jid>,
@@ -64,6 +65,7 @@ pub struct BusinessProfile {
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
+#[non_exhaustive]
 pub struct BusinessHours {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
@@ -72,6 +74,7 @@ pub struct BusinessHours {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct BusinessHoursConfig {
     pub day_of_week: DayOfWeek,
     pub mode: BusinessHourMode,
@@ -80,6 +83,7 @@ pub struct BusinessHoursConfig {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct BusinessCategory {
     pub id: String,
     pub name: String,

@@ -53,6 +53,7 @@ pub struct SendOptions {
 
 /// Result of a successfully sent message.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SendResult {
     pub message_id: String,
     pub to: Jid,

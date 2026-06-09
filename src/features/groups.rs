@@ -205,6 +205,7 @@ impl From<GroupInfoResponse> for GroupMetadata {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CreateGroupResult {
     pub metadata: GroupMetadata,
 }
