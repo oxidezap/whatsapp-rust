@@ -29,8 +29,8 @@ impl Default for HashState {
 pub struct HashUpdateResult {
     /// Whether a REMOVE mutation was missing its previous value.
     /// This happens when the server has an entry we don't have locally.
-    /// WhatsApp Web tracks this as `hasMissingRemove` and uses it to
-    /// determine if MAC validation failures should be fatal.
+    /// WhatsApp Web tracks this as telemetry for MAC-failure diagnostics;
+    /// it must not make MAC validation failures non-fatal.
     pub has_missing_remove: bool,
 }
 

@@ -340,8 +340,8 @@ fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<()
 ///   can't anchor the ltHash) is rejected upstream in `process_patch_list`, which marks
 ///   the collection retryable so it re-syncs via snapshot, matching WhatsApp Web.
 /// * `has_missing_remove` - If true, a REMOVE mutation was missing its previous value.
-///   WhatsApp Web tracks this and makes MAC validation failures non-fatal in this case,
-///   because the ltHash is expected to diverge when we can't subtract a value we don't have.
+///   WhatsApp Web reports this as MAC-failure telemetry, but it does not make
+///   aggregate MAC mismatches acceptable.
 pub fn validate_patch_macs(
     patch: &wa::SyncdPatch,
     state: &HashState,
@@ -370,26 +370,15 @@ pub fn validate_patch_macs(
             hex::encode(snap_mac)
         );
         if computed_snap != *snap_mac {
-            // WhatsApp Web behavior: if hasMissingRemove is true, MAC mismatch is expected
-            // because we couldn't subtract the value we don't have. Log and continue.
-            if has_missing_remove {
-                log::warn!(
-                    target: "AppState",
-                    "Patch {} v{} snapshotMAC mismatch (expected due to hasMissingRemove=true), continuing",
-                    collection_name,
-                    state.version
-                );
-                // Don't fail - WhatsApp Web continues processing in this case
-            } else {
-                debug!(
-                    target: "AppState",
-                    "Patch {} v{} snapshotMAC MISMATCH! ltHash=...{}",
-                    collection_name,
-                    state.version,
-                    hex::encode(&state.hash[120..])
-                );
-                return Err(AppStateError::PatchSnapshotMACMismatch);
-            }
+            debug!(
+                target: "AppState",
+                "Patch {} v{} snapshotMAC MISMATCH! ltHash=...{}, hasMissingRemove={}",
+                collection_name,
+                state.version,
+                hex::encode(&state.hash[120..]),
+                has_missing_remove
+            );
+            return Err(AppStateError::PatchSnapshotMACMismatch);
         }
     }
 
@@ -397,17 +386,14 @@ pub fn validate_patch_macs(
         let version = patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
         let computed_patch = generate_patch_mac(patch, collection_name, &keys.patch_mac, version);
         if computed_patch != *patch_mac {
-            // Also skip patchMac validation if hasMissingRemove, since snapshotMac is part of it
-            if has_missing_remove {
-                log::warn!(
-                    target: "AppState",
-                    "Patch {} v{} patchMAC mismatch (expected due to hasMissingRemove=true), continuing",
-                    collection_name,
-                    state.version
-                );
-            } else {
-                return Err(AppStateError::PatchMACMismatch);
-            }
+            debug!(
+                target: "AppState",
+                "Patch {} v{} patchMAC MISMATCH, hasMissingRemove={}",
+                collection_name,
+                state.version,
+                has_missing_remove
+            );
+            return Err(AppStateError::PatchMACMismatch);
         }
     }
 
@@ -641,6 +627,48 @@ mod tests {
             result.added_macs[0].value_mac
         );
         assert!(result.removed_index_macs.is_empty());
+    }
+
+    #[test]
+    fn validate_patch_macs_rejects_snapshot_mismatch_even_with_missing_remove() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let patch = wa::SyncdPatch {
+            version: Some(wa::SyncdVersion { version: Some(2) }),
+            snapshot_mac: Some(vec![0u8; 32]),
+            ..Default::default()
+        };
+        let state = HashState {
+            version: 2,
+            hash: [3u8; 128],
+            index_value_map: HashMap::new(),
+        };
+
+        let err = validate_patch_macs(&patch, &state, &keys, "regular", false, true)
+            .expect_err("hasMissingRemove is telemetry, not a snapshotMAC bypass");
+
+        assert!(matches!(err, AppStateError::PatchSnapshotMACMismatch));
+    }
+
+    #[test]
+    fn validate_patch_macs_rejects_patch_mismatch_even_with_missing_remove() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let patch = wa::SyncdPatch {
+            version: Some(wa::SyncdVersion { version: Some(2) }),
+            patch_mac: Some(vec![0u8; 32]),
+            ..Default::default()
+        };
+        let state = HashState {
+            version: 2,
+            hash: [5u8; 128],
+            index_value_map: HashMap::new(),
+        };
+
+        let err = validate_patch_macs(&patch, &state, &keys, "regular", false, true)
+            .expect_err("hasMissingRemove is telemetry, not a patchMAC bypass");
+
+        assert!(matches!(err, AppStateError::PatchMACMismatch));
     }
 
     #[test]
