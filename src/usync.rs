@@ -16,14 +16,10 @@ impl Client {
 
         for jid in jids.iter().map(|j| j.to_non_ad()) {
             // Device registry (in-memory cache + DB) is the single source of truth.
-            // An empty list is never a valid device set: WA Web always keeps the
-            // primary (device 0) in a user's device list, so an empty record is local
-            // corruption. Treating it as authoritative would leave the user
-            // permanently unreachable, since a present record otherwise suppresses
-            // the usync re-fetch forever. Fall through to the network instead.
-            if let Some(devices) = self.get_devices_from_registry(&jid).await
-                && !devices.is_empty()
-            {
+            // get_devices_from_registry returns None for an empty record (never a
+            // valid set — WA Web always keeps device 0), so a corrupted empty row
+            // falls through to the network here instead of being trusted.
+            if let Some(devices) = self.get_devices_from_registry(&jid).await {
                 all_devices.extend(devices);
                 continue;
             }

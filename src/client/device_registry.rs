@@ -636,7 +636,15 @@ impl Client {
         // L1: device_registry_cache (moka, fast)
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
-                return Some(Self::reconstruct_device_jids(jid, &record));
+                let devices = Self::reconstruct_device_jids(jid, &record);
+                // An empty record is never a valid device set — WA Web always keeps
+                // the primary (device 0) — so read it as a miss instead of `Some([])`.
+                // The 1:1 send path reads this directly and only warms from the network
+                // on `None`; returning `Some([])` would shadow that warmup and the
+                // bare-JID fallback, leaving a corrupted empty row unhealed.
+                if !devices.is_empty() {
+                    return Some(devices);
+                }
             }
         }
 
@@ -646,6 +654,10 @@ impl Client {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
                     let devices = Self::reconstruct_device_jids(jid, &record);
+                    // Same invariant as L1: an empty row is corruption, treat as a miss.
+                    if devices.is_empty() {
+                        continue;
+                    }
                     self.device_registry_cache
                         .insert(record.user.clone(), Arc::new(record))
                         .await;
@@ -1232,6 +1244,25 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert!(devices[0].is_lid(), "device JID should be LID-typed");
         assert_eq!(devices[0].user, lid, "device JID user should be the LID");
+    }
+
+    // A present-but-empty record must read as a miss (None), not Some([]). The
+    // 1:1 send path reads get_devices_from_registry directly and only warms from
+    // the network on None, so an empty Some would shadow that warmup and the
+    // bare-JID fallback, leaving the corrupted row unhealed on the send path.
+    #[tokio::test]
+    async fn get_devices_from_registry_reads_empty_record_as_miss() {
+        let client = create_test_client().await;
+        let user = "15551234567";
+        setup_device_record(&client, user, &[]).await;
+
+        assert!(
+            client
+                .get_devices_from_registry(&Jid::pn(user))
+                .await
+                .is_none(),
+            "an empty record must read as a miss, not Some([])"
+        );
     }
 
     // ── DB-fallback tests for patch helpers ──────────────────────────────
