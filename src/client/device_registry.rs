@@ -395,10 +395,14 @@ impl Client {
         // only keeps device 0 when it is already in the input, so after a clear the
         // primary would otherwise be lost, leaving a record with no device 0 (or an
         // empty list) that suppresses the usync re-fetch forever.
+        //
+        // The primary's key_index is never read (`filter_devices_by_key_index` keeps
+        // device 0 regardless and `is_key_index_valid` is not applied to it), so store
+        // `None` to match how device 0 is recorded everywhere else.
         if !record.devices.iter().any(|d| d.device_id == 0) {
             record.devices.push(wacore::store::traits::DeviceInfo {
                 device_id: 0,
-                key_index: Some(0),
+                key_index: None,
             });
         }
 
@@ -1231,11 +1235,18 @@ mod tests {
             .get("15551234567")
             .await
             .unwrap();
-        assert!(
-            updated.devices.iter().any(|d| d.device_id == 0),
-            "primary (device 0) must survive a raw_id mismatch clear, got {:?}",
-            updated.devices
-        );
+        let dev0 = updated
+            .devices
+            .iter()
+            .find(|d| d.device_id == 0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "primary (device 0) must survive a raw_id mismatch clear, got {:?}",
+                    updated.devices
+                )
+            });
+        // The re-seeded primary carries no key index (it is never read for device 0).
+        assert_eq!(dev0.key_index, None);
         assert!(updated.devices.iter().any(|d| d.device_id == 19));
         // Stale companion from the old identity is dropped by the clear.
         assert!(!updated.devices.iter().any(|d| d.device_id == 5));
@@ -1280,6 +1291,7 @@ mod tests {
             updated.devices
         );
         assert_eq!(updated.devices[0].device_id, 0);
+        assert_eq!(updated.devices[0].key_index, None);
     }
 
     #[tokio::test]
