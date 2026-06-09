@@ -123,32 +123,96 @@ fn build_user_nodes(users: &[IsOnWhatsAppUser]) -> Vec<Node> {
         .collect()
 }
 
-/// Parse LID JID from a `<lid val="..."/>` child node.
-fn parse_lid_jid(user_node: &NodeRef<'_>) -> Option<Jid> {
-    user_node.get_optional_child("lid").and_then(|lid_node| {
-        lid_node
-            .attrs()
-            .optional_string("val")
-            .and_then(|val| val.parse::<Jid>().ok())
-    })
-}
-
 /// Common fields parsed from a usync `<user>` node.
 struct ParsedUserFields {
     jid: Jid,
     lid: Option<Jid>,
+    lid_error: Option<UsyncSubprotocolError>,
     is_business: bool,
+    business_error: Option<UsyncSubprotocolError>,
     status: Option<String>,
+    status_error: Option<UsyncSubprotocolError>,
     verified_name: Option<VerifiedName>,
 }
 
-/// Parses the `<business><verified_name>` certificate that usync returns for
-/// business accounts (the `name` lives inside the cert protobuf). Mirrors
-/// WAWebUsyncBusiness `businessParser`.
-fn parse_verified_name(user_node: &NodeRef<'_>) -> Option<VerifiedName> {
-    let vn_node = user_node
-        .get_optional_child("business")?
-        .get_optional_child("verified_name")?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UsyncSubprotocolError {
+    pub code: Option<u16>,
+    pub text: Option<String>,
+    pub backoff: Option<u32>,
+}
+
+fn parse_subprotocol_error(protocol_node: &NodeRef<'_>) -> Option<UsyncSubprotocolError> {
+    let error_node = protocol_node.get_optional_child("error")?;
+    Some(UsyncSubprotocolError {
+        code: error_node
+            .attrs()
+            .optional_string("code")
+            .and_then(|s| s.parse().ok()),
+        text: error_node
+            .attrs()
+            .optional_string("text")
+            .map(|s| s.to_string()),
+        backoff: error_node
+            .attrs()
+            .optional_string("backoff")
+            .and_then(|s| s.parse().ok()),
+    })
+}
+
+fn usync_subprotocol_error_message(tag: &str, error: &UsyncSubprotocolError) -> String {
+    let code = error
+        .code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let text = error.text.as_deref().unwrap_or("");
+    format!("usync {tag} error {code}: {text}")
+}
+
+fn parse_lid_fields(user_node: &NodeRef<'_>) -> (Option<Jid>, Option<UsyncSubprotocolError>) {
+    match user_node.get_optional_child("lid") {
+        Some(lid_node) => {
+            if let Some(error) = parse_subprotocol_error(lid_node) {
+                (None, Some(error))
+            } else {
+                (
+                    lid_node
+                        .attrs()
+                        .optional_string("val")
+                        .and_then(|val| val.parse::<Jid>().ok()),
+                    None,
+                )
+            }
+        }
+        None => (None, None),
+    }
+}
+
+fn parse_contact_fields(
+    user_node: &NodeRef<'_>,
+    jid: &Jid,
+) -> (bool, Option<UsyncSubprotocolError>) {
+    match user_node.get_optional_child("contact") {
+        Some(contact_node) => {
+            if let Some(error) = parse_subprotocol_error(contact_node) {
+                (false, Some(error))
+            } else {
+                (
+                    contact_node
+                        .get_attr("type")
+                        .is_some_and(|value| value.as_str() == "in"),
+                    None,
+                )
+            }
+        }
+        None if jid.is_lid() => (true, None),
+        None => (false, None),
+    }
+}
+
+fn parse_verified_name_from_business(business_node: &NodeRef<'_>) -> Option<VerifiedName> {
+    let vn_node = business_node.get_optional_child("verified_name")?;
     // Treat an <error> child or an empty marker (no name, no cert) as absent,
     // mirroring the status/picture parsers, so `verified_name.is_some()` means a
     // real verified name was returned.
@@ -162,6 +226,21 @@ fn parse_verified_name(user_node: &NodeRef<'_>) -> Option<VerifiedName> {
     Some(parsed)
 }
 
+fn parse_business_fields(
+    user_node: &NodeRef<'_>,
+) -> (bool, Option<VerifiedName>, Option<UsyncSubprotocolError>) {
+    match user_node.get_optional_child("business") {
+        Some(business_node) => {
+            if let Some(error) = parse_subprotocol_error(business_node) {
+                (false, None, Some(error))
+            } else {
+                (true, parse_verified_name_from_business(business_node), None)
+            }
+        }
+        None => (false, None, None),
+    }
+}
+
 /// Parse common fields from a usync `<user>` node.
 fn parse_user_common_fields(user_node: &NodeRef<'_>) -> Option<ParsedUserFields> {
     let jid = user_node
@@ -170,45 +249,56 @@ fn parse_user_common_fields(user_node: &NodeRef<'_>) -> Option<ParsedUserFields>
         .parse::<Jid>()
         .ok()?;
 
-    let lid = parse_lid_jid(user_node);
+    let (lid, lid_error) = parse_lid_fields(user_node);
 
-    let status = user_node
-        .get_optional_child("status")
-        .and_then(|status_node| {
-            if status_node.get_optional_child("error").is_some() {
-                return None;
+    let (status, status_error) = match user_node.get_optional_child("status") {
+        Some(status_node) => {
+            if let Some(error) = parse_subprotocol_error(status_node) {
+                (None, Some(error))
+            } else {
+                let status = match status_node.content.as_deref() {
+                    Some(NodeContentRef::String(s)) if !s.is_empty() => Some(s.to_string()),
+                    _ => None,
+                };
+                (status, None)
             }
-            match status_node.content.as_deref() {
-                Some(NodeContentRef::String(s)) if !s.is_empty() => Some(s.to_string()),
-                _ => None,
-            }
-        });
+        }
+        None => (None, None),
+    };
 
-    let is_business = user_node.get_optional_child("business").is_some();
-    let verified_name = parse_verified_name(user_node);
+    let (is_business, verified_name, business_error) = parse_business_fields(user_node);
 
     Some(ParsedUserFields {
         jid,
         lid,
+        lid_error,
         is_business,
+        business_error,
         status,
+        status_error,
         verified_name,
     })
 }
 
-/// Parse picture ID as String (used in UserInfo).
-fn parse_picture_id_string(user_node: &NodeRef<'_>) -> Option<String> {
-    user_node
-        .get_optional_child("picture")
-        .and_then(|pic_node| {
-            if pic_node.get_optional_child("error").is_some() {
-                return None;
+fn parse_picture_id_fields(
+    user_node: &NodeRef<'_>,
+) -> (Option<String>, Option<UsyncSubprotocolError>) {
+    match user_node.get_optional_child("picture") {
+        Some(pic_node) => {
+            if let Some(error) = parse_subprotocol_error(pic_node) {
+                (None, Some(error))
+            } else {
+                (
+                    pic_node
+                        .attrs()
+                        .optional_string("id")
+                        .map(|s| s.to_string()),
+                    None,
+                )
             }
-            pic_node
-                .attrs()
-                .optional_string("id")
-                .map(|s| s.to_string())
-        })
+        }
+        None => (None, None),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -219,7 +309,10 @@ pub struct IsOnWhatsAppResult {
     /// From `pn_jid` response attribute; present when server returns LID as primary JID.
     pub pn_jid: Option<Jid>,
     pub is_registered: bool,
+    pub contact_error: Option<UsyncSubprotocolError>,
+    pub lid_error: Option<UsyncSubprotocolError>,
     pub is_business: bool,
+    pub business_error: Option<UsyncSubprotocolError>,
     /// Verified business name (decoded from `<business><verified_name>`), if any.
     pub verified_name: Option<VerifiedName>,
 }
@@ -230,14 +323,19 @@ pub struct IsOnWhatsAppResult {
 pub struct UserInfo {
     pub jid: Jid,
     pub lid: Option<Jid>,
+    pub lid_error: Option<UsyncSubprotocolError>,
     pub status: Option<String>,
+    pub status_error: Option<UsyncSubprotocolError>,
     pub picture_id: Option<String>,
+    pub picture_error: Option<UsyncSubprotocolError>,
     pub is_business: bool,
+    pub business_error: Option<UsyncSubprotocolError>,
     /// Verified business name (decoded from `<business><verified_name>`), if any.
     pub verified_name: Option<VerifiedName>,
     /// Device IDs from the `<devices version="2">` sublist the same usync query
     /// returns (device 0 is the primary). Empty if the server omitted it.
     pub devices: Vec<u16>,
+    pub devices_error: Option<UsyncSubprotocolError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,19 +383,11 @@ fn check_usync_result_errors(usync: &NodeRef<'_>) -> Result<(), anyhow::Error> {
     let Some(result_node) = usync.get_optional_child("result") else {
         return Ok(());
     };
-    for tag in ["contact", "lid", "business"] {
+    for tag in ["contact", "lid", "business", "status", "picture", "devices"] {
         if let Some(protocol_node) = result_node.get_optional_child(tag)
-            && let Some(error_node) = protocol_node.get_optional_child("error")
+            && let Some(error) = parse_subprotocol_error(protocol_node)
         {
-            let code = error_node
-                .attrs()
-                .optional_string("code")
-                .unwrap_or_default();
-            let text = error_node
-                .attrs()
-                .optional_string("text")
-                .unwrap_or_default();
-            return Err(anyhow!("usync {tag} error {code}: {text}"));
+            return Err(anyhow!(usync_subprotocol_error_message(tag, &error)));
         }
     }
     Ok(())
@@ -361,27 +451,19 @@ impl IqSpec for IsOnWhatsAppSpec {
                 .optional_string("pn_jid")
                 .and_then(|s| s.parse::<Jid>().ok());
 
-            let lid = parse_lid_jid(user_node);
-
-            let contact_node = user_node.get_optional_child("contact");
-            // LID queries omit contact protocol; presence in response implies registered
-            let is_registered = if jid.is_lid() && contact_node.is_none() {
-                true
-            } else {
-                contact_node
-                    .map(|c| c.get_attr("type").is_some_and(|v| v.as_str() == "in"))
-                    .unwrap_or(false)
-            };
-
-            let is_business = user_node.get_optional_child("business").is_some();
-            let verified_name = parse_verified_name(user_node);
+            let (lid, lid_error) = parse_lid_fields(user_node);
+            let (is_registered, contact_error) = parse_contact_fields(user_node, &jid);
+            let (is_business, verified_name, business_error) = parse_business_fields(user_node);
 
             results.push(IsOnWhatsAppResult {
                 jid,
                 lid,
                 pn_jid,
                 is_registered,
+                contact_error,
+                lid_error,
                 is_business,
+                business_error,
                 verified_name,
             });
         }
@@ -454,6 +536,7 @@ impl IqSpec for UserInfoSpec {
         let usync = response
             .get_optional_child("usync")
             .ok_or_else(|| anyhow!("Response missing <usync> node"))?;
+        check_usync_result_errors(usync)?;
 
         let list = usync
             .get_optional_child("list")
@@ -463,16 +546,23 @@ impl IqSpec for UserInfoSpec {
 
         for user_node in list.get_children_by_tag("user") {
             if let Some(fields) = parse_user_common_fields(user_node) {
+                let (picture_id, picture_error) = parse_picture_id_fields(user_node);
+                let (devices, devices_error) = parse_user_device_ids(user_node);
                 results.insert(
                     fields.jid.clone(),
                     UserInfo {
                         jid: fields.jid,
                         lid: fields.lid,
+                        lid_error: fields.lid_error,
                         status: fields.status,
-                        picture_id: parse_picture_id_string(user_node),
+                        status_error: fields.status_error,
+                        picture_id,
+                        picture_error,
                         is_business: fields.is_business,
+                        business_error: fields.business_error,
                         verified_name: fields.verified_name,
-                        devices: parse_user_device_ids(user_node),
+                        devices,
+                        devices_error,
                     },
                 );
             }
@@ -482,16 +572,22 @@ impl IqSpec for UserInfoSpec {
     }
 }
 
-/// Device IDs from a `<user>`'s `<devices><device-list><device id="N"/>` sublist.
-/// Returns empty when the server omitted the sublist or every id is malformed.
-fn parse_user_device_ids(user_node: &NodeRef<'_>) -> Vec<u16> {
-    let Some(device_list) = user_node.get_optional_child_by_tag(&["devices", "device-list"]) else {
-        return Vec::new();
+/// Device IDs plus a subprotocol error if `<devices><error>` was returned.
+fn parse_user_device_ids(user_node: &NodeRef<'_>) -> (Vec<u16>, Option<UsyncSubprotocolError>) {
+    let Some(devices_node) = user_node.get_optional_child("devices") else {
+        return (Vec::new(), None);
     };
-    device_list
+    if let Some(error) = parse_subprotocol_error(devices_node) {
+        return (Vec::new(), Some(error));
+    }
+    let Some(device_list) = devices_node.get_optional_child("device-list") else {
+        return (Vec::new(), None);
+    };
+    let devices = device_list
         .get_children_by_tag("device")
         .filter_map(|d| d.attrs().optional_string("id").and_then(|s| s.parse().ok()))
-        .collect()
+        .collect();
+    (devices, None)
 }
 
 // Re-export types from wacore::usync for convenience
@@ -619,9 +715,13 @@ impl IqSpec for DeviceListSpec {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
-        let list_node = response
-            .get_optional_child_by_tag(&["usync", "list"])
-            .ok_or_else(|| anyhow!("<usync> or <list> not found in usync response"))?;
+        let usync = response
+            .get_optional_child("usync")
+            .ok_or_else(|| anyhow!("<usync> not found in usync response"))?;
+        check_usync_result_errors(usync)?;
+        let list_node = usync
+            .get_optional_child("list")
+            .ok_or_else(|| anyhow!("<list> not found in usync response"))?;
 
         let mut device_lists = Vec::new();
         let mut lid_mappings = Vec::new();
@@ -631,6 +731,14 @@ impl IqSpec for DeviceListSpec {
                 .attrs()
                 .optional_jid("jid")
                 .ok_or_else(|| anyhow!("user node missing required 'jid' attribute"))?;
+            if let Some(devices_node) = user_node.get_optional_child("devices")
+                && let Some(error) = parse_subprotocol_error(devices_node)
+            {
+                return Err(anyhow!(
+                    "{} for {user_jid}",
+                    usync_subprotocol_error_message("devices", &error)
+                ));
+            }
 
             // Extract LID mapping if present
             if user_jid.server == wacore_binary::Server::Pn
@@ -787,9 +895,24 @@ impl IqSpec for LidQuerySpec {
             .get_optional_child("usync")
             .ok_or_else(|| anyhow!("LID query response missing <usync> node"))?;
         check_usync_result_errors(usync)?;
-        usync
+        let list = usync
             .get_optional_child("list")
             .ok_or_else(|| anyhow!("LID query response missing <list> node"))?;
+        for user_node in list.get_children_by_tag("user") {
+            let user_jid = user_node
+                .attrs()
+                .optional_string("jid")
+                .map(|jid| jid.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            if let Some(lid_node) = user_node.get_optional_child("lid")
+                && let Some(error) = parse_subprotocol_error(lid_node)
+            {
+                return Err(anyhow!(
+                    "{} for {user_jid}",
+                    usync_subprotocol_error_message("lid", &error)
+                ));
+            }
+        }
 
         let lid_mappings = crate::usync::parse_lid_mappings_from_response(response);
         Ok(LidQueryResponse { lid_mappings })
@@ -1023,6 +1146,55 @@ mod tests {
     }
 
     #[test]
+    fn is_on_whatsapp_preserves_user_subprotocol_errors() {
+        let spec = IsOnWhatsAppSpec::new(
+            vec![pn_user("1234567890")],
+            "test-sid",
+            IsOnWhatsAppQueryType::Pn,
+        );
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "1234567890@s.whatsapp.net")
+                        .children([
+                            NodeBuilder::new("contact")
+                                .children([NodeBuilder::new("error")
+                                    .attr("code", "403")
+                                    .attr("text", "blocked")
+                                    .build()])
+                                .build(),
+                            NodeBuilder::new("lid")
+                                .children([NodeBuilder::new("error")
+                                    .attr("code", "404")
+                                    .attr("text", "missing")
+                                    .build()])
+                                .build(),
+                            NodeBuilder::new("business")
+                                .children([NodeBuilder::new("error")
+                                    .attr("code", "500")
+                                    .attr("text", "server")
+                                    .build()])
+                                .build(),
+                        ])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].is_registered);
+        assert_eq!(results[0].contact_error.as_ref().unwrap().code, Some(403));
+        assert!(results[0].lid.is_none());
+        assert_eq!(results[0].lid_error.as_ref().unwrap().code, Some(404));
+        assert!(!results[0].is_business);
+        assert_eq!(results[0].business_error.as_ref().unwrap().code, Some(500));
+    }
+
+    #[test]
     fn test_user_info_spec_build_iq() {
         let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
         let spec = UserInfoSpec::new(vec![jid], "test-sid");
@@ -1087,6 +1259,99 @@ mod tests {
         assert!(info.lid.is_some());
         // The <devices> sublist the same query returns is now surfaced, not dropped.
         assert_eq!(info.devices, vec![0, 1]);
+    }
+
+    #[test]
+    fn user_info_preserves_subprotocol_errors() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let spec = UserInfoSpec::new(vec![jid.clone()], "test-sid");
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "1234567890@s.whatsapp.net")
+                        .children([
+                            NodeBuilder::new("lid")
+                                .children([NodeBuilder::new("error")
+                                    .attr("code", "409")
+                                    .attr("text", "lid-conflict")
+                                    .build()])
+                                .build(),
+                            NodeBuilder::new("status")
+                                .children([NodeBuilder::new("error")
+                                    .attr("code", "401")
+                                    .attr("text", "privacy")
+                                    .build()])
+                                .build(),
+                            NodeBuilder::new("picture")
+                                .children([NodeBuilder::new("error")
+                                    .attr("code", "404")
+                                    .attr("text", "missing")
+                                    .build()])
+                                .build(),
+                            NodeBuilder::new("devices")
+                                .children([NodeBuilder::new("error")
+                                    .attr("code", "500")
+                                    .attr("text", "server")
+                                    .build()])
+                                .build(),
+                            NodeBuilder::new("business")
+                                .children([NodeBuilder::new("error")
+                                    .attr("code", "406")
+                                    .attr("text", "business-error")
+                                    .build()])
+                                .build(),
+                        ])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        let info = results.get(&jid).unwrap();
+
+        assert!(info.lid.is_none());
+        assert_eq!(info.lid_error.as_ref().unwrap().code, Some(409));
+        assert!(info.status.is_none());
+        assert_eq!(info.status_error.as_ref().unwrap().code, Some(401));
+        assert_eq!(
+            info.status_error.as_ref().unwrap().text.as_deref(),
+            Some("privacy")
+        );
+        assert!(info.picture_id.is_none());
+        assert_eq!(info.picture_error.as_ref().unwrap().code, Some(404));
+        assert!(info.devices.is_empty());
+        assert_eq!(info.devices_error.as_ref().unwrap().code, Some(500));
+        assert!(!info.is_business);
+        assert_eq!(info.business_error.as_ref().unwrap().code, Some(406));
+    }
+
+    #[test]
+    fn user_info_result_subprotocol_error_is_rejected() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let spec = UserInfoSpec::new(vec![jid], "test-sid");
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([
+                    NodeBuilder::new("result")
+                        .children([NodeBuilder::new("status")
+                            .children([NodeBuilder::new("error")
+                                .attr("code", "403")
+                                .attr("text", "blocked")
+                                .build()])
+                            .build()])
+                        .build(),
+                    NodeBuilder::new("list").build(),
+                ])
+                .build()])
+            .build();
+
+        let err = spec.parse_response(&response.as_node_ref()).unwrap_err();
+        assert!(err.to_string().contains("usync status error 403: blocked"));
     }
 
     #[test]
@@ -1255,6 +1520,64 @@ mod tests {
     }
 
     #[test]
+    fn device_list_devices_error_is_rejected() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let spec = DeviceListSpec::new(vec![jid], "test-sid");
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "1234567890@s.whatsapp.net")
+                        .children([NodeBuilder::new("devices")
+                            .children([NodeBuilder::new("error")
+                                .attr("code", "500")
+                                .attr("text", "server")
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let err = spec.parse_response(&response.as_node_ref()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("usync devices error 500: server for 1234567890@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn lid_query_lid_error_is_rejected() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let spec = LidQuerySpec::new(vec![jid], "test-sid");
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "1234567890@s.whatsapp.net")
+                        .children([NodeBuilder::new("lid")
+                            .children([NodeBuilder::new("error")
+                                .attr("code", "404")
+                                .attr("text", "missing")
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let err = spec.parse_response(&response.as_node_ref()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("usync lid error 404: missing for 1234567890@s.whatsapp.net")
+        );
+    }
+
+    #[test]
     fn test_device_list_spec_parse_response_multiple_users() {
         let jid1: Jid = "1111111111@s.whatsapp.net".parse().unwrap();
         let jid2: Jid = "2222222222@s.whatsapp.net".parse().unwrap();
@@ -1340,32 +1663,28 @@ mod tests {
 
     #[test]
     fn parse_verified_name_skips_error_and_empty() {
-        let user = |vn: Node| {
-            NodeBuilder::new("user")
-                .children([NodeBuilder::new("business").children([vn]).build()])
-                .build()
-        };
+        let business = |vn: Node| NodeBuilder::new("business").children([vn]).build();
 
         // <verified_name><error/></verified_name> -> absent
-        let err = user(
+        let err = business(
             NodeBuilder::new("verified_name")
                 .children([NodeBuilder::new("error").attr("code", "404").build()])
                 .build(),
         );
-        assert!(parse_verified_name(&err.as_node_ref()).is_none());
+        assert!(parse_verified_name_from_business(&err.as_node_ref()).is_none());
 
         // empty <verified_name/> (no attrs, no cert) -> absent
-        let empty = user(NodeBuilder::new("verified_name").build());
-        assert!(parse_verified_name(&empty.as_node_ref()).is_none());
+        let empty = business(NodeBuilder::new("verified_name").build());
+        assert!(parse_verified_name_from_business(&empty.as_node_ref()).is_none());
 
         // real name attr -> present
-        let real = user(
+        let real = business(
             NodeBuilder::new("verified_name")
                 .attr("name", "Acme")
                 .build(),
         );
         assert_eq!(
-            parse_verified_name(&real.as_node_ref())
+            parse_verified_name_from_business(&real.as_node_ref())
                 .expect("real name")
                 .name
                 .as_deref(),

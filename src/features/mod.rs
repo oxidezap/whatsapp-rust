@@ -29,7 +29,9 @@ pub use community::{
 
 pub use chatstate::{ChatStateType, Chatstate};
 
-pub use contacts::{Contacts, IsOnWhatsAppResult, ProfilePicture, UserInfo, VerifiedName};
+pub use contacts::{
+    Contacts, IsOnWhatsAppResult, ProfilePicture, UserInfo, UsyncSubprotocolError, VerifiedName,
+};
 
 pub use events::{EventCreationParams, EventResponseType, Events};
 

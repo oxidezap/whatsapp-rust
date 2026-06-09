@@ -92,8 +92,8 @@ pub use features::{
     ParticipantChangeResponse, ParticipantType, PictureType, Presence, PresenceError,
     PresenceStatus, Profile, ProfilePicture, SecretEncKind, SecretEncrypted,
     SetProfilePictureResponse, Signal, Status, StatusPrivacySetting, StatusSendOptions,
-    SyncActionMessageRange, TcToken, UnlinkSubgroupsResult, UserInfo, VerifiedName, group_type,
-    message_key, message_range,
+    SyncActionMessageRange, TcToken, UnlinkSubgroupsResult, UserInfo, UsyncSubprotocolError,
+    VerifiedName, group_type, message_key, message_range,
 };
 
 pub mod bot;

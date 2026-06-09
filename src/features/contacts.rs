@@ -14,7 +14,7 @@ use wacore_binary::{Jid, JidExt};
 
 // Re-export types from wacore
 pub use wacore::iq::contacts::ProfilePicture;
-pub use wacore::iq::usync::{IsOnWhatsAppResult, UserInfo};
+pub use wacore::iq::usync::{IsOnWhatsAppResult, UserInfo, UsyncSubprotocolError};
 pub use wacore::stanza::business::VerifiedName;
 
 fn ensure_is_on_whatsapp_jids_supported(jids: &[Jid]) -> Result<()> {
