@@ -122,12 +122,13 @@ fn resolve_retry_chat_info(
             .attrs()
             .optional_jid("participant")
             .unwrap_or_else(|| receipt.source.sender.clone());
+        let is_bot = requester.is_bot();
         Some(RetryChatInfo {
             chat: from.clone(),
             requester,
             original_from: from.clone(),
             recipient: node.attrs().optional_jid("recipient"),
-            is_bot: false,
+            is_bot,
         })
     } else {
         // DM: resolve chat target via getTargetChat logic.
@@ -170,6 +171,16 @@ fn resolve_retry_chat_info(
             is_bot,
         })
     }
+}
+
+fn validate_retry_prekey_presence(
+    keys_node: &NodeRef<'_>,
+    is_bot_retry: bool,
+) -> Result<(), anyhow::Error> {
+    if !is_bot_retry && keys_node.get_optional_child("key").is_none() {
+        anyhow::bail!("regular retry key bundle missing one-time prekey");
+    }
+    Ok(())
 }
 
 // No retry_count in the key: concurrent receipts for the same participant must
@@ -616,7 +627,7 @@ impl Client {
         //    `!is_status_broadcast()`; WA Web runs it unconditionally.
         let keys_node_present = node.get_optional_child("keys").is_some();
         let key_bundle_result = self
-            .process_retry_key_bundle(node, resolved_jid, is_peer)
+            .process_retry_key_bundle(node, resolved_jid, is_peer, info.is_bot)
             .await;
         let key_bundle_processed = key_bundle_result.is_ok();
 
@@ -841,16 +852,19 @@ impl Client {
     /// * `node` - The retry receipt node containing the key bundle
     /// * `requester_jid` - The JID of the device requesting the retry
     /// * `is_peer` - Whether this is a peer device (our own device)
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.process_key_bundle", level = "debug", skip_all, fields(peer = %requester_jid.observe(), is_peer), err(Debug)))]
+    /// * `is_bot_retry` - Whether the retry follows the bot_retry parser rules
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.process_key_bundle", level = "debug", skip_all, fields(peer = %requester_jid.observe(), is_peer, is_bot_retry), err(Debug)))]
     async fn process_retry_key_bundle(
         &self,
         node: &NodeRef<'_>,
         requester_jid: &wacore_binary::Jid,
         is_peer: bool,
+        is_bot_retry: bool,
     ) -> Result<(), anyhow::Error> {
         let keys_node = node
             .get_optional_child("keys")
             .ok_or_else(|| anyhow::anyhow!("<keys> child missing from retry receipt"))?;
+        validate_retry_prekey_presence(keys_node, is_bot_retry)?;
 
         let registration_node = node.get_optional_child("registration");
 
@@ -2305,6 +2319,30 @@ mod tests {
     }
 
     #[test]
+    fn regular_retry_requires_one_time_prekey() {
+        let keys = NodeBuilder::new("keys").build();
+
+        let err = validate_retry_prekey_presence(&keys.as_node_ref(), false).unwrap_err();
+        assert!(err.to_string().contains("missing one-time prekey"));
+    }
+
+    #[test]
+    fn bot_retry_allows_missing_one_time_prekey() {
+        let keys = NodeBuilder::new("keys").build();
+
+        validate_retry_prekey_presence(&keys.as_node_ref(), true).unwrap();
+    }
+
+    #[test]
+    fn regular_retry_allows_present_one_time_prekey() {
+        let keys = NodeBuilder::new("keys")
+            .children([NodeBuilder::new("key").build()])
+            .build();
+
+        validate_retry_prekey_presence(&keys.as_node_ref(), false).unwrap();
+    }
+
+    #[test]
     fn extract_registration_id_from_node_test() {
         use wacore_binary::{Attrs, Node};
 
@@ -2714,6 +2752,31 @@ mod tests {
         assert_eq!(info.chat.user, "120363021033254949");
         assert!(info.requester.is_lid());
         assert_eq!(info.requester.device(), 33);
+    }
+
+    #[test]
+    fn resolve_retry_chat_info_group_bot_participant_marks_bot_retry() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt")
+            .attr("participant", "somebot:4@bot")
+            .build();
+        let receipt = Receipt {
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "somebot:4@bot".parse().unwrap(),
+                ..Default::default()
+            },
+            message_ids: vec!["MSG001".to_string()],
+            timestamp: wacore::time::now_utc(),
+            r#type: crate::types::presence::ReceiptType::Retry,
+            offline: false,
+        };
+
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        assert!(info.chat.is_group());
+        assert!(info.is_bot);
     }
 
     #[test]
