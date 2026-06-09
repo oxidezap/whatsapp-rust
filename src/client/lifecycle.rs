@@ -211,7 +211,7 @@ impl Client {
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
-            custom_enc_handlers: Arc::new(async_lock::RwLock::new(HashMap::new())),
+            custom_enc_handlers: std::sync::OnceLock::new(),
             chatstate_handlers: Arc::new(RwLock::new(Vec::new())),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
             device_registry_cache: cache_config.device_registry_cache.build_typed_ttl(

@@ -7053,11 +7053,16 @@ async fn custom_handler_only_skips_fallback_ack() {
     let handler = Arc::new(NoopHandler {
         calls: Arc::clone(&calls),
     });
-    client
-        .custom_enc_handlers
-        .write()
-        .await
-        .insert("frskmsg".to_string(), handler as Arc<dyn EncHandler>);
+    // custom_enc_handlers is set-once (immutable after build); capturing_client
+    // builds via Client::new and leaves it unset, so set it here.
+    let mut handlers = std::collections::HashMap::new();
+    handlers.insert("frskmsg".to_string(), handler as Arc<dyn EncHandler>);
+    // set() returns Err(map) on the already-set path; the map isn't Debug, so
+    // assert via is_ok() rather than expect().
+    assert!(
+        client.custom_enc_handlers.set(handlers).is_ok(),
+        "custom_enc_handlers not yet set"
+    );
 
     let node = NodeBuilder::new("message")
         .attr("from", "5511777776666@s.whatsapp.net")

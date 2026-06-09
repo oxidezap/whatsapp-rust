@@ -104,7 +104,7 @@ impl Client {
             signal_cache_identities: sig_identities,
             signal_cache_sender_keys: sig_sender_keys,
             chatstate_handlers: self.chatstate_handlers.read().await.len(),
-            custom_enc_handlers: self.custom_enc_handlers.read().await.len(),
+            custom_enc_handlers: self.custom_enc_handlers.get().map_or(0, |m| m.len()),
         }
     }
 

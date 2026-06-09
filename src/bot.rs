@@ -770,14 +770,9 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         // drops the AbortHandle and aborts the task.
         let _ = client.saver_handle.set(saver_handle);
 
-        // Register custom enc handlers
-        for (enc_type, handler) in self.custom_enc_handlers {
-            client
-                .custom_enc_handlers
-                .write()
-                .await
-                .insert(enc_type, handler);
-        }
+        // Register custom enc handlers. Immutable after build, so set the whole
+        // map once; the receive hot path then reads it lock-free.
+        let _ = client.custom_enc_handlers.set(self.custom_enc_handlers);
 
         if self.skip_history_sync {
             client.set_skip_history_sync(true);

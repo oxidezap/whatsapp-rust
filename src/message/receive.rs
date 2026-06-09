@@ -131,6 +131,11 @@ impl Client {
         let mut had_unknown_enc = false;
         let mut had_custom_handler = false;
 
+        // Custom enc handlers are set once at Bot::build and immutable after, so
+        // read the map lock-free once instead of acquiring an async RwLock guard
+        // per enc node. `None` (the common zero-handler bot) skips the lookup.
+        let custom_enc_handlers = self.custom_enc_handlers.get();
+
         for enc_node in &all_enc_nodes {
             // Parse sender retry count (WA Web: e.maybeAttrInt("count") ?? 0)
             // Clamp to MAX_DECRYPT_RETRIES to prevent u64→u8 truncation on unexpected values.
@@ -159,12 +164,8 @@ impl Client {
                 }
             };
 
-            if let Some(handler) = self
-                .custom_enc_handlers
-                .read()
-                .await
-                .get(enc_type.as_ref())
-                .cloned()
+            if let Some(handler) =
+                custom_enc_handlers.and_then(|m| m.get(enc_type.as_ref()).cloned())
             {
                 let handler_clone = handler;
                 let client_clone = self.clone();

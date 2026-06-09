@@ -506,8 +506,10 @@ pub struct Client {
     /// Tracks the pending pair code request and ephemeral keys.
     pub(crate) pair_code_state: Arc<Mutex<wacore::pair_code::PairCodeState>>,
 
-    /// Custom handlers for encrypted message types
-    pub custom_enc_handlers: Arc<async_lock::RwLock<HashMap<String, Arc<dyn EncHandler>>>>,
+    /// Custom handlers for encrypted message types. Set once at `Bot::build` and
+    /// immutable afterward, so the receive hot path reads it with a plain
+    /// `OnceLock::get` (no lock) and no per-node guard acquisition.
+    pub custom_enc_handlers: std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>,
 
     /// Chat state (typing indicator) handlers registered by external consumers.
     /// Each handler receives a `ChatStateEvent` describing the chat, optional participant and state.
