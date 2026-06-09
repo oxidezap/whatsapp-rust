@@ -497,6 +497,14 @@ impl Client {
     /// redistributed on the next group send.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.patch_device_remove", level = "debug", skip_all, fields(device_id = device_id)))]
     pub(crate) async fn patch_device_remove(&self, user: &str, device_id: u32) {
+        // WA Web's remove path re-adds the primary unconditionally, mirroring its
+        // add path: device 0 is never dropped. Without this guard a remove for the
+        // primary would both delete its sender-key rows and persist a record with no
+        // device 0, which then suppresses the usync re-fetch forever (the symmetric
+        // failure to the add path fixed above).
+        if device_id == 0 {
+            return;
+        }
         if let Some(mut record) = self.load_device_record(user).await {
             let before = record.devices.len();
             record.devices.retain(|d| d.device_id != device_id);
@@ -1902,6 +1910,27 @@ mod tests {
             .await
             .unwrap();
         assert!(rows.iter().all(|(jid, _)| jid != &device_jid));
+    }
+
+    // A remove targeting the primary (device 0) must be a no-op: WA Web never
+    // drops device 0. Regression guard for the symmetric failure to the add path
+    // — dropping the primary persists a record that suppresses usync forever.
+    #[tokio::test]
+    async fn patch_device_remove_keeps_primary() {
+        let client = create_test_client().await;
+        let user = "15551234567";
+        setup_device_record(&client, user, &[0, 5]).await;
+
+        client.patch_device_remove(user, 0).await;
+
+        let record = client.device_registry_cache.get(user).await.unwrap();
+        assert!(
+            record.devices.iter().any(|d| d.device_id == 0),
+            "remove for the primary must be ignored, got {:?}",
+            record.devices
+        );
+        // The companion is untouched too — the remove is a full no-op.
+        assert!(record.devices.iter().any(|d| d.device_id == 5));
     }
 
     #[tokio::test]
