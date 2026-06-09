@@ -230,10 +230,7 @@ fn test_external_mutations_decode_from_syncd_mutations() {
 }
 
 #[test]
-fn test_validate_patch_macs_skips_on_has_missing_remove() {
-    // When has_missing_remove is true, MAC validation should not fail
-    // because we expect the hash to diverge
-
+fn test_validate_patch_macs_rejects_on_has_missing_remove() {
     let master_key = [7u8; 32];
     let keys = expand_app_state_keys(&master_key);
     let key_id = b"test_key";
@@ -260,7 +257,6 @@ fn test_validate_patch_macs_skips_on_has_missing_remove() {
         client_debug_data: None,
     };
 
-    // Without has_missing_remove, this would fail
     let result_without_flag =
         validate_patch_macs(&patch, &state, &keys, collection_name, false, false);
     assert!(
@@ -268,11 +264,10 @@ fn test_validate_patch_macs_skips_on_has_missing_remove() {
         "Should fail MAC validation without has_missing_remove"
     );
 
-    // With has_missing_remove, this should succeed (MAC mismatch is expected)
     let result_with_flag = validate_patch_macs(&patch, &state, &keys, collection_name, false, true);
     assert!(
-        result_with_flag.is_ok(),
-        "Should pass MAC validation with has_missing_remove=true"
+        result_with_flag.is_err(),
+        "Should reject MAC mismatch even with has_missing_remove=true"
     );
 }
 
