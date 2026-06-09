@@ -5,7 +5,7 @@
 
 use crate::client::Client;
 use crate::request::IqError;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use log::debug;
 use std::collections::HashMap;
 use wacore::iq::contacts::{ProfilePictureSpec, ProfilePictureType};
@@ -16,6 +16,13 @@ use wacore_binary::{Jid, JidExt};
 pub use wacore::iq::contacts::ProfilePicture;
 pub use wacore::iq::usync::{IsOnWhatsAppResult, UserInfo};
 pub use wacore::stanza::business::VerifiedName;
+
+fn ensure_is_on_whatsapp_jids_supported(jids: &[Jid]) -> Result<()> {
+    if let Some(jid) = jids.iter().find(|jid| !jid.is_pn() && !jid.is_lid()) {
+        bail!("is_on_whatsapp only supports PN and LID JIDs, got {jid}");
+    }
+    Ok(())
+}
 
 pub struct Contacts<'a> {
     client: &'a Client,
@@ -64,6 +71,7 @@ impl<'a> Contacts<'a> {
         if jids.is_empty() {
             return Ok(Vec::new());
         }
+        ensure_is_on_whatsapp_jids_supported(jids)?;
 
         debug!("is_on_whatsapp: checking {} JIDs", jids.len());
 
@@ -82,7 +90,7 @@ impl<'a> Contacts<'a> {
                     known_lid: None,
                 });
             } else {
-                log::warn!("is_on_whatsapp: skipping unsupported JID type: {jid}");
+                unreachable!("validated is_on_whatsapp JID type");
             }
         }
 
@@ -205,5 +213,19 @@ mod tests {
         assert_eq!(pic.id, "123456789");
         assert_eq!(pic.url, "https://example.com/pic.jpg");
         assert!(pic.direct_path.is_some());
+    }
+
+    #[test]
+    fn is_on_whatsapp_accepts_pn_and_lid_jids() {
+        ensure_is_on_whatsapp_jids_supported(&[Jid::pn("15550000001"), Jid::lid("100000001")])
+            .unwrap();
+    }
+
+    #[test]
+    fn is_on_whatsapp_rejects_unsupported_jid_type() {
+        let err = ensure_is_on_whatsapp_jids_supported(&[Jid::group("15550000001-1234567890")])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("only supports PN and LID JIDs"));
     }
 }
