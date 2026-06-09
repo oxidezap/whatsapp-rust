@@ -112,7 +112,7 @@ fn resolve_retry_chat_info(
     node: &NodeRef<'_>,
     own_pn: Option<&Jid>,
     own_lid: Option<&Jid>,
-) -> RetryChatInfo {
+) -> Option<RetryChatInfo> {
     let from = &receipt.source.chat;
 
     if from.is_group() || from.is_status_broadcast() {
@@ -122,13 +122,13 @@ fn resolve_retry_chat_info(
             .attrs()
             .optional_jid("participant")
             .unwrap_or_else(|| receipt.source.sender.clone());
-        RetryChatInfo {
+        Some(RetryChatInfo {
             chat: from.clone(),
             requester,
             original_from: from.clone(),
             recipient: node.attrs().optional_jid("recipient"),
             is_bot: false,
-        }
+        })
     } else {
         // DM: resolve chat target via getTargetChat logic.
         let recipient = node.attrs().optional_jid("recipient");
@@ -138,9 +138,6 @@ fn resolve_retry_chat_info(
         // 1. Bot + recipient → chat = recipient
         // 2. Peer device + recipient → chat = recipient
         // 3. Peer device without recipient → WA Web aborts (returns null).
-        //    We log+fall back to `from.to_non_ad()` rather than dropping
-        //    the receipt; the message lookup will likely miss but the
-        //    retry receipt is at least acknowledged downstream.
         // 4. Normal user → chat = asUserWidOrThrow(from) = from.to_non_ad()
         let is_peer = own_pn.is_some_and(|pn| from.is_same_user_as(pn))
             || own_lid.is_some_and(|lid| from.is_same_user_as(lid));
@@ -150,13 +147,9 @@ fn resolve_retry_chat_info(
         } else if is_peer {
             match recipient.as_ref() {
                 Some(r) => r.to_non_ad(),
-                // No recipient on peer retry — chat will be our own JID,
-                // message lookup will likely fail. WA Web returns null here.
                 None => {
-                    log::warn!(
-                        "Peer device retry without recipient attr — message lookup may fail"
-                    );
-                    from.to_non_ad()
+                    log::warn!("Ignoring peer device retry without recipient attr");
+                    return None;
                 }
             }
         } else {
@@ -169,13 +162,13 @@ fn resolve_retry_chat_info(
             from.clone()
         };
 
-        RetryChatInfo {
+        Some(RetryChatInfo {
             chat,
             requester,
             original_from: from.clone(),
             recipient,
             is_bot,
-        }
+        })
     }
 }
 
@@ -228,12 +221,14 @@ impl Client {
         }
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
-        let mut info = resolve_retry_chat_info(
+        let Some(mut info) = resolve_retry_chat_info(
             receipt,
             nr,
             device_snapshot.pn.as_ref(),
             device_snapshot.lid.as_ref(),
-        );
+        ) else {
+            return Ok(());
+        };
         let is_group_or_status = info.chat.is_group() || info.chat.is_status_broadcast();
 
         // WA Web doesn't dedupe receipts (Message/Queue.js just serializes per-chat);
@@ -1247,6 +1242,25 @@ mod tests {
     use wacore::types::jid::JidExt as _;
     use wacore_binary::{Jid, JidExt};
     use waproto::whatsapp as wa;
+
+    fn resolve_retry_chat_info(
+        receipt: &Receipt,
+        node: &NodeRef<'_>,
+        own_pn: Option<&Jid>,
+        own_lid: Option<&Jid>,
+    ) -> RetryChatInfo {
+        super::resolve_retry_chat_info(receipt, node, own_pn, own_lid)
+            .expect("retry should resolve a target chat")
+    }
+
+    fn maybe_resolve_retry_chat_info(
+        receipt: &Receipt,
+        node: &NodeRef<'_>,
+        own_pn: Option<&Jid>,
+        own_lid: Option<&Jid>,
+    ) -> Option<RetryChatInfo> {
+        super::resolve_retry_chat_info(receipt, node, own_pn, own_lid)
+    }
 
     #[tokio::test]
     async fn recent_message_cache_insert_and_take() {
@@ -3188,16 +3202,15 @@ mod tests {
     fn resolve_retry_chat_info_peer_device_without_recipient() {
         use wacore_binary::builder::NodeBuilder;
 
-        // Peer retry without recipient attr — should fall back to from
+        // Peer retry without recipient attr has no target chat in WA Web.
         let our_pn: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
         let node = NodeBuilder::new("receipt").build();
         let receipt = make_test_receipt("5511999999999:2@s.whatsapp.net");
 
-        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), Some(&our_pn), None);
+        let info =
+            maybe_resolve_retry_chat_info(&receipt, &node.as_node_ref(), Some(&our_pn), None);
 
-        // Falls back to from.to_non_ad() (our own bare JID)
-        assert_eq!(info.chat.user, our_pn.user);
-        assert_eq!(info.chat.device(), 0);
+        assert!(info.is_none());
     }
 
     #[test]
