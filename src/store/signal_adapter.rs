@@ -309,6 +309,13 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
     ) -> std::sync::Arc<async_lock::Mutex<()>> {
         self.0.cache.sender_key_lock(sender_key_name).await
     }
+
+    async fn session_setup_lock(
+        &self,
+        sender_key_name: &SenderKeyName,
+    ) -> std::sync::Arc<async_lock::Mutex<()>> {
+        self.0.cache.session_setup_lock(sender_key_name).await
+    }
 }
 
 #[cfg(test)]

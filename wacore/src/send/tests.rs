@@ -354,7 +354,9 @@ fn build_member_label_message_preserves_unicode() {
 #[derive(Clone, Default)]
 struct ChainLockProbe {
     lock: std::sync::Arc<async_lock::Mutex<()>>,
+    setup_lock: std::sync::Arc<async_lock::Mutex<()>>,
     fetched_under_lock: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fetched_without_setup_lock: std::sync::Arc<std::sync::atomic::AtomicBool>,
     fetch_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -441,6 +443,12 @@ impl SendContextResolver for MockSendContextResolver {
             if probe.lock.try_lock().is_none() {
                 probe
                     .fetched_under_lock
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            // The setup lock must be HELD here (try_lock succeeds = violation).
+            if probe.setup_lock.try_lock().is_some() {
+                probe
+                    .fetched_without_setup_lock
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -2806,6 +2814,8 @@ mod mark_full_distribution_list {
         // Shared per-name locks (like production stores override it), so tests
         // can observe whether the chain lock is held during resolver calls.
         locks: std::sync::Mutex<HashMap<SenderKeyName, std::sync::Arc<async_lock::Mutex<()>>>>,
+        setup_locks:
+            std::sync::Mutex<HashMap<SenderKeyName, std::sync::Arc<async_lock::Mutex<()>>>>,
     }
     #[async_trait::async_trait]
     impl SenderKeyStore for MemSenderKeyStore {
@@ -2825,6 +2835,17 @@ mod mark_full_distribution_list {
             n: &SenderKeyName,
         ) -> std::sync::Arc<async_lock::Mutex<()>> {
             self.locks
+                .lock()
+                .unwrap()
+                .entry(n.clone())
+                .or_default()
+                .clone()
+        }
+        async fn session_setup_lock(
+            &self,
+            n: &SenderKeyName,
+        ) -> std::sync::Arc<async_lock::Mutex<()>> {
+            self.setup_locks
                 .lock()
                 .unwrap()
                 .entry(n.clone())
@@ -3041,6 +3062,7 @@ mod mark_full_distribution_list {
             crate::types::jid::make_sender_key_name(&group, &own_jid.to_protocol_address());
         let probe = ChainLockProbe {
             lock: sks.sender_key_lock(&chain_name).await,
+            setup_lock: sks.session_setup_lock(&chain_name).await,
             ..Default::default()
         };
         let mut pks = UnusedPreKeyStore;
@@ -3111,6 +3133,11 @@ mod mark_full_distribution_list {
         assert!(
             !probe.fetched_under_lock.load(SeqCst),
             "prekey fetch must not run under the sender-key chain lock"
+        );
+        assert!(
+            !probe.fetched_without_setup_lock.load(SeqCst),
+            "prekey fetch must run under the per-group session-setup lock \
+             (serializes same-group cold sends' session writes)"
         );
 
         // End-to-end: the session established before the lock produced a

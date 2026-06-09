@@ -330,35 +330,45 @@ pub async fn prepare_group_stanza<
 
     let mut had_unregistered_devices = false;
 
+    let sender_key_name = make_sender_key_name(&to_jid, &own_sending_jid.to_protocol_address());
+
     // Establish missing pairwise sessions (prekey fetch + X3DH) for the SKDM
-    // targets before taking the chain lock, so the critical section below
-    // never spans a network RTT — concurrent sends to the same group would
-    // otherwise serialize behind it. WA Web's GroupSkmsgJob wraps
-    // ensureE2ESessions in try/catch — logs but does NOT rethrow: a session
-    // setup failure must not prevent the group message from being sent.
+    // targets before taking the chain lock, so the chain critical section
+    // below never spans a network RTT — concurrent sends to the same group
+    // would otherwise serialize behind it. The setup lock serializes this
+    // phase per group instead: two cold sends can't race fetch + X3DH writes
+    // to the same per-device sessions, while warm sends (no SKDM) never take
+    // it. WA Web's GroupSkmsgJob wraps ensureE2ESessions in try/catch — logs
+    // but does NOT rethrow: a session setup failure must not prevent the
+    // group message from being sent.
     let session_plan = match distribution_list.as_deref() {
-        Some(list) => match ensure_sessions_for_devices(runtime, stores, resolver, list).await {
-            Ok(plan) => Some(plan),
-            Err(e) => {
-                log::warn!(
-                    "SKDM session setup failed for group {}, continuing without distribution: {e}",
-                    to_jid.observe()
-                );
-                if is_device_unregistered_error(&e) {
-                    had_unregistered_devices = true;
+        Some(list) => {
+            let setup_lock = stores
+                .sender_key_store
+                .session_setup_lock(&sender_key_name)
+                .await;
+            let _setup_guard = setup_lock.lock().await;
+            match ensure_sessions_for_devices(runtime, stores, resolver, list).await {
+                Ok(plan) => Some(plan),
+                Err(e) => {
+                    log::warn!(
+                        "SKDM session setup failed for group {}, continuing without distribution: {e}",
+                        to_jid.observe()
+                    );
+                    if is_device_unregistered_error(&e) {
+                        had_unregistered_devices = true;
+                    }
+                    None
                 }
-                None
             }
-        },
+        }
         None => None,
     };
 
-    // Build the chain name once and hold its lock across SKDM creation + the
-    // skmsg encrypt, so concurrent same-(group, sender) sends can't split the
-    // key between the SKDM and the skmsg (nor reuse a chain iteration). The
-    // lock covers only chain-touching steps; session setup and device
-    // resolution stay outside it.
-    let sender_key_name = make_sender_key_name(&to_jid, &own_sending_jid.to_protocol_address());
+    // Hold the chain lock across SKDM creation + the skmsg encrypt, so
+    // concurrent same-(group, sender) sends can't split the key between the
+    // SKDM and the skmsg (nor reuse a chain iteration). The lock covers only
+    // chain-touching steps; session setup and device resolution stay outside.
     let chain_lock = stores
         .sender_key_store
         .sender_key_lock(&sender_key_name)

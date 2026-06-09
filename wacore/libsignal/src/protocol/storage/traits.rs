@@ -172,6 +172,19 @@ pub trait SenderKeyStore: ThreadSafe {
     ) -> std::sync::Arc<async_lock::Mutex<()>> {
         std::sync::Arc::new(async_lock::Mutex::new(()))
     }
+
+    /// Serializes per-group session setup (prekey fetch + X3DH) so concurrent
+    /// cold sends to the same group can't race writes to the same per-device
+    /// sessions. Distinct from [`sender_key_lock`](Self::sender_key_lock):
+    /// held only across setup — never the chain-advancing critical section —
+    /// so it may span network I/O without blocking warm sends. Default is
+    /// uncontended; stores over shared state override it.
+    async fn session_setup_lock(
+        &self,
+        _sender_key_name: &SenderKeyName,
+    ) -> std::sync::Arc<async_lock::Mutex<()>> {
+        std::sync::Arc::new(async_lock::Mutex::new(()))
+    }
 }
 
 /// Mixes in all the store interfaces defined in this module.

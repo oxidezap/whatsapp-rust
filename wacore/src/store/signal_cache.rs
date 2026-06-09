@@ -535,8 +535,23 @@ impl SignalStoreCache {
     /// Shared lock for the `name` chain. Same name returns the same lock so a
     /// concurrent encrypt can't read a chain iteration another is advancing.
     pub async fn sender_key_lock(&self, name: &SenderKeyName) -> Arc<Mutex<()>> {
+        self.shared_named_lock(name.cache_key()).await
+    }
+
+    /// Shared per-group session-setup lock (see
+    /// `SenderKeyStore::session_setup_lock`). Lives in the chain-lock map
+    /// under a suffixed key; chain cache_keys end in a numeric device id, so
+    /// the key spaces are disjoint.
+    pub async fn session_setup_lock(&self, name: &SenderKeyName) -> Arc<Mutex<()>> {
+        let mut key = String::with_capacity(name.cache_key().len() + 8);
+        key.push_str(name.cache_key());
+        key.push_str("::setup");
+        self.shared_named_lock(&key).await
+    }
+
+    async fn shared_named_lock(&self, key: &str) -> Arc<Mutex<()>> {
         let mut map = self.sender_key_locks.lock().await;
-        if let Some(lock) = map.get(name.cache_key()) {
+        if let Some(lock) = map.get(key) {
             return lock.clone();
         }
         // Drop idle locks (held only by the map) once the map grows large.
@@ -544,7 +559,7 @@ impl SignalStoreCache {
             map.retain(|_, lock| Arc::strong_count(lock) > 1);
         }
         let lock = Arc::new(Mutex::new(()));
-        map.insert(Arc::from(name.cache_key()), lock.clone());
+        map.insert(Arc::from(key), lock.clone());
         lock
     }
 
