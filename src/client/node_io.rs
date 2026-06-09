@@ -62,8 +62,10 @@ impl Client {
                                     Ordering::Relaxed,
                                 );
 
-                                // Feed data into the frame decoder
-                                frame_decoder.feed(&data);
+                                // Feed data into the frame decoder. The payload is
+                                // adopted zero-copy when it is the sole reference
+                                // and no partial frame is pending (steady state).
+                                frame_decoder.feed_bytes(data);
 
                                 // Process all complete frames.
                                 // Frame decryption must be sequential (noise protocol counter),
