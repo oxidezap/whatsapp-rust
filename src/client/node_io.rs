@@ -43,6 +43,14 @@ impl Client {
             .ok_or_else(|| anyhow::anyhow!("Cannot start message loop: not connected"))?;
         drop(rx_guard);
 
+        // The noise socket is installed before this loop starts (connect_internal)
+        // and replaced only across reconnects, which tear this loop down first —
+        // so resolve it once instead of locking the mutex per frame.
+        let noise_socket = self
+            .get_noise_socket()
+            .await
+            .map_err(|_| anyhow::anyhow!("Cannot start message loop: no noise socket"))?;
+
         // Frame decoder to parse incoming data
         let mut frame_decoder = wacore::framing::FrameDecoder::new();
         let shutdown = self.connection_shutdown_signal();
@@ -74,7 +82,7 @@ impl Client {
 
                                 while let Some(encrypted_frame) = frame_decoder.decode_frame() {
                                     // Decrypt the frame synchronously (required for noise counter ordering)
-                                    if let Some(node) = self.decrypt_frame(encrypted_frame).await {
+                                    if let Some(node) = self.decrypt_frame(&noise_socket, encrypted_frame) {
                                         // Determine processing mode for this node:
                                         // - Critical nodes (success/failure/stream:error): inline, required for state
                                         // - Message nodes: inline, preserves arrival order for per-chat queues
@@ -167,18 +175,11 @@ impl Client {
         feature = "tracing",
         tracing::instrument(name = "wa.conn.decrypt_frame", level = "trace", skip_all)
     )]
-    pub(crate) async fn decrypt_frame(
-        self: &Arc<Self>,
+    pub(crate) fn decrypt_frame(
+        &self,
+        noise_socket: &crate::socket::noise_socket::NoiseSocket,
         encrypted_frame: bytes::BytesMut,
     ) -> Option<wacore_binary::OwnedNodeRef> {
-        let noise_socket = match self.get_noise_socket().await {
-            Ok(s) => s,
-            Err(_) => {
-                log::error!("Cannot process frame: not connected (no noise socket)");
-                return None;
-            }
-        };
-
         let decrypted_payload = match noise_socket.decrypt_frame(encrypted_frame) {
             Ok(p) => p,
             Err(e) => {
@@ -960,9 +961,10 @@ impl Client {
             // ACK responses are infrequent; re-encode into OwnedNodeRef for the channel.
             // marshal_ref prepends a leading 0x00 format byte; OwnedNodeRef::new expects raw
             // protocol bytes without it, matching what unpack() produces from the network.
-            match wacore_binary::marshal::marshal_ref(node)
-                .and_then(|bytes| wacore_binary::OwnedNodeRef::new(bytes[1..].to_vec()))
-            {
+            // slice(1..) drops that byte as a zero-copy view instead of re-allocating.
+            match wacore_binary::marshal::marshal_ref(node).and_then(|buf| {
+                wacore_binary::OwnedNodeRef::new(bytes::Bytes::from(buf).slice(1..))
+            }) {
                 Ok(onr) => {
                     if waiter.send(Arc::new(onr)).is_err() {
                         warn!(target: "Client/Ack", "Failed to send ACK response to waiter for ID {id}. Receiver was likely dropped.");
