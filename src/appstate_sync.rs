@@ -556,47 +556,72 @@ mod tests {
             ..Default::default()
         }
         .encode_to_vec();
-        let mutation = create_encrypted_mutation(
-            wa::syncd_mutation::SyncdOperation::Set,
-            &[0x22; 32],
-            &plaintext,
-            &keys,
-            &key_id_bytes,
-        );
-        patch_list.patches.push(wa::SyncdPatch {
-            mutations: vec![mutation],
-            version: Some(wa::SyncdVersion { version: Some(3) }),
-            key_id: Some(wa::KeyId {
-                id: Some(key_id_bytes),
-            }),
-            ..Default::default()
-        });
+        for (version, index_mac) in [(3u64, [0x22u8; 32]), (4, [0x33; 32])] {
+            let mutation = create_encrypted_mutation(
+                wa::syncd_mutation::SyncdOperation::Set,
+                &index_mac,
+                &plaintext,
+                &keys,
+                &key_id_bytes,
+            );
+            patch_list.patches.push(wa::SyncdPatch {
+                mutations: vec![mutation],
+                version: Some(wa::SyncdVersion {
+                    version: Some(version),
+                }),
+                key_id: Some(wa::KeyId {
+                    id: Some(key_id_bytes.clone()),
+                }),
+                ..Default::default()
+            });
+        }
 
         let (mutations, state, pl) = processor
             .process_patch_list(patch_list, false)
             .await
-            .expect("snapshot + patch should process");
+            .expect("snapshot + patches should process");
 
-        assert_eq!(state.version, 3);
-        assert_eq!(mutations.len(), 2, "snapshot record + patch mutation");
-        assert!(
-            pl.snapshot.is_some(),
-            "snapshot must be handed back to the caller"
-        );
+        assert_eq!(state.version, 4);
         assert_eq!(
-            pl.patches.len(),
-            1,
-            "patches must be handed back to the caller"
+            mutations.len(),
+            3,
+            "snapshot record + one mutation per patch"
         );
+
+        let snapshot = pl.snapshot.as_ref().expect("snapshot handed back");
         assert_eq!(
-            pl.patches[0].version.as_ref().and_then(|v| v.version),
-            Some(3),
-            "patch content/order preserved through the handoff"
+            snapshot.version.as_ref().and_then(|v| v.version),
+            Some(2),
+            "the same snapshot must come back, not a substitute"
         );
+        assert_eq!(snapshot.records.len(), 1, "snapshot records preserved");
+
+        let patch_versions: Vec<_> = pl
+            .patches
+            .iter()
+            .map(|p| p.version.as_ref().and_then(|v| v.version))
+            .collect();
         assert_eq!(
-            pl.patches[0].mutations.len(),
-            1,
-            "patch mutations preserved through the handoff"
+            patch_versions,
+            vec![Some(3), Some(4)],
+            "patches handed back in processing order"
+        );
+        let patch_index_macs: Vec<_> = pl
+            .patches
+            .iter()
+            .map(|p| {
+                p.mutations[0]
+                    .record
+                    .as_ref()
+                    .and_then(|r| r.index.as_ref())
+                    .and_then(|i| i.blob.as_deref())
+                    .map(|b| b[0])
+            })
+            .collect();
+        assert_eq!(
+            patch_index_macs,
+            vec![Some(0x22), Some(0x33)],
+            "each patch keeps its own mutations through the handoff"
         );
     }
 
