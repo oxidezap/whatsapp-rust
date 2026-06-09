@@ -4,9 +4,16 @@ use anyhow::Result;
 use std::sync::Arc;
 use wacore_binary::Node;
 
-/// Trait for handling custom encrypted message types
-#[async_trait::async_trait]
-pub trait EncHandler: Send + Sync {
+/// Trait for handling custom encrypted message types.
+///
+/// Mirrors the wasm-portability convention of the sibling extension points
+/// (EventHandler, SendContextResolver): the `MaybeSendSync` supertrait keeps the
+/// `Send + Sync` requirement on native (the client stores `Arc<dyn EncHandler>`
+/// across receive lanes) while dropping it on wasm32, where the client is `!Send`
+/// and a handler may hold `!Send` JS handles.
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait EncHandler: wacore::sync_marker::MaybeSendSync {
     /// Handle an encrypted node of a specific type
     ///
     /// # Arguments
