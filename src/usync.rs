@@ -191,6 +191,14 @@ impl Client {
                 fetched_devices.push(jid);
             }
 
+            // An empty device list is never valid — WA Web always keeps the primary
+            // (device 0), so a usync returning no devices for a user is transient or
+            // corrupt. Persisting it would clobber a good cached record, or store an
+            // empty one that get_user_devices then re-fetches on every send.
+            if devices.is_empty() {
+                continue;
+            }
+
             device_records.push(wacore::store::traits::DeviceListRecord {
                 user: user_list.user.user.to_string(),
                 devices,
@@ -507,6 +515,67 @@ mod tests {
             b_devices.len(),
             2,
             "omitted user's devices must be preserved"
+        );
+    }
+
+    /// A usync that returns an empty device list for a user is transient or
+    /// corrupt (WA Web always keeps device 0). `process_device_list_response`
+    /// must not persist it: a good cached record stays intact instead of being
+    /// clobbered with an empty list that `get_user_devices` then re-fetches on
+    /// every send.
+    #[tokio::test]
+    async fn process_response_skips_empty_device_list() {
+        use wacore::usync::UserDeviceList;
+
+        let client = create_test_client().await;
+
+        client
+            .update_device_list(DeviceListRecord {
+                user: "3333333333".into(),
+                devices: vec![
+                    DeviceInfo {
+                        device_id: 0,
+                        key_index: None,
+                    },
+                    DeviceInfo {
+                        device_id: 4,
+                        key_index: None,
+                    },
+                ],
+                timestamp: wacore::time::now_secs(),
+                phash: Some("3:old".to_string()),
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+
+        // The same user comes back from usync with no devices.
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: "3333333333@s.whatsapp.net".parse().unwrap(),
+                devices: vec![],
+                phash: Some("3:empty".to_string()),
+                key_index_bytes: None,
+            }],
+            lid_mappings: vec![],
+        };
+
+        let fetched = client.process_device_list_response(&response).await;
+        assert!(
+            !fetched.iter().any(|j| j.user == "3333333333"),
+            "an empty returned list contributes no devices"
+        );
+
+        // The good cached record survives — not clobbered with an empty list.
+        let jid: Jid = "3333333333@s.whatsapp.net".parse().unwrap();
+        let devices = client
+            .get_devices_from_registry(&jid)
+            .await
+            .expect("the good record must survive an empty usync response");
+        assert_eq!(
+            devices.len(),
+            2,
+            "empty response must not clobber the record"
         );
     }
 
