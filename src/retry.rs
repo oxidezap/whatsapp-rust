@@ -923,7 +923,10 @@ impl Client {
 
         // Companion devices ADV-bind the fetched identity via <device-identity>;
         // reject a present-but-invalid one so a relay can't swap in a forged key.
-        // Mirrors the prekey-fetch path; a missing one is logged, not fatal.
+        // Mirrors the prekey-fetch path. The account key is the in-blob
+        // `account_signature_key` or, when the server omits it, the contact's
+        // primary (device 0) identity from the store. An unverifiable-for-lack-of-key
+        // chain or a missing device-identity is logged, not fatal.
         if requester_jid.device != 0
             && let Some(device_identity) = keys_node
                 .get_optional_child("device-identity")
@@ -932,10 +935,21 @@ impl Client {
             let fetched_identity: [u8; 32] = identity_bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("identity key in retry receipt is not 32 bytes"))?;
-            if !wacore::adv::validate_adv_with_identity_key(device_identity, &fetched_identity) {
-                return Err(anyhow::anyhow!(
-                    "device-identity ADV validation failed for companion {requester_jid}"
-                ));
+            let account_identity = self.load_account_identity(requester_jid).await;
+            match wacore::adv::validate_adv_with_identity_key(
+                device_identity,
+                &fetched_identity,
+                account_identity.as_ref(),
+            ) {
+                wacore::adv::AdvValidation::Valid => {}
+                wacore::adv::AdvValidation::Invalid => {
+                    return Err(anyhow::anyhow!(
+                        "device-identity ADV validation failed for companion {requester_jid}"
+                    ));
+                }
+                wacore::adv::AdvValidation::NoAccountKey => log::warn!(
+                    "retry key bundle for companion {requester_jid} omits account_signature_key and no stored account identity; proceeding without ADV validation"
+                ),
             }
         } else if requester_jid.device != 0 {
             log::warn!(

@@ -158,8 +158,16 @@ impl PreKeyUtils {
         ]
     }
 
+    /// Parse a prekey-fetch response into bundles.
+    ///
+    /// `account_identities` maps a (normalized) companion JID to its account's
+    /// primary (device 0) identity key, used as the ADV `account_signature_key`
+    /// fallback when the server omits that field from `<device-identity>` (the
+    /// normal case for a contact's companion device). The caller pre-loads these
+    /// from the identity store; pass an empty map when no fallback is available.
     pub fn parse_prekeys_response(
         resp_node: &NodeRef<'_>,
+        account_identities: &HashMap<Jid, [u8; 32]>,
     ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
         let list_node = resp_node
             .get_optional_child("list")
@@ -186,13 +194,15 @@ impl PreKeyUtils {
                 jid.user = CompactString::from(user_base);
                 jid.device = device;
             }
-            let bundle = match Self::node_to_pre_key_bundle_ref(&jid, user_node_ref) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::warn!("Failed to parse prekey bundle for {}: {}", jid, e);
-                    continue;
-                }
-            };
+            let account_identity = account_identities.get(&jid);
+            let bundle =
+                match Self::node_to_pre_key_bundle_ref(&jid, user_node_ref, account_identity) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::warn!("Failed to parse prekey bundle for {}: {}", jid, e);
+                        continue;
+                    }
+                };
             bundles.insert(jid, bundle);
         }
 
@@ -202,6 +212,7 @@ impl PreKeyUtils {
     fn node_to_pre_key_bundle_ref(
         jid: &Jid,
         node: &NodeRef<'_>,
+        account_identity: Option<&[u8; 32]>,
     ) -> Result<PreKeyBundle, anyhow::Error> {
         use crate::xml::DisplayableNodeRef;
         use wacore_binary::NodeContentRef;
@@ -272,10 +283,13 @@ impl PreKeyUtils {
 
         // Companion devices (device != 0) carry a <device-identity> that ADV-binds
         // the fetched identity key to the account, so a relay can't substitute a
-        // fabricated identity. Matches WA Web SessionApi.createSignalSession. When
-        // present-but-invalid we reject the bundle (the loop skips that device); a
-        // missing one is logged but not fatal, since the live/mock server set that
-        // omits it is unverified (WA Web throws here).
+        // fabricated identity. Matches WA Web SessionApi.createSignalSession. The
+        // account key is the in-blob `account_signature_key` or, when the server
+        // omits it (the normal case for a contact's companion), the account's
+        // primary identity from the store (`account_identity`). Invalid → reject
+        // the bundle; a missing device-identity or an unverifiable-for-lack-of-key
+        // chain is logged but not fatal (WA Web throws here, but our store-set is
+        // best-effort and a relay could already strip <device-identity> entirely).
         if jid.device != 0 {
             let device_identity = node
                 .get_optional_child("device-identity")
@@ -285,14 +299,21 @@ impl PreKeyUtils {
                     _ => None,
                 });
             match device_identity {
-                Some(di)
-                    if !crate::adv::validate_adv_with_identity_key(di, &identity_key_array) =>
-                {
-                    return Err(anyhow::anyhow!(
-                        "device-identity ADV validation failed for companion {jid}"
-                    ));
-                }
-                Some(_) => {}
+                Some(di) => match crate::adv::validate_adv_with_identity_key(
+                    di,
+                    &identity_key_array,
+                    account_identity,
+                ) {
+                    crate::adv::AdvValidation::Valid => {}
+                    crate::adv::AdvValidation::Invalid => {
+                        return Err(anyhow::anyhow!(
+                            "device-identity ADV validation failed for companion {jid}"
+                        ));
+                    }
+                    crate::adv::AdvValidation::NoAccountKey => log::warn!(
+                        "prekey bundle for companion {jid} omits account_signature_key and no stored account identity; proceeding without ADV validation"
+                    ),
+                },
                 None => log::warn!(
                     "prekey bundle for companion {jid} omits <device-identity>; proceeding without ADV validation"
                 ),
@@ -432,8 +453,8 @@ mod tests {
             .children([NodeBuilder::new("list").children([user_node]).build()])
             .build();
 
-        let bundles =
-            PreKeyUtils::parse_prekeys_response(&response.as_node_ref()).expect("parse bundles");
+        let bundles = PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
+            .expect("parse bundles");
         assert!(bundles.contains_key(&base_jid));
         assert!(!bundles.contains_key(&raw_jid));
 
@@ -451,7 +472,8 @@ mod tests {
         let response = NodeBuilder::new("iq")
             .children([NodeBuilder::new("list").children([user_node]).build()])
             .build();
-        PreKeyUtils::parse_prekeys_response(&response.as_node_ref()).expect("parse bundles")
+        PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
+            .expect("parse bundles")
     }
 
     #[test]
@@ -464,6 +486,28 @@ mod tests {
         );
     }
 
+    // A trimmed device-identity (no account_signature_key) with no stored
+    // account-identity fallback is unverifiable, not forged: the bundle must be
+    // KEPT (proceed without ADV), otherwise the companion stops receiving. This
+    // is the regression #772 introduced (it dropped the bundle outright).
+    #[test]
+    fn parse_keeps_companion_bundle_when_account_key_omitted_and_no_fallback() {
+        use crate::libsignal::protocol::KeyPair;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let companion = Jid::lid_device("100000012345678", 33);
+        // device-identity without account_signature_key, signatures over the
+        // bundle's identity key (create_mock_bundle's identity is unrelated, but
+        // the NoAccountKey path short-circuits before signature checks anyway).
+        let di = trimmed_device_identity(&account, &device, b"details");
+        let bundles = parse_one(companion.clone(), Some(di));
+        assert!(
+            bundles.contains_key(&companion),
+            "trimmed device-identity with no fallback must be kept, not dropped"
+        );
+    }
+
     #[test]
     fn parse_keeps_primary_bundle_ignoring_device_identity() {
         // device 0 is the account's primary: ADV validation does not apply, so a
@@ -471,5 +515,37 @@ mod tests {
         let primary = Jid::lid_device("100000012345678", 0);
         let bundles = parse_one(primary.clone(), Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
         assert!(bundles.contains_key(&primary));
+    }
+
+    /// Encode an ADVSignedDeviceIdentity without the account_signature_key field.
+    fn trimmed_device_identity(
+        account: &crate::libsignal::protocol::KeyPair,
+        device: &crate::libsignal::protocol::KeyPair,
+        details: &[u8],
+    ) -> Vec<u8> {
+        use prost::Message;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let identity = device.public_key.public_key_bytes();
+        let account_key = account.public_key.public_key_bytes();
+        let account_sig = account
+            .private_key
+            .calculate_signature(&[&[6u8, 0][..], details, identity].concat(), &mut rng)
+            .unwrap()
+            .to_vec();
+        let device_sig = device
+            .private_key
+            .calculate_signature(
+                &[&[6u8, 1][..], details, identity, account_key].concat(),
+                &mut rng,
+            )
+            .unwrap()
+            .to_vec();
+        waproto::whatsapp::AdvSignedDeviceIdentity {
+            details: Some(details.to_vec()),
+            account_signature_key: None,
+            account_signature: Some(account_sig),
+            device_signature: Some(device_sig),
+        }
+        .encode_to_vec()
     }
 }

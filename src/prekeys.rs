@@ -73,6 +73,14 @@ impl Client {
             None => PreKeyFetchSpec::new(jids.to_vec()),
         };
 
+        // Pre-load each companion's account (device 0) identity as the ADV
+        // `account_signature_key` fallback: the server omits that field from a
+        // contact's companion `<device-identity>` because it's the contact's
+        // primary identity the client already stores. Without it we'd reject the
+        // bundle and the device would stop receiving (WA Web uses the same stored
+        // identity as the fallback in validateADVwithIdentityKey).
+        let spec = spec.with_account_identities(self.collect_account_identities(jids).await);
+
         let bundles = self.execute(spec).await?;
 
         for jid in bundles.keys() {
@@ -80,6 +88,56 @@ impl Client {
         }
 
         Ok(bundles)
+    }
+
+    /// Load, for each companion JID, its account (device 0) identity key from the
+    /// store, keyed by the normalized companion JID so the prekey parser can use
+    /// it as the ADV `account_signature_key` fallback. Missing entries are simply
+    /// absent (no fallback for that JID).
+    async fn collect_account_identities(
+        &self,
+        jids: &[Jid],
+    ) -> std::collections::HashMap<Jid, [u8; 32]> {
+        let mut map = std::collections::HashMap::new();
+        for jid in jids.iter().filter(|j| j.device != 0) {
+            if let Some(id) = self.load_account_identity(jid).await {
+                map.insert(jid.normalize_for_prekey_bundle(), id);
+            }
+        }
+        map
+    }
+
+    /// Load a companion's account (device 0) identity from the store, for use as
+    /// the ADV `account_signature_key` fallback (WA Web `validateADVwithIdentityKey`
+    /// loads the same stored identity). Reads through the signal cache so an
+    /// identity established earlier this session (not yet flushed) is still found.
+    /// `None` when not stored.
+    pub(crate) async fn load_account_identity(&self, companion_jid: &Jid) -> Option<[u8; 32]> {
+        use wacore::types::jid::JidExt;
+
+        let account_jid = companion_jid.with_device(0);
+        let addr = account_jid.to_protocol_address();
+        let backend = {
+            let device_store = self.persistence_manager.get_device_arc().await;
+            let guard = device_store.read().await;
+            guard.backend.clone()
+        };
+        match self.signal_cache.get_identity(&addr, &*backend).await {
+            Ok(Some(id)) if id.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&id);
+                Some(arr)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                log::debug!(
+                    "ADV fallback: failed to load account identity for {}: {}",
+                    account_jid.observe(),
+                    e
+                );
+                None
+            }
+        }
     }
 
     /// Query the WhatsApp server for how many pre-keys it currently has for this device.

@@ -16,6 +16,22 @@ const ADV_PREFIX_DEVICE_SIGNATURE: &[u8] = &[6, 1];
 const ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 5];
 const ADV_HOSTED_PREFIX_DEVICE_SIGNATURE: &[u8] = &[6, 6];
 
+/// Outcome of validating a fetched companion device's `ADVSignedDeviceIdentity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvValidation {
+    /// Both signatures verified against an available account key — trusted.
+    Valid,
+    /// The blob is malformed, or the signatures failed to verify against an
+    /// available account key. A relay swapping in a forged identity lands here;
+    /// the caller must reject the bundle.
+    Invalid,
+    /// No account key was available: the blob omits `account_signature_key` and
+    /// no trusted account identity was passed as a fallback, so the chain can't
+    /// be checked at all. The caller decides what to do (we log and proceed,
+    /// matching the existing "device-identity absent" handling).
+    NoAccountKey,
+}
+
 /// Verify a fetched companion device's `ADVSignedDeviceIdentity` binds the
 /// fetched identity key to the account's ADV chain, mirroring WA Web
 /// `WAWebAdvSignatureApi.validateADVwithIdentityKey`.
@@ -28,30 +44,47 @@ const ADV_HOSTED_PREFIX_DEVICE_SIGNATURE: &[u8] = &[6, 6];
 /// the hosted prefix set rather than replicating WA Web's `bizHostedDevicesEnabled`
 /// gating: the prefix is only a domain separator, so accepting whichever the
 /// signer used stays sound (an attacker still can't forge the account signature).
+///
+/// The account key is `blob.account_signature_key || account_identity_fallback`,
+/// exactly as WA Web's `P`/`w` helpers (`e.accountSignatureKey || t`): the server
+/// legitimately omits `account_signature_key` for a contact's companion device
+/// because it's the contact's primary (device 0) identity the client already
+/// holds, so the caller passes that stored identity as the fallback. When neither
+/// source has a key the chain is unverifiable and we return `NoAccountKey` rather
+/// than rejecting a bundle we simply lack the material to check.
 pub fn validate_adv_with_identity_key(
     device_identity_bytes: &[u8],
     fetched_identity_key: &[u8; 32],
-) -> bool {
+    account_identity_fallback: Option<&[u8; 32]>,
+) -> AdvValidation {
     let Ok(signed) = waproto::whatsapp::AdvSignedDeviceIdentity::decode(device_identity_bytes)
     else {
-        return false;
+        return AdvValidation::Invalid;
     };
-    let (Some(details), Some(account_key), Some(account_sig), Some(device_sig)) = (
+    let (Some(details), Some(account_sig), Some(device_sig)) = (
         signed.details.as_deref(),
-        signed.account_signature_key.as_deref(),
         signed.account_signature.as_deref(),
         signed.device_signature.as_deref(),
     ) else {
-        return false;
+        return AdvValidation::Invalid;
+    };
+    // WA Web `e.accountSignatureKey || t`: prefer the in-blob key, else the
+    // caller-supplied trusted identity. An empty field counts as absent.
+    let account_key: &[u8] = match signed.account_signature_key.as_deref() {
+        Some(k) if !k.is_empty() => k,
+        _ => match account_identity_fallback {
+            Some(f) => f.as_slice(),
+            None => return AdvValidation::NoAccountKey,
+        },
     };
     let (Ok(account_pub), Ok(device_pub)) = (
         PublicKey::from_djb_public_key_bytes(account_key),
         PublicKey::from_djb_public_key_bytes(fetched_identity_key),
     ) else {
-        return false;
+        return AdvValidation::Invalid;
     };
 
-    [
+    let verified = [
         (ADV_PREFIX_ACCOUNT_SIGNATURE, ADV_PREFIX_DEVICE_SIGNATURE),
         (
             ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE,
@@ -64,7 +97,13 @@ pub fn validate_adv_with_identity_key(
         let device_msg = [device_prefix, details, fetched_identity_key, account_key].concat();
         account_pub.verify_signature(&account_msg, account_sig)
             && device_pub.verify_signature(&device_msg, device_sig)
-    })
+    });
+
+    if verified {
+        AdvValidation::Valid
+    } else {
+        AdvValidation::Invalid
+    }
 }
 
 /// Decoded fields from `ADVKeyIndexList` protobuf.
@@ -285,11 +324,16 @@ mod tests {
 
     use crate::libsignal::protocol::KeyPair;
 
-    fn signed_identity(
+    /// Build a signed device-identity. When `include_account_key` is false the
+    /// `account_signature_key` field is omitted (the trimmed shape the real
+    /// server sends for a contact's companion device); the signatures are still
+    /// made with the account key so a fallback can verify them.
+    fn signed_identity_opts(
         account: &KeyPair,
         device: &KeyPair,
         details: &[u8],
         hosted: bool,
+        include_account_key: bool,
     ) -> Vec<u8> {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let identity = device.public_key.public_key_bytes();
@@ -317,11 +361,20 @@ mod tests {
             .to_vec();
         waproto::whatsapp::AdvSignedDeviceIdentity {
             details: Some(details.to_vec()),
-            account_signature_key: Some(account_key.to_vec()),
+            account_signature_key: include_account_key.then(|| account_key.to_vec()),
             account_signature: Some(account_sig),
             device_signature: Some(device_sig),
         }
         .encode_to_vec()
+    }
+
+    fn signed_identity(
+        account: &KeyPair,
+        device: &KeyPair,
+        details: &[u8],
+        hosted: bool,
+    ) -> Vec<u8> {
+        signed_identity_opts(account, device, details, hosted, true)
     }
 
     fn id32(kp: &KeyPair) -> [u8; 32] {
@@ -334,7 +387,10 @@ mod tests {
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
         let bytes = signed_identity(&account, &device, b"details", false);
-        assert!(validate_adv_with_identity_key(&bytes, &id32(&device)));
+        assert_eq!(
+            validate_adv_with_identity_key(&bytes, &id32(&device), None),
+            AdvValidation::Valid
+        );
     }
 
     #[test]
@@ -343,7 +399,10 @@ mod tests {
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
         let bytes = signed_identity(&account, &device, b"hosted-details", true);
-        assert!(validate_adv_with_identity_key(&bytes, &id32(&device)));
+        assert_eq!(
+            validate_adv_with_identity_key(&bytes, &id32(&device), None),
+            AdvValidation::Valid
+        );
     }
 
     #[test]
@@ -355,7 +414,10 @@ mod tests {
         let device = KeyPair::generate(&mut rng);
         let attacker = KeyPair::generate(&mut rng);
         let bytes = signed_identity(&account, &device, b"details", false);
-        assert!(!validate_adv_with_identity_key(&bytes, &id32(&attacker)));
+        assert_eq!(
+            validate_adv_with_identity_key(&bytes, &id32(&attacker), None),
+            AdvValidation::Invalid
+        );
     }
 
     #[test]
@@ -370,16 +432,79 @@ mod tests {
             device_signature: None,
         }
         .encode_to_vec();
-        assert!(!validate_adv_with_identity_key(&no_dev_sig, &id32(&device)));
+        assert_eq!(
+            validate_adv_with_identity_key(&no_dev_sig, &id32(&device), None),
+            AdvValidation::Invalid
+        );
     }
 
     #[test]
     fn adv_chain_rejects_garbage() {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let device = KeyPair::generate(&mut rng);
-        assert!(!validate_adv_with_identity_key(
-            &[1, 2, 3, 4],
-            &id32(&device)
-        ));
+        assert_eq!(
+            validate_adv_with_identity_key(&[1, 2, 3, 4], &id32(&device), None),
+            AdvValidation::Invalid
+        );
+    }
+
+    // The real server omits account_signature_key for a contact's companion
+    // device. With the contact's primary identity supplied as the fallback, the
+    // chain verifies — this is the regression #772 broke (it rejected outright).
+    #[test]
+    fn adv_chain_missing_account_key_verifies_with_fallback() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let bytes = signed_identity_opts(&account, &device, b"details", false, false);
+        assert_eq!(
+            validate_adv_with_identity_key(&bytes, &id32(&device), Some(&id32(&account))),
+            AdvValidation::Valid
+        );
+    }
+
+    // No in-blob key and no fallback: the chain is unverifiable, so we must NOT
+    // reject (that would drop a legitimate device); the caller proceeds.
+    #[test]
+    fn adv_chain_missing_account_key_no_fallback_is_no_account_key() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let bytes = signed_identity_opts(&account, &device, b"details", false, false);
+        assert_eq!(
+            validate_adv_with_identity_key(&bytes, &id32(&device), None),
+            AdvValidation::NoAccountKey
+        );
+    }
+
+    // A wrong fallback (relay-supplied account identity) must NOT verify: the
+    // account signature was made by the real account key, so a mismatched
+    // fallback yields Invalid, preserving the forgery protection.
+    #[test]
+    fn adv_chain_missing_account_key_wrong_fallback_is_invalid() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let attacker = KeyPair::generate(&mut rng);
+        let bytes = signed_identity_opts(&account, &device, b"details", false, false);
+        assert_eq!(
+            validate_adv_with_identity_key(&bytes, &id32(&device), Some(&id32(&attacker))),
+            AdvValidation::Invalid
+        );
+    }
+
+    // The in-blob key takes precedence over the fallback (WA Web `|| t`): a valid
+    // full blob still verifies even if an unrelated fallback is passed.
+    #[test]
+    fn adv_chain_in_blob_key_takes_precedence_over_fallback() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let unrelated = KeyPair::generate(&mut rng);
+        let bytes = signed_identity(&account, &device, b"details", false);
+        assert_eq!(
+            validate_adv_with_identity_key(&bytes, &id32(&device), Some(&id32(&unrelated))),
+            AdvValidation::Valid
+        );
     }
 }
