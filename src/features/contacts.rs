@@ -90,10 +90,10 @@ impl<'a> Contacts<'a> {
                     known_lid: None,
                 });
             } else {
-                debug_assert!(
-                    jid.is_pn() || jid.is_lid(),
-                    "validated is_on_whatsapp JID type"
-                );
+                #[cfg(debug_assertions)]
+                panic!("is_on_whatsapp: unexpected JID type {jid} after validation");
+
+                #[cfg(not(debug_assertions))]
                 continue;
             }
         }
