@@ -310,15 +310,15 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         (user_combined, None)
     };
 
-    let (user_end, _agent_override) = if let Some(underscore_idx) = user_agent.find('_') {
+    let user_end = if let Some(underscore_idx) = user_agent.find('_') {
         let agent_part = &user_agent[underscore_idx + 1..];
-        if let Ok(parsed_agent) = agent_part.parse::<u8>() {
-            (underscore_idx, Some(parsed_agent))
+        if agent_part.parse::<u8>().is_ok() {
+            underscore_idx
         } else {
-            (user_agent.len(), None)
+            user_agent.len()
         }
     } else {
-        (user_agent.len(), None)
+        user_agent.len()
     };
 
     let server_kind = jid::Server::try_from(server).ok();

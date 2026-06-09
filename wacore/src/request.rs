@@ -214,8 +214,11 @@ impl RequestUtils {
             return Err(IqError::Disconnected(response_node.to_owned()));
         }
 
-        if let Some(res_type) = response_node.get_attr("type")
-            && res_type.as_str() == "error"
+        let response_type = response_node.get_attr("type");
+
+        if response_type
+            .as_ref()
+            .is_some_and(|res_type| res_type.as_str() == "error")
         {
             let error_child = response_node.get_optional_child_by_tag(&["error"]);
             if let Some(error_node) = error_child {
@@ -248,9 +251,7 @@ impl RequestUtils {
             });
         }
 
-        let got = response_node
-            .get_attr("type")
-            .map(|res_type| res_type.to_string());
+        let got = response_type.map(|res_type| res_type.to_string());
         if got.as_deref() != Some("result") {
             return Err(IqError::UnexpectedResponseType { got });
         }

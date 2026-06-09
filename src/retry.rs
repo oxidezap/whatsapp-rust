@@ -173,16 +173,6 @@ fn resolve_retry_chat_info(
     }
 }
 
-fn validate_retry_prekey_presence(
-    keys_node: &NodeRef<'_>,
-    is_bot_retry: bool,
-) -> Result<(), anyhow::Error> {
-    if !is_bot_retry && keys_node.get_optional_child("key").is_none() {
-        anyhow::bail!("regular retry key bundle missing one-time prekey");
-    }
-    Ok(())
-}
-
 // No retry_count in the key: concurrent receipts for the same participant must
 // serialize, otherwise two update_local_signal_session calls race on session state.
 fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Jid) -> String {
@@ -627,7 +617,7 @@ impl Client {
         //    `!is_status_broadcast()`; WA Web runs it unconditionally.
         let keys_node_present = node.get_optional_child("keys").is_some();
         let key_bundle_result = self
-            .process_retry_key_bundle(node, resolved_jid, is_peer, info.is_bot)
+            .process_retry_key_bundle(node, resolved_jid, is_peer)
             .await;
         let key_bundle_processed = key_bundle_result.is_ok();
 
@@ -852,19 +842,16 @@ impl Client {
     /// * `node` - The retry receipt node containing the key bundle
     /// * `requester_jid` - The JID of the device requesting the retry
     /// * `is_peer` - Whether this is a peer device (our own device)
-    /// * `is_bot_retry` - Whether the retry follows the bot_retry parser rules
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.process_key_bundle", level = "debug", skip_all, fields(peer = %requester_jid.observe(), is_peer, is_bot_retry), err(Debug)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.process_key_bundle", level = "debug", skip_all, fields(peer = %requester_jid.observe(), is_peer), err(Debug)))]
     async fn process_retry_key_bundle(
         &self,
         node: &NodeRef<'_>,
         requester_jid: &wacore_binary::Jid,
         is_peer: bool,
-        is_bot_retry: bool,
     ) -> Result<(), anyhow::Error> {
         let keys_node = node
             .get_optional_child("keys")
             .ok_or_else(|| anyhow::anyhow!("<keys> child missing from retry receipt"))?;
-        validate_retry_prekey_presence(keys_node, is_bot_retry)?;
 
         let registration_node = node.get_optional_child("registration");
 
@@ -1253,6 +1240,7 @@ mod tests {
     use crate::test_utils::MockHttpClient;
     use std::borrow::Cow;
     use std::sync::Arc;
+    use wacore::libsignal::protocol::IdentityKeyPair;
     use wacore::types::jid::JidExt as _;
     use wacore_binary::{Jid, JidExt};
     use waproto::whatsapp as wa;
@@ -2292,6 +2280,75 @@ mod tests {
             .expect("no-op when session exists");
     }
 
+    #[tokio::test]
+    async fn retry_key_bundle_allows_signed_prekey_without_one_time_prekey() {
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+        )
+        .await;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let remote_identity = IdentityKeyPair::generate(&mut rng);
+        let signed_prekey = KeyPair::generate(&mut rng);
+        let signed_prekey_signature = remote_identity
+            .private_key()
+            .calculate_signature(&signed_prekey.public_key.serialize(), &mut rng)
+            .expect("signed prekey signature should be valid");
+
+        let requester = Jid::pn_device("559922223333", 1);
+        let keys = NodeBuilder::new("keys")
+            .children([
+                NodeBuilder::new("type").bytes(vec![5]).build(),
+                NodeBuilder::new("identity")
+                    .bytes(
+                        remote_identity
+                            .identity_key()
+                            .public_key()
+                            .public_key_bytes()
+                            .to_vec(),
+                    )
+                    .build(),
+                SignedPreKeyNode::new(
+                    100,
+                    signed_prekey.public_key.public_key_bytes().to_vec(),
+                    signed_prekey_signature.to_vec(),
+                )
+                .into_node(),
+            ])
+            .build();
+        let receipt = NodeBuilder::new("receipt")
+            .children([
+                NodeBuilder::new("registration")
+                    .bytes(12345u32.to_be_bytes().to_vec())
+                    .build(),
+                keys,
+            ])
+            .build();
+
+        client
+            .process_retry_key_bundle(&receipt.as_node_ref(), &requester, false)
+            .await
+            .expect("signed-prekey-only retry bundle should establish a session");
+
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        let session = client
+            .signal_cache
+            .peek_session(&requester.to_protocol_address(), &*snapshot.backend)
+            .await
+            .expect("session lookup should succeed");
+        assert!(session.is_some());
+    }
+
     #[test]
     fn bot_jid_detection() {
         // Test bot JID detection for bot message filtering
@@ -2316,30 +2373,6 @@ mod tests {
         // Similar but not bot (doesn't start with exact prefix)
         let not_bot: Jid = "1313556123456@s.whatsapp.net".parse().unwrap();
         assert!(!not_bot.is_bot());
-    }
-
-    #[test]
-    fn regular_retry_requires_one_time_prekey() {
-        let keys = NodeBuilder::new("keys").build();
-
-        let err = validate_retry_prekey_presence(&keys.as_node_ref(), false).unwrap_err();
-        assert!(err.to_string().contains("missing one-time prekey"));
-    }
-
-    #[test]
-    fn bot_retry_allows_missing_one_time_prekey() {
-        let keys = NodeBuilder::new("keys").build();
-
-        validate_retry_prekey_presence(&keys.as_node_ref(), true).unwrap();
-    }
-
-    #[test]
-    fn regular_retry_allows_present_one_time_prekey() {
-        let keys = NodeBuilder::new("keys")
-            .children([NodeBuilder::new("key").build()])
-            .build();
-
-        validate_retry_prekey_presence(&keys.as_node_ref(), false).unwrap();
     }
 
     #[test]

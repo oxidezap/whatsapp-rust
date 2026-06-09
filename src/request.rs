@@ -73,23 +73,6 @@ impl From<wacore::request::IqError> for IqError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::IqError;
-
-    #[test]
-    fn converts_unexpected_response_type() {
-        let err = IqError::from(wacore::request::IqError::UnexpectedResponseType {
-            got: Some("get".to_string()),
-        });
-
-        match err {
-            IqError::UnexpectedResponseType { got } => assert_eq!(got.as_deref(), Some("get")),
-            other => panic!("expected UnexpectedResponseType, got {other:?}"),
-        }
-    }
-}
-
 impl Client {
     pub(crate) fn generate_request_id(&self) -> String {
         self.get_request_utils().generate_request_id()
@@ -310,5 +293,22 @@ impl Client {
             Err(_) => "error",
         });
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IqError;
+
+    #[test]
+    fn converts_unexpected_response_type() {
+        let err = IqError::from(wacore::request::IqError::UnexpectedResponseType {
+            got: Some("get".to_string()),
+        });
+
+        match err {
+            IqError::UnexpectedResponseType { got } => assert_eq!(got.as_deref(), Some("get")),
+            other => panic!("expected UnexpectedResponseType, got {other:?}"),
+        }
     }
 }
