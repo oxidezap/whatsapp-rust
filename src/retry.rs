@@ -311,6 +311,21 @@ impl Client {
         let device_known = self
             .has_device(&info.requester.user, sender_device_id)
             .await;
+
+        if !device_known {
+            // A retry from a device missing from our registry is itself the signal
+            // that our device list for this user is stale: the device can receive
+            // our group skmsg yet never got a sender key. Refresh the list
+            // (rate-limited, dedup'd) so the device is learned and the next send
+            // includes it, whether or not we can recover this particular retry from
+            // its <keys> bundle. WA Web triggers syncDeviceListJob on an unknown
+            // device for the same reason; the reconciliation that runs on a 406
+            // during send never fires here, since the device is not in the set we
+            // send to.
+            self.schedule_unknown_device_sync(info.requester.to_non_ad(), false)
+                .await;
+        }
+
         if wacore::protocol::retry::should_drop_unknown_device_retry(
             keys_node_present,
             device_known,

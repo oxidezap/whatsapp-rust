@@ -1236,14 +1236,26 @@ impl Client {
     /// WA Web: online → `syncDeviceListJob`, offline → `OfflinePendingDeviceCache`.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.unknown_device_sync", level = "debug", skip_all, fields(sender = %info.source.sender.observe(), msg_id = %info.id)))]
     async fn handle_unknown_device_sync(self: &Arc<Self>, info: &MessageInfo) {
-        let user_jid = info.source.sender.to_non_ad();
+        self.schedule_unknown_device_sync(info.source.sender.to_non_ad(), info.is_offline)
+            .await;
+    }
 
+    /// Refresh a user's device list after encountering one of their devices that
+    /// is missing from our registry. Dedups per user (skips a sync already
+    /// pending/in-flight), then offline → batch for `doPendingDeviceSync`, online
+    /// → invalidate + usync immediately. WA Web: online `syncDeviceListJob`,
+    /// offline `OfflinePendingDeviceCache`.
+    pub(crate) async fn schedule_unknown_device_sync(
+        self: &Arc<Self>,
+        user_jid: Jid,
+        is_offline: bool,
+    ) {
         // Dedup: skip if we already have a sync pending/in-flight for this user
         if !self.pending_device_sync.add(user_jid.clone()).await {
             return;
         }
 
-        if info.is_offline {
+        if is_offline {
             log::debug!(
                 "Queueing {} for pending device sync (offline)",
                 user_jid.observe()
@@ -1562,5 +1574,31 @@ impl Client {
         let default_jid = Jid::default();
         let own_jid = own_pn.as_ref().unwrap_or(&default_jid);
         wacore::messages::parse_message_info(node, own_jid, own_lid.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_utils::create_test_client_with_failing_http;
+    use wacore_binary::Jid;
+
+    // The offline path batches the user for a deferred usync and dedups repeated
+    // requests, so a retry storm from one unknown device cannot fan out into a
+    // usync storm.
+    #[tokio::test]
+    async fn schedule_unknown_device_sync_batches_and_dedups() {
+        let client = create_test_client_with_failing_http("schedule_resync").await;
+        let user: Jid = "12345678901234@lid".parse().unwrap();
+
+        client
+            .schedule_unknown_device_sync(user.clone(), true)
+            .await;
+        // Same user again is deduped, not enqueued twice.
+        client
+            .schedule_unknown_device_sync(user.clone(), true)
+            .await;
+
+        let pending = client.pending_device_sync.take_all().await;
+        assert_eq!(pending, vec![user]);
     }
 }
