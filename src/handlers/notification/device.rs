@@ -80,7 +80,6 @@ pub(crate) async fn handle_prekey_low(client: &Arc<Client>) {
             if client_clone
                 .persistence_manager
                 .get_device_snapshot()
-                .await
                 .server_has_prekeys
             {
                 debug!("Pre-key upload already completed by another task, skipping");
@@ -152,7 +151,7 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     }
 
     // Self-identity changes use a different flow; clearing our own record would break sessions
-    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+    let device_snapshot = client.persistence_manager.get_device_snapshot();
     let is_me = device_snapshot
         .pn
         .as_ref()
@@ -364,7 +363,7 @@ pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: J
 
     // Self-identity changes use a separate flow; clearing our own record would
     // break our sessions.
-    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+    let device_snapshot = client.persistence_manager.get_device_snapshot();
     let is_me = device_snapshot
         .pn
         .as_ref()
@@ -555,7 +554,7 @@ pub(crate) async fn handle_account_sync_devices(
     );
 
     // Get our own JIDs (PN and LID) to verify this is about our account
-    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+    let device_snapshot = client.persistence_manager.get_device_snapshot();
     let own_pn = device_snapshot.pn.as_ref();
     let own_lid = device_snapshot.lid.as_ref();
 

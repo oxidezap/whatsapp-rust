@@ -133,23 +133,23 @@ impl Client {
         }
 
         match info.source.addressing_mode {
-            Some(AddressingMode::Lid) => match self.get_lid().await {
+            Some(AddressingMode::Lid) => match self.get_lid() {
                 Some(jid) => Some(jid),
-                None => self.get_pn().await,
+                None => self.get_pn(),
             },
-            Some(AddressingMode::Pn) => match self.get_pn().await {
+            Some(AddressingMode::Pn) => match self.get_pn() {
                 Some(jid) => Some(jid),
-                None => self.get_lid().await,
+                None => self.get_lid(),
             },
             None if info.source.sender.is_lid() || info.source.chat.is_lid() => {
-                match self.get_lid().await {
+                match self.get_lid() {
                     Some(jid) => Some(jid),
-                    None => self.get_pn().await,
+                    None => self.get_pn(),
                 }
             }
-            None => match self.get_pn().await {
+            None => match self.get_pn() {
                 Some(jid) => Some(jid),
-                None => self.get_lid().await,
+                None => self.get_lid(),
             },
         }
     }
@@ -653,9 +653,9 @@ impl Client {
             return Some(ts.clone());
         }
         if info.source.sender.server == wacore_binary::Server::Bot {
-            self.get_lid().await
+            self.get_lid()
         } else {
-            self.get_pn().await
+            self.get_pn()
         }
     }
 

@@ -75,7 +75,7 @@ impl Client {
                     .to_string(),
             )
         } else {
-            if self.get_pn().await.is_none() {
+            if self.get_pn().is_none() {
                 return Err(anyhow::Error::from(ClientError::NotLoggedIn));
             }
             None
@@ -143,7 +143,6 @@ impl Client {
             self.get_own_jid_for_group(&to).await?.to_non_ad()
         } else {
             self.get_pn()
-                .await
                 .ok_or_else(|| anyhow::Error::from(ClientError::NotLoggedIn))?
                 .to_non_ad()
         };
@@ -236,7 +235,7 @@ impl Client {
         if id.is_empty() {
             return;
         }
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         if let Some(own_jid) = &device_snapshot.pn {
             // Single source of truth for the wire mapping (ReceiptType::Sent is a derived
             // incoming-only state and is never sent by us).

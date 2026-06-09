@@ -24,7 +24,7 @@ cargo test -p e2e-tests          # requires mock server running
 
 ## Critical Conventions
 
-- **State**: Never modify Device state directly. Use `DeviceCommand` + `PersistenceManager::process_command()`. Read via `get_device_snapshot()`.
+- **State**: Never modify Device state directly (not even in tests — a write-lock mutation bypasses the cached snapshot). Use `DeviceCommand` + `PersistenceManager::process_command()` (or `modify_device` internally). Read via `get_device_snapshot()` — it returns a cached `Arc<Device>` (sync, refcount-cheap, safe to call per message); borrow fields from the held snapshot instead of cloning them. `get_device_arc()` is only for store adapters that need `&mut Device` trait access.
 - **Async**: All I/O uses Tokio. Wrap blocking I/O (`ureq`) and heavy CPU work in `tokio::task::spawn_blocking`.
 - **Concurrency**: `session_locks` serializes per-sender Signal encrypt/decrypt. `message_enqueue_locks` serializes per-chat incoming message processing. Outgoing sends are not per-chat locked (matches WA Web).
 - **Errors**: `thiserror` for typed errors, `anyhow` for multi-failure functions. No `.unwrap()` outside tests.

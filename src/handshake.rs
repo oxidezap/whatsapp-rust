@@ -164,7 +164,7 @@ pub async fn do_handshake(
     transport: Arc<dyn Transport>,
     transport_events: &mut async_channel::Receiver<TransportEvent>,
 ) -> Result<Arc<NoiseSocket>> {
-    let device_snapshot = persistence_manager.get_device_snapshot().await;
+    let device_snapshot = persistence_manager.get_device_snapshot();
     let now_secs = wacore::time::now_secs();
     let pattern = select_pattern(
         &device_snapshot,

@@ -102,7 +102,7 @@ impl Client {
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
 
-        let device_snapshot = persistence_manager.get_device_snapshot().await;
+        let device_snapshot = persistence_manager.get_device_snapshot();
         let core = wacore::client::CoreClient::new(device_snapshot.core.clone());
 
         let (tx, rx) = async_channel::bounded(32);
@@ -271,7 +271,7 @@ impl Client {
         // Tag the session-root span with our own (pseudonymous) account id so
         // connection-lifecycle traces are attributable per account.
         #[cfg(feature = "tracing")]
-        if let Some(lid) = self.get_lid().await {
+        if let Some(lid) = self.get_lid() {
             tracing::Span::current().record("account", tracing::field::display(lid.observe()));
         }
         while self.is_running.load(Ordering::Relaxed) {
@@ -459,7 +459,7 @@ impl Client {
         self.enable_auto_reconnect.store(false, Ordering::Relaxed);
 
         if self.is_connected()
-            && let Ok(jid) = self.require_pn().await
+            && let Ok(jid) = self.require_pn()
             && let Err(e) = self.execute(RemoveCompanionDeviceSpec::new(&jid)).await
         {
             warn!("Failed to send logout IQ: {e}");

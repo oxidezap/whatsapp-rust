@@ -60,7 +60,7 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
 
                     let mut codes = Vec::new();
 
-                    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+                    let device_snapshot = client.persistence_manager.get_device_snapshot();
                     let device_state = DeviceState {
                         identity_key: device_snapshot.identity_key.clone(),
                         noise_key: device_snapshot.noise_key.clone(),
@@ -222,7 +222,7 @@ async fn handle_pair_success<'a>(
         (Jid::default(), Jid::default())
     };
 
-    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+    let device_snapshot = client.persistence_manager.get_device_snapshot();
     let device_state = DeviceState {
         identity_key: device_snapshot.identity_key.clone(),
         noise_key: device_snapshot.noise_key.clone(),
@@ -388,7 +388,7 @@ pub async fn pair_with_qr_code(client: &Arc<Client>, qr_code: &str) -> Result<()
 
     let master_ephemeral = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
 
-    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+    let device_snapshot = client.persistence_manager.get_device_snapshot();
     let device_state = DeviceState {
         identity_key: device_snapshot.identity_key.clone(),
         noise_key: device_snapshot.noise_key.clone(),

@@ -67,8 +67,11 @@ impl<'a> MediaReupload<'a> {
         let (ciphertext, iv) = encrypt_media_retry_receipt(req.media_key, req.msg_id)?;
 
         // Get own JID for the receipt's `to` attribute
-        let device_snapshot = self.client.persistence_manager.get_device_snapshot().await;
-        let own_jid = device_snapshot.pn.clone().ok_or(ClientError::NotLoggedIn)?;
+        let device_snapshot = self.client.persistence_manager.get_device_snapshot();
+        let own_jid = device_snapshot
+            .pn
+            .as_ref()
+            .ok_or(ClientError::NotLoggedIn)?;
 
         // Register waiter BEFORE sending (to avoid race)
         let waiter = self.client.wait_for_node(

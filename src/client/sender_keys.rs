@@ -17,7 +17,7 @@ impl Client {
         exclude_own_devices: bool,
     ) -> Result<()> {
         let snapshot = if exclude_own_devices {
-            Some(self.persistence_manager.get_device_snapshot().await)
+            Some(self.persistence_manager.get_device_snapshot())
         } else {
             None
         };
@@ -115,7 +115,7 @@ impl Client {
 
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
         use wacore::types::jid::JidExt;
-        let snapshot = self.persistence_manager.get_device_snapshot().await;
+        let snapshot = self.persistence_manager.get_device_snapshot();
         for own_jid in snapshot.lid.iter().chain(snapshot.pn.iter()) {
             let sk_name =
                 SenderKeyName::from_parts(group_jid, own_jid.to_protocol_address().as_str());

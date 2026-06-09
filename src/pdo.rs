@@ -65,7 +65,7 @@ impl Client {
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
     ) -> Result<(), anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
         // Resolve to LID for the MessageKey when LID-migrated, matching WA Web's
@@ -188,7 +188,7 @@ impl Client {
         oldest_msg_timestamp_ms: i64,
         count: i32,
     ) -> Result<String, anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
         let pdo_request = wa::message::PeerDataOperationRequestMessage {
@@ -416,7 +416,6 @@ impl Client {
         } else if is_from_me {
             self.persistence_manager
                 .get_device_snapshot()
-                .await
                 .pn
                 .clone()
                 .unwrap_or_else(|| remote_jid.clone())

@@ -974,7 +974,7 @@ mod tests {
 
         let client = bot.client();
         let persistence_manager = client.persistence_manager();
-        let device = persistence_manager.get_device_snapshot().await;
+        let device = persistence_manager.get_device_snapshot();
 
         // Verify the device props were overridden
         assert_eq!(device.device_props.os, Some(custom_os));
@@ -1001,7 +1001,7 @@ mod tests {
 
         let client = bot.client();
         let persistence_manager = client.persistence_manager();
-        let device = persistence_manager.get_device_snapshot().await;
+        let device = persistence_manager.get_device_snapshot();
 
         // Verify only OS was overridden, version should be default
         assert_eq!(device.device_props.os, Some(custom_os));
@@ -1037,7 +1037,7 @@ mod tests {
 
         let client = bot.client();
         let persistence_manager = client.persistence_manager();
-        let device = persistence_manager.get_device_snapshot().await;
+        let device = persistence_manager.get_device_snapshot();
 
         // Verify only version was overridden, OS should be default ("rust")
         assert_eq!(device.device_props.version, Some(custom_version));
@@ -1069,7 +1069,7 @@ mod tests {
 
         let client = bot.client();
         let persistence_manager = client.persistence_manager();
-        let device = persistence_manager.get_device_snapshot().await;
+        let device = persistence_manager.get_device_snapshot();
 
         // Verify platform type was set to Chrome
         assert_eq!(
@@ -1119,7 +1119,7 @@ mod tests {
 
         let client = bot.client();
         let persistence_manager = client.persistence_manager();
-        let device = persistence_manager.get_device_snapshot().await;
+        let device = persistence_manager.get_device_snapshot();
 
         // Verify all device props were overridden
         assert_eq!(device.device_props.os, Some(custom_os));

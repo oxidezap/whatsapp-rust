@@ -62,7 +62,7 @@ impl Client {
 
         let participants = nr.get_optional_child_by_tag(&["participants"]);
         if let Some(participants_node) = participants {
-            let own_jid = self.get_pn().await;
+            let own_jid = self.get_pn();
             let to_nodes = participants_node.get_children_by_tag("to");
             for to_node in to_nodes {
                 let to_jid = match to_node.attrs().optional_jid("jid") {
@@ -1566,14 +1566,11 @@ impl Client {
         &self,
         node: &wacore_binary::NodeRef<'_>,
     ) -> Result<MessageInfo, anyhow::Error> {
-        let (own_pn, own_lid) = {
-            let arc = self.persistence_manager.get_device_arc().await;
-            let guard = arc.read().await;
-            (guard.pn.clone(), guard.lid.clone())
-        };
+        // Per-message path: borrow pn/lid from the snapshot, no lock, no clones.
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let default_jid = Jid::default();
-        let own_jid = own_pn.as_ref().unwrap_or(&default_jid);
-        wacore::messages::parse_message_info(node, own_jid, own_lid.as_ref())
+        let own_jid = device_snapshot.pn.as_ref().unwrap_or(&default_jid);
+        wacore::messages::parse_message_info(node, own_jid, device_snapshot.lid.as_ref())
     }
 }
 

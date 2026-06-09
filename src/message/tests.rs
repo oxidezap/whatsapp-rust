@@ -737,7 +737,7 @@ impl AlicePeer {
 /// `create_test_client_with_name` returns an unpaired client by default
 /// so `device_snapshot.lid` / `.pn` are both `None`.
 async fn ensure_bob_paired(client: &Arc<Client>) {
-    let snapshot = client.persistence_manager.get_device_snapshot().await;
+    let snapshot = client.persistence_manager.get_device_snapshot();
     if snapshot.lid.is_some() || snapshot.pn.is_some() {
         return;
     }
@@ -761,7 +761,7 @@ async fn ensure_bob_paired(client: &Arc<Client>) {
 async fn bobs_prekey_bundle(client: &Arc<Client>) -> (PreKeyBundle, Jid) {
     use wacore::libsignal::protocol::GenericSignedPreKey;
     ensure_bob_paired(client).await;
-    let snapshot = client.persistence_manager.get_device_snapshot().await;
+    let snapshot = client.persistence_manager.get_device_snapshot();
     let identity_kp = snapshot.core.identity_key.clone();
     let reg_id = snapshot.core.registration_id;
 
@@ -1035,15 +1035,9 @@ async fn test_badmac_preserves_session() {
             &client
                 .persistence_manager
                 .get_device_snapshot()
-                .await
                 .lid
                 .clone()
-                .or(client
-                    .persistence_manager
-                    .get_device_snapshot()
-                    .await
-                    .pn
-                    .clone())
+                .or(client.persistence_manager.get_device_snapshot().pn.clone())
                 .expect("own jid")
                 .to_protocol_address(),
             &bob_bundle,
@@ -1054,15 +1048,9 @@ async fn test_badmac_preserves_session() {
     let bob_addr = client
         .persistence_manager
         .get_device_snapshot()
-        .await
         .lid
         .clone()
-        .or(client
-            .persistence_manager
-            .get_device_snapshot()
-            .await
-            .pn
-            .clone())
+        .or(client.persistence_manager.get_device_snapshot().pn.clone())
         .expect("own jid")
         .to_protocol_address();
     let pkmsg = alice.encrypt_text(&bob_addr, "hello").await;
@@ -1213,15 +1201,9 @@ async fn test_prod_scenario_pkmsg_archives_old_session_after_badmac() {
     let bob_addr = client
         .persistence_manager
         .get_device_snapshot()
-        .await
         .lid
         .clone()
-        .or(client
-            .persistence_manager
-            .get_device_snapshot()
-            .await
-            .pn
-            .clone())
+        .or(client.persistence_manager.get_device_snapshot().pn.clone())
         .expect("own jid")
         .to_protocol_address();
     alice.install_bob_session(&bob_addr, &bundle_v1).await;
@@ -1768,9 +1750,7 @@ async fn test_parse_message_info_sender_alt_extraction() {
     );
 
     // Set up own phone number and LID
-    {
-        let device_arc = pm.get_device_arc().await;
-        let mut device = device_arc.write().await;
+    pm.modify_device(|device| {
         device.pn = Some(
             "15551234567@s.whatsapp.net"
                 .parse()
@@ -1781,7 +1761,8 @@ async fn test_parse_message_info_sender_alt_extraction() {
                 .parse()
                 .expect("test JID should be valid"),
         );
-    }
+    })
+    .await;
 
     let (client, _sync_rx) = Client::new(
         Arc::new(crate::runtime_impl::TokioRuntime),
@@ -2468,9 +2449,7 @@ async fn test_parse_message_info_self_sent_dm_via_lid() {
     );
 
     // Set up own phone number and LID
-    {
-        let device_arc = pm.get_device_arc().await;
-        let mut device = device_arc.write().await;
+    pm.modify_device(|device| {
         device.pn = Some(
             "15551234567@s.whatsapp.net"
                 .parse()
@@ -2481,7 +2460,8 @@ async fn test_parse_message_info_self_sent_dm_via_lid() {
                 .parse()
                 .expect("test JID should be valid"),
         );
-    }
+    })
+    .await;
 
     let (client, _sync_rx) = Client::new(
         Arc::new(crate::runtime_impl::TokioRuntime),
@@ -2567,9 +2547,7 @@ async fn test_parse_message_info_dm_from_other_via_lid() {
     );
 
     // Set up own phone number and LID
-    {
-        let device_arc = pm.get_device_arc().await;
-        let mut device = device_arc.write().await;
+    pm.modify_device(|device| {
         device.pn = Some(
             "15551234567@s.whatsapp.net"
                 .parse()
@@ -2580,7 +2558,8 @@ async fn test_parse_message_info_dm_from_other_via_lid() {
                 .parse()
                 .expect("test JID should be valid"),
         );
-    }
+    })
+    .await;
 
     let (client, _sync_rx) = Client::new(
         Arc::new(crate::runtime_impl::TokioRuntime),
@@ -2662,9 +2641,7 @@ async fn test_parse_message_info_dm_to_self() {
     );
 
     // Set up own phone number and LID
-    {
-        let device_arc = pm.get_device_arc().await;
-        let mut device = device_arc.write().await;
+    pm.modify_device(|device| {
         device.pn = Some(
             "15551234567@s.whatsapp.net"
                 .parse()
@@ -2675,7 +2652,8 @@ async fn test_parse_message_info_dm_to_self() {
                 .parse()
                 .expect("test JID should be valid"),
         );
-    }
+    })
+    .await;
 
     let (client, _sync_rx) = Client::new(
         Arc::new(crate::runtime_impl::TokioRuntime),

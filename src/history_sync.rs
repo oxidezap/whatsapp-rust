@@ -143,7 +143,7 @@ impl Client {
         };
 
         let own_user = {
-            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
             device_snapshot.pn.as_ref().map(|j| j.to_non_ad().user)
         };
 
@@ -273,7 +273,7 @@ impl Client {
         let retention = &self.cache_config.msg_secret_retention;
         let now = wacore::time::now_secs();
 
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_pn = device_snapshot.pn.as_ref().map(|j| j.to_non_ad());
         let own_lid = device_snapshot.lid.as_ref().map(|j| j.to_non_ad());
 
@@ -385,7 +385,6 @@ impl Client {
     ) -> Result<(), anyhow::Error> {
         let own_jid = self
             .get_pn()
-            .await
             .ok_or(crate::client::ClientError::NotLoggedIn)?
             .to_non_ad();
         let (ciphertext, iv) =

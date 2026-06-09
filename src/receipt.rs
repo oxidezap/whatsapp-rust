@@ -464,7 +464,7 @@ impl Client {
         if info.id.is_empty() {
             return;
         }
-        let Some(own_pn) = self.get_pn().await else {
+        let Some(own_pn) = self.get_pn() else {
             log::debug!(
                 "[msg:{}] Skipping nack ({:?}): own PN not yet set",
                 info.id,

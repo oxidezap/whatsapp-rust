@@ -16,7 +16,7 @@ async fn test_initial_sync_delivers_push_name() -> anyhow::Result<()> {
     let mut client = TestClient::connect_without_push_name("e2e_as_init_sync").await?;
     client.wait_for_app_state_sync().await?;
 
-    let push_name = client.client.get_push_name().await;
+    let push_name = client.client.get_push_name();
     assert!(
         !push_name.is_empty(),
         "Push name should be set from initial critical_block sync (got empty — app state keys may be broken)"
@@ -39,12 +39,12 @@ async fn test_push_name_survives_reconnect() -> anyhow::Result<()> {
 
     let name = "ReconnectTest";
     client.client.profile().set_push_name(name).await?;
-    assert_eq!(client.client.get_push_name().await, name);
+    assert_eq!(client.client.get_push_name(), name);
     info!("Push name set to '{name}'");
 
     client.reconnect_and_wait().await?;
 
-    let after = client.client.get_push_name().await;
+    let after = client.client.get_push_name();
     assert_eq!(after, name, "Push name should survive reconnect");
     info!("Push name after reconnect: '{after}'");
 
@@ -65,7 +65,6 @@ async fn test_mutation_works_after_reconnect() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -97,7 +96,6 @@ async fn test_undo_mutation_after_reconnect() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -134,7 +132,6 @@ async fn test_cross_collection_mutations() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -195,13 +192,11 @@ async fn test_star_received_message() -> anyhow::Result<()> {
     let jid_a = client_a
         .client
         .get_pn()
-        .await
         .expect("A should have JID")
         .to_non_ad();
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -259,8 +254,8 @@ async fn test_multi_device_app_state_sync() -> anyhow::Result<()> {
     let mut client_a2 = TestClient::connect_as("e2e_multidev_a2", push_name).await?;
 
     // Verify both devices got the same phone number
-    let phone_a1 = client_a1.client.get_pn().await.expect("A1 should have JID");
-    let phone_a2 = client_a2.client.get_pn().await.expect("A2 should have JID");
+    let phone_a1 = client_a1.client.get_pn().expect("A1 should have JID");
+    let phone_a2 = client_a2.client.get_pn().expect("A2 should have JID");
     assert_eq!(
         phone_a1.user, phone_a2.user,
         "Both devices should share the same phone number"
@@ -318,7 +313,6 @@ async fn test_rapid_successive_mutations() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 

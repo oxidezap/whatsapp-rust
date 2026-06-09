@@ -15,7 +15,6 @@ impl Client {
         let stored_hash = self
             .persistence_manager
             .get_device_snapshot()
-            .await
             .props_hash
             .clone();
 
@@ -192,13 +191,7 @@ impl Client {
         if override_.is_empty() {
             return;
         }
-        if self
-            .persistence_manager
-            .get_device_snapshot()
-            .await
-            .pn
-            .is_some()
-        {
+        if self.persistence_manager.get_device_snapshot().pn.is_some() {
             warn!(
                 target: "Client/DeviceProps",
                 "set_device_props called after pairing — stored but not sent on the wire"

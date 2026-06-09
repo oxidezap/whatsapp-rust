@@ -67,11 +67,7 @@ impl<'a> Presence<'a> {
 
     /// Set the presence status.
     pub async fn set(&self, status: PresenceStatus) -> Result<(), PresenceError> {
-        let device_snapshot = self
-            .client
-            .persistence_manager()
-            .get_device_snapshot()
-            .await;
+        let device_snapshot = self.client.persistence_manager().get_device_snapshot();
 
         debug!(
             "send_presence called with push_name: '{}'",
@@ -303,7 +299,7 @@ mod tests {
 
         let client = bot.client();
 
-        let snapshot = client.persistence_manager().get_device_snapshot().await;
+        let snapshot = client.persistence_manager().get_device_snapshot();
         assert!(
             snapshot.push_name.is_empty(),
             "Pushname should be empty on fresh device"
@@ -343,7 +339,7 @@ mod tests {
             .process_command(DeviceCommand::SetPushName("Test User".to_string()))
             .await;
 
-        let snapshot = client.persistence_manager().get_device_snapshot().await;
+        let snapshot = client.persistence_manager().get_device_snapshot();
         assert_eq!(snapshot.push_name, "Test User");
 
         // Validation passes; error should be connection-related, not pushname
@@ -381,7 +377,7 @@ mod tests {
         let client = bot.client();
 
         // Fresh device has empty pushname
-        let snapshot = client.persistence_manager().get_device_snapshot().await;
+        let snapshot = client.persistence_manager().get_device_snapshot();
         assert!(snapshot.push_name.is_empty());
 
         // Presence deferred when pushname empty

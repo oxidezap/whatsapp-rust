@@ -58,8 +58,8 @@ impl StanzaHandler for CallHandler {
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.call_offer_ack", level = "debug", skip_all, fields(peer = %call.from.observe()), err(Debug)))]
 async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow::Result<()> {
     let own_from = match call.from.server {
-        Server::Lid => client.get_lid().await,
-        _ => client.get_pn().await,
+        Server::Lid => client.get_lid(),
+        _ => client.get_pn(),
     };
 
     let Some(receipt) = build_offer_ack_receipt(call, own_from.as_ref()) else {

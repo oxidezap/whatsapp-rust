@@ -77,7 +77,7 @@ impl Client {
             })
         }
 
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let key_store = device_snapshot.backend.clone();
 
         let mut stored_count = 0;

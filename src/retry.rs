@@ -227,7 +227,7 @@ impl Client {
             return Ok(());
         }
 
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let mut info = resolve_retry_chat_info(
             receipt,
             nr,
@@ -491,7 +491,7 @@ impl Client {
             self.ensure_e2e_sessions_resolved(std::slice::from_ref(&resolved_jid))
                 .await?;
 
-            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
 
             let addressing_mode = cached_group_info
                 .as_ref()
@@ -530,7 +530,7 @@ impl Client {
             self.ensure_e2e_sessions_resolved(std::slice::from_ref(&resolved_jid))
                 .await?;
 
-            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
             let signal_address = resolved_jid.to_protocol_address();
             let session_mutex = self.session_lock_for(signal_address.as_str()).await;
             let _session_guard = session_mutex.lock().await;
@@ -649,15 +649,13 @@ impl Client {
 
             if let Some(received_reg_id) = extract_registration_id_from_node_ref(node) {
                 let signal_address = resolved_jid.to_protocol_address();
-                let device_store = self.persistence_manager.get_device_arc().await;
-                let device_guard = device_store.read().await;
+                let device_snapshot = self.persistence_manager.get_device_snapshot();
                 let session = self
                     .signal_cache
-                    .peek_session(&signal_address, &*device_guard.backend)
+                    .peek_session(&signal_address, &*device_snapshot.backend)
                     .await
                     .ok()
                     .flatten();
-                drop(device_guard);
 
                 if let Some(session) = session
                     && let Ok(stored_reg_id) = session.remote_registration_id()
@@ -684,11 +682,10 @@ impl Client {
         // 4-5. Base-key collision logic (WA Web L66-80). Applied to ALL chat
         //      types now — previously only ran in the DM branch.
         let signal_address = resolved_jid.to_protocol_address();
-        let device_store = self.persistence_manager.get_device_arc().await;
-        let device_guard = device_store.read().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let session = self
             .signal_cache
-            .peek_session(&signal_address, &*device_guard.backend)
+            .peek_session(&signal_address, &*device_snapshot.backend)
             .await
             .ok()
             .flatten();
@@ -703,7 +700,7 @@ impl Client {
         let addr_str = signal_address.as_str();
         if retry_count == MIN_RETRY_FOR_BASE_KEY_CHECK {
             // retry == 2: save base key, do NOT delete (WA Web L66-67).
-            match device_guard
+            match device_snapshot
                 .backend
                 .save_base_key(addr_str, message_id, current_base_key)
                 .await
@@ -723,7 +720,7 @@ impl Client {
         }
 
         if retry_count > MIN_RETRY_FOR_BASE_KEY_CHECK {
-            match device_guard
+            match device_snapshot
                 .backend
                 .has_same_base_key(addr_str, message_id, current_base_key)
                 .await
@@ -735,11 +732,10 @@ impl Client {
                         wacore::types::jid::observe_protocol_address(&signal_address),
                         retry_count
                     );
-                    let _ = device_guard
+                    let _ = device_snapshot
                         .backend
                         .delete_base_key(addr_str, message_id)
                         .await;
-                    drop(device_guard);
                     let lock = self.session_lock_for(signal_address.as_str()).await;
                     let _guard = lock.lock().await;
                     self.signal_cache.delete_session(&signal_address).await;
@@ -756,7 +752,7 @@ impl Client {
                         wacore::types::jid::observe_protocol_address(&signal_address),
                         retry_count
                     );
-                    let _ = device_guard
+                    let _ = device_snapshot
                         .backend
                         .delete_base_key(addr_str, message_id)
                         .await;
@@ -797,14 +793,13 @@ impl Client {
         now: wacore::time::Instant,
     ) -> Option<&'static str> {
         let signal_address = jid.to_protocol_address();
-        let device_store = self.persistence_manager.get_device_arc().await;
-        let device_guard = device_store.read().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         // Whatsmeow returns `false` on `ContainsSession` errors so a transient
         // backend read failure doesn't masquerade as "no session" and trigger
         // an unnecessary delete + prekey fetch (`retry.go:161-163`).
         let has_session = match self
             .signal_cache
-            .has_session(&signal_address, &*device_guard.backend)
+            .has_session(&signal_address, &*device_snapshot.backend)
             .await
         {
             Ok(present) => present,
@@ -816,7 +811,6 @@ impl Client {
                 return None;
             }
         };
-        drop(device_guard);
 
         let history = &self.session_recreate_history;
 
@@ -895,15 +889,13 @@ impl Client {
         // Check if the registration ID changed (indicates device reinstall).
         // Read session through cache for consistent state.
         {
-            let device_store = self.persistence_manager.get_device_arc().await;
-            let device_guard = device_store.read().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
             let session = self
                 .signal_cache
-                .peek_session(&signal_address, &*device_guard.backend)
+                .peek_session(&signal_address, &*device_snapshot.backend)
                 .await
                 .ok()
                 .flatten();
-            drop(device_guard);
 
             if let Some(session) = session {
                 let existing_reg_id = session.remote_registration_id()?;
@@ -1050,7 +1042,7 @@ impl Client {
         retry_count: u8,
         reason: RetryReason,
     ) -> Result<(), anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         // WA Web's sendRetryReceipt aborts only when `!to.isBot() && participant.isBot()`,
         // with participant null for DMs. A bot DM is chat == sender == bot, so it is NOT
@@ -1107,15 +1099,13 @@ impl Client {
                 &new_prekey_keypair,
             );
             // This key is not uploaded to the server pool, so mark as false
-            let device_store = self.persistence_manager.get_device_arc().await;
-            let device_guard = device_store.read().await;
-            if let Err(e) = device_guard
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
+            if let Err(e) = device_snapshot
                 .store_prekey(new_prekey_id, new_prekey_record, false)
                 .await
             {
                 warn!("Failed to store new prekey for retry receipt: {e:?}");
             }
-            drop(device_guard);
             drop(prekey_guard);
 
             let device_identity_bytes = device_snapshot
@@ -1213,7 +1203,7 @@ impl Client {
         call_creator: &wacore_binary::Jid,
         retry_count: u8,
     ) -> Result<(), anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         let registration_id_bytes = device_snapshot.registration_id.to_be_bytes().to_vec();
 

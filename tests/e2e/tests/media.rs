@@ -391,7 +391,6 @@ async fn test_send_image_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -458,7 +457,6 @@ async fn test_send_video_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -508,7 +506,6 @@ async fn test_send_document_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -557,7 +554,6 @@ async fn test_send_audio_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -606,7 +602,6 @@ async fn test_send_ptt_voice_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -658,13 +653,11 @@ async fn test_send_image_bidirectional() -> anyhow::Result<()> {
     let jid_a = client_a
         .client
         .get_pn()
-        .await
         .expect("A should have JID")
         .to_non_ad();
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -737,7 +730,6 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -901,7 +893,6 @@ async fn test_send_image_no_caption() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 

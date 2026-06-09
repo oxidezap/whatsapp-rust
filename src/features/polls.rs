@@ -107,7 +107,6 @@ impl<'a> Polls<'a> {
         let my_jid = self
             .client
             .get_pn()
-            .await
             .ok_or_else(|| anyhow!("Not logged in — cannot determine own JID"))?;
         let my_base = my_jid.to_non_ad();
 
@@ -174,7 +173,7 @@ impl<'a> Polls<'a> {
         if !poll_creator_jid.is_lid() {
             return own_pn.clone();
         }
-        match self.client.get_lid().await {
+        match self.client.get_lid() {
             Some(lid) => lid.to_non_ad(),
             None => {
                 log::warn!(

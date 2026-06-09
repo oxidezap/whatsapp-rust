@@ -547,16 +547,17 @@ impl Client {
         let to = Jid::status_broadcast();
         let request_id = self.generate_message_id().await;
 
-        let mut device_snapshot = self.persistence_manager.get_device_snapshot().await;
-        let account_info = device_snapshot.account.take();
+        // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let account_info = &device_snapshot.account;
         let own_jid = device_snapshot
             .pn
-            .take()
+            .as_ref()
             .ok_or(crate::client::ClientError::NotLoggedIn)?;
         // Status is LID-addressed (matches WA Web post-LID-migration). Without
         // a real device LID we can't sign or fan out correctly; refuse rather
         // than silently emit `addressing_mode="lid"` with a PN sender.
-        let own_lid = device_snapshot.lid.take().ok_or_else(|| {
+        let own_lid = device_snapshot.lid.as_ref().ok_or_else(|| {
             anyhow!(
                 "Cannot send status: device has no LID yet. Finish pairing / LID \
                  migration before posting status."
@@ -610,10 +611,9 @@ impl Client {
             let sender_address = own_lid.to_protocol_address();
             let sender_key_name = SenderKeyName::from_parts(&to_str, sender_address.as_str());
 
-            let device_guard = device_store_arc.read().await;
             let key_exists = self
                 .signal_cache
-                .get_sender_key(&sender_key_name, &*device_guard.backend)
+                .get_sender_key(&sender_key_name, &*device_snapshot.backend)
                 .await?
                 .is_some();
 
@@ -976,7 +976,7 @@ impl Client {
         // (WA Web: syncDeviceListJob([recipient, me]))
         if !jid.is_group() && !jid.is_status_broadcast() {
             self.invalidate_device_cache(&jid.user).await;
-            if let Some(own_pn) = &self.persistence_manager.get_device_snapshot().await.pn {
+            if let Some(own_pn) = &self.persistence_manager.get_device_snapshot().pn {
                 self.invalidate_device_cache(&own_pn.user).await;
             }
         }
@@ -998,7 +998,7 @@ impl Client {
                 );
                 use wacore::libsignal::store::sender_key_name::SenderKeyName;
                 use wacore::types::jid::JidExt;
-                let snapshot = self.persistence_manager.get_device_snapshot().await;
+                let snapshot = self.persistence_manager.get_device_snapshot();
                 for own in snapshot.lid.iter().chain(snapshot.pn.iter()) {
                     let sk =
                         SenderKeyName::from_parts(&jid_str, own.to_protocol_address().as_str());
@@ -1046,7 +1046,7 @@ impl Client {
         revoke_type: RevokeType,
     ) -> Result<(), anyhow::Error> {
         let message_id = message_id.into();
-        self.require_pn().await?;
+        self.require_pn()?;
 
         let (from_me, participant, edit_attr) = match &revoke_type {
             RevokeType::Sender => {
@@ -1270,7 +1270,7 @@ impl Client {
 
             let mut store_adapter = self.signal_adapter().await;
 
-            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
             wacore::send::prepare_peer_stanza(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
@@ -1286,15 +1286,16 @@ impl Client {
             // sender-key chain advance per (group, sender) at the cipher.
             let group_info = self.groups().query_info(&to).await?;
 
-            let mut device_snapshot = self.persistence_manager.get_device_snapshot().await;
-            let account_info = device_snapshot.account.take();
+            // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
+            let account_info = &device_snapshot.account;
             let own_jid = device_snapshot
                 .pn
-                .take()
+                .as_ref()
                 .ok_or(crate::client::ClientError::NotLoggedIn)?;
             let own_lid = device_snapshot
                 .lid
-                .take()
+                .as_ref()
                 .ok_or_else(|| anyhow!("LID not set, cannot send to group"))?;
 
             // Store serialized message bytes for retry (lightweight)
@@ -1317,10 +1318,9 @@ impl Client {
                 let sender_address = own_sending_jid.to_protocol_address();
                 let sender_key_name = SenderKeyName::from_parts(&to_str, sender_address.as_str());
 
-                let device_guard = device_store_arc.read().await;
                 let record = self
                     .signal_cache
-                    .get_sender_key(&sender_key_name, &*device_guard.backend)
+                    .get_sender_key(&sender_key_name, &*device_snapshot.backend)
                     .await?;
                 let key_exists = record.is_some();
 
@@ -1336,7 +1336,6 @@ impl Client {
                     .and_then(|state| state.sender_chain_key())
                     .map(|ck| ck.iteration())
                     .is_some_and(|iter| iter >= SENDER_KEY_ROTATION_THRESHOLD);
-                drop(device_guard);
 
                 if needs_rotation {
                     log::info!(
@@ -1479,7 +1478,7 @@ impl Client {
                 self.add_recent_message(&to, &request_id, message).await;
             }
 
-            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
             let own_jid = device_snapshot
                 .pn
                 .as_ref()
@@ -1805,9 +1804,9 @@ impl Client {
     /// `PreparedGroupStanza.sender_identity` directly instead of this.
     pub(crate) async fn dm_sender_identity_for(&self, to: &Jid) -> Option<Jid> {
         if to.server == wacore_binary::Server::Bot {
-            self.get_lid().await
+            self.get_lid()
         } else {
-            self.get_pn().await
+            self.get_pn()
         }
     }
 
@@ -1833,7 +1832,7 @@ impl Client {
         };
 
         // Skip for own JID — no need to send privacy token to ourselves
-        let snapshot = self.persistence_manager.get_device_snapshot().await;
+        let snapshot = self.persistence_manager.get_device_snapshot();
         let is_self = snapshot
             .pn
             .as_ref()

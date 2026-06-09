@@ -155,15 +155,13 @@ impl<'a> Signal<'a> {
         let _chain_guard = chain_lock.lock().await;
 
         // Only create SKDM when no sender key exists (matches WA Web behavior)
-        let device_store = self.client.persistence_manager.get_device_arc().await;
-        let device_guard = device_store.read().await;
+        let device_snapshot = self.client.persistence_manager.get_device_snapshot();
         let key_exists = self
             .client
             .signal_cache
-            .get_sender_key(&sender_key_name, &*device_guard.backend)
+            .get_sender_key(&sender_key_name, &*device_snapshot.backend)
             .await?
             .is_some();
-        drop(device_guard);
 
         let mut adapter = self.client.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -230,11 +228,10 @@ impl<'a> Signal<'a> {
     pub async fn validate_session(&self, jid: &Jid) -> Result<bool> {
         let resolved = self.client.resolve_encryption_jid(jid).await;
         let signal_addr = resolved.to_protocol_address();
-        let device_store = self.client.persistence_manager.get_device_arc().await;
-        let device_guard = device_store.read().await;
+        let device_snapshot = self.client.persistence_manager.get_device_snapshot();
         self.client
             .signal_cache
-            .has_session(&signal_addr, &*device_guard.backend)
+            .has_session(&signal_addr, &*device_snapshot.backend)
             .await
             .map_err(|e| anyhow!("session check failed: {e}"))
     }

@@ -89,7 +89,7 @@ impl Client {
     ///
     /// A string containing the generated message ID in the format expected by WhatsApp.
     pub async fn generate_message_id(&self) -> String {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         self.get_request_utils()
             .generate_message_id(device_snapshot.pn.as_ref())
     }

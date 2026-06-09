@@ -267,7 +267,6 @@ impl TestClient {
     pub async fn jid(&self) -> Jid {
         self.client
             .get_pn()
-            .await
             .expect("Client should have a JID after connect")
             .to_non_ad()
     }
@@ -277,13 +276,12 @@ impl TestClient {
     /// Notification handling stores tcTokens under the sender's LID when it is
     /// available, otherwise it falls back to the phone-number user part.
     pub async fn tc_token_key(&self) -> anyhow::Result<String> {
-        if let Some(lid) = self.client.get_lid().await {
+        if let Some(lid) = self.client.get_lid() {
             return Ok(lid.user.to_string());
         }
 
         self.client
             .get_pn()
-            .await
             .map(|jid| jid.user.to_string())
             .ok_or_else(|| anyhow::anyhow!("Client should have a JID after connect"))
     }
@@ -329,7 +327,6 @@ impl TestClient {
         self.client
             .persistence_manager()
             .get_device_snapshot()
-            .await
             .nct_salt
             .clone()
     }
@@ -446,7 +443,7 @@ impl TestClient {
 
     /// Wait for initial app state sync to complete (keys become available).
     pub async fn wait_for_app_state_sync(&mut self) -> anyhow::Result<()> {
-        let push_name = self.client.get_push_name().await;
+        let push_name = self.client.get_push_name();
         if !push_name.is_empty() {
             return Ok(());
         }

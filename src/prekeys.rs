@@ -117,11 +117,11 @@ impl Client {
 
         let account_jid = companion_jid.with_device(0);
         let addr = account_jid.to_protocol_address();
-        let backend = {
-            let device_store = self.persistence_manager.get_device_arc().await;
-            let guard = device_store.read().await;
-            guard.backend.clone()
-        };
+        let backend = self
+            .persistence_manager
+            .get_device_snapshot()
+            .backend
+            .clone();
         match self.signal_cache.get_identity(&addr, &*backend).await {
             Ok(Some(id)) if id.len() == 32 => {
                 let mut arr = [0u8; 32];
@@ -170,7 +170,6 @@ impl Client {
         let has_prekeys = self
             .persistence_manager
             .get_device_snapshot()
-            .await
             .server_has_prekeys;
 
         if has_prekeys {
@@ -185,7 +184,6 @@ impl Client {
         if self
             .persistence_manager
             .get_device_snapshot()
-            .await
             .server_has_prekeys
         {
             return Ok(());
@@ -240,13 +238,12 @@ impl Client {
         let next_pre_key_id = self
             .persistence_manager
             .get_device_snapshot()
-            .await
             .next_pre_key_id;
-        let backend = {
-            let device_store = self.persistence_manager.get_device_arc().await;
-            let guard = device_store.read().await;
-            guard.backend.clone()
-        };
+        let backend = self
+            .persistence_manager
+            .get_device_snapshot()
+            .backend
+            .clone();
         let max_id = backend.get_max_prekey_id().await?;
         let id = start_prekey_id(next_pre_key_id, max_id);
         let next = (id as u64 % MAX_PREKEY_ID as u64) as u32 + 1;
@@ -269,13 +266,8 @@ impl Client {
         )
     )]
     async fn upload_pre_keys_inner(&self) -> Result<(), anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
-        let device_store = self.persistence_manager.get_device_arc().await;
-
-        let backend = {
-            let device_guard = device_store.read().await;
-            device_guard.backend.clone()
-        };
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let backend = device_snapshot.backend.clone();
 
         // Use the persistent counter, falling back to max(store_id)+1 for migration.
         // The counter is the source of truth after the first upload; start_prekey_id wraps
@@ -510,7 +502,7 @@ impl Client {
         // WA Web's validateLocalKeyBundle validates but catches ALL exceptions without
         // re-uploading. The catch block in digestKey() sets a=false for any throw from y(),
         // meaning only 404 triggers re-upload. We match that: log warnings, return Ok(()).
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         if response.reg_id != device_snapshot.registration_id {
             log::warn!(
                 "digestKey: registration ID mismatch (server={}, local={}), skipping",
@@ -526,11 +518,11 @@ impl Client {
         let skey_pub_bytes = device_snapshot.signed_pre_key.public_key.public_key_bytes();
         let skey_sig_bytes = &device_snapshot.signed_pre_key_signature;
 
-        let device_store = self.persistence_manager.get_device_arc().await;
-        let backend = {
-            let guard = device_store.read().await;
-            guard.backend.clone()
-        };
+        let backend = self
+            .persistence_manager
+            .get_device_snapshot()
+            .backend
+            .clone();
 
         // Batch-load all prekeys referenced by the server digest
         let loaded = match backend.load_prekeys_batch(&response.prekey_ids).await {

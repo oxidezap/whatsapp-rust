@@ -43,7 +43,7 @@ pub async fn resolve_and_update_version(
         return Ok(());
     }
 
-    let device = persistence_manager.get_device_snapshot().await;
+    let device = persistence_manager.get_device_snapshot();
     let last_fetched_ms = device.app_version_last_fetched_ms;
 
     let needs_fetch = if last_fetched_ms == 0 {

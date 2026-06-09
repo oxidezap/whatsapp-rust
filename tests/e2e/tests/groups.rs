@@ -735,7 +735,6 @@ async fn test_query_info_populates_lid_pn_cache_for_participants() -> anyhow::Re
     let jid_b_lid = client_b
         .client
         .get_lid()
-        .await
         .expect("B must have a LID after pairing")
         .to_non_ad();
     info!("B pn={jid_b_pn} lid={jid_b_lid}");

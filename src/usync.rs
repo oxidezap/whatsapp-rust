@@ -229,7 +229,7 @@ impl Client {
         )
     )]
     pub(crate) async fn sync_own_device_list(&self) -> Result<(), anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         let mut jids = Vec::with_capacity(2);
         let mut hashes: std::collections::HashMap<Jid, (String, i64)> =

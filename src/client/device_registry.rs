@@ -2059,11 +2059,10 @@ mod tests {
             .rotate_sender_key_on_participant_remove(group, &["271060335329480"])
             .await;
 
-        let device_arc = client.persistence_manager.get_device_arc().await;
-        let device = device_arc.read().await;
+        let device_snapshot = client.persistence_manager.get_device_snapshot();
         let key = client
             .signal_cache
-            .get_sender_key(&sk_name, &*device.backend)
+            .get_sender_key(&sk_name, &*device_snapshot.backend)
             .await
             .unwrap();
         assert!(
@@ -2114,11 +2113,10 @@ mod tests {
             .rotate_sender_key_on_participant_remove(group, &["271060335329480"])
             .await;
 
-        let device_arc = client.persistence_manager.get_device_arc().await;
-        let device = device_arc.read().await;
+        let device_snapshot = client.persistence_manager.get_device_snapshot();
         let key = client
             .signal_cache
-            .get_sender_key(&sk_name, &*device.backend)
+            .get_sender_key(&sk_name, &*device_snapshot.backend)
             .await
             .unwrap();
         assert!(

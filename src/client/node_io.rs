@@ -456,7 +456,7 @@ impl Client {
         if !self.is_connected() {
             return Err(ClientError::NotConnected);
         }
-        let own_pn = self.get_pn().await;
+        let own_pn = self.get_pn();
         let buf = match encode_ack_bytes(node, own_pn.as_ref()) {
             Ok(Some(buf)) => buf,
             Ok(None) => return Ok(()),
@@ -473,7 +473,7 @@ impl Client {
     /// in a single flushed task.
     pub(crate) async fn send_transport_ack(&self, info: &crate::types::message::MessageInfo) {
         let source = message_ack_source_node(info);
-        let own_pn = self.get_pn().await;
+        let own_pn = self.get_pn();
         match encode_ack_bytes(&source.as_node_ref(), own_pn.as_ref()) {
             Ok(Some(buf)) => {
                 if let Err(e) = self.send_raw_bytes(buf).await
@@ -507,7 +507,7 @@ impl Client {
         self: &Arc<Self>,
         node: &wacore_binary::NodeRef<'_>,
     ) {
-        let own_pn = self.get_pn().await;
+        let own_pn = self.get_pn();
         let buf = match encode_ack_bytes(node, own_pn.as_ref()) {
             Ok(Some(b)) => b,
             Ok(None) => return,
@@ -580,7 +580,7 @@ impl Client {
             // on Device snapshot + write lock).
             if let Some(lid) = lid_from_server {
                 let device_snapshot =
-                    client_clone.persistence_manager.get_device_snapshot().await;
+                    client_clone.persistence_manager.get_device_snapshot();
                 if device_snapshot.lid.as_ref() != Some(&lid) {
                     debug!("Updating LID from server to '{}'", lid.observe());
                     client_clone
@@ -598,7 +598,6 @@ impl Client {
             let already_paired = client_clone
                 .persistence_manager
                 .get_device_snapshot()
-                .await
                 .pn
                 .is_some();
             if already_paired {
@@ -626,7 +625,7 @@ impl Client {
 
             // Check if we need initial app state sync (empty pushname indicates fresh pairing
             // where pushname will come from app state sync's setting_pushName mutation)
-            let device_snapshot = client_clone.persistence_manager.get_device_snapshot().await;
+            let device_snapshot = client_clone.persistence_manager.get_device_snapshot();
             let needs_pushname_from_sync = device_snapshot.push_name.is_empty();
             if needs_pushname_from_sync {
                 debug!("Push name is empty - will be set from app state sync (setting_pushName)");
@@ -805,7 +804,7 @@ impl Client {
                     }
                     // Matches WhatsApp Web's $16(): check if SettingPushName was synced.
                     // If push_name is still empty after 180s, critical sync failed.
-                    let push_name = timeout_client.get_push_name().await;
+                    let push_name = timeout_client.get_push_name();
                     if push_name.is_empty() {
                         warn!(
                             target: "Client/AppState",
@@ -888,7 +887,7 @@ impl Client {
             } else {
                 // === Reconnection path ===
                 // Pushname is already known, send presence and Connected immediately.
-                let device_snapshot = client_clone.persistence_manager.get_device_snapshot().await;
+                let device_snapshot = client_clone.persistence_manager.get_device_snapshot();
                 if !device_snapshot.push_name.is_empty() {
                     if let Err(e) = client_clone.presence().set_available().await {
                         warn!("Failed to send initial presence: {e:?}");

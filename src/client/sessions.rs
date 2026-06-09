@@ -173,23 +173,20 @@ impl Client {
     async fn ensure_sessions_inner(&self, jids: Vec<Jid>) -> Result<()> {
         use wacore::types::jid::JidExt;
 
-        let device_store = self.persistence_manager.get_device_arc().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let mut jids_needing_sessions = Vec::with_capacity(jids.len());
 
-        {
-            let device_guard = device_store.read().await;
-            for jid in jids {
-                let signal_addr = jid.to_protocol_address();
-                // Check cache first (includes unflushed sessions), fall back to backend
-                match self
-                    .signal_cache
-                    .has_session(&signal_addr, &*device_guard.backend)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => jids_needing_sessions.push(jid),
-                    Err(e) => log::warn!("Failed to check session for {}: {}", jid.observe(), e),
-                }
+        for jid in jids {
+            let signal_addr = jid.to_protocol_address();
+            // Check cache first (includes unflushed sessions), fall back to backend
+            match self
+                .signal_cache
+                .has_session(&signal_addr, &*device_snapshot.backend)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => jids_needing_sessions.push(jid),
+                Err(e) => log::warn!("Failed to check session for {}: {}", jid.observe(), e),
             }
         }
 
@@ -300,7 +297,7 @@ impl Client {
         )
     )]
     pub(crate) async fn establish_primary_phone_session_immediate(&self) -> Result<()> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         let own_pn = device_snapshot
             .pn
@@ -339,11 +336,10 @@ impl Client {
 
     /// Check if a session exists for the given JID.
     async fn check_session_exists(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
-        let device_store = self.persistence_manager.get_device_arc().await;
-        let device_guard = device_store.read().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let signal_addr = jid.to_protocol_address();
 
-        device_guard
+        device_snapshot
             .contains_session(&signal_addr)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to check session for {}: {}", jid.observe(), e))

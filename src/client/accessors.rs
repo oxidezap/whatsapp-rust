@@ -114,38 +114,27 @@ impl Client {
         self.persistence_manager.clone()
     }
 
-    pub async fn get_push_name(&self) -> String {
+    // The owned returns below are the only clones left: the snapshot read
+    // itself is an Arc refcount bump (no lock against writers). Callers that
+    // only need a borrow can hold `persistence_manager().get_device_snapshot()`
+    // and read fields directly.
+    pub fn get_push_name(&self) -> String {
         self.persistence_manager
-            .get_device_arc()
-            .await
-            .read()
-            .await
+            .get_device_snapshot()
             .push_name
             .clone()
     }
 
-    pub async fn get_pn(&self) -> Option<Jid> {
-        self.persistence_manager
-            .get_device_arc()
-            .await
-            .read()
-            .await
-            .pn
-            .clone()
+    pub fn get_pn(&self) -> Option<Jid> {
+        self.persistence_manager.get_device_snapshot().pn.clone()
     }
 
-    pub async fn get_lid(&self) -> Option<Jid> {
-        self.persistence_manager
-            .get_device_arc()
-            .await
-            .read()
-            .await
-            .lid
-            .clone()
+    pub fn get_lid(&self) -> Option<Jid> {
+        self.persistence_manager.get_device_snapshot().lid.clone()
     }
 
-    pub(crate) async fn require_pn(&self) -> Result<Jid> {
-        self.get_pn().await.ok_or(ClientError::NotLoggedIn.into())
+    pub(crate) fn require_pn(&self) -> Result<Jid> {
+        self.get_pn().ok_or(ClientError::NotLoggedIn.into())
     }
 
     /// Resolve our own JID for a group, respecting its addressing mode.
@@ -156,7 +145,7 @@ impl Client {
         &self,
         group_jid: &Jid,
     ) -> Result<Jid, anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_pn = device_snapshot
             .pn
             .clone()
@@ -178,7 +167,7 @@ impl Client {
     }
 
     pub(crate) async fn update_push_name_and_notify(self: &Arc<Self>, new_name: String) {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let old_name = device_snapshot.push_name.clone();
 
         if old_name == new_name {
