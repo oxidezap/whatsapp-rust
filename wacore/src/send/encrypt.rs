@@ -382,7 +382,11 @@ where
         {
             Ok(bundles) => bundles,
             Err(e) if is_device_unregistered_error(&e) => {
-                log::warn!(
+                // 406 means the server has no prekeys for these devices (unregistered
+                // this round). Skipping them is the correct, WA Web matching behavior,
+                // and the caller re-fetches on the next send, so this is benign noise
+                // rather than an error.
+                log::debug!(
                     "Prekey fetch returned 406 for {} device(s); skipping them this round",
                     jids_for_fetch.len()
                 );
@@ -426,7 +430,11 @@ where
                 encryption_jid.reset_protocol_address(&mut addr);
 
                 let Some(bundle) = bundles.get(&lookup_jid) else {
-                    log::warn!(
+                    // No bundle means the device has no usable key material this round
+                    // (commonly the cascade of a 406 batch). Skipping is expected and
+                    // the next send re-fetches, so log at debug to avoid one warn per
+                    // skipped device during a prekey-fetch failure.
+                    log::debug!(
                         "No pre-key bundle returned for device {}. This device will be skipped for encryption.",
                         addr
                     );
