@@ -310,7 +310,7 @@ impl PreKeyUtils {
                             "device-identity ADV validation failed for companion {jid}"
                         ));
                     }
-                    crate::adv::AdvValidation::NoAccountKey => log::warn!(
+                    crate::adv::AdvValidation::NoAccountKey => log::debug!(
                         "prekey bundle for companion {jid} omits account_signature_key and no stored account identity; proceeding without ADV validation"
                     ),
                 },

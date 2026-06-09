@@ -952,7 +952,7 @@ impl Client {
                         "device-identity ADV validation failed for companion {requester_jid}"
                     ));
                 }
-                wacore::adv::AdvValidation::NoAccountKey => log::warn!(
+                wacore::adv::AdvValidation::NoAccountKey => log::debug!(
                     "retry key bundle for companion {requester_jid} omits account_signature_key and no stored account identity; proceeding without ADV validation"
                 ),
             }
