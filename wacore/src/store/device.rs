@@ -250,9 +250,16 @@ pub struct Device {
     pub props_hash: Option<String>,
     /// Monotonically increasing counter for one-time pre-key ID generation.
     /// Matches WhatsApp Web's `NEXT_PK_ID` pattern: only increases, never resets.
-    /// Prevents prekey ID collisions when prekeys are consumed non-sequentially.
+    /// Advances at GENERATION time (WA Web `savePreKeys`), so it covers every
+    /// key that exists in the store, uploaded or not.
     #[serde(default)]
     pub next_pre_key_id: u32,
+    /// Watermark of the first generated-but-not-yet-uploaded one-time prekey,
+    /// matching WA Web's `FIRST_UNUPLOAD_PK_ID`. `next_pre_key_id - this` is
+    /// the pool of leftover keys an upload re-offers before generating new
+    /// ones. `0` = unset (legacy device); initialised on the first upload.
+    #[serde(default)]
+    pub first_unupload_pre_key_id: u32,
     /// Persisted flag matching WA Web's `signal_sever_has_pre_keys` metadata.
     #[serde(default)]
     pub server_has_prekeys: bool,
@@ -366,6 +373,7 @@ impl Device {
             edge_routing_info: None,
             props_hash: None,
             next_pre_key_id: 1,
+            first_unupload_pre_key_id: 0,
             server_has_prekeys: false,
             nct_salt: None,
             nct_salt_sync_seen: false,

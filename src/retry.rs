@@ -8,10 +8,7 @@ use wacore::types::message::MessageCategory;
 use scopeguard;
 use std::sync::Arc;
 use wacore::iq::prekeys::{OneTimePreKeyNode, SignedPreKeyNode};
-use wacore::libsignal::protocol::{
-    KeyPair, PreKeyBundle, PublicKey, UsePQRatchet, process_prekey_bundle,
-};
-use wacore::libsignal::store::PreKeyStore;
+use wacore::libsignal::protocol::{PreKeyBundle, PublicKey, UsePQRatchet, process_prekey_bundle};
 use wacore::protocol::ProtocolNode;
 use wacore::types::jid::JidExt;
 use wacore_binary::JidExt as _;
@@ -1110,25 +1107,15 @@ impl Client {
             .build();
 
         let keys_node = if wacore::protocol::retry::should_include_keys(retry_count, reason) {
-            // Allocate the one-time prekey from the same monotonic NEXT_PK_ID counter as the
-            // upload path (WA Web's getOrGenSinglePreKey) so it can never overwrite a live pool
-            // key. Hold prekey_upload_lock to serialize the allocate+bump with uploads.
+            // WA Web's getOrGenSinglePreKey = getOrGenPreKeys(1): the retry
+            // prekey is the first unuploaded window key (reused when one is
+            // left over, freshly generated and stored otherwise) and the next
+            // batch upload re-offers it to the server pool. Hold
+            // prekey_upload_lock to serialize the watermark math with uploads.
             let prekey_guard = self.prekey_upload_lock.lock().await;
-            let new_prekey_id = self.allocate_next_one_time_prekey_id().await?;
-            let new_prekey_keypair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
-            let new_prekey_record = wacore::libsignal::store::record_helpers::new_pre_key_record(
-                new_prekey_id,
-                &new_prekey_keypair,
-            );
-            // This key is not uploaded to the server pool, so mark as false
-            let device_snapshot = self.persistence_manager.get_device_snapshot();
-            if let Err(e) = device_snapshot
-                .store_prekey(new_prekey_id, new_prekey_record, false)
-                .await
-            {
-                warn!("Failed to store new prekey for retry receipt: {e:?}");
-            }
+            let (new_prekey_id, new_prekey_public) = self.get_or_gen_single_pre_key().await?;
             drop(prekey_guard);
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
 
             let device_identity_bytes = device_snapshot
                 .account
@@ -1139,7 +1126,7 @@ impl Client {
             Some(wacore::protocol::retry::build_retry_keys_node(
                 &device_snapshot.identity_key.public_key,
                 new_prekey_id,
-                &new_prekey_keypair.public_key,
+                &new_prekey_public,
                 device_snapshot.signed_pre_key_id,
                 &device_snapshot.signed_pre_key.public_key,
                 device_snapshot.signed_pre_key_signature.to_vec(),
@@ -1266,7 +1253,7 @@ mod tests {
     use crate::test_utils::MockHttpClient;
     use std::borrow::Cow;
     use std::sync::Arc;
-    use wacore::libsignal::protocol::IdentityKeyPair;
+    use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair};
     use wacore::types::jid::JidExt as _;
     use wacore_binary::{Jid, JidExt};
     use waproto::whatsapp as wa;

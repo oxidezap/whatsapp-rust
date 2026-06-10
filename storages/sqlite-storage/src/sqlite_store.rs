@@ -84,6 +84,7 @@ struct DeviceRow {
     server_has_prekeys: bool,
     server_cert_chain: Option<Vec<u8>>,
     login_counter: i32,
+    first_unupload_pre_key_id: i32,
 }
 
 #[derive(Clone)]
@@ -336,6 +337,7 @@ impl SqliteStore {
             device_data.edge_routing_info.as_deref().map(Arc::from);
         let props_hash: Option<Arc<str>> = device_data.props_hash.as_deref().map(Arc::from);
         let next_pre_key_id = device_data.next_pre_key_id as i32;
+        let first_unupload_pre_key_id = device_data.first_unupload_pre_key_id as i32;
         let server_has_prekeys = device_data.server_has_prekeys;
         let nct_salt: Option<Arc<[u8]>> = device_data.nct_salt.as_deref().map(Arc::from);
         let server_cert_chain: Option<Arc<[u8]>> = device_data
@@ -402,6 +404,7 @@ impl SqliteStore {
                         device::edge_routing_info.eq(edge_routing_info.as_deref()),
                         device::props_hash.eq(props_hash.as_deref()),
                         device::next_pre_key_id.eq(next_pre_key_id),
+                        device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(nct_salt.as_deref()),
                         device::server_cert_chain.eq(server_cert_chain.as_deref()),
@@ -430,6 +433,8 @@ impl SqliteStore {
                         device::edge_routing_info.eq(excluded(device::edge_routing_info)),
                         device::props_hash.eq(excluded(device::props_hash)),
                         device::next_pre_key_id.eq(excluded(device::next_pre_key_id)),
+                        device::first_unupload_pre_key_id
+                            .eq(excluded(device::first_unupload_pre_key_id)),
                         device::server_has_prekeys.eq(excluded(device::server_has_prekeys)),
                         device::nct_salt.eq(excluded(device::nct_salt)),
                         device::server_cert_chain.eq(excluded(device::server_cert_chain)),
@@ -461,6 +466,7 @@ impl SqliteStore {
         let app_version_tertiary = new_device.app_version_tertiary as i64;
         let app_version_last_fetched_ms = new_device.app_version_last_fetched_ms;
         let next_pre_key_id = new_device.next_pre_key_id as i32;
+        let first_unupload_pre_key_id = new_device.first_unupload_pre_key_id as i32;
         let server_has_prekeys = new_device.server_has_prekeys;
 
         self.with_retry("create_new_device", || {
@@ -493,6 +499,7 @@ impl SqliteStore {
                         device::edge_routing_info.eq(None::<&[u8]>),
                         device::props_hash.eq(None::<&str>),
                         device::next_pre_key_id.eq(next_pre_key_id),
+                        device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(None::<&[u8]>),
                         device::server_cert_chain.eq(None::<&[u8]>),
@@ -599,6 +606,7 @@ impl SqliteStore {
                 edge_routing_info: row.edge_routing_info,
                 props_hash: row.props_hash,
                 next_pre_key_id: row.next_pre_key_id as u32,
+                first_unupload_pre_key_id: row.first_unupload_pre_key_id as u32,
                 server_has_prekeys: row.server_has_prekeys,
                 nct_salt: row.nct_salt,
                 nct_salt_sync_seen: false,
@@ -3603,6 +3611,60 @@ mod tests {
         assert!(
             loaded.is_some(),
             "device data should be loadable by configured id"
+        );
+    }
+
+    /// Round-trips the prekey watermarks through the SQLite schema: save with
+    /// both counters set, reopen on the same db, load and compare. Exercises
+    /// the `2026-06-10-000000_add_first_unupload_pk_id` migration and the
+    /// column mapping in both upsert paths.
+    #[tokio::test]
+    async fn test_prekey_watermarks_survive_save_load_roundtrip() {
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(300);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_name = format!(
+            "file:memdb_pkwatermark_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            id
+        );
+
+        let device_id = 9;
+        let _writer = SqliteStore::new_for_device(&db_name, device_id)
+            .await
+            .expect("create store");
+        _writer.create_new_device().await.expect("create device");
+
+        let mut device = _writer
+            .load_device_data_for_device(device_id)
+            .await
+            .expect("load")
+            .expect("device should exist after create");
+        assert_eq!(
+            device.first_unupload_pre_key_id, 0,
+            "fresh device starts with the watermark unset"
+        );
+        device.next_pre_key_id = 913;
+        device.first_unupload_pre_key_id = 101;
+        _writer
+            .save_device_data_for_device(device_id, &device)
+            .await
+            .expect("save with watermarks");
+
+        let store = SqliteStore::new_for_device(&db_name, device_id)
+            .await
+            .expect("reopen store");
+        let loaded = store
+            .load_device_data_for_device(device_id)
+            .await
+            .expect("load")
+            .expect("device should exist after reopen");
+        assert_eq!(loaded.next_pre_key_id, 913);
+        assert_eq!(
+            loaded.first_unupload_pre_key_id, 101,
+            "first_unupload_pre_key_id must survive a save/load roundtrip"
         );
     }
 

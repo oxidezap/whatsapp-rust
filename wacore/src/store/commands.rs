@@ -15,6 +15,12 @@ pub enum DeviceCommand {
     SetClientProfile(ClientProfile),
     SetPropsHash(Option<String>),
     SetNextPreKeyId(u32),
+    /// Update both prekey watermarks in one command, so a generation-time
+    /// NEXT advance and a FIRST init/advance can never be observed split.
+    SetPreKeyWatermarks {
+        next_pre_key_id: u32,
+        first_unupload_pre_key_id: u32,
+    },
     SetAdvSecretKey([u8; 32]),
     SetNctSalt(Option<Vec<u8>>),
     SetNctSaltFromHistorySync(Vec<u8>),
@@ -60,6 +66,13 @@ pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
         }
         DeviceCommand::SetNextPreKeyId(id) => {
             device.next_pre_key_id = id;
+        }
+        DeviceCommand::SetPreKeyWatermarks {
+            next_pre_key_id,
+            first_unupload_pre_key_id,
+        } => {
+            device.next_pre_key_id = next_pre_key_id;
+            device.first_unupload_pre_key_id = first_unupload_pre_key_id;
         }
         DeviceCommand::SetAdvSecretKey(key) => {
             device.adv_secret_key = key;

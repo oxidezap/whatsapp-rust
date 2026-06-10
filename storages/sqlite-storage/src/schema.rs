@@ -82,6 +82,7 @@ diesel::table! {
         server_has_prekeys -> Bool,
         server_cert_chain -> Nullable<Binary>,
         login_counter -> Integer,
+        first_unupload_pre_key_id -> Integer,
     }
 }
 
