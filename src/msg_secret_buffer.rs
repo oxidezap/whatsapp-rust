@@ -27,6 +27,10 @@ type Key = (String, String, String);
 
 pub(crate) struct MsgSecretWriteBuffer {
     pending: Mutex<HashMap<Key, MsgSecretEntry>>,
+    /// Serializes backend writes: a snapshot is taken under this lock, so a
+    /// later writer always carries values at least as new as any earlier
+    /// in-flight write, and a stale upsert can never land after a fresh one.
+    write_lock: tokio::sync::Mutex<()>,
     drain_in_flight: AtomicBool,
     backend: Arc<dyn crate::store::traits::Backend>,
     runtime: Arc<dyn wacore::runtime::Runtime>,
@@ -44,6 +48,7 @@ impl MsgSecretWriteBuffer {
     ) -> Arc<Self> {
         Arc::new(Self {
             pending: Mutex::new(HashMap::new()),
+            write_lock: tokio::sync::Mutex::new(()),
             drain_in_flight: AtomicBool::new(false),
             backend,
             runtime,
@@ -117,6 +122,7 @@ impl MsgSecretWriteBuffer {
     /// pending. Idempotent against a concurrent drain: the upsert repeats
     /// harmlessly and [`Self::finish_batch`] only removes what was written.
     async fn flush_pending_once(&self) -> bool {
+        let _write_guard = self.write_lock.lock().await;
         let batch: Vec<MsgSecretEntry> = {
             let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending.values().cloned().collect()

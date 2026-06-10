@@ -528,9 +528,6 @@ impl Client {
             .await;
         self.notify_connection_shutdown();
 
-        // The write-behind secret drain is detached; a clean exit right after
-        // a capture must not lose the only copy.
-        self.msg_secret_buffer.flush().await;
         if let Err(e) = self.persistence_manager.flush().await {
             log::error!("Failed to flush device state during disconnect: {e}");
         }
@@ -540,6 +537,12 @@ impl Client {
             transport.disconnect().await;
         }
         self.cleanup_connection_state().await;
+
+        // The write-behind secret drain is detached; a clean exit right after
+        // a capture must not lose the only copy. Drained after the connection
+        // teardown so receive work still in flight when disconnect started has
+        // had its captures queued; flush() loops until nothing is pending.
+        self.msg_secret_buffer.flush().await;
     }
 
     /// Backoff step used by [`reconnect()`] to create an offline window.
