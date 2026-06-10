@@ -922,7 +922,7 @@ impl Client {
         // resolves Ok to the caller, so without this the failure is invisible.
         if let Some(error_code) = node.get_attr("error") {
             let code = error_code.as_str();
-            let id = node.get_attr("id").map(|v| v.as_str().into_owned());
+            let id = node.get_attr("id").map(|v| v.as_str());
             match code.as_ref() {
                 "463" => {
                     warn!(
@@ -953,9 +953,8 @@ impl Client {
             }
         }
 
-        let id_opt = node.get_attr("id").map(|v| v.as_str().into_owned());
-        if let Some(id) = id_opt
-            && let Some(waiter) = self.response_waiters.lock().await.remove(&id)
+        if let Some(id) = node.get_attr("id").map(|v| v.as_str())
+            && let Some(waiter) = self.response_waiters.lock().await.remove(id.as_ref())
         {
             // ACK responses are infrequent; re-encode into OwnedNodeRef for the channel.
             // marshal_ref prepends a leading 0x00 format byte; OwnedNodeRef::new expects raw
