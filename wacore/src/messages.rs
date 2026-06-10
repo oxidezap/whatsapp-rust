@@ -195,14 +195,25 @@ impl MessageUtils {
     pub fn participant_list_hash<'a>(
         devices: impl IntoIterator<Item = &'a wacore_binary::Jid>,
     ) -> Result<String> {
-        // Hash sorted ad_strings incrementally (avoids join() allocation).
-        let mut jids: Vec<String> = devices.into_iter().map(|j| j.to_ad_string()).collect();
-        jids.sort_unstable();
+        // Format every device into one shared arena and sort range views over
+        // it: two allocations total instead of a heap String per device (this
+        // runs over the full device set on every group send). Sorting the
+        // slices is the same lexicographic order as sorting the individual
+        // ad_strings, so the hashed concatenation is byte-identical.
+        let devices = devices.into_iter();
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(devices.size_hint().0);
+        let mut arena = String::with_capacity(ranges.capacity() * 36);
+        for jid in devices {
+            let start = arena.len();
+            jid.push_ad_to(&mut arena);
+            ranges.push((start, arena.len()));
+        }
+        ranges.sort_unstable_by(|a, b| arena[a.0..a.1].cmp(&arena[b.0..b.1]));
 
         let mut h = CryptographicHash::new("SHA-256")
             .map_err(|e| anyhow!("failed to initialize SHA-256 hasher: {:?}", e))?;
-        for jid in &jids {
-            h.update(jid.as_bytes());
+        for &(start, end) in &ranges {
+            h.update(&arena.as_bytes()[start..end]);
         }
 
         let full_hash = h
@@ -930,6 +941,53 @@ mod parse_message_info_tests {
         assert_eq!(h_single, "2:5s+YxCff");
         assert_eq!(h_control, "2:RJWVxcMQ");
         assert_eq!(h_multi, "2:AAv/hwhn");
+    }
+
+    /// Locks the arena-sorted phash against the straightforward reference
+    /// (one String per device, sorted, concatenated) over a mixed device set:
+    /// unsorted input, duplicate JIDs, agents, multiple servers, and the
+    /// prefix-ordering edge ("111" vs "1110" users) where a slice comparator
+    /// bug would diverge from String ordering.
+    #[test]
+    fn phash_arena_matches_per_string_reference() {
+        use sha2::{Digest, Sha256};
+
+        fn dev(user: &str, agent: u8, device: u16, server: wacore_binary::Server) -> Jid {
+            Jid {
+                user: user.into(),
+                server,
+                agent,
+                device,
+                integrator: 0,
+            }
+        }
+
+        let devices = vec![
+            dev("5511999990000", 0, 14, wacore_binary::Server::Pn),
+            dev("111", 0, 0, wacore_binary::Server::Pn),
+            dev("1110", 0, 0, wacore_binary::Server::Pn),
+            dev("100000000000001", 2, 3, wacore_binary::Server::Lid),
+            dev("5511999990000", 0, 14, wacore_binary::Server::Pn),
+            dev("5511888880000", 1, 0, wacore_binary::Server::Hosted),
+            dev("999", 0, 65535, wacore_binary::Server::Bot),
+        ];
+
+        let mut reference: Vec<String> = devices.iter().map(|j| j.to_ad_string()).collect();
+        reference.sort_unstable();
+        let mut hasher = Sha256::new();
+        for jid in &reference {
+            hasher.update(jid.as_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut expected = String::with_capacity(10);
+        expected.push_str("2:");
+        use base64::Engine as _;
+        base64::prelude::BASE64_STANDARD_NO_PAD.encode_string(&digest[..6], &mut expected);
+
+        assert_eq!(
+            MessageUtils::participant_list_hash(&devices).unwrap(),
+            expected
+        );
     }
 
     // #6 — validate_bcl_hash accepts the matching phashV2 and rejects a tampered

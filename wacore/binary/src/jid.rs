@@ -607,18 +607,27 @@ impl Jid {
     }
 
     pub fn to_ad_string(&self) -> String {
-        if self.user.is_empty() {
-            return self.server.as_str().to_string();
-        }
         let mut s = String::with_capacity(self.user.len() + 20);
-        s.push_str(&self.user);
-        s.push('.');
-        s.push_str(itoa::Buffer::new().format(self.agent));
-        s.push(':');
-        s.push_str(itoa::Buffer::new().format(self.device));
-        s.push('@');
-        s.push_str(self.server.as_str());
+        self.push_ad_to(&mut s);
         s
+    }
+
+    /// Append the AD-string form (`user.agent:device@server`) to `buf`, for
+    /// callers that batch many JIDs into one shared buffer instead of paying
+    /// a heap `String` per JID (see `participant_list_hash`).
+    #[inline]
+    pub fn push_ad_to(&self, buf: &mut String) {
+        if self.user.is_empty() {
+            buf.push_str(self.server.as_str());
+            return;
+        }
+        buf.push_str(&self.user);
+        buf.push('.');
+        buf.push_str(itoa::Buffer::new().format(self.agent));
+        buf.push(':');
+        buf.push_str(itoa::Buffer::new().format(self.device));
+        buf.push('@');
+        buf.push_str(self.server.as_str());
     }
 
     /// Append the Display representation to `buf` using direct push operations,
