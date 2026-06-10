@@ -61,7 +61,15 @@ impl Client {
     }
 
     /// Spawn a delivery receipt, tracked so `disconnect()` can flush it (issue #571).
+    ///
+    /// Offline-drained messages are buffered instead and flushed as aggregate
+    /// `<receipt>` stanzas when the offline sync completes, collapsing a
+    /// reconnect backlog of N receipts into ~1 stanza per (chat, author)
+    /// (WA Web `sendAggregateOfflineReceipts`). Live messages stay 1:1.
     fn spawn_delivery_receipt(self: &Arc<Self>, info: &Arc<MessageInfo>) {
+        if info.is_offline && self.try_buffer_offline_receipt(info) {
+            return;
+        }
         let client = self.clone();
         let info = Arc::clone(info);
         self.outbound_flush.spawn(&*self.runtime, async move {

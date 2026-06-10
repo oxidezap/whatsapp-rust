@@ -474,6 +474,11 @@ pub struct Client {
     pub(crate) offline_sync_notifier: Arc<event_listener::Event>,
     /// Flag indicating offline sync has completed (received ib offline stanza).
     pub(crate) offline_sync_completed: Arc<AtomicBool>,
+    /// Delivery receipts buffered during offline sync, flushed as aggregate
+    /// `<receipt>` stanzas at completion (WA Web `sendAggregateOfflineReceipts`).
+    /// Empty (zero capacity) outside the offline window.
+    pub(crate) offline_receipt_buffer:
+        std::sync::Mutex<Vec<Arc<crate::types::message::MessageInfo>>>,
     /// Number of history sync tasks currently queued or running.
     pub(crate) history_sync_tasks_in_flight: Arc<AtomicUsize>,
     /// Notifier triggered when history sync work becomes idle.

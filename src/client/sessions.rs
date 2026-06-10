@@ -42,6 +42,11 @@ impl Client {
             // Old workers holding the previous semaphore Arc will finish normally.
             self.swap_message_semaphore(64);
 
+            // The flag flip above happens-before this drain takes the buffer
+            // lock, so late offline receipts either land in this flush or
+            // observe the flag and send 1:1 (see try_buffer_offline_receipt).
+            self.flush_offline_receipts();
+
             self.offline_sync_notifier.notify(usize::MAX);
 
             self.core
