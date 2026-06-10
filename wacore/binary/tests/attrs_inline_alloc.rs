@@ -2,6 +2,10 @@
 //! inline capacity must not touch the heap for the attribute storage. A plain
 //! `Vec` backing (the regression this guards) pays one allocation per node on
 //! the encode hot path.
+//!
+//! Single test fn on purpose: the counting allocator is process-global, so a
+//! concurrently running sibling test would bleed its allocations into the
+//! measurement (seen once in CI).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,25 +28,30 @@ unsafe impl GlobalAlloc for CountingAlloc {
 static GLOBAL: CountingAlloc = CountingAlloc;
 
 #[test]
-fn building_fanout_shaped_node_does_not_heap_allocate() {
+fn attrs_inline_and_spill_behavior() {
     // The per-recipient fanout shape: short static keys, inline-able values.
     // Tag and keys are borrowed statics; CompactString keeps short values inline.
-    let before = ALLOCS.load(Ordering::Relaxed);
-    let node = NodeBuilder::new("enc")
-        .attr("v", "2")
-        .attr("type", "msg")
-        .build();
-    let after = ALLOCS.load(Ordering::Relaxed);
+    // Take the minimum delta over many iterations so stray allocations from the
+    // test harness's own threads can't flake the assertion: the build itself is
+    // deterministic, so with inline attrs the minimum is 0, while a heap-backed
+    // Attrs allocates on every single iteration.
+    let mut min_delta = u64::MAX;
+    for _ in 0..100 {
+        let before = ALLOCS.load(Ordering::Relaxed);
+        let node = NodeBuilder::new("enc")
+            .attr("v", "2")
+            .attr("type", "msg")
+            .build();
+        let after = ALLOCS.load(Ordering::Relaxed);
+        min_delta = min_delta.min(after - before);
+        assert_eq!(node.attrs.len(), 2);
+    }
     assert_eq!(
-        after - before,
-        0,
+        min_delta, 0,
         "a node with <= 2 attrs must keep them inline (no heap allocation)"
     );
-    assert_eq!(node.attrs.len(), 2);
-}
 
-#[test]
-fn larger_attr_lists_still_work_by_spilling() {
+    // Larger attribute lists keep working by spilling to the heap.
     let node = NodeBuilder::new("message")
         .attr("to", "5511999990000@s.whatsapp.net")
         .attr("id", "3EB0A9252A8F12B7E2")
