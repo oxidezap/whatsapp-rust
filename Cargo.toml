@@ -182,7 +182,7 @@ cbc = { version = "0.2", features = ["alloc", "block-padding"] }
 flate2 = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18"
 sha2 = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }

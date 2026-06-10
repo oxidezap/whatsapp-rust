@@ -31,10 +31,11 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 fn attrs_inline_and_spill_behavior() {
     // The per-recipient fanout shape: short static keys, inline-able values.
     // Tag and keys are borrowed statics; CompactString keeps short values inline.
-    // Take the minimum delta over many iterations so stray allocations from the
-    // test harness's own threads can't flake the assertion: the build itself is
-    // deterministic, so with inline attrs the minimum is 0, while a heap-backed
-    // Attrs allocates on every single iteration.
+    // Take the minimum delta over many iterations. The counter is process-global,
+    // so harness threads can bleed allocations into any single window, but they
+    // are sporadic: if inline attrs truly never allocate, at least one of the 100
+    // windows is noise-free and the minimum lands on 0. A heap-backed Attrs
+    // allocates on every single iteration, so its minimum can never reach 0.
     let mut min_delta = u64::MAX;
     for _ in 0..100 {
         let before = ALLOCS.load(Ordering::Relaxed);
@@ -45,6 +46,7 @@ fn attrs_inline_and_spill_behavior() {
         let after = ALLOCS.load(Ordering::Relaxed);
         min_delta = min_delta.min(after - before);
         assert_eq!(node.attrs.len(), 2);
+        assert!(!node.attrs.0.spilled(), "2 attrs must stay inline");
     }
     assert_eq!(
         min_delta, 0,
@@ -60,6 +62,10 @@ fn attrs_inline_and_spill_behavior() {
         .attr("phash", "2:abcdefgh")
         .build();
     assert_eq!(node.attrs.len(), 5);
+    assert!(
+        node.attrs.0.spilled(),
+        "5 attrs must spill past the inline capacity"
+    );
     assert_eq!(
         node.attrs.get("type").map(|v| v.as_str().into_owned()),
         Some("text".to_string())
