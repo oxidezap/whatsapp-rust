@@ -334,11 +334,17 @@ impl Client {
         let record_for_cache = record.clone();
 
         // Use canonical_key directly as cache key (no extra clone)
+        // Record every lookup alias, not just canonical+original: a LID-keyed
+        // update must also touch the mapped PN, or a PN-addressed group's memo
+        // (whose member set only knows the PN side) would re-stamp stale.
         self.device_registry_cache
             .insert(
                 canonical_key.clone(),
                 Arc::new(record_for_cache),
-                [canonical_key.as_str(), original_user.as_str()],
+                lookup
+                    .all_keys()
+                    .into_iter()
+                    .chain(std::iter::once(original_user.as_str())),
             )
             .await;
 
@@ -397,11 +403,15 @@ impl Client {
             record.user.clone_from(&canonical_key);
 
             let record_for_cache = record.clone();
+            // Same alias rule as update_device_list: record every lookup key.
             self.device_registry_cache
                 .insert(
                     canonical_key.clone(),
                     Arc::new(record_for_cache),
-                    [canonical_key.as_str(), original_user.as_str()],
+                    lookup
+                        .all_keys()
+                        .into_iter()
+                        .chain(std::iter::once(original_user.as_str())),
                 )
                 .await;
 
@@ -1205,6 +1215,82 @@ mod tests {
             fresh.len(),
             2,
             "a member's mapping change must invalidate the memo"
+        );
+    }
+
+    /// Codex P2 regression: a PN-addressed group's memo only knows the PN
+    /// side of a member when the cached GroupInfo carries no LID map, but a
+    /// later usync update can arrive keyed by the LID (canonical == original).
+    /// The write must record every lookup alias so the memo recomputes
+    /// instead of re-stamping stale.
+    #[tokio::test]
+    async fn lid_keyed_update_invalidates_pn_group_memo() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000079@g.us".parse().expect("group jid");
+        let pn = "5511999990013";
+        let lid = "100000000000079";
+
+        // Mapping known BEFORE the memo: the canonical record lives under the
+        // LID, while the group only references the member by PN.
+        client
+            .add_lid_pn_mapping(lid, pn, crate::lid_pn_cache::LearningSource::Usync)
+            .await
+            .expect("mapping");
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: pn.into(),
+                devices: vec![wacore::store::traits::DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                }],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("seed record");
+
+        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(pn)], AddressingMode::Pn));
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info)
+            .await
+            .expect("resolve");
+        assert_eq!(first.len(), 1);
+
+        // The update arrives keyed by the LID: canonical == original == LID,
+        // so without the alias rule only the LID would be recorded and the
+        // PN-only member set would re-stamp the stale snapshot.
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: lid.into(),
+                devices: vec![
+                    wacore::store::traits::DeviceInfo {
+                        device_id: 0,
+                        key_index: None,
+                    },
+                    wacore::store::traits::DeviceInfo {
+                        device_id: 11,
+                        key_index: None,
+                    },
+                ],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("LID-keyed update");
+
+        let fresh = client
+            .resolve_group_devices_memoized(&group, &group_info)
+            .await
+            .expect("resolve");
+        assert_eq!(
+            fresh.len(),
+            2,
+            "a LID-keyed update for a member must invalidate the PN group's memo"
         );
     }
 
