@@ -2869,12 +2869,15 @@ impl MsgSecretStore for SqliteStore {
         sender: &str,
         msg_id: &str,
     ) -> Result<Option<Vec<u8>>> {
+        // Serialized through the db semaphore for the same reason as
+        // get_msg_secret_with_ts: a read racing a write transaction must wait,
+        // not error out as a phantom miss.
         let pool = self.pool.clone();
         let device_id = self.device_id;
         let chat = chat.to_string();
         let sender = sender.to_string();
         let msg_id = msg_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+        self.with_semaphore(move || -> Result<Option<Vec<u8>>> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -2890,7 +2893,6 @@ impl MsgSecretStore for SqliteStore {
             Ok(row)
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn get_msg_secret_with_ts(
@@ -2899,12 +2901,16 @@ impl MsgSecretStore for SqliteStore {
         sender: &str,
         msg_id: &str,
     ) -> Result<Option<(Vec<u8>, i64)>> {
+        // Serialized through the db semaphore: a raw read racing a write
+        // transaction hits the shared-cache table lock on in-memory stores
+        // (SQLITE_LOCKED is not covered by busy_timeout) and callers treat the
+        // error as a missing secret.
         let pool = self.pool.clone();
         let device_id = self.device_id;
         let chat = chat.to_string();
         let sender = sender.to_string();
         let msg_id = msg_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<(Vec<u8>, i64)>> {
+        self.with_semaphore(move || -> Result<Option<(Vec<u8>, i64)>> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -2920,7 +2926,6 @@ impl MsgSecretStore for SqliteStore {
             Ok(row)
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
