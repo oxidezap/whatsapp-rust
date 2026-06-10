@@ -549,7 +549,8 @@ struct GrpSendData {
     resolver: MockResolver,
     msg: wa::Message,
     // Built once in setup so the measured body excludes thread-pool startup
-    // (iai-callgrind would otherwise charge the syscalls to the encrypt path).
+    // (building the pool inside the bench body would charge its syscalls to
+    // the encrypt path).
     runtime: BenchRuntime,
 }
 

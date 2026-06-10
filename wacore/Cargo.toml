@@ -79,5 +79,13 @@ harness = false
 name = "send_receive_benchmark"
 harness = false
 
+[[bench]]
+name = "history_sync_benchmark"
+harness = false
+
+[[bench]]
+name = "message_utils_benchmark"
+harness = false
+
 [lints]
 workspace = true

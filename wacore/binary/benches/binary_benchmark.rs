@@ -5,7 +5,7 @@ use std::io::Write;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::marshal::{
     marshal, marshal_auto, marshal_exact, marshal_ref, marshal_ref_auto, marshal_ref_exact,
-    marshal_to, marshal_to_vec, unmarshal_ref,
+    marshal_to, unmarshal_ref,
 };
 use wacore_binary::node::Node;
 use wacore_binary::util::unpack;
@@ -149,95 +149,68 @@ fn create_many_children_node() -> Node {
         .build()
 }
 
-// Marshal benchmarks - self-contained, no setup needed
+// Marshal benchmarks. Inputs are pre-built via with_inputs so the reported
+// cost is the encoder alone, not node construction. `marshal_auto` is the
+// production send-path strategy, so it gets one bench per payload shape; the
+// plain/exact strategies are tracked on a single shape for comparison.
 #[divan::bench]
-fn bench_marshal_allocating() -> Vec<u8> {
-    let node = create_large_node();
-    black_box(marshal(black_box(&node)).unwrap())
+fn bench_marshal_auto_small(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_small_node)
+        .bench_values(|node| black_box(marshal_auto(black_box(&node)).unwrap()));
 }
 
 #[divan::bench]
-fn bench_marshal_auto_allocating() -> Vec<u8> {
-    let node = create_large_node();
-    black_box(marshal_auto(black_box(&node)).unwrap())
+fn bench_marshal_auto_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_large_node)
+        .bench_values(|node| black_box(marshal_auto(black_box(&node)).unwrap()));
 }
 
 #[divan::bench]
-fn bench_marshal_exact_allocating() -> Vec<u8> {
-    let node = create_large_node();
-    black_box(marshal_exact(black_box(&node)).unwrap())
+fn bench_marshal_auto_long_string(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_long_string_node)
+        .bench_values(|node| black_box(marshal_auto(black_box(&node)).unwrap()));
 }
 
 #[divan::bench]
-fn bench_marshal_reusing_buffer() -> Vec<u8> {
-    let node = create_large_node();
-    let mut buffer = Vec::with_capacity(4096);
-    marshal_to(black_box(&node), &mut buffer).unwrap();
-    black_box(buffer)
+fn bench_marshal_auto_huge_bytes(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_huge_bytes_node)
+        .bench_values(|node| black_box(marshal_auto(black_box(&node)).unwrap()));
 }
 
 #[divan::bench]
-fn bench_marshal_reusing_buffer_vec_writer() -> Vec<u8> {
-    let node = create_large_node();
-    let mut buffer = Vec::with_capacity(4096);
-    marshal_to_vec(black_box(&node), &mut buffer).unwrap();
-    black_box(buffer)
+fn bench_marshal_auto_many_children(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_many_children_node)
+        .bench_values(|node| black_box(marshal_auto(black_box(&node)).unwrap()));
 }
 
-// Benchmark for marshaling nodes with long string content.
-// This demonstrates the JID parsing optimization: long strings skip parse_jid.
+// Strategy comparison on one shape.
 #[divan::bench]
-fn bench_marshal_long_string() -> Vec<u8> {
-    let node = create_long_string_node();
-    black_box(marshal(black_box(&node)).unwrap())
-}
-
-#[divan::bench]
-fn bench_marshal_auto_long_string() -> Vec<u8> {
-    let node = create_long_string_node();
-    black_box(marshal_auto(black_box(&node)).unwrap())
+fn bench_marshal_plain_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_large_node)
+        .bench_values(|node| black_box(marshal(black_box(&node)).unwrap()));
 }
 
 #[divan::bench]
-fn bench_marshal_exact_long_string() -> Vec<u8> {
-    let node = create_long_string_node();
-    black_box(marshal_exact(black_box(&node)).unwrap())
+fn bench_marshal_exact_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_large_node)
+        .bench_values(|node| black_box(marshal_exact(black_box(&node)).unwrap()));
 }
 
 #[divan::bench]
-fn bench_marshal_huge_bytes_allocating() -> Vec<u8> {
-    let node = create_huge_bytes_node();
-    black_box(marshal(black_box(&node)).unwrap())
-}
-
-#[divan::bench]
-fn bench_marshal_auto_huge_bytes_allocating() -> Vec<u8> {
-    let node = create_huge_bytes_node();
-    black_box(marshal_auto(black_box(&node)).unwrap())
-}
-
-#[divan::bench]
-fn bench_marshal_exact_huge_bytes_allocating() -> Vec<u8> {
-    let node = create_huge_bytes_node();
-    black_box(marshal_exact(black_box(&node)).unwrap())
-}
-
-#[divan::bench]
-fn bench_marshal_many_children_allocating() -> Vec<u8> {
-    let node = create_many_children_node();
-    black_box(marshal(black_box(&node)).unwrap())
-}
-
-#[divan::bench]
-fn bench_marshal_auto_many_children_allocating() -> Vec<u8> {
-    let node = create_many_children_node();
-    black_box(marshal_auto(black_box(&node)).unwrap())
-}
-
-#[divan::bench]
-fn bench_marshal_exact_many_children_allocating() -> Vec<u8> {
-    let node = create_many_children_node();
-    black_box(marshal_exact(black_box(&node)).unwrap())
+fn bench_marshal_to_reused_buffer_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| (create_large_node(), Vec::with_capacity(4096)))
+        .bench_values(|(node, mut buffer)| {
+            marshal_to(black_box(&node), &mut buffer).unwrap();
+            black_box(buffer)
+        });
 }
 
 // Setup functions for unmarshal benchmarks - pre-compute marshaled data
@@ -268,24 +241,41 @@ fn bench_unmarshal_large(bencher: divan::Bencher) {
         });
 }
 
-// Unpack benchmarks - self-contained
-#[divan::bench]
-fn bench_unpack_uncompressed() {
-    let data = b"some random uncompressed data for testing";
+// Unpack benchmarks: payloads are pre-built in setup so the compressed case
+// measures the inflate path, not the deflate used to build the fixture. The
+// compressed body is a realistic multi-KB frame (the marshaled usync-like
+// node), matching what the server actually compresses.
+fn setup_uncompressed_payload() -> Vec<u8> {
     let mut payload = vec![0u8];
-    payload.extend_from_slice(data);
-    black_box(unpack(black_box(&payload)).unwrap());
+    payload.extend_from_slice(&marshal(&create_large_node()).unwrap()[1..]);
+    payload
+}
+
+fn setup_compressed_payload() -> Vec<u8> {
+    let body = marshal(&create_usync_like_node()).unwrap();
+    let mut payload = vec![2u8];
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&body[1..]).unwrap();
+    payload.extend_from_slice(&encoder.finish().unwrap());
+    payload
 }
 
 #[divan::bench]
-fn bench_unpack_compressed() {
-    let data = b"some random uncompressed data for testing";
-    let mut payload = vec![2u8];
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data).unwrap();
-    let compressed_data = encoder.finish().unwrap();
-    payload.extend_from_slice(&compressed_data);
-    black_box(unpack(black_box(&payload)).unwrap());
+fn bench_unpack_uncompressed(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_uncompressed_payload)
+        .bench_values(|payload| {
+            black_box(unpack(black_box(&payload)).unwrap());
+        });
+}
+
+#[divan::bench]
+fn bench_unpack_compressed(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_compressed_payload)
+        .bench_values(|payload| {
+            black_box(unpack(black_box(&payload)).unwrap());
+        });
 }
 
 // Setup function for attr_parser benchmark - pre-compute marshaled data
@@ -293,6 +283,8 @@ fn setup_attr_marshaled() -> Vec<u8> {
     marshal(&create_attr_node()).unwrap()
 }
 
+// Measures decode + attr access together: a NodeRef borrows its wire buffer,
+// so the parse cannot be moved into setup without owning the node.
 #[divan::bench]
 fn bench_attr_parser(bencher: divan::Bencher) {
     bencher
@@ -379,29 +371,28 @@ fn bench_roundtrip_exact_large(bencher: divan::Bencher) {
         });
 }
 
-// Child iteration benchmark: tests get_children_by_tag performance
-// Simulates the recursive traversal pattern used in usync parsing
+// Child iteration benchmark: tests get_children_by_tag performance over the
+// recursive traversal pattern used in usync parsing. The tree is pre-built.
 #[divan::bench]
-fn bench_get_children_by_tag() {
-    let node = create_usync_like_node();
+fn bench_get_children_by_tag(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_usync_like_node)
+        .bench_values(|node| {
+            let usync = node.get_optional_child("usync").unwrap();
+            let list = usync.get_optional_child("list").unwrap();
 
-    // Get the list node containing user children
-    let usync = node.get_optional_child("usync").unwrap();
-    let list = usync.get_optional_child("list").unwrap();
-
-    // Iterate over all "user" children (simulates usync parsing)
-    let mut count = 0;
-    for user in black_box(list.get_children_by_tag("user")) {
-        // For each user, get their device children (nested iteration)
-        if let Some(devices) = user.get_optional_child("devices")
-            && let Some(device_list) = devices.get_optional_child("device-list")
-        {
-            for _device in black_box(device_list.get_children_by_tag("device")) {
-                count += 1;
+            let mut count = 0;
+            for user in black_box(list.get_children_by_tag("user")) {
+                if let Some(devices) = user.get_optional_child("devices")
+                    && let Some(device_list) = devices.get_optional_child("device-list")
+                {
+                    for _device in black_box(device_list.get_children_by_tag("device")) {
+                        count += 1;
+                    }
+                }
             }
-        }
-    }
-    black_box(count);
+            black_box(count);
+        });
 }
 
 // Setup function for JID optimization benchmark - pre-compute marshaled JID-heavy data

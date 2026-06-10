@@ -2882,6 +2882,7 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "codspeed-divan-compat",
  "hex",
  "hkdf",
  "log",
@@ -2962,6 +2963,7 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "codspeed-divan-compat",
  "hkdf",
  "log",
  "prost",

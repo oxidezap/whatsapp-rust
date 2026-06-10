@@ -215,7 +215,8 @@ panic = "abort"
 strip = true
 incremental = false
 
-# Benchmark profile: optimized but without aggressive LTO that breaks iai-callgrind
+# Benchmark profile: release-grade codegen, but thin LTO keeps bench builds
+# fast (release uses fat LTO) and debug symbols stay for local profiling.
 [profile.bench]
 inherits = "release"
 lto = "thin"

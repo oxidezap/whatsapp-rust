@@ -45,7 +45,7 @@ name = "binary_benchmark"
 harness = false
 
 [[bench]]
-name = "numeric_attr_benchmark"
+name = "jid_benchmark"
 harness = false
 
 [lints]
