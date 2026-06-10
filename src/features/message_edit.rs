@@ -450,8 +450,10 @@ pub fn decrypt_secret_encrypted_with_fallback(
 ) -> Result<wa::Message> {
     // The reaction/comment kinds decode a different inner proto, so they go
     // through the per-kind dispatch instead of the wacore Message-only helper.
+    // Like the receive path, every distinct LID/PN combination is attempted:
+    // a migration case can need the alternate on only ONE side of the HKDF.
     if matches!(kind, SecretEncKind::EncReaction | SecretEncKind::EncComment) {
-        let primary = decrypt_secret_encrypted(
+        let mut last_err = match decrypt_secret_encrypted(
             enc_payload,
             enc_iv,
             message_secret,
@@ -459,25 +461,43 @@ pub fn decrypt_secret_encrypted_with_fallback(
             original_msg_id,
             original_sender_jid,
             modification_sender_jid,
-        );
-        let fb_orig = fallback_original_sender.unwrap_or(original_sender_jid);
-        let fb_sender = fallback_modification_sender.unwrap_or(modification_sender_jid);
-        let has_distinct_fallback = fb_orig.to_non_ad() != original_sender_jid.to_non_ad()
-            || fb_sender.to_non_ad() != modification_sender_jid.to_non_ad();
-        return match primary {
-            Ok(inner) => Ok(inner),
-            Err(primary_err) if has_distinct_fallback => decrypt_secret_encrypted(
+        ) {
+            Ok(inner) => return Ok(inner),
+            Err(e) => e,
+        };
+
+        let combos = [
+            (fallback_original_sender, Some(modification_sender_jid)),
+            (Some(original_sender_jid), fallback_modification_sender),
+            (fallback_original_sender, fallback_modification_sender),
+        ];
+        let mut tried: Vec<(Jid, Jid)> = vec![(
+            original_sender_jid.to_non_ad(),
+            modification_sender_jid.to_non_ad(),
+        )];
+        for (orig, sender) in combos {
+            let (Some(orig), Some(sender)) = (orig, sender) else {
+                continue;
+            };
+            let pair = (orig.to_non_ad(), sender.to_non_ad());
+            if tried.contains(&pair) {
+                continue;
+            }
+            match decrypt_secret_encrypted(
                 enc_payload,
                 enc_iv,
                 message_secret,
                 kind,
                 original_msg_id,
-                fb_orig,
-                fb_sender,
-            )
-            .map_err(|fallback_err| anyhow!("primary: {primary_err}; fallback: {fallback_err}")),
-            Err(e) => Err(e),
-        };
+                orig,
+                sender,
+            ) {
+                Ok(inner) => return Ok(inner),
+                Err(e) => last_err = anyhow!("{last_err}; fallback: {e}"),
+            }
+            tried.push(pair);
+        }
+        return Err(last_err);
     }
 
     let orig = original_sender_jid.to_non_ad_string();
@@ -1108,6 +1128,37 @@ mod enc_addon_tests {
                 None,
             )
             .is_err()
+        );
+
+        // Mixed combo on the OTHER side: encrypted under the modifier's LID
+        // while the parent author is already in the right namespace.
+        let reactor_lid: Jid = "222222222222222@lid".parse().unwrap();
+        let (enc2, iv2) = wacore::reaction::encrypt_reaction_with_secret(
+            "\u{1F44D}",
+            43,
+            &secret,
+            "PARENT1",
+            &author.to_non_ad_string(),
+            &reactor_lid.to_non_ad_string(),
+        )
+        .unwrap();
+        let out = decrypt_secret_encrypted_with_fallback(
+            &enc2,
+            &iv2,
+            &secret,
+            SecretEncKind::EncReaction,
+            "PARENT1",
+            &author,
+            &reactor,
+            Some(&author_lid),
+            Some(&reactor_lid),
+        )
+        .expect("primary-author + fallback-modifier combination must decrypt");
+        assert_eq!(
+            out.reaction_message
+                .as_ref()
+                .and_then(|r| r.text.as_deref()),
+            Some("\u{1F44D}")
         );
     }
 
