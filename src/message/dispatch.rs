@@ -24,10 +24,20 @@ impl Client {
         // Keep this ordered with dispatch; add-on messages can immediately
         // reference the secret from the stanza just processed.
         self.maybe_capture_inbound_msg_secret(&msg, &info).await;
-        let dispatch_msg = self
+        let decrypted = self
             .maybe_decrypt_secret_encrypted_message(&msg, &info)
-            .await
-            .unwrap_or(msg);
+            .await;
+        // A decrypted comment surfaces as its inner body Message, which has no
+        // slot for the parent post key; carry the threading link on the info.
+        if decrypted.is_some()
+            && let Some(target) = msg
+                .enc_comment_message
+                .as_ref()
+                .and_then(|c| c.target_message_key.clone())
+        {
+            Arc::make_mut(&mut info).comment_target = Some(target);
+        }
+        let dispatch_msg = decrypted.unwrap_or(msg);
         self.ack_received_message(&info);
 
         self.core

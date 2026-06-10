@@ -230,6 +230,12 @@ pub enum SecretEncKind {
     MessageEdit,
     PollEdit,
     PollAddOption,
+    /// `enc_reaction_message` (CAG reaction): a distinct top-level field, not a
+    /// `SecretEncType`; the inner plaintext is a `ReactionMessage`, not a `Message`.
+    EncReaction,
+    /// `enc_comment_message` (CAG channel comment): distinct top-level field;
+    /// the inner plaintext is the comment body `Message`.
+    EncComment,
 }
 
 impl SecretEncKind {
@@ -250,6 +256,8 @@ impl SecretEncKind {
             Self::MessageEdit => ModificationType::MessageEdit,
             Self::PollEdit => ModificationType::PollEdit,
             Self::PollAddOption => ModificationType::PollAddOption,
+            Self::EncReaction => ModificationType::EncReaction,
+            Self::EncComment => ModificationType::EncComment,
         }
     }
 }
@@ -315,13 +323,43 @@ impl<'a> SecretEncrypted<'a> {
 /// Returns `None` when the message is not secret-encrypted, carries an
 /// unsupported type, or is malformed (missing fields, IV not 12 bytes).
 pub fn extract_secret_encrypted(msg: &wa::Message) -> Option<SecretEncrypted<'_>> {
-    let sec = msg.secret_encrypted_message.as_ref()?;
-    let kind = SecretEncKind::from_proto(sec.secret_enc_type())?;
-    match (
-        sec.target_message_key.as_ref(),
-        sec.enc_payload.as_deref(),
-        sec.enc_iv.as_deref(),
-    ) {
+    if let Some(sec) = msg.secret_encrypted_message.as_ref() {
+        let kind = SecretEncKind::from_proto(sec.secret_enc_type())?;
+        return secret_envelope(
+            kind,
+            sec.target_message_key.as_ref(),
+            sec.enc_payload.as_deref(),
+            sec.enc_iv.as_deref(),
+        );
+    }
+    if let Some(enc) = msg.enc_reaction_message.as_ref() {
+        return secret_envelope(
+            SecretEncKind::EncReaction,
+            enc.target_message_key.as_ref(),
+            enc.enc_payload.as_deref(),
+            enc.enc_iv.as_deref(),
+        );
+    }
+    if let Some(enc) = msg.enc_comment_message.as_ref() {
+        return secret_envelope(
+            SecretEncKind::EncComment,
+            enc.target_message_key.as_ref(),
+            enc.enc_payload.as_deref(),
+            enc.enc_iv.as_deref(),
+        );
+    }
+    None
+}
+
+/// Validate the shared `{target_message_key, enc_payload, enc_iv}` envelope
+/// shape (all three present, 12-byte IV) for any addon kind.
+fn secret_envelope<'a>(
+    kind: SecretEncKind,
+    target_message_key: Option<&'a wa::MessageKey>,
+    enc_payload: Option<&'a [u8]>,
+    enc_iv: Option<&'a [u8]>,
+) -> Option<SecretEncrypted<'a>> {
+    match (target_message_key, enc_payload, enc_iv) {
         (Some(tk), Some(payload), Some(iv)) if iv.len() == 12 => Some(SecretEncrypted {
             kind,
             enc_payload: payload,
@@ -353,18 +391,47 @@ pub fn decrypt_secret_encrypted(
 ) -> Result<wa::Message> {
     let orig = original_sender_jid.to_non_ad_string();
     let sender = modification_sender_jid.to_non_ad_string();
-    let ctx = MessageEditContext {
-        original_msg_id,
-        original_sender_jid: &orig,
-        editor_jid: &sender,
-    };
-    message_edit::decrypt_secret_encrypted(
-        enc_payload,
-        enc_iv,
-        message_secret,
-        kind.modification_type(),
-        &ctx,
-    )
+    match kind {
+        // The reaction plaintext is a ReactionMessage, not a Message; surface
+        // it in the plaintext-reaction shape (key filled by the caller from
+        // the envelope's target_message_key).
+        SecretEncKind::EncReaction => {
+            let reaction = wacore::reaction::decrypt_reaction_with_secret(
+                enc_payload,
+                enc_iv,
+                message_secret,
+                original_msg_id,
+                &orig,
+                &sender,
+            )?;
+            Ok(wa::Message {
+                reaction_message: Some(reaction),
+                ..Default::default()
+            })
+        }
+        SecretEncKind::EncComment => wacore::comment::decrypt_comment_with_secret(
+            enc_payload,
+            enc_iv,
+            message_secret,
+            original_msg_id,
+            &orig,
+            &sender,
+        ),
+        _ => {
+            let ctx = MessageEditContext {
+                original_msg_id,
+                original_sender_jid: &orig,
+                editor_jid: &sender,
+            };
+            message_edit::decrypt_secret_encrypted(
+                enc_payload,
+                enc_iv,
+                message_secret,
+                kind.modification_type(),
+                &ctx,
+            )
+        }
+    }
 }
 
 /// [`decrypt_secret_encrypted`] with a LID↔PN fallback addressing, mirroring
@@ -381,6 +448,38 @@ pub fn decrypt_secret_encrypted_with_fallback(
     fallback_original_sender: Option<&Jid>,
     fallback_modification_sender: Option<&Jid>,
 ) -> Result<wa::Message> {
+    // The reaction/comment kinds decode a different inner proto, so they go
+    // through the per-kind dispatch instead of the wacore Message-only helper.
+    if matches!(kind, SecretEncKind::EncReaction | SecretEncKind::EncComment) {
+        let primary = decrypt_secret_encrypted(
+            enc_payload,
+            enc_iv,
+            message_secret,
+            kind,
+            original_msg_id,
+            original_sender_jid,
+            modification_sender_jid,
+        );
+        let fb_orig = fallback_original_sender.unwrap_or(original_sender_jid);
+        let fb_sender = fallback_modification_sender.unwrap_or(modification_sender_jid);
+        let has_distinct_fallback = fb_orig.to_non_ad() != original_sender_jid.to_non_ad()
+            || fb_sender.to_non_ad() != modification_sender_jid.to_non_ad();
+        return match primary {
+            Ok(inner) => Ok(inner),
+            Err(primary_err) if has_distinct_fallback => decrypt_secret_encrypted(
+                enc_payload,
+                enc_iv,
+                message_secret,
+                kind,
+                original_msg_id,
+                fb_orig,
+                fb_sender,
+            )
+            .map_err(|fallback_err| anyhow!("primary: {primary_err}; fallback: {fallback_err}")),
+            Err(e) => Err(e),
+        };
+    }
+
     let orig = original_sender_jid.to_non_ad_string();
     let sender = modification_sender_jid.to_non_ad_string();
     let primary = MessageEditContext {
@@ -897,5 +996,157 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.conversation.as_deref(), Some("poll edited"));
+    }
+}
+
+#[cfg(test)]
+mod enc_addon_tests {
+    use super::*;
+
+    fn key(id: &str) -> wa::MessageKey {
+        wa::MessageKey {
+            id: Some(id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extract_recognises_enc_reaction_and_comment_envelopes() {
+        let reaction = wa::Message {
+            enc_reaction_message: Some(wa::message::EncReactionMessage {
+                target_message_key: Some(key("PARENT1")),
+                enc_payload: Some(vec![0; 32]),
+                enc_iv: Some(vec![0; 12]),
+            }),
+            ..Default::default()
+        };
+        let env = extract_secret_encrypted(&reaction).expect("reaction recognised");
+        assert_eq!(env.kind, SecretEncKind::EncReaction);
+        assert_eq!(env.target_id(), Some("PARENT1"));
+
+        let comment = wa::Message {
+            enc_comment_message: Some(wa::message::EncCommentMessage {
+                target_message_key: Some(key("PARENT2")),
+                enc_payload: Some(vec![0; 32]),
+                enc_iv: Some(vec![0; 12]),
+            }),
+            ..Default::default()
+        };
+        let env = extract_secret_encrypted(&comment).expect("comment recognised");
+        assert_eq!(env.kind, SecretEncKind::EncComment);
+        assert_eq!(env.target_id(), Some("PARENT2"));
+    }
+
+    #[test]
+    fn extract_rejects_malformed_enc_reaction_envelope() {
+        let bad_iv = wa::Message {
+            enc_reaction_message: Some(wa::message::EncReactionMessage {
+                target_message_key: Some(key("PARENT1")),
+                enc_payload: Some(vec![0; 32]),
+                enc_iv: Some(vec![0; 8]),
+            }),
+            ..Default::default()
+        };
+        assert!(extract_secret_encrypted(&bad_iv).is_none());
+
+        let no_key = wa::Message {
+            enc_reaction_message: Some(wa::message::EncReactionMessage {
+                target_message_key: None,
+                enc_payload: Some(vec![0; 32]),
+                enc_iv: Some(vec![0; 12]),
+            }),
+            ..Default::default()
+        };
+        assert!(extract_secret_encrypted(&no_key).is_none());
+    }
+
+    #[test]
+    fn enc_reaction_decrypts_via_kind_dispatch_with_fallback() {
+        let secret = [0x21u8; 32];
+        let author: Jid = "5511000000001@s.whatsapp.net".parse().unwrap();
+        let author_lid: Jid = "111111111111111@lid".parse().unwrap();
+        let reactor: Jid = "5511000000002@s.whatsapp.net".parse().unwrap();
+
+        // Encrypted under the author's LID identity; the primary (PN) attempt
+        // must fail and the LID fallback succeed.
+        let (enc, iv) = wacore::reaction::encrypt_reaction_with_secret(
+            "\u{2764}",
+            42,
+            &secret,
+            "PARENT1",
+            &author_lid.to_non_ad_string(),
+            &reactor.to_non_ad_string(),
+        )
+        .unwrap();
+
+        let out = decrypt_secret_encrypted_with_fallback(
+            &enc,
+            &iv,
+            &secret,
+            SecretEncKind::EncReaction,
+            "PARENT1",
+            &author,
+            &reactor,
+            Some(&author_lid),
+            None,
+        )
+        .expect("fallback identity must decrypt");
+        let rm = out.reaction_message.expect("reaction shape");
+        assert_eq!(rm.text.as_deref(), Some("\u{2764}"));
+
+        // Without a distinct fallback the primary error surfaces.
+        assert!(
+            decrypt_secret_encrypted_with_fallback(
+                &enc,
+                &iv,
+                &secret,
+                SecretEncKind::EncReaction,
+                "PARENT1",
+                &author,
+                &reactor,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn enc_comment_decrypts_to_inner_body() {
+        let secret = [0x22u8; 32];
+        let author: Jid = "5511000000001@s.whatsapp.net".parse().unwrap();
+        let commenter: Jid = "5511000000002@s.whatsapp.net".parse().unwrap();
+        let body = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some("hi".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let (enc, iv) = wacore::comment::encrypt_comment_with_secret(
+            &body,
+            &secret,
+            "PARENT1",
+            &author.to_non_ad_string(),
+            &commenter.to_non_ad_string(),
+        )
+        .unwrap();
+
+        let out = decrypt_secret_encrypted(
+            &enc,
+            &iv,
+            &secret,
+            SecretEncKind::EncComment,
+            "PARENT1",
+            &author,
+            &commenter,
+        )
+        .expect("comment decrypts");
+        assert_eq!(
+            out.extended_text_message
+                .as_ref()
+                .and_then(|m| m.text.as_deref()),
+            Some("hi")
+        );
     }
 }

@@ -297,6 +297,7 @@ impl<'a> Groups<'a> {
         }
 
         let mut info = GroupInfo::new(participants, group.addressing_mode);
+        info.is_community_announce = Some(group.is_default_sub_group);
         if !lid_to_pn_map.is_empty() {
             info.set_lid_to_pn_map(lid_to_pn_map);
         }
