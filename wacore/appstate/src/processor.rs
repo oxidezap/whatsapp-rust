@@ -207,7 +207,13 @@ where
     // overwrites the same index earlier in the patch takes precedence over the DB value.
     let mut in_patch: HashMap<&[u8], &[u8]> = HashMap::with_capacity(patch.mutations.len());
     let (hash_update_result, result) = state.update_hash(&patch.mutations, |index_mac, idx| {
-        let prev = if let Some(value_mac) = in_patch.get(index_mac) {
+        // WA Web resolves every previous value against the store map fetched before
+        // the loop; the in-patch overlay only models SET-overwrite collapse and must
+        // never feed a REMOVE (a REMOVE preceded by a SET on the same index would
+        // otherwise subtract the in-patch value instead of the store's).
+        let is_remove = patch.mutations[idx].operation.unwrap_or_default()
+            == wa::syncd_mutation::SyncdOperation::Remove as i32;
+        let prev = if !is_remove && let Some(value_mac) = in_patch.get(index_mac) {
             Some(value_mac.to_vec())
         } else {
             get_prev_value_mac(index_mac).map_err(|e| anyhow::anyhow!(e))?
@@ -986,23 +992,20 @@ mod tests {
         );
     }
 
-    /// REMOVE carries a value blob (decode requires >= 48 bytes) and previous-value resolution
-    /// is operation-agnostic, like the reverse scan it replaces: a SET after a REMOVE on the
-    /// same index subtracts the REMOVE's tail, not the DB value.
+    /// SET+REMOVE on the same index in one patch: WA Web index-mode pre-collects the
+    /// REMOVEd indices and suppresses the SET's subtraction (the REMOVE owns it, and
+    /// it subtracts the STORE value, never the in-patch one). Net must be
+    /// base + set_tail - store_prev, which also agrees with the persisted MAC store
+    /// (delete removed_index_macs then put added_macs leaves the index present with
+    /// the SET's value).
     #[test]
-    fn test_process_patch_set_after_remove_uses_remove_tail() {
+    fn test_process_patch_set_plus_remove_same_index_wa_web_index_mode() {
         let master_key = [7u8; 32];
         let keys = expand_app_state_keys(&master_key);
         let key_id = b"test_key_id".to_vec();
         let index_mac = vec![3; 32];
+        let store_prev = vec![9u8; 32];
 
-        let remove = create_encrypted_record(
-            wa::syncd_mutation::SyncdOperation::Remove,
-            &index_mac,
-            &keys,
-            &key_id,
-            1000,
-        );
         let set = create_encrypted_record(
             wa::syncd_mutation::SyncdOperation::Set,
             &index_mac,
@@ -1010,55 +1013,79 @@ mod tests {
             &key_id,
             2000,
         );
+        let remove = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::Remove,
+            &index_mac,
+            &keys,
+            &key_id,
+            1000,
+        );
 
         let tail = |rec: &wa::SyncdRecord| {
             let blob = rec.value.as_ref().unwrap().blob.as_ref().unwrap();
             blob[blob.len() - 32..].to_vec()
         };
-        let remove_tail = tail(&remove);
         let set_tail = tail(&set);
 
-        let patch = wa::SyncdPatch {
+        let build_patch = |mutations: Vec<wa::SyncdMutation>| wa::SyncdPatch {
             version: Some(wa::SyncdVersion { version: Some(1) }),
-            mutations: vec![
-                wa::SyncdMutation {
-                    operation: Some(wa::syncd_mutation::SyncdOperation::Remove as i32),
-                    record: Some(remove),
-                },
-                wa::SyncdMutation {
-                    operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                    record: Some(set),
-                },
-            ],
+            mutations,
             key_id: Some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()
         };
+        let set_mutation = wa::SyncdMutation {
+            operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
+            record: Some(set),
+        };
+        let remove_mutation = wa::SyncdMutation {
+            operation: Some(wa::syncd_mutation::SyncdOperation::Remove as i32),
+            record: Some(remove),
+        };
 
         let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
-        let get_prev = |_: &[u8]| Ok(None);
+        let get_prev = |_: &[u8]| Ok(Some(store_prev.clone()));
 
-        let mut state = HashState::default();
-        let result = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
-            .expect("remove-then-set should process");
-
-        // The SET's previous value is the in-patch REMOVE tail, so it gets subtracted.
-        const EMPTY: &[Vec<u8>] = &[];
         let expected = WAPATCH_INTEGRITY.subtract_then_add(
             &[0u8; 128],
-            std::slice::from_ref(&remove_tail),
+            std::slice::from_ref(&store_prev),
             std::slice::from_ref(&set_tail),
         );
-        assert_eq!(result.state.hash.as_slice(), expected.as_slice());
 
-        // An op==Set guard would skip the REMOVE, dropping to the DB and leaving only +set_tail.
-        let if_remove_skipped = WAPATCH_INTEGRITY.subtract_then_add(
-            &[0u8; 128],
-            EMPTY,
-            std::slice::from_ref(&set_tail),
-        );
-        assert_ne!(result.state.hash.as_slice(), if_remove_skipped.as_slice());
+        // Both orderings must yield the same hash: the math is per-index, not
+        // per-position (WA Web accumulates adds/subtracts in maps).
+        for (label, mutations) in [
+            (
+                "set-then-remove",
+                vec![set_mutation.clone(), remove_mutation.clone()],
+            ),
+            ("remove-then-set", vec![remove_mutation, set_mutation]),
+        ] {
+            let patch = build_patch(mutations);
+            let mut state = HashState::default();
+            let result = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
+                .unwrap_or_else(|e| panic!("{label} should process: {e:?}"));
+
+            assert_eq!(
+                result.state.hash.as_slice(),
+                expected.as_slice(),
+                "{label}: net must be base + set_tail - store_prev (WA Web index-mode)"
+            );
+
+            // The MAC store ends with the index present (delete-then-put), so the
+            // hash above is the only self-consistent answer. The wire blob is the
+            // HMAC of the index identity, recomputed by decode_record.
+            let wire_index_mac = generate_index_mac(&index_mac, &keys.index);
+            assert_eq!(result.added_macs.len(), 1, "{label}");
+            assert_eq!(result.added_macs[0].index_mac, wire_index_mac, "{label}");
+            assert_eq!(result.added_macs[0].value_mac, set_tail, "{label}");
+            assert_eq!(
+                result.removed_index_macs,
+                vec![wire_index_mac.clone()],
+                "{label}"
+            );
+        }
     }
 
     /// WA Web: validatePatchVersion checks `localVersion !== patchVersion - 1`.

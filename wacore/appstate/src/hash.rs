@@ -43,6 +43,34 @@ impl HashState {
     where
         F: FnMut(&[u8], usize) -> anyhow::Result<Option<Vec<u8>>>,
     {
+        // WA Web index-mode (WAWebSyncdAntiTampering, gate `d`): when every mutation
+        // carries an index, a SET whose index is also REMOVEd in the same patch must
+        // NOT subtract its previous value; the REMOVE owns that subtraction. Without
+        // the guard the previous value is subtracted twice and the SET's value is
+        // orphaned in the MAC store, leaving the ltHash and the store in permanent
+        // disagreement. The legacy non-index path keeps the old math, like WA Web.
+        // fn item, not a closure: the borrowed return needs HRTB (issue #825 class).
+        fn index_mac_of(mutation: &wa::SyncdMutation) -> Option<&[u8]> {
+            mutation
+                .record
+                .as_ref()
+                .and_then(|r| r.index.as_ref())
+                .and_then(|idx| idx.blob.as_deref())
+        }
+        let index_mode = mutations.iter().all(|m| index_mac_of(m).is_some());
+        let mut removed_in_patch: std::collections::HashSet<&[u8]> =
+            std::collections::HashSet::new();
+        if index_mode {
+            for mutation in mutations {
+                if mutation.operation.unwrap_or_default()
+                    == wa::syncd_mutation::SyncdOperation::Remove as i32
+                    && let Some(index_mac) = index_mac_of(mutation)
+                {
+                    removed_in_patch.insert(index_mac);
+                }
+            }
+        }
+
         // Borrow the MAC tails instead of copying; mirrors `update_hash_from_records`.
         let mut added: Vec<&[u8]> = Vec::with_capacity(mutations.len());
         let mut removed: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
@@ -50,7 +78,8 @@ impl HashState {
 
         for (i, mutation) in mutations.iter().enumerate() {
             let op = mutation.operation.unwrap_or_default();
-            if op == wa::syncd_mutation::SyncdOperation::Set as i32
+            let is_set = op == wa::syncd_mutation::SyncdOperation::Set as i32;
+            if is_set
                 && let Some(record) = &mutation.record
                 && let Some(value) = &record.value
                 && let Some(blob) = &value.blob
@@ -58,12 +87,10 @@ impl HashState {
             {
                 added.push(&blob[blob.len() - 32..]);
             }
-            let index_mac_opt = mutation
-                .record
-                .as_ref()
-                .and_then(|r| r.index.as_ref())
-                .and_then(|idx| idx.blob.as_ref());
-            if let Some(index_mac) = index_mac_opt {
+            if let Some(index_mac) = index_mac_of(mutation) {
+                if is_set && removed_in_patch.contains(index_mac) {
+                    continue;
+                }
                 match get_prev_set_value_mac(index_mac, i) {
                     Ok(Some(prev)) => removed.push(prev),
                     Ok(None) => {
@@ -292,6 +319,120 @@ mod tests {
             expected_final_hash.as_slice(),
             "The final hash state after overwrite and remove is incorrect."
         );
+    }
+
+    /// WA Web index-mode: a SET whose index is also REMOVEd in the same patch must
+    /// not subtract its previous value; only the REMOVE subtracts (the store value).
+    #[test]
+    fn test_update_hash_set_plus_remove_same_index_subtracts_once() {
+        const INDEX_MAC: &[u8] = &[1; 32];
+        const PREV_VALUE: &[u8] = &[10; 32];
+        const NEW_VALUE: &[u8] = &[20; 32];
+
+        let mutations = vec![
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::Set,
+                INDEX_MAC.to_vec(),
+                Some(NEW_VALUE.to_vec()),
+            ),
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::Remove,
+                INDEX_MAC.to_vec(),
+                Some(PREV_VALUE.to_vec()),
+            ),
+        ];
+
+        let mut state = HashState::default();
+        let mut lookups = 0usize;
+        let (hash_result, result) = state.update_hash(&mutations, |_, _| {
+            lookups += 1;
+            Ok(Some(PREV_VALUE.to_vec()))
+        });
+        assert!(result.is_ok());
+        assert!(!hash_result.has_missing_remove);
+        assert_eq!(lookups, 1, "the suppressed SET must not query the store");
+
+        let expected = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0; 128],
+            &[PREV_VALUE.to_vec()],
+            &[NEW_VALUE.to_vec()],
+        );
+        assert_eq!(state.hash.as_slice(), expected.as_slice());
+    }
+
+    /// Index-mode is gated on every mutation carrying an index (WA Web's `d`):
+    /// with one index-less mutation in the patch, the SET subtracts as before.
+    #[test]
+    fn test_update_hash_suppression_disabled_without_full_index_coverage() {
+        const INDEX_MAC: &[u8] = &[1; 32];
+        const PREV_VALUE: &[u8] = &[10; 32];
+        const NEW_VALUE: &[u8] = &[20; 32];
+
+        let mut index_less = create_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            vec![],
+            Some(vec![30; 32]),
+        );
+        if let Some(rec) = index_less.record.as_mut() {
+            rec.index = None;
+        }
+
+        let mutations = vec![
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::Set,
+                INDEX_MAC.to_vec(),
+                Some(NEW_VALUE.to_vec()),
+            ),
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::Remove,
+                INDEX_MAC.to_vec(),
+                Some(PREV_VALUE.to_vec()),
+            ),
+            index_less,
+        ];
+
+        let mut state = HashState::default();
+        let (_, result) = state.update_hash(&mutations, |_, _| Ok(Some(PREV_VALUE.to_vec())));
+        assert!(result.is_ok());
+
+        // Legacy math: SET and REMOVE each subtract the previous value.
+        let expected = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0; 128],
+            &[PREV_VALUE.to_vec(), PREV_VALUE.to_vec()],
+            &[NEW_VALUE.to_vec(), vec![30; 32]],
+        );
+        assert_eq!(state.hash.as_slice(), expected.as_slice());
+    }
+
+    /// SET+REMOVE same index against an empty store: the SET still adds, the REMOVE
+    /// finds nothing and flags has_missing_remove, matching WA Web index-mode which
+    /// has no fallback query.
+    #[test]
+    fn test_update_hash_set_plus_remove_same_index_empty_store() {
+        const INDEX_MAC: &[u8] = &[1; 32];
+        const NEW_VALUE: &[u8] = &[20; 32];
+
+        let mutations = vec![
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::Set,
+                INDEX_MAC.to_vec(),
+                Some(NEW_VALUE.to_vec()),
+            ),
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::Remove,
+                INDEX_MAC.to_vec(),
+                Some(NEW_VALUE.to_vec()),
+            ),
+        ];
+
+        let mut state = HashState::default();
+        let (hash_result, result) = state.update_hash(&mutations, |_, _| Ok(None));
+        assert!(result.is_ok());
+        assert!(hash_result.has_missing_remove);
+
+        const EMPTY: &[Vec<u8>] = &[];
+        let expected = WAPATCH_INTEGRITY.subtract_then_add(&[0; 128], EMPTY, &[NEW_VALUE.to_vec()]);
+        assert_eq!(state.hash.as_slice(), expected.as_slice());
     }
 
     /// Known-answer test for generate_patch_mac to guard byte ordering and input

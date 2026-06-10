@@ -3386,6 +3386,7 @@ fn create_test_message_info(chat: &str, msg_id: &str, sender: &str) -> MessageIn
         verified_level: None,
         verified_name_serial: None,
         peer_recipient_pn: None,
+        comment_target: None,
         bcl_participants: Vec::new(),
     }
 }
@@ -9548,6 +9549,248 @@ async fn msmsg_without_meta_target_id_nacks_495() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     assert_eq!(code, Some(495));
+}
+
+/// Incoming CAG encrypted reaction: decrypted inline and surfaced in the
+/// plaintext-reaction shape, with the key filled from the envelope's target.
+#[tokio::test]
+async fn enc_reaction_inbound_decrypts_to_plaintext_shape() {
+    use wacore::types::message::{MessageInfo, MessageSource};
+
+    let client = crate::test_utils::create_test_client_with_name("enc_reaction_inbound").await;
+    ensure_bob_paired(&client).await;
+
+    let group: Jid = "120363400000000001@g.us".parse().expect("group");
+    let author: Jid = "5511888887777@s.whatsapp.net".parse().expect("author");
+    let reactor: Jid = "5511777776666@s.whatsapp.net".parse().expect("reactor");
+    let secret = [0x5Au8; 32];
+    const PARENT_ID: &str = "3EB0PARENTPOST1";
+
+    client
+        .persistence_manager
+        .backend()
+        .put_msg_secrets(vec![wacore::store::traits::MsgSecretEntry {
+            chat: group.to_non_ad_string(),
+            sender: author.to_non_ad_string(),
+            msg_id: PARENT_ID.to_string(),
+            secret: secret.to_vec(),
+            expires_at: 0,
+            message_ts: 0,
+        }])
+        .await
+        .expect("persist parent secret");
+
+    let (payload, iv) = wacore::reaction::encrypt_reaction_with_secret(
+        "\u{1F525}",
+        1_700_000_000_000,
+        &secret,
+        PARENT_ID,
+        &author.to_non_ad_string(),
+        &reactor.to_non_ad_string(),
+    )
+    .expect("encrypt");
+
+    let target_key = wa::MessageKey {
+        remote_jid: Some(group.to_string()),
+        from_me: Some(false),
+        id: Some(PARENT_ID.to_string()),
+        participant: Some(author.to_string()),
+    };
+    let msg = wa::Message {
+        enc_reaction_message: Some(wa::message::EncReactionMessage {
+            target_message_key: Some(target_key.clone()),
+            enc_payload: Some(payload),
+            enc_iv: Some(iv.to_vec()),
+        }),
+        ..Default::default()
+    };
+    let info = Arc::new(MessageInfo {
+        id: "REACT1".to_string(),
+        source: MessageSource {
+            chat: group.clone(),
+            sender: reactor.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        timestamp: wacore::time::now_utc(),
+        ..Default::default()
+    });
+
+    let out = client
+        .maybe_decrypt_secret_encrypted_message(&msg, &info)
+        .await
+        .expect("reaction must decrypt");
+    let rm = out.reaction_message.expect("plaintext reaction shape");
+    assert_eq!(rm.text.as_deref(), Some("\u{1F525}"));
+    assert_eq!(rm.sender_timestamp_ms, Some(1_700_000_000_000));
+    assert_eq!(
+        rm.key.as_ref().and_then(|k| k.id.as_deref()),
+        Some(PARENT_ID),
+        "key must be filled from the envelope target"
+    );
+    assert_eq!(
+        rm.key.as_ref().and_then(|k| k.participant.as_deref()),
+        Some(author.to_string().as_str())
+    );
+}
+
+/// Incoming CAG encrypted comment: dispatched as the decrypted body with the
+/// parent post key carried on `MessageInfo::comment_target`, and the comment's
+/// own secret persisted under the comment's id (not the parent's).
+#[tokio::test]
+async fn enc_comment_inbound_dispatches_body_with_parent_link() {
+    use wacore::types::events::ChannelEventHandler;
+    use wacore::types::message::{MessageInfo, MessageSource};
+
+    let (client, _transport) = capturing_client("enc_comment_inbound").await;
+    ensure_bob_paired(&client).await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.add_handler(handler);
+
+    let group: Jid = "120363400000000002@g.us".parse().expect("group");
+    let author: Jid = "5511888887777@s.whatsapp.net".parse().expect("author");
+    let commenter: Jid = "5511777776666@s.whatsapp.net".parse().expect("commenter");
+    let secret = [0x6Bu8; 32];
+    let comment_secret = [0x7Cu8; 32];
+    const PARENT_ID: &str = "3EB0PARENTPOST2";
+    const COMMENT_ID: &str = "3EB0COMMENT1";
+
+    client
+        .persistence_manager
+        .backend()
+        .put_msg_secrets(vec![wacore::store::traits::MsgSecretEntry {
+            chat: group.to_non_ad_string(),
+            sender: author.to_non_ad_string(),
+            msg_id: PARENT_ID.to_string(),
+            secret: secret.to_vec(),
+            expires_at: 0,
+            message_ts: 0,
+        }])
+        .await
+        .expect("persist parent secret");
+
+    let body = wa::Message {
+        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            text: Some("great post".to_string()),
+            ..Default::default()
+        })),
+        // Present but secret-less: the outer secret must merge in, not be
+        // dropped because a context already exists.
+        message_context_info: Some(wa::MessageContextInfo::default()),
+        ..Default::default()
+    };
+    let (payload, iv) = wacore::comment::encrypt_comment_with_secret(
+        &body,
+        &secret,
+        PARENT_ID,
+        &author.to_non_ad_string(),
+        &commenter.to_non_ad_string(),
+    )
+    .expect("encrypt");
+
+    let msg = wa::Message {
+        enc_comment_message: Some(wa::message::EncCommentMessage {
+            target_message_key: Some(wa::MessageKey {
+                remote_jid: Some(group.to_string()),
+                from_me: Some(false),
+                id: Some(PARENT_ID.to_string()),
+                participant: Some(author.to_string()),
+            }),
+            enc_payload: Some(payload),
+            enc_iv: Some(iv.to_vec()),
+        }),
+        // WA Web ships the comment's own secret on the OUTER envelope (the
+        // comment msgData), not inside the encrypted body.
+        message_context_info: Some(wa::MessageContextInfo {
+            message_secret: Some(comment_secret.to_vec()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let info = Arc::new(MessageInfo {
+        id: COMMENT_ID.to_string(),
+        source: MessageSource {
+            chat: group.clone(),
+            sender: commenter.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        timestamp: wacore::time::now_utc(),
+        ..Default::default()
+    });
+
+    client.dispatch_parsed_message(msg, &info).await;
+
+    // Deadline-poll instead of a fixed sleep so a slow CI cannot race the
+    // event delivery.
+    let mut seen = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    'outer: while tokio::time::Instant::now() < deadline {
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Message(msg, info) = event.as_ref()
+                && info.id == COMMENT_ID
+            {
+                seen = true;
+                assert_eq!(
+                    msg.extended_text_message
+                        .as_ref()
+                        .and_then(|m| m.text.as_deref()),
+                    Some("great post"),
+                    "the decrypted body must be dispatched"
+                );
+                assert!(
+                    msg.enc_comment_message.is_none(),
+                    "the envelope must not survive substitution"
+                );
+                assert_eq!(
+                    info.comment_target.as_ref().and_then(|k| k.id.as_deref()),
+                    Some(PARENT_ID),
+                    "the parent post key must surface on the info"
+                );
+                assert_eq!(
+                    msg.message_context_info
+                        .as_ref()
+                        .and_then(|m| m.message_secret.as_deref()),
+                    Some(comment_secret.as_slice()),
+                    "the comment's own secret must survive substitution for app-managed storage"
+                );
+                break 'outer;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(seen, "the decrypted comment must be dispatched");
+
+    // The comment's own secret keys add-ons on the COMMENT, so it must be
+    // stored under the comment's id and sender, never the parent's. The
+    // write-behind buffer is drained first so the backend read is settled.
+    client.msg_secret_buffer.wait_flushed().await;
+    let stored = client
+        .persistence_manager
+        .backend()
+        .get_msg_secret(
+            &group.to_non_ad_string(),
+            &commenter.to_non_ad_string(),
+            COMMENT_ID,
+        )
+        .await
+        .expect("lookup");
+    assert_eq!(stored.as_deref(), Some(comment_secret.as_slice()));
+    let mis_keyed = client
+        .persistence_manager
+        .backend()
+        .get_msg_secret(
+            &group.to_non_ad_string(),
+            &author.to_non_ad_string(),
+            PARENT_ID,
+        )
+        .await
+        .expect("lookup");
+    assert_eq!(
+        mis_keyed.as_deref(),
+        Some(secret.as_slice()),
+        "the parent's own secret must stay untouched"
+    );
 }
 
 /// The write-behind buffer must keep the receive-lane ordering semantic: an

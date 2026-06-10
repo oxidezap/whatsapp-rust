@@ -20,6 +20,11 @@ fn build_pn_to_lid_map(
 pub struct GroupInfo {
     pub participants: Vec<Jid>,
     pub addressing_mode: AddressingMode,
+    /// Whether this group is a Community Announcement Group (WA Web `isCag`,
+    /// derived from `default_sub_group`). `None` means the persisted blob
+    /// predates the field, so the answer is unknown and callers must re-query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_community_announce: Option<bool>,
     /// Maps a LID user identifier (the `user` part of the LID JID) to the
     /// corresponding phone-number JID. This is used for device queries since
     /// LID usync requests may not work reliably.
@@ -40,12 +45,16 @@ struct GroupInfoDe {
     participants: Vec<Jid>,
     addressing_mode: AddressingMode,
     #[serde(default)]
+    is_community_announce: Option<bool>,
+    #[serde(default)]
     lid_to_pn_map: HashMap<CompactString, Jid>,
 }
 
 impl From<GroupInfoDe> for GroupInfo {
     fn from(d: GroupInfoDe) -> Self {
-        Self::with_lid_to_pn_map(d.participants, d.addressing_mode, d.lid_to_pn_map)
+        let mut info = Self::with_lid_to_pn_map(d.participants, d.addressing_mode, d.lid_to_pn_map);
+        info.is_community_announce = d.is_community_announce;
+        info
     }
 }
 
@@ -59,6 +68,7 @@ impl GroupInfo {
         Self {
             participants,
             addressing_mode,
+            is_community_announce: None,
             lid_to_pn_map: HashMap::new(),
             pn_to_lid_map: HashMap::new(),
         }
@@ -75,6 +85,7 @@ impl GroupInfo {
         Self {
             participants,
             addressing_mode,
+            is_community_announce: None,
             lid_to_pn_map,
             pn_to_lid_map,
         }

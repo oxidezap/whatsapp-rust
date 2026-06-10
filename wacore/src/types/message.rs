@@ -338,6 +338,11 @@ pub struct MessageInfo {
     /// goes to the right routing target).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_recipient_pn: Option<Jid>,
+    /// Parent post key when the dispatched message is a decrypted CAG channel
+    /// comment (`enc_comment_message`). The inner `Message` proto has no slot
+    /// for the threading link, so it surfaces here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_target: Option<wa::MessageKey>,
     /// Broadcast-contact-list recipients from `<participants><to jid>` on an
     /// incoming broadcast/status stanza. Populated only for broadcasts; used to
     /// validate a `deviceSentMessage.phash` (WA Web `validateBclHash`). Empty

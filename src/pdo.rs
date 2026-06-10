@@ -460,6 +460,7 @@ impl Client {
             verified_level: None,
             verified_name_serial: None,
             peer_recipient_pn: None,
+            comment_target: None,
             bcl_participants: Vec::new(),
         })
     }
