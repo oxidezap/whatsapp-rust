@@ -77,8 +77,13 @@ impl Client {
             .id
             .clone()
             .ok_or_else(|| anyhow!("target message key missing id"))?;
+        // Receivers derive the addon key with the STANZA sender, which in a
+        // CAG is our LID identity regardless of the parent author's namespace;
+        // mirror the comment path (WA Web authors CAG addons under LID).
         let reactor = self
-            .addon_self_jid(&author)
+            .get_lid()
+            .or_else(|| self.get_pn())
+            .map(|j| j.to_non_ad())
             .ok_or_else(|| anyhow!("not logged in"))?;
 
         let (enc_payload, iv) = wacore::reaction::encrypt_reaction_with_secret(
