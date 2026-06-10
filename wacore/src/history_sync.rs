@@ -935,8 +935,11 @@ fn extract_conversation_fields(
                 };
                 // Decode only messages that can yield a record: the presence
                 // walk is a fraction of the full prost decode, and most real
-                // history messages carry no secret.
-                if has_message_secret(&data[pos..end])
+                // history messages carry no secret. The id guard keeps records
+                // from a (malformed) blob that re-orders messages before the
+                // conversation id from landing under an empty chat id.
+                if !chat_id.is_empty()
+                    && has_message_secret(&data[pos..end])
                     && let Ok(msg) = HistorySyncMsgInternalFields::decode(&data[pos..end])
                 {
                     push_secret_record(chat_id, &mut chat_id_shared, msg, secrets_out);
@@ -1134,6 +1137,47 @@ mod tests {
         process_history_sync(compressed, None, false, None)
             .unwrap()
             .msg_secret_records
+    }
+
+    /// A (malformed) conversation that carries messages BEFORE its id must not
+    /// emit records under an empty chat id.
+    #[test]
+    fn test_messages_before_conversation_id_yield_no_records() {
+        let emit = |out: &mut Vec<u8>, field: u32, v: &[u8]| {
+            out.push(((field << 3) | wire_type::LENGTH_DELIMITED) as u8);
+            out.push(v.len() as u8);
+            out.extend_from_slice(v);
+        };
+
+        let web_msg = wa::WebMessageInfo {
+            key: wa::MessageKey {
+                from_me: Some(false),
+                id: Some("EARLY_MSG".into()),
+                ..Default::default()
+            },
+            message_secret: Some(vec![0x22u8; 32]),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut history_msg = Vec::new();
+        emit(&mut history_msg, tags::history_sync_msg::MESSAGE, &web_msg);
+
+        // messages (field 2) deliberately emitted before id (field 1).
+        let mut conv = Vec::new();
+        emit(&mut conv, tags::conversation::MESSAGES, &history_msg);
+        emit(
+            &mut conv,
+            tags::conversation::ID,
+            b"5511777776666@s.whatsapp.net",
+        );
+        let mut hs = Vec::new();
+        emit(&mut hs, tags::history_sync::CONVERSATIONS, &conv);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let result = process_history_sync(compressed, None, false, None).unwrap();
+        assert!(result.msg_secret_records.is_empty());
     }
 
     /// The presence pre-scan must honor prost merge semantics: a secret carried

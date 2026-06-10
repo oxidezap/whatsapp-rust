@@ -20,7 +20,9 @@ fn main() -> std::io::Result<()> {
 
     ensure_proto_descriptor_hash()?;
 
-    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
+    let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| {
+        std::io::Error::other("OUT_DIR not set (cargo always sets it for build scripts)")
+    })?);
 
     let fds =
         prost_types::FileDescriptorSet::decode(std::fs::read("src/whatsapp.desc")?.as_slice())
