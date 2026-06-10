@@ -1,117 +1,111 @@
-// # Updating the Proto File
-//
-// When modifying `src/whatsapp.proto`, follow these steps:
-//
-// 1. Format the proto file (requires `buf` CLI: https://buf.build/docs/installation):
-//    ```
-//    buf format waproto/src/whatsapp.proto -w
-//    ```
-//
-// 2. Regenerate the Rust code:
-//    ```
-//    cargo build -p waproto --features generate
-//    ```
-//
-// 3. Fix any breaking changes in the codebase (e.g., `optional` -> `required` field changes)
+//! # Updating the proto
+//!
+//! 1. Edit `src/whatsapp.proto`.
+//! 2. Optional: format with `buf format src/whatsapp.proto -w`.
+//! 3. Regenerate the descriptor: `scripts/regenerate-proto-desc.sh`
+//!    (wraps `protoc --descriptor_set_out=src/whatsapp.desc ...`).
+//! 4. `cargo build` — this script consumes `whatsapp.desc` and writes
+//!    `whatsapp.rs` + `tags.rs` to `OUT_DIR`. Consumers never need `protoc`
+//!    installed; only editors of the proto do.
+
+use prost::Message as _;
 
 fn main() -> std::io::Result<()> {
-    #[cfg(not(feature = "generate"))]
-    {
-        println!("cargo:rerun-if-changed=build.rs");
-        Ok(())
-    }
+    // Rerun on desc change (new codegen) and proto change (so the staleness
+    // guard below runs). `build.rs` itself too.
+    println!("cargo:rerun-if-changed=src/whatsapp.desc");
+    println!("cargo:rerun-if-changed=src/whatsapp.desc.sha256");
+    println!("cargo:rerun-if-changed=src/whatsapp.proto");
+    println!("cargo:rerun-if-changed=build.rs");
 
-    #[cfg(feature = "generate")]
-    {
-        println!("cargo:rerun-if-changed=src/whatsapp.proto");
-        println!("cargo:warning=Regenerating proto definitions...");
+    ensure_proto_descriptor_hash()?;
 
-        let mut config = prost_build::Config::new();
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
 
-        // Serialize always; Deserialize only for WASM bridge (halves serde codegen).
-        config.type_attribute(".", "#[derive(serde::Serialize)]");
-        config.type_attribute(
-            ".",
-            "#[cfg_attr(feature = \"serde-deserialize\", derive(serde::Deserialize))]",
-        );
-        // Default missing fields to match protobuf semantics (structs only).
-        config.message_attribute(
-            ".",
-            "#[cfg_attr(feature = \"serde-deserialize\", serde(default))]",
-        );
+    let fds =
+        prost_types::FileDescriptorSet::decode(std::fs::read("src/whatsapp.desc")?.as_slice())
+            .map_err(std::io::Error::other)?;
 
-        // Accept snake_case on deserialization for WASM bridge enum variants.
-        config.type_attribute(
-            ".",
-            "#[cfg_attr(feature = \"serde-snake-case\", serde(rename_all(deserialize = \"snake_case\")))]",
-        );
+    let mut config = prost_build::Config::new();
 
-        // O(1)-clone Bytes for hot-path crypto structures instead of Vec<u8>.
-        config.bytes([
-            ".whatsapp.SessionStructure.Chain.ChainKey",
-            ".whatsapp.SessionStructure.Chain.MessageKey",
-            ".whatsapp.SenderKeyStateStructure.SenderChainKey",
-            ".whatsapp.SenderKeyStateStructure.SenderMessageKey",
-            ".whatsapp.SenderKeyStateStructure.SenderSigningKey",
-        ]);
+    // Serialize always; Deserialize only for WASM bridge (halves serde codegen).
+    config.type_attribute(".", "#[derive(serde::Serialize)]");
+    config.type_attribute(
+        ".",
+        "#[cfg_attr(feature = \"serde-deserialize\", derive(serde::Deserialize))]",
+    );
+    // Default missing fields to match protobuf semantics (structs only).
+    config.message_attribute(
+        ".",
+        "#[cfg_attr(feature = \"serde-deserialize\", serde(default))]",
+    );
 
-        // Bytes fields lack serde support; skip them (internal crypto state).
-        config.field_attribute(
-            ".whatsapp.SessionStructure.Chain.ChainKey.key",
-            "#[serde(skip)]",
-        );
-        config.field_attribute(
-            ".whatsapp.SessionStructure.Chain.MessageKey.cipherKey",
-            "#[serde(skip)]",
-        );
-        config.field_attribute(
-            ".whatsapp.SessionStructure.Chain.MessageKey.macKey",
-            "#[serde(skip)]",
-        );
-        config.field_attribute(
-            ".whatsapp.SessionStructure.Chain.MessageKey.iv",
-            "#[serde(skip)]",
-        );
-        config.field_attribute(
-            ".whatsapp.SenderKeyStateStructure.SenderChainKey.seed",
-            "#[serde(skip)]",
-        );
-        config.field_attribute(
-            ".whatsapp.SenderKeyStateStructure.SenderMessageKey.seed",
-            "#[serde(skip)]",
-        );
-        config.field_attribute(
-            ".whatsapp.SenderKeyStateStructure.SenderSigningKey.public",
-            "#[serde(skip)]",
-        );
-        config.field_attribute(
-            ".whatsapp.SenderKeyStateStructure.SenderSigningKey.private",
-            "#[serde(skip)]",
-        );
+    // Accept snake_case on deserialization for WASM bridge enum variants.
+    config.type_attribute(
+        ".",
+        "#[cfg_attr(feature = \"serde-snake-case\", serde(rename_all(deserialize = \"snake_case\")))]",
+    );
 
-        // Output to src/ so generated code is version-controlled.
-        config.out_dir("src/");
+    // O(1)-clone Bytes for hot-path crypto structures instead of Vec<u8>.
+    config.bytes([
+        ".whatsapp.SessionStructure.Chain.ChainKey",
+        ".whatsapp.SessionStructure.Chain.MessageKey",
+        ".whatsapp.SenderKeyStateStructure.SenderChainKey",
+        ".whatsapp.SenderKeyStateStructure.SenderMessageKey",
+        ".whatsapp.SenderKeyStateStructure.SenderSigningKey",
+    ]);
 
-        let fds_path =
-            std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("whatsapp_fds.bin");
-        config.file_descriptor_set_path(&fds_path);
+    // Bytes fields lack serde support; skip them (internal crypto state).
+    config.field_attribute(
+        ".whatsapp.SessionStructure.Chain.ChainKey.key",
+        "#[serde(skip)]",
+    );
+    config.field_attribute(
+        ".whatsapp.SessionStructure.Chain.MessageKey.cipherKey",
+        "#[serde(skip)]",
+    );
+    config.field_attribute(
+        ".whatsapp.SessionStructure.Chain.MessageKey.macKey",
+        "#[serde(skip)]",
+    );
+    config.field_attribute(
+        ".whatsapp.SessionStructure.Chain.MessageKey.iv",
+        "#[serde(skip)]",
+    );
+    config.field_attribute(
+        ".whatsapp.SenderKeyStateStructure.SenderChainKey.seed",
+        "#[serde(skip)]",
+    );
+    config.field_attribute(
+        ".whatsapp.SenderKeyStateStructure.SenderMessageKey.seed",
+        "#[serde(skip)]",
+    );
+    config.field_attribute(
+        ".whatsapp.SenderKeyStateStructure.SenderSigningKey.public",
+        "#[serde(skip)]",
+    );
+    config.field_attribute(
+        ".whatsapp.SenderKeyStateStructure.SenderSigningKey.private",
+        "#[serde(skip)]",
+    );
 
-        config.compile_protos(&["src/whatsapp.proto"], &["src/"])?;
-        generate_tags(&fds_path)?;
-        Ok(())
-    }
+    config.out_dir(&out_dir);
+    config.compile_fds(fds.clone())?;
+
+    generate_tags(&fds, &out_dir.join("tags.rs"))
 }
 
-/// Generate `src/tags.rs`: one module per message carrying a `u32` const per
-/// field with its wire tag, straight from the compiled descriptor. Hand-written
+/// Generate `tags.rs`: one module per message carrying a `u32` const per
+/// field with its wire tag, straight from the descriptor. Hand-written
 /// partial decoders reference these consts (or compile-time assert against
 /// them), so a schema change that renumbers, renames or removes a field breaks
 /// the build instead of silently desyncing.
-#[cfg(feature = "generate")]
-fn generate_tags(fds_path: &std::path::Path) -> std::io::Result<()> {
+fn generate_tags(
+    fds: &prost_types::FileDescriptorSet,
+    out_path: &std::path::Path,
+) -> std::io::Result<()> {
     use heck::{ToShoutySnakeCase, ToSnakeCase};
-    use prost::Message;
-    use prost_types::{DescriptorProto, FileDescriptorSet};
+    use prost_types::DescriptorProto;
 
     fn module_ident(name: &str) -> String {
         let snake = name.to_snake_case();
@@ -177,12 +171,9 @@ fn generate_tags(fds_path: &std::path::Path) -> std::io::Result<()> {
         out.push_str(&format!("{pad}}}\n"));
     }
 
-    let fds = FileDescriptorSet::decode(std::fs::read(fds_path)?.as_slice())
-        .map_err(std::io::Error::other)?;
-
     let mut out = String::with_capacity(1 << 20);
     out.push_str(
-        "// @generated by waproto's build.rs (feature `generate`). Do not edit.\n\
+        "// @generated from whatsapp.desc by waproto's build.rs. Do not edit.\n\
          //\n\
          // Wire tag of every message field in whatsapp.proto, for hand-written\n\
          // partial decoders. Referencing these (or compile-time asserting against\n\
@@ -194,5 +185,78 @@ fn generate_tags(fds_path: &std::path::Path) -> std::io::Result<()> {
             emit_message(&mut out, msg, 0);
         }
     }
-    std::fs::write("src/tags.rs", out)
+    std::fs::write(out_path, out)
+}
+
+fn ensure_proto_descriptor_hash() -> std::io::Result<()> {
+    let proto = std::fs::read("src/whatsapp.proto")?;
+    let desc = std::fs::read("src/whatsapp.desc")?;
+    let expected = read_expected_hashes("src/whatsapp.desc.sha256")?;
+    let actual_proto = sha256_hex(&proto);
+    let actual_desc = sha256_hex(&desc);
+
+    if actual_proto != expected.proto || actual_desc != expected.desc {
+        return Err(std::io::Error::other(format!(
+            "waproto: src/whatsapp.proto/src/whatsapp.desc do not match src/whatsapp.desc.sha256. \
+             Run `scripts/regenerate-proto-desc.sh` to refresh the descriptor \
+             and commit src/whatsapp.proto, src/whatsapp.desc, and \
+             src/whatsapp.desc.sha256. expected proto {}, desc {}; got proto {}, desc {}",
+            expected.proto, expected.desc, actual_proto, actual_desc
+        )));
+    }
+
+    Ok(())
+}
+
+struct ExpectedHashes {
+    proto: String,
+    desc: String,
+}
+
+fn read_expected_hashes(path: &str) -> std::io::Result<ExpectedHashes> {
+    let contents = std::fs::read_to_string(path)?;
+    let mut proto = None;
+    let mut desc = None;
+
+    for line in contents.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        match name {
+            "proto" => proto = Some(hash.to_owned()),
+            "desc" => desc = Some(hash.to_owned()),
+            _ => {}
+        }
+    }
+
+    let Some(proto) = proto else {
+        return Err(std::io::Error::other(format!(
+            "waproto: {path} missing `proto <sha256>` entry"
+        )));
+    };
+    let Some(desc) = desc else {
+        return Err(std::io::Error::other(format!(
+            "waproto: {path} missing `desc <sha256>` entry"
+        )));
+    };
+
+    Ok(ExpectedHashes { proto, desc })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }

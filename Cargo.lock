@@ -2993,6 +2993,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "serde",
+ "sha2",
 ]
 
 [[package]]

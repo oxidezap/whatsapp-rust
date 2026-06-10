@@ -1,12 +1,11 @@
-// This module contains the auto-generated protobuf definitions.
-// The code is generated from `whatsapp.proto` and checked into version control.
-// To regenerate, run `cargo build -p waproto --features generate`.
-// See `build.rs` for the full proto compilation config.
+// Protobuf definitions, generated at build time into OUT_DIR from the
+// committed `whatsapp.desc` descriptor (see build.rs). Consumers never need
+// `protoc`; editing `whatsapp.proto` requires regenerating the descriptor via
+// `scripts/regenerate-proto-desc.sh` and committing both files.
 
 #![allow(clippy::large_enum_variant)]
 pub mod whatsapp {
-    #[rustfmt::skip]
-    include!("whatsapp.rs");
+    include!(concat!(env!("OUT_DIR"), "/whatsapp.rs"));
 }
 
 /// Wire tags of every message field in `whatsapp.proto`, generated alongside
@@ -14,6 +13,5 @@ pub mod whatsapp {
 /// (or compile-time assert against them) instead of magic numbers, so schema
 /// changes surface as compile errors rather than silent wire-format drift.
 pub mod tags {
-    #[rustfmt::skip]
-    include!("tags.rs");
+    include!(concat!(env!("OUT_DIR"), "/tags.rs"));
 }
