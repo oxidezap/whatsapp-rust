@@ -30,11 +30,12 @@ impl<'a> Polls<'a> {
     /// Caller needs the returned `message_secret` to decrypt votes.
     pub async fn create(
         &self,
-        to: &Jid,
+        to: impl Into<Jid>,
         name: &str,
         options: &[String],
         selectable_count: u32,
     ) -> Result<(SendResult, Vec<u8>)> {
+        let to = &to.into();
         self.create_inner(to, name, options, selectable_count, None)
             .await
     }
@@ -46,11 +47,12 @@ impl<'a> Polls<'a> {
     /// so the count is fixed at 1. Returns the `message_secret` needed to decrypt votes.
     pub async fn create_quiz(
         &self,
-        to: &Jid,
+        to: impl Into<Jid>,
         name: &str,
         options: &[String],
         correct_index: usize,
     ) -> Result<(SendResult, Vec<u8>)> {
+        let to = &to.into();
         self.create_inner(to, name, options, 1, Some(correct_index))
             .await
     }
@@ -92,18 +94,19 @@ impl<'a> Polls<'a> {
             ..Default::default()
         });
 
-        let result = self.client.send_message(to.clone(), message).await?;
+        let result = self.client.send_message(to, message).await?;
         Ok((result, message_secret))
     }
 
     pub async fn vote(
         &self,
-        chat_jid: &Jid,
+        chat_jid: impl Into<Jid>,
         poll_msg_id: &str,
         poll_creator_jid: &Jid,
         message_secret: &[u8],
         option_names: &[String],
     ) -> Result<SendResult> {
+        let chat_jid = &chat_jid.into();
         let my_jid = self
             .client
             .get_pn()
@@ -157,7 +160,7 @@ impl<'a> Polls<'a> {
             ..Default::default()
         };
 
-        self.client.send_message(chat_jid.clone(), message).await
+        self.client.send_message(chat_jid, message).await
     }
 
     /// The voter (self) JID keys the vote's HKDF/AAD, so it must use the poll

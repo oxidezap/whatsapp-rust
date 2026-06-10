@@ -157,7 +157,8 @@ impl<'a> Community<'a> {
     }
 
     /// Deactivate (delete) a community. Subgroups are unlinked but not deleted.
-    pub async fn deactivate(&self, community_jid: &Jid) -> Result<(), anyhow::Error> {
+    pub async fn deactivate(&self, community_jid: impl Into<Jid>) -> Result<(), anyhow::Error> {
+        let community_jid = &community_jid.into();
         self.client
             .execute(DeleteCommunityIq::new(community_jid))
             .await?;
@@ -167,9 +168,10 @@ impl<'a> Community<'a> {
     /// Link existing groups as subgroups of a community.
     pub async fn link_subgroups(
         &self,
-        community_jid: &Jid,
+        community_jid: impl Into<Jid>,
         subgroup_jids: &[Jid],
     ) -> Result<LinkSubgroupsResult, anyhow::Error> {
+        let community_jid = &community_jid.into();
         let response = self
             .client
             .execute(LinkSubgroupsIq::new(community_jid, subgroup_jids))
@@ -195,10 +197,11 @@ impl<'a> Community<'a> {
     /// Unlink subgroups from a community.
     pub async fn unlink_subgroups(
         &self,
-        community_jid: &Jid,
+        community_jid: impl Into<Jid>,
         subgroup_jids: &[Jid],
         remove_orphan_members: bool,
     ) -> Result<UnlinkSubgroupsResult, anyhow::Error> {
+        let community_jid = &community_jid.into();
         let response = self
             .client
             .execute(UnlinkSubgroupsIq::new(
@@ -323,9 +326,11 @@ impl<'a> Community<'a> {
     /// Query a linked subgroup's metadata from the parent community.
     pub async fn query_linked_group(
         &self,
-        community_jid: &Jid,
-        subgroup_jid: &Jid,
+        community_jid: impl Into<Jid>,
+        subgroup_jid: impl Into<Jid>,
     ) -> Result<GroupMetadata, anyhow::Error> {
+        let community_jid = &community_jid.into();
+        let subgroup_jid = &subgroup_jid.into();
         let response = self
             .client
             .execute(QueryLinkedGroupIq::new(community_jid, subgroup_jid))
@@ -336,9 +341,11 @@ impl<'a> Community<'a> {
     /// Join a linked subgroup via the parent community.
     pub async fn join_subgroup(
         &self,
-        community_jid: &Jid,
-        subgroup_jid: &Jid,
+        community_jid: impl Into<Jid>,
+        subgroup_jid: impl Into<Jid>,
     ) -> Result<GroupMetadata, anyhow::Error> {
+        let community_jid = &community_jid.into();
+        let subgroup_jid = &subgroup_jid.into();
         let response = self
             .client
             .execute(JoinLinkedGroupIq::new(community_jid, subgroup_jid))
@@ -349,8 +356,9 @@ impl<'a> Community<'a> {
     /// Get all participants across all linked groups of a community.
     pub async fn get_linked_groups_participants(
         &self,
-        community_jid: &Jid,
+        community_jid: impl Into<Jid>,
     ) -> Result<Vec<GroupParticipant>, anyhow::Error> {
+        let community_jid = &community_jid.into();
         let response = self
             .client
             .execute(GetLinkedGroupsParticipantsIq::new(community_jid))

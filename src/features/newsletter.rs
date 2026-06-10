@@ -371,7 +371,8 @@ impl<'a> Newsletter<'a> {
     /// The server will send `<notification type="newsletter">` stanzas with
     /// `<live_updates>` children, dispatched as `Event::NewsletterLiveUpdate`.
     /// Returns the subscription duration in seconds.
-    pub async fn subscribe_live_updates(&self, jid: &Jid) -> Result<u64, anyhow::Error> {
+    pub async fn subscribe_live_updates(&self, jid: impl Into<Jid>) -> Result<u64, anyhow::Error> {
+        let jid = &jid.into();
         let iq = InfoQuery::set(
             NEWSLETTER_XMLNS,
             jid.clone(),
@@ -472,10 +473,11 @@ impl<'a> Newsletter<'a> {
     /// response to paginate backwards through history.
     pub async fn get_messages(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         count: u32,
         before: Option<u64>,
     ) -> Result<Vec<NewsletterMessage>, anyhow::Error> {
+        let jid = &jid.into();
         let mut messages_node = NodeBuilder::new("messages").attr("count", count);
         if let Some(before_id) = before {
             messages_node = messages_node.attr("before", before_id);

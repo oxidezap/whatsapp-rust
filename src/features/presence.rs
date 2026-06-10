@@ -133,7 +133,8 @@ impl<'a> Presence<'a> {
     ///   <tctoken><!-- raw token bytes --></tctoken>
     /// </presence>
     /// ```
-    pub async fn subscribe(&self, jid: &Jid) -> Result<(), anyhow::Error> {
+    pub async fn subscribe(&self, jid: impl Into<Jid>) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         debug!("presence subscribe: subscribing to {}", jid);
         let node = self.build_subscription_node(jid).await;
         self.client

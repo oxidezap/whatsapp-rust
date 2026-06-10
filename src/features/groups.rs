@@ -391,7 +391,12 @@ impl<'a> Groups<'a> {
         })
     }
 
-    pub async fn set_subject(&self, jid: &Jid, subject: GroupSubject) -> Result<(), anyhow::Error> {
+    pub async fn set_subject(
+        &self,
+        jid: impl Into<Jid>,
+        subject: GroupSubject,
+    ) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(SetGroupSubjectIq::new(jid, subject))
@@ -404,17 +409,19 @@ impl<'a> Groups<'a> {
     /// conflict detection. Pass `None` if unknown.
     pub async fn set_description(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         description: Option<GroupDescription>,
         prev: Option<&str>,
     ) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(SetGroupDescriptionIq::new(jid, description, prev))
             .await?)
     }
 
-    pub async fn leave(&self, jid: &Jid) -> Result<(), anyhow::Error> {
+    pub async fn leave(&self, jid: impl Into<Jid>) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         self.client.execute(LeaveGroupIq::new(jid)).await?;
         self.client.get_group_cache().await.invalidate(jid).await;
         // Drop the persisted blob too: we're no longer in the group, so a stale
@@ -433,9 +440,10 @@ impl<'a> Groups<'a> {
 
     pub async fn add_participants(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         participants: &[Jid],
     ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+        let jid = &jid.into();
         let iq = if self
             .client
             .ab_props()
@@ -471,9 +479,10 @@ impl<'a> Groups<'a> {
 
     pub async fn remove_participants(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         participants: &[Jid],
     ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+        let jid = &jid.into();
         let result = self
             .client
             .execute(RemoveParticipantsIq::new(jid, participants))
@@ -503,9 +512,10 @@ impl<'a> Groups<'a> {
 
     pub async fn promote_participants(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         participants: &[Jid],
     ) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(PromoteParticipantsIq::new(jid, participants))
@@ -514,16 +524,22 @@ impl<'a> Groups<'a> {
 
     pub async fn demote_participants(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         participants: &[Jid],
     ) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(DemoteParticipantsIq::new(jid, participants))
             .await?)
     }
 
-    pub async fn get_invite_link(&self, jid: &Jid, reset: bool) -> Result<String, anyhow::Error> {
+    pub async fn get_invite_link(
+        &self,
+        jid: impl Into<Jid>,
+        reset: bool,
+    ) -> Result<String, anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(GetGroupInviteLinkIq::new(jid, reset))
@@ -531,7 +547,8 @@ impl<'a> Groups<'a> {
     }
 
     /// Lock the group so only admins can change group info.
-    pub async fn set_locked(&self, jid: &Jid, locked: bool) -> Result<(), anyhow::Error> {
+    pub async fn set_locked(&self, jid: impl Into<Jid>, locked: bool) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         let spec = if locked {
             SetGroupLockedIq::lock(jid)
         } else {
@@ -541,7 +558,12 @@ impl<'a> Groups<'a> {
     }
 
     /// Set announcement mode. When enabled, only admins can send messages.
-    pub async fn set_announce(&self, jid: &Jid, announce: bool) -> Result<(), anyhow::Error> {
+    pub async fn set_announce(
+        &self,
+        jid: impl Into<Jid>,
+        announce: bool,
+    ) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         let spec = if announce {
             SetGroupAnnouncementIq::announce(jid)
         } else {
@@ -554,7 +576,12 @@ impl<'a> Groups<'a> {
     ///
     /// Common values: 86400 (24h), 604800 (7d), 7776000 (90d).
     /// Pass 0 to disable.
-    pub async fn set_ephemeral(&self, jid: &Jid, expiration: u32) -> Result<(), anyhow::Error> {
+    pub async fn set_ephemeral(
+        &self,
+        jid: impl Into<Jid>,
+        expiration: u32,
+    ) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         let spec = match std::num::NonZeroU32::new(expiration) {
             Some(exp) => SetGroupEphemeralIq::enable(jid, exp),
             None => SetGroupEphemeralIq::disable(jid),
@@ -565,9 +592,10 @@ impl<'a> Groups<'a> {
     /// Set membership approval mode. When on, new members must be approved by an admin.
     pub async fn set_membership_approval(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         mode: MembershipApprovalMode,
     ) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(SetGroupMembershipApprovalIq::new(jid, mode))
@@ -587,11 +615,13 @@ impl<'a> Groups<'a> {
     /// Accept a V4 invite (received as a GroupInviteMessage, not a link).
     pub async fn join_with_invite_v4(
         &self,
-        group_jid: &Jid,
+        group_jid: impl Into<Jid>,
         code: &str,
         expiration: i64,
-        admin_jid: &Jid,
+        admin_jid: impl Into<Jid>,
     ) -> Result<JoinGroupResult, anyhow::Error> {
+        let group_jid = &group_jid.into();
+        let admin_jid = &admin_jid.into();
         if expiration > 0 {
             let now = wacore::time::now_millis() / 1000;
             if expiration < now {
@@ -620,8 +650,9 @@ impl<'a> Groups<'a> {
     /// Get pending membership approval requests.
     pub async fn get_membership_requests(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
     ) -> Result<Vec<MembershipRequest>, anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(GetMembershipRequestsIq::new(jid))
@@ -631,9 +662,10 @@ impl<'a> Groups<'a> {
     /// Approve pending membership requests.
     pub async fn approve_membership_requests(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         participants: &[Jid],
     ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(MembershipRequestActionIq::approve(jid, participants))
@@ -643,9 +675,10 @@ impl<'a> Groups<'a> {
     /// Reject pending membership requests.
     pub async fn reject_membership_requests(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         participants: &[Jid],
     ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(MembershipRequestActionIq::reject(jid, participants))
@@ -655,9 +688,10 @@ impl<'a> Groups<'a> {
     /// Set who can add members to the group.
     pub async fn set_member_add_mode(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         mode: MemberAddMode,
     ) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(SetMemberAddModeIq::new(jid, mode))
@@ -667,9 +701,10 @@ impl<'a> Groups<'a> {
     /// Restrict or allow frequently-forwarded messages in the group.
     pub async fn set_no_frequently_forwarded(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         restrict: bool,
     ) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(SetNoFrequentlyForwardedIq::new(jid, restrict))
@@ -679,9 +714,10 @@ impl<'a> Groups<'a> {
     /// Enable or disable admin reports in the group.
     pub async fn set_allow_admin_reports(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         allow: bool,
     ) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(SetAllowAdminReportsIq::new(jid, allow))
@@ -689,7 +725,12 @@ impl<'a> Groups<'a> {
     }
 
     /// Enable or disable group history sharing.
-    pub async fn set_group_history(&self, jid: &Jid, enabled: bool) -> Result<(), anyhow::Error> {
+    pub async fn set_group_history(
+        &self,
+        jid: impl Into<Jid>,
+        enabled: bool,
+    ) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(SetGroupHistoryIq::new(jid, enabled))
@@ -739,9 +780,10 @@ impl<'a> Groups<'a> {
     /// Cancel pending membership requests (from the requesting user's side).
     pub async fn cancel_membership_requests(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         participants: &[Jid],
     ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(CancelMembershipRequestsIq::new(jid, participants))
@@ -751,9 +793,10 @@ impl<'a> Groups<'a> {
     /// Revoke invitation codes from specific participants (admin operation).
     pub async fn revoke_request_code(
         &self,
-        jid: &Jid,
+        jid: impl Into<Jid>,
         participants: &[Jid],
     ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+        let jid = &jid.into();
         Ok(self
             .client
             .execute(RevokeRequestCodeIq::new(jid, participants))
@@ -761,7 +804,8 @@ impl<'a> Groups<'a> {
     }
 
     /// Acknowledge a group notification.
-    pub async fn acknowledge(&self, jid: &Jid) -> Result<(), anyhow::Error> {
+    pub async fn acknowledge(&self, jid: impl Into<Jid>) -> Result<(), anyhow::Error> {
+        let jid = &jid.into();
         Ok(self.client.execute(AcknowledgeGroupIq::new(jid)).await?)
     }
 
@@ -826,9 +870,10 @@ impl<'a> Groups<'a> {
     /// ```
     pub async fn set_profile_picture(
         &self,
-        group_jid: &Jid,
+        group_jid: impl Into<Jid>,
         image_data: Vec<u8>,
     ) -> Result<SetProfilePictureResponse, anyhow::Error> {
+        let group_jid = &group_jid.into();
         Ok(self
             .client
             .execute(SetProfilePictureSpec::for_group(group_jid, image_data))
@@ -838,8 +883,9 @@ impl<'a> Groups<'a> {
     /// Remove a group's profile picture (admin operation).
     pub async fn remove_profile_picture(
         &self,
-        group_jid: &Jid,
+        group_jid: impl Into<Jid>,
     ) -> Result<SetProfilePictureResponse, anyhow::Error> {
+        let group_jid = &group_jid.into();
         Ok(self
             .client
             .execute(SetProfilePictureSpec::remove_group(group_jid))
@@ -885,9 +931,10 @@ impl<'a> Groups<'a> {
     /// not as an IQ.
     pub async fn update_member_label(
         &self,
-        group_jid: &Jid,
+        group_jid: impl Into<Jid>,
         label: impl Into<String>,
     ) -> Result<(), anyhow::Error> {
+        let group_jid = &group_jid.into();
         if !group_jid.is_group() {
             return Err(anyhow::anyhow!(
                 "update_member_label requires a group JID, got {group_jid}"

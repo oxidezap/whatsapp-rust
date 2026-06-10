@@ -34,10 +34,11 @@ impl Client {
     /// author is read from `target_key.participant` by the send path.
     pub async fn send_reaction(
         &self,
-        chat: &Jid,
+        chat: impl Into<Jid>,
         target_key: wa::MessageKey,
         emoji: &str,
     ) -> Result<SendResult, anyhow::Error> {
+        let chat = &chat.into();
         if chat.is_group() && self.is_community_announce_group(chat).await? {
             return self.send_enc_reaction(chat, target_key, emoji).await;
         }
@@ -46,7 +47,7 @@ impl Client {
             emoji,
             wacore::time::now_millis(),
         );
-        self.send_message(chat.clone(), reaction).await
+        self.send_message(chat, reaction).await
     }
 
     /// Whether `chat` is a Community Announcement Group (WA Web `isCag`).
@@ -109,6 +110,6 @@ impl Client {
             }),
             ..Default::default()
         };
-        self.send_message(chat.clone(), message).await
+        self.send_message(chat, message).await
     }
 }

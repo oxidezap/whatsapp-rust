@@ -963,6 +963,15 @@ impl From<Jid> for String {
     }
 }
 
+/// Lets `impl Into<Jid>` APIs accept `&Jid` transparently: borrow-callers pay
+/// one cheap clone (the user part is inline for typical numeric ids), owned
+/// callers move for free.
+impl From<&Jid> for Jid {
+    fn from(jid: &Jid) -> Self {
+        jid.clone()
+    }
+}
+
 impl<'a> From<JidRef<'a>> for String {
     fn from(jid: JidRef<'a>) -> Self {
         jid.to_string()

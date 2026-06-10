@@ -35,10 +35,11 @@ impl<'a> Comments<'a> {
     /// received).
     pub async fn send_text(
         &self,
-        chat: &Jid,
+        chat: impl Into<Jid>,
         parent_key: wa::MessageKey,
         text: &str,
     ) -> Result<SendResult> {
+        let chat = &chat.into();
         // WA Web encryptExtendedTextComment: the body is an extendedTextMessage.
         let body = wa::Message {
             extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
@@ -53,10 +54,11 @@ impl<'a> Comments<'a> {
     /// Comment on a channel post with an arbitrary body `Message`.
     pub async fn send_message(
         &self,
-        chat: &Jid,
+        chat: impl Into<Jid>,
         mut parent_key: wa::MessageKey,
         body: wa::Message,
     ) -> Result<SendResult> {
+        let chat = &chat.into();
         let client = self.client;
         let (author, secret) = client
             .resolve_outgoing_addon_parent(chat, &parent_key)
@@ -107,7 +109,7 @@ impl<'a> Comments<'a> {
             }),
             ..Default::default()
         };
-        let result = client.send_message(chat.clone(), message).await?;
+        let result = client.send_message(chat, message).await?;
 
         // The send path only persists reporting-token secrets, so store the
         // comment's own secret here or we could never decrypt add-ons
