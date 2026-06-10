@@ -4736,7 +4736,34 @@ mod jid_into_convention {
         let _ = client
             .send_reaction(&jid, wa::MessageKey::default(), "x")
             .await;
-        // Owned style: moves, no clone.
-        let _ = client.send_message(jid, msg).await;
+        // Owned style: moves, no clone. Each method consumes its own copy so
+        // the whole core surface is pinned, not just send_message.
+        let _ = client.send_message(jid.clone(), msg.clone()).await;
+        let _ = client
+            .send_message_with_options(jid.clone(), msg.clone(), SendOptions::default())
+            .await;
+        let _ = client.forward_message(jid.clone(), &msg).await;
+        let _ = client
+            .edit_message(jid.clone(), "ID", wa::Message::default())
+            .await;
+        let _ = client
+            .revoke_message(jid.clone(), "ID", RevokeType::Sender)
+            .await;
+        let _ = client
+            .pin_message(
+                jid.clone(),
+                wa::MessageKey::default(),
+                PinDuration::default(),
+            )
+            .await;
+        let _ = client
+            .unpin_message(jid.clone(), wa::MessageKey::default())
+            .await;
+        let _ = client
+            .send_reaction(jid.clone(), wa::MessageKey::default(), "x")
+            .await;
+        let _ = client
+            .keep_message(jid, wa::MessageKey::default(), true)
+            .await;
     }
 }
