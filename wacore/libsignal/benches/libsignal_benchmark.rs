@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use iai_callgrind::{
-    Callgrind, FlamegraphConfig, LibraryBenchmarkConfig, library_benchmark,
-    library_benchmark_group, main,
-};
-use std::hint::black_box;
+use divan::black_box;
+
+fn main() {
+    divan::main();
+}
 use wacore_libsignal::protocol::{
     ChainKey, CiphertextMessage, Direction, GenericSignedPreKey, IdentityChange, IdentityKey,
     IdentityKeyPair, IdentityKeyStore, KeyPair, MessageKeyGenerator, PreKeyBundle, PreKeyId,
@@ -429,135 +429,151 @@ fn setup_group_with_distribution() -> (User, User, SenderKeyName) {
     (alice, bob, sender_key_name)
 }
 
-#[library_benchmark]
-#[bench::setup(setup = setup_dm_users)]
-fn bench_dm_session_establishment(data: (User, User)) {
-    let (mut alice, bob) = data;
-    let bob_bundle = bob.get_prekey_bundle();
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+#[divan::bench]
+fn bench_dm_session_establishment(bencher: divan::Bencher) {
+    bencher.with_inputs(setup_dm_users).bench_values(|data| {
+        let (mut alice, bob) = data;
+        let bob_bundle = bob.get_prekey_bundle();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-    futures::executor::block_on(async {
-        process_prekey_bundle(
-            &bob.address,
-            &mut alice.session_store,
-            &mut alice.identity_store,
-            &bob_bundle,
-            &mut rng,
-            UsePQRatchet::No,
-        )
-        .await
-        .expect("session");
+        futures::executor::block_on(async {
+            process_prekey_bundle(
+                &bob.address,
+                &mut alice.session_store,
+                &mut alice.identity_store,
+                &bob_bundle,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("session");
+        });
+
+        black_box(alice);
     });
-
-    black_box(alice);
 }
 
-#[library_benchmark]
-#[bench::first_msg(setup = setup_dm_session)]
-fn bench_dm_encrypt_first_message(data: (User, User)) {
-    let (mut alice, bob) = data;
-    let plaintext = b"Hello Bob! This is the first message.";
+#[divan::bench]
+fn bench_dm_encrypt_first_message(bencher: divan::Bencher) {
+    bencher.with_inputs(setup_dm_session).bench_values(|data| {
+        let (mut alice, bob) = data;
+        let plaintext = b"Hello Bob! This is the first message.";
 
-    let ciphertext = futures::executor::block_on(async {
-        message_encrypt(
-            plaintext,
-            &bob.address,
-            &mut alice.session_store,
-            &mut alice.identity_store,
-        )
-        .await
-        .expect("encryption")
+        let ciphertext = futures::executor::block_on(async {
+            message_encrypt(
+                plaintext,
+                &bob.address,
+                &mut alice.session_store,
+                &mut alice.identity_store,
+            )
+            .await
+            .expect("encryption")
+        });
+
+        black_box(ciphertext);
     });
-
-    black_box(ciphertext);
 }
 
-#[library_benchmark]
-#[bench::decrypt_prekey(setup = setup_dm_with_first_message)]
-fn bench_dm_decrypt_first_message(data: (User, User, Vec<u8>)) {
-    let (alice, mut bob, ciphertext_bytes) = data;
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+#[divan::bench]
+fn bench_dm_decrypt_first_message(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_dm_with_first_message)
+        .bench_values(|data| {
+            let (alice, mut bob, ciphertext_bytes) = data;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-    let plaintext = futures::executor::block_on(async {
-        let ciphertext = CiphertextMessage::PreKeySignalMessage(
-            wacore_libsignal::protocol::PreKeySignalMessage::try_from(ciphertext_bytes.as_slice())
-                .unwrap(),
-        );
-        message_decrypt(
-            &ciphertext,
-            &alice.address,
-            &mut bob.session_store,
-            &mut bob.identity_store,
-            &mut bob.prekey_store,
-            &bob.signed_prekey_store,
-            &mut rng,
-            UsePQRatchet::No,
-        )
-        .await
-        .expect("decryption")
-    });
+            let plaintext = futures::executor::block_on(async {
+                let ciphertext = CiphertextMessage::PreKeySignalMessage(
+                    wacore_libsignal::protocol::PreKeySignalMessage::try_from(
+                        ciphertext_bytes.as_slice(),
+                    )
+                    .unwrap(),
+                );
+                message_decrypt(
+                    &ciphertext,
+                    &alice.address,
+                    &mut bob.session_store,
+                    &mut bob.identity_store,
+                    &mut bob.prekey_store,
+                    &bob.signed_prekey_store,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("decryption")
+            });
 
-    black_box(plaintext);
+            black_box(plaintext);
+        });
 }
 
-#[library_benchmark]
-#[bench::subsequent(setup = setup_established_dm_session)]
-fn bench_dm_encrypt_subsequent_message(data: (User, User)) {
-    let (mut alice, bob) = data;
-    let plaintext = b"This is a follow-up message after session is established.";
+#[divan::bench]
+fn bench_dm_encrypt_subsequent_message(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_established_dm_session)
+        .bench_values(|data| {
+            let (mut alice, bob) = data;
+            let plaintext = b"This is a follow-up message after session is established.";
 
-    let ciphertext = futures::executor::block_on(async {
-        message_encrypt(
-            plaintext,
-            &bob.address,
-            &mut alice.session_store,
-            &mut alice.identity_store,
-        )
-        .await
-        .expect("encryption")
-    });
+            let ciphertext = futures::executor::block_on(async {
+                message_encrypt(
+                    plaintext,
+                    &bob.address,
+                    &mut alice.session_store,
+                    &mut alice.identity_store,
+                )
+                .await
+                .expect("encryption")
+            });
 
-    black_box(ciphertext);
+            black_box(ciphertext);
+        });
 }
 
-#[library_benchmark]
-#[bench::create(setup = setup_group_sender)]
-fn bench_group_create_distribution_message(data: (User, SenderKeyName)) {
-    let (mut alice, sender_key_name) = data;
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+#[divan::bench]
+fn bench_group_create_distribution_message(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_sender)
+        .bench_values(|data| {
+            let (mut alice, sender_key_name) = data;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-    let skdm = futures::executor::block_on(async {
-        create_sender_key_distribution_message(
-            &sender_key_name,
-            &mut alice.sender_key_store,
-            &mut rng,
-        )
-        .await
-        .expect("skdm")
-    });
+            let skdm = futures::executor::block_on(async {
+                create_sender_key_distribution_message(
+                    &sender_key_name,
+                    &mut alice.sender_key_store,
+                    &mut rng,
+                )
+                .await
+                .expect("skdm")
+            });
 
-    black_box(skdm);
+            black_box(skdm);
+        });
 }
 
-#[library_benchmark]
-#[bench::encrypt(setup = setup_group_with_distribution)]
-fn bench_group_encrypt_message(data: (User, User, SenderKeyName)) {
-    let (mut alice, _bob, sender_key_name) = data;
-    let plaintext = b"Hello group! This is a group message from Alice.";
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+#[divan::bench]
+fn bench_group_encrypt_message(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_with_distribution)
+        .bench_values(|data| {
+            let (mut alice, _bob, sender_key_name) = data;
+            let plaintext = b"Hello group! This is a group message from Alice.";
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-    let ciphertext = futures::executor::block_on(async {
-        group_encrypt(
-            &mut alice.sender_key_store,
-            &sender_key_name,
-            plaintext,
-            &mut rng,
-        )
-        .await
-        .expect("group encrypt")
-    });
+            let ciphertext = futures::executor::block_on(async {
+                group_encrypt(
+                    &mut alice.sender_key_store,
+                    &sender_key_name,
+                    plaintext,
+                    &mut rng,
+                )
+                .await
+                .expect("group encrypt")
+            });
 
-    black_box(ciphertext);
+            black_box(ciphertext);
+        });
 }
 
 fn setup_group_with_encrypted_message() -> (User, User, SenderKeyName, Vec<u8>) {
@@ -579,125 +595,132 @@ fn setup_group_with_encrypted_message() -> (User, User, SenderKeyName, Vec<u8>) 
     (alice, bob, sender_key_name, ciphertext)
 }
 
-#[library_benchmark]
-#[bench::decrypt(setup = setup_group_with_encrypted_message)]
-fn bench_group_decrypt_message(data: (User, User, SenderKeyName, Vec<u8>)) {
-    let (alice, mut bob, sender_key_name, ciphertext) = data;
+#[divan::bench]
+fn bench_group_decrypt_message(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_with_encrypted_message)
+        .bench_values(|data| {
+            let (alice, mut bob, sender_key_name, ciphertext) = data;
 
-    let bob_sender_key_name = SenderKeyName::new(
-        sender_key_name.group_id().to_string(),
-        alice.address.name().to_string(),
-    );
+            let bob_sender_key_name = SenderKeyName::new(
+                sender_key_name.group_id().to_string(),
+                alice.address.name().to_string(),
+            );
 
-    let plaintext = futures::executor::block_on(async {
-        group_decrypt(&ciphertext, &mut bob.sender_key_store, &bob_sender_key_name)
-            .await
-            .expect("group decrypt")
-    });
+            let plaintext = futures::executor::block_on(async {
+                group_decrypt(&ciphertext, &mut bob.sender_key_store, &bob_sender_key_name)
+                    .await
+                    .expect("group decrypt")
+            });
 
-    black_box(plaintext);
+            black_box(plaintext);
+        });
 }
 
 fn setup_conversation_data() -> (User, User) {
     setup_dm_users()
 }
 
-#[library_benchmark]
-#[bench::full(setup = setup_conversation_data)]
-fn bench_full_dm_conversation(data: (User, User)) {
-    let (mut alice, mut bob) = data;
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+#[divan::bench]
+fn bench_full_dm_conversation(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_conversation_data)
+        .bench_values(|data| {
+            let (mut alice, mut bob) = data;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-    futures::executor::block_on(async {
-        let bob_bundle = bob.get_prekey_bundle();
-        process_prekey_bundle(
-            &bob.address,
-            &mut alice.session_store,
-            &mut alice.identity_store,
-            &bob_bundle,
-            &mut rng,
-            UsePQRatchet::No,
-        )
-        .await
-        .expect("session");
+            futures::executor::block_on(async {
+                let bob_bundle = bob.get_prekey_bundle();
+                process_prekey_bundle(
+                    &bob.address,
+                    &mut alice.session_store,
+                    &mut alice.identity_store,
+                    &bob_bundle,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("session");
 
-        let msg1 = message_encrypt(
-            b"Hello Bob!",
-            &bob.address,
-            &mut alice.session_store,
-            &mut alice.identity_store,
-        )
-        .await
-        .expect("encrypt1");
+                let msg1 = message_encrypt(
+                    b"Hello Bob!",
+                    &bob.address,
+                    &mut alice.session_store,
+                    &mut alice.identity_store,
+                )
+                .await
+                .expect("encrypt1");
 
-        let ct1 = CiphertextMessage::PreKeySignalMessage(
-            wacore_libsignal::protocol::PreKeySignalMessage::try_from(msg1.serialize()).unwrap(),
-        );
-        let _ = message_decrypt(
-            &ct1,
-            &alice.address,
-            &mut bob.session_store,
-            &mut bob.identity_store,
-            &mut bob.prekey_store,
-            &bob.signed_prekey_store,
-            &mut rng,
-            UsePQRatchet::No,
-        )
-        .await
-        .expect("decrypt1");
+                let ct1 = CiphertextMessage::PreKeySignalMessage(
+                    wacore_libsignal::protocol::PreKeySignalMessage::try_from(msg1.serialize())
+                        .unwrap(),
+                );
+                let _ = message_decrypt(
+                    &ct1,
+                    &alice.address,
+                    &mut bob.session_store,
+                    &mut bob.identity_store,
+                    &mut bob.prekey_store,
+                    &bob.signed_prekey_store,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("decrypt1");
 
-        let msg2 = message_encrypt(
-            b"Hi Alice!",
-            &alice.address,
-            &mut bob.session_store,
-            &mut bob.identity_store,
-        )
-        .await
-        .expect("encrypt2");
+                let msg2 = message_encrypt(
+                    b"Hi Alice!",
+                    &alice.address,
+                    &mut bob.session_store,
+                    &mut bob.identity_store,
+                )
+                .await
+                .expect("encrypt2");
 
-        let ct2 = CiphertextMessage::SignalMessage(
-            wacore_libsignal::protocol::SignalMessage::try_from(msg2.serialize()).unwrap(),
-        );
-        let _ = message_decrypt(
-            &ct2,
-            &bob.address,
-            &mut alice.session_store,
-            &mut alice.identity_store,
-            &mut alice.prekey_store,
-            &alice.signed_prekey_store,
-            &mut rng,
-            UsePQRatchet::No,
-        )
-        .await
-        .expect("decrypt2");
+                let ct2 = CiphertextMessage::SignalMessage(
+                    wacore_libsignal::protocol::SignalMessage::try_from(msg2.serialize()).unwrap(),
+                );
+                let _ = message_decrypt(
+                    &ct2,
+                    &bob.address,
+                    &mut alice.session_store,
+                    &mut alice.identity_store,
+                    &mut alice.prekey_store,
+                    &alice.signed_prekey_store,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("decrypt2");
 
-        let msg3 = message_encrypt(
-            b"How are you?",
-            &bob.address,
-            &mut alice.session_store,
-            &mut alice.identity_store,
-        )
-        .await
-        .expect("encrypt3");
+                let msg3 = message_encrypt(
+                    b"How are you?",
+                    &bob.address,
+                    &mut alice.session_store,
+                    &mut alice.identity_store,
+                )
+                .await
+                .expect("encrypt3");
 
-        let ct3 = CiphertextMessage::SignalMessage(
-            wacore_libsignal::protocol::SignalMessage::try_from(msg3.serialize()).unwrap(),
-        );
-        let _ = message_decrypt(
-            &ct3,
-            &alice.address,
-            &mut bob.session_store,
-            &mut bob.identity_store,
-            &mut bob.prekey_store,
-            &bob.signed_prekey_store,
-            &mut rng,
-            UsePQRatchet::No,
-        )
-        .await
-        .expect("decrypt3");
-    });
+                let ct3 = CiphertextMessage::SignalMessage(
+                    wacore_libsignal::protocol::SignalMessage::try_from(msg3.serialize()).unwrap(),
+                );
+                let _ = message_decrypt(
+                    &ct3,
+                    &alice.address,
+                    &mut bob.session_store,
+                    &mut bob.identity_store,
+                    &mut bob.prekey_store,
+                    &bob.signed_prekey_store,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("decrypt3");
+            });
 
-    black_box((alice, bob));
+            black_box((alice, bob));
+        });
 }
 
 // Signature-specific benchmarks to measure the XEdDSA optimization
@@ -710,41 +733,46 @@ fn setup_keypair_with_message() -> (KeyPair, [u8; 64]) {
 
 // Benchmark raw signature creation (the main target of the caching optimization).
 // This measures signing with a pre-created key, which is the common case in real usage.
-#[library_benchmark]
-#[bench::sign(setup = setup_keypair_with_message)]
-fn bench_signature_creation(data: (KeyPair, [u8; 64])) {
-    let (keypair, message) = data;
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+#[divan::bench]
+fn bench_signature_creation(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_keypair_with_message)
+        .bench_values(|data| {
+            let (keypair, message) = data;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-    // Sign multiple times to amortize any setup overhead
-    for _ in 0..10 {
-        let signature = keypair
-            .calculate_signature(&message, &mut rng)
-            .expect("signature");
-        black_box(signature);
-    }
+            // Sign multiple times to amortize any setup overhead
+            for _ in 0..10 {
+                let signature = keypair
+                    .calculate_signature(&message, &mut rng)
+                    .expect("signature");
+                black_box(signature);
+            }
+        });
 }
 
 // Benchmark signature verification
-#[library_benchmark]
-#[bench::verify(setup = setup_keypair_with_message)]
-fn bench_signature_verification(data: (KeyPair, [u8; 64])) {
-    let (keypair, message) = data;
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-    let signature = keypair
-        .calculate_signature(&message, &mut rng)
-        .expect("signature");
+#[divan::bench]
+fn bench_signature_verification(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_keypair_with_message)
+        .bench_values(|data| {
+            let (keypair, message) = data;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let signature = keypair
+                .calculate_signature(&message, &mut rng)
+                .expect("signature");
 
-    // Verify multiple times
-    for _ in 0..10 {
-        let valid = keypair.public_key.verify_signature(&message, &signature);
-        black_box(valid);
-    }
+            // Verify multiple times
+            for _ in 0..10 {
+                let valid = keypair.public_key.verify_signature(&message, &signature);
+                black_box(valid);
+            }
+        });
 }
 
 // Benchmark key generation (shows the added cost of caching)
-#[library_benchmark]
-#[bench::keygen()]
+#[divan::bench]
 fn bench_key_generation() {
     let mut rng = rand::make_rng::<rand::rngs::StdRng>();
     for _ in 0..10 {
@@ -879,36 +907,39 @@ fn setup_with_archived_sessions() -> (User, User, Vec<Vec<u8>>) {
 
 // Benchmark decryption that requires searching through previous sessions.
 // This tests the take/restore optimization for previous session iteration.
-#[library_benchmark]
-#[bench::previous_session(setup = setup_with_archived_sessions)]
-fn bench_decrypt_with_previous_session(data: (User, User, Vec<Vec<u8>>)) {
-    let (alice, mut bob, ciphertexts) = data;
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+#[divan::bench]
+fn bench_decrypt_with_previous_session(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_with_archived_sessions)
+        .bench_values(|data| {
+            let (alice, mut bob, ciphertexts) = data;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-    // Try to decrypt an old message (encrypted with a previous session)
-    // This forces the decryption to iterate through previous sessions
-    futures::executor::block_on(async {
-        for ciphertext in ciphertexts.iter().take(5) {
-            // Try to parse as SignalMessage (non-PreKey)
-            if let Ok(signal_msg) =
-                wacore_libsignal::protocol::SignalMessage::try_from(ciphertext.as_slice())
-            {
-                let ct = CiphertextMessage::SignalMessage(signal_msg);
-                let result = message_decrypt(
-                    &ct,
-                    &alice.address,
-                    &mut bob.session_store,
-                    &mut bob.identity_store,
-                    &mut bob.prekey_store,
-                    &bob.signed_prekey_store,
-                    &mut rng,
-                    UsePQRatchet::No,
-                )
-                .await;
-                let _ = black_box(result);
-            }
-        }
-    });
+            // Try to decrypt an old message (encrypted with a previous session)
+            // This forces the decryption to iterate through previous sessions
+            futures::executor::block_on(async {
+                for ciphertext in ciphertexts.iter().take(5) {
+                    // Try to parse as SignalMessage (non-PreKey)
+                    if let Ok(signal_msg) =
+                        wacore_libsignal::protocol::SignalMessage::try_from(ciphertext.as_slice())
+                    {
+                        let ct = CiphertextMessage::SignalMessage(signal_msg);
+                        let result = message_decrypt(
+                            &ct,
+                            &alice.address,
+                            &mut bob.session_store,
+                            &mut bob.identity_store,
+                            &mut bob.prekey_store,
+                            &bob.signed_prekey_store,
+                            &mut rng,
+                            UsePQRatchet::No,
+                        )
+                        .await;
+                        let _ = black_box(result);
+                    }
+                }
+            });
+        });
 }
 
 // Setup for out-of-order message benchmark.
@@ -992,34 +1023,37 @@ fn setup_out_of_order_messages() -> (User, User, Vec<Vec<u8>>) {
 // Benchmark out-of-order message decryption.
 // This tests the set_message_keys optimization (push vs insert(0)).
 // Messages are decrypted in reverse order, causing maximum message key storage.
-#[library_benchmark]
-#[bench::out_of_order(setup = setup_out_of_order_messages)]
-fn bench_out_of_order_decryption(data: (User, User, Vec<Vec<u8>>)) {
-    let (alice, mut bob, messages) = data;
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+#[divan::bench]
+fn bench_out_of_order_decryption(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_out_of_order_messages)
+        .bench_values(|data| {
+            let (alice, mut bob, messages) = data;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-    futures::executor::block_on(async {
-        // Decrypt messages in reverse order (worst case for message key storage)
-        for ciphertext in messages.iter().rev() {
-            let signal_msg =
-                wacore_libsignal::protocol::SignalMessage::try_from(ciphertext.as_slice())
-                    .expect("parse");
-            let ct = CiphertextMessage::SignalMessage(signal_msg);
-            let result = message_decrypt(
-                &ct,
-                &alice.address,
-                &mut bob.session_store,
-                &mut bob.identity_store,
-                &mut bob.prekey_store,
-                &bob.signed_prekey_store,
-                &mut rng,
-                UsePQRatchet::No,
-            )
-            .await
-            .expect("decrypt");
-            black_box(result);
-        }
-    });
+            futures::executor::block_on(async {
+                // Decrypt messages in reverse order (worst case for message key storage)
+                for ciphertext in messages.iter().rev() {
+                    let signal_msg =
+                        wacore_libsignal::protocol::SignalMessage::try_from(ciphertext.as_slice())
+                            .expect("parse");
+                    let ct = CiphertextMessage::SignalMessage(signal_msg);
+                    let result = message_decrypt(
+                        &ct,
+                        &alice.address,
+                        &mut bob.session_store,
+                        &mut bob.identity_store,
+                        &mut bob.prekey_store,
+                        &bob.signed_prekey_store,
+                        &mut rng,
+                        UsePQRatchet::No,
+                    )
+                    .await
+                    .expect("decrypt");
+                    black_box(result);
+                }
+            });
+        });
 }
 
 /// Setup for promote_matching_session benchmark.
@@ -1140,35 +1174,38 @@ fn setup_promote_matching_session() -> (User, User, Vec<u8>) {
 
 // Benchmark promote_matching_session during PreKey processing.
 // This tests the find_matching_previous_session_index optimization.
-#[library_benchmark]
-#[bench::promote(setup = setup_promote_matching_session)]
-fn bench_promote_matching_session(data: (User, User, Vec<u8>)) {
-    let (alice, mut bob, prekey_message) = data;
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+#[divan::bench]
+fn bench_promote_matching_session(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_promote_matching_session)
+        .bench_values(|data| {
+            let (alice, mut bob, prekey_message) = data;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-    futures::executor::block_on(async {
-        // Process multiple PreKey messages to exercise promote_matching_session
-        for _ in 0..5 {
-            let ct = CiphertextMessage::PreKeySignalMessage(
-                wacore_libsignal::protocol::PreKeySignalMessage::try_from(
-                    prekey_message.as_slice(),
-                )
-                .unwrap(),
-            );
-            let result = message_decrypt(
-                &ct,
-                &alice.address,
-                &mut bob.session_store,
-                &mut bob.identity_store,
-                &mut bob.prekey_store,
-                &bob.signed_prekey_store,
-                &mut rng,
-                UsePQRatchet::No,
-            )
-            .await;
-            let _ = black_box(result);
-        }
-    });
+            futures::executor::block_on(async {
+                // Process multiple PreKey messages to exercise promote_matching_session
+                for _ in 0..5 {
+                    let ct = CiphertextMessage::PreKeySignalMessage(
+                        wacore_libsignal::protocol::PreKeySignalMessage::try_from(
+                            prekey_message.as_slice(),
+                        )
+                        .unwrap(),
+                    );
+                    let result = message_decrypt(
+                        &ct,
+                        &alice.address,
+                        &mut bob.session_store,
+                        &mut bob.identity_store,
+                        &mut bob.prekey_store,
+                        &bob.signed_prekey_store,
+                        &mut rng,
+                        UsePQRatchet::No,
+                    )
+                    .await;
+                    let _ = black_box(result);
+                }
+            });
+        });
 }
 
 /// Helper function to create a test message key generator.
@@ -1228,69 +1265,22 @@ fn setup_message_key_eviction() -> (SessionState, wacore_libsignal::protocol::Pu
 // Benchmark message key insertion with amortized eviction.
 // This tests the set_message_keys optimization with PRUNE_THRESHOLD.
 // We insert 200 keys beyond MAX_MESSAGE_KEYS to measure multiple eviction cycles.
-#[library_benchmark]
-#[bench::eviction(setup = setup_message_key_eviction)]
-fn bench_message_key_eviction(data: (SessionState, wacore_libsignal::protocol::PublicKey)) {
-    let (mut state, sender_key) = data;
-    let start_counter = (consts::MAX_MESSAGE_KEYS - 1) as u32;
+#[divan::bench]
+fn bench_message_key_eviction(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_message_key_eviction)
+        .bench_values(|data| {
+            let (mut state, sender_key) = data;
+            let start_counter = (consts::MAX_MESSAGE_KEYS - 1) as u32;
 
-    // Insert 200 keys beyond capacity - this will trigger eviction cycles
-    // With PRUNE_THRESHOLD=50, we expect ~4 eviction events
-    for i in 0..200u32 {
-        let counter = start_counter + i;
-        let keys = create_test_message_key_generator(counter);
-        state.set_message_keys(&sender_key, keys).unwrap();
-    }
+            // Insert 200 keys beyond capacity - this will trigger eviction cycles
+            // With PRUNE_THRESHOLD=50, we expect ~4 eviction events
+            for i in 0..200u32 {
+                let counter = start_counter + i;
+                let keys = create_test_message_key_generator(counter);
+                state.set_message_keys(&sender_key, keys).unwrap();
+            }
 
-    black_box(state);
+            black_box(state);
+        });
 }
-
-library_benchmark_group!(
-    name = dm_group;
-    benchmarks =
-        bench_dm_session_establishment,
-        bench_dm_encrypt_first_message,
-        bench_dm_decrypt_first_message,
-        bench_dm_encrypt_subsequent_message
-);
-
-library_benchmark_group!(
-    name = group_messaging_group;
-    benchmarks =
-        bench_group_create_distribution_message,
-        bench_group_encrypt_message,
-        bench_group_decrypt_message
-);
-
-library_benchmark_group!(
-    name = conversation_group;
-    benchmarks = bench_full_dm_conversation
-);
-
-library_benchmark_group!(
-    name = signature_group;
-    benchmarks =
-        bench_signature_creation,
-        bench_signature_verification,
-        bench_key_generation
-);
-
-library_benchmark_group!(
-    name = session_optimization_group;
-    benchmarks =
-        bench_decrypt_with_previous_session,
-        bench_out_of_order_decryption,
-        bench_promote_matching_session,
-        bench_message_key_eviction
-);
-
-main!(
-    config = LibraryBenchmarkConfig::default()
-        .tool(Callgrind::default().flamegraph(FlamegraphConfig::default()));
-    library_benchmark_groups =
-        dm_group,
-        group_messaging_group,
-        conversation_group,
-        signature_group,
-        session_optimization_group
-);

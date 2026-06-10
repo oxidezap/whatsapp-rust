@@ -1,10 +1,6 @@
 //! Full send/receive pipeline benchmarks using real `prepare_*_stanza` functions.
 
 use async_trait::async_trait;
-use iai_callgrind::{
-    Callgrind, FlamegraphConfig, LibraryBenchmarkConfig, library_benchmark,
-    library_benchmark_group, main,
-};
 use prost::Message as ProtoMessage;
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -31,6 +27,10 @@ use wacore_libsignal::store::sender_key_name::SenderKeyName;
 use waproto::whatsapp as wa;
 
 type SigResult<T> = wacore_libsignal::protocol::error::Result<T>;
+
+fn main() {
+    divan::main();
+}
 
 // ---------------------------------------------------------------------------
 // In-memory Signal stores
@@ -549,7 +549,8 @@ struct GrpSendData {
     resolver: MockResolver,
     msg: wa::Message,
     // Built once in setup so the measured body excludes thread-pool startup
-    // (iai-callgrind would otherwise charge the syscalls to the encrypt path).
+    // (building the pool inside the bench body would charge its syscalls to
+    // the encrypt path).
     runtime: BenchRuntime,
 }
 
@@ -689,32 +690,34 @@ fn setup_group_recv() -> GrpRecvData {
 // Benchmarks
 // ===========================================================================
 
-#[library_benchmark]
-#[bench::text(setup = setup_dm_send)]
-fn bench_dm_send(mut d: DmSendData) {
-    let signal_addr = d.bob_jid.to_protocol_address();
-    let node = futures::executor::block_on(prepare_peer_stanza(
-        &mut d.alice.sessions,
-        &mut d.alice.identity,
-        d.bob_jid,
-        &signal_addr,
-        &d.msg,
-        "b-001".into(),
-        None,
-    ))
-    .unwrap();
-    black_box(marshal(&node).unwrap());
+#[divan::bench]
+fn bench_dm_send(bencher: divan::Bencher) {
+    bencher.with_inputs(setup_dm_send).bench_values(|mut d| {
+        let signal_addr = d.bob_jid.to_protocol_address();
+        let node = futures::executor::block_on(prepare_peer_stanza(
+            &mut d.alice.sessions,
+            &mut d.alice.identity,
+            d.bob_jid,
+            &signal_addr,
+            &d.msg,
+            "b-001".into(),
+            None,
+        ))
+        .unwrap();
+        black_box(marshal(&node).unwrap());
+    });
 }
 
-#[library_benchmark]
-#[bench::text(setup = setup_dm_recv)]
-fn bench_dm_recv(mut d: DmRecvData) {
-    black_box(decrypt_dm(
-        &d.ciphertext,
-        &d.enc_type,
-        &d.alice_addr,
-        &mut d.bob,
-    ));
+#[divan::bench]
+fn bench_dm_recv(bencher: divan::Bencher) {
+    bencher.with_inputs(setup_dm_recv).bench_values(|mut d| {
+        black_box(decrypt_dm(
+            &d.ciphertext,
+            &d.enc_type,
+            &d.alice_addr,
+            &mut d.bob,
+        ));
+    });
 }
 
 fn run_group_send(d: &mut GrpSendData) {
@@ -765,42 +768,57 @@ fn run_group_send(d: &mut GrpSendData) {
 }
 
 // Steady-state group send (skmsg only, no SKDM distribution)
-#[library_benchmark]
-#[bench::group_10(setup = setup_group_send_10)]
-#[bench::group_50(setup = setup_group_send_50)]
-#[bench::group_256(setup = setup_group_send_256)]
-fn bench_group_send(mut d: GrpSendData) {
-    run_group_send(&mut d);
+#[divan::bench]
+fn bench_group_send_10(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_send_10)
+        .bench_values(|mut d| run_group_send(&mut d));
+}
+
+#[divan::bench]
+fn bench_group_send_50(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_send_50)
+        .bench_values(|mut d| run_group_send(&mut d));
+}
+
+#[divan::bench]
+fn bench_group_send_256(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_send_256)
+        .bench_values(|mut d| run_group_send(&mut d));
 }
 
 // First-message group send: forces SKDM distribution with N pairwise encryptions
-#[library_benchmark]
-#[bench::skdm_10(setup = setup_group_skdm_10)]
-#[bench::skdm_50(setup = setup_group_skdm_50)]
-#[bench::skdm_256(setup = setup_group_skdm_256)]
-fn bench_group_send_skdm(mut d: GrpSendData) {
-    run_group_send(&mut d);
+#[divan::bench]
+fn bench_group_send_skdm_10(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_skdm_10)
+        .bench_values(|mut d| run_group_send(&mut d));
 }
 
-#[library_benchmark]
-#[bench::text(setup = setup_group_recv)]
-fn bench_group_recv(mut d: GrpRecvData) {
-    black_box(decrypt_group(
-        &d.skmsg_bytes,
-        &d.alice_addr,
-        &d.group_jid,
-        &mut d.bob,
-    ));
+#[divan::bench]
+fn bench_group_send_skdm_50(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_skdm_50)
+        .bench_values(|mut d| run_group_send(&mut d));
 }
 
-library_benchmark_group!(name = dm_send; benchmarks = bench_dm_send);
-library_benchmark_group!(name = dm_recv; benchmarks = bench_dm_recv);
-library_benchmark_group!(name = group_send; benchmarks = bench_group_send);
-library_benchmark_group!(name = group_send_skdm; benchmarks = bench_group_send_skdm);
-library_benchmark_group!(name = group_recv; benchmarks = bench_group_recv);
+#[divan::bench]
+fn bench_group_send_skdm_256(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_skdm_256)
+        .bench_values(|mut d| run_group_send(&mut d));
+}
 
-main!(
-    config = LibraryBenchmarkConfig::default()
-        .tool(Callgrind::default().flamegraph(FlamegraphConfig::default()));
-    library_benchmark_groups = dm_send, dm_recv, group_send, group_send_skdm, group_recv
-);
+#[divan::bench]
+fn bench_group_recv(bencher: divan::Bencher) {
+    bencher.with_inputs(setup_group_recv).bench_values(|mut d| {
+        black_box(decrypt_group(
+            &d.skmsg_bytes,
+            &d.alice_addr,
+            &d.group_jid,
+            &mut d.bob,
+        ));
+    });
+}

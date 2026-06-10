@@ -66,7 +66,7 @@ getrandom = { version = "0.4", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 hkdf = { version = "0.13.0", default-features = false }
 hmac = { version = "0.13.0", default-features = false }
-iai-callgrind = "0.16"
+divan = { package = "codspeed-divan-compat", version = "4.7.0" }
 itoa = "1"
 log = "0.4"
 metrics = "0.24"
@@ -215,7 +215,8 @@ panic = "abort"
 strip = true
 incremental = false
 
-# Benchmark profile: optimized but without aggressive LTO that breaks iai-callgrind
+# Benchmark profile: release-grade codegen, but thin LTO keeps bench builds
+# fast (release uses fat LTO) and debug symbols stay for local profiling.
 [profile.bench]
 inherits = "release"
 lto = "thin"

@@ -37,7 +37,7 @@ serde = { workspace = true, features = ["alloc"] }
 serde_json = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
-iai-callgrind = { workspace = true }
+divan = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 
 [[bench]]
@@ -45,7 +45,7 @@ name = "binary_benchmark"
 harness = false
 
 [[bench]]
-name = "numeric_attr_benchmark"
+name = "jid_benchmark"
 harness = false
 
 [lints]

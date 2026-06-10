@@ -35,6 +35,11 @@ waproto = { workspace = true }
 [dev-dependencies]
 prost = { workspace = true }
 waproto = { workspace = true }
+divan = { workspace = true }
+
+[[bench]]
+name = "noise_benchmark"
+harness = false
 
 [lints]
 workspace = true
