@@ -9662,6 +9662,9 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
             text: Some("great post".to_string()),
             ..Default::default()
         })),
+        // Present but secret-less: the outer secret must merge in, not be
+        // dropped because a context already exists.
+        message_context_info: Some(wa::MessageContextInfo::default()),
         ..Default::default()
     };
     let (payload, iv) = wacore::comment::encrypt_comment_with_secret(

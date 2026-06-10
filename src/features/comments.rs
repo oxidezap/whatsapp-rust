@@ -102,12 +102,30 @@ impl<'a> Comments<'a> {
                 enc_iv: Some(iv.to_vec()),
             }),
             message_context_info: Some(wa::MessageContextInfo {
-                message_secret: Some(comment_secret),
+                message_secret: Some(comment_secret.clone()),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        client.send_message(chat.clone(), message).await
+        let result = client.send_message(chat.clone(), message).await?;
+
+        // The send path only persists reporting-token secrets, so store the
+        // comment's own secret here or we could never decrypt add-ons
+        // targeting our own comment.
+        let secret: [u8; 32] = comment_secret
+            .as_slice()
+            .try_into()
+            .expect("comment secret is 32 bytes");
+        client
+            .persist_outbound_msg_secret(
+                chat,
+                &commenter,
+                &result.message_id,
+                &secret,
+                wacore::msg_secret::RetentionClass::Text,
+            )
+            .await;
+        Ok(result)
     }
 }
 

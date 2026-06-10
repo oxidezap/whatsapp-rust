@@ -339,14 +339,21 @@ impl Client {
 
         // A comment's own messageSecret rides the OUTER envelope (WA Web puts
         // it on the comment msgData), which substitution would drop. Carry it
-        // onto the dispatched body so app-managed secret storage (Disabled
-        // policy) can still learn it for add-ons targeting the comment.
+        // onto the dispatched body (merging into an existing secret-less inner
+        // context) so app-managed secret storage (Disabled policy) can still
+        // learn it for add-ons targeting the comment.
         if env.kind == SecretEncKind::EncComment
-            && inner.message_context_info.is_none()
-            && let Some(outer_mci) = msg.message_context_info.as_ref()
-            && outer_mci.message_secret.is_some()
+            && let Some(outer_secret) = msg
+                .message_context_info
+                .as_ref()
+                .and_then(|m| m.message_secret.as_ref())
         {
-            inner.message_context_info = Some(outer_mci.clone());
+            let inner_mci = inner
+                .message_context_info
+                .get_or_insert_with(Default::default);
+            if inner_mci.message_secret.is_none() {
+                inner_mci.message_secret = Some(outer_secret.clone());
+            }
         }
 
         // Mirror WA Web `ProcessEditProtocolMsgs`: drop a MESSAGE_EDIT authored
@@ -760,7 +767,8 @@ impl Client {
         let author: Jid = if let Some(p) = target_key.participant.as_deref() {
             p.parse().context("invalid participant in target key")?
         } else if target_key.from_me == Some(true) {
-            self.addon_self_jid(chat)
+            self.addon_self_jid_for_chat(chat)
+                .await
                 .ok_or_else(|| anyhow!("not logged in"))?
         } else {
             target_key
@@ -814,6 +822,29 @@ impl Client {
             }
         };
         Ok((author, secret))
+    }
+
+    /// Our own JID in the namespace the chat addresses us under: the group's
+    /// addressing mode for groups (outbound group secrets are persisted under
+    /// the group sender identity), the peer's namespace for DMs.
+    pub(crate) async fn addon_self_jid_for_chat(&self, chat: &Jid) -> Option<Jid> {
+        use wacore_binary::JidExt;
+        if chat.is_group() {
+            let lid_mode = match self.groups().query_info(chat).await {
+                Ok(info) => info.addressing_mode == wacore::types::message::AddressingMode::Lid,
+                Err(e) => {
+                    log::warn!("addon self identity: group info lookup failed: {e:?}");
+                    false
+                }
+            };
+            return if lid_mode {
+                self.get_lid().or_else(|| self.get_pn())
+            } else {
+                self.get_pn().or_else(|| self.get_lid())
+            }
+            .map(|j| j.to_non_ad());
+        }
+        self.addon_self_jid(chat)
     }
 
     /// Our own JID in the namespace matching `reference` (the parent author or
