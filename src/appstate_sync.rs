@@ -34,6 +34,10 @@ mod tests {
         latest_key_id: Arc<Mutex<Option<Vec<u8>>>>,
         // Fault injection: when set, clear_mutation_macs fails (transient store error).
         fail_clear_macs: Arc<Mutex<bool>>,
+        // Call counters distinguishing the batched MAC prefetch from per-item
+        // lookups, so tests can pin which path the processor takes.
+        singular_mac_calls: Arc<std::sync::atomic::AtomicU64>,
+        batch_mac_calls: Arc<std::sync::atomic::AtomicU64>,
     }
 
     // Implement SignalStore - Signal protocol cryptographic operations
@@ -135,12 +139,32 @@ mod tests {
             name: &str,
             index_mac: &[u8],
         ) -> StoreResult<Option<Vec<u8>>> {
+            self.singular_mac_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self
                 .macs
                 .lock()
                 .await
                 .get(&(name.to_string(), index_mac.to_vec()))
                 .cloned())
+        }
+        // Real batch override (not the default singular-loop fallback) so the
+        // counters can prove which path the processor used.
+        async fn get_mutation_macs(
+            &self,
+            name: &str,
+            index_macs: &[Vec<u8>],
+        ) -> StoreResult<HashMap<Vec<u8>, Vec<u8>>> {
+            self.batch_mac_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let macs = self.macs.lock().await;
+            Ok(index_macs
+                .iter()
+                .filter_map(|index_mac| {
+                    macs.get(&(name.to_string(), index_mac.clone()))
+                        .map(|mac| (index_mac.clone(), mac.clone()))
+                })
+                .collect())
         }
         async fn delete_mutation_macs(&self, _: &str, _: &[Vec<u8>]) -> StoreResult<()> {
             Ok(())
@@ -652,7 +676,11 @@ mod tests {
             .await
             .expect("test backend should accept sync key");
 
-        let old_value_mac = vec![0xAA; 32];
+        let second_index_mac = vec![5; 32];
+        let old_value_macs: HashMap<Vec<u8>, Vec<u8>> = HashMap::from([
+            (index_mac.clone(), vec![0xAA; 32]),
+            (second_index_mac.clone(), vec![0xBB; 32]),
+        ]);
         backend
             .set_version(
                 collection_name.as_str(),
@@ -667,10 +695,13 @@ mod tests {
             .put_mutation_macs(
                 collection_name.as_str(),
                 1,
-                &[AppStateMutationMAC {
-                    index_mac: index_mac.clone(),
-                    value_mac: old_value_mac.clone(),
-                }],
+                &old_value_macs
+                    .iter()
+                    .map(|(index_mac, value_mac)| AppStateMutationMAC {
+                        index_mac: index_mac.clone(),
+                        value_mac: value_mac.clone(),
+                    })
+                    .collect::<Vec<_>>(),
             )
             .await
             .expect("test backend should accept mutation MACs");
@@ -683,30 +714,58 @@ mod tests {
             ..Default::default()
         }
         .encode_to_vec();
-        let mutation = create_encrypted_mutation(
-            wa::syncd_mutation::SyncdOperation::Set,
-            &index_mac,
-            &plaintext,
-            &keys,
-            &key_id_bytes,
-        );
+        let mutations: Vec<wa::SyncdMutation> = [&index_mac, &second_index_mac]
+            .into_iter()
+            .map(|mac| {
+                create_encrypted_mutation(
+                    wa::syncd_mutation::SyncdOperation::Set,
+                    mac,
+                    &plaintext,
+                    &keys,
+                    &key_id_bytes,
+                )
+            })
+            .collect();
+
+        let singular_before = backend
+            .singular_mac_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let batch_before = backend
+            .batch_mac_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         let (patch_bytes, base_version) = processor
-            .build_patch(collection_name.as_str(), vec![mutation.clone()])
+            .build_patch(collection_name.as_str(), mutations.clone())
             .await
             .expect("build_patch should succeed");
         assert_eq!(base_version, 1);
 
-        // Recompute the expected post-patch state with the seeded prev MAC.
+        // The prefetch must be ONE batched round-trip, never per-mutation
+        // singular lookups (the N+1 this change removes).
+        assert_eq!(
+            backend
+                .batch_mac_calls
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - batch_before,
+            1,
+            "previous MACs must be fetched via a single get_mutation_macs call"
+        );
+        assert_eq!(
+            backend
+                .singular_mac_calls
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - singular_before,
+            0,
+            "build_patch must not fall back to per-mutation get_mutation_mac"
+        );
+
+        // Recompute the expected post-patch state with the seeded prev MACs.
         let mut expected_state = HashState {
             version: 1,
             ..Default::default()
         };
-        let old_for_closure = old_value_mac.clone();
-        let (hash_result, res) = expected_state
-            .update_hash(std::slice::from_ref(&mutation), |mac, _| {
-                Ok((mac == index_mac.as_slice()).then(|| old_for_closure.clone()))
-            });
+        let (hash_result, res) =
+            expected_state.update_hash(&mutations, |mac, _| Ok(old_value_macs.get(mac).cloned()));
         assert!(res.is_ok() && !hash_result.has_missing_remove);
         expected_state.version = 2;
         let expected_snapshot_mac =
