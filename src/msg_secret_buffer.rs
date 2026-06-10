@@ -114,22 +114,32 @@ impl MsgSecretWriteBuffer {
                 return;
             }
 
-            let keys: Vec<Key> = batch
-                .iter()
-                .map(|e| (e.chat.clone(), e.sender.clone(), e.msg_id.clone()))
-                .collect();
-            if let Err(e) = self.backend.put_msg_secrets(batch).await {
+            if let Err(e) = self.backend.put_msg_secrets(batch.clone()).await {
                 // Same semantics as the previously awaited write: warn + drop.
                 log::warn!("failed to persist messageSecrets: {e:?}");
             }
             self.flushed_batches.fetch_add(1, Ordering::Relaxed);
+            self.finish_batch(&batch);
+        }
+    }
+
+    /// Remove the flushed entries, but only where the pending value is still
+    /// the one that was written: an edit recapture stores a NEW secret under
+    /// the same (chat, sender, id), so a refresh queued while its predecessor
+    /// was in flight must survive for the next drain iteration.
+    fn finish_batch(&self, written: &[MsgSecretEntry]) {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        for entry in written {
+            let key = (
+                entry.chat.clone(),
+                entry.sender.clone(),
+                entry.msg_id.clone(),
+            );
+            if pending
+                .get(&key)
+                .is_some_and(|current| current.secret == entry.secret)
             {
-                // A secret for a given (chat, sender, id) never changes, so
-                // removing by key cannot discard a newer value.
-                let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-                for key in keys {
-                    pending.remove(&key);
-                }
+                pending.remove(&key);
             }
         }
     }
@@ -224,6 +234,35 @@ mod tests {
                 .expect("backend read");
             assert_eq!(stored.as_deref(), Some(&[i; 32][..]), "entry M{i}");
         }
+    }
+
+    /// A secret refreshed for the same key while its predecessor is being
+    /// written (edit recapture) must survive the predecessor's post-flush
+    /// removal and reach the backend on the next iteration.
+    #[tokio::test]
+    async fn refresh_queued_during_flush_survives_removal() {
+        let buf = buffer().await;
+        let stale = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
+        // Simulate the drain having snapshotted `stale` while a refresh lands.
+        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x22)]);
+        buf.finish_batch(std::slice::from_ref(&stale));
+        assert_eq!(
+            buf.lookup("g@g.us", "a@s.whatsapp.net", "PARENT"),
+            Some((vec![0x22; 32], 7)),
+            "the refresh must not be removed by the stale batch's cleanup"
+        );
+
+        buf.wait_flushed().await;
+        let stored = buf
+            .backend
+            .get_msg_secret("g@g.us", "a@s.whatsapp.net", "PARENT")
+            .await
+            .expect("backend read");
+        assert_eq!(
+            stored.as_deref(),
+            Some(&[0x22u8; 32][..]),
+            "the refresh must reach the backend"
+        );
     }
 
     /// Entries queued while a flush is in flight are picked up by the same
