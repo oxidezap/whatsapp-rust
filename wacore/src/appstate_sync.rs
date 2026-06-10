@@ -489,21 +489,23 @@ impl AppStateProcessor {
         let mut state = self.backend.get_version(collection_name).await?;
         let base_version = state.version;
 
-        // Pre-fetch previous value MACs for all index MACs in the mutations
-        let mut db_prev: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-            std::collections::HashMap::new();
+        // Pre-fetch previous value MACs in one backend round-trip, mirroring
+        // the inbound patch path: one batched query instead of a
+        // spawn_blocking + single-row SELECT per mutation.
+        let mut need_db_lookup: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
         for m in &mutations {
             if let Some(rec) = &m.record
                 && let Some(ind) = &rec.index
                 && let Some(index_mac) = &ind.blob
-                && let Some(mac) = self
-                    .backend
-                    .get_mutation_mac(collection_name, index_mac)
-                    .await?
+                && !need_db_lookup.iter().any(|v| v == index_mac)
             {
-                db_prev.insert(index_mac.clone(), mac);
+                need_db_lookup.push(index_mac.clone());
             }
         }
+        let db_prev: std::collections::HashMap<Vec<u8>, Vec<u8>> = self
+            .backend
+            .get_mutation_macs(collection_name, &need_db_lookup)
+            .await?;
 
         // Update hash state
         let (_, hash_result) = state.update_hash(&mutations, |index_mac, _| {
