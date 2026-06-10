@@ -64,13 +64,24 @@ impl MsgSecretWriteBuffer {
             return;
         }
         {
+            use wacore::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
             let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-            for entry in entries {
+            for mut entry in entries {
                 let key = (
                     entry.chat.clone(),
                     entry.sender.clone(),
                     entry.msg_id.clone(),
                 );
+                // Two captures coalescing in the same window must merge the
+                // retention metadata exactly like the backend upsert would
+                // have for two sequential writes (never-expire wins, windows
+                // never shrink, a known parent time is never clobbered).
+                if let Some(existing) = pending.get(&key) {
+                    entry.expires_at =
+                        merge_msg_secret_expiry(existing.expires_at, entry.expires_at);
+                    entry.message_ts =
+                        merge_msg_secret_message_ts(existing.message_ts, entry.message_ts);
+                }
                 pending.insert(key, entry);
             }
         }
@@ -305,6 +316,37 @@ mod tests {
             1,
             "a same-secret metadata refresh must stay pending"
         );
+        buf.wait_flushed().await;
+    }
+
+    /// Coalescing duplicates must merge retention metadata like the backend
+    /// upsert does for sequential writes: never-expire wins and a known
+    /// parent time survives a later unknown one.
+    #[tokio::test]
+    async fn coalesced_duplicates_merge_retention_metadata() {
+        let buf = buffer().await;
+        let mut first = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
+        first.expires_at = 0;
+        first.message_ts = 50;
+        let mut second = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
+        second.expires_at = 100;
+        second.message_ts = 0;
+        buf.queue(vec![first]);
+        buf.queue(vec![second]);
+
+        let pending = buf
+            .pending
+            .lock()
+            .unwrap()
+            .get(&(
+                "g@g.us".to_string(),
+                "a@s.whatsapp.net".to_string(),
+                "PARENT".to_string(),
+            ))
+            .cloned()
+            .expect("entry pending");
+        assert_eq!(pending.expires_at, 0, "never-expire must win");
+        assert_eq!(pending.message_ts, 50, "known parent time must survive");
         buf.wait_flushed().await;
     }
 
