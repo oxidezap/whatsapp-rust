@@ -1,6 +1,8 @@
 use bytes::Bytes;
+use std::sync::Arc;
 use thiserror::Error;
 use wacore_binary::zlib_pool::{InflateReader, decompress_zlib_pooled};
+use waproto::tags;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -90,8 +92,8 @@ pub fn process_history_sync(
         let wire_type_raw = (tag & 0x7) as u32;
 
         match field_number {
-            // field 2 = conversations (repeated, length-delimited)
-            2 if wire_type_raw == wire_type::LENGTH_DELIMITED => {
+            // conversations (repeated, length-delimited)
+            tags::history_sync::CONVERSATIONS if wire_type_raw == wire_type::LENGTH_DELIMITED => {
                 let (len, vlen) = read_varint(&buf[pos..])?;
                 pos += vlen;
                 let end = checked_end(pos, len, buf.len(), "conversation")?;
@@ -105,15 +107,16 @@ pub fn process_history_sync(
                 pos = end;
             }
 
-            // field 7 = pushnames (repeated, length-delimited).
+            // pushnames (repeated, length-delimited).
             // Uses `Option::is_some()` in the guard rather than an
             // `if let` guard — the latter requires Rust 1.94+. The inner
             // `if let` is the defensive complement: if the guard's
             // invariant is ever weakened by a future refactor, we skip
             // the arm body instead of panicking.
-            7 if own_user.is_some()
-                && result.own_pushname.is_none()
-                && wire_type_raw == wire_type::LENGTH_DELIMITED =>
+            tags::history_sync::PUSHNAMES
+                if own_user.is_some()
+                    && result.own_pushname.is_none()
+                    && wire_type_raw == wire_type::LENGTH_DELIMITED =>
             {
                 let (len, vlen) = read_varint(&buf[pos..])?;
                 pos += vlen;
@@ -127,10 +130,10 @@ pub fn process_history_sync(
                 pos = end;
             }
 
-            // field 19 = nctSalt (optional bytes, length-delimited)
+            // nctSalt (optional bytes, length-delimited)
             // Delivered during initial pairing so cstoken is available immediately.
             // Source: storeNctSaltFromHistorySync in WAWeb/History/MsgHandlerAction.js
-            19 if wire_type_raw == wire_type::LENGTH_DELIMITED => {
+            tags::history_sync::NCT_SALT if wire_type_raw == wire_type::LENGTH_DELIMITED => {
                 let (len, vlen) = read_varint(&buf[pos..])?;
                 pos += vlen;
                 let end = checked_end(pos, len, buf.len(), "nctSalt")?;
@@ -214,7 +217,7 @@ fn process_history_sync_streaming(
                     let value = &reader.available()[..len];
                     match field_number {
                         // conversations (repeated)
-                        2 => {
+                        tags::history_sync::CONVERSATIONS => {
                             result.conversations_processed += 1;
                             if let Some(candidate) =
                                 extract_conversation_fields(value, &mut result.msg_secret_records)
@@ -223,7 +226,7 @@ fn process_history_sync_streaming(
                             }
                         }
                         // pushnames (repeated) — only our own is needed
-                        7 => {
+                        tags::history_sync::PUSHNAMES => {
                             if result.own_pushname.is_none()
                                 && let Some(own) = own_user
                                 && let Some(name) = extract_own_pushname(value, own)
@@ -231,8 +234,7 @@ fn process_history_sync_streaming(
                                 result.own_pushname = Some(name);
                             }
                         }
-                        // nctSalt
-                        19 if !value.is_empty() => {
+                        tags::history_sync::NCT_SALT if !value.is_empty() => {
                             result.nct_salt = Some(value.to_vec());
                         }
                         _ => {}
@@ -372,8 +374,8 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
         let wt = (tag & 0x7) as u32;
 
         match field_number {
-            // id (tag 1, string)
-            1 if wt == wire_type::LENGTH_DELIMITED => {
+            // id (string)
+            tags::pushname::ID if wt == wire_type::LENGTH_DELIMITED => {
                 let (len, vlen) = read_varint(data.get(pos..)?).ok()?;
                 pos += vlen;
                 let len = usize::try_from(len).ok()?;
@@ -385,8 +387,8 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
                 }
                 pos = end;
             }
-            // pushname (tag 2, string)
-            2 if wt == wire_type::LENGTH_DELIMITED => {
+            // pushname (string)
+            tags::pushname::PUSHNAME if wt == wire_type::LENGTH_DELIMITED => {
                 let (len, vlen) = read_varint(data.get(pos..)?).ok()?;
                 pos += vlen;
                 let len = usize::try_from(len).ok()?;
@@ -569,6 +571,96 @@ pub(crate) struct FutureProofMessageInternalFields {
     pub message: Option<Box<MessageInternalFields>>,
 }
 
+// Schema pinning for every hand-written `#[prost(tag)]` literal above (prost
+// attributes only accept literals, so they cannot reference the generated
+// consts directly). If whatsapp.proto renumbers, renames or removes any of
+// these fields, compilation fails here instead of the partial decoder silently
+// reading the wrong wire field.
+const _: () = {
+    assert!(tags::history_sync_msg::MESSAGE == 1);
+
+    assert!(tags::web_message_info::KEY == 1);
+    assert!(tags::web_message_info::MESSAGE == 2);
+    assert!(tags::web_message_info::MESSAGE_TIMESTAMP == 3);
+    assert!(tags::web_message_info::PARTICIPANT == 5);
+    assert!(tags::web_message_info::MESSAGE_SECRET == 49);
+
+    assert!(tags::message_key::FROM_ME == 2);
+    assert!(tags::message_key::ID == 3);
+    assert!(tags::message_key::PARTICIPANT == 4);
+
+    assert!(tags::message::IMAGE_MESSAGE == 3);
+    assert!(tags::message::CONTACT_MESSAGE == 4);
+    assert!(tags::message::LOCATION_MESSAGE == 5);
+    assert!(tags::message::EXTENDED_TEXT_MESSAGE == 6);
+    assert!(tags::message::DOCUMENT_MESSAGE == 7);
+    assert!(tags::message::AUDIO_MESSAGE == 8);
+    assert!(tags::message::VIDEO_MESSAGE == 9);
+    assert!(tags::message::CONTACTS_ARRAY_MESSAGE == 13);
+    assert!(tags::message::LIVE_LOCATION_MESSAGE == 18);
+    assert!(tags::message::TEMPLATE_MESSAGE == 25);
+    assert!(tags::message::STICKER_MESSAGE == 26);
+    assert!(tags::message::GROUP_INVITE_MESSAGE == 28);
+    assert!(tags::message::TEMPLATE_BUTTON_REPLY_MESSAGE == 29);
+    assert!(tags::message::PRODUCT_MESSAGE == 30);
+    assert!(tags::message::DEVICE_SENT_MESSAGE == 31);
+    assert!(tags::message::MESSAGE_CONTEXT_INFO == 35);
+    assert!(tags::message::LIST_MESSAGE == 36);
+    assert!(tags::message::VIEW_ONCE_MESSAGE == 37);
+    assert!(tags::message::ORDER_MESSAGE == 38);
+    assert!(tags::message::LIST_RESPONSE_MESSAGE == 39);
+    assert!(tags::message::EPHEMERAL_MESSAGE == 40);
+    assert!(tags::message::BUTTONS_MESSAGE == 42);
+    assert!(tags::message::BUTTONS_RESPONSE_MESSAGE == 43);
+    assert!(tags::message::INTERACTIVE_MESSAGE == 45);
+    assert!(tags::message::INTERACTIVE_RESPONSE_MESSAGE == 48);
+    assert!(tags::message::POLL_CREATION_MESSAGE == 49);
+    assert!(tags::message::DOCUMENT_WITH_CAPTION_MESSAGE == 53);
+    assert!(tags::message::VIEW_ONCE_MESSAGE_V2 == 55);
+    assert!(tags::message::EDITED_MESSAGE == 58);
+    assert!(tags::message::POLL_CREATION_MESSAGE_V2 == 60);
+    assert!(tags::message::POLL_CREATION_MESSAGE_V3 == 64);
+    assert!(tags::message::EVENT_MESSAGE == 75);
+    assert!(tags::message::NEWSLETTER_ADMIN_INVITE_MESSAGE == 78);
+    assert!(tags::message::STICKER_PACK_MESSAGE == 86);
+
+    assert!(tags::message_context_info::MESSAGE_SECRET == 3);
+    assert!(tags::message_context_info::BOT_METADATA == 7);
+
+    assert!(tags::context_info::IS_FORWARDED == 22);
+
+    assert!(tags::message::device_sent_message::MESSAGE == 2);
+    assert!(tags::message::future_proof_message::MESSAGE == 1);
+
+    // ContextInfoTagN carriers: pin the `contextInfo` field number of every
+    // proto message each carrier stands in for.
+    assert!(tags::message::event_message::CONTEXT_INFO == 1); // Tag1
+    assert!(tags::message::template_message::CONTEXT_INFO == 3); // Tag3
+    assert!(tags::message::template_button_reply_message::CONTEXT_INFO == 3);
+    assert!(tags::message::buttons_response_message::CONTEXT_INFO == 3);
+    assert!(tags::message::list_response_message::CONTEXT_INFO == 4); // Tag4
+    assert!(tags::message::poll_creation_message::CONTEXT_INFO == 5); // Tag5 (v2/v3 share the type)
+    assert!(tags::message::newsletter_admin_invite_message::CONTEXT_INFO == 6); // Tag6
+    assert!(tags::message::group_invite_message::CONTEXT_INFO == 7); // Tag7
+    assert!(tags::message::list_message::CONTEXT_INFO == 8); // Tag8
+    assert!(tags::message::buttons_message::CONTEXT_INFO == 8);
+    assert!(tags::message::sticker_pack_message::CONTEXT_INFO == 11); // Tag11
+    assert!(tags::message::interactive_message::CONTEXT_INFO == 15); // Tag15
+    assert!(tags::message::interactive_response_message::CONTEXT_INFO == 15);
+    assert!(tags::message::image_message::CONTEXT_INFO == 17); // Tag17
+    assert!(tags::message::contact_message::CONTEXT_INFO == 17);
+    assert!(tags::message::location_message::CONTEXT_INFO == 17);
+    assert!(tags::message::extended_text_message::CONTEXT_INFO == 17);
+    assert!(tags::message::document_message::CONTEXT_INFO == 17);
+    assert!(tags::message::audio_message::CONTEXT_INFO == 17);
+    assert!(tags::message::video_message::CONTEXT_INFO == 17);
+    assert!(tags::message::contacts_array_message::CONTEXT_INFO == 17);
+    assert!(tags::message::live_location_message::CONTEXT_INFO == 17);
+    assert!(tags::message::sticker_message::CONTEXT_INFO == 17);
+    assert!(tags::message::product_message::CONTEXT_INFO == 17);
+    assert!(tags::message::order_message::CONTEXT_INFO == 17);
+};
+
 impl MessageInternalFields {
     fn base_message(&self) -> &Self {
         let mut current = self;
@@ -678,10 +770,88 @@ impl MessageInternalFields {
     }
 }
 
+/// True when a `HistorySyncMsg` carries a message secret, either the top-level
+/// `WebMessageInfo.message_secret` (tag 49) or the nested
+/// `Message.message_context_info.message_secret` (tags 2 -> 35 -> 3).
+///
+/// Pure presence walk so the expensive prost decode of the 30+-field message
+/// struct only runs for messages that can actually yield a record. Mirrors
+/// prost merge semantics: repeated occurrences of a message field merge, and a
+/// later occurrence can never unset a secret, so any occurrence counts. On
+/// malformed bytes it returns false, matching the decode-failure skip.
+fn has_message_secret(history_msg: &[u8]) -> bool {
+    scan_fields(history_msg, |field, wt, value| {
+        field == tags::history_sync_msg::MESSAGE
+            && wt == wire_type::LENGTH_DELIMITED
+            && web_msg_has_secret(value)
+    })
+}
+
+fn web_msg_has_secret(web_msg: &[u8]) -> bool {
+    scan_fields(web_msg, |field, wt, value| {
+        wt == wire_type::LENGTH_DELIMITED
+            && match field {
+                tags::web_message_info::MESSAGE_SECRET => true,
+                tags::web_message_info::MESSAGE => message_has_context_secret(value),
+                _ => false,
+            }
+    })
+}
+
+fn message_has_context_secret(message: &[u8]) -> bool {
+    scan_fields(message, |field, wt, value| {
+        field == tags::message::MESSAGE_CONTEXT_INFO
+            && wt == wire_type::LENGTH_DELIMITED
+            && scan_fields(value, |f, w, _| {
+                f == tags::message_context_info::MESSAGE_SECRET && w == wire_type::LENGTH_DELIMITED
+            })
+    })
+}
+
+/// Walk one protobuf level, calling `hit` for each field with its value slice
+/// (empty for non-length-delimited fields). Returns true on the first hit;
+/// false at the end of the buffer or on the first malformed field.
+#[inline]
+fn scan_fields(data: &[u8], mut hit: impl FnMut(u32, u32, &[u8]) -> bool) -> bool {
+    let mut pos = 0;
+    while pos < data.len() {
+        let Ok((tag, br)) = read_varint(&data[pos..]) else {
+            return false;
+        };
+        pos += br;
+        let field = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+        if wt == wire_type::LENGTH_DELIMITED {
+            let Ok((len, vl)) = read_varint(&data[pos..]) else {
+                return false;
+            };
+            pos += vl;
+            let Ok(end) = checked_end(pos, len, data.len(), "scan") else {
+                return false;
+            };
+            if hit(field, wt, &data[pos..end]) {
+                return true;
+            }
+            pos = end;
+        } else {
+            if hit(field, wt, &[]) {
+                return true;
+            }
+            match skip_field(wt, data, pos) {
+                Ok(np) => pos = np,
+                Err(_) => return false,
+            }
+        }
+    }
+    false
+}
+
 /// Message-secret data extracted from a conversation during streaming.
 #[derive(Debug, PartialEq)]
 pub struct HistoryMsgSecretRecord {
-    pub chat_id: String,
+    /// Conversation JID. `Arc<str>` because every record of a conversation
+    /// shares the same id: one allocation per conversation, not per record.
+    pub chat_id: Arc<str>,
     pub from_me: bool,
     pub key_participant: Option<String>,
     pub web_msg_participant: Option<String>,
@@ -701,12 +871,12 @@ pub struct HistoryMsgSecretRecord {
 }
 
 /// Partial reader for one conversation: walks its protobuf fields directly
-/// (Conversation tags: 1=id, 2=messages[], 21/22/28=tctoken) and decodes each
-/// `HistorySyncMsg` (field 2) ONE AT A TIME, extracting its secret record and
-/// dropping it immediately. This avoids materializing the whole
-/// `Vec<HistorySyncMsgInternalFields>` (and a heap allocation per message) just
-/// to scan it — only one message is decoded at a time. The complex per-message
-/// flag logic stays in prost via `HistorySyncMsgInternalFields`.
+/// (id, messages[], tctoken trio) and decodes each `HistorySyncMsg` ONE AT A
+/// TIME, extracting its secret record and dropping it immediately. This avoids
+/// materializing the whole `Vec<HistorySyncMsgInternalFields>` (and a heap
+/// allocation per message) just to scan it — only one message is decoded at a
+/// time. The complex per-message flag logic stays in prost via
+/// `HistorySyncMsgInternalFields`.
 ///
 /// Best-effort on malformed bytes: stops at the first bad field, keeping records
 /// already extracted (a malformed tail no longer discards a whole conversation).
@@ -717,9 +887,12 @@ fn extract_conversation_fields(
     use prost::Message;
 
     let mut pos = 0;
-    // Conversation.id (field 1) precedes messages/tctoken in tag order, so it is
+    // Conversation.id precedes messages/tctoken in tag order, so it is
     // captured before any message is processed.
     let mut chat_id: &str = "";
+    // Shared id handed to every record of this conversation; built on first
+    // use and invalidated if a (malformed) blob re-orders the id after data.
+    let mut chat_id_shared: Option<Arc<str>> = None;
     let mut tc_token: &[u8] = &[];
     let mut tc_token_timestamp: Option<u64> = None;
     let mut tc_token_sender_timestamp: Option<u64> = None;
@@ -732,7 +905,7 @@ fn extract_conversation_fields(
         let field = (tag >> 3) as u32;
         let wt = (tag & 0x7) as u32;
         match (field, wt) {
-            (1, wire_type::LENGTH_DELIMITED) => {
+            (tags::conversation::ID, wire_type::LENGTH_DELIMITED) => {
                 let Ok((len, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
@@ -743,15 +916,16 @@ fn extract_conversation_fields(
                 let Ok(id) = std::str::from_utf8(&data[pos..end]) else {
                     // A real conversation id is a JID (always UTF-8). If it
                     // isn't, the conversation is malformed; skip it rather than
-                    // pushing its secrets under an empty chat id. Field 1
-                    // precedes messages (field 2) in tag order, so nothing has
-                    // been extracted from it yet.
+                    // pushing its secrets under an empty chat id. The id
+                    // precedes messages in tag order, so nothing has been
+                    // extracted from it yet.
                     return None;
                 };
                 chat_id = id;
+                chat_id_shared = None;
                 pos = end;
             }
-            (2, wire_type::LENGTH_DELIMITED) => {
+            (tags::conversation::MESSAGES, wire_type::LENGTH_DELIMITED) => {
                 let Ok((len, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
@@ -759,12 +933,17 @@ fn extract_conversation_fields(
                 let Ok(end) = checked_end(pos, len, data.len(), "conv-msg") else {
                     break;
                 };
-                if let Ok(msg) = HistorySyncMsgInternalFields::decode(&data[pos..end]) {
-                    push_secret_record(chat_id, msg, secrets_out);
+                // Decode only messages that can yield a record: the presence
+                // walk is a fraction of the full prost decode, and most real
+                // history messages carry no secret.
+                if has_message_secret(&data[pos..end])
+                    && let Ok(msg) = HistorySyncMsgInternalFields::decode(&data[pos..end])
+                {
+                    push_secret_record(chat_id, &mut chat_id_shared, msg, secrets_out);
                 }
                 pos = end;
             }
-            (21, wire_type::LENGTH_DELIMITED) => {
+            (tags::conversation::TC_TOKEN, wire_type::LENGTH_DELIMITED) => {
                 let Ok((len, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
@@ -775,14 +954,14 @@ fn extract_conversation_fields(
                 tc_token = &data[pos..end];
                 pos = end;
             }
-            (22, wire_type::VARINT) => {
+            (tags::conversation::TC_TOKEN_TIMESTAMP, wire_type::VARINT) => {
                 let Ok((v, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
                 tc_token_timestamp = Some(v);
                 pos += vl;
             }
-            (28, wire_type::VARINT) => {
+            (tags::conversation::TC_TOKEN_SENDER_TIMESTAMP, wire_type::VARINT) => {
                 let Ok((v, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
@@ -815,8 +994,11 @@ fn extract_conversation_fields(
 
 /// Extract a single message's secret record (if any) into `out`. The decode +
 /// forwarded/poll/bot detection stays in prost via the typed fields/methods.
+/// `chat_id_shared` memoizes the conversation id `Arc` so it is allocated only
+/// when the first record is actually pushed.
 fn push_secret_record(
     chat_id: &str,
+    chat_id_shared: &mut Option<Arc<str>>,
     mut history_msg: HistorySyncMsgInternalFields,
     out: &mut Vec<HistoryMsgSecretRecord>,
 ) {
@@ -874,7 +1056,9 @@ fn push_secret_record(
     let web_msg_participant = web_msg.participant.take();
 
     out.push(HistoryMsgSecretRecord {
-        chat_id: chat_id.to_string(),
+        chat_id: chat_id_shared
+            .get_or_insert_with(|| Arc::from(chat_id))
+            .clone(),
         from_me,
         key_participant,
         web_msg_participant,
@@ -910,6 +1094,161 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&proto_bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    /// Wrap raw `HistorySyncMsg` bytes in Conversation/HistorySync framing and
+    /// run the full pipeline, returning the extracted records. Lets tests feed
+    /// hand-crafted wire bytes that prost's encoder cannot produce (repeated
+    /// field occurrences, wrong wire types, malformed tails).
+    fn run_with_raw_history_msg(raw_msg: &[u8]) -> Vec<HistoryMsgSecretRecord> {
+        fn emit_len_field(out: &mut Vec<u8>, field: u32, value: &[u8]) {
+            let mut tag_buf = [0u8; 5];
+            let mut tag = (field << 3) | wire_type::LENGTH_DELIMITED;
+            let mut i = 0;
+            loop {
+                if tag < 0x80 {
+                    tag_buf[i] = tag as u8;
+                    i += 1;
+                    break;
+                }
+                tag_buf[i] = (tag as u8 & 0x7F) | 0x80;
+                tag >>= 7;
+                i += 1;
+            }
+            out.extend_from_slice(&tag_buf[..i]);
+            assert!(value.len() < 0x80, "test helper supports short fields only");
+            out.push(value.len() as u8);
+            out.extend_from_slice(value);
+        }
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let mut conv = Vec::new();
+        emit_len_field(&mut conv, tags::conversation::ID, chat.as_bytes());
+        emit_len_field(&mut conv, tags::conversation::MESSAGES, raw_msg);
+        let mut hs = Vec::new();
+        emit_len_field(&mut hs, tags::history_sync::CONVERSATIONS, &conv);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs).unwrap();
+        let compressed = encoder.finish().unwrap();
+        process_history_sync(compressed, None, false, None)
+            .unwrap()
+            .msg_secret_records
+    }
+
+    /// The presence pre-scan must honor prost merge semantics: a secret carried
+    /// by a LATER occurrence of a repeated message field still yields a record.
+    #[test]
+    fn test_secret_in_second_message_field_occurrence() {
+        let msg_without_secret = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let msg_with_secret = wa::Message {
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(vec![0x11u8; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let key = wa::MessageKey {
+            from_me: Some(false),
+            id: Some("DOUBLE_MSG".into()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        let mut web_msg = Vec::new();
+        let emit = |out: &mut Vec<u8>, field: u32, v: &[u8]| {
+            out.push(((field << 3) | wire_type::LENGTH_DELIMITED) as u8);
+            out.push(v.len() as u8);
+            out.extend_from_slice(v);
+        };
+        emit(&mut web_msg, tags::web_message_info::KEY, &key);
+        emit(
+            &mut web_msg,
+            tags::web_message_info::MESSAGE,
+            &msg_without_secret,
+        );
+        emit(
+            &mut web_msg,
+            tags::web_message_info::MESSAGE,
+            &msg_with_secret,
+        );
+
+        let mut history_msg = Vec::new();
+        emit(&mut history_msg, tags::history_sync_msg::MESSAGE, &web_msg);
+
+        let records = run_with_raw_history_msg(&history_msg);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].msg_id, "DOUBLE_MSG");
+        assert_eq!(records[0].secret, vec![0x11u8; 32]);
+    }
+
+    /// A secret field with the wrong wire type must not yield a record (prost
+    /// fails the decode), and must not panic the pre-scan.
+    #[test]
+    fn test_wrong_wire_type_secret_yields_no_record() {
+        let key = wa::MessageKey {
+            from_me: Some(false),
+            id: Some("BAD_WIRE".into()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        let mut web_msg = Vec::new();
+        web_msg.push(((tags::web_message_info::KEY << 3) | wire_type::LENGTH_DELIMITED) as u8);
+        web_msg.push(key.len() as u8);
+        web_msg.extend_from_slice(&key);
+        // message_secret (tag 49) as VARINT instead of bytes; tag 49 needs a
+        // 2-byte tag varint (49 << 3 = 392).
+        let tag = (tags::web_message_info::MESSAGE_SECRET << 3) | wire_type::VARINT;
+        web_msg.push((tag as u8 & 0x7F) | 0x80);
+        web_msg.push((tag >> 7) as u8);
+        web_msg.push(0x05);
+
+        let mut history_msg = Vec::new();
+        history_msg
+            .push(((tags::history_sync_msg::MESSAGE << 3) | wire_type::LENGTH_DELIMITED) as u8);
+        history_msg.push(web_msg.len() as u8);
+        history_msg.extend_from_slice(&web_msg);
+
+        assert!(run_with_raw_history_msg(&history_msg).is_empty());
+    }
+
+    /// Presence of an EMPTY top-level secret still produces a record (the
+    /// consumer filters by length), pinning presence-not-content semantics.
+    #[test]
+    fn test_empty_secret_still_yields_record() {
+        let chat = "5511777776666@s.whatsapp.net";
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                messages: vec![wa::HistorySyncMsg {
+                    message: Some(wa::WebMessageInfo {
+                        key: wa::MessageKey {
+                            remote_jid: Some(chat.to_string()),
+                            from_me: Some(false),
+                            id: Some("EMPTY_SECRET".to_string()),
+                            ..Default::default()
+                        },
+                        message_secret: Some(Vec::new()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let compressed = encode_and_compress(&hs);
+        let result = process_history_sync(compressed, None, false, None).unwrap();
+        assert_eq!(result.msg_secret_records.len(), 1);
+        assert!(result.msg_secret_records[0].secret.is_empty());
     }
 
     #[test]
@@ -1013,7 +1352,7 @@ mod tests {
         let result = process_history_sync(compressed, None, false, None).unwrap();
 
         assert_eq!(result.msg_secret_records.len(), 2);
-        assert_eq!(result.msg_secret_records[0].chat_id, chat);
+        assert_eq!(&*result.msg_secret_records[0].chat_id, chat);
         assert_eq!(result.msg_secret_records[0].msg_id, "HIST_TOP_LEVEL");
         assert_eq!(
             result.msg_secret_records[0].key_participant.as_deref(),

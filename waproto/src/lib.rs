@@ -8,3 +8,12 @@ pub mod whatsapp {
     #[rustfmt::skip]
     include!("whatsapp.rs");
 }
+
+/// Wire tags of every message field in `whatsapp.proto`, generated alongside
+/// the prost code. Hand-written partial decoders must reference these consts
+/// (or compile-time assert against them) instead of magic numbers, so schema
+/// changes surface as compile errors rather than silent wire-format drift.
+pub mod tags {
+    #[rustfmt::skip]
+    include!("tags.rs");
+}

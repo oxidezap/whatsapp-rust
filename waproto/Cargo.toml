@@ -9,7 +9,7 @@ description = "Protocol Buffers definitions for WhatsApp"
 
 [features]
 default = []
-generate = ["dep:prost-build"]
+generate = ["dep:prost-build", "dep:prost-types", "dep:prost", "dep:heck"]
 serde-deserialize = []
 serde-snake-case = ["serde-deserialize"]
 
@@ -19,6 +19,9 @@ serde = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true, optional = true }
+prost-types = { workspace = true, optional = true }
+prost = { workspace = true, features = ["derive"], optional = true }
+heck = { workspace = true, optional = true }
 
 [lints]
 workspace = true

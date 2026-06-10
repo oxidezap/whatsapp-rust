@@ -2988,8 +2988,10 @@ dependencies = [
 name = "waproto"
 version = "0.6.0"
 dependencies = [
+ "heck",
  "prost",
  "prost-build",
+ "prost-types",
  "serde",
 ]
 

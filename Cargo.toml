@@ -73,6 +73,8 @@ metrics = "0.24"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 prost = { version = "0.14.4", default-features = false, features = ["std"] }
 prost-build = { version = "0.14.3", default-features = false }
+prost-types = { version = "0.14.3", default-features = false, features = ["std"] }
+heck = "0.5"
 rand = "0.10"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
