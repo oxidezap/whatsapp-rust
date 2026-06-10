@@ -337,6 +337,18 @@ impl Client {
             rm.key = Some(env.target_message_key.clone());
         }
 
+        // A comment's own messageSecret rides the OUTER envelope (WA Web puts
+        // it on the comment msgData), which substitution would drop. Carry it
+        // onto the dispatched body so app-managed secret storage (Disabled
+        // policy) can still learn it for add-ons targeting the comment.
+        if env.kind == SecretEncKind::EncComment
+            && inner.message_context_info.is_none()
+            && let Some(outer_mci) = msg.message_context_info.as_ref()
+            && outer_mci.message_secret.is_some()
+        {
+            inner.message_context_info = Some(outer_mci.clone());
+        }
+
         // Mirror WA Web `ProcessEditProtocolMsgs`: drop a MESSAGE_EDIT authored
         // outside the parent's edit-processing window (editTs >= parentTs + 20m).
         // The check is on authored time, not "now", so a validly-authored edit

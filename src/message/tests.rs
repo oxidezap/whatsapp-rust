@@ -9662,10 +9662,6 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
             text: Some("great post".to_string()),
             ..Default::default()
         })),
-        message_context_info: Some(wa::MessageContextInfo {
-            message_secret: Some(comment_secret.to_vec()),
-            ..Default::default()
-        }),
         ..Default::default()
     };
     let (payload, iv) = wacore::comment::encrypt_comment_with_secret(
@@ -9688,6 +9684,12 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
             enc_payload: Some(payload),
             enc_iv: Some(iv.to_vec()),
         }),
+        // WA Web ships the comment's own secret on the OUTER envelope (the
+        // comment msgData), not inside the encrypted body.
+        message_context_info: Some(wa::MessageContextInfo {
+            message_secret: Some(comment_secret.to_vec()),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let info = Arc::new(MessageInfo {
@@ -9703,31 +9705,44 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
     });
 
     client.dispatch_parsed_message(msg, &info).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+    // Deadline-poll instead of a fixed sleep so a slow CI cannot race the
+    // event delivery.
     let mut seen = false;
-    while let Ok(event) = rx.try_recv() {
-        if let Event::Message(msg, info) = event.as_ref()
-            && info.id == COMMENT_ID
-        {
-            seen = true;
-            assert_eq!(
-                msg.extended_text_message
-                    .as_ref()
-                    .and_then(|m| m.text.as_deref()),
-                Some("great post"),
-                "the decrypted body must be dispatched"
-            );
-            assert!(
-                msg.enc_comment_message.is_none(),
-                "the envelope must not survive substitution"
-            );
-            assert_eq!(
-                info.comment_target.as_ref().and_then(|k| k.id.as_deref()),
-                Some(PARENT_ID),
-                "the parent post key must surface on the info"
-            );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    'outer: while tokio::time::Instant::now() < deadline {
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Message(msg, info) = event.as_ref()
+                && info.id == COMMENT_ID
+            {
+                seen = true;
+                assert_eq!(
+                    msg.extended_text_message
+                        .as_ref()
+                        .and_then(|m| m.text.as_deref()),
+                    Some("great post"),
+                    "the decrypted body must be dispatched"
+                );
+                assert!(
+                    msg.enc_comment_message.is_none(),
+                    "the envelope must not survive substitution"
+                );
+                assert_eq!(
+                    info.comment_target.as_ref().and_then(|k| k.id.as_deref()),
+                    Some(PARENT_ID),
+                    "the parent post key must surface on the info"
+                );
+                assert_eq!(
+                    msg.message_context_info
+                        .as_ref()
+                        .and_then(|m| m.message_secret.as_deref()),
+                    Some(comment_secret.as_slice()),
+                    "the comment's own secret must survive substitution for app-managed storage"
+                );
+                break 'outer;
+            }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(seen, "the decrypted comment must be dispatched");
 
