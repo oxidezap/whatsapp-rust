@@ -379,6 +379,7 @@ impl Client {
         self.is_ready.store(false, Ordering::Relaxed);
         self.is_connected.store(false, Ordering::Relaxed);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.clear_offline_receipt_buffer();
         self.offline_batch.reset();
         self.outbound_flush.reopen();
 
@@ -491,7 +492,12 @@ impl Client {
 
         // Drain buffered offline receipts into the flush window before
         // closing it, so a disconnect mid-offline-sync still acks the
-        // already-processed backlog (issue #571 semantics).
+        // already-processed backlog (issue #571 semantics). close() only stops
+        // outbound task spawns, not buffering, so a message still in flight can
+        // re-buffer after this drain; those entries are dropped by the
+        // connection-state reset (clear_offline_receipt_buffer) and the server
+        // redelivers their messages on the next connect, where they are
+        // re-acked fresh.
         self.flush_offline_receipts();
         // Prevent late receipt producers from escaping the drain window.
         self.outbound_flush.close();
@@ -648,6 +654,7 @@ impl Client {
         self.pending_device_sync.clear().await;
         // Reset offline sync state for next connection
         self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.clear_offline_receipt_buffer();
         self.offline_batch.reset();
         self.offline_sync_metrics
             .active

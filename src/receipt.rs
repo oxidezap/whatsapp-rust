@@ -562,7 +562,7 @@ impl Client {
         let mut buffer = self
             .offline_receipt_buffer
             .lock()
-            .expect("offline receipt buffer poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self
             .offline_sync_completed
             .load(std::sync::atomic::Ordering::Acquire)
@@ -583,7 +583,7 @@ impl Client {
             &mut *self
                 .offline_receipt_buffer
                 .lock()
-                .expect("offline receipt buffer poisoned"),
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
         if infos.is_empty() {
             return;
@@ -621,6 +621,19 @@ impl Client {
                 }
             }
         });
+    }
+
+    /// Drop receipts a teardown drain missed. Called from the connection-state
+    /// resets: a receipt buffered after `disconnect()`'s drain belongs to a
+    /// message that was never acked, so the server redelivers it on the next
+    /// connect and it gets re-acked fresh there. Carrying the stale entry over
+    /// would mix a dead connection's receipts into the next connection's
+    /// aggregate flush.
+    pub(crate) fn clear_offline_receipt_buffer(&self) {
+        *self
+            .offline_receipt_buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Vec::new();
     }
 
     /// Spawn an async nack so the caller doesn't await network I/O while
@@ -2443,12 +2456,38 @@ mod tests {
         // Flush drains everything and releases the backing capacity, so no
         // memory is held between offline windows.
         client.flush_offline_receipts();
-        let buffer = client.offline_receipt_buffer.lock().expect("buffer");
-        assert!(buffer.is_empty());
-        assert_eq!(
-            buffer.capacity(),
-            0,
-            "drained buffer must not retain capacity"
+        {
+            let buffer = client.offline_receipt_buffer.lock().expect("buffer");
+            assert!(buffer.is_empty());
+            assert_eq!(
+                buffer.capacity(),
+                0,
+                "drained buffer must not retain capacity"
+            );
+        }
+
+        // Teardown straggler: a receipt buffered after disconnect()'s drain
+        // (flag still false on the next connection) must be dropped by the
+        // connection-state reset instead of leaking into the next
+        // connection's aggregate flush; the server redelivers its message.
+        client
+            .offline_sync_completed
+            .store(false, std::sync::atomic::Ordering::Release);
+        let straggler = offline_info(
+            "OFF4",
+            "5511999990000@s.whatsapp.net",
+            "5511999990000@s.whatsapp.net",
+            false,
+        );
+        assert!(client.try_buffer_offline_receipt(&straggler));
+        client.clear_offline_receipt_buffer();
+        assert!(
+            client
+                .offline_receipt_buffer
+                .lock()
+                .expect("buffer")
+                .is_empty(),
+            "connection reset must drop stale buffered receipts"
         );
     }
 }
