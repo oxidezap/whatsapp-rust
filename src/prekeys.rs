@@ -370,10 +370,13 @@ impl Client {
         let id = if plan.gen_count > 0 {
             plan.gen_start
         } else {
-            // Empty window: generate at NEXT and collapse FIRST onto it.
-            device_snapshot
+            // Empty window: generate at NEXT and collapse FIRST onto it. This
+            // path bypasses the planner's boundary handling, so wrap to 1 at
+            // the 24-bit edge like the planner's collapse does.
+            let raw = device_snapshot
                 .next_pre_key_id
-                .max(plan.window_start.saturating_add(1))
+                .max(plan.window_start.saturating_add(1));
+            if raw > MAX_PREKEY_ID { 1 } else { raw }
         };
         let key_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
         let record = new_pre_key_record(id, &key_pair);
@@ -574,6 +577,12 @@ impl Client {
                 first_unupload_pre_key_id: plan.window_start.max(last_id.saturating_add(1)),
             })
             .await;
+        // The abandon watermark must be durable BEFORE the fallible send: a
+        // crash after a failed IQ would otherwise reload FIRST=window_start
+        // and re-offer ids that may already be in the server pool.
+        if let Err(e) = self.persistence_manager.flush().await {
+            log::warn!("failed to flush prekey watermarks: {e:?}");
+        }
 
         self.execute(spec).await?;
 
