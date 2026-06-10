@@ -1998,6 +1998,40 @@ mod tests {
         emit(&mut raw, tags::history_sync_msg::MESSAGE, &web);
         add("poll field with varint wire type", raw);
 
+        // Repeated occurrences of the same carrier: prost merges their
+        // contextInfo fields; the eager overwrite-when-present walk must agree.
+        let etm_fwd = wa::message::ExtendedTextMessage {
+            context_info: Some(Box::new(wa::ContextInfo {
+                is_forwarded: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let etm_plain = wa::message::ExtendedTextMessage {
+            text: Some("x".into()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        for order in [[&etm_fwd, &etm_plain], [&etm_plain, &etm_fwd]] {
+            let mut msg = Vec::new();
+            for etm in order {
+                emit(&mut msg, tags::message::EXTENDED_TEXT_MESSAGE, etm);
+            }
+            let mci = wa::MessageContextInfo {
+                message_secret: Some(secret.clone()),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            emit(&mut msg, tags::message::MESSAGE_CONTEXT_INFO, &mci);
+            let mut web = Vec::new();
+            emit(&mut web, tags::web_message_info::KEY, &key_a12);
+            emit(&mut web, tags::web_message_info::MESSAGE, &msg);
+            let mut raw = Vec::new();
+            emit(&mut raw, tags::history_sync_msg::MESSAGE, &web);
+            add("repeated carrier occurrences (merge)", raw);
+        }
+
         // Unknown field with proto2 group wire type next to a secret: prost
         // skips the group; the fast path must defer rather than reject.
         let mut web = Vec::new();

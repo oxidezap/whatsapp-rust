@@ -172,6 +172,35 @@ impl Drop for InflateReader<'_> {
     }
 }
 
+/// Grow the output buffer by projecting the decompressed size from the
+/// expansion ratio observed so far, instead of blind capacity doubling. A
+/// high-ratio stream (the up-front `2x compressed` guess undershot) then
+/// converges in one or two reallocations sized near the real total, rather
+/// than a doubling chain whose copies and final overshoot dominate both the
+/// allocated-bytes count and the peak.
+fn grow_by_observed_ratio(
+    scratch: &mut Vec<u8>,
+    decompressor: &Decompress,
+    compressed_len: usize,
+    cap: usize,
+) {
+    let consumed = decompressor.total_in() as usize;
+    let produced = decompressor.total_out() as usize;
+    let remaining_in = compressed_len.saturating_sub(consumed) as u64;
+    let projected = if consumed > 0 && produced > 0 {
+        // 9/8 margin: early bytes compress worse than the warmed-up tail, so
+        // the observed ratio slightly underestimates the remainder.
+        (produced as u64).saturating_mul(remaining_in) / consumed as u64 * 9 / 8
+    } else {
+        0
+    };
+    // Floor keeps progress guaranteed when the projection is tiny.
+    let want = (projected.min(usize::MAX as u64) as usize)
+        .max(64 * 1024)
+        .min(cap - scratch.len());
+    scratch.reserve(want);
+}
+
 /// Decompress zlib data using a pooled decompressor.
 ///
 /// Reuses the per-thread `flate2::Decompress` internal state (~48 KB) across
@@ -232,9 +261,7 @@ pub fn decompress_zlib_pooled(compressed: &[u8], max_size: u64) -> io::Result<Ve
             match status {
                 Status::StreamEnd => break,
                 Status::Ok => {
-                    // Grow but never past the cap
-                    let want = scratch.capacity().max(4096).min(cap - scratch.len());
-                    scratch.reserve(want);
+                    grow_by_observed_ratio(scratch, decompressor, compressed.len(), cap);
                 }
                 Status::BufError => {
                     if decompressor.total_in() == prev_in && decompressor.total_out() == prev_out {
@@ -243,8 +270,7 @@ pub fn decompress_zlib_pooled(compressed: &[u8], max_size: u64) -> io::Result<Ve
                             "zlib stream truncated (no progress)",
                         ));
                     }
-                    let want = scratch.capacity().max(4096).min(cap - scratch.len());
-                    scratch.reserve(want);
+                    grow_by_observed_ratio(scratch, decompressor, compressed.len(), cap);
                 }
             }
         }
@@ -317,6 +343,28 @@ mod tests {
         let compressed = zlib(&original);
         let mut r = InflateReader::new(&compressed, 4096);
         assert!(r.ensure(1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn pooled_high_ratio_stream_roundtrips() {
+        // ~50x expansion: the 2x up-front guess undershoots badly, so this
+        // exercises the ratio-projected growth path end to end.
+        let original: Vec<u8> = (0..4_000_000u32).map(|i| ((i / 1024) % 7) as u8).collect();
+        let compressed = zlib(&original);
+        assert!(
+            compressed.len() < original.len() / 20,
+            "fixture not high-ratio"
+        );
+        let out = decompress_zlib_pooled(&compressed, 64 * 1024 * 1024).unwrap();
+        assert_eq!(out, original);
+        // The projection should land near the real size, not at a doubling
+        // overshoot far past it.
+        assert!(
+            out.capacity() < original.len() * 2,
+            "capacity {} vs data {}",
+            out.capacity(),
+            original.len()
+        );
     }
 
     #[test]
