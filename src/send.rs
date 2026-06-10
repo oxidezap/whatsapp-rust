@@ -4736,6 +4736,9 @@ mod jid_into_convention {
         let _ = client
             .send_reaction(&jid, wa::MessageKey::default(), "x")
             .await;
+        let _ = client
+            .keep_message(&jid, wa::MessageKey::default(), true)
+            .await;
         // Owned style: moves, no clone. Each method consumes its own copy so
         // the whole core surface is pinned, not just send_message.
         let _ = client.send_message(jid.clone(), msg.clone()).await;
