@@ -30,7 +30,7 @@ pub(crate) struct MsgSecretWriteBuffer {
     /// Serializes backend writes: a snapshot is taken under this lock, so a
     /// later writer always carries values at least as new as any earlier
     /// in-flight write, and a stale upsert can never land after a fresh one.
-    write_lock: tokio::sync::Mutex<()>,
+    write_lock: async_lock::Mutex<()>,
     drain_in_flight: AtomicBool,
     backend: Arc<dyn crate::store::traits::Backend>,
     runtime: Arc<dyn wacore::runtime::Runtime>,
@@ -48,7 +48,7 @@ impl MsgSecretWriteBuffer {
     ) -> Arc<Self> {
         Arc::new(Self {
             pending: Mutex::new(HashMap::new()),
-            write_lock: tokio::sync::Mutex::new(()),
+            write_lock: async_lock::Mutex::new(()),
             drain_in_flight: AtomicBool::new(false),
             backend,
             runtime,
