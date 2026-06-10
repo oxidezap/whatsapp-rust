@@ -912,7 +912,10 @@ impl Client {
         own_sending_jid: &Jid,
     ) -> Option<(std::sync::Arc<Vec<Jid>>, Vec<Jid>)> {
         let cached_map = self.skdm_device_map(group_jid).await;
-        match self.resolve_group_devices_memoized(group, group_info).await {
+        match self
+            .resolve_group_devices_memoized(group, group_info, own_sending_jid)
+            .await
+        {
             Ok(all_devices) => {
                 let needs_skdm =
                     self.filter_skdm_targets(group_jid, &all_devices, &cached_map, own_sending_jid);
@@ -1356,6 +1359,11 @@ impl Client {
                 crate::types::message::AddressingMode::Pn => (own_jid.clone(), "pn"),
             };
 
+            // Memo identity must be the CACHED Arc: ensure_self_in_group clones
+            // a fresh GroupInfo whenever self is absent from the snapshot, which
+            // would make the memo miss on every send to such groups. The memoized
+            // resolver applies the same self-append internally.
+            let group_info_for_memo = std::sync::Arc::clone(&group_info);
             // resolve_skdm_targets and prepare_group_stanza both read the
             // participant list and expect self to be present.
             let group_info = ensure_self_in_group(group_info, &own_sending_jid);
@@ -1423,7 +1431,12 @@ impl Client {
                 (None, None)
             } else {
                 match self
-                    .resolve_skdm_targets_memoized(&to, &to_str, &group_info, &own_sending_jid)
+                    .resolve_skdm_targets_memoized(
+                        &to,
+                        &to_str,
+                        &group_info_for_memo,
+                        &own_sending_jid,
+                    )
                     .await
                 {
                     Some((all, needs)) => (Some(all), Some(needs)),

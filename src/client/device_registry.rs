@@ -91,7 +91,18 @@ impl Client {
         &self,
         group: &Jid,
         group_info: &Arc<wacore::client::context::GroupInfo>,
+        own_sending_jid: &Jid,
     ) -> Result<Arc<Vec<Jid>>, anyhow::Error> {
+        // Store-backed registry or mapping caches can be written by OTHER
+        // processes (e.g. shared Redis across pods), which this process's
+        // topology tracker cannot observe; the memo's freshness contract
+        // doesn't hold there, so it is disabled and every send resolves.
+        if !self.group_devices_memo_enabled {
+            return Ok(Arc::new(
+                self.resolve_group_devices_uncached(group_info, own_sending_jid)
+                    .await?,
+            ));
+        }
         // Load the generation BEFORE resolving (do NOT move this after
         // get_user_devices): a write racing the resolve bumps it afterwards,
         // so the memo we store is already stale by its own stamp and the next
@@ -130,47 +141,30 @@ impl Client {
             }
         }
 
-        let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
-        let jids_to_resolve: Vec<Jid> = group_info
-            .participants
-            .iter()
-            .map(|jid| {
-                if is_lid_mode
-                    && jid.is_lid()
-                    && let Some(pn) = group_info.phone_jid_for_lid_user(&jid.user)
-                {
-                    return pn.to_non_ad();
-                }
-                jid.to_non_ad()
-            })
-            .collect();
+        let devices = self
+            .resolve_group_devices_uncached(group_info, own_sending_jid)
+            .await?;
 
-        let mut devices = self.get_user_devices(&jids_to_resolve).await?;
-        if is_lid_mode {
-            // WA Web expects LID addressing in SKDM <to> nodes for LID groups.
-            devices = devices
-                .into_iter()
-                .map(|d| group_info.phone_device_jid_into_lid(d))
-                .collect();
-        }
-
-        // Member identifiers in both namespaces. The topology log records
-        // both keys of every write, so a member's change always intersects:
-        // its group-facing identity is in `participants` and its
-        // registry-facing identity is in the resolved device users.
+        // Member identifiers in both namespaces, so the scoped-invalidation
+        // check can match however a write was keyed: writes record every
+        // resolved lookup alias (see DeviceRegistryCache::insert callers), and
+        // this set carries each member's group-facing identity (participant
+        // user + mapped counterpart) plus the namespace the resolved device
+        // JIDs ended up in.
         let mut members = std::collections::HashSet::with_capacity(
-            group_info.participants.len() * 2 + devices.len(),
+            group_info.participants.len() * 2 + devices.len() + 2,
         );
         for participant in &group_info.participants {
             members.insert(participant.user.clone());
-            if participant.is_lid() {
-                if let Some(pn) = group_info.phone_jid_for_lid_user(&participant.user) {
-                    members.insert(pn.user.clone());
-                }
+            if participant.is_lid()
+                && let Some(pn) = group_info.phone_jid_for_lid_user(&participant.user)
+            {
+                members.insert(pn.user.clone());
             } else if let Some(lid) = group_info.lid_user_for_phone_user(&participant.user) {
                 members.insert(lid.clone());
             }
         }
+        members.insert(own_sending_jid.user.clone());
         for device in &devices {
             members.insert(device.user.clone());
         }
@@ -187,6 +181,56 @@ impl Client {
                 }),
             )
             .await;
+        Ok(devices)
+    }
+
+    /// The memo's recompute body: derive the resolve set from `group_info`
+    /// (participants + LID normalization, appending self when the server
+    /// snapshot omitted it — mirroring `ensure_self_in_group`, so keying the
+    /// memo off the pre-ensure Arc stays equivalent) and resolve it.
+    async fn resolve_group_devices_uncached(
+        &self,
+        group_info: &Arc<wacore::client::context::GroupInfo>,
+        own_sending_jid: &Jid,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
+        let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
+        let mut jids_to_resolve: Vec<Jid> = group_info
+            .participants
+            .iter()
+            .map(|jid| {
+                if is_lid_mode
+                    && jid.is_lid()
+                    && let Some(pn) = group_info.phone_jid_for_lid_user(&jid.user)
+                {
+                    return pn.to_non_ad();
+                }
+                jid.to_non_ad()
+            })
+            .collect();
+        if !group_info
+            .participants
+            .iter()
+            .any(|participant| wacore_binary::JidExt::is_same_user_as(participant, own_sending_jid))
+        {
+            let own = if is_lid_mode
+                && own_sending_jid.is_lid()
+                && let Some(pn) = group_info.phone_jid_for_lid_user(&own_sending_jid.user)
+            {
+                pn.to_non_ad()
+            } else {
+                own_sending_jid.to_non_ad()
+            };
+            jids_to_resolve.push(own);
+        }
+
+        let mut devices = self.get_user_devices(&jids_to_resolve).await?;
+        if is_lid_mode {
+            // WA Web expects LID addressing in SKDM <to> nodes for LID groups.
+            devices = devices
+                .into_iter()
+                .map(|d| group_info.phone_device_jid_into_lid(d))
+                .collect();
+        }
         Ok(devices)
     }
 
@@ -490,6 +534,11 @@ impl Client {
             if let Err(e) = self.persistence_manager.backend().delete_devices(key).await {
                 warn!("Failed to delete device registry from DB for {key}: {e}");
             }
+            // Invalidate again after the delete: a concurrent reader that read
+            // the doomed DB row can promote() it back between the first
+            // invalidate and the delete commit (same guard as the canonical
+            // flip path in update_device_list).
+            self.device_registry_cache.invalidate(key).await;
         }
 
         debug!("Invalidated device cache for user: {} ({:?})", user, lookup);
@@ -939,11 +988,11 @@ impl Client {
 
                 record.user = lid.to_string();
 
-                let backend_write = backend.update_device_list(record.clone()).await;
-                // The backend row may have changed even when the write errors,
-                // so the change is recorded before the early return.
-                self.device_topology.record([pn, lid]);
-                if let Err(e) = backend_write {
+                if let Err(e) = backend.update_device_list(record.clone()).await {
+                    // The backend row may have changed even on error, so the
+                    // change is recorded before the early return; the success
+                    // path records once via the fused cache insert below.
+                    self.device_topology.record([pn, lid]);
                     warn!("Failed to migrate device registry to LID: {}", e);
                     return;
                 }
@@ -1067,7 +1116,7 @@ mod tests {
         ));
 
         let first = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve should succeed");
         assert_eq!(first.len(), 3, "0+5 for A, 0 for B");
@@ -1077,7 +1126,7 @@ mod tests {
         // a silent recompute).
         setup_device_record(&client, user_a, &[0]).await;
         let stale = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve should succeed");
         assert_eq!(
@@ -1089,7 +1138,7 @@ mod tests {
         // sees the new record.
         client.device_topology.record([user_a]);
         let fresh = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve should succeed");
         assert_eq!(fresh.len(), 2, "post-bump resolve must see the raw change");
@@ -1102,7 +1151,11 @@ mod tests {
             AddressingMode::Pn,
         ));
         let after_refresh = client
-            .resolve_group_devices_memoized(&group, &refreshed_info)
+            .resolve_group_devices_memoized(
+                &group,
+                &refreshed_info,
+                &refreshed_info.participants[0],
+            )
             .await
             .expect("resolve should succeed");
         assert_eq!(
@@ -1127,7 +1180,7 @@ mod tests {
         let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(user_a)], AddressingMode::Pn));
 
         let first = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
         assert_eq!(first.len(), 2);
@@ -1138,7 +1191,7 @@ mod tests {
         client.device_topology.record(["5511000000001"]);
         client.device_topology.record(["5511000000002"]);
         let stale = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
         assert_eq!(
@@ -1149,7 +1202,7 @@ mod tests {
         // A member's change recomputes and sees the raw change.
         client.device_topology.record([user_a]);
         let fresh = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
         assert_eq!(fresh.len(), 1, "member change must recompute");
@@ -1158,7 +1211,7 @@ mod tests {
         setup_device_record(&client, user_a, &[0, 5, 9]).await;
         client.device_topology.record_global();
         let after_global = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
         assert_eq!(after_global.len(), 3, "global event must recompute");
@@ -1170,7 +1223,7 @@ mod tests {
             client.device_topology.record(["5511000000003"]);
         }
         let after_overflow = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
         assert_eq!(after_overflow.len(), 1, "log overflow must recompute");
@@ -1190,7 +1243,7 @@ mod tests {
         let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(pn)], AddressingMode::Pn));
 
         let first = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
         assert_eq!(first.len(), 1);
@@ -1208,13 +1261,48 @@ mod tests {
             .await
             .expect("mapping");
         let fresh = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
         assert_eq!(
             fresh.len(),
             2,
             "a member's mapping change must invalidate the memo"
+        );
+    }
+
+    /// Review fix: a server group snapshot that omits self used to be
+    /// rebuilt by ensure_self_in_group on every send (fresh Arc), making the
+    /// memo permanently miss. Keying off the pre-ensure Arc and appending
+    /// self inside the derivation keeps the identity stable.
+    #[tokio::test]
+    async fn memo_hits_when_self_missing_from_group_snapshot() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000080@g.us".parse().expect("group jid");
+        let member = "5511999990014";
+        let own = Jid::pn("5511999990015");
+        setup_device_record(&client, member, &[0]).await;
+        setup_device_record(&client, "5511999990015", &[0, 3]).await;
+
+        // Self deliberately absent from the snapshot.
+        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(member)], AddressingMode::Pn));
+
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info, &own)
+            .await
+            .expect("resolve");
+        assert_eq!(first.len(), 3, "member device + own's two devices");
+
+        let second = client
+            .resolve_group_devices_memoized(&group, &group_info, &own)
+            .await
+            .expect("resolve");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a self-missing group snapshot must still produce memo hits"
         );
     }
 
@@ -1255,7 +1343,7 @@ mod tests {
 
         let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(pn)], AddressingMode::Pn));
         let first = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
         assert_eq!(first.len(), 1);
@@ -1284,7 +1372,7 @@ mod tests {
             .expect("LID-keyed update");
 
         let fresh = client
-            .resolve_group_devices_memoized(&group, &group_info)
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
         assert_eq!(

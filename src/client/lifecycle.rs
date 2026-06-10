@@ -228,6 +228,8 @@ impl Client {
                 Arc::clone(&device_topology),
             ),
             device_topology,
+            group_devices_memo_enabled: cache_config.cache_stores.device_registry_cache.is_none()
+                && cache_config.cache_stores.lid_pn_cache.is_none(),
             group_devices_memo: Cache::builder()
                 .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
                 .build(),

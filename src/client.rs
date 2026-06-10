@@ -534,6 +534,11 @@ pub struct Client {
     /// Shared topology tracker (generation + changed-users log). LidPnCache
     /// records mapping changes into it; the memo validates against it.
     pub(crate) device_topology: Arc<crate::client::device_topology::DeviceTopology>,
+    /// Whether the group-devices memo may be used: false when the registry
+    /// or LID-PN caches are store-backed (a shared external store can be
+    /// written by other processes, which the in-process topology tracker
+    /// cannot observe).
+    pub(crate) group_devices_memo_enabled: bool,
     /// Per-group memo of the fully resolved (LID-converted) device list,
     /// validated by GroupInfo identity + the device topology. Serves the
     /// per-send full-set resolution in `resolve_skdm_targets` so a warm
