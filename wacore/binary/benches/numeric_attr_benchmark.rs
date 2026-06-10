@@ -1,10 +1,11 @@
-use iai_callgrind::{
-    Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
-};
-use std::hint::black_box;
+use divan::black_box;
 
 use compact_str::CompactString;
 use wacore_binary::node::NodeValue;
+
+fn main() {
+    divan::main();
+}
 
 /// Baseline: what the codebase does today — `value.to_string()` then Into<NodeValue>.
 /// Heap-allocates a `String`, then `CompactString::from(String)` re-uses or copies.
@@ -43,37 +44,37 @@ fn proposed_i64(n: i64) -> NodeValue {
     NodeValue::String(CompactString::from(buf.format(n)))
 }
 
-#[library_benchmark]
+#[divan::bench]
 fn bench_baseline_u32() -> NodeValue {
     black_box(baseline_u32(black_box(12345)))
 }
 
-#[library_benchmark]
+#[divan::bench]
 fn bench_proposed_u32() -> NodeValue {
     black_box(proposed_u32(black_box(12345)))
 }
 
-#[library_benchmark]
+#[divan::bench]
 fn bench_baseline_u64() -> NodeValue {
     black_box(baseline_u64(black_box(1234567890123u64)))
 }
 
-#[library_benchmark]
+#[divan::bench]
 fn bench_proposed_u64() -> NodeValue {
     black_box(proposed_u64(black_box(1234567890123u64)))
 }
 
-#[library_benchmark]
+#[divan::bench]
 fn bench_baseline_i64() -> NodeValue {
     black_box(baseline_i64(black_box(-1234567890123i64)))
 }
 
-#[library_benchmark]
+#[divan::bench]
 fn bench_proposed_i64() -> NodeValue {
     black_box(proposed_i64(black_box(-1234567890123i64)))
 }
 
-#[library_benchmark]
+#[divan::bench]
 fn bench_baseline_loop_100_u64() -> u64 {
     let mut acc: u64 = 0;
     for i in 0u64..100 {
@@ -83,7 +84,7 @@ fn bench_baseline_loop_100_u64() -> u64 {
     black_box(acc)
 }
 
-#[library_benchmark]
+#[divan::bench]
 fn bench_proposed_loop_100_u64() -> u64 {
     let mut acc: u64 = 0;
     for i in 0u64..100 {
@@ -92,22 +93,3 @@ fn bench_proposed_loop_100_u64() -> u64 {
     }
     black_box(acc)
 }
-
-library_benchmark_group!(
-    name = bench_group;
-    benchmarks =
-        bench_baseline_u32,
-        bench_proposed_u32,
-        bench_baseline_u64,
-        bench_proposed_u64,
-        bench_baseline_i64,
-        bench_proposed_i64,
-        bench_baseline_loop_100_u64,
-        bench_proposed_loop_100_u64,
-);
-
-main!(
-    config = LibraryBenchmarkConfig::default()
-        .tool(Callgrind::default());
-    library_benchmark_groups = bench_group
-);

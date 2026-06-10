@@ -1,0 +1,53 @@
+name: CodSpeed
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allows CodSpeed to trigger backtest performance analysis to generate
+  # initial baseline data.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # for OpenID Connect authentication with CodSpeed
+
+concurrency:
+  group: codspeed-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  PROTOC_VERSION: "3.25.3"
+
+jobs:
+  benchmarks:
+    name: Run CodSpeed benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-05
+
+      - name: Install tools (protoc, cargo-codspeed)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@4.7.0
+
+      - name: Cache Rust registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ runner.os }}-cargo-codspeed
+          cache-targets: "false"
+
+      - name: Build the benchmark targets
+        run: cargo codspeed build -p wacore -p wacore-binary -p wacore-libsignal
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          mode: simulation
+          run: cargo codspeed run

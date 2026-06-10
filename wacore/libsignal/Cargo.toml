@@ -36,8 +36,8 @@ waproto = { workspace = true }
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 
 [dev-dependencies]
+divan = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
-iai-callgrind = { workspace = true }
 
 [[bench]]
 name = "libsignal_benchmark"
