@@ -537,6 +537,94 @@ mod tests {
         (backend, processor, patch_list, stale_index_mac)
     }
 
+    /// Locks the move-and-restore handoff: the snapshot and each patch move into
+    /// blocking closures (instead of being deep-cloned for the 'static bound) and
+    /// must come back on the returned PatchList, because the caller reads
+    /// pl.snapshot/pl.patches afterwards (get_missing_key_ids, has_more bookkeeping).
+    #[tokio::test]
+    async fn process_patch_list_returns_snapshot_and_patches_to_caller() {
+        let (_backend, processor, mut patch_list, _) = snapshot_resync_scenario().await;
+
+        let key_id_bytes = b"snap_key_id".to_vec();
+        let master_key = [9u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let plaintext = wa::SyncActionData {
+            value: Some(wa::SyncActionValue {
+                timestamp: Some(3000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        for (version, index_mac) in [(3u64, [0x22u8; 32]), (4, [0x33; 32])] {
+            let mutation = create_encrypted_mutation(
+                wa::syncd_mutation::SyncdOperation::Set,
+                &index_mac,
+                &plaintext,
+                &keys,
+                &key_id_bytes,
+            );
+            patch_list.patches.push(wa::SyncdPatch {
+                mutations: vec![mutation],
+                version: Some(wa::SyncdVersion {
+                    version: Some(version),
+                }),
+                key_id: Some(wa::KeyId {
+                    id: Some(key_id_bytes.clone()),
+                }),
+                ..Default::default()
+            });
+        }
+
+        let (mutations, state, pl) = processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("snapshot + patches should process");
+
+        assert_eq!(state.version, 4);
+        assert_eq!(
+            mutations.len(),
+            3,
+            "snapshot record + one mutation per patch"
+        );
+
+        let snapshot = pl.snapshot.as_ref().expect("snapshot handed back");
+        assert_eq!(
+            snapshot.version.as_ref().and_then(|v| v.version),
+            Some(2),
+            "the same snapshot must come back, not a substitute"
+        );
+        assert_eq!(snapshot.records.len(), 1, "snapshot records preserved");
+
+        let patch_versions: Vec<_> = pl
+            .patches
+            .iter()
+            .map(|p| p.version.as_ref().and_then(|v| v.version))
+            .collect();
+        assert_eq!(
+            patch_versions,
+            vec![Some(3), Some(4)],
+            "patches handed back in processing order"
+        );
+        let patch_index_macs: Vec<_> = pl
+            .patches
+            .iter()
+            .map(|p| {
+                p.mutations[0]
+                    .record
+                    .as_ref()
+                    .and_then(|r| r.index.as_ref())
+                    .and_then(|i| i.blob.as_deref())
+                    .map(|b| b[0])
+            })
+            .collect();
+        assert_eq!(
+            patch_index_macs,
+            vec![Some(0x22), Some(0x33)],
+            "each patch keeps its own mutations through the handoff"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_resync_drops_stale_mutation_macs() {
         let (backend, processor, patch_list, stale_index_mac) = snapshot_resync_scenario().await;

@@ -272,7 +272,7 @@ impl AppStateProcessor {
         // (persisted >= incoming) is discarded ("skip applying syncd old version") so it can't
         // roll the collection backward. No-op on the benign first-sync path, where snapshots
         // are requested only at version 0.
-        let snapshot_to_apply = pl.snapshot.as_ref().filter(|snapshot| {
+        let snapshot_fresh = pl.snapshot.as_ref().is_some_and(|snapshot| {
             let snapshot_version = snapshot.version.as_ref().and_then(|v| v.version).unwrap_or(0);
             if snapshot_is_stale(state.version, snapshot_version) {
                 log::warn!(
@@ -284,27 +284,30 @@ impl AppStateProcessor {
             }
             true
         });
-        if let Some(snapshot) = snapshot_to_apply {
+        if snapshot_fresh && let Some(snapshot) = pl.snapshot.take() {
             let keys_map = self.key_cache.lock().await.clone();
-            let snapshot_clone = snapshot.clone();
             let collection_name_owned = collection_name.to_string();
 
-            // Offload CPU-intensive snapshot processing to a blocking thread
+            // Offload CPU-intensive snapshot processing to a blocking thread. The
+            // snapshot moves into the closure (its 'static bound used to force a
+            // multi-MB deep clone on bootstrap) and comes back via the return tuple
+            // because the caller still reads pl.snapshot (get_missing_key_ids).
             let result = crate::runtime::blocking(&*self.runtime, move || {
                 let mut snapshot_state = HashState::default();
                 let result = process_snapshot(
-                    &snapshot_clone,
+                    &snapshot,
                     &mut snapshot_state,
                     |key_id| lookup_app_state_key(&keys_map, key_id),
                     validate_macs,
                     &collection_name_owned,
                 )?;
-                Ok::<_, crate::appstate::AppStateError>((result, snapshot_state))
+                Ok::<_, crate::appstate::AppStateError>((result, snapshot_state, snapshot))
             })
             .await
             .map_err(|e| anyhow!("{}", e))?;
 
-            let (snapshot_result, snapshot_state) = result;
+            let (snapshot_result, snapshot_state, snapshot) = result;
+            pl.snapshot = Some(snapshot);
             state = snapshot_state;
 
             // Snapshot owns the whole collection: move its Vec into the empty
@@ -365,12 +368,18 @@ impl AppStateProcessor {
             }
         }
 
-        // Snapshot the key cache once for all patches (prefetch_keys already populated it)
-        let keys_map = self.key_cache.lock().await.clone();
+        // Snapshot the key cache once for all patches (prefetch_keys already populated
+        // it); Arc so the per-patch closure handoff is a refcount bump, not a map copy.
+        let keys_map = Arc::new(self.key_cache.lock().await.clone());
         let collection_name_owned = collection_name.to_string();
 
-        // Process patches
-        for patch in &pl.patches {
+        // Each patch moves into its blocking closure and comes back via the return
+        // tuple: the 'static bound used to force a full deep clone per patch
+        // (multi-MB once external mutations are inlined), and the caller still
+        // reads pl.patches afterwards (get_missing_key_ids).
+        let patches = std::mem::take(&mut pl.patches);
+        let mut processed_patches = Vec::with_capacity(patches.len());
+        for patch in patches {
             // Collect index MACs we need to look up (pre-allocate with upper bound)
             let mut need_db_lookup: Vec<Vec<u8>> = Vec::with_capacity(patch.mutations.len());
             for m in &patch.mutations {
@@ -390,31 +399,31 @@ impl AppStateProcessor {
                 .get_mutation_macs(collection_name, &need_db_lookup)
                 .await?;
 
-            // Clone data for blocking task
-            let patch_clone = patch.clone();
             let state_clone = state.clone();
             let keys = keys_map.clone();
             let coll = collection_name_owned.clone();
 
             // Offload CPU-intensive patch processing to a blocking thread
-            let result = crate::runtime::blocking(&*self.runtime, move || {
+            let (result, patch) = crate::runtime::blocking(&*self.runtime, move || {
                 let get_prev_value_mac = |index_mac: &[u8]| -> Result<
                     Option<Vec<u8>>,
                     crate::appstate::AppStateError,
                 > { Ok(db_prev.get(index_mac).cloned()) };
 
                 let mut state = state_clone;
-                process_patch(
-                    &patch_clone,
+                let result = process_patch(
+                    &patch,
                     &mut state,
                     |key_id| lookup_app_state_key(&keys, key_id),
                     get_prev_value_mac,
                     validate_macs,
                     &coll,
-                )
+                )?;
+                Ok::<_, crate::appstate::AppStateError>((result, patch))
             })
             .await
             .map_err(|e| anyhow!("{}", e))?;
+            processed_patches.push(patch);
 
             // Update local state with the result from the blocking task
             state = result.state;
@@ -436,6 +445,7 @@ impl AppStateProcessor {
                     .await?;
             }
         }
+        pl.patches = processed_patches;
 
         // Handle case where we only have a snapshot and no patches
         if pl.patches.is_empty() && pl.snapshot.is_some() {
