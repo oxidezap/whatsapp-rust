@@ -90,6 +90,37 @@ impl Client {
         UserLookupKeys::Unknown { user: user.into() }
     }
 
+    /// Server-aware variant of `resolve_lookup_keys` for callers holding a
+    /// full `Jid`: a LID user can only key the lid->pn direction and a PN
+    /// user only pn->lid, so the known namespace removes the blind second
+    /// probe (one `lid_pn_cache` lookup per member instead of two, on every
+    /// group send). Other namespaces keep the two-probe fallback.
+    async fn resolve_lookup_keys_for_jid(&self, jid: &Jid) -> UserLookupKeys {
+        if jid.server == wacore_binary::Server::Lid {
+            if let Some(pn) = self.lid_pn_cache.get_phone_number(&jid.user).await {
+                return UserLookupKeys::LidWithPn {
+                    lid: jid.user.as_str().into(),
+                    pn: pn.into(),
+                };
+            }
+            return UserLookupKeys::Unknown {
+                user: jid.user.as_str().into(),
+            };
+        }
+        if jid.server == wacore_binary::Server::Pn {
+            if let Some(lid) = self.lid_pn_cache.get_current_lid(&jid.user).await {
+                return UserLookupKeys::PnWithLid {
+                    lid,
+                    pn: jid.user.as_str().into(),
+                };
+            }
+            return UserLookupKeys::Unknown {
+                user: jid.user.as_str().into(),
+            };
+        }
+        self.resolve_lookup_keys(&jid.user).await
+    }
+
     /// Owned-key variant of `resolve_lookup_keys`. Test-only: production callers
     /// use the borrowed `resolve_lookup_keys(..).all_keys()` to avoid the churn.
     #[cfg(test)]
@@ -656,7 +687,7 @@ impl Client {
         // backend take `&str`, so going through `get_lookup_keys` (which re-owns
         // the already-cloned keys into a `Vec<String>`) just churns per member on
         // every group send. `lookup` owns the key Strings for the duration here.
-        let lookup = self.resolve_lookup_keys(&jid.user).await;
+        let lookup = self.resolve_lookup_keys_for_jid(jid).await;
 
         // L1: device_registry_cache (moka, fast)
         for key in lookup.all_keys() {
@@ -824,6 +855,43 @@ mod tests {
             .device_registry_cache
             .insert(user.into(), Arc::new(record))
             .await;
+    }
+
+    /// The server-aware probe must resolve the same canonical record as the
+    /// blind two-probe for both namespaces: a LID jid via its lid->pn mapping
+    /// and a PN jid via pn->lid, plus the unmapped-PN fallback.
+    #[tokio::test]
+    async fn server_aware_probe_resolves_both_namespaces() {
+        let client = create_test_client().await;
+        let pn = "5511999990000";
+        let lid = "100000000000001";
+        client
+            .add_lid_pn_mapping(lid, pn, crate::lid_pn_cache::LearningSource::Usync)
+            .await
+            .expect("mapping should persist");
+        setup_device_record(&client, pn, &[0, 7]).await;
+
+        let via_pn = client
+            .get_devices_from_registry(&Jid::pn(pn))
+            .await
+            .expect("PN jid must resolve via pn->lid probe");
+        assert_eq!(via_pn.len(), 2);
+        let via_lid = client
+            .get_devices_from_registry(&Jid::lid(lid))
+            .await
+            .expect("LID jid must resolve via lid->pn probe");
+        assert_eq!(via_lid.len(), 2);
+
+        // Unmapped PN still resolves through its own key.
+        let bare = "5511888880000";
+        setup_device_record(&client, bare, &[0]).await;
+        assert!(
+            client
+                .get_devices_from_registry(&Jid::pn(bare))
+                .await
+                .is_some(),
+            "unmapped PN must resolve via its own record"
+        );
     }
 
     #[tokio::test]
