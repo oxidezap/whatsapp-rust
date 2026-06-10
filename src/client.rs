@@ -529,6 +529,19 @@ pub struct Client {
     pub(crate) device_registry_cache:
         TypedCache<String, Arc<wacore::store::traits::DeviceListRecord>>,
 
+    /// Monotonic stamp of "anything that can change a device-list answer":
+    /// registry record writes/invalidations and LID-PN mapping changes all
+    /// bump it (see `note_device_topology_change`). The group-devices memo
+    /// validates against it, so a stale snapshot is never served after a
+    /// topology write.
+    pub(crate) device_topology_generation: AtomicU64,
+    /// Per-group memo of the fully resolved (LID-converted) device list,
+    /// validated by GroupInfo identity + `device_topology_generation`. Serves
+    /// the per-send full-set resolution in `resolve_skdm_targets` so a warm
+    /// repeat send skips the per-member cache fan-out.
+    pub(crate) group_devices_memo:
+        Cache<Jid, Arc<crate::client::device_registry::GroupDevicesMemo>>,
+
     /// Router for dispatching stanzas to their appropriate handlers
     pub(crate) stanza_router: crate::handlers::router::StanzaRouter,
 

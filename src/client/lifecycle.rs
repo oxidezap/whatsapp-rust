@@ -219,6 +219,8 @@ impl Client {
                 cache_config.cache_stores.device_registry_cache.clone(),
                 "device_registry",
             ),
+            device_topology_generation: AtomicU64::new(0),
+            group_devices_memo: Cache::builder().max_capacity(64).build(),
             stanza_router: Self::create_stanza_router(),
             synchronous_ack: false,
             http_client,

@@ -200,6 +200,7 @@ impl Client {
                 .is_none();
             let entry = LidPnEntry::new(lid, phone_number, source);
             self.lid_pn_cache.add(&entry).await;
+            self.note_device_topology_change();
             entries.push(entry);
             is_new_flags.push(is_new);
         }
@@ -235,6 +236,7 @@ impl Client {
             .is_none();
         let entry = LidPnEntry::new(lid.to_string(), phone_number.to_string(), source);
         self.lid_pn_cache.add(&entry).await;
+        self.note_device_topology_change();
         (entry, is_new_mapping)
     }
 
@@ -567,6 +569,7 @@ impl Client {
 
         let entry = mapping_to_entry(mapping);
         self.lid_pn_cache.add(&entry).await;
+        self.note_device_topology_change();
         Ok(Some(entry))
     }
 
