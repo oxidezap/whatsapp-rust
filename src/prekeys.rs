@@ -330,8 +330,29 @@ impl Client {
         );
 
         if plan.gen_count == 0 {
-            let rows = backend.load_prekeys_batch(&[plan.window_start]).await?;
+            // Load the whole remaining window: a consumed head (a previously
+            // reused retry key the peer already spent) must not abandon the
+            // still-live keys behind it, so the heal advances FIRST to the
+            // next stored id instead of past the window. WA Web throws on a
+            // missing head; healing is strictly better and stays in the same
+            // id namespace.
+            let window_ids: Vec<u32> =
+                (plan.window_start..device_snapshot.next_pre_key_id).collect();
+            let mut rows = backend.load_prekeys_batch(&window_ids).await?;
+            rows.sort_unstable_by_key(|(id, _)| *id);
             if let Some((id, record)) = rows.into_iter().next() {
+                if id != plan.window_start {
+                    log::warn!(
+                        "prekey window head {} missing from store; advancing to {id}",
+                        plan.window_start
+                    );
+                    self.persistence_manager
+                        .process_command(DeviceCommand::SetPreKeyWatermarks {
+                            next_pre_key_id: device_snapshot.next_pre_key_id,
+                            first_unupload_pre_key_id: id,
+                        })
+                        .await;
+                }
                 use prost::Message;
                 let structure = waproto::whatsapp::PreKeyRecordStructure::decode(&record[..])?;
                 let record = wacore::libsignal::store::record_helpers::prekey_structure_to_record(
@@ -339,20 +360,17 @@ impl Client {
                 )?;
                 return Ok((id, record.key_pair()?.public_key));
             }
-            // The window head was consumed (a previously reused retry key the
-            // peer already spent). Skip the dead slot and generate fresh; WA
-            // Web throws here, but healing is strictly better and stays in
-            // the same id namespace.
             log::warn!(
-                "prekey window head {} missing from store; skipping dead slot",
-                plan.window_start
+                "prekey window [{}, {}) fully consumed; generating fresh",
+                plan.window_start,
+                device_snapshot.next_pre_key_id
             );
         }
 
         let id = if plan.gen_count > 0 {
             plan.gen_start
         } else {
-            // Dead-slot heal: generate at NEXT and advance FIRST past the gap.
+            // Empty window: generate at NEXT and collapse FIRST onto it.
             device_snapshot
                 .next_pre_key_id
                 .max(plan.window_start.saturating_add(1))
@@ -373,6 +391,11 @@ impl Client {
                 },
             })
             .await;
+        // Same durability pairing as the batch path: the stored key is
+        // durable, so its watermarks must not ride the lazy saver.
+        if let Err(e) = self.persistence_manager.flush().await {
+            log::warn!("failed to flush prekey watermarks: {e:?}");
+        }
         Ok((id, key_pair.public_key))
     }
 
@@ -475,6 +498,12 @@ impl Client {
                 first_unupload_pre_key_id: plan.window_start,
             })
             .await;
+        // The generated rows are already durable; the watermarks ride the lazy
+        // device saver. Flush them now so a crash before the IQ cannot reload
+        // pre-generation watermarks and orphan the stored window.
+        if let Err(e) = self.persistence_manager.flush().await {
+            log::warn!("failed to flush prekey watermarks: {e:?}");
+        }
 
         // Load the upload window: leftover keys plus the fresh ones. Gaps are
         // tolerated (a window key consumed via a retry receipt leaves a hole).
@@ -1011,6 +1040,48 @@ mod window_tests {
         let (next, first) = snapshot(&client);
         assert_eq!(first, id3);
         assert_eq!(next, id3 + 1);
+    }
+
+    /// A consumed window head must not abandon the live keys behind it: the
+    /// heal advances FIRST to the next stored id and reuses it.
+    #[tokio::test]
+    async fn consumed_head_advances_to_next_live_window_key() {
+        use prost::Message;
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::libsignal::store::record_helpers::new_pre_key_record;
+        use wacore::store::commands::DeviceCommand;
+
+        let client = crate::test_utils::create_test_client_with_name("prekey_window_heal").await;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut publics = std::collections::HashMap::new();
+        for id in 10u32..13 {
+            let kp = KeyPair::generate(&mut rng);
+            publics.insert(id, kp.public_key);
+            backend(&client)
+                .store_prekey(id, &new_pre_key_record(id, &kp).encode_to_vec(), false)
+                .await
+                .expect("store");
+        }
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: 13,
+                first_unupload_pre_key_id: 10,
+            })
+            .await;
+
+        backend(&client).remove_prekey(10).await.expect("consume");
+        let (id, pk) = client.get_or_gen_single_pre_key().await.expect("heal");
+        assert_eq!(id, 11, "heal must advance to the next LIVE window key");
+        assert_eq!(pk.serialize(), publics[&11].serialize());
+        let (next, first) = snapshot(&client);
+        assert_eq!(first, 11, "FIRST lands on the surviving key");
+        assert_eq!(next, 13, "NEXT untouched: 12 is still in the window");
+
+        // And the key behind it is still reachable afterwards.
+        backend(&client).remove_prekey(11).await.expect("consume");
+        let (id, _) = client.get_or_gen_single_pre_key().await.expect("heal 2");
+        assert_eq!(id, 12);
     }
 
     /// A retry-receipt single key lives in the unuploaded window, so the next
