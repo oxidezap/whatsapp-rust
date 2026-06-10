@@ -625,6 +625,101 @@ mod tests {
         );
     }
 
+    /// Locks that build_patch consults the previous value MACs (now via the
+    /// batched get_mutation_macs): a SET overwriting an existing index must
+    /// produce the subtract-then-add ltHash. If the prefetch wiring broke and
+    /// returned nothing, the old MAC would never be subtracted and the
+    /// emitted snapshot_mac would diverge.
+    #[tokio::test]
+    async fn build_patch_subtracts_previous_macs_fetched_in_batch() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let collection_name = WAPatchName::Regular;
+        let index_mac = vec![4; 32];
+        let key_id_bytes = b"patch_key_id".to_vec();
+        let master_key = [11u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+
+        backend
+            .set_sync_key(
+                &key_id_bytes,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept sync key");
+
+        let old_value_mac = vec![0xAA; 32];
+        backend
+            .set_version(
+                collection_name.as_str(),
+                HashState {
+                    version: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept version");
+        backend
+            .put_mutation_macs(
+                collection_name.as_str(),
+                1,
+                &[AppStateMutationMAC {
+                    index_mac: index_mac.clone(),
+                    value_mac: old_value_mac.clone(),
+                }],
+            )
+            .await
+            .expect("test backend should accept mutation MACs");
+
+        let plaintext = wa::SyncActionData {
+            value: Some(wa::SyncActionValue {
+                timestamp: Some(5000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mutation = create_encrypted_mutation(
+            wa::syncd_mutation::SyncdOperation::Set,
+            &index_mac,
+            &plaintext,
+            &keys,
+            &key_id_bytes,
+        );
+
+        let (patch_bytes, base_version) = processor
+            .build_patch(collection_name.as_str(), vec![mutation.clone()])
+            .await
+            .expect("build_patch should succeed");
+        assert_eq!(base_version, 1);
+
+        // Recompute the expected post-patch state with the seeded prev MAC.
+        let mut expected_state = HashState {
+            version: 1,
+            ..Default::default()
+        };
+        let old_for_closure = old_value_mac.clone();
+        let (hash_result, res) = expected_state
+            .update_hash(std::slice::from_ref(&mutation), |mac, _| {
+                Ok((mac == index_mac.as_slice()).then(|| old_for_closure.clone()))
+            });
+        assert!(res.is_ok() && !hash_result.has_missing_remove);
+        expected_state.version = 2;
+        let expected_snapshot_mac =
+            expected_state.generate_snapshot_mac(collection_name.as_str(), &keys.snapshot_mac);
+
+        let patch = wa::SyncdPatch::decode(patch_bytes.as_slice()).expect("patch should decode");
+        assert_eq!(
+            patch.snapshot_mac.as_deref(),
+            Some(expected_snapshot_mac.as_slice()),
+            "snapshot_mac must reflect subtract(old)+add(new); a broken prev-MAC prefetch diverges here"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_resync_drops_stale_mutation_macs() {
         let (backend, processor, patch_list, stale_index_mac) = snapshot_resync_scenario().await;
