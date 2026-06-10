@@ -48,6 +48,7 @@ pub mod jid_utils;
 pub mod keepalive;
 pub mod mediaconn;
 pub mod message;
+pub(crate) mod msg_secret_buffer;
 pub mod pair;
 pub mod pair_code;
 pub mod request;

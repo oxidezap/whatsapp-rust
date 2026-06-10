@@ -7622,6 +7622,7 @@ async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         Some(second_secret.to_vec()),
     );
     client.dispatch_parsed_message(first_msg, &first_info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     let stored = client
         .persistence_manager
@@ -7809,6 +7810,7 @@ async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
         Some(second_secret.to_vec()),
     );
     client.dispatch_parsed_message(first_msg, &first_info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     for sender in [sender_lid, sender_pn] {
         let stored = client
@@ -8546,6 +8548,7 @@ async fn maybe_capture_inbound_msg_secret_persists_for_bot_chats() {
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     let mut got = None;
     for _ in 0..40 {
@@ -8585,6 +8588,7 @@ async fn maybe_capture_inbound_msg_secret_persists_for_non_bot_chats() {
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     let got = client
         .persistence_manager
@@ -8641,6 +8645,7 @@ async fn maybe_capture_inbound_msg_secret_persists_for_group_with_bot_mention() 
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     let mut got = None;
     for _ in 0..40 {
@@ -8698,6 +8703,7 @@ async fn maybe_capture_inbound_msg_secret_skips_forwarded() {
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     for _ in 0..16 {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -8756,6 +8762,7 @@ async fn maybe_capture_inbound_msg_secret_via_bot_metadata_without_mention() {
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     // Group (non-bot chat) → keyed under info.source.sender (our LID in a
     // LID group), which is what the bot reply's target_sender_jid echoes.
@@ -8815,6 +8822,7 @@ async fn bot_only_captures_group_bot_prompt_skips_plain() {
     client
         .maybe_capture_inbound_msg_secret(&plain_msg, &plain_info)
         .await;
+    client.msg_secret_buffer.wait_flushed().await;
     assert!(
         client
             .persistence_manager
@@ -8856,6 +8864,7 @@ async fn bot_only_captures_group_bot_prompt_skips_plain() {
     client
         .maybe_capture_inbound_msg_secret(&bot_msg, &bot_info)
         .await;
+    client.msg_secret_buffer.wait_flushed().await;
     assert_eq!(
         client
             .persistence_manager
@@ -8902,6 +8911,7 @@ async fn maybe_capture_inbound_msg_secret_keys_under_other_participant() {
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     // Keyed under the participant (non-AD), NOT under our own PN/LID.
     let under_participant = client
@@ -9008,6 +9018,7 @@ async fn maybe_capture_inbound_msg_secret_skips_when_secret_absent() {
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     for _ in 0..16 {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -9262,6 +9273,7 @@ async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
     client
         .maybe_capture_inbound_msg_secret(&fanout_msg, &fanout_info)
         .await;
+    client.msg_secret_buffer.wait_flushed().await;
     // Write is awaited inline now, so the secret is already durable here.
     for _ in 0..40 {
         if client
@@ -9536,4 +9548,60 @@ async fn msmsg_without_meta_target_id_nacks_495() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     assert_eq!(code, Some(495));
+}
+
+/// The write-behind buffer must keep the receive-lane ordering semantic: an
+/// add-on referencing the secret of the stanza captured just before it must
+/// decrypt, with no flush in between (the lookup is served buffer-first).
+#[tokio::test]
+async fn addon_decrypts_right_after_capture_without_flush() {
+    use wacore::types::message::{MessageInfo, MessageSource};
+
+    let client = crate::test_utils::create_test_client_with_name("secret_l1_visibility").await;
+    ensure_bob_paired(&client).await;
+    let chat = "5511777776666@s.whatsapp.net";
+    let parent_id = "PARENT_L1";
+    let secret = [0x33u8; 32];
+
+    let parent_msg = wa::Message {
+        conversation: Some("hello".to_string()),
+        message_context_info: Some(wa::MessageContextInfo {
+            message_secret: Some(secret.to_vec()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mk_info = |id: &str| {
+        Arc::new(MessageInfo {
+            id: id.to_string(),
+            source: MessageSource {
+                chat: chat.parse().expect("chat"),
+                sender: chat.parse().expect("sender"),
+                ..Default::default()
+            },
+            timestamp: wacore::time::now_utc(),
+            ..Default::default()
+        })
+    };
+    client
+        .maybe_capture_inbound_msg_secret(&parent_msg, &mk_info(parent_id))
+        .await;
+
+    // Deliberately NO wait_flushed here: the next message in the lane reads
+    // through the buffer.
+    let target_key = wa::MessageKey {
+        remote_jid: Some(chat.to_string()),
+        from_me: Some(false),
+        id: Some(parent_id.to_string()),
+        participant: None,
+    };
+    let edit_msg =
+        encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
+    let out = client
+        .maybe_decrypt_secret_encrypted_message(&edit_msg, &mk_info("EDIT_L1"))
+        .await;
+    assert!(
+        out.is_some(),
+        "an add-on right after the capture must find the secret"
+    );
 }

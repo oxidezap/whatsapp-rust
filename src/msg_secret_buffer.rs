@@ -1,0 +1,250 @@
+//! Write-behind buffer for inbound `messageSecret` persistence.
+//!
+//! Capturing a secret used to upsert SQLite synchronously inside the per-chat
+//! receive lane, before the ack and the `Event::Message` dispatch. The buffer
+//! splits visibility from durability: an insert is immediately readable
+//! through [`MsgSecretWriteBuffer::lookup`] (so an add-on referencing the
+//! secret of the stanza just processed always finds it), while the backend
+//! upsert happens on a detached drain task that coalesces a burst of captures
+//! into one batched `put_msg_secrets` transaction.
+//!
+//! Entries leave the buffer only after the backend write returns, so a reader
+//! sees every secret either in the buffer or in the store, never neither. A
+//! failed write drops its entries with a warning, the same data-loss semantics
+//! the previous awaited write had. The only durability change is the window
+//! between ack and flush: a process crash inside it loses those secrets, which
+//! matches WA Web (IndexedDB persistence is asynchronous there too).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use portable_atomic::AtomicU64;
+use wacore::store::traits::MsgSecretEntry;
+
+type Key = (String, String, String);
+
+pub(crate) struct MsgSecretWriteBuffer {
+    pending: Mutex<HashMap<Key, MsgSecretEntry>>,
+    drain_in_flight: AtomicBool,
+    backend: Arc<dyn crate::store::traits::Backend>,
+    runtime: Arc<dyn wacore::runtime::Runtime>,
+    /// Batches written so far; test observability for the coalescing claim.
+    #[cfg(test)]
+    pub(crate) flushed_batches: AtomicU64,
+    #[cfg(not(test))]
+    flushed_batches: AtomicU64,
+}
+
+impl MsgSecretWriteBuffer {
+    pub(crate) fn new(
+        backend: Arc<dyn crate::store::traits::Backend>,
+        runtime: Arc<dyn wacore::runtime::Runtime>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            pending: Mutex::new(HashMap::new()),
+            drain_in_flight: AtomicBool::new(false),
+            backend,
+            runtime,
+            flushed_batches: AtomicU64::new(0),
+        })
+    }
+
+    /// Make `entries` immediately visible to readers and schedule the durable
+    /// write. Synchronous on purpose: the per-chat lane orders the insert
+    /// before the ack and before any later message in the chat is processed.
+    pub(crate) fn queue(self: &Arc<Self>, entries: Vec<MsgSecretEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            for entry in entries {
+                let key = (
+                    entry.chat.clone(),
+                    entry.sender.clone(),
+                    entry.msg_id.clone(),
+                );
+                pending.insert(key, entry);
+            }
+        }
+        self.schedule_drain();
+    }
+
+    /// Buffered-first read. Returns `(secret, message_ts)` like
+    /// `get_msg_secret_with_ts`.
+    pub(crate) fn lookup(&self, chat: &str, sender: &str, msg_id: &str) -> Option<(Vec<u8>, i64)> {
+        let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        pending
+            .get(&(chat.to_string(), sender.to_string(), msg_id.to_string()))
+            .map(|e| (e.secret.clone(), e.message_ts))
+    }
+
+    fn schedule_drain(self: &Arc<Self>) {
+        if self.drain_in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let buffer = Arc::clone(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                buffer.drain_loop().await;
+            }))
+            .detach();
+    }
+
+    async fn drain_loop(self: Arc<Self>) {
+        loop {
+            let batch: Vec<MsgSecretEntry> = {
+                let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+                pending.values().cloned().collect()
+            };
+            if batch.is_empty() {
+                self.drain_in_flight.store(false, Ordering::Release);
+                // An insert may have raced the flag clear; reclaim the drain
+                // only if work exists and nobody else took it.
+                let has_work = !self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty();
+                if has_work && !self.drain_in_flight.swap(true, Ordering::AcqRel) {
+                    continue;
+                }
+                return;
+            }
+
+            let keys: Vec<Key> = batch
+                .iter()
+                .map(|e| (e.chat.clone(), e.sender.clone(), e.msg_id.clone()))
+                .collect();
+            if let Err(e) = self.backend.put_msg_secrets(batch).await {
+                // Same semantics as the previously awaited write: warn + drop.
+                log::warn!("failed to persist messageSecrets: {e:?}");
+            }
+            self.flushed_batches.fetch_add(1, Ordering::Relaxed);
+            {
+                // A secret for a given (chat, sender, id) never changes, so
+                // removing by key cannot discard a newer value.
+                let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+                for key in keys {
+                    pending.remove(&key);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+#[cfg(test)]
+impl MsgSecretWriteBuffer {
+    /// Deterministically wait until every queued entry reached the backend.
+    /// Yields so the current-thread test runtime can poll the drain task.
+    pub(crate) async fn wait_flushed(&self) {
+        while self.pending_len() > 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(chat: &str, sender: &str, id: &str, secret: u8) -> MsgSecretEntry {
+        MsgSecretEntry {
+            chat: chat.to_string(),
+            sender: sender.to_string(),
+            msg_id: id.to_string(),
+            secret: vec![secret; 32],
+            expires_at: 0,
+            message_ts: 7,
+        }
+    }
+
+    async fn buffer() -> Arc<MsgSecretWriteBuffer> {
+        let backend = crate::test_utils::create_test_backend().await;
+        MsgSecretWriteBuffer::new(backend, Arc::new(crate::runtime_impl::TokioRuntime))
+    }
+
+    /// The point of the buffer: a queued secret is readable BEFORE any flush
+    /// ran, and after the flush it lives in the backend and leaves the buffer.
+    #[tokio::test]
+    async fn read_your_write_before_flush() {
+        let buf = buffer().await;
+        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "M1", 0x11)]);
+
+        // Current-thread runtime: the drain task cannot have polled yet, so
+        // this read is served by the buffer, not the store.
+        assert_eq!(
+            buf.lookup("g@g.us", "a@s.whatsapp.net", "M1"),
+            Some((vec![0x11; 32], 7)),
+            "queued entry must be visible before the flush"
+        );
+
+        buf.wait_flushed().await;
+        assert_eq!(buf.pending_len(), 0);
+        let stored = buf
+            .backend
+            .get_msg_secret("g@g.us", "a@s.whatsapp.net", "M1")
+            .await
+            .expect("backend read");
+        assert_eq!(stored.as_deref(), Some(&[0x11u8; 32][..]));
+    }
+
+    /// A burst of captures queued before the drain task gets polled must land
+    /// in ONE batched put_msg_secrets transaction, not one per message.
+    #[tokio::test]
+    async fn burst_coalesces_into_one_batch() {
+        let buf = buffer().await;
+        for i in 0..20u8 {
+            buf.queue(vec![entry(
+                "g@g.us",
+                "a@s.whatsapp.net",
+                &format!("M{i}"),
+                i,
+            )]);
+        }
+        buf.wait_flushed().await;
+
+        assert_eq!(
+            buf.flushed_batches.load(Ordering::Relaxed),
+            1,
+            "a synchronous burst must coalesce into a single batch"
+        );
+        for i in 0..20u8 {
+            let stored = buf
+                .backend
+                .get_msg_secret("g@g.us", "a@s.whatsapp.net", &format!("M{i}"))
+                .await
+                .expect("backend read");
+            assert_eq!(stored.as_deref(), Some(&[i; 32][..]), "entry M{i}");
+        }
+    }
+
+    /// Entries queued while a flush is in flight are picked up by the same
+    /// drain task (follow-up iteration), never lost.
+    #[tokio::test]
+    async fn entries_queued_during_drain_are_flushed() {
+        let buf = buffer().await;
+        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "FIRST", 1)]);
+        // Let the drain start (and likely finish the first batch).
+        tokio::task::yield_now().await;
+        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "SECOND", 2)]);
+        buf.wait_flushed().await;
+
+        for (id, val) in [("FIRST", 1u8), ("SECOND", 2u8)] {
+            let stored = buf
+                .backend
+                .get_msg_secret("g@g.us", "a@s.whatsapp.net", id)
+                .await
+                .expect("backend read");
+            assert_eq!(stored.as_deref(), Some(&[val; 32][..]), "{id}");
+        }
+        assert_eq!(buf.pending_len(), 0);
+    }
+}

@@ -316,6 +316,9 @@ pub struct Client {
     pub(crate) core: wacore::client::CoreClient,
 
     pub(crate) persistence_manager: Arc<PersistenceManager>,
+    /// Write-behind buffer for inbound messageSecret captures; readers check
+    /// it before the backend so the durable write can leave the receive lane.
+    pub(crate) msg_secret_buffer: Arc<crate::msg_secret_buffer::MsgSecretWriteBuffer>,
     pub(crate) media_conn: Arc<RwLock<Option<crate::mediaconn::MediaConn>>>,
 
     pub(crate) is_logged_in: Arc<AtomicBool>,

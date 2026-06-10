@@ -1851,14 +1851,9 @@ impl Client {
             expires_at,
             message_ts: now,
         };
-        if let Err(e) = self
-            .persistence_manager
-            .backend()
-            .put_msg_secrets(vec![entry])
-            .await
-        {
-            log::warn!("Failed to persist outbound messageSecret for {msg_id}: {e:?}");
-        }
+        // Same write-behind buffer as inbound captures: visible immediately,
+        // flushed off the send path (msmsg replies read buffer-first).
+        self.msg_secret_buffer.queue(vec![entry]);
     }
 
     /// Decide the identity (LID vs PN) under which an outbound DM's
@@ -4514,6 +4509,7 @@ mod tests {
                 wacore::msg_secret::RetentionClass::Text,
             )
             .await;
+        client.msg_secret_buffer.wait_flushed().await;
         let got = client
             .persistence_manager
             .backend()
@@ -4541,6 +4537,7 @@ mod tests {
                 wacore::msg_secret::RetentionClass::Text,
             )
             .await;
+        client.msg_secret_buffer.wait_flushed().await;
         let got = client
             .persistence_manager
             .backend()
@@ -4622,6 +4619,7 @@ mod tests {
                 wacore::msg_secret::RetentionClass::Text,
             )
             .await;
+        client.msg_secret_buffer.wait_flushed().await;
         let got = client
             .persistence_manager
             .backend()

@@ -58,7 +58,7 @@ impl Client {
         {
             entries.push(entry);
         }
-        self.persist_msg_secret_entries(entries).await;
+        self.persist_msg_secret_entries(entries);
     }
 
     /// Build one retention entry, applying the policy gates and computing the
@@ -102,27 +102,11 @@ impl Client {
         })
     }
 
-    /// Write a batch of secret aliases in one atomic upsert, so a multi-alias
-    /// capture/re-persist never leaves only some aliases stored.
-    async fn persist_msg_secret_entries(
-        &self,
-        entries: Vec<wacore::store::traits::MsgSecretEntry>,
-    ) -> bool {
-        if entries.is_empty() {
-            return false;
-        }
-        match self
-            .persistence_manager
-            .backend()
-            .put_msg_secrets(entries)
-            .await
-        {
-            Ok(_) => true,
-            Err(e) => {
-                log::warn!("failed to persist messageSecrets: {e:?}");
-                false
-            }
-        }
+    /// Queue a batch of secret aliases on the write-behind buffer: immediately
+    /// visible to lookups, durably written off the receive lane in one batched
+    /// upsert (a multi-alias capture still lands in a single batch).
+    fn persist_msg_secret_entries(&self, entries: Vec<wacore::store::traits::MsgSecretEntry>) {
+        self.msg_secret_buffer.queue(entries);
     }
 
     async fn own_jid_for_secret_encrypted(&self, info: &MessageInfo) -> Option<Jid> {
@@ -184,38 +168,55 @@ impl Client {
             .unwrap_or_default();
 
         // Look up the secret AND the parent's event time (for the edit window
-        // check below): primary sender, then the LID/PN alternate.
-        let store_secret = match backend
-            .get_msg_secret_with_ts(&chat_for_lookup, &original_sender_str, target_id)
-            .await
-        {
-            Ok(Some(found)) => Some(found),
-            Ok(None) => match fallback_original_sender.as_ref() {
-                Some(alt) => {
-                    let alt_str = alt.to_non_ad_string();
-                    match backend
-                        .get_msg_secret_with_ts(&chat_for_lookup, &alt_str, target_id)
-                        .await
-                    {
-                        Ok(found) => found,
-                        Err(e) => {
-                            log::warn!(
-                                "[msg:{}] secret_encrypted_message alternate secret lookup failed: {e:?}",
-                                info.id
-                            );
-                            None
+        // check below): write-behind buffer first (a not-yet-flushed capture
+        // from this very lane), then the store; primary sender, then the
+        // LID/PN alternate.
+        let buffered = self
+            .msg_secret_buffer
+            .lookup(&chat_for_lookup, &original_sender_str, target_id)
+            .or_else(|| {
+                fallback_original_sender.as_ref().and_then(|alt| {
+                    self.msg_secret_buffer.lookup(
+                        &chat_for_lookup,
+                        &alt.to_non_ad_string(),
+                        target_id,
+                    )
+                })
+            });
+        let store_secret = match buffered {
+            Some(found) => Some(found),
+            None => match backend
+                .get_msg_secret_with_ts(&chat_for_lookup, &original_sender_str, target_id)
+                .await
+            {
+                Ok(Some(found)) => Some(found),
+                Ok(None) => match fallback_original_sender.as_ref() {
+                    Some(alt) => {
+                        let alt_str = alt.to_non_ad_string();
+                        match backend
+                            .get_msg_secret_with_ts(&chat_for_lookup, &alt_str, target_id)
+                            .await
+                        {
+                            Ok(found) => found,
+                            Err(e) => {
+                                log::warn!(
+                                    "[msg:{}] secret_encrypted_message alternate secret lookup failed: {e:?}",
+                                    info.id
+                                );
+                                None
+                            }
                         }
                     }
+                    None => None,
+                },
+                Err(e) => {
+                    log::warn!(
+                        "[msg:{}] backend error reading secret_encrypted_message secret: {e:?}",
+                        info.id
+                    );
+                    None
                 }
-                None => None,
             },
-            Err(e) => {
-                log::warn!(
-                    "[msg:{}] backend error reading secret_encrypted_message secret: {e:?}",
-                    info.id
-                );
-                None
-            }
         };
         // On a total store miss, ask the app-supplied resolver (if any) for the
         // parent secret. This is what lets the Disabled policy still decrypt. The
@@ -386,7 +387,7 @@ impl Client {
             {
                 entries.push(entry);
             }
-            self.persist_msg_secret_entries(entries).await;
+            self.persist_msg_secret_entries(entries);
         }
 
         if env.kind != SecretEncKind::MessageEdit {
@@ -489,28 +490,40 @@ impl Client {
         // Store lookup: primary, then the LID/PN alternate. A backend error is
         // logged and treated as a miss (not a hard nack) so the resolver still
         // gets a chance — mirrors the secret-encrypted edit path.
-        let store_secret = match backend
-            .get_msg_secret(&chat_for_lookup, &target_sender_str, target_id)
-            .await
-        {
-            Ok(Some(s)) => Some(s),
-            Ok(None) => match self
-                .alternate_msg_secret_lookup(&backend, &chat_for_lookup, &target_sender, target_id)
+        let buffered = self
+            .msg_secret_buffer
+            .lookup(&chat_for_lookup, &target_sender_str, target_id)
+            .map(|(secret, _)| secret);
+        let store_secret = match buffered {
+            Some(s) => Some(s),
+            None => match backend
+                .get_msg_secret(&chat_for_lookup, &target_sender_str, target_id)
                 .await
             {
-                Ok(found) => found,
+                Ok(Some(s)) => Some(s),
+                Ok(None) => match self
+                    .alternate_msg_secret_lookup(
+                        &backend,
+                        &chat_for_lookup,
+                        &target_sender,
+                        target_id,
+                    )
+                    .await
+                {
+                    Ok(found) => found,
+                    Err(e) => {
+                        log::warn!("[msg:{}] msmsg: alternate lookup failed: {e:?}", info.id);
+                        None
+                    }
+                },
                 Err(e) => {
-                    log::warn!("[msg:{}] msmsg: alternate lookup failed: {e:?}", info.id);
+                    log::warn!(
+                        "[msg:{}] backend error reading message_secret: {e:?}",
+                        info.id
+                    );
                     None
                 }
             },
-            Err(e) => {
-                log::warn!(
-                    "[msg:{}] backend error reading message_secret: {e:?}",
-                    info.id
-                );
-                None
-            }
         };
         let secret = match store_secret {
             Some(s) => s,
@@ -697,6 +710,12 @@ impl Client {
             return Ok(None);
         };
         let alternate_str = alternate.to_non_ad_string();
+        if let Some((secret, _)) =
+            self.msg_secret_buffer
+                .lookup(chat_for_lookup, &alternate_str, target_id)
+        {
+            return Ok(Some(secret));
+        }
         backend
             .get_msg_secret(chat_for_lookup, &alternate_str, target_id)
             .await

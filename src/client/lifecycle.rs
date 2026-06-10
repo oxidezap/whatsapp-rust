@@ -115,6 +115,10 @@ impl Client {
         let this = Self {
             runtime: runtime.clone(),
             core,
+            msg_secret_buffer: crate::msg_secret_buffer::MsgSecretWriteBuffer::new(
+                persistence_manager.backend(),
+                runtime.clone(),
+            ),
             persistence_manager: persistence_manager.clone(),
             media_conn: Arc::new(RwLock::new(None)),
             is_logged_in: Arc::new(AtomicBool::new(false)),
