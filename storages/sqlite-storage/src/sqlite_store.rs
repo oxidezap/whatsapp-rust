@@ -1669,6 +1669,28 @@ impl SignalStore for SqliteStore {
         })
     }
 
+    async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let device_id = self.device_id;
+        let ids: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
+        self.with_retry("mark_prekeys_uploaded", move || {
+            let ids = ids.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::update(
+                    prekeys::table
+                        .filter(prekeys::id.eq_any(ids))
+                        .filter(prekeys::device_id.eq(device_id)),
+                )
+                .set(prekeys::uploaded.eq(true))
+                .execute(conn)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
     async fn get_max_prekey_id(&self) -> Result<u32> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
@@ -3612,6 +3634,32 @@ mod tests {
             loaded.is_some(),
             "device data should be loadable by configured id"
         );
+    }
+
+    /// mark_prekeys_uploaded must be UPDATE-only: a row deleted between the
+    /// upload snapshot and the mark (consumed one-time key) stays deleted.
+    #[tokio::test]
+    async fn mark_prekeys_uploaded_never_resurrects_deleted_rows() {
+        let store = create_test_store().await;
+        store
+            .store_prekey(1, b"record-1", false)
+            .await
+            .expect("store");
+        store
+            .store_prekey(2, b"record-2", false)
+            .await
+            .expect("store");
+        store.remove_prekey(1).await.expect("consume");
+
+        store
+            .mark_prekeys_uploaded(&[1, 2])
+            .await
+            .expect("mark uploaded");
+
+        let gone = store.load_prekey(1).await.expect("load");
+        assert!(gone.is_none(), "consumed key must not be resurrected");
+        let live = store.load_prekey(2).await.expect("load");
+        assert!(live.is_some(), "live key still present");
     }
 
     /// Round-trips the prekey watermarks through the SQLite schema: save with

@@ -71,6 +71,9 @@ mod tests {
         async fn remove_prekey(&self, _: u32) -> StoreResult<()> {
             Ok(())
         }
+        async fn mark_prekeys_uploaded(&self, _: &[u32]) -> StoreResult<()> {
+            Ok(())
+        }
         async fn get_max_prekey_id(&self) -> StoreResult<u32> {
             Ok(0)
         }

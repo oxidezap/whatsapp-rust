@@ -173,6 +173,13 @@ impl SignalStore for InMemoryBackend {
         Ok(())
     }
 
+    async fn mark_prekeys_uploaded(&self, _ids: &[u32]) -> Result<()> {
+        // The in-memory store does not track the uploaded flag (see
+        // store_prekey); the contract that matters is NOT resurrecting
+        // deleted rows, which a no-op trivially satisfies.
+        Ok(())
+    }
+
     async fn store_prekeys_batch(&self, keys: &[(u32, Bytes)], _uploaded: bool) -> Result<()> {
         let mut state = self.state.lock().await;
         for (id, record) in keys {

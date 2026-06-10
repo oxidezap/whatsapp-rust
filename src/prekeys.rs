@@ -555,6 +555,7 @@ impl Client {
             .map(|(id, _)| *id)
             .expect("non-empty checked above");
         let uploaded_count = pre_key_pairs.len();
+        let pre_key_ids: Vec<u32> = pre_key_pairs.iter().map(|(id, _)| *id).collect();
 
         let spec = PreKeyUploadSpec::new(
             device_snapshot.registration_id,
@@ -586,8 +587,13 @@ impl Client {
 
         self.execute(spec).await?;
 
-        // Mark the uploaded prekeys as server-synced (reuse loaded records).
-        if let Err(e) = backend.store_prekeys_batch(&rows, true).await {
+        // Mark the uploaded prekeys as server-synced. UPDATE semantics: a
+        // window key consumed by an inbound pkmsg while the IQ was in flight
+        // (retry-receipt keys are reachable that way, and consumption is not
+        // serialized by prekey_upload_lock) must stay deleted, not be
+        // resurrected by an upsert of the stale record.
+        let uploaded_ids: Vec<u32> = pre_key_ids;
+        if let Err(e) = backend.mark_prekeys_uploaded(&uploaded_ids).await {
             log::warn!("Failed to mark prekeys as uploaded: {:?}", e);
         }
 
