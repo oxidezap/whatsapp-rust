@@ -3,6 +3,7 @@ mod adapters;
 mod app_state;
 mod context_impl;
 mod device_registry;
+pub(crate) mod device_topology;
 mod iq_ops;
 mod lid_pn;
 mod lifecycle;
@@ -526,18 +527,16 @@ pub struct Client {
     /// LRU cache for device registry (matches WhatsApp Web's 5000 entry limit).
     /// Maps user ID to DeviceListRecord for fast device existence checks.
     /// Backed by persistent storage.
-    pub(crate) device_registry_cache:
-        TypedCache<String, Arc<wacore::store::traits::DeviceListRecord>>,
-
-    /// Monotonic stamp of "anything that can change a device-list answer":
-    /// registry record writes/invalidations and LID-PN mapping changes all
-    /// bump it (see `note_device_topology_change`). The group-devices memo
-    /// validates against it, so a stale snapshot is never served after a
-    /// topology write.
-    pub(crate) device_topology_generation: AtomicU64,
+    /// Device registry fused with its topology tracker: every write records
+    /// the change by construction, so the group-devices memo below can never
+    /// be left stale by a forgotten bump.
+    pub(crate) device_registry_cache: crate::client::device_topology::DeviceRegistryCache,
+    /// Shared topology tracker (generation + changed-users log). LidPnCache
+    /// records mapping changes into it; the memo validates against it.
+    pub(crate) device_topology: Arc<crate::client::device_topology::DeviceTopology>,
     /// Per-group memo of the fully resolved (LID-converted) device list,
-    /// validated by GroupInfo identity + `device_topology_generation`. Serves
-    /// the per-send full-set resolution in `resolve_skdm_targets` so a warm
+    /// validated by GroupInfo identity + the device topology. Serves the
+    /// per-send full-set resolution in `resolve_skdm_targets` so a warm
     /// repeat send skips the per-member cache fan-out.
     pub(crate) group_devices_memo:
         Cache<Jid, Arc<crate::client::device_registry::GroupDevicesMemo>>,

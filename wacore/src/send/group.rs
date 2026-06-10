@@ -139,7 +139,7 @@ pub async fn prepare_group_stanza<
     // sends so the phash covers every device + self even when no SKDM is sent;
     // `None` on the cold `force_skdm` path (the set is resolved here) and for
     // status broadcasts (which keep the prior phash behavior).
-    all_devices_for_phash: Option<Vec<Jid>>,
+    all_devices_for_phash: Option<std::sync::Arc<Vec<Jid>>>,
     edit: Option<crate::types::message::EditAttribute>,
     extra_stanza_nodes: &[Node],
 ) -> Result<PreparedGroupStanza> {
@@ -307,6 +307,7 @@ pub async fn prepare_group_stanza<
         // already holds the full resolved set.
         if let Some(src) = all_devices_for_phash
             .as_deref()
+            .map(Vec::as_slice)
             .or(distribution_list.as_deref())
         {
             let phash_set = build_group_phash_set(src, &own_sending_jid);

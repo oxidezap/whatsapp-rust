@@ -781,7 +781,6 @@ impl Client {
     /// For LID mode, uses `group_info.phone_jid_for_lid_user` to query devices
     /// via PN when available (LID usync is unreliable for own JID), then
     /// converts the result back to LID. Same fallback as `prepare_group_stanza`.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
     /// Load (or lazily build) the per-group sender-key device map.
     ///
     /// Atomic get-or-init: if another task invalidated the cache during our
@@ -811,20 +810,17 @@ impl Client {
             .await
     }
 
-    /// Split the resolved device set into (all, needs_skdm).
+    /// Filter the resolved device set down to the subset still needing SKDM.
     ///
     /// No empty-cache early-exit: WA Web iterates an empty `senderKey` Map
     /// as `false` per participant, so the filter must run unconditionally.
-    fn split_skdm_targets(
+    fn filter_skdm_targets(
         &self,
         group_jid: &str,
-        all_devices: Vec<Jid>,
+        all_devices: &[Jid],
         cached_map: &crate::sender_key_device_cache::SenderKeyDeviceMap,
         own_sending_jid: &Jid,
-    ) -> (Vec<Jid>, Vec<Jid>) {
-        // Borrow for the filter so `all_devices` survives to feed the
-        // phash (the full set), while `needs_skdm` is just the subset
-        // still missing the key.
+    ) -> Vec<Jid> {
         let needs_skdm: Vec<Jid> = all_devices
             .iter()
             .filter(|device| {
@@ -849,17 +845,18 @@ impl Client {
             needs_skdm.len(),
             group_jid
         );
-        (all_devices, needs_skdm)
+        needs_skdm
     }
 
     /// SKDM target resolution for the status path, whose `GroupInfo` is built
     /// fresh per send (no stable identity to memoize against).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
     async fn resolve_skdm_targets(
         &self,
         group_jid: &str,
         group_info: &wacore::client::context::GroupInfo,
         own_sending_jid: &Jid,
-    ) -> Option<(Vec<Jid>, Vec<Jid>)> {
+    ) -> Option<(std::sync::Arc<Vec<Jid>>, Vec<Jid>)> {
         let cached_map = self.skdm_device_map(group_jid).await;
 
         let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
@@ -887,7 +884,10 @@ impl Client {
                 } else {
                     all_devices
                 };
-                Some(self.split_skdm_targets(group_jid, all_devices, &cached_map, own_sending_jid))
+                let all_devices = std::sync::Arc::new(all_devices);
+                let needs_skdm =
+                    self.filter_skdm_targets(group_jid, &all_devices, &cached_map, own_sending_jid);
+                Some((all_devices, needs_skdm))
             }
             Err(e) => {
                 log::warn!(
@@ -903,17 +903,20 @@ impl Client {
     /// SKDM target resolution for cached-group sends: the full device set
     /// comes from the per-group memo (`resolve_group_devices_memoized`), so a
     /// warm repeat send skips the per-member registry fan-out entirely.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets_memoized", level = "debug", skip_all, fields(group = %group_jid)))]
     async fn resolve_skdm_targets_memoized(
         &self,
         group: &Jid,
         group_jid: &str,
         group_info: &std::sync::Arc<wacore::client::context::GroupInfo>,
         own_sending_jid: &Jid,
-    ) -> Option<(Vec<Jid>, Vec<Jid>)> {
+    ) -> Option<(std::sync::Arc<Vec<Jid>>, Vec<Jid>)> {
         let cached_map = self.skdm_device_map(group_jid).await;
         match self.resolve_group_devices_memoized(group, group_info).await {
             Ok(all_devices) => {
-                Some(self.split_skdm_targets(group_jid, all_devices, &cached_map, own_sending_jid))
+                let needs_skdm =
+                    self.filter_skdm_targets(group_jid, &all_devices, &cached_map, own_sending_jid);
+                Some((all_devices, needs_skdm))
             }
             Err(e) => {
                 log::warn!(
@@ -1413,18 +1416,20 @@ impl Client {
             // phash on every group send); `skdm_target_devices` is the subset
             // still missing the key. On the cold/`force_skdm` path both are
             // `None` and `prepare_group_stanza` resolves the set itself.
-            let (all_devices_for_phash, skdm_target_devices): (Option<Vec<Jid>>, Option<Vec<Jid>>) =
-                if force_skdm {
-                    (None, None)
-                } else {
-                    match self
-                        .resolve_skdm_targets_memoized(&to, &to_str, &group_info, &own_sending_jid)
-                        .await
-                    {
-                        Some((all, needs)) => (Some(all), Some(needs)),
-                        None => (None, None),
-                    }
-                };
+            let (all_devices_for_phash, skdm_target_devices): (
+                Option<std::sync::Arc<Vec<Jid>>>,
+                Option<Vec<Jid>>,
+            ) = if force_skdm {
+                (None, None)
+            } else {
+                match self
+                    .resolve_skdm_targets_memoized(&to, &to_str, &group_info, &own_sending_jid)
+                    .await
+                {
+                    Some((all, needs)) => (Some(all), Some(needs)),
+                    None => (None, None),
+                }
+            };
 
             match wacore::send::prepare_group_stanza(
                 &*self.runtime,
@@ -2911,7 +2916,7 @@ mod tests {
             };
             client
                 .device_registry_cache
-                .insert((*user).into(), Arc::new(record))
+                .raw_insert_for_tests((*user).into(), Arc::new(record))
                 .await;
         }
 

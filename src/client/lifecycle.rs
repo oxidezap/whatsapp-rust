@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Max groups with a cached resolved-device snapshot. LRU eviction covers
+/// accounts in more groups; an evicted entry just recomputes on next send.
+const GROUP_DEVICES_MEMO_CAPACITY: u64 = 64;
+
 impl Client {
     pub fn shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
         self.shutdown_notifier.subscribe()
@@ -107,6 +111,7 @@ impl Client {
 
         let (tx, rx) = async_channel::bounded(32);
 
+        let device_topology = crate::client::device_topology::DeviceTopology::new();
         let this = Self {
             runtime: runtime.clone(),
             core,
@@ -215,12 +220,17 @@ impl Client {
             custom_enc_handlers: std::sync::OnceLock::new(),
             chatstate_handlers: Arc::new(RwLock::new(Vec::new())),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
-            device_registry_cache: cache_config.device_registry_cache.build_typed_ttl(
-                cache_config.cache_stores.device_registry_cache.clone(),
-                "device_registry",
+            device_registry_cache: crate::client::device_topology::DeviceRegistryCache::new(
+                cache_config.device_registry_cache.build_typed_ttl(
+                    cache_config.cache_stores.device_registry_cache.clone(),
+                    "device_registry",
+                ),
+                Arc::clone(&device_topology),
             ),
-            device_topology_generation: AtomicU64::new(0),
-            group_devices_memo: Cache::builder().max_capacity(64).build(),
+            device_topology,
+            group_devices_memo: Cache::builder()
+                .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
+                .build(),
             stanza_router: Self::create_stanza_router(),
             synchronous_ack: false,
             http_client,
@@ -234,6 +244,10 @@ impl Client {
         };
 
         let arc = Arc::new(this);
+        // Mapping changes alter which canonical record a device lookup
+        // resolves to, so LidPnCache records into the same topology tracker.
+        arc.lid_pn_cache
+            .attach_topology(Arc::clone(&arc.device_topology));
         let _ = arc.self_weak.set(Arc::downgrade(&arc));
 
         // Warm up the LID-PN cache from persistent storage

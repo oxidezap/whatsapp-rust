@@ -46,6 +46,11 @@ pub struct LidPnCache {
     lid_to_entry: TypedCache<Arc<str>, Arc<LidPnEntry>>,
     /// Phone number -> Entry mapping (stores the most recent LID for that PN)
     pn_to_entry: TypedCache<Arc<str>, Arc<LidPnEntry>>,
+    /// Device-topology tracker (attached by Client construction): a mapping
+    /// change alters which canonical record either key resolves to, so adds
+    /// record both identifiers. Recording lives here, at the write
+    /// chokepoint, so callers cannot forget it.
+    topology: std::sync::OnceLock<Arc<crate::client::device_topology::DeviceTopology>>,
     /// PN -> the LID this process durably persisted for it. Lets the learn hot
     /// path skip a re-persist without swallowing the first live persist of a
     /// mapping an offline replay only warmed in memory. Keyed by the pair so a
@@ -85,13 +90,25 @@ impl LidPnCache {
                 // Always in-memory: tracks per-process persist state, never the
                 // mapping itself, so it must not go through the shared store.
                 persisted: TypedCache::from_moka(config.build_with_tti()),
+                topology: std::sync::OnceLock::new(),
             },
             None => Self {
                 lid_to_entry: TypedCache::from_moka(config.build_with_tti()),
                 pn_to_entry: TypedCache::from_moka(config.build_with_tti()),
                 persisted: TypedCache::from_moka(config.build_with_tti()),
+                topology: std::sync::OnceLock::new(),
             },
         }
+    }
+
+    /// Attach the device-topology tracker. Mapping writes before the attach
+    /// (none in practice: Client construction attaches before warm-up) are
+    /// simply not scoped.
+    pub(crate) fn attach_topology(
+        &self,
+        topology: Arc<crate::client::device_topology::DeviceTopology>,
+    ) {
+        let _ = self.topology.set(topology);
     }
 
     /// Returns approximate entry counts for the LID and PN maps.
@@ -185,6 +202,9 @@ impl LidPnCache {
                 .insert(shared.phone_number.clone(), shared)
                 .await;
         }
+        if let Some(topology) = self.topology.get() {
+            topology.record([&*entry.lid, &*entry.phone_number]);
+        }
     }
 
     /// Whether this process has durably persisted exactly `phone -> lid`.
@@ -231,6 +251,9 @@ impl LidPnCache {
         self.lid_to_entry.clear().await;
         self.pn_to_entry.clear().await;
         self.persisted.clear().await;
+        if let Some(topology) = self.topology.get() {
+            topology.record_global();
+        }
     }
 
     /// Get the number of LID entries in the cache.

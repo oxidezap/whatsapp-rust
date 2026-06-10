@@ -723,7 +723,8 @@ fn run_group_send(d: &mut GrpSendData) {
     // only emits a phash if it gets the full device set. Mirror the real
     // warm-send caller by passing it; the cold/force_skdm path resolves the set
     // itself and keeps None.
-    let all_devices_for_phash = (!d.force_skdm).then(|| d.participants.clone());
+    let all_devices_for_phash =
+        (!d.force_skdm).then(|| std::sync::Arc::new(d.participants.clone()));
     let mut group_info = GroupInfo::new(std::mem::take(&mut d.participants), AddressingMode::Pn);
     let own_base = own_jid.to_non_ad();
     if !group_info

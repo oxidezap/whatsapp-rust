@@ -815,7 +815,7 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert("5511999999999".into(), Arc::new(record))
+            .raw_insert_for_tests("5511999999999".into(), Arc::new(record))
             .await;
 
         // Seed a stored identity so the had-prior-identity gate runs the full reset
@@ -1118,7 +1118,7 @@ mod tests {
         // cleanup has something to do, but deliberately do NOT seed an identity.
         client
             .device_registry_cache
-            .insert(
+            .raw_insert_for_tests(
                 "5511666666666".into(),
                 Arc::new(wacore::store::traits::DeviceListRecord {
                     user: "5511666666666".into(),
