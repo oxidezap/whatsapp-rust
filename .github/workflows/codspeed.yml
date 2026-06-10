@@ -45,51 +45,18 @@ jobs:
           prefix-key: ${{ runner.os }}-cargo-codspeed
           cache-targets: "false"
 
+      # simulation and memory share the same instrumented build, so one
+      # build covers both instruments.
       - name: Build the benchmark targets
         run: >
-          cargo codspeed build
+          cargo codspeed build -m simulation -m memory
           -p wacore -p wacore-binary -p wacore-libsignal
           -p wacore-appstate -p wacore-noise
 
+      # Both instruments run serially in a single invocation so each
+      # benchmark uploads as one run carrying CPU and memory metrics.
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
         with:
-          mode: simulation
-          run: cargo codspeed run
-
-  benchmarks-memory:
-    name: Run CodSpeed memory benchmarks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-04-05
-
-      - name: Install tools (protoc, cargo-codspeed)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@4.7.0
-
-      - name: Cache Rust registry
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: ${{ runner.os }}-cargo-codspeed-memory
-          cache-targets: "false"
-
-      # The memory instrument needs its own instrumented build
-      # (https://codspeed.io/docs/instruments/memory).
-      - name: Build the benchmark targets (memory instrumented)
-        run: >
-          cargo codspeed build --measurement-mode memory
-          -p wacore -p wacore-binary -p wacore-libsignal
-          -p wacore-appstate -p wacore-noise
-
-      - name: Run the benchmarks (memory)
-        uses: CodSpeedHQ/action@v4
-        with:
-          mode: memory
+          mode: simulation,memory
           run: cargo codspeed run
