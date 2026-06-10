@@ -324,8 +324,8 @@ impl Client {
 
             let sender_count = senders.len();
             let mut chat_id = chat.to_non_ad_string();
-            let mut msg_id = record.msg_id;
-            let mut secret = record.secret;
+            let mut msg_id = record.msg_id.into_string();
+            let mut secret = record.secret.into_vec();
             for (idx, sender) in senders.into_iter().enumerate() {
                 let last_sender = idx + 1 == sender_count;
                 entries.push(MsgSecretEntry {

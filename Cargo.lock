@@ -2843,6 +2843,7 @@ dependencies = [
  "bytes",
  "chrono",
  "codspeed-divan-compat",
+ "compact_str",
  "ctr",
  "event-listener",
  "flate2",
