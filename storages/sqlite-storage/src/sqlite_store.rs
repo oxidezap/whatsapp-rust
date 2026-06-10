@@ -87,6 +87,9 @@ struct DeviceRow {
     first_unupload_pre_key_id: i32,
 }
 
+/// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
+const ID_PARAM_CHUNK: usize = 900;
+
 #[derive(Clone)]
 pub struct SqliteStore {
     pub(crate) pool: SqlitePool,
@@ -1603,16 +1606,22 @@ impl SignalStore for SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let rows: Vec<(i32, Vec<u8>)> = prekeys::table
-                .select((prekeys::id, prekeys::key))
-                .filter(prekeys::id.eq_any(&ids))
-                .filter(prekeys::device_id.eq(device_id))
-                .load(&mut conn)
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(rows
-                .into_iter()
-                .map(|(id, key)| (id as u32, Bytes::from(key)))
-                .collect())
+            // Chunked like mark_prekeys_uploaded: the upload window can carry
+            // more ids than SQLite's host-parameter limit.
+            let mut out = Vec::with_capacity(ids.len());
+            for chunk in ids.chunks(ID_PARAM_CHUNK) {
+                let rows: Vec<(i32, Vec<u8>)> = prekeys::table
+                    .select((prekeys::id, prekeys::key))
+                    .filter(prekeys::id.eq_any(chunk))
+                    .filter(prekeys::device_id.eq(device_id))
+                    .load(&mut conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                out.extend(
+                    rows.into_iter()
+                        .map(|(id, key)| (id as u32, Bytes::from(key))),
+                );
+            }
+            Ok(out)
         })
         .await
     }
@@ -1678,13 +1687,17 @@ impl SignalStore for SqliteStore {
         self.with_retry("mark_prekeys_uploaded", move || {
             let ids = ids.clone();
             Box::new(move |conn: &mut SqliteConnection| {
-                diesel::update(
-                    prekeys::table
-                        .filter(prekeys::id.eq_any(ids))
-                        .filter(prekeys::device_id.eq(device_id)),
-                )
-                .set(prekeys::uploaded.eq(true))
-                .execute(conn)?;
+                // Stay under SQLite's host-parameter limit (999 by default);
+                // the upload batch is configurable up to u16::MAX ids.
+                for chunk in ids.chunks(ID_PARAM_CHUNK) {
+                    diesel::update(
+                        prekeys::table
+                            .filter(prekeys::id.eq_any(chunk.to_vec()))
+                            .filter(prekeys::device_id.eq(device_id)),
+                    )
+                    .set(prekeys::uploaded.eq(true))
+                    .execute(conn)?;
+                }
                 Ok(())
             })
         })

@@ -395,10 +395,12 @@ impl Client {
             })
             .await;
         // Same durability pairing as the batch path: the stored key is
-        // durable, so its watermarks must not ride the lazy saver.
-        if let Err(e) = self.persistence_manager.flush().await {
-            log::warn!("failed to flush prekey watermarks: {e:?}");
-        }
+        // durable, so its watermarks must not ride the lazy saver. A failed
+        // flush fails the allocation; the retry dance recovers later.
+        self.persistence_manager
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to flush prekey watermarks: {e:?}"))?;
         Ok((id, key_pair.public_key))
     }
 
@@ -503,10 +505,13 @@ impl Client {
             .await;
         // The generated rows are already durable; the watermarks ride the lazy
         // device saver. Flush them now so a crash before the IQ cannot reload
-        // pre-generation watermarks and orphan the stored window.
-        if let Err(e) = self.persistence_manager.flush().await {
-            log::warn!("failed to flush prekey watermarks: {e:?}");
-        }
+        // pre-generation watermarks and orphan the stored window. A failed
+        // flush aborts the pass: proceeding would upload keys whose
+        // accounting is not durable, the exact state this barrier prevents.
+        self.persistence_manager
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to flush prekey watermarks: {e:?}"))?;
 
         // Load the upload window: leftover keys plus the fresh ones. Gaps are
         // tolerated (a window key consumed via a retry receipt leaves a hole).
@@ -580,10 +585,12 @@ impl Client {
             .await;
         // The abandon watermark must be durable BEFORE the fallible send: a
         // crash after a failed IQ would otherwise reload FIRST=window_start
-        // and re-offer ids that may already be in the server pool.
-        if let Err(e) = self.persistence_manager.flush().await {
-            log::warn!("failed to flush prekey watermarks: {e:?}");
-        }
+        // and re-offer ids that may already be in the server pool. A failed
+        // flush aborts instead of sending with non-durable abandonment.
+        self.persistence_manager
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to flush abandon watermark: {e:?}"))?;
 
         self.execute(spec).await?;
 
