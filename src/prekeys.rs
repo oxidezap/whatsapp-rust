@@ -417,6 +417,15 @@ impl Client {
         )
     )]
     async fn upload_pre_keys_inner(&self) -> Result<(), anyhow::Error> {
+        self.upload_pre_keys_pass(true).await
+    }
+
+    /// One upload pass. `allow_collapse_retry` permits a single inline rerun
+    /// after collapsing a fully consumed window, so a one-shot caller (the
+    /// login path logs and moves on) still ends the pass with fresh keys; the
+    /// rerun cannot hit the empty branch again because the collapsed plan
+    /// generates a full batch.
+    async fn upload_pre_keys_pass(&self, allow_collapse_retry: bool) -> Result<(), anyhow::Error> {
         // INVARIANT: every caller holds `prekey_upload_lock` (login, prekey-low
         // notification, refresh, digest repair), serializing the watermark math
         // with the retry-receipt single-key path.
@@ -521,7 +530,7 @@ impl Client {
         if rows.is_empty() {
             // A fully consumed/missing window with no generation would bail
             // forever (available > 0 keeps gen_count at 0). Collapse the
-            // window so the next attempt generates a fresh batch.
+            // window and rerun the pass so a one-shot caller still uploads.
             if plan.gen_count == 0 {
                 self.persistence_manager
                     .process_command(DeviceCommand::SetPreKeyWatermarks {
@@ -529,6 +538,14 @@ impl Client {
                         first_unupload_pre_key_id: plan.new_next,
                     })
                     .await;
+                if allow_collapse_retry {
+                    log::warn!(
+                        "prekey window [{}, {}) fully missing; collapsed, regenerating",
+                        plan.window_start,
+                        plan.new_next
+                    );
+                    return Box::pin(self.upload_pre_keys_pass(false)).await;
+                }
             }
             anyhow::bail!("no prekey available to upload");
         }
@@ -1104,6 +1121,38 @@ mod window_tests {
         backend(&client).remove_prekey(11).await.expect("consume");
         let (id, _) = client.get_or_gen_single_pre_key().await.expect("heal 2");
         assert_eq!(id, 12);
+    }
+
+    /// A fully missing window must collapse AND regenerate within the same
+    /// pass: the login path is one-shot, so bailing without minting would
+    /// leave the device without prekeys until an unrelated trigger.
+    #[tokio::test]
+    async fn fully_missing_window_collapses_and_regenerates_in_one_pass() {
+        use wacore::store::commands::DeviceCommand;
+
+        let client =
+            crate::test_utils::create_test_client_with_name("prekey_window_collapse").await;
+        client.set_wanted_pre_key_count(5);
+        // Watermarks claim a 5-key window, but nothing is stored (all consumed).
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: 15,
+                first_unupload_pre_key_id: 10,
+            })
+            .await;
+
+        // The IQ still fails (disconnected), but the SAME pass must have
+        // collapsed and generated a fresh batch.
+        let _ = client.upload_pre_keys_inner().await;
+        let (next, first) = snapshot(&client);
+        assert_eq!(next, 20, "fresh batch minted at the collapsed NEXT");
+        assert_eq!(first, 20, "marked past the window before the send");
+        let rows = backend(&client)
+            .load_prekeys_batch(&[15, 16, 17, 18, 19])
+            .await
+            .expect("load");
+        assert_eq!(rows.len(), 5, "regeneration happened within the pass");
     }
 
     /// A retry-receipt single key lives in the unuploaded window, so the next
