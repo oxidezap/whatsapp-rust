@@ -1,6 +1,7 @@
 mod blocking;
 pub(crate) mod chat_actions;
 mod chatstate;
+mod comments;
 mod community;
 mod contacts;
 mod events;
@@ -28,6 +29,8 @@ pub use community::{
 };
 
 pub use chatstate::{ChatStateType, Chatstate};
+
+pub use comments::Comments;
 
 pub use contacts::{
     Contacts, IsOnWhatsAppResult, ProfilePicture, UserInfo, UsyncSubprotocolError, VerifiedName,

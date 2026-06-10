@@ -1167,6 +1167,9 @@ mod consumed_prekey_atomicity_tests {
             async fn remove_prekey(&self, id: u32) -> crate::store::error::Result<()> {
                 self.0.remove_prekey(id).await
             }
+            async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> crate::store::error::Result<()> {
+                self.0.mark_prekeys_uploaded(ids).await
+            }
             async fn get_max_prekey_id(&self) -> crate::store::error::Result<u32> {
                 self.0.get_max_prekey_id().await
             }
@@ -1286,6 +1289,9 @@ mod consumed_prekey_atomicity_tests {
                     tokio::task::yield_now().await;
                 }
                 self.inner.put_sessions_batch(sessions).await
+            }
+            async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> crate::store::error::Result<()> {
+                self.inner.mark_prekeys_uploaded(ids).await
             }
             async fn remove_prekey(&self, id: u32) -> crate::store::error::Result<()> {
                 // The fix drains prekeys under the sessions lock, so a try_lock here

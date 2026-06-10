@@ -48,6 +48,85 @@ fn start_prekey_id(next_pre_key_id: u32, max_store_id: u32) -> u32 {
     ((raw - 1) % MAX_PREKEY_ID as u64) as u32 + 1
 }
 
+/// One upload pass's accounting, mirroring WA Web `getOrGenPreKeys` semantics
+/// (`WAWebSignalStoreApi`): the upload window starts at the FIRST_UNUPLOAD
+/// watermark and re-offers leftover generated-but-unuploaded keys, generating
+/// only enough new ones to reach the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreKeyUploadPlan {
+    /// First id of the upload window (the FIRST_UNUPLOAD watermark after
+    /// migration init / self-heal).
+    window_start: u32,
+    /// Leftover generated-but-unuploaded keys already in the store.
+    available: u32,
+    /// New keys to generate (`wanted - available`, floored at 0).
+    gen_count: u32,
+    /// First id of the newly generated range (`window_start + available`).
+    gen_start: u32,
+    /// NEXT_PK_ID after generation (`gen_start + gen_count`).
+    new_next: u32,
+}
+
+/// Compute the upload window and generation range from the two watermarks.
+///
+/// `first_unupload == 0` is the unset/legacy state: the window starts fresh at
+/// the legacy-safe `start_prekey_id` (which skips stored-but-unconfirmed rows
+/// from the pre-watermark model) with no leftovers. The same reset handles a
+/// corrupt `first > next` pair and a window that would cross the 24-bit id
+/// boundary; the wrap collapse keeps the window contiguous and is the same
+/// accepted tradeoff as the old per-id modulo (the server consumes keys well
+/// before a 16M cycle).
+fn plan_prekey_upload(
+    first_unupload: u32,
+    next: u32,
+    max_store_id: u32,
+    wanted: usize,
+) -> PreKeyUploadPlan {
+    let wanted = wanted as u64;
+    let first = first_unupload as u64;
+    let next_eff = next as u64;
+
+    let fresh_window = |start: u64| {
+        let start = if start + wanted - 1 > MAX_PREKEY_ID as u64 {
+            1
+        } else {
+            start
+        };
+        PreKeyUploadPlan {
+            window_start: start as u32,
+            available: 0,
+            gen_count: wanted as u32,
+            gen_start: start as u32,
+            new_next: (start + wanted) as u32,
+        }
+    };
+
+    if first == 0 || first > next_eff {
+        return fresh_window(start_prekey_id(next, max_store_id) as u64);
+    }
+    // Cap leftovers at the target: surplus stays in the window for next time
+    // (WA Web p <= 0 path uploads only getPreKeysByRange(s, wanted)). New
+    // generation always starts at NEXT (savePreKeys semantics), so a capped
+    // window never regresses the counter.
+    let available = (next_eff - first).min(wanted);
+    let gen_count = wanted - available;
+    if first + wanted - 1 > MAX_PREKEY_ID as u64
+        || (gen_count > 0 && next_eff + gen_count - 1 > MAX_PREKEY_ID as u64)
+    {
+        // Window or generation would cross the id boundary: collapse to a
+        // fresh window at 1 (old high-id rows are overwritten progressively,
+        // same acceptance as the previous modulo wrap).
+        return fresh_window(1);
+    }
+    PreKeyUploadPlan {
+        window_start: first as u32,
+        available: available as u32,
+        gen_count: gen_count as u32,
+        gen_start: next_eff as u32,
+        new_next: (next_eff + gen_count) as u32,
+    }
+}
+
 /// The upload IQ encodes the pre-key `<list>` length as a u16
 /// (`Encoder::write_list_start`), so a larger batch fails to encode after the
 /// keys were already generated and stored. Well below MAX_PREKEY_ID, so a single
@@ -221,36 +300,108 @@ impl Client {
         self.upload_pre_keys_inner().await
     }
 
-    /// Allocate the next one-time prekey id from the persistent monotonic `NEXT_PK_ID` counter
-    /// (the same namespace as uploads) and advance it, so a retry-receipt prekey can never
-    /// collide with a live pool key. The caller must hold `prekey_upload_lock` to serialize the
-    /// allocate+bump with the upload path. Mirrors WA Web's `getOrGenSinglePreKey -> NEXT_PK_ID`.
+    /// Get-or-generate ONE one-time prekey, mirroring WA Web's
+    /// `getOrGenSinglePreKey` = `getOrGenPreKeys(1)`: reuse the first
+    /// generated-but-unuploaded window key when one exists (it stays in the
+    /// window and is uploaded by the next batch, like WA Web), else generate a
+    /// fresh key at `NEXT_PK_ID` and advance the counter at generation time.
+    /// The caller must hold `prekey_upload_lock` to serialize the watermark
+    /// math with the upload path.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
-            name = "wa.session.allocate_prekey_id",
+            name = "wa.session.get_or_gen_prekey",
             level = "debug",
             skip_all,
             err(Debug)
         )
     )]
-    pub(crate) async fn allocate_next_one_time_prekey_id(&self) -> Result<u32, anyhow::Error> {
-        let next_pre_key_id = self
-            .persistence_manager
-            .get_device_snapshot()
-            .next_pre_key_id;
-        let backend = self
-            .persistence_manager
-            .get_device_snapshot()
-            .backend
-            .clone();
+    pub(crate) async fn get_or_gen_single_pre_key(
+        &self,
+    ) -> Result<(u32, PublicKey), anyhow::Error> {
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let backend = device_snapshot.backend.clone();
         let max_id = backend.get_max_prekey_id().await?;
-        let id = start_prekey_id(next_pre_key_id, max_id);
-        let next = (id as u64 % MAX_PREKEY_ID as u64) as u32 + 1;
+        let plan = plan_prekey_upload(
+            device_snapshot.first_unupload_pre_key_id,
+            device_snapshot.next_pre_key_id,
+            max_id,
+            1,
+        );
+
+        if plan.gen_count == 0 {
+            // Load the whole remaining window: a consumed head (a previously
+            // reused retry key the peer already spent) must not abandon the
+            // still-live keys behind it, so the heal advances FIRST to the
+            // next stored id instead of past the window. WA Web throws on a
+            // missing head; healing is strictly better and stays in the same
+            // id namespace.
+            let window_ids: Vec<u32> =
+                (plan.window_start..device_snapshot.next_pre_key_id).collect();
+            let mut rows = backend.load_prekeys_batch(&window_ids).await?;
+            rows.sort_unstable_by_key(|(id, _)| *id);
+            if let Some((id, record)) = rows.into_iter().next() {
+                if id != plan.window_start {
+                    log::warn!(
+                        "prekey window head {} missing from store; advancing to {id}",
+                        plan.window_start
+                    );
+                    self.persistence_manager
+                        .process_command(DeviceCommand::SetPreKeyWatermarks {
+                            next_pre_key_id: device_snapshot.next_pre_key_id,
+                            first_unupload_pre_key_id: id,
+                        })
+                        .await;
+                }
+                use prost::Message;
+                let structure = waproto::whatsapp::PreKeyRecordStructure::decode(&record[..])?;
+                let record = wacore::libsignal::store::record_helpers::prekey_structure_to_record(
+                    structure,
+                )?;
+                return Ok((id, record.key_pair()?.public_key));
+            }
+            log::warn!(
+                "prekey window [{}, {}) fully consumed; generating fresh",
+                plan.window_start,
+                device_snapshot.next_pre_key_id
+            );
+        }
+
+        let id = if plan.gen_count > 0 {
+            plan.gen_start
+        } else {
+            // Empty window: generate at NEXT and collapse FIRST onto it. This
+            // path bypasses the planner's boundary handling, so wrap to 1 at
+            // the 24-bit edge like the planner's collapse does.
+            let raw = device_snapshot
+                .next_pre_key_id
+                .max(plan.window_start.saturating_add(1));
+            if raw > MAX_PREKEY_ID { 1 } else { raw }
+        };
+        let key_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let record = new_pre_key_record(id, &key_pair);
+        use prost::Message;
+        backend
+            .store_prekey(id, &record.encode_to_vec(), false)
+            .await?;
         self.persistence_manager
-            .process_command(DeviceCommand::SetNextPreKeyId(next))
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: id.saturating_add(1),
+                first_unupload_pre_key_id: if plan.gen_count > 0 {
+                    plan.window_start
+                } else {
+                    id
+                },
+            })
             .await;
-        Ok(id)
+        // Same durability pairing as the batch path: the stored key is
+        // durable, so its watermarks must not ride the lazy saver. A failed
+        // flush fails the allocation; the retry dance recovers later.
+        self.persistence_manager
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to flush prekey watermarks: {e:?}"))?;
+        Ok((id, key_pair.public_key))
     }
 
     /// Generate and upload the configured number of pre-keys (see
@@ -266,21 +417,20 @@ impl Client {
         )
     )]
     async fn upload_pre_keys_inner(&self) -> Result<(), anyhow::Error> {
+        self.upload_pre_keys_pass(true).await
+    }
+
+    /// One upload pass. `allow_collapse_retry` permits a single inline rerun
+    /// after collapsing a fully consumed window, so a one-shot caller (the
+    /// login path logs and moves on) still ends the pass with fresh keys; the
+    /// rerun cannot hit the empty branch again because the collapsed plan
+    /// generates a full batch.
+    async fn upload_pre_keys_pass(&self, allow_collapse_retry: bool) -> Result<(), anyhow::Error> {
+        // INVARIANT: every caller holds `prekey_upload_lock` (login, prekey-low
+        // notification, refresh, digest repair), serializing the watermark math
+        // with the retry-receipt single-key path.
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let backend = device_snapshot.backend.clone();
-
-        // Use the persistent counter, falling back to max(store_id)+1 for migration.
-        // The counter is the source of truth after the first upload; start_prekey_id wraps
-        // into the 24-bit range so lingering high-ID rows don't pin start_id above it.
-        let max_id = backend.get_max_prekey_id().await?;
-        if device_snapshot.next_pre_key_id == 0 {
-            log::info!(
-                "Migrating pre-key counter: MAX(key_id) in store = {}, starting from {}",
-                max_id,
-                max_id + 1
-            );
-        }
-        let start_id = start_prekey_id(device_snapshot.next_pre_key_id, max_id);
 
         let configured = self.wanted_pre_key_count.load(Ordering::Relaxed);
         let wanted = clamp_wanted_pre_key_count(configured);
@@ -288,52 +438,146 @@ impl Client {
             log::warn!("wanted_pre_key_count {configured} out of range, clamped to {wanted}");
         }
 
-        // Per-key X25519 generation and prost encoding are CPU-bound, and the
-        // batch size is caller-configurable, so offload the whole batch to keep
-        // the async executor responsive. Records are encoded into one contiguous
-        // buffer with zero-copy Bytes slices instead of an alloc per record.
-        let (encoded_batch, pre_key_pairs) = wacore::runtime::blocking(&*self.runtime, move || {
+        // WA Web getOrGenPreKeys: re-offer the leftover generated-but-unuploaded
+        // window first and only generate enough new keys to reach the target.
+        let max_id = backend.get_max_prekey_id().await?;
+        if device_snapshot.first_unupload_pre_key_id == 0 {
+            log::info!(
+                "Initialising prekey upload window (legacy counter = {}, MAX(key_id) = {})",
+                device_snapshot.next_pre_key_id,
+                max_id
+            );
+        }
+        let plan = plan_prekey_upload(
+            device_snapshot.first_unupload_pre_key_id,
+            device_snapshot.next_pre_key_id,
+            max_id,
+            wanted,
+        );
+
+        if plan.gen_count > 0 {
+            let gen_start = plan.gen_start;
+            let gen_count = plan.gen_count as usize;
+            // Per-key X25519 generation and prost encoding are CPU-bound, and the
+            // batch size is caller-configurable, so offload the whole batch to keep
+            // the async executor responsive. Records are encoded into one contiguous
+            // buffer with zero-copy Bytes slices instead of an alloc per record.
+            let encoded_batch = wacore::runtime::blocking(&*self.runtime, move || {
+                use prost::Message;
+
+                // Seed one CSPRNG and advance it per key, rather than reseeding from
+                // entropy on every iteration.
+                let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+                let mut records = Vec::with_capacity(gen_count);
+                for i in 0..gen_count {
+                    let pre_key_id = gen_start + i as u32;
+                    let key_pair = KeyPair::generate(&mut rng);
+                    records.push((pre_key_id, new_pre_key_record(pre_key_id, &key_pair)));
+                }
+
+                let total_len: usize = records.iter().map(|(_, r)| r.encoded_len()).sum();
+                let mut buf = Vec::with_capacity(total_len);
+                let mut offsets = Vec::with_capacity(records.len());
+                for (id, record) in &records {
+                    let start = buf.len();
+                    record
+                        .encode(&mut buf)
+                        .expect("prost encode into pre-sized Vec");
+                    offsets.push((*id, start..buf.len()));
+                }
+                let shared = bytes::Bytes::from(buf);
+                let encoded_batch: Vec<(u32, bytes::Bytes)> = offsets
+                    .into_iter()
+                    .map(|(id, range)| (id, shared.slice(range)))
+                    .collect();
+                encoded_batch
+            })
+            .await;
+
+            // Persist the freshly generated prekeys before uploading them so they are
+            // already available for local decryption if the server starts sending
+            // pkmsg traffic immediately after accepting the upload.
+            // Propagate errors — uploading a key we can't store locally would cause
+            // decryption failures when the server hands it out.
+            backend.store_prekeys_batch(&encoded_batch, false).await?;
+        }
+
+        // Advance NEXT at GENERATION time (WA Web savePreKeys) and initialise
+        // FIRST for a legacy device, in one command. From here the window
+        // covers every stored-but-unuploaded key, so a failure below never
+        // leads to regenerating over live ids.
+        self.persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: plan.new_next,
+                first_unupload_pre_key_id: plan.window_start,
+            })
+            .await;
+        // The generated rows are already durable; the watermarks ride the lazy
+        // device saver. Flush them now so a crash before the IQ cannot reload
+        // pre-generation watermarks and orphan the stored window. A failed
+        // flush aborts the pass: proceeding would upload keys whose
+        // accounting is not durable, the exact state this barrier prevents.
+        self.persistence_manager
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to flush prekey watermarks: {e:?}"))?;
+
+        // Load the upload window: leftover keys plus the fresh ones. Gaps are
+        // tolerated (a window key consumed via a retry receipt leaves a hole).
+        let window_ids: Vec<u32> = (0..wanted as u32).map(|i| plan.window_start + i).collect();
+        let mut rows = backend.load_prekeys_batch(&window_ids).await?;
+        rows.sort_unstable_by_key(|(id, _)| *id);
+        if rows.is_empty() {
+            // A fully consumed/missing window with no generation would bail
+            // forever (available > 0 keeps gen_count at 0). Collapse the
+            // window and rerun the pass so a one-shot caller still uploads.
+            if plan.gen_count == 0 {
+                self.persistence_manager
+                    .process_command(DeviceCommand::SetPreKeyWatermarks {
+                        next_pre_key_id: plan.new_next,
+                        first_unupload_pre_key_id: plan.new_next,
+                    })
+                    .await;
+                if allow_collapse_retry {
+                    log::warn!(
+                        "prekey window [{}, {}) fully missing; collapsed, regenerating",
+                        plan.window_start,
+                        plan.new_next
+                    );
+                    return Box::pin(self.upload_pre_keys_pass(false)).await;
+                }
+            }
+            anyhow::bail!("no prekey available to upload");
+        }
+
+        let pre_key_pairs = {
             use prost::Message;
-
-            // Seed one CSPRNG and advance it per key, rather than reseeding from
-            // entropy on every iteration.
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-            let mut records = Vec::with_capacity(wanted);
-            let mut pre_key_pairs: Vec<(u32, PublicKey)> = Vec::with_capacity(wanted);
-            for i in 0..wanted {
-                let pre_key_id =
-                    (((start_id as u64 - 1) + i as u64) % (MAX_PREKEY_ID as u64)) as u32 + 1;
-                let key_pair = KeyPair::generate(&mut rng);
-                records.push((pre_key_id, new_pre_key_record(pre_key_id, &key_pair)));
-                pre_key_pairs.push((pre_key_id, key_pair.public_key));
+            let mut pairs: Vec<(u32, PublicKey)> = Vec::with_capacity(rows.len());
+            for (id, record) in &rows {
+                let public_key = waproto::whatsapp::PreKeyRecordStructure::decode(&record[..])
+                    .map_err(anyhow::Error::from)
+                    .and_then(|structure| {
+                        let raw = structure
+                            .public_key
+                            .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
+                        Ok(PublicKey::from_djb_public_key_bytes(&raw)?)
+                    });
+                match public_key {
+                    Ok(public_key) => pairs.push((*id, public_key)),
+                    Err(e) => log::warn!("skipping undecodable prekey record {id}: {e:?}"),
+                }
             }
-
-            let total_len: usize = records.iter().map(|(_, r)| r.encoded_len()).sum();
-            let mut buf = Vec::with_capacity(total_len);
-            let mut offsets = Vec::with_capacity(records.len());
-            for (id, record) in &records {
-                let start = buf.len();
-                record
-                    .encode(&mut buf)
-                    .expect("prost encode into pre-sized Vec");
-                offsets.push((*id, start..buf.len()));
+            if pairs.is_empty() {
+                anyhow::bail!("no decodable prekey available to upload");
             }
-            let shared = bytes::Bytes::from(buf);
-            let encoded_batch: Vec<(u32, bytes::Bytes)> = offsets
-                .into_iter()
-                .map(|(id, range)| (id, shared.slice(range)))
-                .collect();
-
-            (encoded_batch, pre_key_pairs)
-        })
-        .await;
-
-        // Persist the freshly generated prekeys before uploading them so they are
-        // already available for local decryption if the server starts sending
-        // pkmsg traffic immediately after accepting the upload.
-        // Propagate errors — uploading a key we can't store locally would cause
-        // decryption failures when the server hands it out.
-        backend.store_prekeys_batch(&encoded_batch, false).await?;
+            pairs
+        };
+        let last_id = pre_key_pairs
+            .last()
+            .map(|(id, _)| *id)
+            .expect("non-empty checked above");
+        let uploaded_count = pre_key_pairs.len();
+        let pre_key_ids: Vec<u32> = pre_key_pairs.iter().map(|(id, _)| *id).collect();
 
         let spec = PreKeyUploadSpec::new(
             device_snapshot.registration_id,
@@ -344,21 +588,38 @@ impl Client {
             pre_key_pairs,
         );
 
+        // Mark the window uploaded BEFORE the send, like WA Web's
+        // markKeyAsUploaded (PreKeysJob.js runs it ahead of the IQ). On a
+        // mid-flight failure the server state is unknown, so the keys are
+        // abandoned rather than re-offered: re-uploading an id a peer may
+        // already have consumed would corrupt the server pool. The keys stay
+        // stored locally and remain decryptable if the upload did land.
+        self.persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: plan.new_next,
+                first_unupload_pre_key_id: plan.window_start.max(last_id.saturating_add(1)),
+            })
+            .await;
+        // The abandon watermark must be durable BEFORE the fallible send: a
+        // crash after a failed IQ would otherwise reload FIRST=window_start
+        // and re-offer ids that may already be in the server pool. A failed
+        // flush aborts instead of sending with non-durable abandonment.
+        self.persistence_manager
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to flush abandon watermark: {e:?}"))?;
+
         self.execute(spec).await?;
 
-        // Mark the uploaded prekeys as server-synced (reuse encoded batch)
-        if let Err(e) = backend.store_prekeys_batch(&encoded_batch, true).await {
+        // Mark the uploaded prekeys as server-synced. UPDATE semantics: a
+        // window key consumed by an inbound pkmsg while the IQ was in flight
+        // (retry-receipt keys are reachable that way, and consumption is not
+        // serialized by prekey_upload_lock) must stay deleted, not be
+        // resurrected by an upsert of the stale record.
+        let uploaded_ids: Vec<u32> = pre_key_ids;
+        if let Err(e) = backend.mark_prekeys_uploaded(&uploaded_ids).await {
             log::warn!("Failed to mark prekeys as uploaded: {:?}", e);
         }
-
-        // IDs wrap modulo MAX_PREKEY_ID. If the counter wraps while unconsumed
-        // high-ID prekeys still exist, the upsert (.on_conflict.do_update)
-        // silently overwrites them. Acceptable: the server consumes keys well
-        // before a full 16M cycle completes.
-        let next_id = (((start_id as u64 - 1) + wanted as u64) % (MAX_PREKEY_ID as u64)) as u32 + 1;
-        self.persistence_manager
-            .process_command(DeviceCommand::SetNextPreKeyId(next_id))
-            .await;
 
         // Persist flag matching WA Web's setServerHasPreKeys(true) (PreKeysJob.js:79)
         self.persistence_manager
@@ -366,9 +627,10 @@ impl Client {
             .await;
 
         log::debug!(
-            "Successfully uploaded {} new pre-keys with sequential IDs starting from {}.",
-            wanted,
-            start_id
+            "Successfully uploaded {} pre-keys ({} reused from the window) starting from {}.",
+            uploaded_count,
+            plan.available,
+            plan.window_start
         );
 
         Ok(())
@@ -591,8 +853,86 @@ impl Client {
 mod tests {
     use super::{
         DEFAULT_WANTED_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH, MAX_PREKEY_ID, MIN_PRE_KEY_COUNT,
-        clamp_wanted_pre_key_count, should_upload_pre_keys, start_prekey_id,
+        clamp_wanted_pre_key_count, plan_prekey_upload, should_upload_pre_keys, start_prekey_id,
     };
+
+    #[test]
+    fn plan_initialises_window_for_legacy_device() {
+        // first unset: fresh window at the legacy-safe start (max(counter, store+1)),
+        // full generation.
+        let p = plan_prekey_upload(0, 7, 20, 812);
+        assert_eq!(p.window_start, 21, "legacy start skips stored rows");
+        assert_eq!(p.available, 0);
+        assert_eq!(p.gen_count, 812);
+        assert_eq!(p.gen_start, 21);
+        assert_eq!(p.new_next, 833);
+    }
+
+    #[test]
+    fn plan_generates_full_batch_on_empty_window() {
+        let p = plan_prekey_upload(100, 100, 99, 812);
+        assert_eq!(p.window_start, 100);
+        assert_eq!(p.available, 0);
+        assert_eq!(p.gen_count, 812);
+        assert_eq!(p.gen_start, 100);
+        assert_eq!(p.new_next, 912);
+    }
+
+    #[test]
+    fn plan_reuses_leftovers_and_tops_up() {
+        // 50 leftover unuploaded keys: only 762 new ones, window re-offers all 812.
+        let p = plan_prekey_upload(100, 150, 149, 812);
+        assert_eq!(p.window_start, 100);
+        assert_eq!(p.available, 50);
+        assert_eq!(p.gen_count, 762);
+        assert_eq!(p.gen_start, 150, "generation starts at NEXT (savePreKeys)");
+        assert_eq!(p.new_next, 912);
+    }
+
+    #[test]
+    fn plan_full_window_generates_nothing_and_keeps_next() {
+        // More leftovers than the target (WA Web p <= 0): upload the first
+        // `wanted`, generate nothing, and never regress NEXT.
+        let p = plan_prekey_upload(100, 1500, 1499, 812);
+        assert_eq!(p.window_start, 100);
+        assert_eq!(p.available, 812);
+        assert_eq!(p.gen_count, 0);
+        assert_eq!(p.new_next, 1500, "a capped window must not regress NEXT");
+    }
+
+    #[test]
+    fn plan_heals_corrupt_first_past_next() {
+        let p = plan_prekey_upload(500, 100, 600, 812);
+        assert_eq!(p.window_start, 601, "heals via the legacy-safe start");
+        assert_eq!(p.available, 0);
+        assert_eq!(p.gen_count, 812);
+    }
+
+    #[test]
+    fn plan_collapses_window_at_id_boundary() {
+        // Window would cross the 24-bit boundary: collapse to a fresh window at 1.
+        let p = plan_prekey_upload(
+            MAX_PREKEY_ID - 10,
+            MAX_PREKEY_ID - 5,
+            MAX_PREKEY_ID - 6,
+            812,
+        );
+        assert_eq!(p.window_start, 1);
+        assert_eq!(p.available, 0);
+        assert_eq!(p.gen_count, 812);
+        assert_eq!(p.new_next, 813);
+    }
+
+    #[test]
+    fn plan_single_key_reuses_window_head() {
+        // getOrGenSinglePreKey = getOrGenPreKeys(1): a non-empty window means
+        // no generation; the head key is the answer.
+        let p = plan_prekey_upload(10, 12, 11, 1);
+        assert_eq!(p.window_start, 10);
+        assert_eq!(p.available, 1);
+        assert_eq!(p.gen_count, 0);
+        assert_eq!(p.new_next, 12);
+    }
 
     #[test]
     fn default_matches_wa_web_upload_keys_count() {
@@ -649,6 +989,226 @@ mod tests {
         assert!(
             should_upload_pre_keys(false, MIN_PRE_KEY_COUNT - 1),
             "below threshold uploads even without force"
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use wacore::libsignal::protocol::PublicKey;
+
+    fn snapshot(client: &crate::client::Client) -> (u32, u32) {
+        let d = client.persistence_manager.get_device_snapshot();
+        (d.next_pre_key_id, d.first_unupload_pre_key_id)
+    }
+
+    fn backend(
+        client: &crate::client::Client,
+    ) -> std::sync::Arc<dyn crate::store::traits::Backend> {
+        client.persistence_manager.backend()
+    }
+
+    /// A failed upload IQ must leave the watermarks past the generated window
+    /// (WA Web abandons on unknown server state) and the next attempt must
+    /// mint FRESH ids, never regenerating over the stored ones: that
+    /// regeneration was the prekey-collision class on partial success.
+    #[tokio::test]
+    async fn failed_upload_abandons_window_and_never_remints_ids() {
+        let client = crate::test_utils::create_test_client_with_name("prekey_window_fail").await;
+        client.set_wanted_pre_key_count(5);
+
+        let err = client.upload_pre_keys_inner().await;
+        assert!(err.is_err(), "IQ must fail on a disconnected client");
+
+        let (next, first) = snapshot(&client);
+        assert_eq!(next, 6, "NEXT advances at generation time");
+        assert_eq!(first, 6, "FIRST is marked past the window before the send");
+
+        let rows = backend(&client)
+            .load_prekeys_batch(&[1, 2, 3, 4, 5])
+            .await
+            .expect("load");
+        assert_eq!(rows.len(), 5, "the generated window stays stored");
+        let before: Vec<_> = rows.into_iter().collect();
+
+        let _ = client.upload_pre_keys_inner().await;
+        let (next, first) = snapshot(&client);
+        assert_eq!(next, 11, "second attempt mints fresh ids 6..=10");
+        assert_eq!(first, 11);
+
+        let rows2 = backend(&client)
+            .load_prekeys_batch(&[6, 7, 8, 9, 10])
+            .await
+            .expect("load");
+        assert_eq!(rows2.len(), 5);
+
+        let after = backend(&client)
+            .load_prekeys_batch(&[1, 2, 3, 4, 5])
+            .await
+            .expect("load");
+        assert_eq!(
+            before, after,
+            "abandoned rows must never be regenerated (collision class)"
+        );
+    }
+
+    /// getOrGenSinglePreKey parity: the window head is reused until an upload
+    /// (or consumption) moves past it, and a consumed head heals by skipping
+    /// the dead slot instead of failing like WA Web does.
+    #[tokio::test]
+    async fn single_prekey_is_reused_until_consumed() {
+        let client = crate::test_utils::create_test_client_with_name("prekey_single_reuse").await;
+
+        let (id1, pk1) = client.get_or_gen_single_pre_key().await.expect("gen");
+        let (id2, pk2) = client.get_or_gen_single_pre_key().await.expect("reuse");
+        assert_eq!(id1, id2, "window head must be reused");
+        assert_eq!(
+            pk1.serialize(),
+            pk2.serialize(),
+            "same stored key, not a regenerated one"
+        );
+        let (next, first) = snapshot(&client);
+        assert_eq!(first, id1);
+        assert_eq!(next, id1 + 1);
+
+        // The peer consumed it via pkmsg: the row is gone.
+        backend(&client).remove_prekey(id1).await.expect("remove");
+        let (id3, pk3) = client.get_or_gen_single_pre_key().await.expect("heal");
+        assert_eq!(id3, id1 + 1, "dead slot skipped, fresh id minted");
+        assert_ne!(pk3.serialize(), pk1.serialize());
+        let (next, first) = snapshot(&client);
+        assert_eq!(first, id3);
+        assert_eq!(next, id3 + 1);
+    }
+
+    /// A consumed window head must not abandon the live keys behind it: the
+    /// heal advances FIRST to the next stored id and reuses it.
+    #[tokio::test]
+    async fn consumed_head_advances_to_next_live_window_key() {
+        use prost::Message;
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::libsignal::store::record_helpers::new_pre_key_record;
+        use wacore::store::commands::DeviceCommand;
+
+        let client = crate::test_utils::create_test_client_with_name("prekey_window_heal").await;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut publics = std::collections::HashMap::new();
+        for id in 10u32..13 {
+            let kp = KeyPair::generate(&mut rng);
+            publics.insert(id, kp.public_key);
+            backend(&client)
+                .store_prekey(id, &new_pre_key_record(id, &kp).encode_to_vec(), false)
+                .await
+                .expect("store");
+        }
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: 13,
+                first_unupload_pre_key_id: 10,
+            })
+            .await;
+
+        backend(&client).remove_prekey(10).await.expect("consume");
+        let (id, pk) = client.get_or_gen_single_pre_key().await.expect("heal");
+        assert_eq!(id, 11, "heal must advance to the next LIVE window key");
+        assert_eq!(pk.serialize(), publics[&11].serialize());
+        let (next, first) = snapshot(&client);
+        assert_eq!(first, 11, "FIRST lands on the surviving key");
+        assert_eq!(next, 13, "NEXT untouched: 12 is still in the window");
+
+        // And the key behind it is still reachable afterwards.
+        backend(&client).remove_prekey(11).await.expect("consume");
+        let (id, _) = client.get_or_gen_single_pre_key().await.expect("heal 2");
+        assert_eq!(id, 12);
+    }
+
+    /// A fully missing window must collapse AND regenerate within the same
+    /// pass: the login path is one-shot, so bailing without minting would
+    /// leave the device without prekeys until an unrelated trigger.
+    #[tokio::test]
+    async fn fully_missing_window_collapses_and_regenerates_in_one_pass() {
+        use wacore::store::commands::DeviceCommand;
+
+        let client =
+            crate::test_utils::create_test_client_with_name("prekey_window_collapse").await;
+        client.set_wanted_pre_key_count(5);
+        // Watermarks claim a 5-key window, but nothing is stored (all consumed).
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: 15,
+                first_unupload_pre_key_id: 10,
+            })
+            .await;
+
+        // The IQ still fails (disconnected), but the SAME pass must have
+        // collapsed and generated a fresh batch.
+        let _ = client.upload_pre_keys_inner().await;
+        let (next, first) = snapshot(&client);
+        assert_eq!(next, 20, "fresh batch minted at the collapsed NEXT");
+        assert_eq!(first, 20, "marked past the window before the send");
+        let rows = backend(&client)
+            .load_prekeys_batch(&[15, 16, 17, 18, 19])
+            .await
+            .expect("load");
+        assert_eq!(rows.len(), 5, "regeneration happened within the pass");
+    }
+
+    /// A retry-receipt single key lives in the unuploaded window, so the next
+    /// batch upload re-offers the SAME stored key and only tops up the rest
+    /// (WA Web getOrGenPreKeys target-total semantics).
+    #[tokio::test]
+    async fn upload_window_includes_retry_single_key() {
+        let client = crate::test_utils::create_test_client_with_name("prekey_window_topup").await;
+        client.set_wanted_pre_key_count(5);
+
+        let (retry_id, retry_pk) = client.get_or_gen_single_pre_key().await.expect("gen");
+        let before = backend(&client)
+            .load_prekeys_batch(&[retry_id])
+            .await
+            .expect("load");
+        assert_eq!(before.len(), 1);
+
+        let _ = client.upload_pre_keys_inner().await;
+        let (next, _) = snapshot(&client);
+        assert_eq!(
+            next,
+            retry_id + 5,
+            "only wanted - available new keys are generated"
+        );
+
+        let after = backend(&client)
+            .load_prekeys_batch(&[retry_id])
+            .await
+            .expect("load");
+        assert_eq!(
+            before, after,
+            "the retry key is re-offered, not regenerated"
+        );
+        let window = backend(&client)
+            .load_prekeys_batch(&[
+                retry_id,
+                retry_id + 1,
+                retry_id + 2,
+                retry_id + 3,
+                retry_id + 4,
+            ])
+            .await
+            .expect("load");
+        assert_eq!(window.len(), 5, "window = retry key + top-up");
+
+        use prost::Message;
+        let structure = waproto::whatsapp::PreKeyRecordStructure::decode(&after[0].1[..])
+            .expect("decode structure");
+        let reloaded = PublicKey::from_djb_public_key_bytes(
+            structure.public_key.as_deref().expect("public key"),
+        )
+        .expect("pub");
+        assert_eq!(
+            reloaded.serialize(),
+            retry_pk.serialize(),
+            "stored record matches the key shipped in the receipt"
         );
     }
 }

@@ -115,6 +115,10 @@ impl Client {
         let this = Self {
             runtime: runtime.clone(),
             core,
+            msg_secret_buffer: crate::msg_secret_buffer::MsgSecretWriteBuffer::new(
+                persistence_manager.backend(),
+                runtime.clone(),
+            ),
             persistence_manager: persistence_manager.clone(),
             media_conn: Arc::new(RwLock::new(None)),
             is_logged_in: Arc::new(AtomicBool::new(false)),
@@ -533,6 +537,14 @@ impl Client {
             transport.disconnect().await;
         }
         self.cleanup_connection_state().await;
+
+        // The write-behind secret drain is detached; a clean exit right after
+        // a capture must not lose the only copy. Sealing first degrades any
+        // straggler capture (a lane worker still draining its backlog) to an
+        // inline write, so nothing can land on the detached drain after the
+        // final flush below and then be acked.
+        self.msg_secret_buffer.seal();
+        self.msg_secret_buffer.flush().await;
     }
 
     /// Backoff step used by [`reconnect()`] to create an offline window.

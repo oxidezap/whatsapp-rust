@@ -192,6 +192,12 @@ pub trait SignalStore: Send + Sync {
         Ok(result)
     }
 
+    /// Mark already-stored pre-keys as uploaded WITHOUT inserting. UPDATE
+    /// semantics on purpose: a key consumed (deleted) between the upload
+    /// snapshot and this call must stay deleted, never be resurrected by an
+    /// upsert.
+    async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> Result<()>;
+
     /// Remove a pre-key.
     async fn remove_prekey(&self, id: u32) -> Result<()>;
 

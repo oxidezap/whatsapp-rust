@@ -36,9 +36,10 @@ impl<'a> Events<'a> {
     /// later responses (RSVPs) via [`wacore::event::decrypt_event_response_with_secret`].
     pub async fn create(
         &self,
-        to: &Jid,
+        to: impl Into<Jid>,
         params: EventCreationParams,
     ) -> Result<(SendResult, Vec<u8>)> {
+        let to = &to.into();
         if params.name.trim().is_empty() {
             return Err(anyhow!("Event name must not be empty"));
         }
@@ -62,7 +63,7 @@ impl<'a> Events<'a> {
             ..Default::default()
         });
 
-        let result = self.client.send_message(to.clone(), message).await?;
+        let result = self.client.send_message(to, message).await?;
         Ok((result, message_secret))
     }
 
@@ -70,13 +71,14 @@ impl<'a> Events<'a> {
     /// message); `event_creator_jid` is who created the event.
     pub async fn respond(
         &self,
-        chat_jid: &Jid,
+        chat_jid: impl Into<Jid>,
         event_msg_id: &str,
         event_creator_jid: &Jid,
         message_secret: &[u8],
         response: EventResponseType,
         extra_guest_count: Option<i32>,
     ) -> Result<SendResult> {
+        let chat_jid = &chat_jid.into();
         let my_jid = self
             .client
             .get_pn()
@@ -124,7 +126,7 @@ impl<'a> Events<'a> {
             ..Default::default()
         };
 
-        self.client.send_message(chat_jid.clone(), message).await
+        self.client.send_message(chat_jid, message).await
     }
 
     /// The responder (self) JID keys the RSVP's HKDF/AAD, so it must use the event

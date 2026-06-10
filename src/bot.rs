@@ -65,7 +65,7 @@ impl MessageContext {
         message: wa::Message,
     ) -> Result<crate::send::SendResult, anyhow::Error> {
         self.client
-            .send_message(self.info.source.chat.clone(), message)
+            .send_message(&self.info.source.chat, message)
             .await
     }
 
@@ -103,11 +103,7 @@ impl MessageContext {
         new_message: wa::Message,
     ) -> Result<String, anyhow::Error> {
         self.client
-            .edit_message(
-                self.info.source.chat.clone(),
-                original_message_id,
-                new_message,
-            )
+            .edit_message(&self.info.source.chat, original_message_id, new_message)
             .await
     }
 
@@ -119,7 +115,7 @@ impl MessageContext {
         revoke_type: crate::send::RevokeType,
     ) -> Result<(), anyhow::Error> {
         self.client
-            .revoke_message(self.info.source.chat.clone(), message_id, revoke_type)
+            .revoke_message(&self.info.source.chat, message_id, revoke_type)
             .await
     }
 

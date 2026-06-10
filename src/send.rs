@@ -411,10 +411,10 @@ impl Client {
     /// For status/story updates use [`Client::status()`] instead.
     pub async fn send_message(
         &self,
-        to: Jid,
+        to: impl Into<Jid>,
         message: wa::Message,
     ) -> Result<SendResult, anyhow::Error> {
-        self.send_message_with_options(to, message, SendOptions::default())
+        self.send_message_with_options_inner(to.into(), message, SendOptions::default())
             .await
     }
 
@@ -428,17 +428,30 @@ impl Client {
     /// from the same CDN blob rather than re-uploaded.
     pub async fn forward_message(
         &self,
-        to: Jid,
+        to: impl Into<Jid>,
         message: &wa::Message,
     ) -> Result<SendResult, anyhow::Error> {
         use wacore::proto_helpers::MessageExt;
         let body = *message.get_base_message().prepare_for_forward();
-        self.send_message(to, body).await
+        self.send_message_with_options_inner(to.into(), body, SendOptions::default())
+            .await
     }
 
     /// Send a message with additional options.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn send_message_with_options(
+        &self,
+        to: impl Into<Jid>,
+        message: wa::Message,
+        options: SendOptions,
+    ) -> Result<SendResult, anyhow::Error> {
+        // Thin generic shim: the large async body below stays monomorphic so
+        // each `Into<Jid>` instantiation does not duplicate the state machine.
+        self.send_message_with_options_inner(to.into(), message, options)
+            .await
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
+    async fn send_message_with_options_inner(
         &self,
         to: Jid,
         mut message: wa::Message,
@@ -1088,14 +1101,23 @@ impl Client {
     /// * `message_id` - The ID of the message to delete
     /// * `revoke_type` - Use `RevokeType::Sender` to delete your own message,
     ///   or `RevokeType::Admin { original_sender }` to delete another user's message as group admin
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.revoke", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn revoke_message(
         &self,
-        to: Jid,
+        to: impl Into<Jid>,
         message_id: impl Into<String>,
         revoke_type: RevokeType,
     ) -> Result<(), anyhow::Error> {
-        let message_id = message_id.into();
+        self.revoke_message_inner(to.into(), message_id.into(), revoke_type)
+            .await
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.revoke", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
+    async fn revoke_message_inner(
+        &self,
+        to: Jid,
+        message_id: String,
+        revoke_type: RevokeType,
+    ) -> Result<(), anyhow::Error> {
         self.require_pn()?;
 
         let (from_me, participant, edit_attr) = match &revoke_type {
@@ -1159,10 +1181,11 @@ impl Client {
     /// text add-on and maps the undo case to a sender-revoke edit attribute.
     pub async fn keep_message(
         &self,
-        chat: Jid,
+        chat: impl Into<Jid>,
         key: wa::MessageKey,
         keep: bool,
     ) -> Result<SendResult, anyhow::Error> {
+        let chat = chat.into();
         let message = wacore::proto_helpers::build_keep_in_chat_message(
             key,
             keep,
@@ -1174,12 +1197,12 @@ impl Client {
     /// Pin a message in a chat for all participants.
     pub async fn pin_message(
         &self,
-        chat: Jid,
+        chat: impl Into<Jid>,
         key: wa::MessageKey,
         duration: PinDuration,
     ) -> Result<(), anyhow::Error> {
         self.send_pin(
-            chat,
+            chat.into(),
             key,
             wa::message::pin_in_chat_message::Type::PinForAll,
             duration.as_secs(),
@@ -1188,9 +1211,13 @@ impl Client {
     }
 
     /// Unpin a previously pinned message.
-    pub async fn unpin_message(&self, chat: Jid, key: wa::MessageKey) -> Result<(), anyhow::Error> {
+    pub async fn unpin_message(
+        &self,
+        chat: impl Into<Jid>,
+        key: wa::MessageKey,
+    ) -> Result<(), anyhow::Error> {
         self.send_pin(
-            chat,
+            chat.into(),
             key,
             wa::message::pin_in_chat_message::Type::UnpinForAll,
             0,
@@ -1851,14 +1878,9 @@ impl Client {
             expires_at,
             message_ts: now,
         };
-        if let Err(e) = self
-            .persistence_manager
-            .backend()
-            .put_msg_secrets(vec![entry])
-            .await
-        {
-            log::warn!("Failed to persist outbound messageSecret for {msg_id}: {e:?}");
-        }
+        // Same write-behind buffer as inbound captures: visible immediately,
+        // flushed off the send path (msmsg replies read buffer-first).
+        self.msg_secret_buffer.queue(vec![entry]).await;
     }
 
     /// Decide the identity (LID vs PN) under which an outbound DM's
@@ -4514,6 +4536,7 @@ mod tests {
                 wacore::msg_secret::RetentionClass::Text,
             )
             .await;
+        client.msg_secret_buffer.wait_flushed().await;
         let got = client
             .persistence_manager
             .backend()
@@ -4541,6 +4564,7 @@ mod tests {
                 wacore::msg_secret::RetentionClass::Text,
             )
             .await;
+        client.msg_secret_buffer.wait_flushed().await;
         let got = client
             .persistence_manager
             .backend()
@@ -4622,6 +4646,7 @@ mod tests {
                 wacore::msg_secret::RetentionClass::Text,
             )
             .await;
+        client.msg_secret_buffer.wait_flushed().await;
         let got = client
             .persistence_manager
             .backend()
@@ -4682,5 +4707,66 @@ mod tests {
             message_secret: Some(result.message_secret),
         };
         assert_eq!(prepared.message_secret.as_ref().unwrap().len(), 32);
+    }
+}
+
+#[cfg(test)]
+mod jid_into_convention {
+    use super::*;
+
+    /// Compile-time guard for the `impl Into<Jid>` convention: every core
+    /// method must accept BOTH an owned `Jid` (move, zero copy) and a `&Jid`
+    /// (one clone via `From<&Jid>`). Never executed; compilation is the test.
+    #[allow(dead_code)]
+    async fn both_call_styles_compile(client: &crate::client::Client, jid: Jid) {
+        let msg = wa::Message::default();
+        let _ = client.send_message(&jid, msg.clone()).await;
+        let _ = client
+            .send_message_with_options(&jid, msg.clone(), SendOptions::default())
+            .await;
+        let _ = client.forward_message(&jid, &msg).await;
+        let _ = client
+            .edit_message(&jid, "ID", wa::Message::default())
+            .await;
+        let _ = client.revoke_message(&jid, "ID", RevokeType::Sender).await;
+        let _ = client
+            .pin_message(&jid, wa::MessageKey::default(), PinDuration::default())
+            .await;
+        let _ = client.unpin_message(&jid, wa::MessageKey::default()).await;
+        let _ = client
+            .send_reaction(&jid, wa::MessageKey::default(), "x")
+            .await;
+        let _ = client
+            .keep_message(&jid, wa::MessageKey::default(), true)
+            .await;
+        // Owned style: moves, no clone. Each method consumes its own copy so
+        // the whole core surface is pinned, not just send_message.
+        let _ = client.send_message(jid.clone(), msg.clone()).await;
+        let _ = client
+            .send_message_with_options(jid.clone(), msg.clone(), SendOptions::default())
+            .await;
+        let _ = client.forward_message(jid.clone(), &msg).await;
+        let _ = client
+            .edit_message(jid.clone(), "ID", wa::Message::default())
+            .await;
+        let _ = client
+            .revoke_message(jid.clone(), "ID", RevokeType::Sender)
+            .await;
+        let _ = client
+            .pin_message(
+                jid.clone(),
+                wa::MessageKey::default(),
+                PinDuration::default(),
+            )
+            .await;
+        let _ = client
+            .unpin_message(jid.clone(), wa::MessageKey::default())
+            .await;
+        let _ = client
+            .send_reaction(jid.clone(), wa::MessageKey::default(), "x")
+            .await;
+        let _ = client
+            .keep_message(jid, wa::MessageKey::default(), true)
+            .await;
     }
 }

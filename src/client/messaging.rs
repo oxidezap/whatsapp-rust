@@ -56,15 +56,23 @@ impl Client {
         }
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn edit_message(
         &self,
-        to: Jid,
+        to: impl Into<Jid>,
         original_id: impl Into<String>,
         new_content: wa::Message,
     ) -> Result<String, anyhow::Error> {
-        let original_id = original_id.into();
+        self.edit_message_inner(to.into(), original_id.into(), new_content)
+            .await
+    }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
+    async fn edit_message_inner(
+        &self,
+        to: Jid,
+        original_id: String,
+        new_content: wa::Message,
+    ) -> Result<String, anyhow::Error> {
         // WhatsApp Web uses getMeUserLidOrJidForChat(chat, EditMessage) which
         // returns LID for LID-addressing groups and PN otherwise.
         let participant = if to.is_group() {
@@ -117,11 +125,27 @@ impl Client {
     /// `message_secret` is the *original* message's 32-byte secret (you generated it when
     /// you sent that message). You can only edit your own messages, so the original
     /// sender and the editor are both you.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit_encrypted", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn edit_message_encrypted(
         &self,
-        to: Jid,
+        to: impl Into<Jid>,
         original_id: impl Into<String>,
+        message_secret: &[u8],
+        new_content: wa::Message,
+    ) -> Result<String, anyhow::Error> {
+        self.edit_message_encrypted_inner(
+            to.into(),
+            original_id.into(),
+            message_secret,
+            new_content,
+        )
+        .await
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit_encrypted", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
+    async fn edit_message_encrypted_inner(
+        &self,
+        to: Jid,
+        original_id: String,
         message_secret: &[u8],
         new_content: wa::Message,
     ) -> Result<String, anyhow::Error> {
@@ -137,7 +161,6 @@ impl Client {
             "message_secret must be exactly 32 bytes, got {}",
             message_secret.len()
         );
-        let original_id = original_id.into();
 
         let self_jid = if to.is_group() {
             self.get_own_jid_for_group(&to).await?.to_non_ad()

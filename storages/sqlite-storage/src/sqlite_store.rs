@@ -84,7 +84,11 @@ struct DeviceRow {
     server_has_prekeys: bool,
     server_cert_chain: Option<Vec<u8>>,
     login_counter: i32,
+    first_unupload_pre_key_id: i32,
 }
+
+/// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
+const ID_PARAM_CHUNK: usize = 900;
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -336,6 +340,7 @@ impl SqliteStore {
             device_data.edge_routing_info.as_deref().map(Arc::from);
         let props_hash: Option<Arc<str>> = device_data.props_hash.as_deref().map(Arc::from);
         let next_pre_key_id = device_data.next_pre_key_id as i32;
+        let first_unupload_pre_key_id = device_data.first_unupload_pre_key_id as i32;
         let server_has_prekeys = device_data.server_has_prekeys;
         let nct_salt: Option<Arc<[u8]>> = device_data.nct_salt.as_deref().map(Arc::from);
         let server_cert_chain: Option<Arc<[u8]>> = device_data
@@ -402,6 +407,7 @@ impl SqliteStore {
                         device::edge_routing_info.eq(edge_routing_info.as_deref()),
                         device::props_hash.eq(props_hash.as_deref()),
                         device::next_pre_key_id.eq(next_pre_key_id),
+                        device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(nct_salt.as_deref()),
                         device::server_cert_chain.eq(server_cert_chain.as_deref()),
@@ -430,6 +436,8 @@ impl SqliteStore {
                         device::edge_routing_info.eq(excluded(device::edge_routing_info)),
                         device::props_hash.eq(excluded(device::props_hash)),
                         device::next_pre_key_id.eq(excluded(device::next_pre_key_id)),
+                        device::first_unupload_pre_key_id
+                            .eq(excluded(device::first_unupload_pre_key_id)),
                         device::server_has_prekeys.eq(excluded(device::server_has_prekeys)),
                         device::nct_salt.eq(excluded(device::nct_salt)),
                         device::server_cert_chain.eq(excluded(device::server_cert_chain)),
@@ -461,6 +469,7 @@ impl SqliteStore {
         let app_version_tertiary = new_device.app_version_tertiary as i64;
         let app_version_last_fetched_ms = new_device.app_version_last_fetched_ms;
         let next_pre_key_id = new_device.next_pre_key_id as i32;
+        let first_unupload_pre_key_id = new_device.first_unupload_pre_key_id as i32;
         let server_has_prekeys = new_device.server_has_prekeys;
 
         self.with_retry("create_new_device", || {
@@ -493,6 +502,7 @@ impl SqliteStore {
                         device::edge_routing_info.eq(None::<&[u8]>),
                         device::props_hash.eq(None::<&str>),
                         device::next_pre_key_id.eq(next_pre_key_id),
+                        device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(None::<&[u8]>),
                         device::server_cert_chain.eq(None::<&[u8]>),
@@ -599,6 +609,7 @@ impl SqliteStore {
                 edge_routing_info: row.edge_routing_info,
                 props_hash: row.props_hash,
                 next_pre_key_id: row.next_pre_key_id as u32,
+                first_unupload_pre_key_id: row.first_unupload_pre_key_id as u32,
                 server_has_prekeys: row.server_has_prekeys,
                 nct_salt: row.nct_salt,
                 nct_salt_sync_seen: false,
@@ -1595,16 +1606,22 @@ impl SignalStore for SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let rows: Vec<(i32, Vec<u8>)> = prekeys::table
-                .select((prekeys::id, prekeys::key))
-                .filter(prekeys::id.eq_any(&ids))
-                .filter(prekeys::device_id.eq(device_id))
-                .load(&mut conn)
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(rows
-                .into_iter()
-                .map(|(id, key)| (id as u32, Bytes::from(key)))
-                .collect())
+            // Chunked like mark_prekeys_uploaded: the upload window can carry
+            // more ids than SQLite's host-parameter limit.
+            let mut out = Vec::with_capacity(ids.len());
+            for chunk in ids.chunks(ID_PARAM_CHUNK) {
+                let rows: Vec<(i32, Vec<u8>)> = prekeys::table
+                    .select((prekeys::id, prekeys::key))
+                    .filter(prekeys::id.eq_any(chunk))
+                    .filter(prekeys::device_id.eq(device_id))
+                    .load(&mut conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                out.extend(
+                    rows.into_iter()
+                        .map(|(id, key)| (id as u32, Bytes::from(key))),
+                );
+            }
+            Ok(out)
         })
         .await
     }
@@ -1659,6 +1676,32 @@ impl SignalStore for SqliteStore {
         Err(StoreError::RetriesExhausted {
             op: "remove_prekey".to_string(),
         })
+    }
+
+    async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let device_id = self.device_id;
+        let ids: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
+        self.with_retry("mark_prekeys_uploaded", move || {
+            let ids = ids.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                // Stay under SQLite's host-parameter limit (999 by default);
+                // the upload batch is configurable up to u16::MAX ids.
+                for chunk in ids.chunks(ID_PARAM_CHUNK) {
+                    diesel::update(
+                        prekeys::table
+                            .filter(prekeys::id.eq_any(chunk.to_vec()))
+                            .filter(prekeys::device_id.eq(device_id)),
+                    )
+                    .set(prekeys::uploaded.eq(true))
+                    .execute(conn)?;
+                }
+                Ok(())
+            })
+        })
+        .await
     }
 
     async fn get_max_prekey_id(&self) -> Result<u32> {
@@ -2869,12 +2912,15 @@ impl MsgSecretStore for SqliteStore {
         sender: &str,
         msg_id: &str,
     ) -> Result<Option<Vec<u8>>> {
+        // Serialized through the db semaphore for the same reason as
+        // get_msg_secret_with_ts: a read racing a write transaction must wait,
+        // not error out as a phantom miss.
         let pool = self.pool.clone();
         let device_id = self.device_id;
         let chat = chat.to_string();
         let sender = sender.to_string();
         let msg_id = msg_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+        self.with_semaphore(move || -> Result<Option<Vec<u8>>> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -2890,7 +2936,6 @@ impl MsgSecretStore for SqliteStore {
             Ok(row)
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn get_msg_secret_with_ts(
@@ -2899,12 +2944,16 @@ impl MsgSecretStore for SqliteStore {
         sender: &str,
         msg_id: &str,
     ) -> Result<Option<(Vec<u8>, i64)>> {
+        // Serialized through the db semaphore: a raw read racing a write
+        // transaction hits the shared-cache table lock on in-memory stores
+        // (SQLITE_LOCKED is not covered by busy_timeout) and callers treat the
+        // error as a missing secret.
         let pool = self.pool.clone();
         let device_id = self.device_id;
         let chat = chat.to_string();
         let sender = sender.to_string();
         let msg_id = msg_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<(Vec<u8>, i64)>> {
+        self.with_semaphore(move || -> Result<Option<(Vec<u8>, i64)>> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -2920,7 +2969,6 @@ impl MsgSecretStore for SqliteStore {
             Ok(row)
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
@@ -3603,6 +3651,86 @@ mod tests {
         assert!(
             loaded.is_some(),
             "device data should be loadable by configured id"
+        );
+    }
+
+    /// mark_prekeys_uploaded must be UPDATE-only: a row deleted between the
+    /// upload snapshot and the mark (consumed one-time key) stays deleted.
+    #[tokio::test]
+    async fn mark_prekeys_uploaded_never_resurrects_deleted_rows() {
+        let store = create_test_store().await;
+        store
+            .store_prekey(1, b"record-1", false)
+            .await
+            .expect("store");
+        store
+            .store_prekey(2, b"record-2", false)
+            .await
+            .expect("store");
+        store.remove_prekey(1).await.expect("consume");
+
+        store
+            .mark_prekeys_uploaded(&[1, 2])
+            .await
+            .expect("mark uploaded");
+
+        let gone = store.load_prekey(1).await.expect("load");
+        assert!(gone.is_none(), "consumed key must not be resurrected");
+        let live = store.load_prekey(2).await.expect("load");
+        assert!(live.is_some(), "live key still present");
+    }
+
+    /// Round-trips the prekey watermarks through the SQLite schema: save with
+    /// both counters set, reopen on the same db, load and compare. Exercises
+    /// the `2026-06-10-000000_add_first_unupload_pk_id` migration and the
+    /// column mapping in both upsert paths.
+    #[tokio::test]
+    async fn test_prekey_watermarks_survive_save_load_roundtrip() {
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(300);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_name = format!(
+            "file:memdb_pkwatermark_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            id
+        );
+
+        let device_id = 9;
+        let _writer = SqliteStore::new_for_device(&db_name, device_id)
+            .await
+            .expect("create store");
+        _writer.create_new_device().await.expect("create device");
+
+        let mut device = _writer
+            .load_device_data_for_device(device_id)
+            .await
+            .expect("load")
+            .expect("device should exist after create");
+        assert_eq!(
+            device.first_unupload_pre_key_id, 0,
+            "fresh device starts with the watermark unset"
+        );
+        device.next_pre_key_id = 913;
+        device.first_unupload_pre_key_id = 101;
+        _writer
+            .save_device_data_for_device(device_id, &device)
+            .await
+            .expect("save with watermarks");
+
+        let store = SqliteStore::new_for_device(&db_name, device_id)
+            .await
+            .expect("reopen store");
+        let loaded = store
+            .load_device_data_for_device(device_id)
+            .await
+            .expect("load")
+            .expect("device should exist after reopen");
+        assert_eq!(loaded.next_pre_key_id, 913);
+        assert_eq!(
+            loaded.first_unupload_pre_key_id, 101,
+            "first_unupload_pre_key_id must survive a save/load roundtrip"
         );
     }
 
