@@ -16,7 +16,7 @@ crate-type = ["rlib"]
 [features]
 default = ["simd"]
 simd = []
-serde = ["dep:serde", "compact_str/serde"]
+serde = ["dep:serde", "compact_str/serde", "smallvec/serde"]
 # Render raw phone numbers in `Jid::observe()` instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.
 tracing-pii = []
@@ -28,6 +28,7 @@ flate2 = { workspace = true }
 hashify = { version = "0.2.9", default-features = false }
 itoa = { workspace = true }
 serde = { workspace = true, optional = true }
+smallvec = "1.15"
 stable_deref_trait = "1.2.0"
 yoke = { workspace = true }
 

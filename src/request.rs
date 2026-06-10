@@ -25,7 +25,7 @@ pub enum IqError {
     #[error("client state prevented send")]
     ClientState(#[source] ClientError),
     #[error("received disconnect node during IQ wait: {0:?}")]
-    Disconnected(Node),
+    Disconnected(Box<Node>),
     #[error("received a server error response: code={code}, text='{text}'")]
     ServerError {
         code: u16,

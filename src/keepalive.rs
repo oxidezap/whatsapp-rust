@@ -314,7 +314,7 @@ mod tests {
     fn test_classify_disconnected_is_fatal() {
         let node = NodeBuilder::new("disconnect").build();
         assert_eq!(
-            classify_keepalive_error(&IqError::Disconnected(node)),
+            classify_keepalive_error(&IqError::Disconnected(Box::new(node))),
             KeepaliveResult::FatalFailure,
         );
     }
@@ -359,7 +359,7 @@ mod tests {
         assert!(is_benign_teardown(&IqError::NotConnected));
         assert!(is_benign_teardown(&IqError::InternalChannelClosed));
         let node = NodeBuilder::new("disconnect").build();
-        assert!(is_benign_teardown(&IqError::Disconnected(node)));
+        assert!(is_benign_teardown(&IqError::Disconnected(Box::new(node))));
     }
 
     // Bad path: a broken socket/send pipeline or an encode failure is fatal for

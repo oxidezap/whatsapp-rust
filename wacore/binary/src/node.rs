@@ -298,24 +298,33 @@ impl From<bool> for NodeValue {
     }
 }
 
+/// Inline backing store for [`Attrs`]. A plain `Vec` paid one heap allocation
+/// per node on the encode hot path just for the backing buffer. Capacity 2 is
+/// the measured sweet spot: the per-recipient fanout nodes (`to`, `enc`) carry
+/// 1-2 attributes and stay inline, while stanza roots with 3+ attrs spill once
+/// per stanza. A larger inline array (4) grows `Node` enough that moving it
+/// through children Vecs costs more than the spared spills save.
+pub type AttrsVec = smallvec::SmallVec<[(Cow<'static, str>, NodeValue); 2]>;
+
 /// A collection of node attributes stored as key-value pairs.
-/// Uses a Vec internally for better cache locality with small attribute counts (typically 3-6).
+/// Stored inline for small attribute counts (typically 3-6) for cache locality
+/// and to avoid a per-node heap allocation; see [`AttrsVec`].
 /// Values can be either strings or JIDs, avoiding stringification overhead for JID attributes.
 /// Keys use `Cow<'static, str>` to avoid heap allocation for compile-time-known strings
 /// (e.g., "type", "id", "to") which are the vast majority of attribute keys.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct Attrs(pub Vec<(Cow<'static, str>, NodeValue)>);
+pub struct Attrs(pub AttrsVec);
 
 impl Attrs {
     #[inline]
     pub fn new() -> Self {
-        Self(Vec::new())
+        Self(AttrsVec::new())
     }
 
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self(Vec::with_capacity(capacity))
+        Self(AttrsVec::with_capacity(capacity))
     }
 
     /// Get a reference to the NodeValue for a key, or None if not found.
@@ -383,7 +392,7 @@ impl Attrs {
 /// Owned iterator implementation (consuming).
 impl IntoIterator for Attrs {
     type Item = (Cow<'static, str>, NodeValue);
-    type IntoIter = std::vec::IntoIter<(Cow<'static, str>, NodeValue)>;
+    type IntoIter = smallvec::IntoIter<[(Cow<'static, str>, NodeValue); 2]>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
@@ -1042,10 +1051,13 @@ mod serde_tests {
     fn node_ref_serializes_same_as_node() {
         let node = Node::new(
             Cow::Borrowed("message"),
-            Attrs(vec![
-                (Cow::Borrowed("type"), NodeValue::String("text".into())),
-                (Cow::Borrowed("from"), NodeValue::Jid(Jid::pn("5550199999"))),
-            ]),
+            Attrs(
+                vec![
+                    (Cow::Borrowed("type"), NodeValue::String("text".into())),
+                    (Cow::Borrowed("from"), NodeValue::Jid(Jid::pn("5550199999"))),
+                ]
+                .into(),
+            ),
             Some(NodeContent::String("hello".into())),
         );
         let node_ref = node.as_node_ref();
@@ -1075,7 +1087,7 @@ mod serde_tests {
     fn bytes_content_serializes_same() {
         let node = Node::new(
             Cow::Borrowed("iq"),
-            Attrs(vec![(Cow::Borrowed("id"), NodeValue::String("1".into()))]),
+            Attrs(vec![(Cow::Borrowed("id"), NodeValue::String("1".into()))].into()),
             Some(NodeContent::Bytes(vec![0xDE, 0xAD])),
         );
         let node_ref = node.as_node_ref();
@@ -1119,7 +1131,7 @@ mod serde_tests {
     fn owned_node_ref_serializes_same_as_owned() {
         let node = Node::new(
             Cow::Borrowed("iq"),
-            Attrs(vec![(Cow::Borrowed("id"), NodeValue::String("abc".into()))]),
+            Attrs(vec![(Cow::Borrowed("id"), NodeValue::String("abc".into()))].into()),
             Some(NodeContent::String("payload".into())),
         );
 

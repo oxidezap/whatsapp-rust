@@ -86,7 +86,7 @@ pub enum IqError {
     #[error("client is not connected")]
     NotConnected,
     #[error("received disconnect node during IQ wait: {0:?}")]
-    Disconnected(Node),
+    Disconnected(Box<Node>),
     #[error("received a server error response: code={code}, text='{text}'")]
     ServerError {
         code: u16,
@@ -211,7 +211,7 @@ impl RequestUtils {
 
     pub fn parse_iq_response(&self, response_node: &NodeRef<'_>) -> Result<(), IqError> {
         if response_node.tag == "stream:error" || response_node.tag == "xmlstreamend" {
-            return Err(IqError::Disconnected(response_node.to_owned()));
+            return Err(IqError::Disconnected(Box::new(response_node.to_owned())));
         }
 
         let response_type = response_node.get_attr("type");
