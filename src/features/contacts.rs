@@ -30,10 +30,12 @@ fn ensure_is_on_whatsapp_jids_supported(jids: &[Jid]) -> Result<()> {
 /// that box those futures (`#[async_trait]`, `Box<dyn Future + Send>`) hit
 /// "implementation of `FnOnce` is not general enough" (issue #825). Fn items
 /// implement `Fn` for every lifetime by construction.
+/// PN-primary result -> (PN, LID mapping).
 fn forward_lid_pair(r: &IsOnWhatsAppResult) -> (&Jid, Option<&Jid>) {
     (&r.jid, r.lid.as_ref())
 }
 
+/// LID-primary result inverted to (PN, LID); None when not LID-primary.
 fn reverse_lid_pair(r: &IsOnWhatsAppResult) -> Option<(&Jid, Option<&Jid>)> {
     if r.jid.is_lid() {
         r.pn_jid.as_ref().map(|pn| (pn, Some(&r.jid)))
@@ -42,6 +44,7 @@ fn reverse_lid_pair(r: &IsOnWhatsAppResult) -> Option<(&Jid, Option<&Jid>)> {
     }
 }
 
+/// UserInfo entry -> (queried JID, LID mapping).
 fn user_info_lid_pair(entry: &UserInfo) -> (&Jid, Option<&Jid>) {
     (&entry.jid, entry.lid.as_ref())
 }
@@ -55,6 +58,10 @@ impl<'a> Contacts<'a> {
         Self { client }
     }
 
+    /// Callers must pass `fn` items (e.g. [`forward_lid_pair`]), NOT
+    /// closures: a closure returning borrowed pairs embeds a non-HRTB type in
+    /// the public caller's future and breaks `#[async_trait]` consumers
+    /// (issue #825, guarded by tests/async_trait_boxed_future_compat.rs).
     async fn persist_lid_mappings<'b, I>(&self, entries: I)
     where
         I: IntoIterator<Item = (&'b Jid, Option<&'b Jid>)>,
