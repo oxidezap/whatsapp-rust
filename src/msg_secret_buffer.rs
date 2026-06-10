@@ -95,32 +95,49 @@ impl MsgSecretWriteBuffer {
 
     async fn drain_loop(self: Arc<Self>) {
         loop {
-            let batch: Vec<MsgSecretEntry> = {
-                let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-                pending.values().cloned().collect()
-            };
-            if batch.is_empty() {
-                self.drain_in_flight.store(false, Ordering::Release);
-                // An insert may have raced the flag clear; reclaim the drain
-                // only if work exists and nobody else took it.
-                let has_work = !self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .is_empty();
-                if has_work && !self.drain_in_flight.swap(true, Ordering::AcqRel) {
-                    continue;
-                }
-                return;
+            if self.flush_pending_once().await {
+                continue;
             }
-
-            if let Err(e) = self.backend.put_msg_secrets(batch.clone()).await {
-                // Same semantics as the previously awaited write: warn + drop.
-                log::warn!("failed to persist messageSecrets: {e:?}");
+            self.drain_in_flight.store(false, Ordering::Release);
+            // An insert may have raced the flag clear; reclaim the drain
+            // only if work exists and nobody else took it.
+            let has_work = !self
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty();
+            if has_work && !self.drain_in_flight.swap(true, Ordering::AcqRel) {
+                continue;
             }
-            self.flushed_batches.fetch_add(1, Ordering::Relaxed);
-            self.finish_batch(&batch);
+            return;
         }
+    }
+
+    /// Write one snapshot of the pending map. Returns whether anything was
+    /// pending. Idempotent against a concurrent drain: the upsert repeats
+    /// harmlessly and [`Self::finish_batch`] only removes what was written.
+    async fn flush_pending_once(&self) -> bool {
+        let batch: Vec<MsgSecretEntry> = {
+            let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            pending.values().cloned().collect()
+        };
+        if batch.is_empty() {
+            return false;
+        }
+        if let Err(e) = self.backend.put_msg_secrets(batch.clone()).await {
+            // Same semantics as the previously awaited write: warn + drop.
+            log::warn!("failed to persist messageSecrets: {e:?}");
+        }
+        self.flushed_batches.fetch_add(1, Ordering::Relaxed);
+        self.finish_batch(&batch);
+        true
+    }
+
+    /// Drain everything pending before returning. For graceful shutdown: the
+    /// detached drain task is not awaited anywhere, so disconnect calls this
+    /// to make sure a just-captured secret is not lost on a clean exit.
+    pub(crate) async fn flush(&self) {
+        while self.flush_pending_once().await {}
     }
 
     /// Remove the flushed entries, but only where the pending value is still
@@ -135,10 +152,12 @@ impl MsgSecretWriteBuffer {
                 entry.sender.clone(),
                 entry.msg_id.clone(),
             );
-            if pending
-                .get(&key)
-                .is_some_and(|current| current.secret == entry.secret)
-            {
+            let unchanged = |current: &MsgSecretEntry| {
+                current.secret == entry.secret
+                    && current.expires_at == entry.expires_at
+                    && current.message_ts == entry.message_ts
+            };
+            if pending.get(&key).is_some_and(unchanged) {
                 pending.remove(&key);
             }
         }
@@ -263,6 +282,40 @@ mod tests {
             Some(&[0x22u8; 32][..]),
             "the refresh must reach the backend"
         );
+    }
+
+    /// Same secret but refreshed retention metadata queued during the flush
+    /// must also survive the cleanup (a recapture can extend expires_at).
+    #[tokio::test]
+    async fn metadata_refresh_during_flush_survives_removal() {
+        let buf = buffer().await;
+        let stale = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
+        let mut refreshed = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
+        refreshed.expires_at = 999;
+        buf.queue(vec![refreshed]);
+        buf.finish_batch(std::slice::from_ref(&stale));
+        assert_eq!(
+            buf.pending_len(),
+            1,
+            "a same-secret metadata refresh must stay pending"
+        );
+        buf.wait_flushed().await;
+    }
+
+    /// The production flush drains everything synchronously, covering the
+    /// graceful-shutdown path where the detached drain is never awaited.
+    #[tokio::test]
+    async fn explicit_flush_drains_everything() {
+        let buf = buffer().await;
+        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "SHUTDOWN", 0x44)]);
+        buf.flush().await;
+        assert_eq!(buf.pending_len(), 0);
+        let stored = buf
+            .backend
+            .get_msg_secret("g@g.us", "a@s.whatsapp.net", "SHUTDOWN")
+            .await
+            .expect("backend read");
+        assert_eq!(stored.as_deref(), Some(&[0x44u8; 32][..]));
     }
 
     /// Entries queued while a flush is in flight are picked up by the same

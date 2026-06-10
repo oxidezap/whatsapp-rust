@@ -528,6 +528,9 @@ impl Client {
             .await;
         self.notify_connection_shutdown();
 
+        // The write-behind secret drain is detached; a clean exit right after
+        // a capture must not lose the only copy.
+        self.msg_secret_buffer.flush().await;
         if let Err(e) = self.persistence_manager.flush().await {
             log::error!("Failed to flush device state during disconnect: {e}");
         }
