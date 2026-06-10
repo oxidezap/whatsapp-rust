@@ -27,6 +27,11 @@ type Key = (String, String, String);
 
 pub(crate) struct MsgSecretWriteBuffer {
     pending: Mutex<HashMap<Key, MsgSecretEntry>>,
+    /// Set by the terminal disconnect. A sealed buffer writes every queue
+    /// inline (the old synchronous semantics), so a lane worker still
+    /// draining its backlog after the shutdown flush cannot strand a secret
+    /// on the detached drain and then ack the message.
+    sealed: AtomicBool,
     /// Serializes backend writes: a snapshot is taken under this lock, so a
     /// later writer always carries values at least as new as any earlier
     /// in-flight write, and a stale upsert can never land after a fresh one.
@@ -48,6 +53,7 @@ impl MsgSecretWriteBuffer {
     ) -> Arc<Self> {
         Arc::new(Self {
             pending: Mutex::new(HashMap::new()),
+            sealed: AtomicBool::new(false),
             write_lock: async_lock::Mutex::new(()),
             drain_in_flight: AtomicBool::new(false),
             backend,
@@ -57,9 +63,11 @@ impl MsgSecretWriteBuffer {
     }
 
     /// Make `entries` immediately visible to readers and schedule the durable
-    /// write. Synchronous on purpose: the per-chat lane orders the insert
-    /// before the ack and before any later message in the chat is processed.
-    pub(crate) fn queue(self: &Arc<Self>, entries: Vec<MsgSecretEntry>) {
+    /// write. The insert itself is synchronous, so the per-chat lane orders it
+    /// before the ack and before any later message in the chat is processed;
+    /// the await is a no-op flag check unless the buffer is sealed, in which
+    /// case the write happens inline before returning.
+    pub(crate) async fn queue(self: &Arc<Self>, entries: Vec<MsgSecretEntry>) {
         if entries.is_empty() {
             return;
         }
@@ -85,7 +93,19 @@ impl MsgSecretWriteBuffer {
                 pending.insert(key, entry);
             }
         }
-        self.schedule_drain();
+        // The mutex above orders this load against seal(): an insert that the
+        // shutdown flush's snapshot missed observes sealed and writes inline.
+        if self.sealed.load(Ordering::Acquire) {
+            self.flush().await;
+        } else {
+            self.schedule_drain();
+        }
+    }
+
+    /// Switch the buffer to inline writes. Terminal: called once by
+    /// `disconnect()` right before its final flush.
+    pub(crate) fn seal(&self) {
+        self.sealed.store(true, Ordering::Release);
     }
 
     /// Buffered-first read. Returns `(secret, message_ts)` like
@@ -222,7 +242,8 @@ mod tests {
     #[tokio::test]
     async fn read_your_write_before_flush() {
         let buf = buffer().await;
-        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "M1", 0x11)]);
+        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "M1", 0x11)])
+            .await;
 
         // Current-thread runtime: the drain task cannot have polled yet, so
         // this read is served by the buffer, not the store.
@@ -253,7 +274,8 @@ mod tests {
                 "a@s.whatsapp.net",
                 &format!("M{i}"),
                 i,
-            )]);
+            )])
+            .await;
         }
         buf.wait_flushed().await;
 
@@ -280,7 +302,8 @@ mod tests {
         let buf = buffer().await;
         let stale = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
         // Simulate the drain having snapshotted `stale` while a refresh lands.
-        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x22)]);
+        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x22)])
+            .await;
         buf.finish_batch(std::slice::from_ref(&stale));
         assert_eq!(
             buf.lookup("g@g.us", "a@s.whatsapp.net", "PARENT"),
@@ -309,7 +332,7 @@ mod tests {
         let stale = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
         let mut refreshed = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
         refreshed.expires_at = 999;
-        buf.queue(vec![refreshed]);
+        buf.queue(vec![refreshed]).await;
         buf.finish_batch(std::slice::from_ref(&stale));
         assert_eq!(
             buf.pending_len(),
@@ -331,8 +354,8 @@ mod tests {
         let mut second = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
         second.expires_at = 100;
         second.message_ts = 0;
-        buf.queue(vec![first]);
-        buf.queue(vec![second]);
+        buf.queue(vec![first]).await;
+        buf.queue(vec![second]).await;
 
         let pending = buf
             .pending
@@ -350,12 +373,32 @@ mod tests {
         buf.wait_flushed().await;
     }
 
+    /// After seal() a queue is written inline before returning: a lane worker
+    /// still draining its backlog after the shutdown flush cannot strand a
+    /// secret on the detached drain and then ack the message.
+    #[tokio::test]
+    async fn sealed_queue_writes_inline() {
+        let buf = buffer().await;
+        buf.seal();
+        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "LATE", 0x55)])
+            .await;
+        // No drain dependency: durable the moment queue() returns.
+        assert_eq!(buf.pending_len(), 0);
+        let stored = buf
+            .backend
+            .get_msg_secret("g@g.us", "a@s.whatsapp.net", "LATE")
+            .await
+            .expect("backend read");
+        assert_eq!(stored.as_deref(), Some(&[0x55u8; 32][..]));
+    }
+
     /// The production flush drains everything synchronously, covering the
     /// graceful-shutdown path where the detached drain is never awaited.
     #[tokio::test]
     async fn explicit_flush_drains_everything() {
         let buf = buffer().await;
-        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "SHUTDOWN", 0x44)]);
+        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "SHUTDOWN", 0x44)])
+            .await;
         buf.flush().await;
         assert_eq!(buf.pending_len(), 0);
         let stored = buf
@@ -371,10 +414,12 @@ mod tests {
     #[tokio::test]
     async fn entries_queued_during_drain_are_flushed() {
         let buf = buffer().await;
-        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "FIRST", 1)]);
+        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "FIRST", 1)])
+            .await;
         // Let the drain start (and likely finish the first batch).
         tokio::task::yield_now().await;
-        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "SECOND", 2)]);
+        buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "SECOND", 2)])
+            .await;
         buf.wait_flushed().await;
 
         for (id, val) in [("FIRST", 1u8), ("SECOND", 2u8)] {

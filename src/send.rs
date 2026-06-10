@@ -1853,7 +1853,7 @@ impl Client {
         };
         // Same write-behind buffer as inbound captures: visible immediately,
         // flushed off the send path (msmsg replies read buffer-first).
-        self.msg_secret_buffer.queue(vec![entry]);
+        self.msg_secret_buffer.queue(vec![entry]).await;
     }
 
     /// Decide the identity (LID vs PN) under which an outbound DM's

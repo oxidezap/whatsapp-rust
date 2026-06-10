@@ -58,7 +58,7 @@ impl Client {
         {
             entries.push(entry);
         }
-        self.persist_msg_secret_entries(entries);
+        self.persist_msg_secret_entries(entries).await;
     }
 
     /// Build one retention entry, applying the policy gates and computing the
@@ -105,8 +105,11 @@ impl Client {
     /// Queue a batch of secret aliases on the write-behind buffer: immediately
     /// visible to lookups, durably written off the receive lane in one batched
     /// upsert (a multi-alias capture still lands in a single batch).
-    fn persist_msg_secret_entries(&self, entries: Vec<wacore::store::traits::MsgSecretEntry>) {
-        self.msg_secret_buffer.queue(entries);
+    async fn persist_msg_secret_entries(
+        &self,
+        entries: Vec<wacore::store::traits::MsgSecretEntry>,
+    ) {
+        self.msg_secret_buffer.queue(entries).await;
     }
 
     async fn own_jid_for_secret_encrypted(&self, info: &MessageInfo) -> Option<Jid> {
@@ -434,7 +437,7 @@ impl Client {
             {
                 entries.push(entry);
             }
-            self.persist_msg_secret_entries(entries);
+            self.persist_msg_secret_entries(entries).await;
         }
 
         if env.kind != SecretEncKind::MessageEdit {

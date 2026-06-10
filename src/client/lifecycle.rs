@@ -539,9 +539,11 @@ impl Client {
         self.cleanup_connection_state().await;
 
         // The write-behind secret drain is detached; a clean exit right after
-        // a capture must not lose the only copy. Drained after the connection
-        // teardown so receive work still in flight when disconnect started has
-        // had its captures queued; flush() loops until nothing is pending.
+        // a capture must not lose the only copy. Sealing first degrades any
+        // straggler capture (a lane worker still draining its backlog) to an
+        // inline write, so nothing can land on the detached drain after the
+        // final flush below and then be acked.
+        self.msg_secret_buffer.seal();
         self.msg_secret_buffer.flush().await;
     }
 
