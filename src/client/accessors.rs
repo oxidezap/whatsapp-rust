@@ -92,6 +92,7 @@ impl Client {
             message_retry_counts: self.message_retry_counts.entry_count(),
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
             pdo_pending_requests: self.pdo_pending_requests.entry_count(),
+            pdo_requested: self.pdo_requested.entry_count(),
             session_locks: self.session_locks.entry_count(),
             chat_lanes: self.chat_lanes.entry_count(),
             response_waiters: self.response_waiters.lock().await.len(),

@@ -190,6 +190,7 @@ pub struct MemoryDiagnostics {
     pub message_retry_counts: u64,
     pub undecryptable_dispatched: u64,
     pub pdo_pending_requests: u64,
+    pub pdo_requested: u64,
     // -- Moka caches (capacity-only, no TTL) --
     pub session_locks: u64,
     pub chat_lanes: u64,
@@ -234,6 +235,7 @@ impl std::fmt::Display for MemoryDiagnostics {
             self.undecryptable_dispatched
         )?;
         writeln!(f, "  pdo_pending_requests:   {}", self.pdo_pending_requests)?;
+        writeln!(f, "  pdo_requested:          {}", self.pdo_requested)?;
         writeln!(f, "--- Moka caches (capacity-only) ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
@@ -526,6 +528,14 @@ pub struct Client {
 
     pub(crate) pdo_pending_requests:
         Cache<wacore::types::message::ChatMessageId, crate::pdo::PendingPdoRequest>,
+
+    /// Messages already covered by a placeholder-resend PDO request. Mirrors
+    /// the session-lifetime set in
+    /// `WAWebNonMessageDataRequestPlaceholderMessageResendUtils`: at most one
+    /// request per message, no matter how many times the server redelivers
+    /// the undecryptable original. Entries are dropped on send failure so a
+    /// transient error does not block the next attempt.
+    pub(crate) pdo_requested: Cache<wacore::types::message::ChatMessageId, ()>,
 
     /// LRU cache for device registry (matches WhatsApp Web's 5000 entry limit).
     /// Maps user ID to DeviceListRecord for fast device existence checks.

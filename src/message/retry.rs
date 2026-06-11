@@ -185,7 +185,9 @@ impl Client {
     /// This asks our primary phone to share the already-decrypted message content.
     /// PDO is NOT spawned on subsequent retries to avoid duplicate requests.
     ///
-    /// When max retries is reached, an immediate PDO request is sent as a last resort.
+    /// When max retries is reached, a PDO request is attempted as a last resort;
+    /// the `pdo_requested` memo makes it a no-op if one already went out for
+    /// this message, so capped redeliveries cannot re-ask the phone.
     ///
     /// # Arguments
     /// * `info` - The message info for the failed message
@@ -220,8 +222,12 @@ impl Client {
             .await;
 
         let Some(retry_count) = self.increment_retry_count(&cache_key, reason).await else {
-            log::info!(
-                "Max retries ({}) reached for message {} from {} [{:?}]. Sending immediate PDO request.",
+            // Every further redelivery of a capped message lands here, so
+            // keep it at debug; the high-retry warn already fired on the way
+            // to the cap, and the PDO is a once-per-message no-op after the
+            // first request.
+            log::debug!(
+                "Max retries ({}) reached for message {} from {} [{:?}]. Requesting PDO fallback.",
                 MAX_DECRYPT_RETRIES,
                 info.id,
                 info.source.sender.observe(),

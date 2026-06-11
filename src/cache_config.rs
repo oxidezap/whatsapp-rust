@@ -181,6 +181,14 @@ pub struct CacheConfig {
     pub undecryptable_dispatched: CacheEntryConfig,
     /// PDO pending requests (time_to_live). Default: 30s TTL, 200 entries.
     pub pdo_pending_requests: CacheEntryConfig,
+    /// Messages already covered by a placeholder-resend PDO request
+    /// (time_to_live). WA Web keeps a session-lifetime set
+    /// (`WAWebNonMessageDataRequestPlaceholderMessageResendUtils`) so each
+    /// message triggers at most one request; without it, every redelivery of
+    /// an undecryptable message re-asks the phone (a stuck sender resending
+    /// every ~11s produced ~700 requests in 3h). The TTL stands in for
+    /// "session lifetime" with bounded memory. Default: 24h TTL, 512 entries.
+    pub pdo_requested: CacheEntryConfig,
     /// Sender key device tracking cache (time_to_idle). Default: 1h TTI, 500 entries.
     /// Caches per-group SKDM distribution state to avoid DB reads on every group send.
     pub sender_key_devices_cache: CacheEntryConfig,
@@ -260,6 +268,7 @@ impl std::fmt::Debug for CacheConfig {
             .field("message_retry_counts", &self.message_retry_counts)
             .field("undecryptable_dispatched", &self.undecryptable_dispatched)
             .field("pdo_pending_requests", &self.pdo_pending_requests)
+            .field("pdo_requested", &self.pdo_requested)
             .field("sender_key_devices_cache", &self.sender_key_devices_cache)
             .field("session_recreate_history", &self.session_recreate_history)
             .field("session_locks_capacity", &self.session_locks_capacity)
@@ -312,6 +321,7 @@ impl Default for CacheConfig {
             message_retry_counts: CacheEntryConfig::new(one_hour, 500),
             undecryptable_dispatched: CacheEntryConfig::new(five_min, 1_000),
             pdo_pending_requests: CacheEntryConfig::new(Some(Duration::from_secs(30)), 200),
+            pdo_requested: CacheEntryConfig::new(Some(Duration::from_secs(24 * 3600)), 512),
             sender_key_devices_cache: CacheEntryConfig::new(one_hour, 500),
             session_recreate_history: CacheEntryConfig::new(one_hour, 256),
             // Coordination caches hold live mutexes/senders; capacity eviction
