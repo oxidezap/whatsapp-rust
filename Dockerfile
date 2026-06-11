@@ -15,7 +15,7 @@
 FROM rust:alpine AS chef
 RUN apk add --no-cache musl-dev
 COPY rust-toolchain.toml .
-RUN rustup show && cargo install cargo-chef
+RUN rustup show && cargo install cargo-chef --locked
 WORKDIR /app
 
 FROM chef AS planner
