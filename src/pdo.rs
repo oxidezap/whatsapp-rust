@@ -103,8 +103,19 @@ impl Client {
         // pending cache below only covers in-flight requests; once the phone
         // answers (even without content) it empties, and a sender that keeps
         // redelivering the same undecryptable message would otherwise trigger
-        // a fresh request per copy.
-        if self.pdo_requested.get(&cache_key).await.is_some() {
+        // a fresh request per copy. Claimed via the single-flight `get_with`
+        // (same arm as `dispatch_undecryptable_event`): decrypt-failure tasks
+        // are detached per copy, so a get-then-insert would let two
+        // concurrent copies both pass the gate, and only the claim winner may
+        // release the slot on send failure below.
+        let claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let claimed_clone = claimed.clone();
+        self.pdo_requested
+            .get_with(cache_key.clone(), async move {
+                claimed_clone.store(true, std::sync::atomic::Ordering::Release);
+            })
+            .await;
+        if !claimed.load(std::sync::atomic::Ordering::Acquire) {
             debug!(
                 "PDO request already sent for message {} from {}; not re-requesting",
                 info.id,
@@ -122,7 +133,6 @@ impl Client {
             return Ok(());
         }
 
-        self.pdo_requested.insert(cache_key.clone(), ()).await;
         let pending = PendingPdoRequest {
             message_info: Arc::clone(info),
             requested_at: wacore::time::Instant::now(),
