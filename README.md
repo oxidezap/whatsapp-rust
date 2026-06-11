@@ -29,7 +29,7 @@ For the full API reference and guides, see the **[documentation](https://whatsap
 ```toml
 [dependencies]
 whatsapp-rust = "0.6"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 
 ```rust,no_run
