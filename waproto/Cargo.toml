@@ -17,10 +17,10 @@ prost = { workspace = true, features = ["derive"] }
 serde = { workspace = true }
 
 [build-dependencies]
+heck = { workspace = true }
+prost = { workspace = true }
 prost-build = { workspace = true }
 prost-types = { workspace = true }
-prost = { workspace = true }
-heck = { workspace = true }
 sha2 = { workspace = true }
 
 [lints]

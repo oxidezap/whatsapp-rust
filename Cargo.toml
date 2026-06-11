@@ -58,15 +58,16 @@ bytes = { version = "1.5", default-features = false }
 chrono = { version = "0.4", default-features = false }
 compact_str = { version = "0.9", default-features = false }
 ctr = { version = "0.10", default-features = false }
+divan = { package = "codspeed-divan-compat", version = "4.7.0" }
 env_logger = { version = "0.11", default-features = false }
 event-listener = { version = "5", default-features = false }
 flate2 = { version = "1.1.5", default-features = false, features = ["zlib-rs"] }
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 getrandom = { version = "0.4", default-features = false }
+heck = "0.5"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 hkdf = { version = "0.13.0", default-features = false }
 hmac = { version = "0.13.0", default-features = false }
-divan = { package = "codspeed-divan-compat", version = "4.7.0" }
 itoa = "1"
 log = "0.4"
 metrics = "0.24"
@@ -74,7 +75,6 @@ portable-atomic = { version = "1", default-features = false, features = ["fallba
 prost = { version = "0.14.4", default-features = false, features = ["std"] }
 prost-build = { version = "0.14.3", default-features = false }
 prost-types = { version = "0.14.3", default-features = false, features = ["std"] }
-heck = "0.5"
 rand = "0.10"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
