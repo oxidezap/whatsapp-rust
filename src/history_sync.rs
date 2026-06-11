@@ -93,12 +93,6 @@ impl Client {
             return;
         }
 
-        // file_length is the decrypted (but still zlib-compressed) blob size, not
-        // the final decompressed size. We still pass it as a hint — the decompressor
-        // uses it with a 4x multiplier, which is a better estimate than guessing
-        // from the encrypted size (which includes MAC/padding overhead).
-        let compressed_size_hint = notification.file_length.filter(|&s| s > 0);
-
         // Use take() to avoid cloning large payloads - moves ownership instead
         let compressed_data = if let Some(inline_payload) =
             notification.initial_hist_bootstrap_inline_payload.take()
@@ -161,17 +155,12 @@ impl Client {
                 compressed_data,
                 own_user.as_deref(),
                 retain_history_blob,
-                compressed_size_hint,
             ))
         } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
-                let result = process_history_sync(
-                    compressed_data,
-                    own_user.as_deref(),
-                    retain_history_blob,
-                    compressed_size_hint,
-                );
+                let result =
+                    process_history_sync(compressed_data, own_user.as_deref(), retain_history_blob);
                 let _ = result_tx.send(result);
             }));
             self.runtime
@@ -225,9 +214,10 @@ impl Client {
                 self.store_history_sync_msg_secrets(sync_result.msg_secret_records)
                     .await;
 
-                if let Some(decompressed) = sync_result.decompressed_bytes {
+                if let Some(compressed) = sync_result.compressed_bytes {
                     let lazy_hs = LazyHistorySync::new(
-                        decompressed,
+                        compressed,
+                        sync_result.decompressed_size,
                         notification.sync_type().into(),
                         notification.chunk_order,
                         notification.progress,
@@ -568,6 +558,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, Some(secret));
+    }
+
+    #[tokio::test]
+    async fn process_history_sync_task_dispatches_compressed_lazy_event() {
+        let client = crate::test_utils::create_test_client_with_name("history_lazy_event").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let history_sync = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let raw_len = history_sync.encode_to_vec().len();
+        let compressed = compress_history_sync(&history_sync);
+        let compressed_copy = compressed.clone();
+        let notification = HistorySyncNotification {
+            file_length: Some(compressed.len() as u64),
+            sync_type: Some(wa::message::HistorySyncType::InitialBootstrap as i32),
+            initial_hist_bootstrap_inline_payload: Some(compressed),
+            ..Default::default()
+        };
+
+        // Register a handler BEFORE the task so retain_blob is true.
+        let (handler, event_rx) = wacore::types::events::ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+
+        client
+            .process_history_sync_task("HIST_LAZY_EVENT".to_string(), notification)
+            .await;
+
+        let event = event_rx.try_recv().expect("HistorySync event dispatched");
+        let crate::types::events::Event::HistorySync(lazy) = &*event else {
+            panic!("expected HistorySync event, got {event:?}");
+        };
+
+        // The event carries the original compressed payload plus the exact
+        // inflated size, and every consumption path works.
+        assert_eq!(lazy.compressed_bytes().as_ref(), &compressed_copy[..]);
+        assert_eq!(lazy.decompressed_size(), raw_len);
+        let decoded = lazy.get().expect("decodes");
+        assert_eq!(decoded.conversations[0].id, chat);
+        let mut stream = lazy.stream();
+        assert_eq!(
+            stream.next_conversation().unwrap().unwrap().id,
+            chat,
+            "stream still works after get()"
+        );
     }
 
     #[tokio::test]

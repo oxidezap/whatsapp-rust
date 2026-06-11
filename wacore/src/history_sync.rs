@@ -2,8 +2,9 @@ use bytes::Bytes;
 use compact_str::CompactString;
 use std::sync::Arc;
 use thiserror::Error;
-use wacore_binary::zlib_pool::{InflateReader, decompress_zlib_pooled};
+use wacore_binary::zlib_pool::InflateReader;
 use waproto::tags;
+use waproto::whatsapp as wa;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -14,7 +15,18 @@ pub enum HistorySyncError {
     ProtobufDecodeError(#[from] prost::DecodeError),
     #[error("Malformed protobuf: {0}")]
     MalformedProtobuf(String),
+    /// [`HistorySyncStream::remainder`] was called while the tail still held a
+    /// conversation the caller never read; surfacing it beats silently dropping
+    /// chat data.
+    #[error("remainder() called with unread conversations still in the stream")]
+    UnreadConversations,
 }
+
+/// Hard ceiling on the decompressed size of a history-sync blob, preventing
+/// OOM on malformed or hostile input. Typical InitialBootstrap chunks inflate
+/// to 5-20 MB. Producers that know the exact inflated size should pass that
+/// instead (a strictly tighter bound).
+pub const MAX_DECOMPRESSED: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct HistorySyncResult {
@@ -27,9 +39,13 @@ pub struct HistorySyncResult {
     /// Tctoken candidates extracted from 1:1 conversations during streaming.
     pub tc_token_candidates: Vec<TcTokenCandidate>,
     pub msg_secret_records: Vec<HistoryMsgSecretRecord>,
-    /// The full decompressed protobuf blob, only retained when event
-    /// listeners exist. Wrapped in `LazyHistorySync` for on-demand decoding.
-    pub decompressed_bytes: Option<Bytes>,
+    /// The original zlib-compressed input, handed back (moved, never copied or
+    /// re-inflated) only when event listeners exist. Wrapped in
+    /// `LazyHistorySync` for on-demand consumption.
+    pub compressed_bytes: Option<Bytes>,
+    /// Exact size of the fully inflated blob, counted during the extraction
+    /// walk. Carried into `LazyHistorySync` as the inflate cap.
+    pub decompressed_size: usize,
 }
 
 mod wire_type {
@@ -43,35 +59,175 @@ mod wire_type {
 
 /// Decompress and process a history sync blob.
 ///
-/// **Memory strategy**: Decompresses the entire blob into a single `Bytes`
-/// buffer, then scans top-level fields and partially decodes only the
-/// conversation fields needed for internal caches.
-///
-/// After decompression, the compressed input is dropped immediately, so peak
-/// memory = max(compressed, decompressed) + small overhead, not both.
+/// **Memory strategy**: always streams — inflates with a bounded window and
+/// extracts each top-level field as soon as its bytes are buffered, so peak
+/// memory is the largest single conversation, never the whole blob. With
+/// `retain_blob`, the original compressed input is handed back in
+/// [`HistorySyncResult::compressed_bytes`] (a move, no copy and no second
+/// inflate) for on-demand consumer decoding via `LazyHistorySync`.
 pub fn process_history_sync(
     compressed_data: Vec<u8>,
     own_user: Option<&str>,
     retain_blob: bool,
-    _compressed_size_hint: Option<u64>,
 ) -> Result<HistorySyncResult, HistorySyncError> {
-    // Hard limit to prevent OOM on malformed blobs.
-    // Typical InitialBootstrap: 5-20 MB decompressed.
-    const MAX_DECOMPRESSED: u64 = 64 * 1024 * 1024;
+    let mut result = process_history_sync_streaming(&compressed_data, own_user, MAX_DECOMPRESSED)?;
+    if retain_blob {
+        result.compressed_bytes = Some(Bytes::from(compressed_data));
+    }
+    Ok(result)
+}
 
-    // When the caller doesn't need the full decompressed blob (no Event::HistorySync
-    // consumer), stream-decompress and extract incrementally so peak memory stays
-    // ~one conversation instead of the whole blob.
-    if !retain_blob {
-        return process_history_sync_streaming(&compressed_data, own_user, MAX_DECOMPRESSED);
+/// One top-level protobuf field, borrowed from the walker's inflate window.
+struct RawField<'w> {
+    field_number: u32,
+    wire_type: u32,
+    /// Full wire span (tag + length prefix + payload): what a raw re-emit of
+    /// the field must copy.
+    raw: &'w [u8],
+    /// Offset of the payload inside `raw`. Only meaningful for
+    /// length-delimited fields.
+    payload_start: usize,
+}
+
+/// The single protobuf wire walk over a compressed HistorySync blob: an
+/// incremental inflate window plus top-level field framing. Both the internal
+/// extractor ([`process_history_sync`]) and the public [`HistorySyncStream`]
+/// consume it, so the format knowledge lives in exactly one place.
+struct FieldWalker<'a> {
+    reader: InflateReader<'a>,
+    /// Span of the previously yielded field, consumed lazily on the next call
+    /// so the caller can keep borrowing the field bytes from the window in
+    /// between.
+    pending: usize,
+}
+
+impl<'a> FieldWalker<'a> {
+    fn new(compressed: &'a [u8], max_decompressed: u64) -> Self {
+        Self {
+            reader: InflateReader::new(compressed, max_decompressed),
+            pending: 0,
+        }
     }
 
-    let decompressed = decompress_zlib_pooled(&compressed_data, MAX_DECOMPRESSED)
-        .map_err(HistorySyncError::DecompressionError)?;
-    drop(compressed_data);
+    fn total_out(&self) -> u64 {
+        self.reader.total_out()
+    }
 
-    let buf = Bytes::from(decompressed);
-    let mut pos = 0;
+    /// Re-borrow the payload of the field most recently yielded by
+    /// [`FieldWalker::next_field`] (it stays buffered until the next call).
+    fn pending_payload(&self, payload_start: usize) -> &[u8] {
+        &self.reader.available()[payload_start..self.pending]
+    }
+
+    /// Advance to the next top-level field, returning `Ok(None)` at clean EOF.
+    /// The returned borrows point into the inflate window and stay valid until
+    /// the next `next_field` call.
+    fn next_field(&mut self) -> Result<Option<RawField<'_>>, HistorySyncError> {
+        self.reader.consume(self.pending);
+        self.pending = 0;
+
+        // A field starts with a tag varint; stop cleanly when the stream ends.
+        if !self
+            .reader
+            .ensure(1)
+            .map_err(HistorySyncError::DecompressionError)?
+        {
+            return Ok(None);
+        }
+        // A varint is at most 10 bytes (fewer is fine right at EOF).
+        self.reader
+            .ensure(10)
+            .map_err(HistorySyncError::DecompressionError)?;
+        let (tag, tlen) = read_varint(self.reader.available())?;
+        let field_number = (tag >> 3) as u32;
+        let wire_type_raw = (tag & 0x7) as u32;
+
+        let (span, payload_start) = match wire_type_raw {
+            wire_type::LENGTH_DELIMITED => {
+                self.reader
+                    .ensure(tlen + 10)
+                    .map_err(HistorySyncError::DecompressionError)?;
+                let (len, vlen) = read_varint(&self.reader.available()[tlen..])?;
+                let len = usize::try_from(len).map_err(|_| {
+                    HistorySyncError::MalformedProtobuf(format!(
+                        "field length overflows usize: {len}"
+                    ))
+                })?;
+                let payload_start = tlen + vlen;
+                let span = payload_start.checked_add(len).ok_or_else(|| {
+                    HistorySyncError::MalformedProtobuf(format!(
+                        "field span overflows: header={payload_start}, len={len}"
+                    ))
+                })?;
+                if !self
+                    .reader
+                    .ensure(span)
+                    .map_err(HistorySyncError::DecompressionError)?
+                {
+                    return Err(HistorySyncError::MalformedProtobuf(
+                        "length-delimited field truncated".into(),
+                    ));
+                }
+                (span, payload_start)
+            }
+            wire_type::VARINT => {
+                self.reader
+                    .ensure(tlen + 10)
+                    .map_err(HistorySyncError::DecompressionError)?;
+                let (_, vlen) = read_varint(&self.reader.available()[tlen..])?;
+                (tlen + vlen, tlen)
+            }
+            wire_type::FIXED64 => {
+                if !self
+                    .reader
+                    .ensure(tlen + 8)
+                    .map_err(HistorySyncError::DecompressionError)?
+                {
+                    return Err(HistorySyncError::MalformedProtobuf(
+                        "fixed64 field truncated".into(),
+                    ));
+                }
+                (tlen + 8, tlen)
+            }
+            wire_type::FIXED32 => {
+                if !self
+                    .reader
+                    .ensure(tlen + 4)
+                    .map_err(HistorySyncError::DecompressionError)?
+                {
+                    return Err(HistorySyncError::MalformedProtobuf(
+                        "fixed32 field truncated".into(),
+                    ));
+                }
+                (tlen + 4, tlen)
+            }
+            _ => {
+                return Err(HistorySyncError::MalformedProtobuf(format!(
+                    "unknown wire type {wire_type_raw}"
+                )));
+            }
+        };
+
+        self.pending = span;
+        Ok(Some(RawField {
+            field_number,
+            wire_type: wire_type_raw,
+            raw: &self.reader.available()[..span],
+            payload_start,
+        }))
+    }
+}
+
+/// The internal extraction pass: decompresses incrementally and pulls out
+/// secrets, tctokens, pushname and nctSalt as each top-level field is
+/// buffered, so peak memory is bounded by the largest single conversation
+/// rather than the whole blob.
+fn process_history_sync_streaming(
+    compressed_data: &[u8],
+    own_user: Option<&str>,
+    max_decompressed: u64,
+) -> Result<HistorySyncResult, HistorySyncError> {
+    let mut walker = FieldWalker::new(compressed_data, max_decompressed);
     let mut result = HistorySyncResult {
         own_pushname: None,
         nct_salt: None,
@@ -81,208 +237,152 @@ pub fn process_history_sync(
         // size a Vec that only holds the secret-record subset (it over-allocated
         // and cost ~2.5% of the decode); plain growth is cheaper here.
         msg_secret_records: Vec::new(),
-        // Always retained on this path: the `!retain_blob` case returned above
-        // and ran the streaming variant, so control only reaches here when the
-        // caller wants the blob.
-        decompressed_bytes: Some(buf.clone()),
+        compressed_bytes: None,
+        decompressed_size: 0,
     };
 
-    while pos < buf.len() {
-        let (tag, bytes_read) = read_varint(&buf[pos..])?;
-        pos += bytes_read;
-
-        let field_number = (tag >> 3) as u32;
-        let wire_type_raw = (tag & 0x7) as u32;
-
-        match field_number {
-            // conversations (repeated, length-delimited)
-            tags::history_sync::CONVERSATIONS if wire_type_raw == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(&buf[pos..])?;
-                pos += vlen;
-                let end = checked_end(pos, len, buf.len(), "conversation")?;
-
+    while let Some(field) = walker.next_field()? {
+        if field.wire_type != wire_type::LENGTH_DELIMITED {
+            continue;
+        }
+        let value = &field.raw[field.payload_start..];
+        match field.field_number {
+            // conversations (repeated)
+            tags::history_sync::CONVERSATIONS => {
                 result.conversations_processed += 1;
                 if let Some(candidate) =
-                    extract_conversation_fields(&buf[pos..end], &mut result.msg_secret_records)
+                    extract_conversation_fields(value, &mut result.msg_secret_records)
                 {
                     result.tc_token_candidates.push(candidate);
                 }
-                pos = end;
             }
-
-            // pushnames (repeated, length-delimited).
-            // Uses `Option::is_some()` in the guard rather than an
-            // `if let` guard — the latter requires Rust 1.94+. The inner
-            // `if let` is the defensive complement: if the guard's
-            // invariant is ever weakened by a future refactor, we skip
-            // the arm body instead of panicking.
-            tags::history_sync::PUSHNAMES
-                if own_user.is_some()
-                    && result.own_pushname.is_none()
-                    && wire_type_raw == wire_type::LENGTH_DELIMITED =>
-            {
-                let (len, vlen) = read_varint(&buf[pos..])?;
-                pos += vlen;
-                let end = checked_end(pos, len, buf.len(), "pushname")?;
-
-                if let Some(own) = own_user
-                    && let Some(name) = extract_own_pushname(&buf[pos..end], own)
+            // pushnames (repeated) — only our own is needed
+            tags::history_sync::PUSHNAMES => {
+                if result.own_pushname.is_none()
+                    && let Some(own) = own_user
+                    && let Some(name) = extract_own_pushname(value, own)
                 {
                     result.own_pushname = Some(name);
                 }
-                pos = end;
             }
-
-            // nctSalt (optional bytes, length-delimited)
-            // Delivered during initial pairing so cstoken is available immediately.
-            // Source: storeNctSaltFromHistorySync in WAWeb/History/MsgHandlerAction.js
-            tags::history_sync::NCT_SALT if wire_type_raw == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(&buf[pos..])?;
-                pos += vlen;
-                let end = checked_end(pos, len, buf.len(), "nctSalt")?;
-
-                let salt = buf[pos..end].to_vec();
-                if !salt.is_empty() {
-                    result.nct_salt = Some(salt);
-                }
-                pos = end;
+            tags::history_sync::NCT_SALT if !value.is_empty() => {
+                result.nct_salt = Some(value.to_vec());
             }
-
-            _ => {
-                pos = skip_field(wire_type_raw, &buf, pos)?;
-            }
+            _ => {}
         }
     }
 
+    result.decompressed_size = walker.total_out() as usize;
     Ok(result)
 }
 
-/// Streaming variant of [`process_history_sync`] for when the full decompressed
-/// blob is NOT needed (`retain_blob == false`). Decompresses incrementally and
-/// parses each top-level field as soon as its bytes are buffered, so peak memory
-/// is bounded by the largest single conversation rather than the whole blob.
-/// Produces the same extraction results (secrets, tctokens, pushname, nctSalt)
-/// as the full path, but with `decompressed_bytes == None`.
-fn process_history_sync_streaming(
-    compressed_data: &[u8],
-    own_user: Option<&str>,
-    max_decompressed: u64,
-) -> Result<HistorySyncResult, HistorySyncError> {
-    let mut reader = InflateReader::new(compressed_data, max_decompressed);
-    let mut result = HistorySyncResult {
-        own_pushname: None,
-        nct_salt: None,
-        conversations_processed: 0,
-        tc_token_candidates: Vec::new(),
-        msg_secret_records: Vec::new(),
-        decompressed_bytes: None,
-    };
+/// Incremental reader over a compressed HistorySync blob: yields conversations
+/// one at a time and the non-conversation fields as a final decoded remainder,
+/// without ever materializing the whole decompressed blob.
+///
+/// Decompression uses a bounded window, so peak memory is roughly the largest
+/// single conversation plus the accumulated non-conversation fields (a few KB
+/// on conversation-heavy blobs; effectively the whole — small — blob on
+/// conversation-less ones such as PushName-only or nctSalt-only chunks).
+///
+/// Cost model: one zlib inflate per full pass. A multi-MB InitialBootstrap
+/// chunk takes tens of milliseconds to inflate and decode; inside an async
+/// handler, prefer draining the stream in `spawn_blocking` (clone the
+/// compressed `Bytes` into the closure) when
+/// [`LazyHistorySync::decompressed_size`](crate::types::events::LazyHistorySync::decompressed_size)
+/// is large.
+pub struct HistorySyncStream<'a> {
+    walker: FieldWalker<'a>,
+    /// Raw (tag + payload) bytes of every non-conversation top-level field
+    /// encountered while iterating, decoded at the end by
+    /// [`HistorySyncStream::remainder`]. Accumulating raw fields makes wire
+    /// order irrelevant: conversations interleaved with other fields decode
+    /// identically to a field-ordered blob.
+    remainder: Vec<u8>,
+    skipped_conversations: usize,
+}
 
-    loop {
-        // A field starts with a tag varint; stop cleanly when the stream ends.
-        if !reader
-            .ensure(1)
-            .map_err(HistorySyncError::DecompressionError)?
-        {
-            break;
+impl<'a> HistorySyncStream<'a> {
+    /// Reader over `compressed`, refusing to inflate past `max_decompressed`
+    /// (use [`MAX_DECOMPRESSED`] when the exact inflated size is unknown).
+    pub fn new(compressed: &'a [u8], max_decompressed: u64) -> Self {
+        Self {
+            walker: FieldWalker::new(compressed, max_decompressed),
+            remainder: Vec::new(),
+            skipped_conversations: 0,
         }
-        // A varint is at most 10 bytes (fewer is fine right at EOF).
-        reader
-            .ensure(10)
-            .map_err(HistorySyncError::DecompressionError)?;
-        let (tag, tlen) = read_varint(reader.available())?;
-        reader.consume(tlen);
+    }
 
-        let field_number = (tag >> 3) as u32;
-        let wire_type_raw = (tag & 0x7) as u32;
+    /// Raw protobuf bytes of the next `conversations` entry, or `Ok(None)` at
+    /// clean EOF. The borrow points into the inflate window and stays valid
+    /// until the next call on the stream.
+    ///
+    /// Every other top-level field encountered along the way is buffered for
+    /// [`HistorySyncStream::remainder`]. A truncated field or zlib error is
+    /// fatal; per-conversation decode leniency lives in
+    /// [`HistorySyncStream::next_conversation`].
+    pub fn next_conversation_bytes(&mut self) -> Result<Option<&[u8]>, HistorySyncError> {
+        let payload_start = loop {
+            let Some(field) = self.walker.next_field()? else {
+                return Ok(None);
+            };
+            if field.field_number == tags::history_sync::CONVERSATIONS
+                && field.wire_type == wire_type::LENGTH_DELIMITED
+            {
+                break field.payload_start;
+            }
+            self.remainder.extend_from_slice(field.raw);
+        };
+        // Re-borrow outside the loop: the field stays buffered (consumed lazily
+        // on the next walker call), so the payload slice is still in the window.
+        Ok(Some(self.walker.pending_payload(payload_start)))
+    }
 
-        match wire_type_raw {
-            wire_type::LENGTH_DELIMITED => {
-                reader
-                    .ensure(10)
-                    .map_err(HistorySyncError::DecompressionError)?;
-                let (len, vlen) = read_varint(reader.available())?;
-                reader.consume(vlen);
-                let len = usize::try_from(len).map_err(|_| {
-                    HistorySyncError::MalformedProtobuf(format!(
-                        "field length overflows usize: {len}"
-                    ))
-                })?;
-                if !reader
-                    .ensure(len)
-                    .map_err(HistorySyncError::DecompressionError)?
-                {
-                    return Err(HistorySyncError::MalformedProtobuf(
-                        "length-delimited field truncated".into(),
-                    ));
-                }
-                {
-                    let value = &reader.available()[..len];
-                    match field_number {
-                        // conversations (repeated)
-                        tags::history_sync::CONVERSATIONS => {
-                            result.conversations_processed += 1;
-                            if let Some(candidate) =
-                                extract_conversation_fields(value, &mut result.msg_secret_records)
-                            {
-                                result.tc_token_candidates.push(candidate);
-                            }
-                        }
-                        // pushnames (repeated) — only our own is needed
-                        tags::history_sync::PUSHNAMES => {
-                            if result.own_pushname.is_none()
-                                && let Some(own) = own_user
-                                && let Some(name) = extract_own_pushname(value, own)
-                            {
-                                result.own_pushname = Some(name);
-                            }
-                        }
-                        tags::history_sync::NCT_SALT if !value.is_empty() => {
-                            result.nct_salt = Some(value.to_vec());
-                        }
-                        _ => {}
+    /// Decoded variant of [`HistorySyncStream::next_conversation_bytes`].
+    /// LENIENT: a conversation that fails prost decode is skipped and counted
+    /// in [`HistorySyncStream::skipped_conversations`], not fatal — one
+    /// corrupt entry doesn't void the rest of the blob.
+    pub fn next_conversation(&mut self) -> Result<Option<wa::Conversation>, HistorySyncError> {
+        loop {
+            match self.next_conversation_bytes()? {
+                None => return Ok(None),
+                Some(bytes) => match <wa::Conversation as prost::Message>::decode(bytes) {
+                    Ok(conversation) => return Ok(Some(conversation)),
+                    Err(e) => {
+                        log::debug!("Skipping undecodable history-sync conversation: {e}");
+                        self.skipped_conversations += 1;
                     }
-                }
-                reader.consume(len);
-            }
-            wire_type::VARINT => {
-                reader
-                    .ensure(10)
-                    .map_err(HistorySyncError::DecompressionError)?;
-                let (_, vlen) = read_varint(reader.available())?;
-                reader.consume(vlen);
-            }
-            wire_type::FIXED64 => {
-                if !reader
-                    .ensure(8)
-                    .map_err(HistorySyncError::DecompressionError)?
-                {
-                    return Err(HistorySyncError::MalformedProtobuf(
-                        "fixed64 field truncated".into(),
-                    ));
-                }
-                reader.consume(8);
-            }
-            wire_type::FIXED32 => {
-                if !reader
-                    .ensure(4)
-                    .map_err(HistorySyncError::DecompressionError)?
-                {
-                    return Err(HistorySyncError::MalformedProtobuf(
-                        "fixed32 field truncated".into(),
-                    ));
-                }
-                reader.consume(4);
-            }
-            _ => {
-                return Err(HistorySyncError::MalformedProtobuf(format!(
-                    "unknown wire type {wire_type_raw}"
-                )));
+                },
             }
         }
     }
 
-    Ok(result)
+    /// How many conversations [`HistorySyncStream::next_conversation`] skipped
+    /// because they failed to decode.
+    pub fn skipped_conversations(&self) -> usize {
+        self.skipped_conversations
+    }
+
+    /// Decode the accumulated non-conversation fields (pushnames, mappings,
+    /// settings, nctSalt, ...) as a conversations-less [`wa::HistorySync`].
+    ///
+    /// Call after `next_conversation*` returned `None`. Calling earlier drains
+    /// the rest of the stream and fails with
+    /// [`HistorySyncError::UnreadConversations`] if an unread conversation is
+    /// found, instead of silently dropping it.
+    pub fn remainder(mut self) -> Result<wa::HistorySync, HistorySyncError> {
+        while let Some(field) = self.walker.next_field()? {
+            if field.field_number == tags::history_sync::CONVERSATIONS
+                && field.wire_type == wire_type::LENGTH_DELIMITED
+            {
+                return Err(HistorySyncError::UnreadConversations);
+            }
+            self.remainder.extend_from_slice(field.raw);
+        }
+        Ok(waproto::codec::history_sync_decode(
+            self.remainder.as_slice(),
+        )?)
+    }
 }
 
 /// Compute `pos + len` with overflow and bounds checking.
@@ -2177,7 +2277,7 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&hs).unwrap();
         let compressed = encoder.finish().unwrap();
-        process_history_sync(compressed, None, false, None)
+        process_history_sync(compressed, None, false)
             .unwrap()
             .msg_secret_records
     }
@@ -2219,7 +2319,7 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&hs).unwrap();
         let compressed = encoder.finish().unwrap();
-        let result = process_history_sync(compressed, None, false, None).unwrap();
+        let result = process_history_sync(compressed, None, false).unwrap();
         assert!(result.msg_secret_records.is_empty());
     }
 
@@ -2333,7 +2433,7 @@ mod tests {
         };
 
         let compressed = encode_and_compress(&hs);
-        let result = process_history_sync(compressed, None, false, None).unwrap();
+        let result = process_history_sync(compressed, None, false).unwrap();
         assert_eq!(result.msg_secret_records.len(), 1);
         assert!(result.msg_secret_records[0].secret.is_empty());
     }
@@ -2348,7 +2448,7 @@ mod tests {
         };
 
         let compressed = encode_and_compress(&hs);
-        let result = process_history_sync(compressed, None, false, None).unwrap();
+        let result = process_history_sync(compressed, None, false).unwrap();
 
         assert_eq!(result.nct_salt, Some(salt));
     }
@@ -2361,7 +2461,7 @@ mod tests {
         };
 
         let compressed = encode_and_compress(&hs);
-        let result = process_history_sync(compressed, None, false, None).unwrap();
+        let result = process_history_sync(compressed, None, false).unwrap();
 
         assert!(result.nct_salt.is_none());
     }
@@ -2380,7 +2480,7 @@ mod tests {
         };
 
         let compressed = encode_and_compress(&hs);
-        let result = process_history_sync(compressed, Some("0000000000"), false, None).unwrap();
+        let result = process_history_sync(compressed, Some("0000000000"), false).unwrap();
 
         assert_eq!(result.nct_salt, Some(salt));
         assert_eq!(result.own_pushname.as_deref(), Some("TestUser"));
@@ -2436,7 +2536,7 @@ mod tests {
         };
 
         let compressed = encode_and_compress(&hs);
-        let result = process_history_sync(compressed, None, false, None).unwrap();
+        let result = process_history_sync(compressed, None, false).unwrap();
 
         assert_eq!(result.msg_secret_records.len(), 2);
         assert_eq!(&*result.msg_secret_records[0].chat_id, chat);
@@ -2495,7 +2595,7 @@ mod tests {
         };
 
         let compressed = encode_and_compress(&hs);
-        let result = process_history_sync(compressed, None, false, None).unwrap();
+        let result = process_history_sync(compressed, None, false).unwrap();
 
         assert_eq!(result.msg_secret_records.len(), 1);
         assert_eq!(result.msg_secret_records[0].msg_id, "HIST_BOTH");
@@ -2552,7 +2652,7 @@ mod tests {
         };
 
         let compressed = encode_and_compress(&hs);
-        let result = process_history_sync(compressed, None, false, None).unwrap();
+        let result = process_history_sync(compressed, None, false).unwrap();
 
         assert!(result.msg_secret_records.is_empty());
     }
@@ -2613,24 +2713,86 @@ mod tests {
         };
 
         let compressed = encode_and_compress(&hs);
-        let result = process_history_sync(compressed, None, false, None).unwrap();
+        let result = process_history_sync(compressed, None, false).unwrap();
 
         assert!(result.msg_secret_records.is_empty());
     }
 
-    /// The streaming path (retain_blob=false) must produce byte-for-byte the same
-    /// extraction as the full-decompress path (retain_blob=true), across multiple
-    /// conversations, a >64 KB conversation that spans decompress chunks, a group
-    /// (no tctoken), pushname and nctSalt.
-    #[test]
-    fn streaming_and_full_paths_produce_identical_results() {
+    /// Differential oracle: the pre-streaming full-buffer walk, kept test-only
+    /// so the parity check compares the production stream against an
+    /// independent implementation instead of a second production path.
+    fn reference_full_walk(decompressed: &[u8], own_user: Option<&str>) -> HistorySyncResult {
+        let mut pos = 0;
+        let mut result = HistorySyncResult {
+            own_pushname: None,
+            nct_salt: None,
+            conversations_processed: 0,
+            tc_token_candidates: Vec::new(),
+            msg_secret_records: Vec::new(),
+            compressed_bytes: None,
+            decompressed_size: decompressed.len(),
+        };
+
+        while pos < decompressed.len() {
+            let (tag, bytes_read) = read_varint(&decompressed[pos..]).unwrap();
+            pos += bytes_read;
+            let field_number = (tag >> 3) as u32;
+            let wt = (tag & 0x7) as u32;
+            match field_number {
+                tags::history_sync::CONVERSATIONS if wt == wire_type::LENGTH_DELIMITED => {
+                    let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
+                    pos += vlen;
+                    let end = checked_end(pos, len, decompressed.len(), "conversation").unwrap();
+                    result.conversations_processed += 1;
+                    if let Some(candidate) = extract_conversation_fields(
+                        &decompressed[pos..end],
+                        &mut result.msg_secret_records,
+                    ) {
+                        result.tc_token_candidates.push(candidate);
+                    }
+                    pos = end;
+                }
+                tags::history_sync::PUSHNAMES
+                    if own_user.is_some()
+                        && result.own_pushname.is_none()
+                        && wt == wire_type::LENGTH_DELIMITED =>
+                {
+                    let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
+                    pos += vlen;
+                    let end = checked_end(pos, len, decompressed.len(), "pushname").unwrap();
+                    if let Some(own) = own_user
+                        && let Some(name) = extract_own_pushname(&decompressed[pos..end], own)
+                    {
+                        result.own_pushname = Some(name);
+                    }
+                    pos = end;
+                }
+                tags::history_sync::NCT_SALT if wt == wire_type::LENGTH_DELIMITED => {
+                    let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
+                    pos += vlen;
+                    let end = checked_end(pos, len, decompressed.len(), "nctSalt").unwrap();
+                    let salt = decompressed[pos..end].to_vec();
+                    if !salt.is_empty() {
+                        result.nct_salt = Some(salt);
+                    }
+                    pos = end;
+                }
+                _ => {
+                    pos = skip_field(wt, decompressed, pos).unwrap();
+                }
+            }
+        }
+        result
+    }
+
+    /// Multi-conversation fixture: a >64 KB DM (spans decompress chunks, has a
+    /// tctoken), a group (tctoken must be ignored), pushname and nctSalt.
+    fn parity_fixture(own: &str) -> wa::HistorySync {
         use wa::history_sync::HistorySyncType;
-        let own = "5511000000000";
         let dm = "5511777776666@s.whatsapp.net";
         let group = "123456789-987654321@g.us";
         let participant = "5511888889999@s.whatsapp.net";
 
-        // Big 1:1 conversation (>64 KB decompressed) carrying a tctoken.
         let mut big_msgs = Vec::new();
         for i in 0..1500u32 {
             big_msgs.push(wa::HistorySyncMsg {
@@ -2656,7 +2818,6 @@ mod tests {
             ..Default::default()
         };
 
-        // Group conversation: a secret message, but the tctoken must be ignored.
         let group_conv = wa::Conversation {
             id: group.to_string(),
             messages: vec![wa::HistorySyncMsg {
@@ -2677,7 +2838,7 @@ mod tests {
             ..Default::default()
         };
 
-        let hs = wa::HistorySync {
+        wa::HistorySync {
             sync_type: HistorySyncType::InitialBootstrap as i32,
             conversations: vec![big_conv, group_conv],
             pushnames: vec![wa::Pushname {
@@ -2686,32 +2847,444 @@ mod tests {
             }],
             nct_salt: Some(vec![0x01, 0x02, 0x03, 0x04]),
             ..Default::default()
+        }
+    }
+
+    /// The production extraction (always streaming) must match the test-only
+    /// full-buffer reference walk byte for byte, and `retain_blob` must hand
+    /// the compressed input back with the exact inflated size.
+    #[test]
+    fn streaming_extraction_matches_full_buffer_reference() {
+        let own = "5511000000000";
+        let hs = parity_fixture(own);
+        let compressed = encode_and_compress(&hs);
+        let decompressed =
+            wacore_binary::zlib_pool::decompress_zlib_pooled(&compressed, MAX_DECOMPRESSED)
+                .unwrap();
+
+        let reference = reference_full_walk(&decompressed, Some(own));
+        let streamed = process_history_sync(compressed.clone(), Some(own), false).unwrap();
+        let retained = process_history_sync(compressed.clone(), Some(own), true).unwrap();
+
+        assert!(streamed.compressed_bytes.is_none(), "no-retain drops input");
+        assert_eq!(
+            retained.compressed_bytes.as_deref(),
+            Some(compressed.as_slice()),
+            "retain hands the original compressed input back"
+        );
+        assert_eq!(streamed.decompressed_size, decompressed.len());
+        assert_eq!(retained.decompressed_size, decompressed.len());
+
+        for result in [&streamed, &retained] {
+            assert_eq!(result.nct_salt, reference.nct_salt);
+            assert_eq!(result.own_pushname, reference.own_pushname);
+            assert_eq!(result.own_pushname.as_deref(), Some("Me"));
+            assert_eq!(
+                result.conversations_processed,
+                reference.conversations_processed
+            );
+            assert_eq!(result.conversations_processed, 2);
+            assert_eq!(result.tc_token_candidates, reference.tc_token_candidates);
+            assert_eq!(
+                result.tc_token_candidates.len(),
+                1,
+                "only the DM has a tctoken"
+            );
+            assert_eq!(result.msg_secret_records, reference.msg_secret_records);
+            assert_eq!(result.msg_secret_records.len(), 1500 + 1);
+        }
+    }
+
+    /// Collecting `next_conversation()` + `remainder()` and stitching them back
+    /// together must equal one full prost decode of the decompressed blob.
+    #[test]
+    fn stream_parity_with_full_prost_decode() {
+        let own = "5511000000000";
+        let hs = parity_fixture(own);
+        let compressed = encode_and_compress(&hs);
+
+        let mut stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
+        let mut conversations = Vec::new();
+        while let Some(conversation) = stream.next_conversation().unwrap() {
+            conversations.push(conversation);
+        }
+        assert_eq!(stream.skipped_conversations(), 0);
+        let mut stitched = stream.remainder().unwrap();
+        assert!(stitched.conversations.is_empty());
+        stitched.conversations = conversations;
+
+        let decompressed =
+            wacore_binary::zlib_pool::decompress_zlib_pooled(&compressed, MAX_DECOMPRESSED)
+                .unwrap();
+        let full = waproto::codec::history_sync_decode(&decompressed).unwrap();
+        assert_eq!(stitched, full);
+    }
+
+    /// Conversations interleaved with other top-level fields in any wire order
+    /// must stream identically: the remainder accumulation makes order
+    /// irrelevant.
+    #[test]
+    fn stream_handles_field_order_shuffled_blobs() {
+        let conv_a = wa::Conversation {
+            id: "5511111111111@s.whatsapp.net".into(),
+            ..Default::default()
+        };
+        let conv_b = wa::Conversation {
+            id: "5511222222222@s.whatsapp.net".into(),
+            ..Default::default()
+        };
+        let pushname = wa::Pushname {
+            id: Some("5511000000000".into()),
+            pushname: Some("Me".into()),
         };
 
-        let compressed = encode_and_compress(&hs);
-        let full = process_history_sync(compressed.clone(), Some(own), true, None).unwrap();
-        let streamed = process_history_sync(compressed, Some(own), false, None).unwrap();
+        // pushname, conv A, unknown varint field, nctSalt, conv B.
+        let mut blob = Vec::new();
+        emit_len_field(
+            &mut blob,
+            tags::history_sync::PUSHNAMES,
+            &pushname.encode_to_vec(),
+        );
+        emit_len_field(
+            &mut blob,
+            tags::history_sync::CONVERSATIONS,
+            &conv_a.encode_to_vec(),
+        );
+        emit_varint(&mut blob, ((50 << 3) | wire_type::VARINT) as u64);
+        emit_varint(&mut blob, 7);
+        emit_len_field(&mut blob, tags::history_sync::NCT_SALT, &[0xAA, 0xBB]);
+        emit_len_field(
+            &mut blob,
+            tags::history_sync::CONVERSATIONS,
+            &conv_b.encode_to_vec(),
+        );
 
-        assert!(full.decompressed_bytes.is_some(), "full path retains blob");
-        assert!(
-            streamed.decompressed_bytes.is_none(),
-            "streaming path drops blob"
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&blob).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
+        let got_a = stream.next_conversation().unwrap().unwrap();
+        let got_b = stream.next_conversation().unwrap().unwrap();
+        assert!(stream.next_conversation().unwrap().is_none());
+        assert_eq!(got_a, conv_a);
+        assert_eq!(got_b, conv_b);
+
+        let remainder = stream.remainder().unwrap();
+        assert_eq!(remainder.pushnames, vec![pushname]);
+        assert_eq!(remainder.nct_salt.as_deref(), Some(&[0xAA, 0xBB][..]));
+        assert!(remainder.conversations.is_empty());
+    }
+
+    /// PushName-only / nctSalt-only / empty blobs: zero conversations, complete
+    /// remainder.
+    #[test]
+    fn stream_conversationless_blobs() {
+        let cases: Vec<wa::HistorySync> = vec![
+            wa::HistorySync {
+                sync_type: wa::history_sync::HistorySyncType::PushName as i32,
+                pushnames: vec![wa::Pushname {
+                    id: Some("5511000000000".into()),
+                    pushname: Some("Me".into()),
+                }],
+                ..Default::default()
+            },
+            wa::HistorySync {
+                sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+                nct_salt: Some(vec![1, 2, 3]),
+                ..Default::default()
+            },
+            wa::HistorySync::default(),
+        ];
+
+        for hs in cases {
+            let compressed = encode_and_compress(&hs);
+            let mut stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
+            assert!(stream.next_conversation().unwrap().is_none());
+            let remainder = stream.remainder().unwrap();
+            assert_eq!(remainder, hs);
+        }
+    }
+
+    /// One corrupt conversation among valid ones: skipped and counted, the
+    /// stream continues and the remainder stays intact.
+    #[test]
+    fn stream_lenient_decode_skips_corrupt_conversation() {
+        let good = wa::Conversation {
+            id: "5511111111111@s.whatsapp.net".into(),
+            ..Default::default()
+        };
+        // Field 1 (id) claims 5 bytes but only 1 follows: prost decode fails.
+        let corrupt = [0x0A, 0x05, b'x'];
+
+        let mut blob = Vec::new();
+        emit_len_field(
+            &mut blob,
+            tags::history_sync::CONVERSATIONS,
+            &good.encode_to_vec(),
         );
-        assert_eq!(full.nct_salt, streamed.nct_salt);
-        assert_eq!(full.own_pushname, streamed.own_pushname);
-        assert_eq!(full.own_pushname.as_deref(), Some("Me"));
+        emit_len_field(&mut blob, tags::history_sync::CONVERSATIONS, &corrupt);
+        emit_len_field(
+            &mut blob,
+            tags::history_sync::CONVERSATIONS,
+            &good.encode_to_vec(),
+        );
+        emit_len_field(&mut blob, tags::history_sync::NCT_SALT, &[0x42]);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&blob).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
+        let mut decoded = Vec::new();
+        while let Some(conversation) = stream.next_conversation().unwrap() {
+            decoded.push(conversation);
+        }
+        assert_eq!(decoded, vec![good.clone(), good]);
+        assert_eq!(stream.skipped_conversations(), 1);
+        let remainder = stream.remainder().unwrap();
+        assert_eq!(remainder.nct_salt.as_deref(), Some(&[0x42][..]));
+    }
+
+    /// Level 1 still yields the corrupt entry's raw bytes (leniency is a level
+    /// 2 policy).
+    #[test]
+    fn stream_level1_yields_raw_bytes_verbatim() {
+        let corrupt = [0x0A, 0x05, b'x'];
+        let mut blob = Vec::new();
+        emit_len_field(&mut blob, tags::history_sync::CONVERSATIONS, &corrupt);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&blob).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
         assert_eq!(
-            full.conversations_processed,
-            streamed.conversations_processed
+            stream.next_conversation_bytes().unwrap(),
+            Some(&corrupt[..])
         );
-        assert_eq!(full.conversations_processed, 2);
-        assert_eq!(full.tc_token_candidates, streamed.tc_token_candidates);
-        assert_eq!(
-            full.tc_token_candidates.len(),
-            1,
-            "only the DM has a tctoken"
+        assert!(stream.next_conversation_bytes().unwrap().is_none());
+    }
+
+    /// A zero-length conversation entry is yielded (empty slice; decodes to the
+    /// default Conversation), not conflated with EOF.
+    #[test]
+    fn stream_zero_length_conversation() {
+        let mut blob = Vec::new();
+        emit_len_field(&mut blob, tags::history_sync::CONVERSATIONS, &[]);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&blob).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
+        let conversation = stream.next_conversation().unwrap().unwrap();
+        assert_eq!(conversation, wa::Conversation::default());
+        assert!(stream.next_conversation().unwrap().is_none());
+    }
+
+    /// Truncated zlib stream and truncated length-delimited field both surface
+    /// clean errors.
+    #[test]
+    fn stream_truncated_inputs_error_cleanly() {
+        let hs = parity_fixture("5511000000000");
+        let compressed = encode_and_compress(&hs);
+        let truncated_zlib = &compressed[..compressed.len() / 2];
+        let mut stream = HistorySyncStream::new(truncated_zlib, MAX_DECOMPRESSED);
+        let mut saw_error = false;
+        loop {
+            match stream.next_conversation_bytes() {
+                Ok(Some(_)) => continue,
+                Ok(None) => break,
+                Err(e) => {
+                    saw_error = true;
+                    assert!(matches!(
+                        e,
+                        HistorySyncError::DecompressionError(_)
+                            | HistorySyncError::MalformedProtobuf(_)
+                    ));
+                    break;
+                }
+            }
+        }
+        assert!(saw_error, "a half zlib stream must not parse cleanly");
+
+        // A field that claims more payload than the stream carries.
+        let mut blob = Vec::new();
+        emit_varint(
+            &mut blob,
+            ((tags::history_sync::CONVERSATIONS << 3) | wire_type::LENGTH_DELIMITED) as u64,
         );
-        assert_eq!(full.msg_secret_records, streamed.msg_secret_records);
-        assert_eq!(full.msg_secret_records.len(), 1500 + 1);
+        emit_varint(&mut blob, 100);
+        blob.extend_from_slice(&[0u8; 10]);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&blob).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
+        assert!(matches!(
+            stream.next_conversation_bytes(),
+            Err(HistorySyncError::MalformedProtobuf(_))
+        ));
+    }
+
+    /// A conversation far larger than the inflate window must force the window
+    /// to grow and still come out intact.
+    #[test]
+    fn stream_window_grows_for_large_conversation() {
+        let big = wa::Conversation {
+            id: "5511111111111@s.whatsapp.net".into(),
+            messages: vec![wa::HistorySyncMsg {
+                message: Some(wa::WebMessageInfo {
+                    key: wa::MessageKey {
+                        id: Some("BIG".into()),
+                        ..Default::default()
+                    },
+                    message: Some(wa::Message {
+                        conversation: Some("x".repeat(1_000_000)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let hs = wa::HistorySync {
+            conversations: vec![big.clone()],
+            ..Default::default()
+        };
+        let compressed = encode_and_compress(&hs);
+
+        let mut stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
+        let got = stream.next_conversation().unwrap().unwrap();
+        assert_eq!(got, big);
+        assert!(stream.next_conversation().unwrap().is_none());
+    }
+
+    /// Many mid-size conversations force repeated window refills, so field
+    /// headers straddle inflate chunk boundaries somewhere along the way.
+    #[test]
+    fn stream_survives_many_window_refills() {
+        let mut conversations = Vec::new();
+        for i in 0..50u32 {
+            conversations.push(wa::Conversation {
+                id: format!("55119{i:08}@s.whatsapp.net"),
+                messages: vec![wa::HistorySyncMsg {
+                    message: Some(wa::WebMessageInfo {
+                        key: wa::MessageKey {
+                            id: Some(format!("M{i}")),
+                            ..Default::default()
+                        },
+                        message: Some(wa::Message {
+                            conversation: Some(format!("{i}").repeat(4_000)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
+        let hs = wa::HistorySync {
+            conversations: conversations.clone(),
+            ..Default::default()
+        };
+        let compressed = encode_and_compress(&hs);
+
+        let mut stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
+        let mut got = Vec::new();
+        while let Some(conversation) = stream.next_conversation().unwrap() {
+            got.push(conversation);
+        }
+        assert_eq!(got, conversations);
+    }
+
+    /// Inflating past `max_decompressed` must error instead of allocating.
+    #[test]
+    fn stream_enforces_decompressed_cap() {
+        let hs = wa::HistorySync {
+            conversations: vec![wa::Conversation {
+                id: "5511111111111@s.whatsapp.net".into(),
+                messages: vec![wa::HistorySyncMsg {
+                    message: Some(wa::WebMessageInfo {
+                        message: Some(wa::Message {
+                            conversation: Some("y".repeat(64 * 1024)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let compressed = encode_and_compress(&hs);
+
+        let mut stream = HistorySyncStream::new(&compressed, 1024);
+        assert!(matches!(
+            stream.next_conversation_bytes(),
+            Err(HistorySyncError::DecompressionError(_))
+        ));
+    }
+
+    /// `remainder()` before exhaustion drains the tail; an unread conversation
+    /// in it is a loud error, while a conversation-free tail succeeds.
+    #[test]
+    fn stream_remainder_before_exhaustion_is_fail_loud() {
+        let conv = wa::Conversation {
+            id: "5511111111111@s.whatsapp.net".into(),
+            ..Default::default()
+        };
+        let hs = wa::HistorySync {
+            conversations: vec![conv],
+            nct_salt: Some(vec![9]),
+            ..Default::default()
+        };
+        let compressed = encode_and_compress(&hs);
+        let stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
+        assert!(matches!(
+            stream.remainder(),
+            Err(HistorySyncError::UnreadConversations)
+        ));
+
+        // Without conversations the early call is fine: the drain only meets
+        // remainder fields.
+        let hs = wa::HistorySync {
+            nct_salt: Some(vec![9]),
+            ..Default::default()
+        };
+        let compressed = encode_and_compress(&hs);
+        let stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
+        let remainder = stream.remainder().unwrap();
+        assert_eq!(remainder.nct_salt.as_deref(), Some(&[9][..]));
+    }
+
+    /// Group wire types (3/4) don't exist in HistorySync; the stream mirrors
+    /// the extractor and rejects them as malformed.
+    #[test]
+    fn stream_unknown_wire_type_errors() {
+        let mut blob = Vec::new();
+        emit_varint(&mut blob, ((99 << 3) | wire_type::START_GROUP) as u64);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&blob).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
+        assert!(matches!(
+            stream.next_conversation_bytes(),
+            Err(HistorySyncError::MalformedProtobuf(_))
+        ));
+    }
+
+    /// The extraction pass reports the exact inflated size.
+    #[test]
+    fn extraction_reports_exact_decompressed_size() {
+        let hs = parity_fixture("5511000000000");
+        let raw_len = hs.encode_to_vec().len();
+        let compressed = encode_and_compress(&hs);
+        let result = process_history_sync(compressed, None, false).unwrap();
+        assert_eq!(result.decompressed_size, raw_len);
     }
 }

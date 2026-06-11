@@ -92,6 +92,12 @@ impl<'a> InflateReader<'a> {
         self.eof && self.cursor >= self.buf.len()
     }
 
+    /// Total decompressed bytes produced so far. After the stream ends this is
+    /// the blob's exact inflated size.
+    pub fn total_out(&self) -> u64 {
+        self.total_out
+    }
+
     fn pump(&mut self) -> io::Result<()> {
         // Drop the consumed prefix before growing, so the buffer holds roughly
         // just the record currently being accumulated.
@@ -225,8 +231,12 @@ pub fn decompress_zlib_pooled(compressed: &[u8], max_size: u64) -> io::Result<Ve
         // every multi-MB history-sync chunk. 2x the compressed length is a
         // conservative first guess (zlib here compresses ~2-5x): it rarely
         // overshoots the real size, so it cuts reallocations without inflating
-        // peak memory. Bounded by `cap` so a bad guess can't exceed the limit.
-        let estimated = compressed.len().saturating_mul(2).clamp(4096, cap);
+        // peak memory. Bounded by `cap` so a bad guess can't exceed the limit;
+        // the floor also bows to `cap` because callers now pass exact (possibly
+        // tiny) decompressed sizes as the limit, where a fixed 4096 floor would
+        // invert the clamp and panic.
+        let floor = 4096.min(cap);
+        let estimated = compressed.len().saturating_mul(2).clamp(floor, cap);
         if scratch.capacity() < estimated {
             scratch.reserve(estimated - scratch.capacity());
         }
