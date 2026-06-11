@@ -302,6 +302,12 @@ impl EventInterest {
     pub const fn wants(self, kind: EventKind) -> bool {
         self.0 & (1u64 << (kind as u8)) != 0
     }
+
+    /// Set union, for aggregating the interests of several handlers behind one
+    /// bus registration.
+    pub const fn union(self, other: Self) -> Self {
+        EventInterest(self.0 | other.0)
+    }
 }
 
 pub trait EventHandler: crate::sync_marker::MaybeSendSync {

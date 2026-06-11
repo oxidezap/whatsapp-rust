@@ -290,7 +290,7 @@ mod tests {
         let transport = TokioWebSocketTransportFactory::new();
 
         let bot = Bot::builder()
-            .with_backend(backend)
+            .with_backend_arc(backend)
             .with_transport_factory(transport)
             .with_http_client(MockHttpClient)
             .with_runtime(TokioRuntime)
@@ -325,7 +325,7 @@ mod tests {
         let transport = TokioWebSocketTransportFactory::new();
 
         let bot = Bot::builder()
-            .with_backend(backend)
+            .with_backend_arc(backend)
             .with_transport_factory(transport)
             .with_http_client(MockHttpClient)
             .with_runtime(TokioRuntime)
@@ -367,7 +367,7 @@ mod tests {
         let transport = TokioWebSocketTransportFactory::new();
 
         let bot = Bot::builder()
-            .with_backend(backend)
+            .with_backend_arc(backend)
             .with_transport_factory(transport)
             .with_http_client(MockHttpClient)
             .with_runtime(TokioRuntime)
@@ -409,7 +409,7 @@ mod tests {
         let transport = TokioWebSocketTransportFactory::new();
 
         let bot = Bot::builder()
-            .with_backend(backend)
+            .with_backend_arc(backend)
             .with_transport_factory(transport)
             .with_http_client(MockHttpClient)
             .with_runtime(TokioRuntime)
@@ -433,7 +433,7 @@ mod tests {
         let transport = TokioWebSocketTransportFactory::new();
 
         let bot = Bot::builder()
-            .with_backend(backend)
+            .with_backend_arc(backend)
             .with_transport_factory(transport)
             .with_http_client(MockHttpClient)
             .with_runtime(TokioRuntime)
@@ -460,7 +460,7 @@ mod tests {
         let transport = TokioWebSocketTransportFactory::new();
 
         let bot = Bot::builder()
-            .with_backend(backend)
+            .with_backend_arc(backend)
             .with_transport_factory(transport)
             .with_http_client(MockHttpClient)
             .with_runtime(TokioRuntime)

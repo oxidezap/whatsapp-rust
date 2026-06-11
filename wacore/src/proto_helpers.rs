@@ -87,6 +87,38 @@ macro_rules! find_context_info_impl {
     }};
 }
 
+/// Constructors for common outbound message bodies, so simple sends don't
+/// hand-assemble protobuf structs. Import the trait and call the associated
+/// functions on [`wa::Message`] (`wa::Message::text("hi")`).
+pub trait MessageBuilderExt {
+    /// Plain text body. WA Web sends bare text as `conversation`.
+    fn text(text: impl Into<String>) -> wa::Message;
+
+    /// Text carrying a [`wa::ContextInfo`] (quote, mentions). WA Web switches
+    /// from `conversation` to `extendedTextMessage` once context is attached.
+    fn text_with_context(text: impl Into<String>, context: wa::ContextInfo) -> wa::Message;
+}
+
+impl MessageBuilderExt for wa::Message {
+    fn text(text: impl Into<String>) -> wa::Message {
+        wa::Message {
+            conversation: Some(text.into()),
+            ..Default::default()
+        }
+    }
+
+    fn text_with_context(text: impl Into<String>, context: wa::ContextInfo) -> wa::Message {
+        wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some(text.into()),
+                context_info: Some(Box::new(context)),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+}
+
 /// Extension trait for wa::Message
 pub trait MessageExt {
     /// Recursively unwraps ephemeral/view-once/document_with_caption/edited wrappers to get the core message.

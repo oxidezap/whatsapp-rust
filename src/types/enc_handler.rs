@@ -83,7 +83,7 @@ mod tests {
         let transport = whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory::new();
         let http_client = whatsapp_rust_ureq_http_client::UreqHttpClient::new();
         let bot = Bot::builder()
-            .with_backend(backend)
+            .with_backend_arc(backend)
             .with_transport_factory(transport)
             .with_http_client(http_client)
             .with_enc_handler("frskmsg", mock_handler)
@@ -115,7 +115,7 @@ mod tests {
         let transport = whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory::new();
         let http_client = whatsapp_rust_ureq_http_client::UreqHttpClient::new();
         let bot = Bot::builder()
-            .with_backend(backend)
+            .with_backend_arc(backend)
             .with_transport_factory(transport)
             .with_http_client(http_client)
             .with_enc_handler("frskmsg", handler1)
@@ -143,7 +143,7 @@ mod tests {
         let transport = whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory::new();
         let http_client = whatsapp_rust_ureq_http_client::UreqHttpClient::new();
         let bot = Bot::builder()
-            .with_backend(backend)
+            .with_backend_arc(backend)
             .with_transport_factory(transport)
             .with_http_client(http_client)
             .with_runtime(TokioRuntime)

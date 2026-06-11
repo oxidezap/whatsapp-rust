@@ -8,7 +8,6 @@ use wacore::types::events::{ChannelEventHandler, Event};
 use wacore_binary::node::Node;
 use whatsapp_rust::Jid;
 use whatsapp_rust::bot::Bot;
-use whatsapp_rust::store::traits::Backend;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
@@ -119,12 +118,11 @@ impl TestClient {
     }
 
     async fn connect_inner(_prefix: &str, push_name: Option<String>) -> anyhow::Result<Self> {
-        let backend = Arc::new(InMemoryBackend::new()) as Arc<dyn Backend>;
         let transport_factory = TokioWebSocketTransportFactory::new().with_url(mock_server_url());
         let (event_handler, event_rx) = ChannelEventHandler::new();
 
         let mut builder = Bot::builder()
-            .with_backend(backend)
+            .with_backend(InMemoryBackend::new())
             .with_transport_factory(transport_factory)
             .with_http_client(UreqHttpClient::new())
             .with_runtime(whatsapp_rust::TokioRuntime)
@@ -135,7 +133,7 @@ impl TestClient {
             builder = builder.with_push_name(name);
         }
 
-        let mut bot = builder.build().await?;
+        let bot = builder.build().await?;
 
         let client = bot.client();
         // with_push_name pre-seeds the name so the setting_pushName mutation has old==new (skipping auto set_available), so force active to keep delivery receipts from being type="inactive".
@@ -154,7 +152,7 @@ impl TestClient {
         client.register_handler(qr_handler);
         let _qr_responder = spawn_qr_autoresponder_http(qr_rx);
 
-        let run_handle = bot.run().await?;
+        let run_handle = bot.spawn();
 
         // Wait for PairSuccess + Connected.
         //

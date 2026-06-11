@@ -1,3 +1,6 @@
+// Compile-checks the README examples as doctests, so the advertised quick
+// start can never silently rot.
+#![doc = include_str!("../README.md")]
 // Instrumenting large async fns (e.g. process_sync_task) wraps them in deep
 // `Instrumented` future types; the default depth limit overflows when the
 // `tracing` + `tracing-pii` paths combine. Raise it (compile-time only).
@@ -14,6 +17,12 @@ pub use wacore_binary::CompactString;
 pub use wacore_binary::OwnedNodeRef;
 pub use wacore_binary::builder::NodeBuilder;
 pub use wacore_binary::{Jid, Server};
+
+// Whole-crate re-exports so a git consumer needs a single dependency:
+// every `wacore::…`/`wacore_binary::…`/`waproto::…` path is reachable as
+// `whatsapp_rust::wacore::…` (etc.) without declaring the sibling crates.
+pub use wacore;
+pub use wacore_binary;
 pub use waproto;
 
 pub mod cache;
@@ -102,6 +111,24 @@ pub mod lid_pn_cache;
 pub mod spam_report;
 pub mod sync_task;
 pub mod version;
+
+/// One-import surface for the common bot path:
+/// `use whatsapp_rust::prelude::*;`.
+pub mod prelude {
+    pub use crate::bot::{Bot, BotBuilder, BotHandle, MessageContext};
+    pub use crate::client::Client;
+    #[cfg(feature = "tokio-runtime")]
+    pub use crate::runtime_impl::TokioRuntime;
+    pub use crate::send::{SendOptions, SendResult};
+    #[cfg(feature = "sqlite-storage")]
+    pub use crate::store::SqliteStore;
+    pub use crate::types::events::{Event, EventKind};
+    pub use crate::types::message::MessageInfo;
+    pub use crate::{Jid, Server};
+    pub use wacore::proto_helpers::{MessageBuilderExt, MessageExt};
+    /// The protobuf namespace (`wa::Message`, `wa::message::*`).
+    pub use waproto::whatsapp as wa;
+}
 
 pub use spam_report::{SpamFlow, SpamReportRequest, SpamReportResult};
 

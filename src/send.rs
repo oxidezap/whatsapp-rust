@@ -417,6 +417,21 @@ impl Client {
             .await
     }
 
+    /// Plain-text convenience over [`Client::send_message`].
+    pub async fn send_text(
+        &self,
+        to: impl Into<Jid>,
+        text: impl Into<String>,
+    ) -> Result<SendResult, anyhow::Error> {
+        use wacore::proto_helpers::MessageBuilderExt;
+        self.send_message_with_options_inner(
+            to.into(),
+            wa::Message::text(text),
+            SendOptions::default(),
+        )
+        .await
+    }
+
     /// Forward an existing message to a chat.
     ///
     /// Builds a forward-ready copy of `message` (sets `is_forwarded`, bumps the

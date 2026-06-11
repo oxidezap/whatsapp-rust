@@ -1,4 +1,3 @@
-use chrono::Local;
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -6,7 +5,6 @@ use wacore::net::{HttpClient, HttpRequest};
 use wacore::proto_helpers::MessageExt;
 use wacore::store::InMemoryBackend;
 use wacore::types::events::{Event, EventKind};
-use waproto::whatsapp as wa;
 use whatsapp_rust::TokioRuntime;
 use whatsapp_rust::bot::{Bot, MessageContext};
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
@@ -37,7 +35,7 @@ fn main() {
             writeln!(
                 buf,
                 "{} [{:<5}] [{}] - {}",
-                Local::now().format("%H:%M:%S"),
+                wacore::time::now_utc().format("%H:%M:%S"),
                 record.level(),
                 record.target(),
                 record.args()
@@ -51,8 +49,6 @@ fn main() {
         .expect("Failed to build tokio runtime");
 
     rt.block_on(async {
-        let backend = Arc::new(InMemoryBackend::new());
-
         // Accept either WHATSAPP_WS_URL or MOCK_SERVER_URL — the latter
         // matches the convention the e2e suite uses.
         let configured_ws_url = std::env::var("WHATSAPP_WS_URL")
@@ -71,12 +67,12 @@ fn main() {
         let http_client = UreqHttpClient::new();
 
         let builder = Bot::builder()
-            .with_backend(backend)
+            .with_backend(InMemoryBackend::new())
             .with_transport_factory(transport_factory)
             .with_http_client(http_client)
             .with_runtime(TokioRuntime);
 
-        let mut bot = builder
+        let bot = builder
             .on_event_for(
                 &[
                     EventKind::Message,
@@ -92,16 +88,12 @@ fn main() {
                                 if let Some(text) = msg.text_content()
                                     && text == "ping"
                                 {
-                                    let ctx = MessageContext::from_parts(msg, info, client);
+                                    let ctx =
+                                        MessageContext::from_arc(Arc::clone(msg), info, client);
                                     info!("Received text ping, sending pong...");
 
                                     let pong_text = format!("pong {}", ctx.info.id);
-                                    let reply_message = wa::Message {
-                                        conversation: Some(pong_text),
-                                        ..Default::default()
-                                    };
-
-                                    if let Err(e) = ctx.send_message(reply_message).await {
+                                    if let Err(e) = ctx.reply(pong_text).await {
                                         error!("Failed to send pong reply: {}", e);
                                     }
                                 }
@@ -154,16 +146,6 @@ fn main() {
             .await
             .expect("Failed to build bot");
 
-        let bot_handle = match bot.run().await {
-            Ok(handle) => handle,
-            Err(e) => {
-                error!("Bot failed to start: {}", e);
-                return;
-            }
-        };
-
-        bot_handle
-            .await
-            .expect("Bot task should complete without panicking");
+        bot.run().await;
     });
 }
