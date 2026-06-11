@@ -377,11 +377,25 @@ impl Client {
         info!("Client run loop has shut down.");
     }
 
+    /// Boxed barrier: see [`crate::bot::Bot::run`]. Coroutines are LocalCopy
+    /// across crates, so consumers awaiting the connect graph directly would
+    /// re-codegen it; the box makes them poll through a vtable instead.
+    pub async fn connect(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+        self.connect_boxed().await
+    }
+
+    #[inline(never)]
+    fn connect_boxed(
+        self: &Arc<Self>,
+    ) -> wacore::runtime::BoxFuture<'_, Result<(), anyhow::Error>> {
+        Box::pin(self.connect_graph())
+    }
+
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.conn.connect", level = "info", skip_all, err(Debug))
     )]
-    pub async fn connect(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+    async fn connect_graph(self: &Arc<Self>) -> Result<(), anyhow::Error> {
         if self.is_connecting.swap(true, Ordering::SeqCst) {
             return Err(ClientError::AlreadyConnected.into());
         }

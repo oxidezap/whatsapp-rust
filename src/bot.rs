@@ -221,11 +221,25 @@ impl Bot {
         self.client.clone()
     }
 
+    /// Coroutines are LocalCopy across crates: a consumer crate that awaits
+    /// this future re-codegens the whole state machine graph behind it in its
+    /// own binary. The boxed barrier below type-erases the graph in a plain
+    /// (linker-shared) function, so callers poll through a vtable and the
+    /// graph is compiled once, here. One allocation per process.
+    pub async fn run(&mut self) -> Result<BotHandle> {
+        self.run_boxed().await
+    }
+
+    #[inline(never)]
+    fn run_boxed(&mut self) -> wacore::runtime::BoxFuture<'_, Result<BotHandle>> {
+        Box::pin(self.run_graph())
+    }
+
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.bot.run", level = "debug", skip_all, err(Debug))
     )]
-    pub async fn run(&mut self) -> Result<BotHandle> {
+    async fn run_graph(&mut self) -> Result<BotHandle> {
         if let Some(receiver) = self.sync_task_receiver.take() {
             let worker_client = Arc::downgrade(&self.client);
             self.client
@@ -706,11 +720,25 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
 // ── build() — only available when all 4 required fields are Provided ─────
 
 impl BotBuilder<Provided, Provided, Provided, Provided> {
+    /// Boxed barrier: see [`Bot::run`]. Building the client wires every cache
+    /// and background loop, so an unboxed await here would duplicate that
+    /// whole construction graph into the consumer crate.
+    pub async fn build(self) -> std::result::Result<Bot, BotBuilderError> {
+        self.build_boxed().await
+    }
+
+    #[inline(never)]
+    fn build_boxed(
+        self,
+    ) -> wacore::runtime::BoxFuture<'static, std::result::Result<Bot, BotBuilderError>> {
+        Box::pin(self.build_graph())
+    }
+
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.bot.build", level = "debug", skip_all, err(Debug))
     )]
-    pub async fn build(self) -> std::result::Result<Bot, BotBuilderError> {
+    async fn build_graph(self) -> std::result::Result<Bot, BotBuilderError> {
         // Destructure to extract required fields — typestate guarantees all are Some.
         let (Some(runtime), Some(backend), Some(transport_factory), Some(http_client)) = (
             self.runtime,
