@@ -286,7 +286,7 @@ fn process_history_sync_streaming(
 }
 
 /// Compute `pos + len` with overflow and bounds checking.
-#[inline]
+#[inline(always)]
 fn checked_end(
     pos: usize,
     len: u64,
@@ -310,7 +310,9 @@ fn checked_end(
 }
 
 /// Read a protobuf varint from `data`, returning (value, bytes_consumed).
-#[inline]
+// inline(always): per-field hot path; the thin-LTO bench profile keeps plain
+// #[inline] candidates outlined and the call overhead dominates the walk.
+#[inline(always)]
 fn read_varint(data: &[u8]) -> Result<(u64, usize), HistorySyncError> {
     // Single-byte fast-path: most history-sync varints (tags, small lengths) fit in one byte.
     let Some(&first) = data.first() else {
@@ -348,7 +350,7 @@ fn read_varint(data: &[u8]) -> Result<(u64, usize), HistorySyncError> {
 }
 
 /// Skip a protobuf field based on wire type, returning the new position.
-#[inline]
+#[inline(always)]
 fn skip_field(wire_type: u32, buf: &[u8], pos: usize) -> Result<usize, HistorySyncError> {
     match wire_type {
         wire_type::VARINT => {
@@ -991,6 +993,10 @@ struct WireField<'a> {
 impl<'a> Iterator for FieldIter<'a> {
     type Item = Result<WireField<'a>, WalkStop>;
 
+    // inline(always): one call per protobuf field; outlined (as the thin-LTO
+    // bench build does by default) the WireField/Result plumbing goes through
+    // memory and this single function is ~30% of the history-sync profile.
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos >= self.data.len() {
             return None;
