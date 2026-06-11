@@ -229,15 +229,17 @@ impl SenderKeyState {
             let _ = signing_key_memo.set(key);
         }
         let verifying_key_memo = std::sync::OnceLock::new();
-        let verifier = crate::core::curve::PreparedVerifyingKey::new(&signature_key);
         if signing_key_memo.get().is_none() {
             // Receive-side state (no private key): this key will verify every
-            // incoming message, so derive the Edwards entries here, at SKDM
-            // processing, once per sender rotation. Send-side states never
-            // verify their own messages and keep the entries cold.
+            // incoming message, so build the verifier and derive its Edwards
+            // entries here, at SKDM processing, once per sender rotation.
+            // Send-side states never verify their own messages, so they skip
+            // even the verifier allocation; the memo builds lazily if ever
+            // asked.
+            let verifier = crate::core::curve::PreparedVerifyingKey::new(&signature_key);
             verifier.precompute();
+            let _ = verifying_key_memo.set(verifier);
         }
-        let _ = verifying_key_memo.set(verifier);
         Self {
             state,
             signing_key_memo,
@@ -672,8 +674,12 @@ mod tests {
                 .has_warm_signing_cache()
         );
 
-        // Verifier memo: seeded at creation, rebuilt lazily after a cold
-        // load, and clones carry it.
+        // Verifier memo: send-side states (private key present) skip even
+        // the allocation; it builds lazily if asked, is seeded eagerly only
+        // on receive-side creation, rebuilds after a cold load, and clones
+        // carry it.
+        assert!(state.verifying_key_memo.get().is_none());
+        let _ = state.signing_key_verifier().expect("lazy build works");
         assert!(state.verifying_key_memo.get().is_some());
         let cold = SenderKeyState::from_protobuf(state.as_protobuf());
         assert!(cold.verifying_key_memo.get().is_none());
