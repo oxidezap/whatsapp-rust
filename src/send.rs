@@ -869,7 +869,7 @@ impl Client {
         group_jid: &str,
         group_info: &wacore::client::context::GroupInfo,
         own_sending_jid: &Jid,
-    ) -> Option<(std::sync::Arc<Vec<Jid>>, Vec<Jid>)> {
+    ) -> Option<(std::sync::Arc<wacore::send::ResolvedGroupDevices>, Vec<Jid>)> {
         let cached_map = self.skdm_device_map(group_jid).await;
 
         let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
@@ -897,9 +897,14 @@ impl Client {
                 } else {
                     all_devices
                 };
-                let all_devices = std::sync::Arc::new(all_devices);
-                let needs_skdm =
-                    self.filter_skdm_targets(group_jid, &all_devices, &cached_map, own_sending_jid);
+                let all_devices =
+                    std::sync::Arc::new(wacore::send::ResolvedGroupDevices::new(all_devices));
+                let needs_skdm = self.filter_skdm_targets(
+                    group_jid,
+                    all_devices.devices(),
+                    &cached_map,
+                    own_sending_jid,
+                );
                 Some((all_devices, needs_skdm))
             }
             Err(e) => {
@@ -923,15 +928,19 @@ impl Client {
         group_jid: &str,
         group_info: &std::sync::Arc<wacore::client::context::GroupInfo>,
         own_sending_jid: &Jid,
-    ) -> Option<(std::sync::Arc<Vec<Jid>>, Vec<Jid>)> {
+    ) -> Option<(std::sync::Arc<wacore::send::ResolvedGroupDevices>, Vec<Jid>)> {
         let cached_map = self.skdm_device_map(group_jid).await;
         match self
             .resolve_group_devices_memoized(group, group_info, own_sending_jid)
             .await
         {
             Ok(all_devices) => {
-                let needs_skdm =
-                    self.filter_skdm_targets(group_jid, &all_devices, &cached_map, own_sending_jid);
+                let needs_skdm = self.filter_skdm_targets(
+                    group_jid,
+                    all_devices.devices(),
+                    &cached_map,
+                    own_sending_jid,
+                );
                 Some((all_devices, needs_skdm))
             }
             Err(e) => {
@@ -1452,7 +1461,7 @@ impl Client {
             // still missing the key. On the cold/`force_skdm` path both are
             // `None` and `prepare_group_stanza` resolves the set itself.
             let (all_devices_for_phash, skdm_target_devices): (
-                Option<std::sync::Arc<Vec<Jid>>>,
+                Option<std::sync::Arc<wacore::send::ResolvedGroupDevices>>,
                 Option<Vec<Jid>>,
             ) = if force_skdm {
                 (None, None)
@@ -2970,10 +2979,10 @@ mod tests {
         // Empty cache → every participant needs SKDM, and the full set equals
         // the target set on this cold path.
         assert_eq!(needs_skdm.len(), participants.len());
-        assert_eq!(all_devices.len(), participants.len());
+        assert_eq!(all_devices.devices().len(), participants.len());
         for user in &participant_users {
             assert!(needs_skdm.iter().any(|j| j.user == *user));
-            assert!(all_devices.iter().any(|j| j.user == *user));
+            assert!(all_devices.devices().iter().any(|j| j.user == *user));
         }
     }
 

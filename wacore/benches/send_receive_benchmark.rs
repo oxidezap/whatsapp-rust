@@ -594,6 +594,9 @@ struct GrpSendData {
     alice: User,
     group_jid: Jid,
     participants: Vec<Jid>,
+    /// Warm-send fixture: the resolved set with its phash memo pre-warmed in
+    /// setup, like the per-group device memo serves production repeat sends.
+    resolved_for_phash: Option<std::sync::Arc<wacore::send::ResolvedGroupDevices>>,
     force_skdm: bool,
     resolver: MockResolver,
     msg: wa::Message,
@@ -625,10 +628,18 @@ fn setup_group_send(n: usize) -> GrpSendData {
             .unwrap();
     });
 
+    let resolved = std::sync::Arc::new(wacore::send::ResolvedGroupDevices::new(
+        participants.clone(),
+    ));
+    // Warm steady state: production warms the memo on the first send after a
+    // topology change and serves every later send from it.
+    let _ = resolved.phash(&alice.jid);
+
     GrpSendData {
         alice,
         group_jid,
         participants,
+        resolved_for_phash: Some(resolved),
         force_skdm: false,
         resolver: MockResolver(devices),
         msg: text_msg(),
@@ -650,16 +661,19 @@ fn setup_group_send_256() -> GrpSendData {
 fn setup_group_skdm_10() -> GrpSendData {
     let mut d = setup_group_send(10);
     d.force_skdm = true;
+    d.resolved_for_phash = None;
     d
 }
 fn setup_group_skdm_50() -> GrpSendData {
     let mut d = setup_group_send(50);
     d.force_skdm = true;
+    d.resolved_for_phash = None;
     d
 }
 fn setup_group_skdm_256() -> GrpSendData {
     let mut d = setup_group_send(256);
     d.force_skdm = true;
+    d.resolved_for_phash = None;
     d
 }
 
@@ -775,8 +789,7 @@ fn run_group_send(d: &mut GrpSendData) {
     // only emits a phash if it gets the full device set. Mirror the real
     // warm-send caller by passing it; the cold/force_skdm path resolves the set
     // itself and keeps None.
-    let all_devices_for_phash =
-        (!d.force_skdm).then(|| std::sync::Arc::new(d.participants.clone()));
+    let all_devices_for_phash = d.resolved_for_phash.clone();
     let mut group_info = GroupInfo::new(std::mem::take(&mut d.participants), AddressingMode::Pn);
     let own_base = own_jid.to_non_ad();
     if !group_info

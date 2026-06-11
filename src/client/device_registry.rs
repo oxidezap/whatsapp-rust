@@ -24,7 +24,7 @@ pub(crate) struct GroupDevicesMemo {
     /// counterparts, resolved device users): the scoped-invalidation check
     /// tests the topology log's touched users against this set.
     pub(crate) members: Arc<std::collections::HashSet<wacore_binary::CompactString>>,
-    pub(crate) devices: Arc<Vec<Jid>>,
+    pub(crate) devices: Arc<wacore::send::ResolvedGroupDevices>,
 }
 
 /// Result of resolving a user identifier to lookup keys.
@@ -92,16 +92,16 @@ impl Client {
         group: &Jid,
         group_info: &Arc<wacore::client::context::GroupInfo>,
         own_sending_jid: &Jid,
-    ) -> Result<Arc<Vec<Jid>>, anyhow::Error> {
+    ) -> Result<Arc<wacore::send::ResolvedGroupDevices>, anyhow::Error> {
         // Store-backed registry or mapping caches can be written by OTHER
         // processes (e.g. shared Redis across pods), which this process's
         // topology tracker cannot observe; the memo's freshness contract
         // doesn't hold there, so it is disabled and every send resolves.
         if !self.group_devices_memo_enabled {
-            return Ok(Arc::new(
+            return Ok(Arc::new(wacore::send::ResolvedGroupDevices::new(
                 self.resolve_group_devices_uncached(group_info, own_sending_jid)
                     .await?,
-            ));
+            )));
         }
         // Load the generation BEFORE resolving (do NOT move this after
         // get_user_devices): a write racing the resolve bumps it afterwards,
@@ -169,7 +169,7 @@ impl Client {
             members.insert(device.user.clone());
         }
 
-        let devices = Arc::new(devices);
+        let devices = Arc::new(wacore::send::ResolvedGroupDevices::new(devices));
         self.group_devices_memo
             .insert(
                 group.clone(),
@@ -1119,7 +1119,7 @@ mod tests {
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve should succeed");
-        assert_eq!(first.len(), 3, "0+5 for A, 0 for B");
+        assert_eq!(first.devices().len(), 3, "0+5 for A, 0 for B");
 
         // Raw cache write WITHOUT a topology bump: the memo must keep serving
         // the snapshot (this is what proves the repeat call was a hit and not
@@ -1129,8 +1129,8 @@ mod tests {
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve should succeed");
-        assert_eq!(
-            stale, first,
+        assert!(
+            std::sync::Arc::ptr_eq(&stale, &first),
             "same Arc + same generation must be a memo hit"
         );
 
@@ -1141,7 +1141,11 @@ mod tests {
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve should succeed");
-        assert_eq!(fresh.len(), 2, "post-bump resolve must see the raw change");
+        assert_eq!(
+            fresh.devices().len(),
+            2,
+            "post-bump resolve must see the raw change"
+        );
 
         // A refreshed GroupInfo (new Arc, identical content) must recompute
         // even with an unchanged generation.
@@ -1159,7 +1163,7 @@ mod tests {
             .await
             .expect("resolve should succeed");
         assert_eq!(
-            after_refresh.len(),
+            after_refresh.devices().len(),
             3,
             "a new GroupInfo Arc must invalidate the memo by identity"
         );
@@ -1183,7 +1187,7 @@ mod tests {
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
-        assert_eq!(first.len(), 2);
+        assert_eq!(first.devices().len(), 2);
 
         // Raw change (not recorded) + changes touching only a NON-member:
         // the memo must re-stamp and keep serving the snapshot.
@@ -1194,8 +1198,8 @@ mod tests {
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
-        assert_eq!(
-            stale, first,
+        assert!(
+            std::sync::Arc::ptr_eq(&stale, &first),
             "non-member changes must re-stamp, not recompute"
         );
 
@@ -1205,7 +1209,7 @@ mod tests {
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
-        assert_eq!(fresh.len(), 1, "member change must recompute");
+        assert_eq!(fresh.devices().len(), 1, "member change must recompute");
 
         // Global events (mapping cache clear, warm-up) poison the fast path.
         setup_device_record(&client, user_a, &[0, 5, 9]).await;
@@ -1214,7 +1218,11 @@ mod tests {
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
-        assert_eq!(after_global.len(), 3, "global event must recompute");
+        assert_eq!(
+            after_global.devices().len(),
+            3,
+            "global event must recompute"
+        );
 
         // Log overflow past the memo's stamp: cannot prove cleanliness,
         // must recompute.
@@ -1226,7 +1234,11 @@ mod tests {
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
-        assert_eq!(after_overflow.len(), 1, "log overflow must recompute");
+        assert_eq!(
+            after_overflow.devices().len(),
+            1,
+            "log overflow must recompute"
+        );
     }
 
     /// A mapping add for a member (logged under BOTH its LID and PN keys)
@@ -1246,7 +1258,7 @@ mod tests {
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
-        assert_eq!(first.len(), 1);
+        assert_eq!(first.devices().len(), 1);
 
         // Raw change, then learn a LID mapping for the member: the add logs
         // (lid, pn) and the memo's member set carries the PN, so it must
@@ -1265,7 +1277,7 @@ mod tests {
             .await
             .expect("resolve");
         assert_eq!(
-            fresh.len(),
+            fresh.devices().len(),
             2,
             "a member's mapping change must invalidate the memo"
         );
@@ -1294,7 +1306,11 @@ mod tests {
             .resolve_group_devices_memoized(&group, &group_info, &own)
             .await
             .expect("resolve");
-        assert_eq!(first.len(), 3, "member device + own's two devices");
+        assert_eq!(
+            first.devices().len(),
+            3,
+            "member device + own's two devices"
+        );
 
         let second = client
             .resolve_group_devices_memoized(&group, &group_info, &own)
@@ -1346,7 +1362,7 @@ mod tests {
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await
             .expect("resolve");
-        assert_eq!(first.len(), 1);
+        assert_eq!(first.devices().len(), 1);
 
         // The update arrives keyed by the LID: canonical == original == LID,
         // so without the alias rule only the LID would be recorded and the
@@ -1376,7 +1392,7 @@ mod tests {
             .await
             .expect("resolve");
         assert_eq!(
-            fresh.len(),
+            fresh.devices().len(),
             2,
             "a LID-keyed update for a member must invalidate the PN group's memo"
         );

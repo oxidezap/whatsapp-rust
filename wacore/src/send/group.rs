@@ -139,7 +139,7 @@ pub async fn prepare_group_stanza<
     // sends so the phash covers every device + self even when no SKDM is sent;
     // `None` on the cold `force_skdm` path (the set is resolved here) and for
     // status broadcasts (which keep the prior phash behavior).
-    all_devices_for_phash: Option<std::sync::Arc<Vec<Jid>>>,
+    all_devices_for_phash: Option<std::sync::Arc<super::ResolvedGroupDevices>>,
     edit: Option<crate::types::message::EditAttribute>,
     extra_stanza_nodes: &[Node],
 ) -> Result<PreparedGroupStanza> {
@@ -169,7 +169,7 @@ pub async fn prepare_group_stanza<
 
     let mut message_children: Vec<Node> = Vec::new();
     let mut includes_prekey_message = false;
-    let mut phash_for_stanza: Option<String> = None;
+    let mut phash_for_stanza: Option<CompactString> = None;
     let mut skdm_encrypted_devices: Vec<Jid> = Vec::new();
 
     // Determine if we need to distribute SKDM and to which devices.
@@ -302,17 +302,16 @@ pub async fn prepare_group_stanza<
     // broadcasts keep the prior behavior (phash over the distribution list only,
     // when distributing); WA Web's status path does not augment with self.
     if to_jid.is_group() {
-        // Warm/partial sends pass the complete set in `all_devices_for_phash`;
-        // the cold `force_skdm` path leaves it None and `distribution_list`
-        // already holds the full resolved set.
-        if let Some(src) = all_devices_for_phash
-            .as_deref()
-            .map(Vec::as_slice)
-            .or(distribution_list.as_deref())
-        {
+        // Warm/partial sends pass the complete set in `all_devices_for_phash`,
+        // whose phash memo serves repeat sends with an inline copy; the cold
+        // `force_skdm` path leaves it None and `distribution_list` already
+        // holds the full resolved set.
+        if let Some(resolved) = all_devices_for_phash.as_deref() {
+            phash_for_stanza = resolved.phash(&own_sending_jid);
+        } else if let Some(src) = distribution_list.as_deref() {
             let phash_set = build_group_phash_set(src, &own_sending_jid);
             match MessageUtils::participant_list_hash(&phash_set) {
-                Ok(phash) => phash_for_stanza = Some(phash),
+                Ok(phash) => phash_for_stanza = Some(CompactString::new(&phash)),
                 Err(e) => {
                     log::warn!(
                         "Failed to compute group phash for {}: {:?}",
@@ -324,7 +323,7 @@ pub async fn prepare_group_stanza<
         }
     } else if let Some(ref distribution_list) = distribution_list {
         match MessageUtils::participant_list_hash(distribution_list) {
-            Ok(phash) => phash_for_stanza = Some(phash),
+            Ok(phash) => phash_for_stanza = Some(CompactString::new(&phash)),
             Err(e) => log::warn!("Failed to compute phash for {}: {:?}", to_jid.observe(), e),
         }
     }

@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::{Jid, JidExt as _};
+use wacore_binary::{CompactString, Jid, JidExt as _};
 use wacore_libsignal::crypto::aes_256_cbc_encrypt_into;
 use waproto::whatsapp as wa;
 
@@ -68,6 +68,7 @@ mod dm;
 mod encrypt;
 mod group;
 mod peer;
+mod resolved_devices;
 mod status;
 
 pub use classify::*;
@@ -78,6 +79,7 @@ pub use dm::*;
 pub use encrypt::*;
 pub use group::*;
 pub use peer::*;
+pub use resolved_devices::ResolvedGroupDevices;
 pub use status::*;
 
 #[cfg(test)]
