@@ -303,6 +303,21 @@ impl PrivateKey {
         }
     }
 
+    /// Pre-derives the XEdDSA signing cache (scalar + Edwards point). Clones
+    /// of this key carry the warm cache, so warming once at rest lets every
+    /// later signature skip the basepoint multiplication.
+    pub fn precompute_signing_cache(&self) {
+        let _ = self.get_edwards_cache();
+    }
+
+    /// Test-only visibility into the lazy cache, to pin the warm-clone contract.
+    #[cfg(test)]
+    pub(crate) fn has_warm_signing_cache(&self) -> bool {
+        match &self.key {
+            PrivateKeyData::DjbPrivateKey { edwards_cache, .. } => edwards_cache.get().is_some(),
+        }
+    }
+
     pub fn deserialize(value: &[u8]) -> Result<Self, CurveError> {
         if value.len() != curve25519::PRIVATE_KEY_LENGTH {
             Err(CurveError::BadKeyLength(KeyType::Djb, value.len()))
