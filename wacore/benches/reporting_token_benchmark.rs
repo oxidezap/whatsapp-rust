@@ -51,18 +51,14 @@ fn setup_extended_message() -> wa::Message {
 fn bench_content_extraction_simple(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_simple_message)
-        .bench_values(|msg| {
-            let _ = black_box(generate_reporting_token_content(&msg));
-        });
+        .bench_refs(|msg| black_box(generate_reporting_token_content(msg)));
 }
 
 #[divan::bench]
 fn bench_content_extraction_extended(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_extended_message)
-        .bench_values(|msg| {
-            let _ = black_box(generate_reporting_token_content(&msg));
-        });
+        .bench_refs(|msg| black_box(generate_reporting_token_content(msg)));
 }
 
 // Key derivation benchmark
@@ -117,14 +113,14 @@ fn setup_full_gen_extended() -> FullGenSetup {
 fn bench_full_token_generation_simple(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_full_gen_simple)
-        .bench_values(|data| {
-            let _ = black_box(generate_reporting_token(
+        .bench_refs(|data| {
+            black_box(generate_reporting_token(
                 &data.msg,
                 "STANZA123",
                 &data.sender,
                 &data.remote,
                 Some(&data.secret),
-            ));
+            ))
         });
 }
 
@@ -132,14 +128,14 @@ fn bench_full_token_generation_simple(bencher: divan::Bencher) {
 fn bench_full_token_generation_extended(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_full_gen_extended)
-        .bench_values(|data| {
-            let _ = black_box(generate_reporting_token(
+        .bench_refs(|data| {
+            black_box(generate_reporting_token(
                 &data.msg,
                 "STANZA123",
                 &data.sender,
                 &data.remote,
                 Some(&data.secret),
-            ));
+            ))
         });
 }
 
@@ -148,12 +144,12 @@ fn bench_full_token_generation_extended(bencher: divan::Bencher) {
 fn bench_message_encoding_simple(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_simple_message)
-        .bench_values(|msg| black_box(msg.encode_to_vec()));
+        .bench_refs(|msg| black_box(msg.encode_to_vec()));
 }
 
 #[divan::bench]
 fn bench_message_encoding_extended(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_extended_message)
-        .bench_values(|msg| black_box(msg.encode_to_vec()));
+        .bench_refs(|msg| black_box(msg.encode_to_vec()));
 }

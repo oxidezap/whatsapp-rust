@@ -378,7 +378,7 @@ fn bench_roundtrip_exact_large(bencher: divan::Bencher) {
 fn bench_get_children_by_tag(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_usync_like_node)
-        .bench_values(|node| {
+        .bench_refs(|node| {
             let usync = node.get_optional_child("usync").unwrap();
             let list = usync.get_optional_child("list").unwrap();
 
@@ -411,7 +411,7 @@ fn setup_jid_heavy_marshaled() -> Vec<u8> {
 fn bench_jid_to_owned_access(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_jid_heavy_marshaled)
-        .bench_values(|marshaled| {
+        .bench_refs(|marshaled| {
             // Skip the flag byte at position 0
             let node_ref = unmarshal_ref(&marshaled[1..]).unwrap();
 
@@ -427,5 +427,6 @@ fn bench_jid_to_owned_access(bencher: divan::Bencher) {
             black_box(parser.optional_jid("notify"));
             black_box(parser.optional_string("id"));
             black_box(parser.optional_string("type"));
+            node
         });
 }
