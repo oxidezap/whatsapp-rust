@@ -194,9 +194,12 @@ fn grow_by_observed_ratio(
     } else {
         0
     };
-    // Floor keeps progress guaranteed when the projection is tiny.
+    // Floor at the doubling step: small payloads (protocol nodes) keep their
+    // old growth exactly; the projection only ever grows MORE, for the
+    // high-ratio multi-MB streams it exists for.
+    let min_grow = scratch.capacity().max(4096);
     let want = (projected.min(usize::MAX as u64) as usize)
-        .max(64 * 1024)
+        .max(min_grow)
         .min(cap - scratch.len());
     scratch.reserve(want);
 }
