@@ -32,6 +32,10 @@ FROM chef AS builder
 # does not apply since LTO sees all bitcode anyway.
 ENV RUSTFLAGS="-C target-cpu=native -Zshare-generics=y"
 
+# The dependency cook runs before the source COPY, so make the nightly
+# override explicit in /app instead of relying on rustup walking up to the
+# chef stage's copy at /; the nightly-only RUSTFLAGS above depends on it.
+COPY rust-toolchain.toml .
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
