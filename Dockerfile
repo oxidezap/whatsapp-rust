@@ -25,7 +25,12 @@ RUN cargo chef prepare --recipe-path recipe.json
 # --- Builder: cook deps (cached layer), then compile source ---
 FROM chef AS builder
 
-ENV RUSTFLAGS="-C target-cpu=native"
+# -Zshare-generics reuses upstream monomorphizations instead of re-codegening
+# them per crate, deduplicating most cross-crate generic/coroutine copies
+# (measured: -666 KiB, -5.6% .text). Nightly-only, which this image already
+# pins via rust-toolchain.toml; with fat LTO the historical inlining downside
+# does not apply since LTO sees all bitcode anyway.
+ENV RUSTFLAGS="-C target-cpu=native -Zshare-generics=y"
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
