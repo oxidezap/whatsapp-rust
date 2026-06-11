@@ -115,19 +115,22 @@ impl<'a> InflateReader<'a> {
             self.cursor = 0;
         }
 
-        let mut chunk = [0u8; Self::CHUNK];
         // `decomp` is `Some` for the reader's whole lifetime (only `Drop` takes it),
         // so this is unreachable in practice; surface it as an error rather than panic.
         let decomp = self
             .decomp
             .as_mut()
             .ok_or_else(|| io::Error::other("InflateReader used after pool return"))?;
+        // Inflate straight into the window's spare capacity: a stack chunk +
+        // extend_from_slice would copy every decompressed byte a second time
+        // (~10% of a history-sync extraction).
+        self.buf.reserve(Self::CHUNK);
         let prev_in = decomp.total_in();
         let prev_out = decomp.total_out();
         let status = decomp
-            .decompress(
+            .decompress_vec(
                 &self.input[self.in_pos..],
-                &mut chunk,
+                &mut self.buf,
                 FlushDecompress::None,
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -141,7 +144,6 @@ impl<'a> InflateReader<'a> {
                 format!("decompressed payload exceeds {} bytes", self.max),
             ));
         }
-        self.buf.extend_from_slice(&chunk[..produced]);
 
         match status {
             Status::StreamEnd => {
