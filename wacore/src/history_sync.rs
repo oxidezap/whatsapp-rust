@@ -3390,12 +3390,7 @@ mod tests {
             }
 
             let mut stream = HistorySyncStream::new(&mutated, MAX_DECOMPRESSED);
-            loop {
-                match stream.next_conversation() {
-                    Ok(Some(_)) => continue,
-                    Ok(None) | Err(_) => break,
-                }
-            }
+            while let Ok(Some(_)) = stream.next_conversation() {}
             let _ = stream.remainder();
             let _ = process_history_sync(mutated, None, true);
         }
