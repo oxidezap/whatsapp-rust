@@ -416,8 +416,11 @@ impl Client {
                             info.source.sender.observe()
                         );
                     } else {
-                        log::log!(
-                            decrypt_fail_log_level(decrypt_fail_mode),
+                        // WA Web skips the skmsg silently after a retryable
+                        // pkmsg failure (canDecryptNext in
+                        // WAWebMsgProcessingDecryptionHandler); the pkmsg
+                        // failure itself is already logged and retried.
+                        log::debug!(
                             "Skipping skmsg decryption for message {} from {} because pkmsg failed to decrypt.",
                             info.id,
                             info.source.sender.observe()
@@ -1446,11 +1449,24 @@ impl Client {
         // Release the address lock so the migration loop can acquire it for
         // the matching device without re-entering.
         *session_guard = None;
-        self.migrate_signal_sessions_on_lid_discovery(&pn, &sender_jid.user)
+        let migrated = self
+            .migrate_signal_sessions_on_lid_discovery(&pn, &sender_jid.user)
             .await;
         // Re-acquire for the retry decrypt and hand the guard back to the
         // caller for subsequent payloads in the batch.
         *session_guard = Some(session_mutex.lock_arc().await);
+
+        // Nothing moved namespaces, so the retry would hit the exact same
+        // state, fail identically, and log a second decrypt failure for
+        // every redelivered copy of an undecryptable message.
+        if !migrated {
+            log::debug!(
+                "[msg:{}] No PN state to migrate for {}; skipping migration retry decrypt",
+                info.id,
+                info.source.sender.observe()
+            );
+            return MigrationDecryptOutcome::default();
+        }
 
         match message_decrypt(
             parsed_message,
