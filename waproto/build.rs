@@ -109,42 +109,24 @@ fn generate_tags(
     use heck::{ToShoutySnakeCase, ToSnakeCase};
     use prost_types::DescriptorProto;
 
+    /// prost-parity identifier sanitization (mirror of prost-build's
+    /// `ident::sanitize_identifier` + `to_snake`), so module names always
+    /// match what prost would generate for the same message.
     fn module_ident(name: &str) -> String {
         let snake = name.to_snake_case();
-        // Keep parity with prost's module naming for raw-identifier cases.
-        if matches!(
-            snake.as_str(),
-            "as" | "box"
-                | "break"
-                | "const"
-                | "continue"
-                | "else"
-                | "enum"
-                | "fn"
-                | "for"
-                | "if"
-                | "impl"
-                | "in"
-                | "let"
-                | "loop"
-                | "match"
-                | "mod"
-                | "move"
-                | "mut"
-                | "pub"
-                | "ref"
-                | "return"
-                | "static"
-                | "struct"
-                | "trait"
-                | "type"
-                | "use"
-                | "where"
-                | "while"
-        ) {
-            format!("r#{snake}")
-        } else {
-            snake
+        match snake.as_str() {
+            // Strict and reserved keywords across editions: raw identifier.
+            "as" | "break" | "const" | "continue" | "else" | "enum" | "false" | "fn" | "for"
+            | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move" | "mut" | "pub"
+            | "ref" | "return" | "static" | "struct" | "trait" | "true" | "type" | "unsafe"
+            | "use" | "where" | "while" | "dyn" | "abstract" | "become" | "box" | "do"
+            | "final" | "macro" | "override" | "priv" | "typeof" | "unsized" | "virtual"
+            | "yield" | "async" | "await" | "try" | "gen" => format!("r#{snake}"),
+            // Not usable as raw identifiers: underscore suffix.
+            "_" | "super" | "self" | "crate" | "extern" => format!("{snake}_"),
+            // Digit-leading names get an underscore prefix.
+            other if other.starts_with(|c: char| c.is_numeric()) => format!("_{snake}"),
+            _ => snake,
         }
     }
 
@@ -160,10 +142,18 @@ fn generate_tags(
         }
         let pad = "    ".repeat(indent);
         out.push_str(&format!("{pad}pub mod {} {{\n", module_ident(msg.name())));
+        let mut seen = std::collections::HashSet::new();
         for field in &msg.field {
+            let const_name = field.name().to_shouty_snake_case();
+            // Two field names collapsing to one const (e.g. fooBar/foo_bar)
+            // would emit duplicate consts; fail loudly at generation time.
+            assert!(
+                seen.insert(const_name.clone()),
+                "tags.rs: const name collision `{const_name}` in message `{}`",
+                msg.name()
+            );
             out.push_str(&format!(
-                "{pad}    pub const {}: u32 = {};\n",
-                field.name().to_shouty_snake_case(),
+                "{pad}    pub const {const_name}: u32 = {};\n",
                 field.number()
             ));
         }

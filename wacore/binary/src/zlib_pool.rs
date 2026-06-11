@@ -190,7 +190,7 @@ fn grow_by_observed_ratio(
     let projected = if consumed > 0 && produced > 0 {
         // 9/8 margin: early bytes compress worse than the warmed-up tail, so
         // the observed ratio slightly underestimates the remainder.
-        (produced as u64).saturating_mul(remaining_in) / consumed as u64 * 9 / 8
+        ((produced as u64).saturating_mul(remaining_in) / consumed as u64).saturating_mul(9) / 8
     } else {
         0
     };

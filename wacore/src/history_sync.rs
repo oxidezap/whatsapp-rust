@@ -324,6 +324,13 @@ fn read_varint(data: &[u8]) -> Result<(u64, usize), HistorySyncError> {
     let mut value = (first & 0x7F) as u64;
     let mut shift = 7u32;
     for (i, &byte) in data[1..].iter().enumerate() {
+        // The 10th byte of a 64-bit varint may only carry one bit; prost
+        // rejects the overflow instead of silently truncating it.
+        if shift == 63 && byte > 1 {
+            return Err(HistorySyncError::MalformedProtobuf(
+                "varint overflows 64 bits".into(),
+            ));
+        }
         value |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
             return Ok((value, i + 2));
@@ -992,6 +999,13 @@ impl<'a> Iterator for FieldIter<'a> {
             self.pos = self.data.len();
             return Some(Err(WalkStop::Malformed));
         };
+        // prost decodes the key as u32 and requires field >= 1; mirror both
+        // so malformed keys fail like a failed decode instead of truncating
+        // into a (possibly mirrored) field number.
+        if tag > u64::from(u32::MAX) || (tag >> 3) == 0 {
+            self.pos = self.data.len();
+            return Some(Err(WalkStop::Malformed));
+        }
         self.pos += br;
         let field = (tag >> 3) as u32;
         let wt = (tag & 0x7) as u32;
@@ -2069,6 +2083,38 @@ mod tests {
         let mut raw = Vec::new();
         emit(&mut raw, tags::history_sync_msg::MESSAGE, &web);
         add("repeated ephemeral wrappers (fallback)", raw);
+
+        // prost rejects field number 0, keys above u32 range, and varints
+        // whose 10th byte overflows 64 bits; the fast path must produce the
+        // same no-record outcome instead of skipping or truncating. Each case
+        // carries a valid secret so a lax walk WOULD emit a record.
+        let mut web = Vec::new();
+        emit(&mut web, tags::web_message_info::KEY, &key_a12);
+        emit(&mut web, tags::web_message_info::MESSAGE_SECRET, &secret);
+        web.push(wire_type::LENGTH_DELIMITED as u8); // key with field number 0
+        web.push(0);
+        let mut raw = Vec::new();
+        emit(&mut raw, tags::history_sync_msg::MESSAGE, &web);
+        add("field number zero", raw);
+
+        let mut web = Vec::new();
+        emit(&mut web, tags::web_message_info::KEY, &key_a12);
+        emit(&mut web, tags::web_message_info::MESSAGE_SECRET, &secret);
+        // Key varint above u32 range whose truncated field number is benign.
+        emit_varint(&mut web, (5u64 << 32) | (1000u64 << 3));
+        web.push(0x01);
+        let mut raw = Vec::new();
+        emit(&mut raw, tags::history_sync_msg::MESSAGE, &web);
+        add("key varint above u32 range", raw);
+
+        let mut web = Vec::new();
+        emit(&mut web, tags::web_message_info::KEY, &key_a12);
+        emit(&mut web, tags::web_message_info::MESSAGE_SECRET, &secret);
+        web.push(((tags::web_message_info::MESSAGE_TIMESTAMP << 3) | wire_type::VARINT) as u8);
+        web.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]);
+        let mut raw = Vec::new();
+        emit(&mut raw, tags::history_sync_msg::MESSAGE, &web);
+        add("timestamp varint overflowing 64 bits", raw);
 
         // Nesting beyond the unwrap budget defers to prost's recursion rules
         // (decode fails past prost's limit -> no record; the fast path must
