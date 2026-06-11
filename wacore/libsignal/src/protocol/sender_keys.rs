@@ -229,9 +229,15 @@ impl SenderKeyState {
             let _ = signing_key_memo.set(key);
         }
         let verifying_key_memo = std::sync::OnceLock::new();
-        let _ = verifying_key_memo.set(crate::core::curve::PreparedVerifyingKey::new(
-            &signature_key,
-        ));
+        let verifier = crate::core::curve::PreparedVerifyingKey::new(&signature_key);
+        if signing_key_memo.get().is_none() {
+            // Receive-side state (no private key): this key will verify every
+            // incoming message, so derive the Edwards entries here, at SKDM
+            // processing, once per sender rotation. Send-side states never
+            // verify their own messages and keep the entries cold.
+            verifier.precompute();
+        }
+        let _ = verifying_key_memo.set(verifier);
         Self {
             state,
             signing_key_memo,

@@ -256,8 +256,10 @@ type PreparedEdwards = (EdwardsPoint, [u8; 32]);
 pub struct PreparedVerifyingKey {
     mont: [u8; 32],
     /// Per sign bit; `None` when the key has no Edwards form for that bit
-    /// (such a signature can never verify).
-    cached: [OnceLock<Option<PreparedEdwards>>; 2],
+    /// (such a signature can never verify). Behind an `Arc` so the many
+    /// per-use clones of a memoizing holder share one allocation and one
+    /// warm state, instead of each clone copying (or re-deriving) entries.
+    cached: std::sync::Arc<[OnceLock<Option<PreparedEdwards>>; 2]>,
 }
 
 impl PreparedVerifyingKey {
@@ -265,8 +267,17 @@ impl PreparedVerifyingKey {
         let PublicKeyData::DjbPublicKey(mont) = key.key;
         Self {
             mont,
-            cached: [OnceLock::new(), OnceLock::new()],
+            cached: std::sync::Arc::new([OnceLock::new(), OnceLock::new()]),
         }
+    }
+
+    /// Derives both sign-bit entries now. The signature's sign bit is fixed
+    /// per signer but unknowable from the Montgomery key alone, so a
+    /// receive-side holder warms both once instead of paying the derivation
+    /// inside the first verification.
+    pub fn precompute(&self) {
+        let _ = self.entry(0);
+        let _ = self.entry(1);
     }
 
     fn entry(&self, sign: u8) -> Option<&(EdwardsPoint, [u8; 32])> {
