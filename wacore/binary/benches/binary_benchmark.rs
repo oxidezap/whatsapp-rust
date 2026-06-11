@@ -157,35 +157,35 @@ fn create_many_children_node() -> Node {
 fn bench_marshal_auto_small(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_small_node)
-        .bench_values(|node| black_box(marshal_auto(black_box(&node)).unwrap()));
+        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
 #[divan::bench]
 fn bench_marshal_auto_large(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_large_node)
-        .bench_values(|node| black_box(marshal_auto(black_box(&node)).unwrap()));
+        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
 #[divan::bench]
 fn bench_marshal_auto_long_string(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_long_string_node)
-        .bench_values(|node| black_box(marshal_auto(black_box(&node)).unwrap()));
+        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
 #[divan::bench]
 fn bench_marshal_auto_huge_bytes(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_huge_bytes_node)
-        .bench_values(|node| black_box(marshal_auto(black_box(&node)).unwrap()));
+        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
 #[divan::bench]
 fn bench_marshal_auto_many_children(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_many_children_node)
-        .bench_values(|node| black_box(marshal_auto(black_box(&node)).unwrap()));
+        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
 // Strategy comparison on one shape.
@@ -193,23 +193,23 @@ fn bench_marshal_auto_many_children(bencher: divan::Bencher) {
 fn bench_marshal_plain_large(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_large_node)
-        .bench_values(|node| black_box(marshal(black_box(&node)).unwrap()));
+        .bench_refs(|node| black_box(marshal(black_box(node)).unwrap()));
 }
 
 #[divan::bench]
 fn bench_marshal_exact_large(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_large_node)
-        .bench_values(|node| black_box(marshal_exact(black_box(&node)).unwrap()));
+        .bench_refs(|node| black_box(marshal_exact(black_box(node)).unwrap()));
 }
 
 #[divan::bench]
 fn bench_marshal_to_reused_buffer_large(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| (create_large_node(), Vec::with_capacity(4096)))
-        .bench_values(|(node, mut buffer)| {
-            marshal_to(black_box(&node), &mut buffer).unwrap();
-            black_box(buffer)
+        .bench_refs(|(node, buffer)| {
+            marshal_to(black_box(node), buffer).unwrap();
+            black_box(buffer.len())
         });
 }
 
@@ -227,7 +227,7 @@ fn setup_large_marshaled() -> Vec<u8> {
 fn bench_unmarshal_small(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_small_marshaled)
-        .bench_values(|marshaled| {
+        .bench_refs(|marshaled| {
             black_box(unmarshal_ref(black_box(&marshaled[1..])).unwrap());
         });
 }
@@ -236,7 +236,7 @@ fn bench_unmarshal_small(bencher: divan::Bencher) {
 fn bench_unmarshal_large(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_large_marshaled)
-        .bench_values(|marshaled| {
+        .bench_refs(|marshaled| {
             black_box(unmarshal_ref(black_box(&marshaled[1..])).unwrap());
         });
 }
@@ -264,8 +264,8 @@ fn setup_compressed_payload() -> Vec<u8> {
 fn bench_unpack_uncompressed(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_uncompressed_payload)
-        .bench_values(|payload| {
-            black_box(unpack(black_box(&payload)).unwrap());
+        .bench_refs(|payload| {
+            black_box(unpack(black_box(payload)).unwrap());
         });
 }
 
@@ -273,8 +273,8 @@ fn bench_unpack_uncompressed(bencher: divan::Bencher) {
 fn bench_unpack_compressed(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_compressed_payload)
-        .bench_values(|payload| {
-            black_box(unpack(black_box(&payload)).unwrap());
+        .bench_refs(|payload| {
+            black_box(unpack(black_box(payload)).unwrap());
         });
 }
 
@@ -289,7 +289,7 @@ fn setup_attr_marshaled() -> Vec<u8> {
 fn bench_attr_parser(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_attr_marshaled)
-        .bench_values(|marshaled| {
+        .bench_refs(|marshaled| {
             // Skip the flag byte at position 0
             let node_ref = unmarshal_ref(&marshaled[1..]).unwrap();
 
@@ -309,7 +309,7 @@ fn bench_attr_parser(bencher: divan::Bencher) {
 fn bench_roundtrip_small(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_small_marshaled)
-        .bench_values(|marshaled| {
+        .bench_refs(|marshaled| {
             // Skip the flag byte at position 0
             let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
             black_box(marshal_ref(&node_ref).unwrap())
@@ -320,7 +320,7 @@ fn bench_roundtrip_small(bencher: divan::Bencher) {
 fn bench_roundtrip_large(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_large_marshaled)
-        .bench_values(|marshaled| {
+        .bench_refs(|marshaled| {
             // Skip the flag byte at position 0
             let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
             black_box(marshal_ref(&node_ref).unwrap())
@@ -331,7 +331,7 @@ fn bench_roundtrip_large(bencher: divan::Bencher) {
 fn bench_roundtrip_auto_small(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_small_marshaled)
-        .bench_values(|marshaled| {
+        .bench_refs(|marshaled| {
             // Skip the flag byte at position 0
             let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
             black_box(marshal_ref_auto(&node_ref).unwrap())
@@ -342,7 +342,7 @@ fn bench_roundtrip_auto_small(bencher: divan::Bencher) {
 fn bench_roundtrip_auto_large(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_large_marshaled)
-        .bench_values(|marshaled| {
+        .bench_refs(|marshaled| {
             // Skip the flag byte at position 0
             let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
             black_box(marshal_ref_auto(&node_ref).unwrap())
@@ -353,7 +353,7 @@ fn bench_roundtrip_auto_large(bencher: divan::Bencher) {
 fn bench_roundtrip_exact_small(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_small_marshaled)
-        .bench_values(|marshaled| {
+        .bench_refs(|marshaled| {
             // Skip the flag byte at position 0
             let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
             black_box(marshal_ref_exact(&node_ref).unwrap())
@@ -364,7 +364,7 @@ fn bench_roundtrip_exact_small(bencher: divan::Bencher) {
 fn bench_roundtrip_exact_large(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_large_marshaled)
-        .bench_values(|marshaled| {
+        .bench_refs(|marshaled| {
             // Skip the flag byte at position 0
             let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
             black_box(marshal_ref_exact(&node_ref).unwrap())

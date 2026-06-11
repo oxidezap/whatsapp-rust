@@ -13,6 +13,21 @@ fn main() {
     divan::main();
 }
 
+/// Deterministic xorshift-based filler: real chat text compresses ~2-4x;
+/// repeated literal filler compressed ~24x and masked the inflate cost.
+fn pseudo_text(mut seed: u64, len: usize) -> String {
+    seed = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).max(1);
+    let mut out = String::with_capacity(len + 17);
+    while out.len() < len {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        out.push_str(&format!("{seed:016x} "));
+    }
+    out.truncate(len);
+    out
+}
+
 fn build_realistic_history_sync(n_convos: usize, msgs_per_convo: usize) -> Vec<u8> {
     let mut conversations = Vec::with_capacity(n_convos);
     for c in 0..n_convos {
@@ -24,16 +39,13 @@ fn build_realistic_history_sync(n_convos: usize, msgs_per_convo: usize) -> Vec<u
             // 2-byte length varints, matching real chat history.
             let inner = if m % 3 == 0 {
                 wa::Message {
-                    conversation: Some(format!(
-                        "Mensagem de teste numero {m} no chat {c} com um pouco mais de texto \
-                         para variar o tamanho do campo e gerar varints de 2 bytes ocasionais."
-                    )),
+                    conversation: Some(pseudo_text((c * 41 + m) as u64, 130)),
                     ..Default::default()
                 }
             } else {
                 wa::Message {
                     extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
-                        text: Some(format!("Texto estendido curto {m}")),
+                        text: Some(pseudo_text((c * 43 + m) as u64, 24)),
                         context_info: Some(Box::new(wa::ContextInfo {
                             is_forwarded: Some(m % 4 == 0),
                             forwarding_score: Some((m % 7) as u32),
@@ -91,13 +103,14 @@ fn bench_process_history_sync(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_history_sync_blob)
         .bench_values(|blob| {
-            // retain_blob = true exercises the full-buffer path: count pass +
-            // main loop + per-conversation scan, the maximum varint volume.
-            let _ = black_box(wacore::history_sync::process_history_sync(
+            // retain_blob = true exercises the full-buffer path. The result
+            // (records + retained blob) is returned so the harness drops it
+            // outside the measured window, like a consumer would later.
+            black_box(wacore::history_sync::process_history_sync(
                 black_box(blob),
                 None,
                 true,
                 None,
-            ));
+            ))
         });
 }

@@ -26,7 +26,7 @@ fn bench_jid_to_string(bencher: divan::Bencher) {
             jid.device = 7;
             jid
         })
-        .bench_values(|jid| black_box(jid.to_string()));
+        .bench_refs(|jid| black_box(jid.to_string()));
 }
 
 #[divan::bench]
@@ -37,7 +37,7 @@ fn bench_jid_to_non_ad_string(bencher: divan::Bencher) {
             jid.device = 3;
             jid
         })
-        .bench_values(|jid| black_box(jid.to_non_ad_string()));
+        .bench_refs(|jid| black_box(jid.to_non_ad_string()));
 }
 
 /// The per-recipient fan-out formatter: writes the AD form into a reused
@@ -50,8 +50,8 @@ fn bench_jid_push_ad_to(bencher: divan::Bencher) {
             jid.device = 7;
             (jid, String::with_capacity(64))
         })
-        .bench_values(|(jid, mut buf)| {
-            jid.push_ad_to(&mut buf);
-            black_box(buf)
+        .bench_refs(|(jid, buf)| {
+            jid.push_ad_to(buf);
+            black_box(buf.len())
         });
 }

@@ -19,9 +19,9 @@ fn frame(len: usize) -> Vec<u8> {
 fn bench_frame_encrypt_in_place(bencher: divan::Bencher, len: usize) {
     bencher
         .with_inputs(|| (NoiseCipher::new(&KEY).unwrap(), frame(len)))
-        .bench_values(|(cipher, mut buf)| {
-            cipher.encrypt_in_place_with_counter(7, &mut buf).unwrap();
-            black_box(buf)
+        .bench_refs(|(cipher, buf)| {
+            cipher.encrypt_in_place_with_counter(7, buf).unwrap();
+            black_box(buf.len())
         });
 }
 
@@ -34,8 +34,8 @@ fn bench_frame_decrypt_in_place(bencher: divan::Bencher, len: usize) {
             cipher.encrypt_in_place_with_counter(7, &mut buf).unwrap();
             (cipher, buf)
         })
-        .bench_values(|(cipher, mut buf)| {
-            cipher.decrypt_in_place_with_counter(7, &mut buf).unwrap();
-            black_box(buf)
+        .bench_refs(|(cipher, buf)| {
+            cipher.decrypt_in_place_with_counter(7, buf).unwrap();
+            black_box(buf.len())
         });
 }

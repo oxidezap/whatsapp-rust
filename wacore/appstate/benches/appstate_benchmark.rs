@@ -31,9 +31,9 @@ fn bench_lthash_subtract_then_add_812(bencher: divan::Bencher) {
                 .collect();
             (base, macs)
         })
-        .bench_values(|(base, macs)| {
+        .bench_refs(|(base, macs)| {
             const EMPTY: &[Vec<u8>] = &[];
-            black_box(WAPATCH_INTEGRITY.subtract_then_add(black_box(&base), EMPTY, &macs))
+            black_box(WAPATCH_INTEGRITY.subtract_then_add(black_box(&*base), EMPTY, macs))
         });
 }
 
@@ -124,7 +124,7 @@ fn setup_patch(n: usize) -> PatchFixture {
 fn bench_process_patch_50_validated(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| setup_patch(50))
-        .bench_values(|fixture| {
+        .bench_refs(|fixture| {
             let keys = Arc::clone(&fixture.keys);
             let mut state = HashState::default();
             black_box(

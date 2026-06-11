@@ -431,8 +431,8 @@ fn setup_group_with_distribution() -> (User, User, SenderKeyName) {
 
 #[divan::bench]
 fn bench_dm_session_establishment(bencher: divan::Bencher) {
-    bencher.with_inputs(setup_dm_users).bench_values(|data| {
-        let (mut alice, bob) = data;
+    bencher.with_inputs(setup_dm_users).bench_refs(|data| {
+        let (alice, bob) = data;
         let bob_bundle = bob.get_prekey_bundle();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
@@ -455,8 +455,8 @@ fn bench_dm_session_establishment(bencher: divan::Bencher) {
 
 #[divan::bench]
 fn bench_dm_encrypt_first_message(bencher: divan::Bencher) {
-    bencher.with_inputs(setup_dm_session).bench_values(|data| {
-        let (mut alice, bob) = data;
+    bencher.with_inputs(setup_dm_session).bench_refs(|data| {
+        let (alice, bob) = data;
         let plaintext = b"Hello Bob! This is the first message.";
 
         let ciphertext = futures::executor::block_on(async {
@@ -478,8 +478,8 @@ fn bench_dm_encrypt_first_message(bencher: divan::Bencher) {
 fn bench_dm_decrypt_first_message(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_dm_with_first_message)
-        .bench_values(|data| {
-            let (alice, mut bob, ciphertext_bytes) = data;
+        .bench_refs(|data| {
+            let (alice, bob, ciphertext_bytes) = data;
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
             let plaintext = futures::executor::block_on(async {
@@ -511,8 +511,8 @@ fn bench_dm_decrypt_first_message(bencher: divan::Bencher) {
 fn bench_dm_encrypt_subsequent_message(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_established_dm_session)
-        .bench_values(|data| {
-            let (mut alice, bob) = data;
+        .bench_refs(|data| {
+            let (alice, bob) = data;
             let plaintext = b"This is a follow-up message after session is established.";
 
             let ciphertext = futures::executor::block_on(async {
@@ -532,39 +532,37 @@ fn bench_dm_encrypt_subsequent_message(bencher: divan::Bencher) {
 
 #[divan::bench]
 fn bench_group_create_distribution_message(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_group_sender)
-        .bench_values(|data| {
-            let (mut alice, sender_key_name) = data;
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    bencher.with_inputs(setup_group_sender).bench_refs(|data| {
+        let (alice, sender_key_name) = data;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
-            let skdm = futures::executor::block_on(async {
-                create_sender_key_distribution_message(
-                    &sender_key_name,
-                    &mut alice.sender_key_store,
-                    &mut rng,
-                )
-                .await
-                .expect("skdm")
-            });
-
-            black_box(skdm);
+        let skdm = futures::executor::block_on(async {
+            create_sender_key_distribution_message(
+                sender_key_name,
+                &mut alice.sender_key_store,
+                &mut rng,
+            )
+            .await
+            .expect("skdm")
         });
+
+        black_box(skdm);
+    });
 }
 
 #[divan::bench]
 fn bench_group_encrypt_message(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_group_with_distribution)
-        .bench_values(|data| {
-            let (mut alice, _bob, sender_key_name) = data;
+        .bench_refs(|data| {
+            let (alice, _bob, sender_key_name) = data;
             let plaintext = b"Hello group! This is a group message from Alice.";
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
             let ciphertext = futures::executor::block_on(async {
                 group_encrypt(
                     &mut alice.sender_key_store,
-                    &sender_key_name,
+                    sender_key_name,
                     plaintext,
                     &mut rng,
                 )
@@ -599,8 +597,8 @@ fn setup_group_with_encrypted_message() -> (User, User, SenderKeyName, Vec<u8>) 
 fn bench_group_decrypt_message(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_group_with_encrypted_message)
-        .bench_values(|data| {
-            let (alice, mut bob, sender_key_name, ciphertext) = data;
+        .bench_refs(|data| {
+            let (alice, bob, sender_key_name, ciphertext) = data;
 
             let bob_sender_key_name = SenderKeyName::new(
                 sender_key_name.group_id().to_string(),
@@ -608,7 +606,7 @@ fn bench_group_decrypt_message(bencher: divan::Bencher) {
             );
 
             let plaintext = futures::executor::block_on(async {
-                group_decrypt(&ciphertext, &mut bob.sender_key_store, &bob_sender_key_name)
+                group_decrypt(ciphertext, &mut bob.sender_key_store, &bob_sender_key_name)
                     .await
                     .expect("group decrypt")
             });
@@ -625,8 +623,8 @@ fn setup_conversation_data() -> (User, User) {
 fn bench_full_dm_conversation(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_conversation_data)
-        .bench_values(|data| {
-            let (mut alice, mut bob) = data;
+        .bench_refs(|data| {
+            let (alice, bob) = data;
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
             futures::executor::block_on(async {
@@ -737,14 +735,14 @@ fn setup_keypair_with_message() -> (KeyPair, [u8; 64]) {
 fn bench_signature_creation(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_keypair_with_message)
-        .bench_values(|data| {
+        .bench_refs(|data| {
             let (keypair, message) = data;
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
             // Sign multiple times to amortize any setup overhead
             for _ in 0..10 {
                 let signature = keypair
-                    .calculate_signature(&message, &mut rng)
+                    .calculate_signature(&message[..], &mut rng)
                     .expect("signature");
                 black_box(signature);
             }
@@ -756,16 +754,18 @@ fn bench_signature_creation(bencher: divan::Bencher) {
 fn bench_signature_verification(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_keypair_with_message)
-        .bench_values(|data| {
+        .bench_refs(|data| {
             let (keypair, message) = data;
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
             let signature = keypair
-                .calculate_signature(&message, &mut rng)
+                .calculate_signature(&message[..], &mut rng)
                 .expect("signature");
 
             // Verify multiple times
             for _ in 0..10 {
-                let valid = keypair.public_key.verify_signature(&message, &signature);
+                let valid = keypair
+                    .public_key
+                    .verify_signature(&message[..], &signature);
                 black_box(valid);
             }
         });
@@ -911,8 +911,8 @@ fn setup_with_archived_sessions() -> (User, User, Vec<Vec<u8>>) {
 fn bench_decrypt_with_previous_session(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_with_archived_sessions)
-        .bench_values(|data| {
-            let (alice, mut bob, ciphertexts) = data;
+        .bench_refs(|data| {
+            let (alice, bob, ciphertexts) = data;
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
             // Try to decrypt an old message (encrypted with a previous session)
@@ -1027,8 +1027,8 @@ fn setup_out_of_order_messages() -> (User, User, Vec<Vec<u8>>) {
 fn bench_out_of_order_decryption(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_out_of_order_messages)
-        .bench_values(|data| {
-            let (alice, mut bob, messages) = data;
+        .bench_refs(|data| {
+            let (alice, bob, messages) = data;
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
             futures::executor::block_on(async {
@@ -1178,8 +1178,8 @@ fn setup_promote_matching_session() -> (User, User, Vec<u8>) {
 fn bench_promote_matching_session(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_promote_matching_session)
-        .bench_values(|data| {
-            let (alice, mut bob, prekey_message) = data;
+        .bench_refs(|data| {
+            let (alice, bob, prekey_message) = data;
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
             futures::executor::block_on(async {
@@ -1269,8 +1269,8 @@ fn setup_message_key_eviction() -> (SessionState, wacore_libsignal::protocol::Pu
 fn bench_message_key_eviction(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_message_key_eviction)
-        .bench_values(|data| {
-            let (mut state, sender_key) = data;
+        .bench_refs(|data| {
+            let (state, sender_key) = data;
             let start_counter = (consts::MAX_MESSAGE_KEYS - 1) as u32;
 
             // Insert 200 keys beyond capacity - this will trigger eviction cycles
@@ -1278,7 +1278,7 @@ fn bench_message_key_eviction(bencher: divan::Bencher) {
             for i in 0..200u32 {
                 let counter = start_counter + i;
                 let keys = create_test_message_key_generator(counter);
-                state.set_message_keys(&sender_key, keys).unwrap();
+                state.set_message_keys(sender_key, keys).unwrap();
             }
 
             black_box(state);

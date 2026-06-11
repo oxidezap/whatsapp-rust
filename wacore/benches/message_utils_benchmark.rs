@@ -28,8 +28,8 @@ fn setup_device_list(users: usize, devices_per_user: u16) -> Vec<Jid> {
 fn bench_participant_list_hash_1600(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| setup_device_list(800, 2))
-        .bench_values(|devices| {
-            black_box(MessageUtils::participant_list_hash(black_box(&devices)).unwrap())
+        .bench_refs(|devices| {
+            black_box(MessageUtils::participant_list_hash(black_box(&**devices)).unwrap())
         });
 }
 
@@ -54,7 +54,7 @@ fn text_message() -> wa::Message {
 fn bench_encode_and_pad(bencher: divan::Bencher) {
     bencher
         .with_inputs(text_message)
-        .bench_values(|msg| black_box(MessageUtils::encode_and_pad(black_box(&msg))));
+        .bench_refs(|msg| black_box(MessageUtils::encode_and_pad(black_box(msg))));
 }
 
 /// Unpad of a received plaintext: runs once per decrypted message.
@@ -65,9 +65,9 @@ fn bench_unpad_message_ref(bencher: divan::Bencher) {
             use prost::Message as _;
             MessageUtils::pad_message_v2(text_message().encode_to_vec())
         })
-        .bench_values(|padded| {
+        .bench_refs(|padded| {
             black_box(
-                MessageUtils::unpad_message_ref(black_box(&padded), 2)
+                MessageUtils::unpad_message_ref(black_box(padded), 2)
                     .unwrap()
                     .len(),
             )
