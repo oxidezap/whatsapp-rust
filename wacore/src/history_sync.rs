@@ -1847,7 +1847,7 @@ mod tests {
                 "A3",
                 false,
                 Some(wa::Message {
-                    message_context_info: Some(secret_ctx(&secret)),
+                    message_context_info: Some(Box::new(secret_ctx(&secret))),
                     ..Default::default()
                 }),
             )),
@@ -1856,7 +1856,7 @@ mod tests {
             "A4",
             false,
             Some(wa::Message {
-                message_context_info: Some(secret_ctx(&[0xBB; 32])),
+                message_context_info: Some(Box::new(secret_ctx(&[0xBB; 32]))),
                 ..Default::default()
             }),
         );
@@ -1877,7 +1877,7 @@ mod tests {
                             })),
                             ..Default::default()
                         })),
-                        message_context_info: Some(secret_ctx(&secret)),
+                        message_context_info: Some(Box::new(secret_ctx(&secret))),
                         ..Default::default()
                     }),
                 )),
@@ -1917,7 +1917,7 @@ mod tests {
                         })),
                         ..Default::default()
                     })),
-                    message_context_info: Some(secret_ctx(&secret)),
+                    message_context_info: Some(Box::new(secret_ctx(&secret))),
                     ..Default::default()
                 }),
             )),
@@ -1953,11 +1953,11 @@ mod tests {
                 "A9",
                 false,
                 Some(wa::Message {
-                    message_context_info: Some(wa::MessageContextInfo {
+                    message_context_info: Some(Box::new(wa::MessageContextInfo {
                         message_secret: Some(secret.clone()),
                         bot_metadata: Some(wa::BotMetadata::default()),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }),
             )),
@@ -1968,10 +1968,10 @@ mod tests {
                 false,
                 Some(wa::Message {
                     ephemeral_message: Some(fp(wa::Message {
-                        message_context_info: Some(wa::MessageContextInfo {
+                        message_context_info: Some(Box::new(wa::MessageContextInfo {
                             bot_metadata: Some(wa::BotMetadata::default()),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     })),
                     ..Default::default()
@@ -1992,7 +1992,7 @@ mod tests {
                         )),
                         ..Default::default()
                     })),
-                    message_context_info: Some(secret_ctx(&secret)),
+                    message_context_info: Some(Box::new(secret_ctx(&secret))),
                     ..Default::default()
                 }),
             )),
@@ -2046,7 +2046,7 @@ mod tests {
         }
         .encode_to_vec();
         let msg_secret = wa::Message {
-            message_context_info: Some(secret_ctx(&secret)),
+            message_context_info: Some(Box::new(secret_ctx(&secret))),
             ..Default::default()
         }
         .encode_to_vec();
@@ -2367,10 +2367,10 @@ mod tests {
         }
         .encode_to_vec();
         let msg_with_secret = wa::Message {
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_secret: Some(vec![0x11u8; 32]),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         }
         .encode_to_vec();
@@ -2553,10 +2553,10 @@ mod tests {
                                 participant: None,
                             },
                             message: Some(Box::new(wa::Message {
-                                message_context_info: Some(wa::MessageContextInfo {
+                                message_context_info: Some(Box::new(wa::MessageContextInfo {
                                     message_secret: Some(context_secret.clone()),
                                     ..Default::default()
-                                }),
+                                })),
                                 ..Default::default()
                             })),
                             ..Default::default()
@@ -2613,10 +2613,10 @@ mod tests {
                         },
                         message_secret: Some(top_level_secret.clone()),
                         message: Some(Box::new(wa::Message {
-                            message_context_info: Some(wa::MessageContextInfo {
+                            message_context_info: Some(Box::new(wa::MessageContextInfo {
                                 message_secret: Some(context_secret.clone()),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         })),
                         ..Default::default()
@@ -2670,10 +2670,10 @@ mod tests {
                                     ..Default::default()
                                 },
                             )),
-                            message_context_info: Some(wa::MessageContextInfo {
+                            message_context_info: Some(Box::new(wa::MessageContextInfo {
                                 message_secret: Some(vec![0x66u8; 32]),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         })),
                         ..Default::default()
@@ -2731,10 +2731,10 @@ mod tests {
                                     ..Default::default()
                                 })),
                             })),
-                            message_context_info: Some(wa::MessageContextInfo {
+                            message_context_info: Some(Box::new(wa::MessageContextInfo {
                                 message_secret: Some(vec![0x77u8; 32]),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
                         })),
                         ..Default::default()

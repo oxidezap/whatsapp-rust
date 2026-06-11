@@ -378,7 +378,7 @@ pub fn unwrap_device_sent(mut msg: wa::Message) -> wa::Message {
         if let Some(mut inner) = dsm.message.take() {
             inner.message_context_info = crate::proto_helpers::merge_dsm_context(
                 inner.message_context_info.take(),
-                msg.message_context_info.as_ref(),
+                msg.message_context_info.as_deref(),
             );
             return *inner;
         }
@@ -1075,10 +1075,10 @@ mod device_sent_tests {
     fn msg_with_secret(secret: &[u8]) -> wa::Message {
         wa::Message {
             conversation: Some("hi".into()),
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_secret: Some(secret.to_vec()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         }
     }
@@ -1120,10 +1120,10 @@ mod device_sent_tests {
     #[test]
     fn wrap_then_unwrap_preserves_non_secret_context_fields() {
         let inner = wa::Message {
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_add_on_duration_in_secs: Some(604800),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         let unwrapped = unwrap_device_sent(wrap_device_sent(inner, "1@s.whatsapp.net".into()));
@@ -1217,10 +1217,10 @@ mod device_sent_tests {
                     })),
                     ..Default::default()
                 })),
-                message_context_info: Some(wa::MessageContextInfo {
+                message_context_info: Some(Box::new(wa::MessageContextInfo {
                     message_secret: Some(vec![1, 2, 3, 4]),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             },
             dest,
@@ -1244,10 +1244,10 @@ mod device_sent_tests {
         // mci-only (no content body)
         assert_splice_matches(
             wa::Message {
-                message_context_info: Some(wa::MessageContextInfo {
+                message_context_info: Some(Box::new(wa::MessageContextInfo {
                     message_secret: Some(vec![7u8; 32]),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             },
             dest,
@@ -1291,7 +1291,7 @@ mod device_sent_tests {
         );
 
         let outer_mci = wa::Message {
-            message_context_info: Some(wa::MessageContextInfo::default()),
+            message_context_info: Some(Box::default()),
             ..Default::default()
         };
         assert_eq!(
@@ -1332,13 +1332,13 @@ mod device_sent_tests {
             },
             wa::Message {
                 conversation: Some("poll".into()),
-                message_context_info: Some(wa::MessageContextInfo {
+                message_context_info: Some(Box::new(wa::MessageContextInfo {
                     // preserved by the merge
                     message_add_on_duration_in_secs: Some(604800),
                     // overwritten by the reporting context
                     message_secret: Some(vec![1u8; 32]),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             },
         ]

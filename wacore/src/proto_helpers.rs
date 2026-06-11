@@ -642,9 +642,9 @@ pub(crate) fn strip_nested_context_info(msg: &mut wa::Message, always_clear_quot
 /// - **`thread_id`**: inner if non-empty, otherwise outer
 /// - **`bot_metadata`**: inner, falling back to outer
 pub fn merge_dsm_context(
-    inner: Option<wa::MessageContextInfo>,
+    inner: Option<Box<wa::MessageContextInfo>>,
     outer: Option<&wa::MessageContextInfo>,
-) -> Option<wa::MessageContextInfo> {
+) -> Option<Box<wa::MessageContextInfo>> {
     match (inner, outer) {
         (None, None) => None,
         (Some(mut inner), None) => {
@@ -654,7 +654,7 @@ pub fn merge_dsm_context(
         }
         // Inner was cleared by a WA-Web-style hoist; restore the full context the
         // sender moved to the outer message, not just the merge subset.
-        (None, Some(outer)) => Some(outer.clone()),
+        (None, Some(outer)) => Some(Box::new(outer.clone())),
         (Some(mut inner), Some(outer)) => {
             if inner.message_secret.is_none() {
                 inner.message_secret = outer.message_secret.clone();
@@ -1694,7 +1694,7 @@ mod tests {
             message_secret: Some(vec![1, 2, 3]),
             ..Default::default()
         };
-        let result = merge_dsm_context(Some(inner.clone()), None).unwrap();
+        let result = merge_dsm_context(Some(Box::new(inner.clone())), None).unwrap();
         assert_eq!(result.message_secret, Some(vec![1, 2, 3]));
     }
 
@@ -1741,7 +1741,7 @@ mod tests {
             message_secret: Some(vec![4, 5, 6]),
             ..Default::default()
         };
-        let result = merge_dsm_context(Some(inner), Some(&outer)).unwrap();
+        let result = merge_dsm_context(Some(Box::new(inner)), Some(&outer)).unwrap();
         assert_eq!(
             result.message_secret,
             Some(vec![1, 2, 3]),
@@ -1759,7 +1759,7 @@ mod tests {
             message_secret: Some(vec![4, 5, 6]),
             ..Default::default()
         };
-        let result = merge_dsm_context(Some(inner), Some(&outer)).unwrap();
+        let result = merge_dsm_context(Some(Box::new(inner)), Some(&outer)).unwrap();
         assert_eq!(
             result.message_secret,
             Some(vec![4, 5, 6]),
@@ -1783,7 +1783,7 @@ mod tests {
             limit_sharing_v2: Some(outer_ls),
             ..Default::default()
         };
-        let result = merge_dsm_context(Some(inner), Some(&outer)).unwrap();
+        let result = merge_dsm_context(Some(Box::new(inner)), Some(&outer)).unwrap();
         assert_eq!(
             result.limit_sharing_v2,
             Some(outer_ls),
@@ -1795,7 +1795,7 @@ mod tests {
             limit_sharing_v2: Some(wa::LimitSharing::default()),
             ..Default::default()
         };
-        let result = merge_dsm_context(Some(inner_with_ls), None).unwrap();
+        let result = merge_dsm_context(Some(Box::new(inner_with_ls)), None).unwrap();
         assert_eq!(
             result.limit_sharing_v2, None,
             "limit_sharing_v2 should be cleared when outer is None"
@@ -1810,7 +1810,7 @@ mod tests {
         };
         // Inner has empty thread_id → should fall back to outer
         let inner_empty = wa::MessageContextInfo::default();
-        let result = merge_dsm_context(Some(inner_empty), Some(&outer)).unwrap();
+        let result = merge_dsm_context(Some(Box::new(inner_empty)), Some(&outer)).unwrap();
         assert_eq!(
             result.thread_id.len(),
             1,
@@ -1822,7 +1822,7 @@ mod tests {
             thread_id: vec![wa::ThreadId::default(), wa::ThreadId::default()],
             ..Default::default()
         };
-        let result = merge_dsm_context(Some(inner_filled), Some(&outer)).unwrap();
+        let result = merge_dsm_context(Some(Box::new(inner_filled)), Some(&outer)).unwrap();
         assert_eq!(
             result.thread_id.len(),
             2,
@@ -2031,10 +2031,10 @@ mod tests {
                 url: Some("https://mmg.whatsapp.net/vid".to_string()),
                 ..Default::default()
             })),
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_secret: Some(secret.clone()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
 

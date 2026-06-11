@@ -425,10 +425,10 @@ fn build_secret_message_edit(
             ),
             remote_key_id: None,
         }),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(message_secret.to_vec()),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     })
 }

@@ -1265,10 +1265,10 @@ impl Client {
                 r#type: Some(pin_type as i32),
                 sender_timestamp_ms: Some(wacore::time::now_millis()),
             }),
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_add_on_duration_in_secs: Some(duration_secs),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
 

@@ -4195,7 +4195,7 @@ fn test_is_sender_key_distribution_only() {
     // SKDM + message_context_info → still true (context_info is metadata)
     assert!(is_sender_key_distribution_only(&mut wa::Message {
         sender_key_distribution_message: Some(skdm.clone()),
-        message_context_info: Some(wa::MessageContextInfo::default()),
+        message_context_info: Some(Box::default()),
         ..Default::default()
     }));
 
@@ -4235,10 +4235,10 @@ fn skdm_only_detection_restores_carrier_fields() {
                 axolotl_sender_key_distribution_message: Some(vec![4, 5, 6]),
             },
         ),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![9, 8, 7]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
 
@@ -4344,20 +4344,20 @@ fn test_unwrap_device_sent_passthrough() {
 fn test_unwrap_device_sent_merges_context_info() {
     let wrapped = wa::Message {
         // Outer message_context_info (from the DSM envelope)
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![10, 20, 30]),
             limit_sharing_v2: Some(wa::LimitSharing::default()),
             ..Default::default()
-        }),
+        })),
         device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
             destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
             message: Some(Box::new(wa::Message {
                 conversation: Some("hello".to_string()),
                 // Inner has its own message_secret but no limit_sharing_v2
-                message_context_info: Some(wa::MessageContextInfo {
+                message_context_info: Some(Box::new(wa::MessageContextInfo {
                     message_secret: Some(vec![1, 2, 3]),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             })),
             phash: None,
@@ -4383,10 +4383,10 @@ fn test_unwrap_device_sent_merges_context_info() {
 #[test]
 fn test_unwrap_device_sent_secret_fallback() {
     let wrapped = wa::Message {
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![10, 20, 30]),
             ..Default::default()
-        }),
+        })),
         device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
             destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
             message: Some(Box::new(wa::Message {
@@ -7330,9 +7330,11 @@ fn inner_message_edit(text: &str, next_secret: Option<Vec<u8>>) -> wa::Message {
             timestamp_ms: Some(1_770_000_000_000),
             ..Default::default()
         })),
-        message_context_info: next_secret.map(|secret| wa::MessageContextInfo {
-            message_secret: Some(secret),
-            ..Default::default()
+        message_context_info: next_secret.map(|secret| {
+            Box::new(wa::MessageContextInfo {
+                message_secret: Some(secret),
+                ..Default::default()
+            })
         }),
         ..Default::default()
     }
@@ -8646,10 +8648,10 @@ async fn maybe_capture_inbound_msg_secret_persists_for_bot_chats() {
     });
     let msg = wa::Message {
         conversation: Some("hi bot".into()),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0xAB; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -8686,10 +8688,10 @@ async fn maybe_capture_inbound_msg_secret_persists_for_non_bot_chats() {
     });
     let msg = wa::Message {
         conversation: Some("hi".into()),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0xCD; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -8743,10 +8745,10 @@ async fn maybe_capture_inbound_msg_secret_persists_for_group_with_bot_mention() 
             })),
             ..Default::default()
         })),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0xEE; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -8801,10 +8803,10 @@ async fn maybe_capture_inbound_msg_secret_skips_forwarded() {
             })),
             ..Default::default()
         })),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0xFF; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -8856,14 +8858,14 @@ async fn maybe_capture_inbound_msg_secret_via_bot_metadata_without_mention() {
             // No mention at all — just bot_metadata signals the invocation.
             ..Default::default()
         })),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0x7B; 32]),
             bot_metadata: Some(wa::BotMetadata {
                 persona_id: Some("867051314767696".into()),
                 ..Default::default()
             }),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -8918,10 +8920,10 @@ async fn bot_only_captures_group_bot_prompt_skips_plain() {
     });
     let plain_msg = wa::Message {
         conversation: Some("hi".into()),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0x01; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client
@@ -8956,14 +8958,14 @@ async fn bot_only_captures_group_bot_prompt_skips_plain() {
             text: Some("continue".into()),
             ..Default::default()
         })),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0x02; 32]),
             bot_metadata: Some(wa::BotMetadata {
                 persona_id: Some("867051314767696".into()),
                 ..Default::default()
             }),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client
@@ -9009,10 +9011,10 @@ async fn maybe_capture_inbound_msg_secret_keys_under_other_participant() {
             })),
             ..Default::default()
         })),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0x5A; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -9369,10 +9371,10 @@ async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
     });
     let fanout_msg = wa::Message {
         conversation: Some("hi bot".into()),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(secret.to_vec()),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client
@@ -9780,7 +9782,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
         })),
         // Present but secret-less: the outer secret must merge in, not be
         // dropped because a context already exists.
-        message_context_info: Some(wa::MessageContextInfo::default()),
+        message_context_info: Some(Box::default()),
         ..Default::default()
     };
     let (payload, iv) = wacore::comment::encrypt_comment_with_secret(
@@ -9805,10 +9807,10 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
         }),
         // WA Web ships the comment's own secret on the OUTER envelope (the
         // comment msgData), not inside the encrypted body.
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(comment_secret.to_vec()),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     let info = Arc::new(MessageInfo {
@@ -9912,10 +9914,10 @@ async fn addon_decrypts_right_after_capture_without_flush() {
 
     let parent_msg = wa::Message {
         conversation: Some("hello".to_string()),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(secret.to_vec()),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     let mk_info = |id: &str| {

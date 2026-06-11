@@ -979,12 +979,14 @@ mod tests {
         ts_secs: u64,
         bot_prompt: bool,
     ) -> wa::HistorySyncMsg {
-        let message_context_info = bot_prompt.then(|| wa::MessageContextInfo {
-            bot_metadata: Some(wa::BotMetadata {
-                persona_id: Some("867051314767696".into()),
+        let message_context_info = bot_prompt.then(|| {
+            Box::new(wa::MessageContextInfo {
+                bot_metadata: Some(wa::BotMetadata {
+                    persona_id: Some("867051314767696".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
+            })
         });
         wa::HistorySyncMsg {
             message: Some(Box::new(wa::WebMessageInfo {

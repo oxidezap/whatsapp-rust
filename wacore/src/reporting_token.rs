@@ -649,10 +649,10 @@ mod tests {
         let secret = [0x42u8; MESSAGE_SECRET_SIZE];
         let msg = wa::Message {
             conversation: Some("hi".into()),
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_secret: Some(secret.to_vec()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         let to: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
@@ -966,10 +966,10 @@ mod tests {
     fn test_extract_message_secret() {
         let secret = vec![0x55u8; MESSAGE_SECRET_SIZE];
         let message = wa::Message {
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_secret: Some(secret.clone()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
 
@@ -1378,10 +1378,10 @@ mod tests {
         // If message already has MessageContextInfo, we should update it, not replace
         let original = wa::Message {
             conversation: Some("Test".to_string()),
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 device_list_metadata_version: Some(42), // Some existing field
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
 

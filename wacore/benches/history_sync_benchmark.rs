@@ -53,10 +53,10 @@ fn build_realistic_history_sync(n_convos: usize, msgs_per_convo: usize) -> Vec<u
                         })),
                         ..Default::default()
                     })),
-                    message_context_info: Some(wa::MessageContextInfo {
+                    message_context_info: Some(Box::new(wa::MessageContextInfo {
                         message_secret: Some(vec![m as u8; 32]),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }
             };

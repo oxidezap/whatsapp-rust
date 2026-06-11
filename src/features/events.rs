@@ -58,10 +58,10 @@ impl<'a> Events<'a> {
             rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut secret);
             secret
         };
-        message.message_context_info = Some(wa::MessageContextInfo {
+        message.message_context_info = Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(message_secret.clone()),
             ..Default::default()
-        });
+        }));
 
         let result = self.client.send_message(to, message).await?;
         Ok((result, message_secret))

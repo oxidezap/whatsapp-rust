@@ -103,10 +103,10 @@ impl<'a> Comments<'a> {
                 enc_payload: Some(enc_payload),
                 enc_iv: Some(iv.to_vec()),
             }),
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_secret: Some(comment_secret.clone()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         let result = client.send_message(chat, message).await?;

@@ -57,14 +57,13 @@ fn main() -> std::io::Result<()> {
         ".whatsapp.SenderKeyStateStructure.SenderSigningKey",
     ]);
 
-    // Box the giant per-message structs out of the repeated-field decode path:
-    // WebMessageInfo is ~15.6 KB inline (wa::Message ~6.5 KB inside it), so
-    // prost's push(default) + Vec doubling memcpy'd hundreds of MB per full
-    // history-sync decode with HistorySyncMsg elements at ~15.7 KB each.
-    // Boxing collapses the element to pointer size; CodSpeed flamegraphs
-    // attributed ~94% of a full conversation decode to those copies.
+    // Boxed: large (and mostly absent-on-the-wire) submessages whose inline
+    // form makes prost's repeated-field decode memcpy-bound — every element
+    // pays push(default) plus Vec-growth copies of the full struct size.
     config.boxed(".whatsapp.HistorySyncMsg.message");
     config.boxed(".whatsapp.WebMessageInfo.message");
+    config.boxed(".whatsapp.WebMessageInfo.statusMentionMessageInfo");
+    config.boxed(".whatsapp.Message.messageContextInfo");
 
     // Bytes fields lack serde support; skip them (internal crypto state).
     config.field_attribute(
