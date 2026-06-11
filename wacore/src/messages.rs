@@ -422,7 +422,9 @@ pub fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
     let fast = msg.fast_ratchet_key_sender_key_distribution_message.take();
     let ctx = msg.message_context_info.take();
 
-    let only = *msg == wa::Message::default();
+    // Same predicate as `== Message::default()` (proto2 fields only encode
+    // when set), without anchoring prost's derived PartialEq tree.
+    let only = waproto::codec::message_encoded_len(msg) == 0;
 
     msg.sender_key_distribution_message = skdm;
     msg.fast_ratchet_key_sender_key_distribution_message = fast;
