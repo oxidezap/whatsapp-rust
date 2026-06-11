@@ -50,7 +50,7 @@ COPY --from=planner /app/recipe.json recipe.json
 # build-std demands an explicit --target; use the image's own host triple so
 # multi-arch builds (e.g. buildx linux/arm64) keep producing native binaries
 # exactly like the implicit-target build did.
-RUN rustc -vV | sed -n 's/^host: //p' > /rust-target
+RUN rustc -vV | sed -n 's/^host: //p' > /rust-target && test -s /rust-target
 RUN cargo chef cook --release --recipe-path recipe.json --target "$(cat /rust-target)"
 COPY . .
 RUN cargo build --release --target "$(cat /rust-target)" \
