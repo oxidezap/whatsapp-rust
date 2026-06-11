@@ -1630,13 +1630,15 @@ fn extract_conversation_fields(
         }
     }
 
-    // tc-token candidate: only for 1:1 chats that actually carry a token.
+    // tc-token candidate: only for 1:1 chats that actually carry a token. A
+    // malformed conversation without an id must not emit a candidate either
+    // (same guard the message-secret extraction applies).
+    if chat_id.is_empty() || tc_token.is_empty() {
+        return None;
+    }
     if let Some(parts) = wacore_binary::jid::parse_jid_fast(chat_id)
         && (parts.server == "g.us" || parts.server == "newsletter" || parts.server == "bot")
     {
-        return None;
-    }
-    if tc_token.is_empty() {
         return None;
     }
     Some(TcTokenCandidate {
@@ -2330,6 +2332,29 @@ mod tests {
         let compressed = encoder.finish().unwrap();
         let result = process_history_sync(compressed, None, false).unwrap();
         assert!(result.msg_secret_records.is_empty());
+    }
+
+    /// A (malformed) conversation carrying a tctoken but no id must not emit a
+    /// candidate under an empty chat id.
+    #[test]
+    fn test_tc_token_without_conversation_id_yields_no_candidate() {
+        let mut conv = Vec::new();
+        emit_len_field(&mut conv, tags::conversation::TC_TOKEN, &[0xABu8; 16]);
+        emit_varint(
+            &mut conv,
+            ((tags::conversation::TC_TOKEN_TIMESTAMP << 3) | wire_type::VARINT) as u64,
+        );
+        emit_varint(&mut conv, 1_700_000_123);
+        let mut hs = Vec::new();
+        emit_len_field(&mut hs, tags::history_sync::CONVERSATIONS, &conv);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let result = process_history_sync(compressed, None, false).unwrap();
+        assert!(result.tc_token_candidates.is_empty());
+        assert_eq!(result.conversations_processed, 1);
     }
 
     /// The presence pre-scan must honor prost merge semantics: a secret carried

@@ -141,12 +141,10 @@ impl Client {
             device_snapshot.pn.as_ref().map(|j| j.to_non_ad().user)
         };
 
-        // Retain (and fully decompress) the blob only when a handler actually
-        // wants HistorySync. A message-only bot leaves this false, so the
-        // streaming decompress-and-parse path runs instead of materializing the
-        // whole payload just to drop it at dispatch.
-        let retain_history_blob = self.core.event_bus.has_handler_for(EventKind::HistorySync);
-
+        // Always carry the compressed input through (a move, no copy or extra
+        // inflate); handler interest is evaluated at dispatch time below, so a
+        // handler that registers while a large blob is being parsed still gets
+        // the event instead of racing a pre-parse snapshot.
         // Small blobs (PushName, Recent): decode inline to avoid spawn_blocking overhead.
         // Large blobs: use blocking thread to avoid stalling the async runtime.
         const INLINE_THRESHOLD: usize = 256 * 1024;
@@ -154,13 +152,12 @@ impl Client {
             Some(process_history_sync(
                 compressed_data,
                 own_user.as_deref(),
-                retain_history_blob,
+                true,
             ))
         } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
-                let result =
-                    process_history_sync(compressed_data, own_user.as_deref(), retain_history_blob);
+                let result = process_history_sync(compressed_data, own_user.as_deref(), true);
                 let _ = result_tx.send(result);
             }));
             self.runtime
@@ -214,7 +211,12 @@ impl Client {
                 self.store_history_sync_msg_secrets(sync_result.msg_secret_records)
                     .await;
 
-                if let Some(compressed) = sync_result.compressed_bytes {
+                // Dispatch-time interest check: a bot with no HistorySync
+                // handler drops the compressed payload here (it was a move,
+                // never a copy), while one registered mid-parse still wins.
+                if self.core.event_bus.has_handler_for(EventKind::HistorySync)
+                    && let Some(compressed) = sync_result.compressed_bytes
+                {
                     let lazy_hs = LazyHistorySync::new(
                         compressed,
                         sync_result.decompressed_size,
