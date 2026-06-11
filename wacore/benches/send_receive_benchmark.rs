@@ -32,11 +32,47 @@ fn main() {
     divan::main();
 }
 
+/// Deterministic bench RNG (SplitMix64). A local algorithm, so fixtures are
+/// stable across rand versions and platforms and baselines never shift on a
+/// dependency bump. The `CryptoRng` marker is satisfied for API purposes
+/// only: bench key material is synthetic by design.
+struct BenchRng(u64);
+
+impl BenchRng {
+    fn step(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+// rand 0.10: `Rng`/`CryptoRng` are blanket-implemented over the infallible
+// Try* traits, so these two impls are the whole surface.
+impl rand::TryRng for BenchRng {
+    type Error = std::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok((self.step() >> 32) as u32)
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.step())
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        for chunk in dst.chunks_mut(8) {
+            let bytes = self.step().to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+        Ok(())
+    }
+}
+
+impl rand::rand_core::TryCryptoRng for BenchRng {}
+
 /// Deterministically seeded RNG: fixtures must be identical across runs and
 /// builds so CodSpeed comparisons measure code, not key material.
-fn bench_rng(seed: u64) -> rand::rngs::StdRng {
-    use rand::SeedableRng;
-    rand::rngs::StdRng::seed_from_u64(seed)
+fn bench_rng(seed: u64) -> BenchRng {
+    BenchRng(seed)
 }
 
 /// FNV-1a fold of a fixture label into an RNG seed.
