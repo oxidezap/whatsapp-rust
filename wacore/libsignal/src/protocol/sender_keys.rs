@@ -179,10 +179,19 @@ pub struct SenderKeyState {
     signing_key_memo: std::sync::OnceLock<PrivateKey>,
 }
 
+// Manual impl with the signing key REDACTED: the protobuf state embeds the
+// serialized private signing key, and the previous derive printed it raw
+// into any `{:?}` log or panic message.
 impl std::fmt::Debug for SenderKeyState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SenderKeyState")
-            .field("state", &self.state)
+            .field("chain_id", &self.chain_id())
+            .field(
+                "chain_iteration",
+                &self.sender_chain_key().map(|c| c.iteration()),
+            )
+            .field("message_keys", &self.state.sender_message_keys.len())
+            .field("signing_key", &"<redacted>")
             .finish_non_exhaustive()
     }
 }
