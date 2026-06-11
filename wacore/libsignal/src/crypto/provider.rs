@@ -13,7 +13,7 @@ use bytes::BytesMut;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
-use crate::crypto::aes_gcm::{Aes256GcmDecryption, Aes256GcmEncryption};
+use crate::crypto::aes_gcm::{Aes256GcmDecryption, Aes256GcmEncryption, Aes256GcmKey};
 
 const GCM_TAG: usize = 16;
 
@@ -81,6 +81,52 @@ pub enum CryptoProviderError {
     AuthFailed,
     /// provider backend reported failure
     BackendFailed,
+}
+
+/// Connection-lifetime AES-256-GCM handle for the Noise transport: one key,
+/// many nonces. Lets a provider precompute key-dependent state once instead
+/// of per frame; the default routes every call through the configured
+/// provider so custom providers keep observing transport crypto.
+pub trait TransportAead: Send + Sync {
+    fn encrypt_in_place(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        buffer: &mut dyn GcmInPlaceBuffer,
+    ) -> Result<(), CryptoProviderError>;
+
+    fn decrypt_in_place(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        buffer: &mut dyn GcmInPlaceBuffer,
+    ) -> Result<(), CryptoProviderError>;
+}
+
+/// Default [`TransportAead`]: per-call dispatch through the configured
+/// provider, with no precomputed state.
+struct PerCallTransportAead {
+    key: [u8; 32],
+}
+
+impl TransportAead for PerCallTransportAead {
+    fn encrypt_in_place(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        buffer: &mut dyn GcmInPlaceBuffer,
+    ) -> Result<(), CryptoProviderError> {
+        provider().aes_256_gcm_encrypt_in_place(&self.key, nonce, aad, buffer)
+    }
+
+    fn decrypt_in_place(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        buffer: &mut dyn GcmInPlaceBuffer,
+    ) -> Result<(), CryptoProviderError> {
+        provider().aes_256_gcm_decrypt_in_place(&self.key, nonce, aad, buffer)
+    }
 }
 
 /// Pluggable crypto primitives used by libsignal and higher-level callers.
@@ -170,6 +216,16 @@ pub trait SignalCryptoProvider: Send + Sync + 'static {
         buffer.resize(out.len(), 0);
         buffer.as_mut_slice().copy_from_slice(&out);
         Ok(())
+    }
+
+    /// Connection-lifetime transport AEAD for one fixed key. Default keeps
+    /// per-call dispatch through the configured provider; override to
+    /// precompute key-dependent state (key schedule, GHASH subkey) once.
+    fn transport_aead(
+        &self,
+        key: &[u8; 32],
+    ) -> Result<Box<dyn TransportAead>, CryptoProviderError> {
+        Ok(Box::new(PerCallTransportAead { key: *key }))
     }
 }
 
@@ -329,6 +385,56 @@ impl SignalCryptoProvider for RustCryptoProvider {
 
         let mut dec =
             Aes256GcmDecryption::new(key, nonce, aad).map_err(|_| CryptoProviderError::BadInput)?;
+        dec.decrypt(&mut buffer.as_mut_slice()[..pt_len]);
+        dec.verify_tag(&tag)
+            .map_err(|_| CryptoProviderError::AuthFailed)?;
+        buffer.truncate(pt_len);
+        Ok(())
+    }
+
+    fn transport_aead(
+        &self,
+        key: &[u8; 32],
+    ) -> Result<Box<dyn TransportAead>, CryptoProviderError> {
+        Ok(Box::new(
+            Aes256GcmKey::new(key).map_err(|_| CryptoProviderError::BadInput)?,
+        ))
+    }
+}
+
+impl TransportAead for Aes256GcmKey {
+    fn encrypt_in_place(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        buffer: &mut dyn GcmInPlaceBuffer,
+    ) -> Result<(), CryptoProviderError> {
+        let plaintext_len = buffer.len();
+        let mut enc = Aes256GcmEncryption::new_with_key(self, nonce, aad)
+            .map_err(|_| CryptoProviderError::BadInput)?;
+        enc.encrypt(buffer.as_mut_slice());
+        let tag = enc.compute_tag();
+        buffer.resize(plaintext_len + GCM_TAG, 0);
+        buffer.as_mut_slice()[plaintext_len..].copy_from_slice(&tag);
+        Ok(())
+    }
+
+    fn decrypt_in_place(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        buffer: &mut dyn GcmInPlaceBuffer,
+    ) -> Result<(), CryptoProviderError> {
+        let total = buffer.len();
+        if total < GCM_TAG {
+            return Err(CryptoProviderError::BadInput);
+        }
+        let pt_len = total - GCM_TAG;
+        let mut tag = [0u8; GCM_TAG];
+        tag.copy_from_slice(&buffer.as_slice()[pt_len..]);
+
+        let mut dec = Aes256GcmDecryption::new_with_key(self, nonce, aad)
+            .map_err(|_| CryptoProviderError::BadInput)?;
         dec.decrypt(&mut buffer.as_mut_slice()[..pt_len]);
         dec.verify_tag(&tag)
             .map_err(|_| CryptoProviderError::AuthFailed)?;

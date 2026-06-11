@@ -21,9 +21,19 @@ pub use hash::{
     CryptographicHash, CryptographicMac, SHA1_OUTPUT_SIZE, SHA256_OUTPUT_SIZE, SHA512_OUTPUT_SIZE,
 };
 pub use provider::{
-    CryptoProviderError, GcmInPlaceBuffer, RustCryptoProvider, SignalCryptoProvider,
+    CryptoProviderError, GcmInPlaceBuffer, RustCryptoProvider, SignalCryptoProvider, TransportAead,
     set_crypto_provider,
 };
+
+/// Connection-lifetime transport AEAD for one fixed key, from the active
+/// [`SignalCryptoProvider`]. The default RustCrypto path precomputes the
+/// key-dependent state once.
+#[inline]
+pub fn transport_aead(
+    key: &[u8; 32],
+) -> std::result::Result<Box<dyn TransportAead>, CryptoProviderError> {
+    provider::provider().transport_aead(key)
+}
 
 /// AES-256-GCM seal. Appends `ciphertext || tag(16)` to `out`.
 /// Delegates to the active [`SignalCryptoProvider`].
