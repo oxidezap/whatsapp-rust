@@ -103,20 +103,22 @@ pub trait TransportAead: Send + Sync {
     ) -> Result<(), CryptoProviderError>;
 }
 
-/// Default [`TransportAead`]: per-call dispatch through the configured
-/// provider, with no precomputed state.
-struct PerCallTransportAead {
+/// Default [`TransportAead`]: per-call dispatch through the provider that
+/// created it, with no precomputed state.
+struct PerCallTransportAead<P: ?Sized + 'static> {
+    provider: &'static P,
     key: [u8; 32],
 }
 
-impl TransportAead for PerCallTransportAead {
+impl<P: SignalCryptoProvider + ?Sized> TransportAead for PerCallTransportAead<P> {
     fn encrypt_in_place(
         &self,
         nonce: &[u8; 12],
         aad: &[u8],
         buffer: &mut dyn GcmInPlaceBuffer,
     ) -> Result<(), CryptoProviderError> {
-        provider().aes_256_gcm_encrypt_in_place(&self.key, nonce, aad, buffer)
+        self.provider
+            .aes_256_gcm_encrypt_in_place(&self.key, nonce, aad, buffer)
     }
 
     fn decrypt_in_place(
@@ -125,7 +127,8 @@ impl TransportAead for PerCallTransportAead {
         aad: &[u8],
         buffer: &mut dyn GcmInPlaceBuffer,
     ) -> Result<(), CryptoProviderError> {
-        provider().aes_256_gcm_decrypt_in_place(&self.key, nonce, aad, buffer)
+        self.provider
+            .aes_256_gcm_decrypt_in_place(&self.key, nonce, aad, buffer)
     }
 }
 
@@ -219,13 +222,17 @@ pub trait SignalCryptoProvider: Send + Sync + 'static {
     }
 
     /// Connection-lifetime transport AEAD for one fixed key. Default keeps
-    /// per-call dispatch through the configured provider; override to
-    /// precompute key-dependent state (key schedule, GHASH subkey) once.
+    /// per-call dispatch through this same provider; override to precompute
+    /// key-dependent state (key schedule, GHASH subkey) once. The `'static`
+    /// receiver ties the handle to the installed provider's lifetime.
     fn transport_aead(
-        &self,
+        &'static self,
         key: &[u8; 32],
     ) -> Result<Box<dyn TransportAead>, CryptoProviderError> {
-        Ok(Box::new(PerCallTransportAead { key: *key }))
+        Ok(Box::new(PerCallTransportAead {
+            provider: self,
+            key: *key,
+        }))
     }
 }
 
@@ -393,7 +400,7 @@ impl SignalCryptoProvider for RustCryptoProvider {
     }
 
     fn transport_aead(
-        &self,
+        &'static self,
         key: &[u8; 32],
     ) -> Result<Box<dyn TransportAead>, CryptoProviderError> {
         Ok(Box::new(
