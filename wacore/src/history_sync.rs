@@ -3339,6 +3339,68 @@ mod tests {
         ));
     }
 
+    /// Deterministic mutation fuzz: every byte-level corruption of a valid
+    /// blob must surface as a clean error or lenient skip, never a panic, on
+    /// both the public stream and the extraction pass.
+    #[test]
+    fn stream_and_extractor_survive_mutated_inputs() {
+        let hs = wa::HistorySync {
+            conversations: vec![
+                wa::Conversation {
+                    id: "5511111111111@s.whatsapp.net".into(),
+                    ..Default::default()
+                },
+                wa::Conversation {
+                    id: "5511222222222@s.whatsapp.net".into(),
+                    ..Default::default()
+                },
+            ],
+            pushnames: vec![wa::Pushname {
+                id: Some("5511000000000".into()),
+                pushname: Some("Me".into()),
+            }],
+            nct_salt: Some(vec![1, 2, 3, 4]),
+            ..Default::default()
+        };
+        let compressed = encode_and_compress(&hs);
+
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+
+        for _ in 0..10_000 {
+            let mut mutated = compressed.clone();
+            for _ in 0..=(next() % 3) {
+                match next() % 4 {
+                    0 if !mutated.is_empty() => {
+                        let len = mutated.len();
+                        mutated.truncate(next() as usize % len);
+                    }
+                    _ if !mutated.is_empty() => {
+                        let len = mutated.len();
+                        let idx = next() as usize % len;
+                        mutated[idx] ^= (next() % 255 + 1) as u8;
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut stream = HistorySyncStream::new(&mutated, MAX_DECOMPRESSED);
+            loop {
+                match stream.next_conversation() {
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            let _ = stream.remainder();
+            let _ = process_history_sync(mutated, None, true);
+        }
+    }
+
     /// Group wire types (3/4) don't exist in HistorySync; the stream mirrors
     /// the extractor and rejects them as malformed.
     #[test]
