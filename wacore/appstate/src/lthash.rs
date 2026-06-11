@@ -146,12 +146,15 @@ mod tests {
     /// `Hkdf::new(None, key)`; any drift would corrupt every ltHash.
     #[test]
     fn pre_keyed_extract_matches_plain_hkdf() {
+        let mut keys: Vec<Vec<u8>> = (0..16u8).map(|i| vec![i.wrapping_mul(17); 32]).collect();
+        keys.push(Vec::new());
+        keys.push(vec![0xAB; 3]);
+
         let mut ours = [0u8; 128];
         let mut reference = [0u8; 128];
-        for i in 0..16u8 {
-            let key = [i.wrapping_mul(17); 32];
-            hkdf_sha256_into(&key, WAPATCH_INTEGRITY_INFO.as_bytes(), &mut ours);
-            Hkdf::<Sha256>::new(None, &key)
+        for key in &keys {
+            hkdf_sha256_into(key, WAPATCH_INTEGRITY_INFO.as_bytes(), &mut ours);
+            Hkdf::<Sha256>::new(None, key)
                 .expand(WAPATCH_INTEGRITY_INFO.as_bytes(), &mut reference)
                 .expect("hkdf expand");
             assert_eq!(ours, reference);
