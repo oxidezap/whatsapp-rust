@@ -632,8 +632,11 @@ fn setup_group_send(n: usize) -> GrpSendData {
         participants.clone(),
     ));
     // Warm steady state: production warms the memo on the first send after a
-    // topology change and serves every later send from it.
-    let _ = resolved.phash(&alice.jid);
+    // topology change and serves every later send from it. Assert it, so a
+    // silent failure can't leave the bench measuring the cold path.
+    resolved
+        .phash(&alice.jid)
+        .expect("phash must warm in setup");
 
     GrpSendData {
         alice,

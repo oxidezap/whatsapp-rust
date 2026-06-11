@@ -48,7 +48,9 @@ impl ResolvedGroupDevices {
             return Self::compute(&self.devices, own_sending_jid);
         }
         let hash = Self::compute(&self.devices, own_sending_jid)?;
-        // Benign race: concurrent firsts compute the same value.
+        // Benign race: whichever first wins the cell. Every caller returns
+        // the value computed for its OWN jid; a racer with a different jid
+        // that loses the set is served by the bypass branch above afterwards.
         let _ = self.phash.set((own_sending_jid.clone(), hash.clone()));
         Some(hash)
     }
