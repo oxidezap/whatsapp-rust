@@ -15,8 +15,10 @@
 FROM rust:alpine AS chef
 RUN apk add --no-cache musl-dev
 COPY rust-toolchain.toml .
-# rust-src feeds -Zbuild-std in the builder stage.
-RUN rustup show && rustup component add rust-src && cargo install cargo-chef --locked
+# rust-src feeds -Zbuild-std in the builder stage. cargo-chef is pinned to an
+# exact release (plus --locked for its dependency graph) so image rebuilds are
+# deterministic instead of tracking the latest crates.io release.
+RUN rustup show && rustup component add rust-src && cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /app
 
 FROM chef AS planner
