@@ -61,17 +61,17 @@ fn build_realistic_history_sync(n_convos: usize, msgs_per_convo: usize) -> Vec<u
                 }
             };
             messages.push(wa::HistorySyncMsg {
-                message: Some(wa::WebMessageInfo {
+                message: Some(Box::new(wa::WebMessageInfo {
                     key: wa::MessageKey {
                         remote_jid: Some(chat.clone()),
                         from_me: Some(from_me),
                         id: Some(format!("MSGID{c:04}{m:04}ABCDEF")),
                         participant: None,
                     },
-                    message: Some(inner),
+                    message: Some(Box::new(inner)),
                     message_timestamp: Some(1_700_000_000 + (c * msgs_per_convo + m) as u64),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             });
         }

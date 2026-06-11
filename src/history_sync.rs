@@ -519,20 +519,20 @@ mod tests {
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
+                    message: Some(Box::new(wa::WebMessageInfo {
                         key: wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
                             id: Some(parent_id.to_string()),
                             participant: None,
                         },
-                        message: Some(wa::Message {
+                        message: Some(Box::new(wa::Message {
                             conversation: Some("historical".to_string()),
                             ..Default::default()
-                        }),
+                        })),
                         message_secret: Some(secret.clone()),
                         ..Default::default()
-                    }),
+                    })),
                     msg_order_id: Some(1),
                 }],
                 ..Default::default()
@@ -631,20 +631,20 @@ mod tests {
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
+                    message: Some(Box::new(wa::WebMessageInfo {
                         key: wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
                             id: Some(parent_id.to_string()),
                             participant: None,
                         },
-                        message: Some(wa::Message {
+                        message: Some(Box::new(wa::Message {
                             conversation: Some("bot historical".to_string()),
                             ..Default::default()
-                        }),
+                        })),
                         message_secret: Some(secret.clone()),
                         ..Default::default()
-                    }),
+                    })),
                     msg_order_id: Some(1),
                 }],
                 ..Default::default()
@@ -695,18 +695,18 @@ mod tests {
             }
         };
         wa::HistorySyncMsg {
-            message: Some(wa::WebMessageInfo {
+            message: Some(Box::new(wa::WebMessageInfo {
                 key: wa::MessageKey {
                     remote_jid: Some(chat.to_string()),
                     from_me: Some(false),
                     id: Some(msg_id.to_string()),
                     participant: None,
                 },
-                message: Some(message),
+                message: Some(Box::new(message)),
                 message_secret: Some(secret.to_vec()),
                 message_timestamp: Some(ts_secs),
                 ..Default::default()
-            }),
+            })),
             msg_order_id: Some(1),
         }
     }
@@ -985,25 +985,25 @@ mod tests {
             ..Default::default()
         });
         wa::HistorySyncMsg {
-            message: Some(wa::WebMessageInfo {
+            message: Some(Box::new(wa::WebMessageInfo {
                 key: wa::MessageKey {
                     remote_jid: Some(chat.to_string()),
                     from_me: Some(false),
                     id: Some(msg_id.to_string()),
                     participant: Some(participant.to_string()),
                 },
-                message: Some(wa::Message {
+                message: Some(Box::new(wa::Message {
                     extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
                         text: Some("hi".into()),
                         ..Default::default()
                     })),
                     message_context_info,
                     ..Default::default()
-                }),
+                })),
                 message_secret: Some(secret.to_vec()),
                 message_timestamp: Some(ts_secs),
                 ..Default::default()
-            }),
+            })),
             msg_order_id: Some(1),
         }
     }

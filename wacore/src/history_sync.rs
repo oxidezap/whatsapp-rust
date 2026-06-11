@@ -1782,7 +1782,7 @@ mod tests {
 
     fn wrap_in_history_msg(web_msg: &wa::WebMessageInfo) -> Vec<u8> {
         wa::HistorySyncMsg {
-            message: Some(web_msg.clone()),
+            message: Some(Box::new(web_msg.clone())),
             ..Default::default()
         }
         .encode_to_vec()
@@ -1802,7 +1802,7 @@ mod tests {
                 id: Some(id.to_string()),
                 ..Default::default()
             },
-            message,
+            message: message.map(Box::new),
             message_timestamp: Some(1_700_000_777),
             ..Default::default()
         }
@@ -2424,7 +2424,7 @@ mod tests {
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
+                    message: Some(Box::new(wa::WebMessageInfo {
                         key: wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
@@ -2433,7 +2433,7 @@ mod tests {
                         },
                         message_secret: Some(Vec::new()),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2507,7 +2507,7 @@ mod tests {
                 id: chat.to_string(),
                 messages: vec![
                     wa::HistorySyncMsg {
-                        message: Some(wa::WebMessageInfo {
+                        message: Some(Box::new(wa::WebMessageInfo {
                             key: wa::MessageKey {
                                 remote_jid: Some(chat.to_string()),
                                 from_me: Some(false),
@@ -2516,26 +2516,26 @@ mod tests {
                             },
                             message_secret: Some(top_level_secret.clone()),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     },
                     wa::HistorySyncMsg {
-                        message: Some(wa::WebMessageInfo {
+                        message: Some(Box::new(wa::WebMessageInfo {
                             key: wa::MessageKey {
                                 remote_jid: Some(chat.to_string()),
                                 from_me: Some(true),
                                 id: Some("HIST_CONTEXT".to_string()),
                                 participant: None,
                             },
-                            message: Some(wa::Message {
+                            message: Some(Box::new(wa::Message {
                                 message_context_info: Some(wa::MessageContextInfo {
                                     message_secret: Some(context_secret.clone()),
                                     ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
+                            })),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
                     },
                 ],
@@ -2579,7 +2579,7 @@ mod tests {
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
+                    message: Some(Box::new(wa::WebMessageInfo {
                         key: wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
@@ -2587,15 +2587,15 @@ mod tests {
                             participant: Some("5511888889999@s.whatsapp.net".to_string()),
                         },
                         message_secret: Some(top_level_secret.clone()),
-                        message: Some(wa::Message {
+                        message: Some(Box::new(wa::Message {
                             message_context_info: Some(wa::MessageContextInfo {
                                 message_secret: Some(context_secret.clone()),
                                 ..Default::default()
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2627,14 +2627,14 @@ mod tests {
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
+                    message: Some(Box::new(wa::WebMessageInfo {
                         key: wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
                             id: Some("HIST_FORWARDED".to_string()),
                             ..Default::default()
                         },
-                        message: Some(wa::Message {
+                        message: Some(Box::new(wa::Message {
                             extended_text_message: Some(Box::new(
                                 wa::message::ExtendedTextMessage {
                                     text: Some("forwarded".into()),
@@ -2650,9 +2650,9 @@ mod tests {
                                 ..Default::default()
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2674,14 +2674,14 @@ mod tests {
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
+                    message: Some(Box::new(wa::WebMessageInfo {
                         key: wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
                             id: Some("HIST_NESTED_FORWARDED".to_string()),
                             ..Default::default()
                         },
-                        message: Some(wa::Message {
+                        message: Some(Box::new(wa::Message {
                             view_once_message: Some(Box::new(wa::message::FutureProofMessage {
                                 message: Some(Box::new(wa::Message {
                                     ephemeral_message: Some(Box::new(
@@ -2711,9 +2711,9 @@ mod tests {
                                 ..Default::default()
                             }),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -2805,7 +2805,7 @@ mod tests {
         let mut big_msgs = Vec::new();
         for i in 0..1500u32 {
             big_msgs.push(wa::HistorySyncMsg {
-                message: Some(wa::WebMessageInfo {
+                message: Some(Box::new(wa::WebMessageInfo {
                     key: wa::MessageKey {
                         remote_jid: Some(dm.to_string()),
                         from_me: Some(i % 2 == 0),
@@ -2815,7 +2815,7 @@ mod tests {
                     message_timestamp: Some(1_700_000_000 + i as u64),
                     message_secret: Some(vec![(i % 251) as u8; 32]),
                     ..Default::default()
-                }),
+                })),
                 msg_order_id: Some(i as u64 + 1),
             });
         }
@@ -2830,7 +2830,7 @@ mod tests {
         let group_conv = wa::Conversation {
             id: group.to_string(),
             messages: vec![wa::HistorySyncMsg {
-                message: Some(wa::WebMessageInfo {
+                message: Some(Box::new(wa::WebMessageInfo {
                     key: wa::MessageKey {
                         remote_jid: Some(group.to_string()),
                         from_me: Some(false),
@@ -2839,7 +2839,7 @@ mod tests {
                     },
                     message_secret: Some(vec![0x33u8; 32]),
                     ..Default::default()
-                }),
+                })),
                 msg_order_id: Some(1),
             }],
             tc_token: Some(vec![0xCDu8; 16]),
@@ -3143,17 +3143,17 @@ mod tests {
         let big = wa::Conversation {
             id: "5511111111111@s.whatsapp.net".into(),
             messages: vec![wa::HistorySyncMsg {
-                message: Some(wa::WebMessageInfo {
+                message: Some(Box::new(wa::WebMessageInfo {
                     key: wa::MessageKey {
                         id: Some("BIG".into()),
                         ..Default::default()
                     },
-                    message: Some(wa::Message {
+                    message: Some(Box::new(wa::Message {
                         conversation: Some("x".repeat(1_000_000)),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             }],
             ..Default::default()
@@ -3179,17 +3179,17 @@ mod tests {
             conversations.push(wa::Conversation {
                 id: format!("55119{i:08}@s.whatsapp.net"),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
+                    message: Some(Box::new(wa::WebMessageInfo {
                         key: wa::MessageKey {
                             id: Some(format!("M{i}")),
                             ..Default::default()
                         },
-                        message: Some(wa::Message {
+                        message: Some(Box::new(wa::Message {
                             conversation: Some(format!("{i}").repeat(4_000)),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -3216,13 +3216,13 @@ mod tests {
             conversations: vec![wa::Conversation {
                 id: "5511111111111@s.whatsapp.net".into(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
-                        message: Some(wa::Message {
+                    message: Some(Box::new(wa::WebMessageInfo {
+                        message: Some(Box::new(wa::Message {
                             conversation: Some("y".repeat(64 * 1024)),
                             ..Default::default()
-                        }),
+                        })),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 }],
                 ..Default::default()

@@ -415,7 +415,7 @@ impl Client {
         self.core
             .event_bus
             .dispatch(wacore::types::events::Event::Message(
-                Arc::new(message),
+                Arc::from(message),
                 message_info,
             ));
     }

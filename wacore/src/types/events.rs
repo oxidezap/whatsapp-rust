@@ -1457,13 +1457,13 @@ mod tests {
         let conv = wa::Conversation {
             id: "chat@s.whatsapp.net".to_string(),
             messages: vec![wa::HistorySyncMsg {
-                message: Some(wa::WebMessageInfo {
+                message: Some(Box::new(wa::WebMessageInfo {
                     key: wa::MessageKey {
                         id: Some("msg-0".to_string()),
                         ..Default::default()
                     },
                     ..Default::default()
-                }),
+                })),
                 msg_order_id: Some(0),
             }],
             ..Default::default()
