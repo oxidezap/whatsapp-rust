@@ -847,9 +847,63 @@ pub fn push_jid_to_compact(
     write_jid!(infallible buf, user, server, agent, device);
 }
 
+/// Stack writer sized for any realistic JID, so `Display` can emit a single
+/// `write_str`: a `ToString`-backed `String` then reserves once at the exact
+/// length instead of reallocating per fragment. Overflow errors out and the
+/// caller falls back to direct fragment writes.
+struct JidStackWriter {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl JidStackWriter {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0; 64],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        // Whole `&str` fragments are appended, never split, so the bytes
+        // stay valid UTF-8.
+        std::str::from_utf8(&self.buf[..self.len]).expect("concatenated str fragments")
+    }
+}
+
+impl fmt::Write for JidStackWriter {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        if end > self.buf.len() {
+            return Err(fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+#[inline]
+fn write_jid_fallible<W: fmt::Write>(
+    w: &mut W,
+    user: &str,
+    server: Server,
+    agent: u8,
+    device: u16,
+) -> fmt::Result {
+    write_jid!(fallible w, user, server, agent, device)
+}
+
 impl fmt::Display for Jid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_jid!(fallible f, &*self.user, self.server, self.agent, self.device)
+        let mut w = JidStackWriter::new();
+        if write_jid_fallible(&mut w, &self.user, self.server, self.agent, self.device).is_ok() {
+            return f.write_str(w.as_str());
+        }
+        write_jid_fallible(f, &self.user, self.server, self.agent, self.device)
     }
 }
 
@@ -953,7 +1007,11 @@ impl fmt::Display for ObservedJid<'_> {
 
 impl<'a> fmt::Display for JidRef<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_jid!(fallible f, &*self.user, self.server, self.agent, self.device)
+        let mut w = JidStackWriter::new();
+        if write_jid_fallible(&mut w, &self.user, self.server, self.agent, self.device).is_ok() {
+            return f.write_str(w.as_str());
+        }
+        write_jid_fallible(f, &self.user, self.server, self.agent, self.device)
     }
 }
 
