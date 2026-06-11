@@ -33,6 +33,7 @@ pub struct InflateReader<'a> {
     total_out: u64,
     max: u64,
     eof: bool,
+    stream_end: bool,
 }
 
 impl<'a> InflateReader<'a> {
@@ -60,6 +61,7 @@ impl<'a> InflateReader<'a> {
             total_out: 0,
             max,
             eof: false,
+            stream_end: false,
         }
     }
 
@@ -96,6 +98,13 @@ impl<'a> InflateReader<'a> {
     /// the blob's exact inflated size.
     pub fn total_out(&self) -> u64 {
         self.total_out
+    }
+
+    /// Whether zlib reported a proper stream end (terminator + adler32
+    /// checksum). An EOF (`ensure` returning false) without this means the
+    /// input was truncated, not finished.
+    pub fn stream_ended(&self) -> bool {
+        self.stream_end
     }
 
     fn pump(&mut self) -> io::Result<()> {
@@ -135,11 +144,16 @@ impl<'a> InflateReader<'a> {
         self.buf.extend_from_slice(&chunk[..produced]);
 
         match status {
-            Status::StreamEnd => self.eof = true,
+            Status::StreamEnd => {
+                self.eof = true;
+                self.stream_end = true;
+            }
             // No output produced and not at stream end: distinguish a truncated
-            // tail (no input left → treat as end) from a stalled/corrupt stream
-            // (input remains but the decompressor consumed none → error, instead
-            // of spinning forever since 64 KB of output is always available).
+            // tail (no input left → treat as end, with `stream_end` left false
+            // so callers can tell it apart from a real terminator) from a
+            // stalled/corrupt stream (input remains but the decompressor
+            // consumed none → error, instead of spinning forever since 64 KB of
+            // output is always available).
             // Mirrors the no-progress guard in `decompress_zlib_pooled`.
             _ if produced == 0 => {
                 if self.in_pos >= self.input.len() {

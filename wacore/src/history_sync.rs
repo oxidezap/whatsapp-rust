@@ -132,6 +132,15 @@ impl<'a> FieldWalker<'a> {
             .ensure(1)
             .map_err(HistorySyncError::DecompressionError)?
         {
+            // Input exhausted at a field boundary is only a clean EOF when zlib
+            // saw its terminator; otherwise a truncated blob would pass as
+            // parsed (side effects applied, event dispatched) and the retained
+            // payload would fail every later get()/decompress().
+            if !self.reader.stream_ended() {
+                return Err(HistorySyncError::MalformedProtobuf(
+                    "zlib stream truncated (missing terminator)".into(),
+                ));
+            }
             return Ok(None);
         }
         // A varint is at most 10 bytes (fewer is fine right at EOF).
@@ -3259,6 +3268,50 @@ mod tests {
         let stream = HistorySyncStream::new(&compressed, MAX_DECOMPRESSED);
         let remainder = stream.remainder().unwrap();
         assert_eq!(remainder.nct_salt.as_deref(), Some(&[9][..]));
+    }
+
+    /// A zlib stream cut exactly at a protobuf field boundary (all fields
+    /// parse, but no zlib terminator) must NOT pass as a successfully parsed
+    /// blob: the old retained path rejected it via the full decompress, and a
+    /// dispatched event would fail every later get()/decompress().
+    #[test]
+    fn truncated_zlib_without_terminator_is_rejected() {
+        let conv = wa::Conversation {
+            id: "5511111111111@s.whatsapp.net".into(),
+            ..Default::default()
+        };
+        let hs = wa::HistorySync {
+            conversations: vec![conv.clone()],
+            ..Default::default()
+        };
+
+        // Sync-flush makes every written byte inflatable, then drop the
+        // encoder without finish(): a valid prefix with no terminator, so the
+        // inflater exhausts input cleanly right at the field boundary.
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs.encode_to_vec()).unwrap();
+        encoder.flush().unwrap();
+        let truncated = encoder.get_ref().clone();
+
+        // Sanity: the same bytes WITH the terminator parse fine.
+        let complete = encoder.finish().unwrap();
+        assert!(process_history_sync(complete, None, true).is_ok());
+
+        // Extraction rejects the truncated form outright (no side effects, no
+        // event).
+        assert!(matches!(
+            process_history_sync(truncated.clone(), None, true),
+            Err(HistorySyncError::MalformedProtobuf(_))
+        ));
+
+        // The public stream yields the conversations it can, then surfaces the
+        // truncation instead of reporting clean EOF.
+        let mut stream = HistorySyncStream::new(&truncated, MAX_DECOMPRESSED);
+        assert_eq!(stream.next_conversation().unwrap().unwrap(), conv);
+        assert!(matches!(
+            stream.next_conversation(),
+            Err(HistorySyncError::MalformedProtobuf(_))
+        ));
     }
 
     /// Group wire types (3/4) don't exist in HistorySync; the stream mirrors
