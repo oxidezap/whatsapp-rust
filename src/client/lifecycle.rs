@@ -183,8 +183,6 @@ impl Client {
 
             message_retry_counts: cache_config.message_retry_counts.build_with_ttl(),
 
-            recent_retry_reasons: cache_config.message_retry_counts.build_with_ttl(),
-
             session_recreate_history: cache_config.session_recreate_history.build_with_ttl(),
 
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),

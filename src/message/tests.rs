@@ -1011,7 +1011,11 @@ async fn migration_plaintext_failure_nacks_without_signal_retry() {
         .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
         .await;
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         None,
         "local protobuf failure after migration must not request Signal retry"
     );
@@ -1156,21 +1160,18 @@ async fn await_retry_receipt(
         .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
         .await;
     for _ in 0..200 {
-        if let (Some(c), Some(r)) = (
-            client.message_retry_counts.get(&cache_key).await,
-            client.recent_retry_reasons.get(&cache_key).await,
-        ) && c == expected_count
+        if let Some((c, Some(r))) = client.message_retry_counts.get(&cache_key).await
+            && c == expected_count
             && r == expected_reason
         {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    let count = client.message_retry_counts.get(&cache_key).await;
-    let reason = client.recent_retry_reasons.get(&cache_key).await;
+    let state = client.message_retry_counts.get(&cache_key).await;
     panic!(
         "expected retry ({expected_count}, {expected_reason:?}) for {cache_key}, \
-             got ({count:?}, {reason:?})"
+             got {state:?}"
     );
 }
 
@@ -3439,7 +3440,11 @@ async fn test_increment_retry_count_starts_at_one() {
     assert_eq!(count, Some(1), "First retry should be count 1");
 
     // Verify it's stored in cache
-    let stored = client.message_retry_counts.get(cache_key).await;
+    let stored = client
+        .message_retry_counts
+        .get(cache_key)
+        .await
+        .map(|(c, _)| c);
     assert_eq!(stored, Some(1), "Cache should store count 1");
 }
 
@@ -3489,7 +3494,11 @@ async fn test_increment_retry_count_respects_max_retries() {
     );
 
     // Verify cache still has max value
-    let stored = client.message_retry_counts.get(cache_key).await;
+    let stored = client
+        .message_retry_counts
+        .get(cache_key)
+        .await
+        .map(|(c, _)| c);
     assert_eq!(stored, Some(5), "Cache should retain max count");
 }
 
@@ -3524,9 +3533,18 @@ async fn test_retry_count_different_messages_are_independent() {
         .await; // key3 = 2
 
     // Verify each has independent counts
-    assert_eq!(client.message_retry_counts.get(key1).await, Some(3));
-    assert_eq!(client.message_retry_counts.get(key2).await, Some(1));
-    assert_eq!(client.message_retry_counts.get(key3).await, Some(2));
+    assert_eq!(
+        client.message_retry_counts.get(key1).await.map(|(c, _)| c),
+        Some(3)
+    );
+    assert_eq!(
+        client.message_retry_counts.get(key2).await.map(|(c, _)| c),
+        Some(1)
+    );
+    assert_eq!(
+        client.message_retry_counts.get(key3).await.map(|(c, _)| c),
+        Some(2)
+    );
 }
 
 #[tokio::test]
@@ -3615,7 +3633,11 @@ async fn test_concurrent_retry_increments() {
     );
 
     // Final count should be 5 (max)
-    let final_count = client.message_retry_counts.get(cache_key).await;
+    let final_count = client
+        .message_retry_counts
+        .get(cache_key)
+        .await
+        .map(|(c, _)| c);
     assert_eq!(final_count, Some(5), "Final count should be capped at 5");
 }
 
@@ -3680,7 +3702,11 @@ async fn test_retry_count_cache_expiration() {
     assert_eq!(count, Some(1));
 
     // Entry should still exist immediately after
-    let stored = client.message_retry_counts.get(cache_key).await;
+    let stored = client
+        .message_retry_counts
+        .get(cache_key)
+        .await
+        .map(|(c, _)| c);
     assert!(
         stored.is_some(),
         "Entry should exist immediately after insert"
@@ -3703,7 +3729,12 @@ async fn test_spawn_retry_receipt_basic_flow() {
 
     // Verify count starts at 0
     assert!(
-        client.message_retry_counts.get(&cache_key).await.is_none(),
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c)
+            .is_none(),
         "Cache should be empty initially"
     );
 
@@ -3715,7 +3746,11 @@ async fn test_spawn_retry_receipt_basic_flow() {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Verify count was incremented (the actual send will fail due to no connection, but count should update)
-    let stored = client.message_retry_counts.get(&cache_key).await;
+    let stored = client
+        .message_retry_counts
+        .get(&cache_key)
+        .await
+        .map(|(c, _)| c);
     assert_eq!(stored, Some(1), "Retry count should be 1 after spawn");
 }
 
@@ -3733,12 +3768,16 @@ async fn test_spawn_retry_receipt_respects_max_retries() {
     // Pre-fill cache to max retries
     client
         .message_retry_counts
-        .insert(cache_key.clone(), MAX_DECRYPT_RETRIES)
+        .insert(cache_key.clone(), (MAX_DECRYPT_RETRIES, None))
         .await;
 
     // Verify count is at max
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(MAX_DECRYPT_RETRIES)
     );
 
@@ -3750,7 +3789,11 @@ async fn test_spawn_retry_receipt_respects_max_retries() {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Count should still be at max (not incremented)
-    let stored = client.message_retry_counts.get(&cache_key).await;
+    let stored = client
+        .message_retry_counts
+        .get(&cache_key)
+        .await
+        .map(|(c, _)| c);
     assert_eq!(
         stored,
         Some(MAX_DECRYPT_RETRIES),
@@ -3813,12 +3856,12 @@ async fn test_multiple_senders_same_message_id_tracked_separately() {
 
     // Verify independent tracking
     assert_eq!(
-        client.message_retry_counts.get(&key1).await,
+        client.message_retry_counts.get(&key1).await.map(|(c, _)| c),
         Some(3),
         "Sender1 should have 3 retries"
     );
     assert_eq!(
-        client.message_retry_counts.get(&key2).await,
+        client.message_retry_counts.get(&key2).await.map(|(c, _)| c),
         Some(1),
         "Sender2 should have 1 retry"
     );
@@ -4112,12 +4155,22 @@ async fn test_no_sender_key_sends_immediate_retry() {
         .await;
     for _ in 0..20 {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        if client.message_retry_counts.get(&retry_key).await.is_some() {
+        if client
+            .message_retry_counts
+            .get(&retry_key)
+            .await
+            .map(|(c, _)| c)
+            .is_some()
+        {
             break;
         }
     }
     assert_eq!(
-        client.message_retry_counts.get(&retry_key).await,
+        client
+            .message_retry_counts
+            .get(&retry_key)
+            .await
+            .map(|(c, _)| c),
         Some(1),
         "NoSenderKeyState should immediately trigger retry receipt (count=1)"
     );
@@ -4475,7 +4528,11 @@ async fn test_revoked_message_still_retries() {
         .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
         .await;
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(1),
         "revoked message should still have retry count 1 (WA Web retries all messages)"
     );
@@ -4494,15 +4551,25 @@ async fn test_enc_count_preseeds_retry_cache() {
         .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
         .await;
     // Insert only if absent (portable alternative to moka's entry_by_ref().or_insert())
-    if client.message_retry_counts.get(&cache_key).await.is_none() {
+    if client
+        .message_retry_counts
+        .get(&cache_key)
+        .await
+        .map(|(c, _)| c)
+        .is_none()
+    {
         client
             .message_retry_counts
-            .insert(cache_key.clone(), max_sender_retry_count)
+            .insert(cache_key.clone(), (max_sender_retry_count, None))
             .await;
     }
 
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(3),
         "cache should be pre-seeded with sender retry count"
     );
@@ -4521,10 +4588,16 @@ async fn test_enc_no_count_cache_empty() {
         let cache_key = client
             .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
             .await;
-        if client.message_retry_counts.get(&cache_key).await.is_none() {
+        if client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c)
+            .is_none()
+        {
             client
                 .message_retry_counts
-                .insert(cache_key, max_sender_retry_count)
+                .insert(cache_key, (max_sender_retry_count, None))
                 .await;
         }
     }
@@ -4533,7 +4606,12 @@ async fn test_enc_no_count_cache_empty() {
         .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
         .await;
     assert!(
-        client.message_retry_counts.get(&cache_key).await.is_none(),
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c)
+            .is_none(),
         "cache should be empty when no count attribute"
     );
 }
@@ -4552,7 +4630,7 @@ async fn test_enc_count_does_not_overwrite_higher() {
     // Pre-insert a higher value
     client
         .message_retry_counts
-        .insert(cache_key.clone(), 4)
+        .insert(cache_key.clone(), (4, None))
         .await;
 
     // max(existing, incoming) should NOT overwrite with a lower value
@@ -4561,16 +4639,21 @@ async fn test_enc_count_does_not_overwrite_higher() {
         .message_retry_counts
         .get(&cache_key)
         .await
+        .map(|(c, _)| c)
         .unwrap_or(0);
     if max_sender_retry_count > existing {
         client
             .message_retry_counts
-            .insert(cache_key.clone(), max_sender_retry_count)
+            .insert(cache_key.clone(), (max_sender_retry_count, None))
             .await;
     }
 
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(4),
         "should not overwrite existing higher value"
     );
@@ -4590,7 +4673,7 @@ async fn test_enc_count_updates_when_sender_higher() {
     // Pre-insert a lower value
     client
         .message_retry_counts
-        .insert(cache_key.clone(), 1)
+        .insert(cache_key.clone(), (1, None))
         .await;
 
     // max(existing, incoming) SHOULD update with a higher value
@@ -4599,16 +4682,21 @@ async fn test_enc_count_updates_when_sender_higher() {
         .message_retry_counts
         .get(&cache_key)
         .await
+        .map(|(c, _)| c)
         .unwrap_or(0);
     if max_sender_retry_count > existing {
         client
             .message_retry_counts
-            .insert(cache_key.clone(), max_sender_retry_count)
+            .insert(cache_key.clone(), (max_sender_retry_count, None))
             .await;
     }
 
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(3),
         "should update to higher sender count"
     );
@@ -4879,7 +4967,14 @@ async fn test_undecryptable_fires_before_retry_task() {
         .await;
 
     assert!(recorder.undecryptable().is_empty());
-    assert!(client.message_retry_counts.get(&cache_key).await.is_none());
+    assert!(
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c)
+            .is_none()
+    );
 
     let _ = client
         .handle_decrypt_failure(&info, RetryReason::InvalidKeyId, DecryptFailMode::Show)
@@ -4891,13 +4986,22 @@ async fn test_undecryptable_fires_before_retry_task() {
         "UndecryptableMessage dispatched inside handle_decrypt_failure",
     );
     assert!(
-        client.message_retry_counts.get(&cache_key).await.is_none(),
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c)
+            .is_none(),
         "retry task has not progressed yet",
     );
 
     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(1),
         "retry task runs after the dispatch",
     );

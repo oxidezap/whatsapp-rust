@@ -291,10 +291,12 @@ impl Client {
             let cache_key = self
                 .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
                 .await;
-            let existing = self.message_retry_counts.get(&cache_key).await.unwrap_or(0);
-            if max_sender_retry_count > existing {
+            let existing = self.message_retry_counts.get(&cache_key).await;
+            if max_sender_retry_count > existing.map_or(0, |(count, _)| count) {
+                // Keep any locally recorded reason; the echoed count carries none.
+                let reason = existing.and_then(|(_, reason)| reason);
                 self.message_retry_counts
-                    .insert(cache_key, max_sender_retry_count)
+                    .insert(cache_key, (max_sender_retry_count, reason))
                     .await;
             }
             log::debug!(

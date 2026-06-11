@@ -436,15 +436,16 @@ pub struct Client {
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
 
     /// Track retry attempts per message to prevent infinite retry loops.
-    /// Key: "{chat}:{msg_id}:{sender}", Value: retry count
-    /// Matches WhatsApp Web's MAX_RETRY = 5 behavior.
-    pub(crate) message_retry_counts: Cache<String, u8>,
-
-    /// Most recent `RetryReason` we attached to a retry receipt for this
-    /// message (same key shape as `message_retry_counts`). Lets diagnostics
-    /// and regression tests distinguish which decrypt-failure arm actually
-    /// ran (the count alone can't separate NoSession from BadMac etc.).
-    pub(crate) recent_retry_reasons: Cache<String, wacore::protocol::retry::RetryReason>,
+    /// Key: "{chat}:{msg_id}:{sender}", Value: retry count plus the most
+    /// recent `RetryReason` we attached, fused so the decrypt-failure path
+    /// does one cache write and the binary carries one moka instantiation
+    /// instead of two. The reason is `None` when the count was learned from
+    /// the sender's echoed stanza `count` attribute rather than a local
+    /// decrypt failure; diagnostics and regression tests read it to tell
+    /// which failure arm ran (the count alone can't separate NoSession from
+    /// BadMac etc.). Matches WhatsApp Web's MAX_RETRY = 5 behavior.
+    pub(crate) message_retry_counts:
+        Cache<String, (u8, Option<wacore::protocol::retry::RetryReason>)>,
 
     /// Per-peer timestamp of the last forced session recreate via the
     /// "no keys + retry≥2 + >1h since last" path (whatsmeow parity).

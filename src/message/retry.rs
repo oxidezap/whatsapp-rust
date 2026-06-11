@@ -137,14 +137,13 @@ impl Client {
         let cache_key = cache_key.to_owned();
         let current = self.message_retry_counts.get(&cache_key).await;
         let new_count = match current {
-            Some(count) if count >= MAX_DECRYPT_RETRIES => return None,
-            Some(count) => count + 1,
+            Some((count, _)) if count >= MAX_DECRYPT_RETRIES => return None,
+            Some((count, _)) => count + 1,
             None => 1,
         };
         self.message_retry_counts
-            .insert(cache_key.clone(), new_count)
+            .insert(cache_key, (new_count, Some(reason)))
             .await;
-        self.recent_retry_reasons.insert(cache_key, reason).await;
         Some(new_count)
     }
 
