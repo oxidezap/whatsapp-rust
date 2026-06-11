@@ -1,4 +1,4 @@
-use crate::types::events::{Event, EventKind, LazyHistorySync};
+use crate::types::events::{Event, LazyHistorySync};
 use std::sync::Arc;
 use wacore::history_sync::{HistoryMsgSecretRecord, TcTokenCandidate, process_history_sync};
 use wacore::store::traits::{MsgSecretEntry, TcTokenEntry};
@@ -211,12 +211,12 @@ impl Client {
                 self.store_history_sync_msg_secrets(sync_result.msg_secret_records)
                     .await;
 
-                // Dispatch-time interest check: a bot with no HistorySync
-                // handler drops the compressed payload here (it was a move,
-                // never a copy), while one registered mid-parse still wins.
-                if self.core.event_bus.has_handler_for(EventKind::HistorySync)
-                    && let Some(compressed) = sync_result.compressed_bytes
-                {
+                // No interest pre-check: dispatch() evaluates handler interest
+                // against a single bus snapshot (and skips materializing the
+                // Arc when nobody listens), so deferring to it removes the
+                // check-to-dispatch race window entirely. Building the event
+                // is just a Bytes refcount move plus metadata.
+                if let Some(compressed) = sync_result.compressed_bytes {
                     let lazy_hs = LazyHistorySync::new(
                         compressed,
                         sync_result.decompressed_size,
