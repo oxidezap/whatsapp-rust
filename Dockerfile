@@ -47,12 +47,17 @@ ENV CARGO_UNSTABLE_BUILD_STD="std,panic_abort"
 # chef stage's copy at /; the nightly-only RUSTFLAGS above depends on it.
 COPY rust-toolchain.toml .
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json --target x86_64-unknown-linux-musl
+# build-std demands an explicit --target; use the image's own host triple so
+# multi-arch builds (e.g. buildx linux/arm64) keep producing native binaries
+# exactly like the implicit-target build did.
+RUN rustc -vV | sed -n 's/^host: //p' > /rust-target
+RUN cargo chef cook --release --recipe-path recipe.json --target "$(cat /rust-target)"
 COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl
+RUN cargo build --release --target "$(cat /rust-target)" \
+    && cp "target/$(cat /rust-target)/release/whatsapp-rust" /app/whatsapp-rust-bin
 
 # --- Runtime: static binary on empty image ---
 FROM scratch
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/whatsapp-rust /whatsapp-rust
+COPY --from=builder /app/whatsapp-rust-bin /whatsapp-rust
 WORKDIR /data
 ENTRYPOINT ["/whatsapp-rust"]
