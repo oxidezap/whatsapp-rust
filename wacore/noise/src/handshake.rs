@@ -380,7 +380,7 @@ pub struct IkFallbackInputs {
 pub enum IkServerHelloOutcome {
     /// Server accepted IK; cert payload was decrypted and the cipher keys
     /// are derivable. The cached cert chain on the device stays untouched.
-    Continue(IkHandshakeOutcome),
+    Continue(Box<IkHandshakeOutcome>),
     /// Server rejected IK by replying with `static != null`. Switch to
     /// XX-fallback using the carryover inputs. Boxed since `IkFallbackInputs`
     /// holds two KeyPairs and a payload, dwarfing `Continue`'s two ciphers.
@@ -630,10 +630,12 @@ impl IkHandshakeState {
         let _cert_plaintext = noise.decrypt(&cert_payload)?;
 
         let (write_cipher, read_cipher) = noise.finish()?;
-        Ok(IkServerHelloOutcome::Continue(IkHandshakeOutcome {
-            write_cipher,
-            read_cipher,
-        }))
+        Ok(IkServerHelloOutcome::Continue(Box::new(
+            IkHandshakeOutcome {
+                write_cipher,
+                read_cipher,
+            },
+        )))
     }
 }
 

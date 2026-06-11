@@ -15,7 +15,7 @@ pub use aes_cbc::{
     DecryptionError, EncryptionError, aes_256_cbc_decrypt_into, aes_256_cbc_encrypt_into,
 };
 pub use aes_ctr::Aes256Ctr32;
-pub use aes_gcm::{Aes256GcmDecryption, Aes256GcmEncryption};
+pub use aes_gcm::{Aes256GcmDecryption, Aes256GcmEncryption, Aes256GcmKey};
 pub use error::{Error, Result};
 pub use hash::{
     CryptographicHash, CryptographicMac, SHA1_OUTPUT_SIZE, SHA256_OUTPUT_SIZE, SHA512_OUTPUT_SIZE,

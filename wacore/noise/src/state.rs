@@ -2,8 +2,8 @@ use crate::error::{NoiseError, Result};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use wacore_libsignal::crypto::{
-    GcmInPlaceBuffer, aes_256_gcm_decrypt, aes_256_gcm_decrypt_in_place, aes_256_gcm_encrypt,
-    aes_256_gcm_encrypt_in_place,
+    Aes256GcmDecryption, Aes256GcmEncryption, Aes256GcmKey, CryptoProviderError, GcmInPlaceBuffer,
+    aes_256_gcm_decrypt, aes_256_gcm_encrypt,
 };
 
 /// Buffer kinds accepted by [`NoiseCipher::decrypt_in_place_with_counter`].
@@ -25,13 +25,19 @@ const TAG_LEN: usize = 16;
 /// A cipher wrapper that encapsulates AES-256-GCM encryption/decryption
 /// with counter-based IV generation.
 pub struct NoiseCipher {
-    key: [u8; 32],
+    /// Pre-keyed GCM state: the transport key is fixed for the connection,
+    /// so the AES key schedule and the GHASH subkey are derived once here
+    /// instead of on every frame.
+    key: Aes256GcmKey,
 }
 
 impl NoiseCipher {
     /// Creates a new cipher from a 32-byte key.
     pub fn new(key: &[u8; 32]) -> Result<Self> {
-        Ok(Self { key: *key })
+        Ok(Self {
+            key: Aes256GcmKey::new(key)
+                .map_err(|_| NoiseError::Encrypt(CryptoProviderError::BadInput))?,
+        })
     }
 
     /// Encrypts plaintext using the specified counter for IV generation.
@@ -39,8 +45,11 @@ impl NoiseCipher {
     pub fn encrypt_with_counter(&self, counter: u32, plaintext: &[u8]) -> Result<Vec<u8>> {
         let iv = generate_iv(counter);
         let mut out = Vec::with_capacity(plaintext.len() + TAG_LEN);
-        aes_256_gcm_encrypt(&self.key, &iv, b"", plaintext, &mut out)
-            .map_err(NoiseError::Encrypt)?;
+        out.extend_from_slice(plaintext);
+        let mut enc = Aes256GcmEncryption::new_with_key(&self.key, &iv, b"")
+            .map_err(|_| NoiseError::Encrypt(CryptoProviderError::BadInput))?;
+        enc.encrypt(&mut out);
+        out.extend_from_slice(&enc.compute_tag());
         Ok(out)
     }
 
@@ -54,7 +63,14 @@ impl NoiseCipher {
         buffer: &mut B,
     ) -> Result<()> {
         let iv = generate_iv(counter);
-        aes_256_gcm_encrypt_in_place(&self.key, &iv, b"", buffer).map_err(NoiseError::Encrypt)
+        let plaintext_len = buffer.len();
+        let mut enc = Aes256GcmEncryption::new_with_key(&self.key, &iv, b"")
+            .map_err(|_| NoiseError::Encrypt(CryptoProviderError::BadInput))?;
+        enc.encrypt(buffer.as_mut_slice());
+        let tag = enc.compute_tag();
+        buffer.resize(plaintext_len + TAG_LEN, 0);
+        buffer.as_mut_slice()[plaintext_len..].copy_from_slice(&tag);
+        Ok(())
     }
 
     /// Decrypts ciphertext (with 16-byte tag appended) in-place within the
@@ -67,7 +83,21 @@ impl NoiseCipher {
         buffer: &mut B,
     ) -> Result<()> {
         let iv = generate_iv(counter);
-        aes_256_gcm_decrypt_in_place(&self.key, &iv, b"", buffer).map_err(NoiseError::Decrypt)
+        let total = buffer.len();
+        if total < TAG_LEN {
+            return Err(NoiseError::Decrypt(CryptoProviderError::BadInput));
+        }
+        let pt_len = total - TAG_LEN;
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&buffer.as_slice()[pt_len..]);
+
+        let mut dec = Aes256GcmDecryption::new_with_key(&self.key, &iv, b"")
+            .map_err(|_| NoiseError::Decrypt(CryptoProviderError::BadInput))?;
+        dec.decrypt(&mut buffer.as_mut_slice()[..pt_len]);
+        dec.verify_tag(&tag)
+            .map_err(|_| NoiseError::Decrypt(CryptoProviderError::AuthFailed))?;
+        buffer.truncate(pt_len);
+        Ok(())
     }
 }
 
