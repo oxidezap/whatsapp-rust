@@ -177,6 +177,10 @@ pub struct SenderKeyState {
     /// rebuilt lazily after a cold load. If a signing-key setter is ever
     /// added, it must reset this memo.
     signing_key_memo: std::sync::OnceLock<PrivateKey>,
+    /// Receive-side mirror of `signing_key_memo`: cached verifier whose
+    /// Edwards derivations are reused across every incoming message under
+    /// this sender key. Same lifecycle rules as above.
+    verifying_key_memo: std::sync::OnceLock<crate::core::curve::PreparedVerifyingKey>,
 }
 
 // Manual impl with the signing key REDACTED: the protobuf state embeds the
@@ -224,9 +228,22 @@ impl SenderKeyState {
             key.precompute_signing_cache();
             let _ = signing_key_memo.set(key);
         }
+        let verifying_key_memo = std::sync::OnceLock::new();
+        if signing_key_memo.get().is_none() {
+            // Receive-side state (no private key): this key will verify every
+            // incoming message, so build the verifier and derive its Edwards
+            // entries here, at SKDM processing, once per sender rotation.
+            // Send-side states never verify their own messages, so they skip
+            // even the verifier allocation; the memo builds lazily if ever
+            // asked.
+            let verifier = crate::core::curve::PreparedVerifyingKey::new(&signature_key);
+            verifier.precompute();
+            let _ = verifying_key_memo.set(verifier);
+        }
         Self {
             state,
             signing_key_memo,
+            verifying_key_memo,
         }
     }
 
@@ -234,6 +251,7 @@ impl SenderKeyState {
         Self {
             state,
             signing_key_memo: std::sync::OnceLock::new(),
+            verifying_key_memo: std::sync::OnceLock::new(),
         }
     }
 
@@ -274,6 +292,23 @@ impl SenderKeyState {
         } else {
             Err(InvalidSenderKeySessionError("missing signing key"))
         }
+    }
+
+    /// Cached verifier for this sender's signing key; the Edwards
+    /// derivations warm on first use and persist with the in-memory state.
+    pub fn signing_key_verifier(
+        &self,
+    ) -> Result<&crate::core::curve::PreparedVerifyingKey, InvalidSenderKeySessionError> {
+        if let Some(verifier) = self.verifying_key_memo.get() {
+            return Ok(verifier);
+        }
+        let verifier = crate::core::curve::PreparedVerifyingKey::new(&self.signing_key_public()?);
+        // Benign race: concurrent firsts compute the same value.
+        let _ = self.verifying_key_memo.set(verifier);
+        Ok(self
+            .verifying_key_memo
+            .get()
+            .expect("set on the line above"))
     }
 
     pub fn signing_key_private(&self) -> Result<PrivateKey, InvalidSenderKeySessionError> {
@@ -638,6 +673,19 @@ mod tests {
                 .expect("cloned key")
                 .has_warm_signing_cache()
         );
+
+        // Verifier memo: send-side states (private key present) skip even
+        // the allocation; it builds lazily if asked, is seeded eagerly only
+        // on receive-side creation, rebuilds after a cold load, and clones
+        // carry it.
+        assert!(state.verifying_key_memo.get().is_none());
+        let _ = state.signing_key_verifier().expect("lazy build works");
+        assert!(state.verifying_key_memo.get().is_some());
+        let cold = SenderKeyState::from_protobuf(state.as_protobuf());
+        assert!(cold.verifying_key_memo.get().is_none());
+        let _ = cold.signing_key_verifier().expect("verifier");
+        assert!(cold.verifying_key_memo.get().is_some());
+        assert!(cold.clone().verifying_key_memo.get().is_some());
 
         // The memoized key still signs correctly.
         let msg = b"skmsg";

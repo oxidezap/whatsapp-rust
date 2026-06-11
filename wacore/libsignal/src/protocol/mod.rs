@@ -32,7 +32,7 @@ mod state;
 mod storage;
 mod stores;
 mod timestamp;
-pub use crate::core::curve::{CurveError, KeyPair, PrivateKey, PublicKey};
+pub use crate::core::curve::{CurveError, KeyPair, PreparedVerifyingKey, PrivateKey, PublicKey};
 pub use crate::core::{
     Aci, DeviceId, Pni, ProtocolAddress, ServiceId, ServiceIdFixedWidthBinaryBytes, ServiceIdKind,
 };

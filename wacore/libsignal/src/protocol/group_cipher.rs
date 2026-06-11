@@ -210,9 +210,9 @@ pub async fn group_decrypt(
     }
 
     let signing_key = sender_key_state
-        .signing_key_public()
+        .signing_key_verifier()
         .map_err(|_| SignalProtocolError::InvalidSenderKeySession)?;
-    if !skm.verify_signature(&signing_key)? {
+    if !skm.verify_signature_prepared(signing_key)? {
         return Err(SignalProtocolError::SignatureValidationFailed);
     }
 
