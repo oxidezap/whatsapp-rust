@@ -23,7 +23,7 @@ impl Client {
         };
 
         if let Some(bytes) = plaintext_node.content_bytes() {
-            match wa::Message::decode(bytes) {
+            match waproto::codec::message_decode(bytes) {
                 Ok(msg) => {
                     log::info!(
                         "[msg:{}] Received newsletter plaintext message from {}",

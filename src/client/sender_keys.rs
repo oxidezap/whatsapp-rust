@@ -186,13 +186,12 @@ impl Client {
 
     /// Look up and consume a message by exact `ChatMessageId` (L1 cache then DB).
     async fn try_take_by_key(&self, key: &ChatMessageId) -> Option<wa::Message> {
-        use prost::Message;
         let chat_str = key.chat.to_string();
         let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
 
         // L1 cache check (if capacity > 0)
         if has_l1_cache && let Some(bytes) = self.recent_messages.remove(key).await {
-            if let Ok(msg) = wa::Message::decode(bytes.as_slice()) {
+            if let Ok(msg) = waproto::codec::message_decode(bytes.as_slice()) {
                 // Cache hit — consume the DB row in the background to avoid orphans.
                 let backend = self.persistence_manager.backend();
                 let mid = key.id.clone();
@@ -219,7 +218,7 @@ impl Client {
             .take_sent_message(&chat_str, &key.id)
             .await
         {
-            Ok(Some(bytes)) => match wa::Message::decode(bytes.as_slice()) {
+            Ok(Some(bytes)) => match waproto::codec::message_decode(bytes.as_slice()) {
                 Ok(msg) => Some(msg),
                 Err(e) => {
                     log::warn!(
@@ -283,12 +282,11 @@ impl Client {
     /// (capacity 0) or misses; the DB is intentionally not read here so the caller
     /// can fall back to the consuming take + re-add path.
     async fn peek_by_key(&self, key: &ChatMessageId) -> Option<wa::Message> {
-        use prost::Message;
         if self.cache_config.recent_messages.capacity == 0 {
             return None;
         }
         let bytes = self.recent_messages.get(key).await?;
-        match wa::Message::decode(bytes.as_slice()) {
+        match waproto::codec::message_decode(bytes.as_slice()) {
             Ok(msg) => Some(msg),
             Err(e) => {
                 log::warn!(
@@ -307,9 +305,8 @@ impl Client {
     /// With L1 cache, the DB write is backgrounded since the cache serves reads immediately.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.add_recent_message", level = "debug", skip_all, fields(peer = %to.observe())))]
     pub(crate) async fn add_recent_message(&self, to: &Jid, id: &str, msg: &wa::Message) {
-        use prost::Message;
         let key = self.make_chat_message_id(to, id).await;
-        let bytes = msg.encode_to_vec();
+        let bytes = waproto::codec::message_to_vec(msg);
         let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
 
         if has_l1_cache {

@@ -4,7 +4,6 @@ use crate::types::message::MessageInfo;
 use crate::types::presence::{ChatPresence, ChatPresenceMedia, ReceiptType};
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
-use prost::Message;
 use serde::Serialize;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -131,7 +130,9 @@ impl LazyHistorySync {
             // Cheap refcount bump; the lock is released before decoding so a
             // concurrent reader isn't blocked by the parse.
             let raw = self.locked_raw().clone()?;
-            wa::HistorySync::decode(&raw[..]).ok().map(Box::new)
+            waproto::codec::history_sync_decode(&raw[..])
+                .ok()
+                .map(Box::new)
         });
         // Free the raw bytes only AFTER the owned proto is committed, so a
         // concurrent clone never sees both gone (raw == None implies parsed set).

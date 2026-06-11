@@ -20,7 +20,6 @@
 use anyhow::{Result, anyhow};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
-use prost::Message;
 use sha2::Sha256;
 use wacore_binary::Jid;
 use wacore_binary::Node;
@@ -512,7 +511,7 @@ pub fn generate_reporting_token_content(message: &wa::Message) -> Option<Vec<u8>
     if !should_include_reporting_token(message) {
         return None;
     }
-    let message_bytes = message.encode_to_vec();
+    let message_bytes = waproto::codec::message_to_vec(message);
     extract_reporting_token_content(&message_bytes, REPORTING_FIELDS)
 }
 
@@ -628,6 +627,7 @@ pub fn extract_message_secret(message: &wa::Message) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
 
     #[test]
     fn test_generate_message_secret() {

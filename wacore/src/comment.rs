@@ -8,7 +8,6 @@
 //! outer envelope.
 
 use anyhow::{Result, ensure};
-use prost::Message;
 use waproto::whatsapp as wa;
 
 use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
@@ -43,7 +42,7 @@ pub fn encrypt_comment_with_secret(
         "message_secret must be {MESSAGE_SECRET_SIZE} bytes, got {}",
         message_secret.len()
     );
-    let plaintext = inner.encode_to_vec();
+    let plaintext = waproto::codec::message_to_vec(inner);
     encrypt_addon(
         &plaintext,
         message_secret,
@@ -72,7 +71,7 @@ pub fn decrypt_comment_with_secret(
         message_secret,
         &comment_addon_ctx(parent_msg_id, parent_sender_jid, commenter_jid),
     )?;
-    Ok(wa::Message::decode(&plaintext[..])?)
+    Ok(waproto::codec::message_decode(&plaintext[..])?)
 }
 
 #[cfg(test)]

@@ -17,7 +17,6 @@
 use crate::client::Client;
 use crate::types::message::MessageInfo;
 use log::{debug, info, warn};
-use prost::Message;
 use std::sync::Arc;
 use wacore::types::message::{
     ChatMessageId, EditAttribute, MessageCategory, MessageSource, MsgMetaInfo,
@@ -335,13 +334,14 @@ impl Client {
             return;
         };
 
-        let web_msg_info = match wa::WebMessageInfo::decode(web_message_info_bytes.as_slice()) {
-            Ok(info) => info,
-            Err(e) => {
-                warn!("Failed to decode WebMessageInfo from PDO response: {:?}", e);
-                return;
-            }
-        };
+        let web_msg_info =
+            match waproto::codec::web_message_info_decode(web_message_info_bytes.as_slice()) {
+                Ok(info) => info,
+                Err(e) => {
+                    warn!("Failed to decode WebMessageInfo from PDO response: {:?}", e);
+                    return;
+                }
+            };
 
         let key = &web_msg_info.key;
         let remote_jid_str = key.remote_jid.as_deref().unwrap_or("");

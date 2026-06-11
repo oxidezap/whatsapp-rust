@@ -351,7 +351,6 @@ pub(crate) fn build_newsletter_edit_node(
     op: NewsletterEdit<'_>,
 ) -> Node {
     use crate::types::message::EditAttribute;
-    use prost::Message as _;
     let mut plaintext = NodeBuilder::new("plaintext");
     let (edit, stanza_type, body) = match op {
         NewsletterEdit::Edit(m) => {
@@ -361,7 +360,7 @@ pub(crate) fn build_newsletter_edit_node(
             (
                 EditAttribute::AdminEdit,
                 wacore::send::stanza_type_from_message(m),
-                m.encode_to_vec(),
+                waproto::codec::message_to_vec(m),
             )
         }
         NewsletterEdit::Revoke => (EditAttribute::AdminRevoke, "text", Vec::new()),
@@ -488,7 +487,6 @@ impl Client {
         // Newsletters are not E2E encrypted — send as plaintext via SMAX stanza.
         // Matches WA Web's OutMessagePublishNewsletterRequest + ContentType mixins.
         if to.is_newsletter() {
-            use prost::Message as _;
             let stanza_type = stanza_type_override
                 .map(StanzaType::as_wire)
                 .unwrap_or_else(|| wacore::send::stanza_type_from_message(&message));
@@ -497,7 +495,11 @@ impl Client {
             if let Some(mt) = wacore::send::media_type_from_message(&message) {
                 plaintext_builder = plaintext_builder.attr("mediatype", mt);
             }
-            let mut children = vec![plaintext_builder.bytes(message.encode_to_vec()).build()];
+            let mut children = vec![
+                plaintext_builder
+                    .bytes(waproto::codec::message_to_vec(&message))
+                    .build(),
+            ];
             children.extend(meta_node);
             children.extend(options.extra_stanza_nodes);
             let stanza = NodeBuilder::new("message")

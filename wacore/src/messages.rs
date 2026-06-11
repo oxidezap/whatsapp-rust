@@ -24,8 +24,8 @@ impl MessageUtils {
     /// Encode + pad in a single pre-sized allocation.
     pub fn encode_and_pad(msg: &wa::Message) -> Vec<u8> {
         let pad = Self::random_pad_len();
-        let mut buf = Vec::with_capacity(msg.encoded_len() + pad as usize);
-        msg.encode(&mut buf).expect("encode into pre-sized Vec");
+        let mut buf = Vec::with_capacity(waproto::codec::message_encoded_len(msg) + pad as usize);
+        waproto::codec::message_encode_into(msg, &mut buf);
         buf.resize(buf.len() + pad as usize, pad);
         buf
     }
@@ -47,10 +47,14 @@ impl MessageUtils {
     ) -> Vec<u8> {
         let pad = Self::random_pad_len();
         let extra_len = extra_context.map_or(0, |c| {
-            len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, c.encoded_len())
+            len_delimited_len(
+                TAG_MESSAGE_CONTEXT_INFO,
+                waproto::codec::message_context_info_encoded_len(c),
+            )
         });
-        let mut buf = Vec::with_capacity(msg.encoded_len() + extra_len + pad as usize);
-        msg.encode(&mut buf).expect("encode into pre-sized Vec");
+        let mut buf =
+            Vec::with_capacity(waproto::codec::message_encoded_len(msg) + extra_len + pad as usize);
+        waproto::codec::message_encode_into(msg, &mut buf);
         if let Some(c) = extra_context {
             push_message_field(TAG_MESSAGE_CONTEXT_INFO, c, &mut buf);
         }
@@ -94,7 +98,7 @@ impl MessageUtils {
                 let ctx = owned
                     .message_context_info
                     .get_or_insert_with(Default::default);
-                ctx.merge(extra.encode_to_vec().as_slice())
+                ctx.merge(waproto::codec::message_context_info_to_vec(extra).as_slice())
                     .expect("merge MessageContextInfo");
             }
             return Self::encode_dm_plaintexts_owned(owned, destination_jid);
@@ -107,18 +111,19 @@ impl MessageUtils {
         const MAX_PAD: usize = 16;
 
         let mci_field_len = extra_context.map_or(0, |m| {
-            len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, m.encoded_len())
+            len_delimited_len(
+                TAG_MESSAGE_CONTEXT_INFO,
+                waproto::codec::message_context_info_encoded_len(m),
+            )
         });
-        let content_len = message.encoded_len();
+        let content_len = waproto::codec::message_encoded_len(message);
         let dest = destination_jid.as_bytes();
 
         // recipient = content (encoded once) + the extra message_context_info field.
         // Pre-size for content + the appended mci field + padding so it never
         // reallocates; the content bytes are then spliced into the own-device buffer.
         let mut recipient = Vec::with_capacity(content_len + mci_field_len + MAX_PAD);
-        message
-            .encode(&mut recipient)
-            .expect("encode into pre-sized Vec");
+        waproto::codec::message_encode_into(message, &mut recipient);
 
         // own-device plaintext = Message { device_sent_message { destination_jid,
         // message }, [message_context_info] }. The DeviceSentMessage length is
@@ -160,15 +165,16 @@ impl MessageUtils {
         // mci struct (not a temp Vec): it is small and encoded straight into each buffer.
         let mci = message.message_context_info.take();
         let mci_field_len = mci.as_ref().map_or(0, |m| {
-            len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, m.encoded_len())
+            len_delimited_len(
+                TAG_MESSAGE_CONTEXT_INFO,
+                waproto::codec::message_context_info_encoded_len(m),
+            )
         });
-        let content_len = message.encoded_len();
+        let content_len = waproto::codec::message_encoded_len(&message);
         let dest = destination_jid.as_bytes();
 
         let mut recipient = Vec::with_capacity(content_len + mci_field_len + MAX_PAD);
-        message
-            .encode(&mut recipient)
-            .expect("encode into pre-sized Vec");
+        waproto::codec::message_encode_into(&message, &mut recipient);
 
         let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest.len())
             + len_delimited_len(TAG_DSM_MESSAGE, content_len);
@@ -268,7 +274,7 @@ impl MessageUtils {
 /// runtime-independent portion of `handle_decrypted_plaintext`.
 pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<wa::Message> {
     let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
-    wa::Message::decode(plaintext_slice)
+    waproto::codec::message_decode(plaintext_slice)
         .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
 }
 
@@ -332,10 +338,13 @@ fn len_delimited_len(field: u64, payload_len: usize) -> usize {
 /// straight into `out` (no intermediate `Vec`). Used for the small
 /// `message_context_info` field on both plaintexts.
 #[inline]
-fn push_message_field<M: ProtoMessage>(field: u64, msg: &M, out: &mut Vec<u8>) {
+fn push_message_field(field: u64, msg: &wa::MessageContextInfo, out: &mut Vec<u8>) {
     push_varint((field << 3) | 2, out);
-    push_varint(msg.encoded_len() as u64, out);
-    msg.encode(out).expect("encode into Vec is infallible");
+    push_varint(
+        waproto::codec::message_context_info_encoded_len(msg) as u64,
+        out,
+    );
+    waproto::codec::message_context_info_encode_into(msg, out);
 }
 
 /// Wrap a message into a DeviceSentMessage for own-device sync, hoisting

@@ -689,7 +689,7 @@ impl Client {
             },
         };
 
-        let msg = match wa::Message::decode(plaintext.as_slice()) {
+        let msg = match waproto::codec::message_decode(plaintext.as_slice()) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!(
