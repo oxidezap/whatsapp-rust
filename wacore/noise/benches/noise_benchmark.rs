@@ -21,7 +21,8 @@ fn bench_frame_encrypt_in_place(bencher: divan::Bencher, len: usize) {
         .with_inputs(|| (NoiseCipher::new(&KEY).unwrap(), frame(len)))
         .bench_refs(|(cipher, buf)| {
             cipher.encrypt_in_place_with_counter(7, buf).unwrap();
-            black_box(buf.len())
+            // Contents, not length: keeps the in-place writes observable.
+            black_box(buf.as_slice());
         });
 }
 
@@ -36,6 +37,7 @@ fn bench_frame_decrypt_in_place(bencher: divan::Bencher, len: usize) {
         })
         .bench_refs(|(cipher, buf)| {
             cipher.decrypt_in_place_with_counter(7, buf).unwrap();
-            black_box(buf.len())
+            // Contents, not length: keeps the in-place writes observable.
+            black_box(buf.as_slice());
         });
 }

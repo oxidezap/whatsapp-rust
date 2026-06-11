@@ -209,7 +209,8 @@ fn bench_marshal_to_reused_buffer_large(bencher: divan::Bencher) {
         .with_inputs(|| (create_large_node(), Vec::with_capacity(4096)))
         .bench_refs(|(node, buffer)| {
             marshal_to(black_box(node), buffer).unwrap();
-            black_box(buffer.len())
+            // Contents, not length: keeps the marshal writes observable.
+            black_box(buffer.as_slice());
         });
 }
 

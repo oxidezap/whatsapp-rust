@@ -52,6 +52,8 @@ fn bench_jid_push_ad_to(bencher: divan::Bencher) {
         })
         .bench_refs(|(jid, buf)| {
             jid.push_ad_to(buf);
-            black_box(buf.len())
+            // black-box the contents, not just the length: observing only
+            // `len` lets LLVM elide the actual formatting writes.
+            black_box(buf.as_bytes());
         });
 }
