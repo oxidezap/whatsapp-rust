@@ -288,12 +288,15 @@ pub struct DmPlaintexts {
     pub own_devices: Vec<u8>,
 }
 
-// Protobuf field numbers spliced by `encode_dm_plaintexts`. A wrong tag changes
-// the decoded result, so the `splice_*` differential tests pin them against prost.
-const TAG_DEVICE_SENT_MESSAGE: u64 = 31; // Message.device_sent_message
-const TAG_MESSAGE_CONTEXT_INFO: u64 = 35; // Message.message_context_info
-const TAG_DSM_DESTINATION_JID: u64 = 1; // DeviceSentMessage.destination_jid
-const TAG_DSM_MESSAGE: u64 = 2; // DeviceSentMessage.message
+// Protobuf field numbers spliced by `encode_dm_plaintexts`, sourced from the
+// generated schema tags so a .proto renumber breaks here at compile time
+// instead of silently changing the wire payload. The `splice_*` differential
+// tests still pin the hand-written framing itself against prost.
+const TAG_DEVICE_SENT_MESSAGE: u64 = waproto::tags::message::DEVICE_SENT_MESSAGE as u64;
+const TAG_MESSAGE_CONTEXT_INFO: u64 = waproto::tags::message::MESSAGE_CONTEXT_INFO as u64;
+const TAG_DSM_DESTINATION_JID: u64 =
+    waproto::tags::message::device_sent_message::DESTINATION_JID as u64;
+const TAG_DSM_MESSAGE: u64 = waproto::tags::message::device_sent_message::MESSAGE as u64;
 
 /// Append a base-128 varint (protobuf wire format).
 #[inline]
