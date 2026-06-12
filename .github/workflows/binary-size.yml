@@ -73,8 +73,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # --event push: a fork PR from a branch named "main" also matches
+          # --branch main, and its artifact must not become the baseline.
           run_id=$(gh run list --workflow binary-size.yml --branch main \
-            --status success --limit 1 --json databaseId \
+            --event push --status success --limit 1 --json databaseId \
             --jq '.[0].databaseId' || true)
           if [ -n "$run_id" ] && [ "$run_id" != "null" ]; then
             if gh run download "$run_id" --name size-metrics --dir base-out; then
