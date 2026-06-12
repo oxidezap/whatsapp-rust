@@ -73,3 +73,67 @@ fn bench_unpad_message_ref(bencher: divan::Bencher) {
             )
         });
 }
+
+fn dm_shape(shape: &str) -> wa::Message {
+    match shape {
+        "text_reply" => text_message(),
+        "media_refs" => wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                url: Some("https://mmg.whatsapp.net/v/t62.7118-24/abc123".into()),
+                direct_path: Some("/v/t62.7118-24/abc123".into()),
+                mimetype: Some("image/jpeg".into()),
+                caption: Some("Benchmark media caption".into()),
+                media_key: Some(vec![0xA5; 32]),
+                file_sha256: Some(vec![0x11; 32]),
+                file_enc_sha256: Some(vec![0x22; 32]),
+                file_length: Some(184_320),
+                height: Some(1280),
+                width: Some(960),
+                jpeg_thumbnail: Some(vec![0x7F; 6 * 1024]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+        "large_text" => wa::Message {
+            conversation: Some("Lorem ipsum dolor sit amet 0123456789 ".repeat(108)),
+            ..Default::default()
+        },
+        other => unreachable!("unknown shape {other}"),
+    }
+}
+
+/// The CPU a single DM send pays in the encode/token department, mirroring
+/// `wacore::send::dm` plus the retry-cache serialization the client does:
+/// reporting token (full content encode + HKDF + HMAC), the splice into the
+/// recipient and DeviceSentMessage plaintexts, and the recent-message bytes.
+/// Exists so flamegraphs keep the byte-identical encode pair (reporting
+/// content vs retry bytes) visible while it remains deduplicable.
+#[divan::bench(args = ["text_reply", "media_refs", "large_text"])]
+fn bench_dm_send_encode_work(bencher: divan::Bencher, shape: &str) {
+    use wacore::reporting_token::{
+        extract_message_secret, generate_reporting_token, reporting_context_info,
+    };
+
+    let own_jid: Jid = "5511999990000:7@s.whatsapp.net".parse().unwrap();
+    let to_jid: Jid = "5511888887777@s.whatsapp.net".parse().unwrap();
+
+    bencher
+        .with_inputs(|| dm_shape(shape))
+        .bench_refs(|message| {
+            let reporting_result = generate_reporting_token(
+                black_box(message),
+                "3EB0BENCHBENCHBENCH01",
+                &own_jid,
+                &to_jid,
+                extract_message_secret(message),
+            );
+            let extra_context = reporting_result.as_ref().map(reporting_context_info);
+            let plaintexts = MessageUtils::encode_dm_plaintexts(
+                black_box(message),
+                extra_context.as_ref(),
+                "5511888887777@s.whatsapp.net",
+            );
+            let retry_bytes = waproto::codec::message_to_vec(black_box(message));
+            black_box((plaintexts, retry_bytes))
+        });
+}
