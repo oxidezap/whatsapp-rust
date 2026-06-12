@@ -258,8 +258,10 @@ const USE_CASE_REPORT_TOKEN: &str = "Report Token";
 /// Generate a random message secret (32 bytes)
 pub fn generate_message_secret() -> [u8; MESSAGE_SECRET_SIZE] {
     use rand::RngExt;
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-    rng.random()
+    // Pull straight from the thread RNG (an auto-reseeding CSPRNG) rather than
+    // seeding a fresh StdRng per call; the discarded per-send ChaCha reseed
+    // showed up as ~16% of the small-message send-token cost in the flamegraph.
+    rand::rng().random()
 }
 
 /// Build the HKDF info bytes for reporting token key derivation.
