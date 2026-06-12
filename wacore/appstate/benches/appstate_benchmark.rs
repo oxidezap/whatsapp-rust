@@ -7,7 +7,8 @@ use divan::black_box;
 use std::collections::HashMap;
 use std::sync::Arc;
 use wacore_appstate::{
-    WAPATCH_INTEGRITY, encode_record, expand_app_state_keys, hash::HashState, process_patch,
+    WAPATCH_INTEGRITY, decode_record, encode_record, expand_app_state_keys, hash::HashState,
+    process_patch,
 };
 use waproto::whatsapp as wa;
 
@@ -138,5 +139,81 @@ fn bench_process_patch_50_validated(bencher: divan::Bencher) {
                 )
                 .unwrap(),
             );
+        });
+}
+
+/// One encrypted app-state record built the way the server delivers it, so
+/// `decode_record` runs its full inbound cost: AES-256-CBC decrypt, the content
+/// HMAC-SHA512 and index HMAC-SHA256 validation, the prost decode of the action
+/// value, and the serde_json parse of the index array. This runs once per
+/// mutation, up to ~1000× per resume patch; `process_patch` covers the whole
+/// loop but never isolates this inner per-record cost.
+fn setup_record(
+    shape: &str,
+) -> (
+    wa::SyncdRecord,
+    wacore_appstate::ExpandedAppStateKeys,
+    Vec<u8>,
+) {
+    let keys = expand_app_state_keys(&[0x07u8; 32]);
+    let key_id = b"AAAA".to_vec();
+    let (index, value) = match shape {
+        // A starred-message mutation: 5-part index (the real STAR schema),
+        // tiny action value.
+        "star" => (
+            "[\"star\",\"5511000000000@s.whatsapp.net\",\"3EB0123456789ABCDEF01234\",\"1\",\"0\"]"
+                .to_string(),
+            wa::SyncActionValue {
+                timestamp: Some(1_700_000_000),
+                star_action: Some(wa::sync_action_value::StarAction {
+                    starred: Some(true),
+                }),
+                ..Default::default()
+            },
+        ),
+        // A contact mutation: longer index plus a name-carrying value, the
+        // larger-payload end of the AES/HMAC cost.
+        "contact" => (
+            "[\"contact\",\"5511999998888@s.whatsapp.net\"]".to_string(),
+            wa::SyncActionValue {
+                timestamp: Some(1_700_000_000),
+                contact_action: Some(wa::sync_action_value::ContactAction {
+                    full_name: Some("Benchmark Contact Full Name".to_string()),
+                    first_name: Some("Benchmark".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ),
+        other => unreachable!("unknown shape {other}"),
+    };
+    let (mutation, _value_mac) = encode_record(
+        wa::syncd_mutation::SyncdOperation::Set,
+        index.as_bytes(),
+        &value,
+        &keys,
+        &key_id,
+        &[0x11u8; 16],
+        1,
+    );
+    let record = mutation.record.expect("encoded record");
+    (record, keys, key_id)
+}
+
+#[divan::bench(args = ["star", "contact"])]
+fn bench_decode_record(bencher: divan::Bencher, shape: &str) {
+    bencher
+        .with_inputs(|| setup_record(shape))
+        .bench_refs(|(record, keys, key_id)| {
+            black_box(
+                decode_record(
+                    wa::syncd_mutation::SyncdOperation::Set,
+                    black_box(record),
+                    black_box(keys),
+                    black_box(key_id),
+                    true,
+                )
+                .unwrap(),
+            )
         });
 }

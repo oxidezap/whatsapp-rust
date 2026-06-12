@@ -173,3 +173,96 @@ fn bench_dm_send_encode_work(bencher: divan::Bencher, shape: &str) {
             black_box((plaintexts, retry_bytes, reporting_result))
         });
 }
+
+/// A `<message>` stanza with the attributes each inbound shape carries, so
+/// `parse_message_info` exercises every arm of its addressing-mode dispatch.
+/// Each carries an `<enc>` child like every real message, so the
+/// `get_optional_child` scans run instead of returning instant-None.
+fn msg_info_node(shape: &str) -> wacore_binary::node::Node {
+    use wacore_binary::builder::NodeBuilder;
+    let enc = || {
+        NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .attr("v", "2")
+            .bytes(vec![0u8; 64])
+            .build()
+    };
+    match shape {
+        // Plain 1:1 DM from a PN peer; sender_lid carries the LID fallback a
+        // LID-migrated peer sends, exercising the self/other-DM sender_alt arm.
+        "dm_pn" => NodeBuilder::new("message")
+            .attr("from", "5511888887777@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "3EB0BENCH000000000001")
+            .attr("t", "1777415965")
+            .attr("notify", "Bench Peer")
+            .attr("sender_lid", "100000012345678@lid")
+            .children([enc()])
+            .build(),
+        // LID-addressed group message: participant is a LID JID, participant_pn
+        // carries the phone fallback the LID-PN cache re-warms from.
+        "group_lid" => NodeBuilder::new("message")
+            .attr("from", "120363000000000001@g.us")
+            .attr("type", "text")
+            .attr("id", "3EB0BENCH000000000002")
+            .attr("t", "1777415965")
+            .attr("addressing_mode", "lid")
+            .attr("participant", "100000012345678@lid")
+            .attr("participant_pn", "5511888887777@s.whatsapp.net")
+            .attr("notify", "Bench Member")
+            .children([enc()])
+            .build(),
+        // Status broadcast: from=status@broadcast, participant is the author,
+        // participant_lid warms the LID-PN cache.
+        "status_broadcast" => NodeBuilder::new("message")
+            .attr("from", "status@broadcast")
+            .attr("type", "media")
+            .attr("id", "3EB0BENCH000000000003")
+            .attr("t", "1777415965")
+            .attr("participant", "5511999990001@s.whatsapp.net")
+            .attr("participant_lid", "100000011111111@lid")
+            .children([enc()])
+            .build(),
+        // Self-sent message (from == own JID): recipient drives chat resolution.
+        "self_sent" => NodeBuilder::new("message")
+            .attr("from", "5511999990000:7@s.whatsapp.net")
+            .attr("recipient", "5511888887777@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "3EB0BENCH000000000004")
+            .attr("t", "1777415965")
+            .children([enc()])
+            .build(),
+        other => unreachable!("unknown shape {other}"),
+    }
+}
+
+/// Stanza-to-MessageInfo parse: the metadata extraction that runs once per
+/// inbound message before any Signal work. Exercises typed-JID attribute
+/// materialization and the addressing-mode dispatch. The input is a marshal
+/// round-trip decoded back into an `OwnedNodeRef` (untimed in `with_inputs`),
+/// so attributes arrive wire-typed (`ValueRef::Jid`) exactly as the decoder
+/// hands them to the receive path — not string-parsed, which production never
+/// does. Only the parse is measured; the whole `MessageInfo` is observed.
+#[divan::bench(args = ["dm_pn", "group_lid", "status_broadcast", "self_sent"])]
+fn bench_parse_message_info(bencher: divan::Bencher, shape: &str) {
+    use wacore_binary::node::OwnedNodeRef;
+    let own_jid: Jid = "5511999990000@s.whatsapp.net".parse().unwrap();
+    let own_lid: Jid = "100000000000000@lid".parse().unwrap();
+
+    bencher
+        .with_inputs(|| {
+            let bytes = wacore_binary::marshal::marshal(&msg_info_node(shape)).unwrap();
+            // marshal prefixes a flag byte; the receive path strips it in unpack.
+            OwnedNodeRef::new(bytes[1..].to_vec()).unwrap()
+        })
+        .bench_refs(|owned| {
+            black_box(
+                wacore::messages::parse_message_info(
+                    black_box(owned.get()),
+                    &own_jid,
+                    Some(&own_lid),
+                )
+                .unwrap(),
+            )
+        });
+}

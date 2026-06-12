@@ -9,11 +9,11 @@ fn main() {
 use wacore_libsignal::protocol::{
     ChainKey, CiphertextMessage, Direction, GenericSignedPreKey, IdentityChange, IdentityKey,
     IdentityKeyPair, IdentityKeyStore, KeyPair, MessageKeyGenerator, PreKeyBundle, PreKeyId,
-    PreKeyRecord, PreKeyStore, ProtocolAddress, RootKey, SenderKeyRecord, SenderKeyStore,
-    SessionRecord, SessionState, SessionStore, SignedPreKeyId, SignedPreKeyRecord,
-    SignedPreKeyStore, Timestamp, UsePQRatchet, consts, create_sender_key_distribution_message,
-    group_decrypt, group_encrypt, message_decrypt, message_encrypt, process_prekey_bundle,
-    process_sender_key_distribution_message,
+    PreKeyRecord, PreKeyStore, ProtocolAddress, RootKey, SenderKeyDistributionMessage,
+    SenderKeyRecord, SenderKeyStore, SessionRecord, SessionState, SessionStore, SignedPreKeyId,
+    SignedPreKeyRecord, SignedPreKeyStore, Timestamp, UsePQRatchet, consts,
+    create_sender_key_distribution_message, group_decrypt, group_encrypt, message_decrypt,
+    message_encrypt, process_prekey_bundle, process_sender_key_distribution_message,
 };
 use wacore_libsignal::store::sender_key_name::SenderKeyName;
 
@@ -1283,4 +1283,126 @@ fn bench_message_key_eviction(bencher: divan::Bencher) {
 
             black_box(state);
         });
+}
+
+/// Worst-case group out-of-order decrypt: a receiver that fell behind by ~2000
+/// messages buffers that many skipped sender-message-keys, and each late
+/// message consumes one via `SenderKeyState::remove_sender_message_key`, an
+/// O(n) linear scan over the backlog (gap-analysis data-structures-22). The
+/// expensive backlog fill runs once per iteration in `with_inputs` (untimed);
+/// only the worst-case decrypt — the one whose key sits at the tail of the
+/// backlog, forcing a full scan — is measured.
+///
+/// This is the full out-of-order decrypt, not a scan-isolating microbenchmark:
+/// the backlog-sized `SenderKeyRecord` clone in `load_sender_key` and the
+/// signature check are the bulk of it, with the linear scan a smaller slice. Use
+/// it as the out-of-order decrypt baseline; the clone is itself backlog-proportional.
+fn setup_group_out_of_order_worst_case() -> (User, SenderKeyName, Vec<u8>) {
+    // A fill just under MAX_MESSAGE_KEYS: eviction only starts past
+    // MAX_MESSAGE_KEYS + MESSAGE_KEY_PRUNE_THRESHOLD, so the whole backlog
+    // survives intact for the scan.
+    const N: u32 = (consts::MAX_MESSAGE_KEYS - 1) as u32;
+
+    let (mut alice, mut bob, sender_key_name) = setup_group_with_distribution();
+
+    let bob_sender_key_name = SenderKeyName::new(
+        sender_key_name.group_id().to_string(),
+        alice.address.name().to_string(),
+    );
+
+    let worst_case_ct = futures::executor::block_on(async {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ciphertexts: Vec<Vec<u8>> = Vec::with_capacity((N + 1) as usize);
+        for i in 0..=N {
+            let skm = group_encrypt(
+                &mut alice.sender_key_store,
+                &sender_key_name,
+                format!("group msg {i}").as_bytes(),
+                &mut rng,
+            )
+            .await
+            .expect("group encrypt");
+            ciphertexts.push(skm.serialized().to_vec());
+        }
+
+        // Decrypting the latest message first ratchets the chain forward over
+        // iterations 0..N-1, buffering N skipped keys in arrival order.
+        group_decrypt(
+            &ciphertexts[N as usize],
+            &mut bob.sender_key_store,
+            &bob_sender_key_name,
+        )
+        .await
+        .expect("group decrypt newest");
+
+        // Iteration N-1 sits at the tail of the buffer: its lookup scans every
+        // entry, the worst case for the linear `position()`.
+        ciphertexts[(N - 1) as usize].clone()
+    });
+
+    (bob, bob_sender_key_name, worst_case_ct)
+}
+
+#[divan::bench(sample_count = 30)]
+fn bench_group_out_of_order_decrypt_worst_case(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_out_of_order_worst_case)
+        .bench_refs(|(bob, sender_key_name, ciphertext)| {
+            let plaintext = futures::executor::block_on(async {
+                group_decrypt(
+                    black_box(ciphertext.as_slice()),
+                    &mut bob.sender_key_store,
+                    sender_key_name,
+                )
+                .await
+                .expect("group decrypt worst case")
+            });
+            black_box(plaintext);
+        });
+}
+
+/// SKDM ingest: installing a sender's distribution message into a fresh
+/// receiver store, the work done on the first group message from each new
+/// sender and on every sender-key rotation. The SKDM build and the fresh empty
+/// store are prepared in `with_inputs`; only the ingest is measured.
+fn setup_skdm_ingest() -> (
+    SenderKeyDistributionMessage,
+    InMemorySenderKeyStore,
+    SenderKeyName,
+) {
+    let (mut alice, sender_key_name) = setup_group_sender();
+    let receiver_key_name = SenderKeyName::new(
+        sender_key_name.group_id().to_string(),
+        alice.address.name().to_string(),
+    );
+    let skdm = futures::executor::block_on(async {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        create_sender_key_distribution_message(
+            &sender_key_name,
+            &mut alice.sender_key_store,
+            &mut rng,
+        )
+        .await
+        .expect("skdm")
+    });
+    (skdm, InMemorySenderKeyStore::new(), receiver_key_name)
+}
+
+#[divan::bench]
+fn bench_process_sender_key_distribution_message(bencher: divan::Bencher) {
+    bencher.with_inputs(setup_skdm_ingest).bench_refs(
+        |(skdm, receiver_store, receiver_key_name)| {
+            futures::executor::block_on(async {
+                process_sender_key_distribution_message(
+                    receiver_key_name,
+                    black_box(skdm),
+                    receiver_store,
+                )
+                .await
+                .expect("process skdm")
+            });
+            // Observe the store so the store_sender_key write is not elided.
+            black_box(&*receiver_store);
+        },
+    );
 }
