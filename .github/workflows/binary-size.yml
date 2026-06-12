@@ -161,6 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # github-action-benchmark deploys the gh-pages site after auto-push.
       deployments: write
     steps:
       - uses: actions/checkout@v6
