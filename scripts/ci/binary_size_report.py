@@ -79,6 +79,12 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     head = load_metrics(head_dir / "size-metrics.json")
     head_meta = json.loads((head_dir / "size-meta.json").read_text())
+    # Otherwise dropping a gated row from the measure script would silently
+    # disarm the budget. The baseline stays lenient: a PR introducing a new
+    # gated metric can't have it in main's artifact yet.
+    missing = sorted(name for name in GATED if name not in head)
+    if missing:
+        raise SystemExit(f"head metrics missing gated rows: {', '.join(missing)}")
 
     base = base_meta = None
     if args.base:

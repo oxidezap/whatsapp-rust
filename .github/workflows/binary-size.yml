@@ -10,7 +10,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: binary-size-${{ github.head_ref || github.run_id }}
+  # head_ref alone could collide across forks; the PR number is unique.
+  group: binary-size-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -100,18 +101,25 @@ jobs:
           benchmark-data-dir-path: dev/binary-size
           summary-always: true
 
-      - name: Generate report and evaluate gate
+      # The event payload freezes the labels at trigger time; query them
+      # live so adding size-increase-ok + re-running the job works.
+      - name: Check size-increase-ok label
+        id: override
         env:
-          BASE_DIR: ${{ steps.baseline.outputs.dir }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          # The event payload freezes the labels at trigger time; query them
-          # live so adding size-increase-ok + re-running the job works.
-          ALLOW_SIZE_INCREASE=$(gh api \
+          allow=$(gh api \
             "repos/${{ github.repository }}/issues/${PR_NUMBER}/labels" \
             --jq 'map(.name) | index("size-increase-ok") != null')
-          export ALLOW_SIZE_INCREASE
+          echo "allow=$allow" >> "$GITHUB_OUTPUT"
+
+      # No GH_TOKEN here: the report script is PR-controlled code.
+      - name: Generate report and evaluate gate
+        env:
+          BASE_DIR: ${{ steps.baseline.outputs.dir }}
+          ALLOW_SIZE_INCREASE: ${{ steps.override.outputs.allow }}
+        run: |
           python3 scripts/ci/binary_size_report.py --head size-out \
             ${BASE_DIR:+--base "$BASE_DIR"} --out-dir size-out
           cat size-out/report.md >> "$GITHUB_STEP_SUMMARY"
@@ -145,11 +153,13 @@ jobs:
           echo "Gate status: $status"
 
   binary-size-push:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Dispatch only publishes from main so stray branches can't pollute the series.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     name: Binary Size (push)
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      deployments: write
     steps:
       - uses: actions/checkout@v6
 
