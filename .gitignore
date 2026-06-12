@@ -11,3 +11,4 @@ docs
 __pycache__
 .codex
 dhat-heap*.json
+/size-out
