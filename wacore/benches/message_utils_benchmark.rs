@@ -134,6 +134,10 @@ fn bench_dm_send_encode_work(bencher: divan::Bencher, shape: &str) {
                 "5511888887777@s.whatsapp.net",
             );
             let retry_bytes = waproto::codec::message_to_vec(black_box(message));
-            black_box((plaintexts, retry_bytes))
+            // Observe the whole result, not just the secret reporting_context_info
+            // reads: reporting_token feeds nothing downstream, so without this the
+            // HMAC (and, by cascade, the HKDF and the content encode this bench
+            // exists to profile) is dead under the bench profile's thin LTO.
+            black_box((plaintexts, retry_bytes, reporting_result))
         });
 }
