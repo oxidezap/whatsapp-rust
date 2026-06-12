@@ -1,6 +1,7 @@
-//! Per-send message utilities on realistic shapes: the participant hash that
-//! runs on every group send (1600 devices = a large LID group) and the
-//! pad/encode steps every outgoing message pays before encryption.
+//! Per-message utilities on realistic shapes: the participant hash that
+//! runs on every group send (1600 devices = a large LID group), the
+//! pad/encode steps every outgoing message pays before encryption, and the
+//! unpad/decode steps every incoming message pays after decryption.
 
 use divan::black_box;
 use wacore::messages::MessageUtils;
@@ -100,6 +101,37 @@ fn dm_shape(shape: &str) -> wa::Message {
         },
         other => unreachable!("unknown shape {other}"),
     }
+}
+
+fn recv_shape(shape: &str) -> wa::Message {
+    match shape {
+        // The first group message from a sender carries the SKDM inline
+        // alongside the content.
+        "group_skdm_text" => wa::Message {
+            sender_key_distribution_message: Some(wa::message::SenderKeyDistributionMessage {
+                group_id: Some("120363000000000001@g.us".into()),
+                axolotl_sender_key_distribution_message: Some(vec![0x33; 350]),
+            }),
+            conversation: Some("Benchmark group message with realistic text.".into()),
+            ..Default::default()
+        },
+        other => dm_shape(other),
+    }
+}
+
+/// Unpad + prost decode of a received padded plaintext: the pure tail of every
+/// inbound message decryption, and the inbound mirror of `encode_and_pad`.
+/// Shapes match the send-side bench plus the inline-SKDM group first-message.
+#[divan::bench(args = ["text_reply", "media_refs", "large_text", "group_skdm_text"])]
+fn bench_decode_plaintext(bencher: divan::Bencher, shape: &str) {
+    bencher
+        .with_inputs(|| {
+            use prost::Message as _;
+            MessageUtils::pad_message_v2(recv_shape(shape).encode_to_vec())
+        })
+        .bench_refs(|padded| {
+            black_box(wacore::messages::decode_plaintext(black_box(padded), 2).unwrap())
+        });
 }
 
 /// The CPU a single DM send pays in the encode/token department, mirroring

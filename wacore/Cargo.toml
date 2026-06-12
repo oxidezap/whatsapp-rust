@@ -88,5 +88,9 @@ harness = false
 name = "message_utils_benchmark"
 harness = false
 
+[[bench]]
+name = "appstate_sync_benchmark"
+harness = false
+
 [lints]
 workspace = true
