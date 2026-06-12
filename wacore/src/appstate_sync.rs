@@ -23,6 +23,24 @@ use waproto::whatsapp as wa;
 // Re-export Mutation from appstate for convenience
 pub use crate::appstate::Mutation;
 
+/// Unique index MACs of a patch's mutations, in first-seen order, feeding the
+/// batched previous-value-MAC backend lookup. Linear-scan dedup is deliberate:
+/// HashSet measured 6-120% slower at small N in this codebase, so don't switch
+/// without benchmarking both ends (patches carry up to ~1000 mutations).
+pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
+    for m in mutations {
+        if let Some(rec) = &m.record
+            && let Some(ind) = &rec.index
+            && let Some(index_mac) = &ind.blob
+            && !out.iter().any(|v| v == index_mac)
+        {
+            out.push(index_mac.clone());
+        }
+    }
+    out
+}
+
 fn lookup_app_state_key(
     keys_map: &HashMap<String, Arc<ExpandedAppStateKeys>>,
     key_id: &[u8],
@@ -380,17 +398,7 @@ impl AppStateProcessor {
         let patches = std::mem::take(&mut pl.patches);
         let mut processed_patches = Vec::with_capacity(patches.len());
         for patch in patches {
-            // Collect index MACs we need to look up (pre-allocate with upper bound)
-            let mut need_db_lookup: Vec<Vec<u8>> = Vec::with_capacity(patch.mutations.len());
-            for m in &patch.mutations {
-                if let Some(rec) = &m.record
-                    && let Some(ind) = &rec.index
-                    && let Some(index_mac) = &ind.blob
-                    && !need_db_lookup.iter().any(|v| v == index_mac)
-                {
-                    need_db_lookup.push(index_mac.clone());
-                }
-            }
+            let need_db_lookup = collect_unique_index_macs(&patch.mutations);
 
             // Fetch previous value MACs in one backend round-trip instead of a
             // spawn_blocking + query per mutation (N+1).
@@ -492,16 +500,7 @@ impl AppStateProcessor {
         // Pre-fetch previous value MACs in one backend round-trip, mirroring
         // the inbound patch path: one batched query instead of a
         // spawn_blocking + single-row SELECT per mutation.
-        let mut need_db_lookup: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
-        for m in &mutations {
-            if let Some(rec) = &m.record
-                && let Some(ind) = &rec.index
-                && let Some(index_mac) = &ind.blob
-                && !need_db_lookup.iter().any(|v| v == index_mac)
-            {
-                need_db_lookup.push(index_mac.clone());
-            }
-        }
+        let need_db_lookup = collect_unique_index_macs(&mutations);
         let db_prev: std::collections::HashMap<Vec<u8>, Vec<u8>> = self
             .backend
             .get_mutation_macs(collection_name, &need_db_lookup)
