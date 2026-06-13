@@ -158,7 +158,7 @@ impl DeviceRegistryCache {
         self.cache.entry_count()
     }
 
-    /// Test-only passthrough for moka maintenance flushes.
+    /// Test-only passthrough for cache maintenance flushes.
     #[cfg(test)]
     pub(crate) async fn run_pending_tasks(&self) {
         self.cache.run_pending_tasks().await;

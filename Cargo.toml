@@ -114,7 +114,6 @@ tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
 danger-skip-cert-chain-verify = ["wacore/danger-skip-cert-chain-verify"]
 default = [
-    "moka-cache",
     "simd",
     "sqlite-storage",
     "tokio-transport",
@@ -123,7 +122,6 @@ default = [
     "tokio-native",
     "signal",
 ]
-moka-cache = ["dep:moka"]
 simd = ["wacore/simd"]
 ureq-client = ["dep:whatsapp-rust-ureq-http-client"]
 tokio-transport = ["dep:whatsapp-rust-tokio-transport"]
@@ -170,13 +168,6 @@ whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version 
 # selected via `--cfg getrandom_backend="wasm_js"` in RUSTFLAGS; no native effect.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, features = ["wasm_js"] }
-
-# moka is thread-based (crossbeam/uuid) and does not build on wasm32, so it is
-# scoped to non-wasm targets. The `moka-cache` feature can still be enabled on
-# wasm32 (it stays in `default`); `dep:moka` is simply inert there and the cache
-# falls back to PortableCache via the target gate in src/cache.rs.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-moka = { version = "0.12.12", features = ["future"], optional = true }
 
 [dev-dependencies]
 aes = { workspace = true }

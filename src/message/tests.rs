@@ -4550,7 +4550,7 @@ async fn test_enc_count_preseeds_retry_cache() {
     let cache_key = client
         .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
         .await;
-    // Insert only if absent (portable alternative to moka's entry_by_ref().or_insert())
+    // Insert only if absent (get-then-insert; the cache has no atomic upsert)
     if client
         .message_retry_counts
         .get(&cache_key)

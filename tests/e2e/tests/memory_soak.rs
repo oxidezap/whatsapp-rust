@@ -1,7 +1,7 @@
 //! Memory soak tests — aggressive stress tests to detect unbounded memory growth.
 //!
 //! Track both internal collection sizes and process RSS to catch leaks that
-//! escape moka/HashMap tracking.
+//! escape cache/HashMap tracking.
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -58,7 +58,7 @@ async fn snapshot(label: &str, round: usize, client: &whatsapp_rust::client::Cli
     let heap_bytes = dhat::HeapStats::get().curr_bytes;
 
     info!(
-        "[round {round:>4}] {label} | RSS={rss}K | moka(recent_msg={},session_locks={},chat_lanes={},device_reg={}) | unbounded(signal_sess={},signal_id={},signal_sk={},resp_waiters={},pending_retries={},presence_subs={},app_state_kr={},app_state_sync={})",
+        "[round {round:>4}] {label} | RSS={rss}K | bounded(recent_msg={},session_locks={},chat_lanes={},device_reg={}) | unbounded(signal_sess={},signal_id={},signal_sk={},resp_waiters={},pending_retries={},presence_subs={},app_state_kr={},app_state_sync={})",
         diag.recent_messages,
         diag.session_locks,
         diag.chat_lanes,

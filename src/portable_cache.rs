@@ -1,7 +1,8 @@
-//! Portable in-process cache (moka replacement for WASM).
+//! Portable in-process cache: the client's sole cache backend, on every target
+//! including wasm32.
 //!
 //! Uses [`wacore::time::now_millis`] for time checks — no `std::time::Instant`.
-//! API mirrors moka's [`Cache`](moka::future::Cache).
+//! Provides capacity + TTL/TTI eviction and an async, single-flight `get_with`.
 //!
 //! `get_with` / `get_with_by_ref` are single-flight: concurrent inits for the
 //! same missing key run the initializer once.
@@ -279,7 +280,7 @@ where
         }
     }
 
-    /// Sync invalidate (moka-compatible). Spins briefly if lock is held.
+    /// Sync invalidate. Spins briefly if the lock is held.
     pub fn invalidate_all(&self) {
         for _ in 0..64 {
             if let Some(mut guard) = self.inner.try_write() {
@@ -299,8 +300,7 @@ where
             .unwrap_or(0)
     }
 
-    /// Eager snapshot iterator over `(Arc<K>, V)` — matches `moka::Cache::iter`'s
-    /// shape but diverges on semantics: snapshot, not lazy. Includes
+    /// Eager snapshot iterator over `(Arc<K>, V)`: snapshot, not lazy. Includes
     /// expired-but-not-yet-evicted entries (consistent with `entry_count`).
     /// Caller must not `.await` with the writer guard held from the same task —
     /// would deadlock on single-threaded runtimes.

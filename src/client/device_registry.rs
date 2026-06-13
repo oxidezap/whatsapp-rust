@@ -422,7 +422,7 @@ impl Client {
     }
 
     /// Batched variant of [`update_device_list`]. Cache is populated
-    /// synchronously per record (cheap moka inserts); the backend write
+    /// synchronously per record (cheap in-process inserts); the backend write
     /// collapses into a single transaction. Used by usync after fetching
     /// device lists for many users at once, where the per-row commit
     /// dominated wall-clock time on large groups.
@@ -879,13 +879,13 @@ impl Client {
     /// then the backend database.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.get_devices_from_registry", level = "trace", skip_all, fields(peer = %jid.observe())))]
     pub(crate) async fn get_devices_from_registry(&self, jid: &Jid) -> Option<Vec<Jid>> {
-        // Use the borrowed `&str` keys directly: both the moka cache and the
+        // Use the borrowed `&str` keys directly: both the in-process cache and the
         // backend take `&str`, so going through `get_lookup_keys` (which re-owns
         // the already-cloned keys into a `Vec<String>`) just churns per member on
         // every group send. `lookup` owns the key Strings for the duration here.
         let lookup = self.resolve_lookup_keys_for_jid(jid).await;
 
-        // L1: device_registry_cache (moka, fast)
+        // L1: device_registry_cache (in-process, fast)
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
                 let devices = Self::reconstruct_device_jids(jid, &record);
@@ -2103,7 +2103,7 @@ mod tests {
 
         let client = create_test_client().await;
 
-        // Seed backend DB directly (bypassing moka cache)
+        // Seed backend DB directly (bypassing the in-process cache)
         let record = DeviceListRecord {
             user: "15551234567".into(),
             devices: vec![DeviceInfo {

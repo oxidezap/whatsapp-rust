@@ -27,7 +27,6 @@ wacore = { path = "../../wacore" }
 whatsapp-rust = { path = "../..", default-features = false, features = [
   "danger-skip-tls-verify",
   "debug-diagnostics",
-  "moka-cache",
   "simd",
   "tokio-runtime",
   "tokio-native",

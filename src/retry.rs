@@ -451,7 +451,7 @@ impl Client {
         // doesn't catch silently-diverged sessions; this fallback does.
         if nr.get_optional_child("keys").is_none() {
             // Hold the per-peer session lock across the throttle check+stamp AND
-            // the delete so the recreate decision is atomic per peer. The moka
+            // the delete so the recreate decision is atomic per peer. The
             // `session_recreate_history` get+insert is not atomic on its own,
             // and retry receipts for different message_ids from the same peer
             // dispatch concurrently (detached spawn in `handle_receipt`), so
@@ -842,9 +842,9 @@ impl Client {
 
         // Throttle: skip if this peer was recreated within the timeout. This
         // explicit age check against the injectable `now` is the authoritative,
-        // deterministic gate. moka's 1h TTL on `session_recreate_history` is
-        // only a real-wall-clock memory backstop (it evicts on moka's own clock,
-        // which tests don't advance and which the stored `now` doesn't drive).
+        // deterministic gate. The cache's 1h TTL on `session_recreate_history`
+        // is only a memory backstop (lazy eviction independent of the stored
+        // `now`, so it can't drive the throttle decision).
         // Do NOT drop this check as "redundant with the TTL".
         if let Some(prev) = history.get(jid).await
             && now.saturating_duration_since(prev) < RECREATE_SESSION_TIMEOUT
@@ -2182,9 +2182,9 @@ mod tests {
         );
     }
 
-    /// The moka `session_recreate_history` is capacity-bounded (256), unlike the
+    /// The `session_recreate_history` is capacity-bounded (256), unlike the
     /// old age-only prune which never evicted a still-recent entry. Under more
-    /// than that many distinct peers retrying within the window, moka can evict
+    /// than that many distinct peers retrying within the window, the cache can evict
     /// a recent entry, costing at most one extra recreate for that peer
     /// (bounded and self-healing: re-stamped on the next receipt), never the
     /// unbounded prekey loop the throttle prevents. Documents that trade-off.
@@ -2212,7 +2212,7 @@ mod tests {
     }
 
     /// Atomicity guard for the per-peer session lock the retry caller wraps
-    /// around the recreate check+stamp. moka's get+insert is not atomic, and
+    /// around the recreate check+stamp. The cache's get+insert is not atomic, and
     /// same-peer retries for different message_ids dispatch concurrently, so
     /// without the lock both could observe a cold history and recreate. Holding
     /// `session_lock_for` serializes the decision: exactly one recreate fires.

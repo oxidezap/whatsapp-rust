@@ -78,7 +78,7 @@ impl LidPnCache {
     /// when a timeout is set; default config has none).
     ///
     /// When `store` is `Some`, both internal maps use the custom backend.
-    /// When `store` is `None`, both maps use in-process moka caches.
+    /// When `store` is `None`, both maps use in-process caches.
     pub fn with_config(
         config: &CacheEntryConfig,
         store: Option<Arc<dyn wacore::store::CacheStore>>,
@@ -89,13 +89,13 @@ impl LidPnCache {
                 pn_to_entry: TypedCache::from_store(s, NS_PN, config.timeout),
                 // Always in-memory: tracks per-process persist state, never the
                 // mapping itself, so it must not go through the shared store.
-                persisted: TypedCache::from_moka(config.build_with_tti()),
+                persisted: TypedCache::from_local(config.build_with_tti()),
                 topology: std::sync::OnceLock::new(),
             },
             None => Self {
-                lid_to_entry: TypedCache::from_moka(config.build_with_tti()),
-                pn_to_entry: TypedCache::from_moka(config.build_with_tti()),
-                persisted: TypedCache::from_moka(config.build_with_tti()),
+                lid_to_entry: TypedCache::from_local(config.build_with_tti()),
+                pn_to_entry: TypedCache::from_local(config.build_with_tti()),
+                persisted: TypedCache::from_local(config.build_with_tti()),
                 topology: std::sync::OnceLock::new(),
             },
         }

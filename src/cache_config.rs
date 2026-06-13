@@ -11,7 +11,7 @@ pub use wacore::store::cache::CacheStore;
 
 /// Configuration for a single cache instance.
 ///
-/// Controls the expiry timeout and maximum capacity of a moka cache.
+/// Controls the expiry timeout and maximum capacity of an in-process cache.
 /// The `timeout` field is used as either TTL (`build_with_ttl`) or TTI
 /// (`build_with_tti`) depending on which builder method is called.
 /// Set `timeout` to `None` to disable time-based expiry (entries stay until
@@ -56,7 +56,7 @@ impl CacheEntryConfig {
     {
         match store {
             Some(s) => TypedCache::from_store(s, namespace, self.timeout),
-            None => TypedCache::from_moka(self.build_with_ttl()),
+            None => TypedCache::from_local(self.build_with_ttl()),
         }
     }
 
@@ -77,7 +77,7 @@ impl CacheEntryConfig {
 /// Per-cache custom store overrides.
 ///
 /// Each field is an optional [`CacheStore`] for that specific cache. When
-/// `None`, the default in-process moka cache is used.
+/// `None`, the default in-process cache is used.
 ///
 /// # Example — group and device registry on Redis
 ///
@@ -166,7 +166,7 @@ pub struct CacheConfig {
     /// LID-to-phone cache. WAWebLidPnCache uses plain Maps with no expiry
     /// and no size cap; evicting a still-valid mapping silently downgrades
     /// Signal addresses to `@c.us`. Default: no timeout, capacity u64::MAX
-    /// (effectively unbounded — moka doesn't expose an `unbounded()` builder).
+    /// (effectively unbounded — the cache has no dedicated `unbounded()` builder).
     pub lid_pn_cache: CacheEntryConfig,
     /// Optional L1 in-memory cache for sent messages (retry support).
     /// Default: capacity 0 (disabled — DB-only, matching WA Web).
@@ -248,8 +248,8 @@ pub struct CacheConfig {
     /// Per-cache custom store overrides.
     ///
     /// For each field set to `Some(store)`, the corresponding cache uses that
-    /// backend instead of the default in-process moka cache. Fields left as
-    /// `None` keep the default moka behaviour.
+    /// backend instead of the default in-process cache. Fields left as
+    /// `None` keep the default in-process behaviour.
     ///
     /// Coordination caches (`session_locks`, `chat_lanes`), the signal write-behind
     /// cache, and `pdo_pending_requests` always stay in-process — they hold live Rust

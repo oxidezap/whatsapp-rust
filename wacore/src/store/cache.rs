@@ -2,7 +2,7 @@
 //!
 //! Implementations of [`CacheStore`] can back any of the client's data caches
 //! (group metadata, device lists, LID-PN mappings, etc.). The default behaviour
-//! uses in-process moka caches; a Redis, Memcached, or any other implementation
+//! uses in-process caches; a Redis, Memcached, or any other implementation
 //! can be plugged in via [`CacheConfig`](crate::CacheConfig).
 
 use async_trait::async_trait;
