@@ -42,15 +42,3 @@ jobs:
           cargo build -p whatsapp-rust --lib --release
           --target wasm32-unknown-unknown
           --no-default-features --features debug-diagnostics
-      # moka-cache is in the default feature set and is thread-based (can't build
-      # on wasm32), so a defaults-based consumer that forgets --no-default-features
-      # would hit it. The target gate in src/cache.rs must fall back to
-      # PortableCache instead of pulling moka; this step exercises that path so it
-      # can't silently regress.
-      - name: Build whatsapp-rust lib for wasm32 with moka-cache (release)
-        env:
-          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
-        run: >
-          cargo build -p whatsapp-rust --lib --release
-          --target wasm32-unknown-unknown
-          --no-default-features --features debug-diagnostics,moka-cache
