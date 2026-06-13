@@ -88,9 +88,14 @@ impl SenderKeyDeviceCache {
     /// after a device is removed: a future re-add of the same device_id would
     /// otherwise hit a stale `has_key=true` entry and skip SKDM redistribution.
     pub(crate) async fn invalidate_entries_for_device(&self, user: &str, device_id: u16) {
+        // Reliable awaited snapshot, not the best-effort `iter()`: a skipped
+        // entry here would leave a stale `has_key=true` and drop a later SKDM
+        // fanout for a re-added device.
         let to_drop: Vec<String> = self
             .inner
-            .iter()
+            .snapshot_entries()
+            .await
+            .into_iter()
             .filter_map(|(group_jid, map)| {
                 map.devices
                     .get(user)

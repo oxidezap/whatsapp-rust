@@ -316,10 +316,21 @@ where
             .unwrap_or(0)
     }
 
+    /// Reliable awaited snapshot of `(Arc<K>, V)` pairs. Prefer this over
+    /// [`iter`](Self::iter) in async contexts: `iter` is best-effort (a
+    /// `try_read` spin that yields an empty snapshot under write contention),
+    /// which would silently skip entries an invalidation pass must see.
+    pub async fn snapshot_entries(&self) -> Vec<(Arc<K>, V)> {
+        let guard = self.inner.read().await;
+        Self::snapshot(&guard)
+    }
+
     /// Eager snapshot iterator over `(Arc<K>, V)`: snapshot, not lazy. Includes
     /// expired-but-not-yet-evicted entries (consistent with `entry_count`).
-    /// Caller must not `.await` with the writer guard held from the same task —
-    /// would deadlock on single-threaded runtimes.
+    /// Best-effort (`try_read` spin); use [`snapshot_entries`](Self::snapshot_entries)
+    /// when missing an entry would be a correctness bug. Caller must not `.await`
+    /// with the writer guard held from the same task — would deadlock on
+    /// single-threaded runtimes.
     pub fn iter(&self) -> std::vec::IntoIter<(Arc<K>, V)> {
         for _ in 0..1024 {
             if let Some(guard) = self.inner.try_read() {
