@@ -11,6 +11,17 @@ use wacore_binary::Node;
 
 pub use wacore::request::{InfoQuery, InfoQueryType, RequestUtils};
 
+/// Type-erased send future handed to [`Client::send_and_wait_iq`]. Boxing it
+/// keeps that function non-generic so it isn't re-monomorphized per `IqSpec`.
+/// `Send` on native (IQ awaits happen inside spawned handler tasks); dropped
+/// on wasm where the runtime is single-threaded.
+#[cfg(not(target_arch = "wasm32"))]
+type IqSendFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + Send + 'a>>;
+#[cfg(target_arch = "wasm32")]
+type IqSendFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + 'a>>;
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum IqError {
@@ -171,8 +182,12 @@ impl Client {
         let request_utils = self.get_request_utils();
         let node = request_utils.build_iq_node(query, Some(req_id.clone()));
 
-        self.send_and_wait_iq(req_id, iq_timeout, async { self.send_node(node).await })
-            .await
+        self.send_and_wait_iq(
+            req_id,
+            iq_timeout,
+            Box::pin(async { self.send_node(node).await }),
+        )
+        .await
     }
 
     /// Executes an IQ specification and returns the typed response.
@@ -200,9 +215,11 @@ impl Client {
             match spec.encode_iq_direct(&req_id, &mut buf) {
                 Ok(true) => {
                     let response = self
-                        .send_and_wait_iq(req_id, Duration::from_secs(75), async {
-                            self.send_raw_bytes(buf).await
-                        })
+                        .send_and_wait_iq(
+                            req_id,
+                            Duration::from_secs(75),
+                            Box::pin(async { self.send_raw_bytes(buf).await }),
+                        )
                         .await?;
                     return spec
                         .parse_response(response.get())
@@ -223,15 +240,19 @@ impl Client {
     }
 
     /// Centralizes waiter registration and shutdown/timeout handling.
-    async fn send_and_wait_iq<F>(
+    ///
+    /// `send_fn` is type-erased (boxed) rather than a generic `F`: it's only
+    /// awaited once, inline, and `execute<S>` would otherwise stamp out a
+    /// fresh copy of this whole waiter/timeout body per IqSpec (the send
+    /// closure's type is distinct per `S`). One box allocation per IQ — all
+    /// control-plane, never the message hot path — collapses ~15 monomorphized
+    /// copies into one.
+    async fn send_and_wait_iq(
         &self,
         req_id: String,
         timeout: Duration,
-        send_fn: F,
-    ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError>
-    where
-        F: std::future::Future<Output = Result<(), crate::client::ClientError>>,
-    {
+        send_fn: IqSendFuture<'_>,
+    ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         let _t = wacore::telemetry::timer(wacore::telemetry::IQ_DURATION);
         if !self.is_running.load(Ordering::Relaxed) {
             wacore::telemetry::iq("error");
