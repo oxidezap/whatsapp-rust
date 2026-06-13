@@ -191,7 +191,7 @@ pub struct MemoryDiagnostics {
     pub undecryptable_dispatched: u64,
     pub pdo_pending_requests: u64,
     pub pdo_requested: u64,
-    // -- In-process caches (capacity-only, no TTL) --
+    // -- Capacity-only caches (no TTL) --
     pub session_locks: u64,
     pub chat_lanes: u64,
     // -- Unbounded collections --
@@ -213,7 +213,7 @@ pub struct MemoryDiagnostics {
 impl std::fmt::Display for MemoryDiagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "=== Memory Diagnostics ===")?;
-        writeln!(f, "--- In-process caches (TTL-bounded) ---")?;
+        writeln!(f, "--- TTL-bounded caches ---")?;
         writeln!(f, "  group_cache:            {}", self.group_cache)?;
         writeln!(
             f,
@@ -236,7 +236,7 @@ impl std::fmt::Display for MemoryDiagnostics {
         )?;
         writeln!(f, "  pdo_pending_requests:   {}", self.pdo_pending_requests)?;
         writeln!(f, "  pdo_requested:          {}", self.pdo_requested)?;
-        writeln!(f, "--- In-process caches (capacity-only) ---")?;
+        writeln!(f, "--- Capacity-only caches ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
         writeln!(f, "--- Unbounded collections ---")?;
