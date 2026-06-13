@@ -195,7 +195,7 @@ where
     /// Remove all entries, awaiting completion for custom backends.
     pub async fn clear(&self) {
         match &self.inner {
-            Inner::Local(cache) => cache.invalidate_all(),
+            Inner::Local(cache) => cache.clear().await,
             Inner::Custom {
                 store, namespace, ..
             } => {

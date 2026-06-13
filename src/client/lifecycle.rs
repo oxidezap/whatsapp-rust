@@ -669,8 +669,10 @@ impl Client {
         let _ =
             self.send_active_receipts
                 .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
-        // Drop per-chat lanes so workers exit via channel close.
-        self.chat_lanes.invalidate_all();
+        // Drop per-chat lanes so workers exit via channel close. Reliable
+        // (awaited) clear: a skipped invalidation would leave a stale ChatLane
+        // whose worker exits on the generation check after reconnect.
+        self.chat_lanes.clear().await;
         // Clear pending retries so stale keys from detached scopeguard
         // cleanup don't suppress the first retry after reconnect.
         self.pending_retries
