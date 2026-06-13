@@ -114,15 +114,9 @@ pub struct PreparedGroupStanza {
 
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.group_prepare", level = "debug", skip_all, fields(to = %to_jid.observe()), err(Debug)))]
 #[allow(clippy::too_many_arguments)]
-pub async fn prepare_group_stanza<
-    'a,
-    S: crate::libsignal::protocol::SessionStore + Clone + Send + Sync + 'static,
-    I: crate::libsignal::protocol::IdentityKeyStore + Clone + Send + Sync + 'static,
-    P: crate::libsignal::protocol::PreKeyStore + Send + Sync,
-    SP: crate::libsignal::protocol::SignedPreKeyStore + Send + Sync,
->(
+pub async fn prepare_group_stanza(
     runtime: &dyn Runtime,
-    stores: &mut SignalStores<'a, S, I, P, SP>,
+    stores: &mut SignalStores<'_>,
     resolver: &dyn SendContextResolver,
     // Caller guarantees `own_base_jid` is already present in `participants`, so
     // this reads the shared (Arc-backed) metadata without cloning it.

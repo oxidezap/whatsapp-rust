@@ -70,15 +70,7 @@ impl SignalProtocolStoreAdapter {
         }
     }
 
-    pub fn as_signal_stores(
-        &mut self,
-    ) -> wacore::send::SignalStores<
-        '_,
-        SessionAdapter,
-        IdentityAdapter,
-        PreKeyAdapter,
-        SignedPreKeyAdapter,
-    > {
+    pub fn as_signal_stores(&mut self) -> wacore::send::SignalStores<'_> {
         wacore::send::SignalStores {
             session_store: &mut self.session_store,
             identity_store: &mut self.identity_store,
