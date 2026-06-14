@@ -52,11 +52,9 @@ pub mod codec {
 
     /// Decode a `Message` directly onto the heap.
     ///
-    /// `whatsapp::Message` is ~3.8 KiB inline, so returning it by value made the
-    /// decode path memcpy-bound: profiling the inbound decode (callgrind, PR #857)
-    /// attributed ~60% of it to three full-struct moves, not protobuf parsing.
-    /// Decoding in place into a `Box` via `merge` keeps the big struct on the heap
-    /// the whole time — the return and every downstream hand-off are pointer-sized.
+    /// `Message` is large enough that returning it by value made the decode path
+    /// memcpy-bound (PR #857); keeping it boxed makes the return and every
+    /// downstream hand-off pointer-sized.
     #[inline(never)]
     pub fn message_decode(mut bytes: &[u8]) -> Result<Box<whatsapp::Message>, prost::DecodeError> {
         let mut msg = Box::<whatsapp::Message>::default();
