@@ -17,6 +17,8 @@
 //! without seeing the full message content. Only specific fields are extracted
 //! based on a predefined whitelist matching WhatsApp Web behavior.
 
+use std::sync::LazyLock;
+
 use anyhow::{Result, anyhow};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
@@ -255,6 +257,13 @@ pub const REPORTING_TOKEN_SIZE: usize = 16;
 /// This string is appended to the HKDF info as per WhatsApp Web implementation.
 const USE_CASE_REPORT_TOKEN: &str = "Report Token";
 
+/// HKDF-Extract with no salt is `HMAC-SHA256(zero_block, ikm)`, so the zero-key
+/// ipad/opad schedule is constant across every send. Cache it once and clone per
+/// derivation instead of re-running `Hkdf::new(None, ..)`'s two compressions each
+/// time. Same trick as the libsignal message-key extract and the appstate ltHash.
+static REPORTING_TOKEN_EXTRACT_HMAC: LazyLock<Hmac<Sha256>> =
+    LazyLock::new(|| Hmac::<Sha256>::new_from_slice(&[0u8; 32]).expect("32-byte HMAC key"));
+
 /// Generate a random message secret (32 bytes)
 pub fn generate_message_secret() -> [u8; MESSAGE_SECRET_SIZE] {
     use rand::RngExt;
@@ -304,9 +313,15 @@ pub fn derive_reporting_token_key(
 
     let info = build_hkdf_info(stanza_id, sender_jid, remote_jid);
 
-    let hk = Hkdf::<Sha256>::new(None, message_secret);
+    // No-salt extract via the cached zero-keyed HMAC; output is byte-identical to
+    // `Hkdf::new(None, message_secret)` but skips the constant ipad/opad schedule.
+    let mut extract = REPORTING_TOKEN_EXTRACT_HMAC.clone();
+    extract.update(message_secret);
+    let prk = extract.finalize().into_bytes();
     let mut key = [0u8; REPORTING_TOKEN_KEY_SIZE];
-    hk.expand(&info, &mut key)
+    Hkdf::<Sha256>::from_prk(&prk)
+        .expect("PRK is hash-sized")
+        .expand(&info, &mut key)
         .map_err(|e| anyhow!("HKDF expand failed: {}", e))?;
 
     Ok(key)
@@ -691,6 +706,30 @@ mod tests {
         let key3 = derive_reporting_token_key(&secret, "different_id", sender_jid, remote_jid)
             .expect("valid secret should derive key successfully");
         assert_ne!(key, key3);
+    }
+
+    #[test]
+    fn derive_key_matches_plain_hkdf_extract() {
+        // The cached zero-keyed HMAC extract must produce a key byte-identical to
+        // `Hkdf::new(None, secret)` across a spread of secrets.
+        let stanza_id = "3EB0E0E5F2D4F618589C0B";
+        let sender_jid = "5511999887766@s.whatsapp.net";
+        let remote_jid = "5511888776655@s.whatsapp.net";
+        let info = build_hkdf_info(stanza_id, sender_jid, remote_jid);
+
+        for seed in 0u8..32 {
+            let secret = [seed.wrapping_mul(37).wrapping_add(11); MESSAGE_SECRET_SIZE];
+
+            let mut expected = [0u8; REPORTING_TOKEN_KEY_SIZE];
+            Hkdf::<Sha256>::new(None, &secret)
+                .expand(&info, &mut expected)
+                .expect("valid output length");
+
+            let got = derive_reporting_token_key(&secret, stanza_id, sender_jid, remote_jid)
+                .expect("valid secret should derive key successfully");
+
+            assert_eq!(got, expected, "mismatch for seed {seed}");
+        }
     }
 
     #[test]
