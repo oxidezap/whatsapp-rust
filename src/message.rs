@@ -154,7 +154,7 @@ mod special;
 /// Re-export from wacore for backwards compatibility (used by tests via `super::*`).
 #[cfg(test)]
 fn unwrap_device_sent(msg: wa::Message) -> wa::Message {
-    wacore::messages::unwrap_device_sent(msg)
+    *wacore::messages::unwrap_device_sent(Box::new(msg))
 }
 
 /// Re-export from wacore for backwards compatibility (used by tests via `super::*`).

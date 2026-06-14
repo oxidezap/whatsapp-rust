@@ -828,7 +828,7 @@ mod tests {
 
         // Poll update should NOT include token
         let poll_update = wa::Message {
-            poll_update_message: Some(wa::message::PollUpdateMessage::default()),
+            poll_update_message: Some(Default::default()),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&poll_update));
@@ -1355,19 +1355,19 @@ mod tests {
         assert!(generate_reporting_token_content(&reaction).is_none());
 
         let enc_reaction = wa::Message {
-            enc_reaction_message: Some(wa::message::EncReactionMessage::default()),
+            enc_reaction_message: Some(Default::default()),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&enc_reaction));
 
         let poll_update = wa::Message {
-            poll_update_message: Some(wa::message::PollUpdateMessage::default()),
+            poll_update_message: Some(Default::default()),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&poll_update));
 
         let keep_in_chat = wa::Message {
-            keep_in_chat_message: Some(wa::message::KeepInChatMessage::default()),
+            keep_in_chat_message: Some(Default::default()),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&keep_in_chat));

@@ -202,7 +202,7 @@ impl Client {
                         }
                     }))
                     .detach();
-                return Some(msg);
+                return Some(*msg);
             }
             log::warn!(
                 "Failed to decode cached message for {}:{}, trying DB",
@@ -219,7 +219,7 @@ impl Client {
             .await
         {
             Ok(Some(bytes)) => match waproto::codec::message_decode(bytes.as_slice()) {
-                Ok(msg) => Some(msg),
+                Ok(msg) => Some(*msg),
                 Err(e) => {
                     log::warn!(
                         "Failed to decode DB message for {}:{}: {}",
@@ -287,7 +287,7 @@ impl Client {
         }
         let bytes = self.recent_messages.get(key).await?;
         match waproto::codec::message_decode(bytes.as_slice()) {
-            Ok(msg) => Some(msg),
+            Ok(msg) => Some(*msg),
             Err(e) => {
                 log::warn!(
                     "Failed to decode cached message for {}:{}: {e}",

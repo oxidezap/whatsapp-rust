@@ -3084,7 +3084,7 @@ mod tests {
         #[test]
         fn pin_returns_edit_attribute() {
             let msg = wa::Message {
-                pin_in_chat_message: Some(wa::message::PinInChatMessage::default()),
+                pin_in_chat_message: Some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);

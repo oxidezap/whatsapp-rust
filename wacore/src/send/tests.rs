@@ -237,7 +237,7 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_enc_reaction() {
         let msg = wa::Message {
-            enc_reaction_message: Some(wa::message::EncReactionMessage::default()),
+            enc_reaction_message: Some(Default::default()),
             ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
@@ -272,7 +272,7 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_reaction_inside_ephemeral_wrapper() {
         let inner = wa::Message {
-            reaction_message: Some(wa::message::ReactionMessage::default()),
+            reaction_message: Some(Default::default()),
             ..Default::default()
         };
         let msg = wa::Message {
