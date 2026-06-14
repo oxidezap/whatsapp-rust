@@ -23,39 +23,57 @@ use waproto::whatsapp as wa;
 // Re-export Mutation from appstate for convenience
 pub use crate::appstate::Mutation;
 
+/// Index MAC carried by a mutation's record, if present.
+fn mutation_index_mac(m: &wa::SyncdMutation) -> Option<&[u8]> {
+    m.record.as_ref()?.index.as_ref()?.blob.as_deref()
+}
+
 /// Unique index MACs of a patch's mutations, in first-seen order, feeding the
 /// batched previous-value-MAC backend lookup.
 ///
-/// Linear-scan dedup wins for small patches (a HashSet measured 6-120% slower at
-/// small N here), but it is O(n²) and patches carry up to ~1000 mutations, where
-/// the scan dominates. Above [`MAC_DEDUP_SCAN_LIMIT`] we track membership in a
-/// side set that borrows the source MACs, keeping the hot small-N path untouched.
+/// Small patches use a cache-friendly linear scan (a HashSet measured 6-120%
+/// slower at small N here). Patches carry up to ~1000 mutations, where the
+/// scan's O(n²) compares dominate, so above [`MAC_DEDUP_SCAN_LIMIT`] dedup runs
+/// through a sort of position indices — O(n log n) with only a `Vec<u32>` of
+/// scratch, far cheaper than a `HashSet` of 32-byte MACs — then re-emits in
+/// first-seen order.
 pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>> {
-    let mut out: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
-    let mut seen: Option<std::collections::HashSet<&[u8]>> = (mutations.len()
-        > MAC_DEDUP_SCAN_LIMIT)
-        .then(|| std::collections::HashSet::with_capacity(mutations.len()));
-    for m in mutations {
-        if let Some(rec) = &m.record
-            && let Some(ind) = &rec.index
-            && let Some(index_mac) = &ind.blob
-        {
-            let is_new = match &mut seen {
-                Some(seen) => seen.insert(index_mac.as_slice()),
-                None => !out.iter().any(|v| v == index_mac),
-            };
-            if is_new {
-                out.push(index_mac.clone());
+    if mutations.len() <= MAC_DEDUP_SCAN_LIMIT {
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
+        for m in mutations {
+            if let Some(mac) = mutation_index_mac(m)
+                && !out.iter().any(|v| v.as_slice() == mac)
+            {
+                out.push(mac.to_vec());
             }
         }
+        return out;
     }
-    out
+
+    // Indices in `order` always carry a MAC, so the default branch is dead; it
+    // only keeps the lookup `unwrap`-free.
+    let mac_at = |i: u32| mutation_index_mac(&mutations[i as usize]).unwrap_or_default();
+
+    // Positions of mutations carrying a MAC, in first-seen order.
+    let mut order: Vec<u32> = mutations
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| mutation_index_mac(m).map(|_| i as u32))
+        .collect();
+
+    // Group equal MACs (ties broken by position so each run's first occurrence
+    // leads it), drop all but each run's leader, then restore first-seen order.
+    order.sort_unstable_by(|&a, &b| mac_at(a).cmp(mac_at(b)).then(a.cmp(&b)));
+    order.dedup_by(|&mut a, &mut b| mac_at(a) == mac_at(b));
+    order.sort_unstable();
+
+    order.into_iter().map(|i| mac_at(i).to_vec()).collect()
 }
 
 /// Mutation count above which [`collect_unique_index_macs`] switches from the
-/// cache-friendly O(n²) linear scan to O(n) set-based dedup. Chosen well below
-/// the ~1000-mutation patch ceiling and above the small-N range where the scan
-/// beats hashing.
+/// cache-friendly O(n²) linear scan to the O(n log n) index sort. Chosen well
+/// below the ~1000-mutation patch ceiling and above the small-N range where the
+/// scan beats sorting.
 const MAC_DEDUP_SCAN_LIMIT: usize = 64;
 
 fn lookup_app_state_key(
@@ -763,10 +781,10 @@ mod dedup_tests {
     }
 
     /// Both dedup paths must yield identical first-seen-order unique results;
-    /// the set path (large N) and scan path (small N) cannot diverge.
+    /// the index-sort path (large N) and scan path (small N) cannot diverge.
     #[test]
-    fn scan_and_set_paths_agree() {
-        // Small N exercises the linear scan; large N (> limit) the side set.
+    fn scan_and_sort_paths_agree() {
+        // Small N exercises the linear scan; large N (> limit) the index sort.
         for &n in &[8usize, MAC_DEDUP_SCAN_LIMIT, MAC_DEDUP_SCAN_LIMIT + 1, 1000] {
             let distinct = (n / 2).max(1);
             assert_eq!(
