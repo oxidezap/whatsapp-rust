@@ -24,22 +24,39 @@ use waproto::whatsapp as wa;
 pub use crate::appstate::Mutation;
 
 /// Unique index MACs of a patch's mutations, in first-seen order, feeding the
-/// batched previous-value-MAC backend lookup. Linear-scan dedup is deliberate:
-/// HashSet measured 6-120% slower at small N in this codebase, so don't switch
-/// without benchmarking both ends (patches carry up to ~1000 mutations).
+/// batched previous-value-MAC backend lookup.
+///
+/// Linear-scan dedup wins for small patches (a HashSet measured 6-120% slower at
+/// small N here), but it is O(n²) and patches carry up to ~1000 mutations, where
+/// the scan dominates. Above [`MAC_DEDUP_SCAN_LIMIT`] we track membership in a
+/// side set that borrows the source MACs, keeping the hot small-N path untouched.
 pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
+    let mut seen: Option<std::collections::HashSet<&[u8]>> = (mutations.len()
+        > MAC_DEDUP_SCAN_LIMIT)
+        .then(|| std::collections::HashSet::with_capacity(mutations.len()));
     for m in mutations {
         if let Some(rec) = &m.record
             && let Some(ind) = &rec.index
             && let Some(index_mac) = &ind.blob
-            && !out.iter().any(|v| v == index_mac)
         {
-            out.push(index_mac.clone());
+            let is_new = match &mut seen {
+                Some(seen) => seen.insert(index_mac.as_slice()),
+                None => !out.iter().any(|v| v == index_mac),
+            };
+            if is_new {
+                out.push(index_mac.clone());
+            }
         }
     }
     out
 }
+
+/// Mutation count above which [`collect_unique_index_macs`] switches from the
+/// cache-friendly O(n²) linear scan to O(n) set-based dedup. Chosen well below
+/// the ~1000-mutation patch ceiling and above the small-N range where the scan
+/// beats hashing.
+const MAC_DEDUP_SCAN_LIMIT: usize = 64;
 
 fn lookup_app_state_key(
     keys_map: &HashMap<String, Arc<ExpandedAppStateKeys>>,
@@ -704,5 +721,77 @@ mod external_blob_tests {
         let mut pl = pl_with_snapshot_ref(None);
         let download = |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> { Ok(Vec::new()) };
         assert!(download_external_blobs(&mut pl, &download).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    fn mutation(index_mac: &[u8]) -> wa::SyncdMutation {
+        wa::SyncdMutation {
+            record: Some(wa::SyncdRecord {
+                index: Some(wa::SyncdIndex {
+                    blob: Some(index_mac.to_vec()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Builds `n` mutations whose index MACs repeat every `distinct` values, so
+    /// the expected output is the first `distinct` MACs in first-seen order.
+    fn build(n: usize, distinct: usize) -> Vec<wa::SyncdMutation> {
+        (0..n)
+            .map(|i| {
+                let mut mac = vec![0u8; 32];
+                mac[..8].copy_from_slice(&((i % distinct) as u64).to_le_bytes());
+                mutation(&mac)
+            })
+            .collect()
+    }
+
+    fn expected(distinct: usize) -> Vec<Vec<u8>> {
+        (0..distinct)
+            .map(|i| {
+                let mut mac = vec![0u8; 32];
+                mac[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                mac
+            })
+            .collect()
+    }
+
+    /// Both dedup paths must yield identical first-seen-order unique results;
+    /// the set path (large N) and scan path (small N) cannot diverge.
+    #[test]
+    fn scan_and_set_paths_agree() {
+        // Small N exercises the linear scan; large N (> limit) the side set.
+        for &n in &[8usize, MAC_DEDUP_SCAN_LIMIT, MAC_DEDUP_SCAN_LIMIT + 1, 1000] {
+            let distinct = (n / 2).max(1);
+            assert_eq!(
+                collect_unique_index_macs(&build(n, distinct)),
+                expected(distinct),
+                "n = {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn skips_mutations_without_index_blob() {
+        let mutations = vec![
+            mutation(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            wa::SyncdMutation::default(),
+            mutation(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            mutation(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ];
+        let macs = collect_unique_index_macs(&mutations);
+        assert_eq!(
+            macs,
+            vec![
+                b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec(),
+                b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_vec()
+            ]
+        );
     }
 }
