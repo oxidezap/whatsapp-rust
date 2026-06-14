@@ -622,10 +622,136 @@ mod tests {
         assert_eq!(EditAttribute::infer_from_message(&msg), None);
     }
 
+    // ── boxing-specific infer_from_message tests ────────────────────────
+    // These tests verify that the newly-boxed content variants of wa::Message
+    // are recognised (or correctly ignored) by infer_from_message after the
+    // PR that shrank wa::Message ~75% by boxing its inline fields.
+
+    #[test]
+    fn infer_from_message_pin_in_chat_box_new_returns_pin_in_chat() {
+        // pin_in_chat_message is now Box<PinInChatMessage>. The is_some() check
+        // inside infer_from_message must still fire via the Box deref.
+        let msg = waproto::whatsapp::Message {
+            pin_in_chat_message: Some(Box::new(
+                waproto::whatsapp::message::PinInChatMessage::default(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            EditAttribute::infer_from_message(&msg),
+            Some(EditAttribute::PinInChat)
+        );
+    }
+
+    #[test]
+    fn infer_from_message_pin_in_chat_box_default_returns_pin_in_chat() {
+        // Box::default() is the ergonomic form introduced in the PR; must be
+        // identical to Box::new(T::default()) for this check.
+        let msg = waproto::whatsapp::Message {
+            pin_in_chat_message: Some(Box::default()),
+            ..Default::default()
+        };
+        assert_eq!(
+            EditAttribute::infer_from_message(&msg),
+            Some(EditAttribute::PinInChat)
+        );
+    }
+
+    #[test]
+    fn infer_from_message_reaction_message_box_new_empty_text_returns_sender_revoke() {
+        // reaction_message is now Box<ReactionMessage>. The as_ref() deref in
+        // infer_from_message must still reach the inner text field.
+        let msg = waproto::whatsapp::Message {
+            reaction_message: Some(Box::new(waproto::whatsapp::message::ReactionMessage {
+                text: Some(String::new()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            EditAttribute::infer_from_message(&msg),
+            Some(EditAttribute::SenderRevoke)
+        );
+    }
+
+    #[test]
+    fn infer_from_message_reaction_message_box_new_non_empty_returns_none() {
+        // A non-empty boxed reaction is a plain send, not an edit.
+        let msg = waproto::whatsapp::Message {
+            reaction_message: Some(Box::new(waproto::whatsapp::message::ReactionMessage {
+                text: Some("👍".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(EditAttribute::infer_from_message(&msg), None);
+    }
+
+    #[test]
+    fn infer_from_message_keep_in_chat_undo_box_new_returns_sender_revoke() {
+        // keep_in_chat_message is now Box<KeepInChatMessage>. The compound
+        // as_ref() + field access chain must still work via Box auto-deref.
+        let msg = waproto::whatsapp::Message {
+            keep_in_chat_message: Some(Box::new(
+                waproto::whatsapp::message::KeepInChatMessage {
+                    key: Some(waproto::whatsapp::MessageKey {
+                        from_me: Some(true),
+                        ..Default::default()
+                    }),
+                    keep_type: Some(waproto::whatsapp::KeepType::UndoKeepForAll as i32),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        assert_eq!(
+            EditAttribute::infer_from_message(&msg),
+            Some(EditAttribute::SenderRevoke)
+        );
+    }
+
+    #[test]
+    fn infer_from_message_keep_in_chat_keep_for_all_returns_none() {
+        // KEEP_FOR_ALL (keep=true) is not a revoke — must return None.
+        let msg = waproto::whatsapp::Message {
+            keep_in_chat_message: Some(Box::new(
+                waproto::whatsapp::message::KeepInChatMessage {
+                    key: Some(waproto::whatsapp::MessageKey {
+                        from_me: Some(true),
+                        ..Default::default()
+                    }),
+                    keep_type: Some(waproto::whatsapp::KeepType::KeepForAll as i32),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        assert_eq!(EditAttribute::infer_from_message(&msg), None);
+    }
+
+    #[test]
+    fn infer_from_message_secret_encrypted_poll_edit_box_new_returns_none() {
+        // secret_encrypted_message is now Box<SecretEncryptedMessage>.
+        // PollEdit is NOT in the MessageEdit/EventEdit match inside
+        // infer_from_message (only MessageEdit and EventEdit produce a
+        // MessageEdit attribute), so it must return None.
+        use waproto::whatsapp::message::secret_encrypted_message::SecretEncType;
+        let msg = waproto::whatsapp::Message {
+            secret_encrypted_message: Some(Box::new(
+                waproto::whatsapp::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(SecretEncType::PollEdit as i32),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        assert_eq!(EditAttribute::infer_from_message(&msg), None);
+    }
+
     #[test]
     fn infer_from_message_unwraps_neutral_wrappers() {
         let inner_revoke = waproto::whatsapp::Message {
-            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
+
                 key: Some(waproto::whatsapp::MessageKey {
                     from_me: Some(false),
                     ..Default::default()
@@ -648,7 +774,7 @@ mod tests {
 
         // Same for pin wrapped in view_once and device_sent (double nesting).
         let inner_pin = waproto::whatsapp::Message {
-            pin_in_chat_message: Some(waproto::whatsapp::message::PinInChatMessage::default()),
+            pin_in_chat_message: Some(Box::default()),
             ..Default::default()
         };
         let wrapped_pin = waproto::whatsapp::Message {

@@ -13,10 +13,10 @@ use waproto::whatsapp as wa;
 #[test]
 fn regression_a1_revoked_reaction_returns_sender_revoke() {
     let msg = wa::Message {
-        reaction_message: Some(wa::message::ReactionMessage {
+        reaction_message: Some(Box::new(wa::message::ReactionMessage {
             text: Some(String::new()),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     assert_eq!(
@@ -28,14 +28,14 @@ fn regression_a1_revoked_reaction_returns_sender_revoke() {
 #[test]
 fn regression_a1_keep_in_chat_undo_returns_sender_revoke() {
     let msg = wa::Message {
-        keep_in_chat_message: Some(wa::message::KeepInChatMessage {
+        keep_in_chat_message: Some(Box::new(wa::message::KeepInChatMessage {
             key: Some(wa::MessageKey {
                 from_me: Some(true),
                 ..Default::default()
             }),
             keep_type: Some(wa::KeepType::UndoKeepForAll as i32),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     assert_eq!(
@@ -47,12 +47,12 @@ fn regression_a1_keep_in_chat_undo_returns_sender_revoke() {
 #[test]
 fn regression_a1_secret_encrypted_message_edit_returns_message_edit() {
     let msg = wa::Message {
-        secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
             secret_enc_type: Some(
                 wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
             ),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     assert_eq!(
@@ -64,17 +64,106 @@ fn regression_a1_secret_encrypted_message_edit_returns_message_edit() {
 #[test]
 fn regression_a1_secret_encrypted_event_edit_returns_message_edit() {
     let msg = wa::Message {
-        secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
             secret_enc_type: Some(
                 wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32,
             ),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     assert_eq!(
         EditAttribute::infer_from_message(&msg),
         Some(EditAttribute::MessageEdit),
+    );
+}
+
+// A1-B. Newly-boxed message variants behave identically to their pre-boxing
+// equivalents. Each test pins the `EditAttribute::infer_from_message` result
+// so that a regression back to non-boxed fields fails at compile time.
+
+#[test]
+fn regression_a1b_pin_in_chat_box_default_returns_pin_in_chat() {
+    // pin_in_chat_message is now Box<PinInChatMessage>.
+    // Box::default() must be equivalent to Box::new(PinInChatMessage::default()).
+    let msg_via_box_default = wa::Message {
+        pin_in_chat_message: Some(Box::default()),
+        ..Default::default()
+    };
+    let msg_via_box_new = wa::Message {
+        pin_in_chat_message: Some(Box::new(wa::message::PinInChatMessage::default())),
+        ..Default::default()
+    };
+    assert_eq!(
+        EditAttribute::infer_from_message(&msg_via_box_default),
+        Some(EditAttribute::PinInChat),
+    );
+    assert_eq!(
+        EditAttribute::infer_from_message(&msg_via_box_new),
+        Some(EditAttribute::PinInChat),
+        "Box::new(default) must equal Box::default() for pin_in_chat_message"
+    );
+}
+
+#[test]
+fn regression_a1b_poll_update_message_box_new_returns_no_edit_attr() {
+    // poll_update_message is now Box<PollUpdateMessage>. A poll vote is NOT
+    // an edit — infer_from_message must return None for it.
+    let msg = wa::Message {
+        poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
+            vote: Some(wa::message::PollEncValue::default()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    assert_eq!(
+        EditAttribute::infer_from_message(&msg),
+        None,
+        "poll_update_message must not produce an edit attribute"
+    );
+}
+
+#[test]
+fn regression_a1b_enc_reaction_message_box_default_returns_no_edit_attr() {
+    // enc_reaction_message is now Box<EncReactionMessage>. It carries no edit
+    // semantics; infer_from_message must return None.
+    let msg = wa::Message {
+        enc_reaction_message: Some(Box::default()),
+        ..Default::default()
+    };
+    assert_eq!(
+        EditAttribute::infer_from_message(&msg),
+        None,
+        "enc_reaction_message must not produce an edit attribute"
+    );
+}
+
+#[test]
+fn regression_a1b_box_default_equals_box_new_default_for_reaction() {
+    // Verify that `Some(Box::default())` and `Some(Box::new(T::default()))`
+    // produce the same infer_from_message result for reaction_message.
+
+    // Non-empty reaction: no edit attribute.
+    let non_empty_via_box_new = wa::Message {
+        reaction_message: Some(Box::new(wa::message::ReactionMessage {
+            text: Some("👍".to_string()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    assert_eq!(EditAttribute::infer_from_message(&non_empty_via_box_new), None);
+
+    // Empty reaction via Box::new: sender revoke.
+    let empty_via_box_new = wa::Message {
+        reaction_message: Some(Box::new(wa::message::ReactionMessage {
+            text: Some(String::new()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    assert_eq!(
+        EditAttribute::infer_from_message(&empty_via_box_new),
+        Some(EditAttribute::SenderRevoke),
     );
 }
 

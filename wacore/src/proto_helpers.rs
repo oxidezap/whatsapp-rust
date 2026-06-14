@@ -555,11 +555,11 @@ pub fn build_keep_in_chat_message(
         wa::KeepType::UndoKeepForAll
     };
     wa::Message {
-        keep_in_chat_message: Some(wa::message::KeepInChatMessage {
+        keep_in_chat_message: Some(Box::new(wa::message::KeepInChatMessage {
             key: Some(key),
             keep_type: Some(keep_type as i32),
             timestamp_ms: Some(timestamp_ms),
-        }),
+        })),
         ..Default::default()
     }
 }
@@ -768,12 +768,12 @@ pub fn build_reaction_message(
     sender_timestamp_ms: i64,
 ) -> wa::Message {
     wa::Message {
-        reaction_message: Some(wa::message::ReactionMessage {
+        reaction_message: Some(Box::new(wa::message::ReactionMessage {
             key: Some(key),
             text: Some(emoji.into()),
             sender_timestamp_ms: Some(sender_timestamp_ms),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     }
 }
@@ -1594,10 +1594,10 @@ mod tests {
             device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
                 destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
                 message: Some(Box::new(wa::Message {
-                    reaction_message: Some(wa::message::ReactionMessage {
+                    reaction_message: Some(Box::new(wa::message::ReactionMessage {
                         text: Some("\u{2764}".to_string()),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 })),
                 phash: None,
@@ -2620,5 +2620,152 @@ mod tests {
             EditAttribute::infer_from_message(&unreact),
             Some(EditAttribute::SenderRevoke)
         );
+    }
+
+    // ── boxing-specific tests ────────────────────────────────────────────
+    // These tests pin the observable behaviour after boxing the inline
+    // message-content variants of wa::Message (PR: shrink wa::Message ~75%).
+
+    #[test]
+    fn build_reaction_message_field_is_box_wrapped_and_dereferences() {
+        // reaction_message is now Option<Box<ReactionMessage>>. Verify that
+        // .as_ref() returns a reference to the inner struct (Box auto-derefs),
+        // so existing call-sites that use .as_ref().unwrap().field remain valid.
+        let key = group_target_key();
+        let msg = build_reaction_message(key.clone(), "🎉", 9_999_999);
+
+        let inner = msg
+            .reaction_message
+            .as_ref()
+            .expect("reaction_message must be Some");
+        // Accessing fields through the Box deref.
+        assert_eq!(inner.text.as_deref(), Some("🎉"));
+        assert_eq!(inner.sender_timestamp_ms, Some(9_999_999));
+        assert_eq!(inner.key.as_ref(), Some(&key));
+        // No other content fields are set.
+        assert!(msg.conversation.is_none());
+        assert!(msg.extended_text_message.is_none());
+    }
+
+    #[test]
+    fn build_keep_in_chat_message_field_is_box_wrapped_and_dereferences() {
+        // keep_in_chat_message is now Option<Box<KeepInChatMessage>>. Verify
+        // that .as_ref() returns a reference to the inner struct, keeping
+        // access patterns identical to the pre-boxing API.
+        let key = wa::MessageKey {
+            id: Some("KIC-ID".into()),
+            from_me: Some(true),
+            remote_jid: Some("919123456789@s.whatsapp.net".into()),
+            ..Default::default()
+        };
+        let msg = build_keep_in_chat_message(key.clone(), true, 42_000);
+
+        let inner = msg
+            .keep_in_chat_message
+            .as_ref()
+            .expect("keep_in_chat_message must be Some");
+        assert_eq!(inner.keep_type, Some(wa::KeepType::KeepForAll as i32));
+        assert_eq!(inner.timestamp_ms, Some(42_000));
+        assert_eq!(
+            inner.key.as_ref().and_then(|k| k.id.as_deref()),
+            Some("KIC-ID")
+        );
+        // Only the keep field is populated.
+        assert!(msg.conversation.is_none());
+        assert!(msg.reaction_message.is_none());
+    }
+
+    #[test]
+    fn build_keep_in_chat_message_undo_field_is_accessible_via_deref() {
+        // Undo variant: the Box deref must expose keep_type correctly.
+        let msg = build_keep_in_chat_message(wa::MessageKey::default(), false, 0);
+        let inner = msg
+            .keep_in_chat_message
+            .as_ref()
+            .expect("keep_in_chat_message must be Some");
+        assert_eq!(inner.keep_type, Some(wa::KeepType::UndoKeepForAll as i32));
+    }
+
+    #[test]
+    fn poll_update_message_box_new_fields_accessible_via_deref() {
+        // poll_update_message is now Option<Box<PollUpdateMessage>>.
+        // Verify that fields are reachable through the Box deref.
+        let msg = wa::Message {
+            poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
+                vote: Some(wa::message::PollEncValue {
+                    enc_payload: Some(vec![0xAB, 0xCD]),
+                    enc_iv: Some(vec![0x01; 12]),
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let inner = msg
+            .poll_update_message
+            .as_ref()
+            .expect("poll_update_message must be Some");
+        assert!(inner.vote.is_some(), "vote must be accessible via Box deref");
+        let vote = inner.vote.as_ref().unwrap();
+        assert_eq!(vote.enc_payload.as_deref(), Some([0xAB_u8, 0xCD].as_slice()));
+    }
+
+    #[test]
+    fn poll_update_message_box_default_has_no_vote() {
+        // Box::default() for poll_update_message must produce an empty struct
+        // (no vote field set), which must NOT trigger the poll-vote meta node.
+        let msg = wa::Message {
+            poll_update_message: Some(Box::default()),
+            ..Default::default()
+        };
+        let inner = msg.poll_update_message.as_ref().unwrap();
+        assert!(
+            inner.vote.is_none(),
+            "Box::default() must not set the vote field"
+        );
+    }
+
+    #[test]
+    fn enc_reaction_message_box_new_fields_accessible_via_deref() {
+        // enc_reaction_message is now Option<Box<EncReactionMessage>>.
+        let target_key = wa::MessageKey {
+            id: Some("PARENT-ID".into()),
+            ..Default::default()
+        };
+        let msg = wa::Message {
+            enc_reaction_message: Some(Box::new(wa::message::EncReactionMessage {
+                target_message_key: Some(target_key.clone()),
+                enc_payload: Some(vec![1, 2, 3, 4]),
+                enc_iv: Some(vec![0; 12]),
+            })),
+            ..Default::default()
+        };
+
+        let inner = msg
+            .enc_reaction_message
+            .as_ref()
+            .expect("enc_reaction_message must be Some");
+        assert_eq!(inner.enc_payload.as_deref(), Some([1_u8, 2, 3, 4].as_slice()));
+        assert_eq!(
+            inner
+                .target_message_key
+                .as_ref()
+                .and_then(|k| k.id.as_deref()),
+            Some("PARENT-ID")
+        );
+    }
+
+    #[test]
+    fn keep_in_chat_message_and_reaction_message_are_mutually_exclusive_on_message() {
+        // A single wa::Message must only carry one content variant. Verify
+        // that constructing with one leaves the other absent (post-boxing,
+        // the fields stay independently addressable).
+        let reaction_msg = build_reaction_message(group_target_key(), "💯", 1);
+        assert!(reaction_msg.reaction_message.is_some());
+        assert!(reaction_msg.keep_in_chat_message.is_none());
+
+        let keep_msg = build_keep_in_chat_message(wa::MessageKey::default(), true, 1);
+        assert!(keep_msg.keep_in_chat_message.is_some());
+        assert!(keep_msg.reaction_message.is_none());
     }
 }
