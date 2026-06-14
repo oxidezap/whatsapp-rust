@@ -222,10 +222,10 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_reaction() {
         let msg = wa::Message {
-            reaction_message: Some(wa::message::ReactionMessage {
+            reaction_message: Some(Box::new(wa::message::ReactionMessage {
                 text: Some("💚".into()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert!(
@@ -237,7 +237,7 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_enc_reaction() {
         let msg = wa::Message {
-            enc_reaction_message: Some(wa::message::EncReactionMessage::default()),
+            enc_reaction_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
@@ -272,7 +272,7 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_reaction_inside_ephemeral_wrapper() {
         let inner = wa::Message {
-            reaction_message: Some(wa::message::ReactionMessage::default()),
+            reaction_message: Some(Box::default()),
             ..Default::default()
         };
         let msg = wa::Message {
@@ -2119,7 +2119,7 @@ mod decrypt_fail {
     #[test]
     fn reaction() {
         let msg = wa::Message {
-            reaction_message: Some(Default::default()),
+            reaction_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2128,7 +2128,7 @@ mod decrypt_fail {
     #[test]
     fn pin() {
         let msg = wa::Message {
-            pin_in_chat_message: Some(Default::default()),
+            pin_in_chat_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2137,10 +2137,10 @@ mod decrypt_fail {
     #[test]
     fn poll_vote() {
         let msg = wa::Message {
-            poll_update_message: Some(wa::message::PollUpdateMessage {
+            poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
                 vote: Some(Default::default()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2149,7 +2149,7 @@ mod decrypt_fail {
     #[test]
     fn poll_update_without_vote() {
         let msg = wa::Message {
-            poll_update_message: Some(Default::default()),
+            poll_update_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(!should_hide_decrypt_fail(&msg));
@@ -2160,7 +2160,7 @@ mod decrypt_fail {
         let msg = wa::Message {
             ephemeral_message: Some(Box::new(wa::message::FutureProofMessage {
                 message: Some(Box::new(wa::Message {
-                    reaction_message: Some(Default::default()),
+                    reaction_message: Some(Box::default()),
                     ..Default::default()
                 })),
             })),
@@ -2172,7 +2172,7 @@ mod decrypt_fail {
     #[test]
     fn conditional_reveal() {
         let msg = wa::Message {
-            conditional_reveal_message: Some(Default::default()),
+            conditional_reveal_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2182,10 +2182,10 @@ mod decrypt_fail {
     fn poll_add_option_edit() {
         use wa::message::secret_encrypted_message::SecretEncType;
         let msg = wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 secret_enc_type: Some(SecretEncType::PollAddOption as i32),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2231,7 +2231,7 @@ mod decrypt_fail_for_send {
     fn revoke_does_not_block_content_based_hide() {
         // A reaction still hides on its own merits even under a revoke edit.
         let msg = wa::Message {
-            reaction_message: Some(Default::default()),
+            reaction_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail_for_send(
@@ -2247,10 +2247,10 @@ mod stanza_type {
 
     fn secret(enc: SecretEncType) -> wa::Message {
         wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 secret_enc_type: Some(enc as i32),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         }
     }
@@ -2345,15 +2345,15 @@ mod stanza_type {
                 ..Default::default()
             },
             wa::Message {
-                decline_payment_request_message: Some(Default::default()),
+                decline_payment_request_message: Some(Box::default()),
                 ..Default::default()
             },
             wa::Message {
-                cancel_payment_request_message: Some(Default::default()),
+                cancel_payment_request_message: Some(Box::default()),
                 ..Default::default()
             },
             wa::Message {
-                payment_invite_message: Some(Default::default()),
+                payment_invite_message: Some(Box::default()),
                 ..Default::default()
             },
         ];
@@ -2415,7 +2415,7 @@ mod stanza_type {
     #[test]
     fn preserved_classifier_branches() {
         let r = wa::Message {
-            reaction_message: Some(Default::default()),
+            reaction_message: Some(Box::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&r), stanza::MSG_TYPE_REACTION);

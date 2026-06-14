@@ -156,7 +156,7 @@ impl<'a> Polls<'a> {
         };
 
         let message = wa::Message {
-            poll_update_message: Some(poll_update),
+            poll_update_message: Some(Box::new(poll_update)),
             ..Default::default()
         };
 

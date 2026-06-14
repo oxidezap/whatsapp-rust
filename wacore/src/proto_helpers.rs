@@ -555,11 +555,11 @@ pub fn build_keep_in_chat_message(
         wa::KeepType::UndoKeepForAll
     };
     wa::Message {
-        keep_in_chat_message: Some(wa::message::KeepInChatMessage {
+        keep_in_chat_message: Some(Box::new(wa::message::KeepInChatMessage {
             key: Some(key),
             keep_type: Some(keep_type as i32),
             timestamp_ms: Some(timestamp_ms),
-        }),
+        })),
         ..Default::default()
     }
 }
@@ -768,12 +768,12 @@ pub fn build_reaction_message(
     sender_timestamp_ms: i64,
 ) -> wa::Message {
     wa::Message {
-        reaction_message: Some(wa::message::ReactionMessage {
+        reaction_message: Some(Box::new(wa::message::ReactionMessage {
             key: Some(key),
             text: Some(emoji.into()),
             sender_timestamp_ms: Some(sender_timestamp_ms),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     }
 }
@@ -1594,10 +1594,10 @@ mod tests {
             device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
                 destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
                 message: Some(Box::new(wa::Message {
-                    reaction_message: Some(wa::message::ReactionMessage {
+                    reaction_message: Some(Box::new(wa::message::ReactionMessage {
                         text: Some("\u{2764}".to_string()),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 })),
                 phash: None,

@@ -405,7 +405,7 @@ pub fn decrypt_secret_encrypted(
                 &sender,
             )?;
             Ok(wa::Message {
-                reaction_message: Some(reaction),
+                reaction_message: Some(Box::new(reaction)),
                 ..Default::default()
             })
         }
@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn extract_envelope_recognises_message_edit() {
         let msg = wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 target_message_key: Some(wa::MessageKey {
                     remote_jid: Some("g@g.us".to_string()),
                     from_me: Some(false),
@@ -599,7 +599,7 @@ mod tests {
                     wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
                 ),
                 remote_key_id: None,
-            }),
+            })),
             ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn original_sender_jid_uses_my_jid_for_self_sent_edits() {
         let msg = wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 target_message_key: Some(wa::MessageKey {
                     remote_jid: Some("5510000@s.whatsapp.net".to_string()),
                     from_me: Some(true),
@@ -628,7 +628,7 @@ mod tests {
                     wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
                 ),
                 remote_key_id: None,
-            }),
+            })),
             ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
@@ -647,7 +647,7 @@ mod tests {
         // editor's frame (from_me=true), so the receive path uses the envelope
         // sender via `original_sender_for_dispatch`, not this resolver.
         let msg = wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 target_message_key: Some(wa::MessageKey {
                     remote_jid: Some("5510000@s.whatsapp.net".to_string()),
                     from_me: Some(false),
@@ -660,7 +660,7 @@ mod tests {
                     wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
                 ),
                 remote_key_id: None,
-            }),
+            })),
             ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
@@ -676,7 +676,7 @@ mod tests {
         // The MESSAGE_EDIT-specific consumer API resolves from the envelope
         // frame, ignoring the editor-framed target key (here from_me=true).
         let msg = wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 target_message_key: Some(wa::MessageKey {
                     remote_jid: Some("100000000000001@lid".to_string()),
                     from_me: Some(true),
@@ -689,7 +689,7 @@ mod tests {
                     wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
                 ),
                 remote_key_id: None,
-            }),
+            })),
             ..Default::default()
         };
         let env = extract_envelope(&msg).expect("recognised");
@@ -718,7 +718,7 @@ mod tests {
         // is always the author (you can only edit your own message), so the
         // sender must come from the envelope frame.
         let msg = wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 target_message_key: Some(wa::MessageKey {
                     remote_jid: Some("100000000000001@lid".to_string()), // our LID (editor's frame)
                     from_me: Some(true),
@@ -731,7 +731,7 @@ mod tests {
                     wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
                 ),
                 remote_key_id: None,
-            }),
+            })),
             ..Default::default()
         };
         let env = extract_secret_encrypted(&msg).expect("recognised");
@@ -751,7 +751,7 @@ mod tests {
         // Our own edit, synced from another linked device: the envelope IS from
         // me, so the original sender is us — device suffix stripped.
         let msg = wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 target_message_key: Some(wa::MessageKey {
                     remote_jid: Some("200000000000002@lid".to_string()),
                     from_me: Some(true),
@@ -764,7 +764,7 @@ mod tests {
                     wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
                 ),
                 remote_key_id: None,
-            }),
+            })),
             ..Default::default()
         };
         let env = extract_secret_encrypted(&msg).expect("recognised");
@@ -784,7 +784,7 @@ mod tests {
         // other than the target's author (e.g. a peer votes on our poll), so the
         // target key stays authoritative for non-edit kinds.
         let msg = wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 target_message_key: Some(wa::MessageKey {
                     remote_jid: Some("g@g.us".to_string()),
                     from_me: Some(false),
@@ -797,7 +797,7 @@ mod tests {
                     wa::message::secret_encrypted_message::SecretEncType::PollEdit as i32,
                 ),
                 remote_key_id: None,
-            }),
+            })),
             ..Default::default()
         };
         let env = extract_secret_encrypted(&msg).expect("recognised");
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn extract_envelope_rejects_non_edit_secret_enc_type() {
         let msg = wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 target_message_key: Some(wa::MessageKey::default()),
                 enc_payload: Some(vec![0u8; 32]),
                 enc_iv: Some(vec![0u8; 12]),
@@ -824,7 +824,7 @@ mod tests {
                     wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32,
                 ),
                 remote_key_id: None,
-            }),
+            })),
             ..Default::default()
         };
         assert!(extract_envelope(&msg).is_none());
@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn extract_envelope_rejects_invalid_iv_size() {
         let msg = wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 target_message_key: Some(wa::MessageKey::default()),
                 enc_payload: Some(vec![0u8; 32]),
                 enc_iv: Some(vec![0u8; 11]),
@@ -841,7 +841,7 @@ mod tests {
                     wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
                 ),
                 remote_key_id: None,
-            }),
+            })),
             ..Default::default()
         };
         assert!(extract_envelope(&msg).is_none());
@@ -912,7 +912,7 @@ mod tests {
 
     fn secret_msg(enc_type: SecretEncType, payload: Vec<u8>, iv: Vec<u8>) -> wa::Message {
         wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 target_message_key: Some(wa::MessageKey {
                     remote_jid: Some("5510000@s.whatsapp.net".to_string()),
                     from_me: Some(false),
@@ -923,7 +923,7 @@ mod tests {
                 enc_iv: Some(iv),
                 secret_enc_type: Some(enc_type as i32),
                 remote_key_id: None,
-            }),
+            })),
             ..Default::default()
         }
     }
@@ -1033,11 +1033,11 @@ mod enc_addon_tests {
     #[test]
     fn extract_recognises_enc_reaction_and_comment_envelopes() {
         let reaction = wa::Message {
-            enc_reaction_message: Some(wa::message::EncReactionMessage {
+            enc_reaction_message: Some(Box::new(wa::message::EncReactionMessage {
                 target_message_key: Some(key("PARENT1")),
                 enc_payload: Some(vec![0; 32]),
                 enc_iv: Some(vec![0; 12]),
-            }),
+            })),
             ..Default::default()
         };
         let env = extract_secret_encrypted(&reaction).expect("reaction recognised");
@@ -1045,11 +1045,11 @@ mod enc_addon_tests {
         assert_eq!(env.target_id(), Some("PARENT1"));
 
         let comment = wa::Message {
-            enc_comment_message: Some(wa::message::EncCommentMessage {
+            enc_comment_message: Some(Box::new(wa::message::EncCommentMessage {
                 target_message_key: Some(key("PARENT2")),
                 enc_payload: Some(vec![0; 32]),
                 enc_iv: Some(vec![0; 12]),
-            }),
+            })),
             ..Default::default()
         };
         let env = extract_secret_encrypted(&comment).expect("comment recognised");
@@ -1060,21 +1060,21 @@ mod enc_addon_tests {
     #[test]
     fn extract_rejects_malformed_enc_reaction_envelope() {
         let bad_iv = wa::Message {
-            enc_reaction_message: Some(wa::message::EncReactionMessage {
+            enc_reaction_message: Some(Box::new(wa::message::EncReactionMessage {
                 target_message_key: Some(key("PARENT1")),
                 enc_payload: Some(vec![0; 32]),
                 enc_iv: Some(vec![0; 8]),
-            }),
+            })),
             ..Default::default()
         };
         assert!(extract_secret_encrypted(&bad_iv).is_none());
 
         let no_key = wa::Message {
-            enc_reaction_message: Some(wa::message::EncReactionMessage {
+            enc_reaction_message: Some(Box::new(wa::message::EncReactionMessage {
                 target_message_key: None,
                 enc_payload: Some(vec![0; 32]),
                 enc_iv: Some(vec![0; 12]),
-            }),
+            })),
             ..Default::default()
         };
         assert!(extract_secret_encrypted(&no_key).is_none());

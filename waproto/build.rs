@@ -65,6 +65,46 @@ fn main() -> std::io::Result<()> {
     config.boxed(".whatsapp.WebMessageInfo.statusMentionMessageInfo");
     config.boxed(".whatsapp.Message.messageContextInfo");
 
+    // Shrink `wa::Message` (~3.8 KiB: the sum of ~110 inline content variants,
+    // of which exactly one is ever set) by boxing the remaining inline
+    // message-typed fields. prost already boxes the variants in recursion
+    // cycles; these are the rest. The struct drops to ~0.9 KiB, so every
+    // `Arc<Message>` event is cheaper to allocate and hold, and decode/clone
+    // move far less. Each boxed field's set value costs one small heap alloc.
+    for field in [
+        "bcallMessage",
+        "callLogMesssage",
+        "cancelPaymentRequestMessage",
+        "chat",
+        "conditionalRevealMessage",
+        "declinePaymentRequestMessage",
+        "encCommentMessage",
+        "encEventResponseMessage",
+        "encReactionMessage",
+        "groupRootKeyShare",
+        "invoiceMessage",
+        "keepInChatMessage",
+        "paymentInviteMessage",
+        "paymentReminderMessage",
+        "pinInChatMessage",
+        "placeholderMessage",
+        "pollAddOptionMessage",
+        "pollUpdateMessage",
+        "questionResponseMessage",
+        "reactionMessage",
+        "rootSecretDistributeMessage",
+        "scheduledCallCreationMessage",
+        "scheduledCallEditMessage",
+        "secretEncryptedMessage",
+        "statusNotificationMessage",
+        "statusQuestionAnswerMessage",
+        "statusQuotedMessage",
+        "statusStickerInteractionMessage",
+        "stickerSyncRmrMessage",
+    ] {
+        config.boxed(format!(".whatsapp.Message.{field}").as_str());
+    }
+
     // Bytes fields lack serde support; skip them (internal crypto state).
     config.field_attribute(
         ".whatsapp.SessionStructure.Chain.ChainKey.key",

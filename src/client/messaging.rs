@@ -411,7 +411,7 @@ fn build_secret_message_edit(
         wacore::message_edit::encrypt_message_edit(&inner, message_secret, &ctx)?;
 
     Ok(wa::Message {
-        secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
             target_message_key: Some(wa::MessageKey {
                 remote_jid: Some(to.to_string()),
                 from_me: Some(true),
@@ -424,7 +424,7 @@ fn build_secret_message_edit(
                 wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
             ),
             remote_key_id: None,
-        }),
+        })),
         message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(message_secret.to_vec()),
             ..Default::default()
