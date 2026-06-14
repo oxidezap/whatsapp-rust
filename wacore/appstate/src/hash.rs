@@ -58,15 +58,20 @@ impl HashState {
                 .and_then(|idx| idx.blob.as_deref())
         }
         let index_mode = mutations.iter().all(|m| index_mac_of(m).is_some());
-        let mut removed_in_patch: std::collections::HashSet<&[u8]> =
-            std::collections::HashSet::new();
+        // Membership set over REMOVE index_macs, which are HMAC outputs (uniformly
+        // random). A linear-scan Vec beats a SipHash HashSet at the patch sizes seen
+        // in practice — the same trade-off as detect_duplicate_index_in_patch and
+        // collect_unique_index_macs (#856). Only `.contains()` is queried below, so an
+        // unconditional push is membership-equivalent to the set (a malformed duplicate
+        // REMOVE is rejected by the duplicate-index guard regardless).
+        let mut removed_in_patch: Vec<&[u8]> = Vec::new();
         if index_mode {
             for mutation in mutations {
                 if mutation.operation.unwrap_or_default()
                     == wa::syncd_mutation::SyncdOperation::Remove as i32
                     && let Some(index_mac) = index_mac_of(mutation)
                 {
-                    removed_in_patch.insert(index_mac);
+                    removed_in_patch.push(index_mac);
                 }
             }
         }
@@ -88,7 +93,7 @@ impl HashState {
                 added.push(&blob[blob.len() - 32..]);
             }
             if let Some(index_mac) = index_mac_of(mutation) {
-                if is_set && removed_in_patch.contains(index_mac) {
+                if is_set && removed_in_patch.contains(&index_mac) {
                     continue;
                 }
                 match get_prev_set_value_mac(index_mac, i) {
