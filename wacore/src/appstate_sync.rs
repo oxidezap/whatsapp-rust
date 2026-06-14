@@ -773,14 +773,14 @@ mod dedup_tests {
             .collect()
     }
 
+    fn mac_bytes(i: usize) -> Vec<u8> {
+        let mut mac = vec![0u8; 32];
+        mac[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        mac
+    }
+
     fn expected(distinct: usize) -> Vec<Vec<u8>> {
-        (0..distinct)
-            .map(|i| {
-                let mut mac = vec![0u8; 32];
-                mac[..8].copy_from_slice(&(i as u64).to_le_bytes());
-                mac
-            })
-            .collect()
+        (0..distinct).map(mac_bytes).collect()
     }
 
     /// Both dedup paths must yield identical first-seen-order unique results;
@@ -796,6 +796,25 @@ mod dedup_tests {
                 "n = {n}"
             );
         }
+    }
+
+    /// The index-sort path must re-emit in first-seen order, not byte-sort order.
+    /// Force that path (> limit MACs) with first appearances running opposite to
+    /// byte order, plus trailing duplicates that must be dropped — so a bug in
+    /// the order-restoration step can't pass by coinciding with the sort order.
+    #[test]
+    fn sort_path_restores_first_seen_order() {
+        let distinct = MAC_DEDUP_SCAN_LIMIT + 20;
+        // First-seen order is descending i; byte order is ascending (i < 256).
+        let mut mutations: Vec<wa::SyncdMutation> = (0..distinct)
+            .rev()
+            .map(|i| mutation(&mac_bytes(i)))
+            .collect();
+        for i in [distinct - 1, distinct / 2, 0] {
+            mutations.push(mutation(&mac_bytes(i)));
+        }
+        let want: Vec<Vec<u8>> = (0..distinct).rev().map(mac_bytes).collect();
+        assert_eq!(collect_unique_index_macs(&mutations), want);
     }
 
     #[test]
