@@ -50,16 +50,17 @@ pub mod codec {
         msg.encode_to_vec()
     }
 
-    /// Decode a `Message` directly onto the heap.
+    /// Decode a `Message` onto the heap.
     ///
     /// `Message` is large enough that returning it by value made the decode path
-    /// memcpy-bound (PR #857); keeping it boxed makes the return and every
-    /// downstream hand-off pointer-sized.
+    /// memcpy-bound (PR #857); boxing makes the return and every downstream
+    /// hand-off pointer-sized. Goes through `decode` (not `merge` on a boxed
+    /// default) so it reuses the workspace's single `&mut &[u8]` buffer
+    /// instantiation — a direct `merge` call uses a distinct buffer type and
+    /// duplicates prost's per-message `merge_field` tree (~210 KiB of `.text`).
     #[inline(never)]
     pub fn message_decode(mut bytes: &[u8]) -> Result<Box<whatsapp::Message>, prost::DecodeError> {
-        let mut msg = Box::<whatsapp::Message>::default();
-        msg.merge(&mut bytes)?;
-        Ok(msg)
+        Ok(Box::new(whatsapp::Message::decode(&mut bytes)?))
     }
 
     #[inline(never)]
