@@ -54,12 +54,15 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>
     // only keeps the lookup `unwrap`-free.
     let mac_at = |i: u32| mutation_index_mac(&mutations[i as usize]).unwrap_or_default();
 
-    // Positions of mutations carrying a MAC, in first-seen order.
-    let mut order: Vec<u32> = mutations
-        .iter()
-        .enumerate()
-        .filter_map(|(i, m)| mutation_index_mac(m).map(|_| i as u32))
-        .collect();
+    // Positions of mutations carrying a MAC, in first-seen order. Pre-sized to
+    // one allocation (the only scratch this path adds over the returned Vec).
+    let mut order: Vec<u32> = Vec::with_capacity(mutations.len());
+    order.extend(
+        mutations
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| mutation_index_mac(m).map(|_| i as u32)),
+    );
 
     // Group equal MACs (ties broken by position so each run's first occurrence
     // leads it), drop all but each run's leader, then restore first-seen order.
