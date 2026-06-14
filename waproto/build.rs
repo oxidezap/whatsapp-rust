@@ -65,45 +65,6 @@ fn main() -> std::io::Result<()> {
     config.boxed(".whatsapp.WebMessageInfo.statusMentionMessageInfo");
     config.boxed(".whatsapp.Message.messageContextInfo");
 
-    // Box the remaining inline content variants (prost already boxes the ones in
-    // recursion cycles) so `Message` doesn't carry ~100 mostly-absent variants by
-    // value — it shrinks ~4x, making every move/decode/drop cheaper. The two
-    // SenderKeyDistribution fields stay inline: small, and on the group-send hot
-    // path where a per-send allocation isn't worth it.
-    for field in [
-        "bcallMessage",
-        "callLogMesssage",
-        "cancelPaymentRequestMessage",
-        "chat",
-        "conditionalRevealMessage",
-        "declinePaymentRequestMessage",
-        "encCommentMessage",
-        "encEventResponseMessage",
-        "encReactionMessage",
-        "groupRootKeyShare",
-        "invoiceMessage",
-        "keepInChatMessage",
-        "paymentInviteMessage",
-        "paymentReminderMessage",
-        "pinInChatMessage",
-        "placeholderMessage",
-        "pollAddOptionMessage",
-        "pollUpdateMessage",
-        "questionResponseMessage",
-        "reactionMessage",
-        "rootSecretDistributeMessage",
-        "scheduledCallCreationMessage",
-        "scheduledCallEditMessage",
-        "secretEncryptedMessage",
-        "statusNotificationMessage",
-        "statusQuestionAnswerMessage",
-        "statusQuotedMessage",
-        "statusStickerInteractionMessage",
-        "stickerSyncRmrMessage",
-    ] {
-        config.boxed(format!(".whatsapp.Message.{field}").as_str());
-    }
-
     // Bytes fields lack serde support; skip them (internal crypto state).
     config.field_attribute(
         ".whatsapp.SessionStructure.Chain.ChainKey.key",

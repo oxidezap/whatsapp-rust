@@ -122,7 +122,7 @@ impl<'a> Events<'a> {
         };
 
         let message = wa::Message {
-            enc_event_response_message: Some(Box::new(enc)),
+            enc_event_response_message: Some(enc),
             ..Default::default()
         };
 
