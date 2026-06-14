@@ -4277,10 +4277,10 @@ fn test_unwrap_device_sent_extracts_reaction() {
         device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
             destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
             message: Some(Box::new(wa::Message {
-                reaction_message: Some(wa::message::ReactionMessage {
+                reaction_message: Some(Box::new(wa::message::ReactionMessage {
                     text: Some("\u{2764}".to_string()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             })),
             phash: None,
@@ -7362,7 +7362,7 @@ fn encrypted_message_edit(
     .expect("test edit encryption");
 
     wa::Message {
-        secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
             target_message_key: Some(target_key),
             enc_payload: Some(enc_payload),
             enc_iv: Some(enc_iv.to_vec()),
@@ -7370,7 +7370,7 @@ fn encrypted_message_edit(
                 wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
             ),
             remote_key_id: None,
-        }),
+        })),
         ..Default::default()
     }
 }
@@ -7409,7 +7409,7 @@ async fn secret_encrypted_message_edit_dispatches_legacy_edit() {
     };
     let msg = encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(Box::new(msg), &info).await;
 
     let got = collect_event(
         &client,
@@ -7470,7 +7470,7 @@ async fn secret_encrypted_peer_edit_resolves_sender_from_envelope() {
     // HKDF binds the real author (peer) as both original sender and editor.
     let msg = encrypted_message_edit(target_key, peer, peer, parent_id, &secret, "edited", None);
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(Box::new(msg), &info).await;
 
     let got = collect_event(
         &client,
@@ -7534,7 +7534,7 @@ async fn run_secret_edit_with_window(test_id: &str, parent_ts: i64, edit_offset:
         participant: None,
     };
     let msg = encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(Box::new(msg), &info).await;
 
     collect_event(
         &client,
@@ -7667,7 +7667,7 @@ async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
         None,
     );
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(Box::new(msg), &info).await;
 
     let got = collect_event(
         &client,
@@ -7728,7 +7728,9 @@ async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         "first",
         Some(second_secret.to_vec()),
     );
-    client.dispatch_parsed_message(first_msg, &first_info).await;
+    client
+        .dispatch_parsed_message(Box::new(first_msg), &first_info)
+        .await;
     client.msg_secret_buffer.wait_flushed().await;
 
     let stored = client
@@ -7758,7 +7760,7 @@ async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         None,
     );
     client
-        .dispatch_parsed_message(second_msg, &second_info)
+        .dispatch_parsed_message(Box::new(second_msg), &second_info)
         .await;
 
     let got = collect_event(
@@ -7835,7 +7837,7 @@ async fn secret_encrypted_message_edit_uses_lid_pn_fallback_in_group() {
         None,
     );
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(Box::new(msg), &info).await;
 
     let got = collect_event(
         &client,
@@ -7916,7 +7918,9 @@ async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
         "first",
         Some(second_secret.to_vec()),
     );
-    client.dispatch_parsed_message(first_msg, &first_info).await;
+    client
+        .dispatch_parsed_message(Box::new(first_msg), &first_info)
+        .await;
     client.msg_secret_buffer.wait_flushed().await;
 
     for sender in [sender_lid, sender_pn] {
@@ -7956,7 +7960,7 @@ async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
         None,
     );
     client
-        .dispatch_parsed_message(second_msg, &second_info)
+        .dispatch_parsed_message(Box::new(second_msg), &second_info)
         .await;
 
     let got = collect_event(
@@ -9703,11 +9707,11 @@ async fn enc_reaction_inbound_decrypts_to_plaintext_shape() {
         participant: Some(author.to_string()),
     };
     let msg = wa::Message {
-        enc_reaction_message: Some(wa::message::EncReactionMessage {
+        enc_reaction_message: Some(Box::new(wa::message::EncReactionMessage {
             target_message_key: Some(target_key.clone()),
             enc_payload: Some(payload),
             enc_iv: Some(iv.to_vec()),
-        }),
+        })),
         ..Default::default()
     };
     let info = Arc::new(MessageInfo {
@@ -9795,7 +9799,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
     .expect("encrypt");
 
     let msg = wa::Message {
-        enc_comment_message: Some(wa::message::EncCommentMessage {
+        enc_comment_message: Some(Box::new(wa::message::EncCommentMessage {
             target_message_key: Some(wa::MessageKey {
                 remote_jid: Some(group.to_string()),
                 from_me: Some(false),
@@ -9804,7 +9808,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
             }),
             enc_payload: Some(payload),
             enc_iv: Some(iv.to_vec()),
-        }),
+        })),
         // WA Web ships the comment's own secret on the OUTER envelope (the
         // comment msgData), not inside the encrypted body.
         message_context_info: Some(Box::new(wa::MessageContextInfo {
@@ -9825,7 +9829,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
         ..Default::default()
     });
 
-    client.dispatch_parsed_message(msg, &info).await;
+    client.dispatch_parsed_message(Box::new(msg), &info).await;
 
     // Deadline-poll instead of a fixed sleep so a slow CI cannot race the
     // event delivery.

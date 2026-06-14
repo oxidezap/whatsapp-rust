@@ -99,7 +99,10 @@ pub fn decrypt_secret_encrypted(
         modification_type,
     };
     let plaintext = decrypt_addon(enc_payload, iv, message_secret, &addon)?;
+    // Cold edit path: unbox at the boundary rather than ripple Box through the
+    // secret-encrypted decrypt callers.
     waproto::codec::message_decode(&plaintext[..])
+        .map(|m| *m)
         .map_err(|e| anyhow!("Failed to decode inner secret-encrypted Message: {e}"))
 }
 

@@ -71,7 +71,9 @@ pub fn decrypt_comment_with_secret(
         message_secret,
         &comment_addon_ctx(parent_msg_id, parent_sender_jid, commenter_jid),
     )?;
-    Ok(waproto::codec::message_decode(&plaintext[..])?)
+    // Cold addon path: unbox at the boundary rather than ripple Box through the
+    // comment/edit decrypt callers.
+    Ok(*waproto::codec::message_decode(&plaintext[..])?)
 }
 
 #[cfg(test)]

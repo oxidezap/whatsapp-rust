@@ -65,6 +65,49 @@ fn main() -> std::io::Result<()> {
     config.boxed(".whatsapp.WebMessageInfo.statusMentionMessageInfo");
     config.boxed(".whatsapp.Message.messageContextInfo");
 
+    // `Message` carries ~110 optional content variants; exactly one is set per
+    // message, so every inline variant is dead weight that still inflates the
+    // struct (~3.8 KiB) and the memcpy/drop cost of moving it. prost already
+    // boxes the variants caught in recursion cycles (image/video/template/...);
+    // these are the remaining inline message-typed fields. Boxing them shrinks
+    // `Message` by ~75% (to ~0.9 KiB), so decode-in-place, the retry-cache
+    // re-encode, and every Box<Message> hand-off allocate and move far less. The
+    // two SenderKeyDistribution fields stay inline: they are small and sit on the
+    // group-send hot path where an extra allocation per send isn't worth it.
+    for field in [
+        "bcallMessage",
+        "callLogMesssage",
+        "cancelPaymentRequestMessage",
+        "chat",
+        "conditionalRevealMessage",
+        "declinePaymentRequestMessage",
+        "encCommentMessage",
+        "encEventResponseMessage",
+        "encReactionMessage",
+        "groupRootKeyShare",
+        "invoiceMessage",
+        "keepInChatMessage",
+        "paymentInviteMessage",
+        "paymentReminderMessage",
+        "pinInChatMessage",
+        "placeholderMessage",
+        "pollAddOptionMessage",
+        "pollUpdateMessage",
+        "questionResponseMessage",
+        "reactionMessage",
+        "rootSecretDistributeMessage",
+        "scheduledCallCreationMessage",
+        "scheduledCallEditMessage",
+        "secretEncryptedMessage",
+        "statusNotificationMessage",
+        "statusQuestionAnswerMessage",
+        "statusQuotedMessage",
+        "statusStickerInteractionMessage",
+        "stickerSyncRmrMessage",
+    ] {
+        config.boxed(format!(".whatsapp.Message.{field}").as_str());
+    }
+
     // Bytes fields lack serde support; skip them (internal crypto state).
     config.field_attribute(
         ".whatsapp.SessionStructure.Chain.ChainKey.key",

@@ -648,7 +648,9 @@ mod tests {
 
         // Same for pin wrapped in view_once and device_sent (double nesting).
         let inner_pin = waproto::whatsapp::Message {
-            pin_in_chat_message: Some(waproto::whatsapp::message::PinInChatMessage::default()),
+            pin_in_chat_message: Some(Box::new(
+                waproto::whatsapp::message::PinInChatMessage::default(),
+            )),
             ..Default::default()
         };
         let wrapped_pin = waproto::whatsapp::Message {

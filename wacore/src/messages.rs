@@ -272,7 +272,7 @@ impl MessageUtils {
 /// Unpads the plaintext (using the given padding version) and decodes the
 /// protobuf bytes into a WhatsApp Message. This is the pure,
 /// runtime-independent portion of `handle_decrypted_plaintext`.
-pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<wa::Message> {
+pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<Box<wa::Message>> {
     let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
     waproto::codec::message_decode(plaintext_slice)
         .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
@@ -373,14 +373,16 @@ pub fn wrap_device_sent(mut message: wa::Message, destination_jid: String) -> wa
 /// message (preserving `message_context_info`), or returns the original
 /// message unchanged when there is no wrapper or the wrapper has no inner
 /// message.
-pub fn unwrap_device_sent(mut msg: wa::Message) -> wa::Message {
+pub fn unwrap_device_sent(mut msg: Box<wa::Message>) -> Box<wa::Message> {
     if let Some(mut dsm) = msg.device_sent_message.take() {
         if let Some(mut inner) = dsm.message.take() {
             inner.message_context_info = crate::proto_helpers::merge_dsm_context(
                 inner.message_context_info.take(),
                 msg.message_context_info.as_deref(),
             );
-            return *inner;
+            // `inner` is already boxed (DeviceSentMessage.message is a boxed
+            // recursive field), so this hands back the heap message as-is.
+            return inner;
         }
         msg.device_sent_message = Some(dsm);
     }
@@ -1126,7 +1128,8 @@ mod device_sent_tests {
             })),
             ..Default::default()
         };
-        let unwrapped = unwrap_device_sent(wrap_device_sent(inner, "1@s.whatsapp.net".into()));
+        let unwrapped =
+            unwrap_device_sent(Box::new(wrap_device_sent(inner, "1@s.whatsapp.net".into())));
         assert_eq!(
             unwrapped
                 .message_context_info
@@ -1139,7 +1142,7 @@ mod device_sent_tests {
     fn wrap_then_unwrap_round_trips_secret() {
         let secret = [9u8; 32];
         let wrapped = wrap_device_sent(msg_with_secret(&secret), "1@s.whatsapp.net".into());
-        let unwrapped = unwrap_device_sent(wrapped);
+        let unwrapped = unwrap_device_sent(Box::new(wrapped));
 
         assert_eq!(unwrapped.conversation.as_deref(), Some("hi"));
         assert_eq!(

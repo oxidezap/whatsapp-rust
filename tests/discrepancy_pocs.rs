@@ -13,10 +13,10 @@ use waproto::whatsapp as wa;
 #[test]
 fn regression_a1_revoked_reaction_returns_sender_revoke() {
     let msg = wa::Message {
-        reaction_message: Some(wa::message::ReactionMessage {
+        reaction_message: Some(Box::new(wa::message::ReactionMessage {
             text: Some(String::new()),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     assert_eq!(
@@ -28,14 +28,14 @@ fn regression_a1_revoked_reaction_returns_sender_revoke() {
 #[test]
 fn regression_a1_keep_in_chat_undo_returns_sender_revoke() {
     let msg = wa::Message {
-        keep_in_chat_message: Some(wa::message::KeepInChatMessage {
+        keep_in_chat_message: Some(Box::new(wa::message::KeepInChatMessage {
             key: Some(wa::MessageKey {
                 from_me: Some(true),
                 ..Default::default()
             }),
             keep_type: Some(wa::KeepType::UndoKeepForAll as i32),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     assert_eq!(
@@ -47,12 +47,12 @@ fn regression_a1_keep_in_chat_undo_returns_sender_revoke() {
 #[test]
 fn regression_a1_secret_encrypted_message_edit_returns_message_edit() {
     let msg = wa::Message {
-        secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
             secret_enc_type: Some(
                 wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
             ),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     assert_eq!(
@@ -64,12 +64,12 @@ fn regression_a1_secret_encrypted_message_edit_returns_message_edit() {
 #[test]
 fn regression_a1_secret_encrypted_event_edit_returns_message_edit() {
     let msg = wa::Message {
-        secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
             secret_enc_type: Some(
                 wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32,
             ),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     assert_eq!(

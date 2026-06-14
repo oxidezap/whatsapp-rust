@@ -665,7 +665,9 @@ fn parse_newsletter_messages_response(
                 .get_optional_child("plaintext")
                 .and_then(|pt| match pt.content.as_deref() {
                     Some(NodeContentRef::Bytes(bytes)) => {
-                        waproto::codec::message_decode(bytes.as_ref()).ok()
+                        waproto::codec::message_decode(bytes.as_ref())
+                            .ok()
+                            .map(|m| *m)
                     }
                     _ => None,
                 });

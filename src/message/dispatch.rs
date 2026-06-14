@@ -7,7 +7,7 @@ impl Client {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.dispatch", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn dispatch_parsed_message(
         self: &Arc<Self>,
-        msg: wa::Message,
+        msg: Box<wa::Message>,
         info: &Arc<MessageInfo>,
     ) {
         use wacore::proto_helpers::MessageExt;
@@ -37,7 +37,10 @@ impl Client {
         {
             Arc::make_mut(&mut info).comment_target = Some(target);
         }
-        let dispatch_msg = decrypted.unwrap_or(msg);
+        // Unbox only here, at the event boundary: the message rode the whole
+        // decode → unwrap → dispatch pipeline on the heap, and the event needs an
+        // owned `Message` regardless.
+        let dispatch_msg = decrypted.unwrap_or_else(|| *msg);
         self.ack_received_message(&info);
 
         self.core

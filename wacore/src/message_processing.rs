@@ -232,7 +232,9 @@ pub struct ProtocolMessageInfo {
 #[derive(Debug, Clone)]
 pub struct DecryptedMessageResult {
     /// The user-visible message content (with DeviceSentMessage unwrapped).
-    pub message: wa::Message,
+    /// Boxed: it is decoded in place on the heap and threaded through the receive
+    /// path without ever materializing the ~3.8 KiB struct on the stack.
+    pub message: Box<wa::Message>,
     /// The sender key distribution message, if present.
     /// Must be processed to store the sender key for future group decryption.
     pub skdm: Option<wa::message::SenderKeyDistributionMessage>,
