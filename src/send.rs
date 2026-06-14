@@ -3084,7 +3084,7 @@ mod tests {
         #[test]
         fn pin_returns_edit_attribute() {
             let msg = wa::Message {
-                pin_in_chat_message: Some(Box::new(wa::message::PinInChatMessage::default())),
+                pin_in_chat_message: Some(Box::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3247,7 +3247,7 @@ mod tests {
         #[test]
         fn event_response_returns_meta_node() {
             let msg = wa::Message {
-                enc_event_response_message: Some(Box::new(Default::default())),
+                enc_event_response_message: Some(Box::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);

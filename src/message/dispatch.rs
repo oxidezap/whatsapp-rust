@@ -39,8 +39,12 @@ impl Client {
         }
         // Unbox only here, at the event boundary: the message rode the whole
         // decode → unwrap → dispatch pipeline on the heap, and the event needs an
-        // owned `Message` regardless.
-        let dispatch_msg = decrypted.unwrap_or_else(|| *msg);
+        // owned `Message` regardless. `match` (not `unwrap_or(*msg)`) keeps the
+        // unbox out of the decrypted-addon branch.
+        let dispatch_msg = match decrypted {
+            Some(d) => d,
+            None => *msg,
+        };
         self.ack_received_message(&info);
 
         self.core
