@@ -10,7 +10,7 @@ use crate::hash::{HashState, generate_patch_mac};
 use crate::keys::ExpandedAppStateKeys;
 use log::{debug, trace};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use waproto::whatsapp as wa;
 
@@ -311,8 +311,13 @@ where
 /// WA Web keys on the decrypted index; the raw index_mac blob is a deterministic
 /// function of that index, so keying on it is equivalent for detection.
 fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<(), AppStateError> {
-    let mut seen_set: HashSet<&[u8]> = HashSet::new();
-    let mut seen_remove: HashSet<&[u8]> = HashSet::new();
+    // index_macs are HMAC outputs (uniformly random), so a HashSet only buys
+    // SipHash setup plus an allocation for no distribution benefit. A linear scan
+    // wins at the patch sizes seen in practice — the same trade-off measured for
+    // collect_unique_index_macs (#856). Set and Remove are deduped independently:
+    // a Set and a Remove may legitimately carry the same index within one patch.
+    let mut seen_set: Vec<&[u8]> = Vec::new();
+    let mut seen_remove: Vec<&[u8]> = Vec::new();
     for m in mutations {
         let Some(rec) = &m.record else { continue };
         let Some(index_mac) = rec.index.as_ref().and_then(|i| i.blob.as_deref()) else {
@@ -324,9 +329,10 @@ fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<()
             wa::syncd_mutation::SyncdOperation::Set => &mut seen_set,
             wa::syncd_mutation::SyncdOperation::Remove => &mut seen_remove,
         };
-        if !seen.insert(index_mac) {
+        if seen.contains(&index_mac) {
             return Err(AppStateError::DuplicateIndexInPatch);
         }
+        seen.push(index_mac);
     }
     Ok(())
 }
