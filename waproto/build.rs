@@ -65,12 +65,11 @@ fn main() -> std::io::Result<()> {
     config.boxed(".whatsapp.WebMessageInfo.statusMentionMessageInfo");
     config.boxed(".whatsapp.Message.messageContextInfo");
 
-    // Shrink `wa::Message` (~3.8 KiB: the sum of ~110 inline content variants,
-    // of which exactly one is ever set) by boxing the remaining inline
-    // message-typed fields. prost already boxes the variants in recursion
-    // cycles; these are the rest. The struct drops to ~0.9 KiB, so every
-    // `Arc<Message>` event is cheaper to allocate and hold, and decode/clone
-    // move far less. Each boxed field's set value costs one small heap alloc.
+    // Box the remaining inline message-typed fields so `wa::Message` — a union
+    // of ~110 content variants of which exactly one is ever set — stops paying
+    // for all of them inline. prost already boxes the variants in recursion
+    // cycles; these are the rest. Shrinking the struct makes every clone,
+    // decode, and `Arc<Message>` event cheaper to move and hold.
     for field in [
         "bcallMessage",
         "callLogMesssage",
