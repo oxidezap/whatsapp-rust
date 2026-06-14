@@ -4277,10 +4277,10 @@ fn test_unwrap_device_sent_extracts_reaction() {
         device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
             destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
             message: Some(Box::new(wa::Message {
-                reaction_message: Some(wa::message::ReactionMessage {
+                reaction_message: Some(Box::new(wa::message::ReactionMessage {
                     text: Some("\u{2764}".to_string()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             })),
             phash: None,
@@ -7362,7 +7362,7 @@ fn encrypted_message_edit(
     .expect("test edit encryption");
 
     wa::Message {
-        secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
             target_message_key: Some(target_key),
             enc_payload: Some(enc_payload),
             enc_iv: Some(enc_iv.to_vec()),
@@ -7370,7 +7370,7 @@ fn encrypted_message_edit(
                 wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
             ),
             remote_key_id: None,
-        }),
+        })),
         ..Default::default()
     }
 }
@@ -9703,11 +9703,11 @@ async fn enc_reaction_inbound_decrypts_to_plaintext_shape() {
         participant: Some(author.to_string()),
     };
     let msg = wa::Message {
-        enc_reaction_message: Some(wa::message::EncReactionMessage {
+        enc_reaction_message: Some(Box::new(wa::message::EncReactionMessage {
             target_message_key: Some(target_key.clone()),
             enc_payload: Some(payload),
             enc_iv: Some(iv.to_vec()),
-        }),
+        })),
         ..Default::default()
     };
     let info = Arc::new(MessageInfo {
@@ -9795,7 +9795,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
     .expect("encrypt");
 
     let msg = wa::Message {
-        enc_comment_message: Some(wa::message::EncCommentMessage {
+        enc_comment_message: Some(Box::new(wa::message::EncCommentMessage {
             target_message_key: Some(wa::MessageKey {
                 remote_jid: Some(group.to_string()),
                 from_me: Some(false),
@@ -9804,7 +9804,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
             }),
             enc_payload: Some(payload),
             enc_iv: Some(iv.to_vec()),
-        }),
+        })),
         // WA Web ships the comment's own secret on the OUTER envelope (the
         // comment msgData), not inside the encrypted body.
         message_context_info: Some(Box::new(wa::MessageContextInfo {

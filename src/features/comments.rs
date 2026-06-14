@@ -98,11 +98,11 @@ impl<'a> Comments<'a> {
         };
 
         let message = wa::Message {
-            enc_comment_message: Some(wa::message::EncCommentMessage {
+            enc_comment_message: Some(Box::new(wa::message::EncCommentMessage {
                 target_message_key: Some(parent_key),
                 enc_payload: Some(enc_payload),
                 enc_iv: Some(iv.to_vec()),
-            }),
+            })),
             message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_secret: Some(comment_secret.clone()),
                 ..Default::default()

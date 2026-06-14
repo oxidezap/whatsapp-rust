@@ -1260,11 +1260,11 @@ impl Client {
         duration_secs: u32,
     ) -> Result<(), anyhow::Error> {
         let message = wa::Message {
-            pin_in_chat_message: Some(wa::message::PinInChatMessage {
+            pin_in_chat_message: Some(Box::new(wa::message::PinInChatMessage {
                 key: Some(key),
                 r#type: Some(pin_type as i32),
                 sender_timestamp_ms: Some(wacore::time::now_millis()),
-            }),
+            })),
             message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_add_on_duration_in_secs: Some(duration_secs),
                 ..Default::default()
@@ -2402,7 +2402,7 @@ mod tests {
             .send_message(
                 to,
                 wa::Message {
-                    reaction_message: Some(wa::message::ReactionMessage {
+                    reaction_message: Some(Box::new(wa::message::ReactionMessage {
                         key: Some(wa::MessageKey {
                             remote_jid: Some("status@broadcast".into()),
                             from_me: Some(false),
@@ -2412,7 +2412,7 @@ mod tests {
                         text: Some("❤️".into()),
                         sender_timestamp_ms: Some(1),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -2432,7 +2432,7 @@ mod tests {
             .send_message(
                 to,
                 wa::Message {
-                    reaction_message: Some(wa::message::ReactionMessage {
+                    reaction_message: Some(Box::new(wa::message::ReactionMessage {
                         key: Some(wa::MessageKey {
                             remote_jid: Some("status@broadcast".into()),
                             from_me: Some(false),
@@ -2442,7 +2442,7 @@ mod tests {
                         text: Some("❤️".into()),
                         sender_timestamp_ms: Some(1),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -3084,7 +3084,7 @@ mod tests {
         #[test]
         fn pin_returns_edit_attribute() {
             let msg = wa::Message {
-                pin_in_chat_message: Some(wa::message::PinInChatMessage::default()),
+                pin_in_chat_message: Some(Box::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3203,10 +3203,10 @@ mod tests {
         #[test]
         fn poll_vote_returns_meta_node() {
             let msg = wa::Message {
-                poll_update_message: Some(wa::message::PollUpdateMessage {
+                poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
                     vote: Some(wa::message::PollEncValue::default()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3247,7 +3247,7 @@ mod tests {
         #[test]
         fn event_response_returns_meta_node() {
             let msg = wa::Message {
-                enc_event_response_message: Some(Default::default()),
+                enc_event_response_message: Some(Box::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3264,10 +3264,10 @@ mod tests {
         #[test]
         fn poll_update_without_vote_returns_none() {
             let msg = wa::Message {
-                poll_update_message: Some(wa::message::PollUpdateMessage {
+                poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
                     vote: None,
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3278,10 +3278,10 @@ mod tests {
         #[test]
         fn revoked_reaction_returns_sender_revoke() {
             let msg = wa::Message {
-                reaction_message: Some(wa::message::ReactionMessage {
+                reaction_message: Some(Box::new(wa::message::ReactionMessage {
                     text: Some(String::new()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -3291,14 +3291,14 @@ mod tests {
         #[test]
         fn keep_in_chat_undo_returns_sender_revoke() {
             let msg = wa::Message {
-                keep_in_chat_message: Some(wa::message::KeepInChatMessage {
+                keep_in_chat_message: Some(Box::new(wa::message::KeepInChatMessage {
                     key: Some(wa::MessageKey {
                         from_me: Some(true),
                         ..Default::default()
                     }),
                     keep_type: Some(wa::KeepType::UndoKeepForAll as i32),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -3308,12 +3308,12 @@ mod tests {
         #[test]
         fn secret_encrypted_message_edit_returns_message_edit() {
             let msg = wa::Message {
-                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                     secret_enc_type: Some(
                         wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
                     ),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -3325,12 +3325,12 @@ mod tests {
             // EVENT_EDIT is the one case where the edit attribute AND the
             // meta node both fire: `event_type=edit` meta + `edit="1"` attr.
             let msg = wa::Message {
-                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                     secret_enc_type: Some(
                         wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32,
                     ),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
