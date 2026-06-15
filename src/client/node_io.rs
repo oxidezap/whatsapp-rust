@@ -54,10 +54,15 @@ impl Client {
         // Frame decoder to parse incoming data
         let mut frame_decoder = wacore::framing::FrameDecoder::new();
         let shutdown = self.connection_shutdown_signal();
+        // Subscribe once: a fresh wait_for_shutdown() inside the select allocated an
+        // event_listener on every frame. The signal is one-shot, so a single pinned
+        // listener still catches an in-loop firing.
+        let shutdown_fut = wacore::runtime::wait_for_shutdown(&shutdown).fuse();
+        futures::pin_mut!(shutdown_fut);
 
         loop {
             futures::select_biased! {
-                    _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => {
+                    _ = shutdown_fut => {
                         debug!("Shutdown signaled in message loop. Exiting message loop.");
                         return Ok(());
                     },
