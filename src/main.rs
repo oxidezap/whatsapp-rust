@@ -189,9 +189,26 @@ async fn handle_send_command(ctx: &MessageContext, args: &str) {
         }
     };
 
-    match ctx.client.send_message(jid, wa::Message::text(text)).await {
-        Ok(sent) => info!("Sent message {} to {}", sent.message_id, sent.to),
-        Err(e) => error!("Failed to send message: {e}"),
+    let start = wacore::time::Instant::now();
+    let sent = match ctx.client.send_message(jid, wa::Message::text(text)).await {
+        Ok(sent) => sent,
+        Err(e) => {
+            error!("Failed to send message: {e}");
+            return;
+        }
+    };
+    let duration = format!("{:.2?}", start.elapsed());
+    info!(
+        "Sent message {} to {} in {}",
+        sent.message_id, sent.to, duration
+    );
+
+    // Report the timing back in the chat where the command was issued, not the target.
+    if let Err(e) = ctx
+        .reply_quoting(format!("✅ Sent to {}\n`{duration}`", sent.to))
+        .await
+    {
+        error!("Failed to send timing reply: {e}");
     }
 }
 
