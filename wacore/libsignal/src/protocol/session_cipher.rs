@@ -148,63 +148,68 @@ async fn message_encrypt_inner(
         ));
     }
 
-    let ctext = ENCRYPTION_BUFFER.with(|buffer| {
+    // Encrypt into the thread-local buffer and build the message while still
+    // borrowing it: SignalMessage::new copies the ciphertext into its protobuf
+    // body, so no owned intermediate Vec is needed. The buffer is reused across
+    // calls (cleared, capacity kept) instead of being taken out and reallocated.
+    // aes_256_cbc_encrypt appends from buf.len(), so clear it first; this also
+    // drops any ciphertext left by a prior call that errored.
+    let message = ENCRYPTION_BUFFER.with(|buffer| {
         let mut buf_wrapper = buffer.borrow_mut();
         let buf = buf_wrapper.get_buffer();
+        buf.clear();
         aes_256_cbc_encrypt_into(ptext, message_keys.cipher_key(), message_keys.iv(), buf)
             .map_err(|_| {
                 log::error!("session state corrupt for {remote_address}");
                 SignalProtocolError::InvalidSessionStructure("invalid sender chain message keys")
             })?;
-        let result = std::mem::take(buf);
-        // Restore buffer capacity for next use (take() leaves empty Vec with 0 capacity)
-        buf.reserve(EncryptionBuffer::INITIAL_CAPACITY);
-        Ok::<Vec<u8>, SignalProtocolError>(result)
+        let ctext = buf.as_slice();
+
+        let message = if let Some(items) = session_state.unacknowledged_pre_key_message_items()? {
+            let local_registration_id = session_state.local_registration_id();
+
+            log::debug!(
+                "Building PreKeyWhisperMessage for: {} with preKeyId: {}",
+                remote_address,
+                items
+                    .pre_key_id()
+                    .map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+            );
+
+            let message = SignalMessage::new(
+                session_version,
+                message_keys.mac_key(),
+                sender_ephemeral,
+                chain_key.index(),
+                previous_counter,
+                ctext,
+                &local_identity_key,
+                &their_identity_key,
+            )?;
+
+            CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::new(
+                session_version,
+                local_registration_id,
+                items.pre_key_id(),
+                items.signed_pre_key_id(),
+                *items.base_key(),
+                local_identity_key,
+                message,
+            )?)
+        } else {
+            CiphertextMessage::SignalMessage(SignalMessage::new(
+                session_version,
+                message_keys.mac_key(),
+                sender_ephemeral,
+                chain_key.index(),
+                previous_counter,
+                ctext,
+                &local_identity_key,
+                &their_identity_key,
+            )?)
+        };
+        Ok::<CiphertextMessage, SignalProtocolError>(message)
     })?;
-
-    let message = if let Some(items) = session_state.unacknowledged_pre_key_message_items()? {
-        let local_registration_id = session_state.local_registration_id();
-
-        log::debug!(
-            "Building PreKeyWhisperMessage for: {} with preKeyId: {}",
-            remote_address,
-            items
-                .pre_key_id()
-                .map_or_else(|| "<none>".to_string(), |id| id.to_string()),
-        );
-
-        let message = SignalMessage::new(
-            session_version,
-            message_keys.mac_key(),
-            sender_ephemeral,
-            chain_key.index(),
-            previous_counter,
-            &ctext,
-            &local_identity_key,
-            &their_identity_key,
-        )?;
-
-        CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::new(
-            session_version,
-            local_registration_id,
-            items.pre_key_id(),
-            items.signed_pre_key_id(),
-            *items.base_key(),
-            local_identity_key,
-            message,
-        )?)
-    } else {
-        CiphertextMessage::SignalMessage(SignalMessage::new(
-            session_version,
-            message_keys.mac_key(),
-            sender_ephemeral,
-            chain_key.index(),
-            previous_counter,
-            &ctext,
-            &local_identity_key,
-            &their_identity_key,
-        )?)
-    };
 
     identity_store
         .save_identity(remote_address, &their_identity_key)
