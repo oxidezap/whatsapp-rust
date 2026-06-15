@@ -530,6 +530,119 @@ fn bench_dm_encrypt_subsequent_message(bencher: divan::Bencher) {
         });
 }
 
+// Establish a DM session and advance it to where Alice sends plain
+// SignalMessages on an existing Bob receiver chain, then return the next
+// strictly in-order ciphertext. Decrypting it exercises the steady-state path
+// (existing chain, counter == chain index) — the common case for an active
+// chat, distinct from the first-message (PreKeySignalMessage) path.
+fn setup_dm_with_inorder_subsequent_message() -> (User, User, Vec<u8>) {
+    let (mut alice, mut bob) = setup_established_dm_session();
+
+    futures::executor::block_on(async {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+        // Bob replies and Alice decrypts it, clearing Alice's pending prekey so
+        // her subsequent messages are plain SignalMessages.
+        let reply = message_encrypt(
+            b"ack",
+            &alice.address,
+            &mut bob.session_store,
+            &mut bob.identity_store,
+        )
+        .await
+        .expect("bob reply");
+        let reply_bytes = reply.serialize().to_vec();
+        let reply_msg = CiphertextMessage::SignalMessage(
+            wacore_libsignal::protocol::SignalMessage::try_from(reply_bytes.as_slice()).unwrap(),
+        );
+        message_decrypt(
+            &reply_msg,
+            &bob.address,
+            &mut alice.session_store,
+            &mut alice.identity_store,
+            &mut alice.prekey_store,
+            &alice.signed_prekey_store,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .expect("alice decrypts reply");
+
+        // Alice sends a first SignalMessage; Bob decrypts it so his receiver
+        // chain for Alice's current ephemeral exists and is advanced. The
+        // benchmarked message below is then strictly in-order on that chain.
+        let m1 = message_encrypt(
+            b"first subsequent",
+            &bob.address,
+            &mut alice.session_store,
+            &mut alice.identity_store,
+        )
+        .await
+        .expect("alice m1");
+        let m1_bytes = m1.serialize().to_vec();
+        let m1_msg = CiphertextMessage::SignalMessage(
+            wacore_libsignal::protocol::SignalMessage::try_from(m1_bytes.as_slice()).unwrap(),
+        );
+        message_decrypt(
+            &m1_msg,
+            &alice.address,
+            &mut bob.session_store,
+            &mut bob.identity_store,
+            &mut bob.prekey_store,
+            &bob.signed_prekey_store,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .expect("bob decrypts m1");
+
+        // The in-order message to benchmark (same sending chain as m1, next counter).
+        let m2 = message_encrypt(
+            b"in-order subsequent message",
+            &bob.address,
+            &mut alice.session_store,
+            &mut alice.identity_store,
+        )
+        .await
+        .expect("alice m2");
+
+        (alice, bob, m2.serialize().to_vec())
+    })
+}
+
+#[divan::bench]
+fn bench_dm_decrypt_subsequent_message(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_dm_with_inorder_subsequent_message)
+        .bench_refs(|data| {
+            let (alice, bob, ciphertext_bytes) = data;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+            let plaintext = futures::executor::block_on(async {
+                let ciphertext = CiphertextMessage::SignalMessage(
+                    wacore_libsignal::protocol::SignalMessage::try_from(
+                        ciphertext_bytes.as_slice(),
+                    )
+                    .unwrap(),
+                );
+                message_decrypt(
+                    &ciphertext,
+                    &alice.address,
+                    &mut bob.session_store,
+                    &mut bob.identity_store,
+                    &mut bob.prekey_store,
+                    &bob.signed_prekey_store,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("decryption")
+            });
+
+            black_box(plaintext);
+        });
+}
+
 #[divan::bench]
 fn bench_group_create_distribution_message(bencher: divan::Bencher) {
     bencher.with_inputs(setup_group_sender).bench_refs(|data| {
