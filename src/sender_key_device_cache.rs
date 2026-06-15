@@ -1,7 +1,7 @@
 //! In-memory cache for per-group sender key device tracking.
 //! Avoids DB round-trips on group sends after the first.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::Cache;
@@ -13,26 +13,20 @@ use wacore_binary::Jid;
 pub(crate) struct SenderKeyDeviceMap {
     /// user → (device_id → has_key)
     devices: HashMap<Arc<str>, HashMap<u16, bool>>,
-    /// Users with at least one `has_key=false` device.
-    forgotten_users: HashSet<Arc<str>>,
 }
 
 impl SenderKeyDeviceMap {
     pub fn from_db_rows(rows: &[(String, bool)]) -> Self {
         let mut devices: HashMap<Arc<str>, HashMap<u16, bool>> = HashMap::with_capacity(rows.len());
-        let mut forgotten_users = HashSet::with_capacity(rows.len() / 4);
 
         for (jid_str, has_key) in rows {
             match jid_str.parse::<Jid>() {
                 Ok(jid) => {
                     let user: Arc<str> = Arc::from(jid.user.as_str());
                     devices
-                        .entry(user.clone())
+                        .entry(user)
                         .or_default()
                         .insert(jid.device, *has_key);
-                    if !*has_key {
-                        forgotten_users.insert(user);
-                    }
                 }
                 Err(e) => {
                     log::warn!("Skipping malformed device JID '{}': {}", jid_str, e);
@@ -40,10 +34,7 @@ impl SenderKeyDeviceMap {
             }
         }
 
-        Self {
-            devices,
-            forgotten_users,
-        }
+        Self { devices }
     }
 
     #[cfg(test)]
@@ -53,10 +44,6 @@ impl SenderKeyDeviceMap {
 
     pub fn device_has_key(&self, user: &str, device: u16) -> Option<bool> {
         self.devices.get(user)?.get(&device).copied()
-    }
-
-    pub fn is_user_forgotten(&self, user: &str) -> bool {
-        self.forgotten_users.contains(user)
     }
 }
 

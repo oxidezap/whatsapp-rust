@@ -860,11 +860,14 @@ impl Client {
                 if device.user == own_sending_jid.user && device.device == own_sending_jid.device {
                     return false;
                 }
-                // O(1) lookups into pre-indexed cache
+                // WA Web parity (ParticipantStore.js skDistribList): a device is
+                // warm only when it AND its primary (device 0) hold the key, so a
+                // forgotten primary redistributes the whole user while a forgotten
+                // companion redistributes only itself.
                 !cached_map
                     .device_has_key(&device.user, device.device)
                     .unwrap_or(false)
-                    || cached_map.is_user_forgotten(&device.user)
+                    || !cached_map.device_has_key(&device.user, 0).unwrap_or(false)
             })
             .cloned()
             .collect();
@@ -2927,7 +2930,6 @@ mod tests {
 
         let map = SenderKeyDeviceMap::from_db_rows(&[]);
         assert_eq!(map.device_has_key("271060335329480", 0), None);
-        assert!(!map.is_user_forgotten("271060335329480"));
 
         let all_resolved_devices: Vec<Jid> = [
             "271060335329480@lid",
@@ -2943,7 +2945,7 @@ mod tests {
             .filter(|device| {
                 !map.device_has_key(&device.user, device.device)
                     .unwrap_or(false)
-                    || map.is_user_forgotten(&device.user)
+                    || !map.device_has_key(&device.user, 0).unwrap_or(false)
             })
             .collect();
 
@@ -3009,7 +3011,6 @@ mod tests {
 
         let map = SenderKeyDeviceMap::from_db_rows(&[("271060335329480@lid".to_string(), false)]);
         assert_eq!(map.device_has_key("271060335329480", 0), Some(false));
-        assert!(map.is_user_forgotten("271060335329480"));
 
         let all_resolved_devices: Vec<Jid> = [
             "271060335329480@lid",
@@ -3025,7 +3026,7 @@ mod tests {
             .filter(|device| {
                 !map.device_has_key(&device.user, device.device)
                     .unwrap_or(false)
-                    || map.is_user_forgotten(&device.user)
+                    || !map.device_has_key(&device.user, 0).unwrap_or(false)
             })
             .collect();
 
@@ -3034,6 +3035,56 @@ mod tests {
             3,
             "after retry inserts one row, ALL devices correctly flagged for SKDM \
              (this is what unblocks redistribution on the SECOND message)"
+        );
+    }
+
+    /// WA Web primary-device gate (ParticipantStore.js): a companion is warm only
+    /// when it AND its primary (device 0) hold the key. A forgotten companion
+    /// redistributes only itself (no per-user amplification); a forgotten primary
+    /// redistributes the whole user. Drives the real `filter_skdm_targets`.
+    #[tokio::test]
+    async fn filter_skdm_targets_uses_primary_device_gate() {
+        use crate::sender_key_device_cache::SenderKeyDeviceMap;
+
+        let client = crate::test_utils::create_test_client().await;
+        let group = "120363161500776365@g.us";
+        let own = Jid::from_str("999999999999999:1@lid").unwrap();
+
+        // Companion forgotten, primary warm: only the companion redistributes.
+        let map = SenderKeyDeviceMap::from_db_rows(&[
+            ("100100100100100@lid".to_string(), true),
+            ("100100100100100:5@lid".to_string(), false),
+        ]);
+        let devices = [
+            Jid::from_str("100100100100100@lid").unwrap(),
+            Jid::from_str("100100100100100:5@lid").unwrap(),
+        ];
+        let needs = client.filter_skdm_targets(group, &devices, &map, &own);
+        assert_eq!(needs.len(), 1, "warm primary keeps the keyed companion out");
+        assert_eq!(needs[0].device, 5);
+
+        // Primary forgotten, companion warm: the whole user redistributes (WA Web
+        // marks a companion cold when its primary is cold).
+        let map = SenderKeyDeviceMap::from_db_rows(&[
+            ("200200200200200@lid".to_string(), false),
+            ("200200200200200:5@lid".to_string(), true),
+        ]);
+        let devices = [
+            Jid::from_str("200200200200200@lid").unwrap(),
+            Jid::from_str("200200200200200:5@lid").unwrap(),
+        ];
+        let needs = client.filter_skdm_targets(group, &devices, &map, &own);
+        assert_eq!(needs.len(), 2, "cold primary redistributes the whole user");
+
+        // Companion warm but the primary row is absent (None): WA Web's `?? false`
+        // treats a missing primary as cold, so the companion still redistributes.
+        let map = SenderKeyDeviceMap::from_db_rows(&[("300300300300300:5@lid".to_string(), true)]);
+        let devices = [Jid::from_str("300300300300300:5@lid").unwrap()];
+        let needs = client.filter_skdm_targets(group, &devices, &map, &own);
+        assert_eq!(
+            needs.len(),
+            1,
+            "absent primary is cold, companion redistributes"
         );
     }
 
