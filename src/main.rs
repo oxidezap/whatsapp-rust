@@ -7,6 +7,7 @@ use whatsapp_rust::pair_code::PairCodeOptions;
 use whatsapp_rust::prelude::*;
 
 const PING_TRIGGER: &str = "🦀ping";
+const SEND_TRIGGER: &str = "🦀send";
 const PONG_TEXT: &str = "🏓 Pong!";
 const REACTION_EMOJI: &str = "🏓";
 
@@ -93,8 +94,15 @@ fn main() {
                     if let Err(e) = ctx.send_message(reply).await {
                         error!("Failed to send media pong: {}", e);
                     }
-                } else if ctx.message.text_content() == Some(PING_TRIGGER) {
+                    return;
+                }
+                let Some(text) = ctx.message.text_content() else {
+                    return;
+                };
+                if text == PING_TRIGGER {
                     handle_text_ping(&ctx).await;
+                } else if let Some(args) = text.strip_prefix(SEND_TRIGGER) {
+                    handle_send_command(&ctx, args).await;
                 }
             });
 
@@ -162,6 +170,28 @@ async fn handle_text_ping(ctx: &MessageContext) {
     };
     if let Err(e) = ctx.edit_message(sent.message_id.clone(), edit).await {
         error!("Failed to edit message {}: {}", sent.message_id, e);
+    }
+}
+
+/// Handles `🦀send <jid> <text>`, relaying text to an arbitrary group or DM JID.
+async fn handle_send_command(ctx: &MessageContext, args: &str) {
+    let Some((target, text)) = args.trim_start().split_once(char::is_whitespace) else {
+        error!("Usage: {SEND_TRIGGER} <jid> <text>");
+        return;
+    };
+    let text = text.trim_start();
+
+    let jid: Jid = match target.parse() {
+        Ok(jid) => jid,
+        Err(e) => {
+            error!("Invalid JID '{target}': {e}");
+            return;
+        }
+    };
+
+    match ctx.client.send_message(jid, wa::Message::text(text)).await {
+        Ok(sent) => info!("Sent message {} to {}", sent.message_id, sent.to),
+        Err(e) => error!("Failed to send message: {e}"),
     }
 }
 
