@@ -293,7 +293,10 @@ impl Client {
         // the tally happens once the send is committed, so cache-miss/status
         // early returns don't consume the budget.
         if self.resend_counts.get(&resend_key).await.unwrap_or(0) >= MAX_RESENDS_PER_MESSAGE {
-            warn!(
+            // debug, not warn: hitting the cap is expected, healthy behavior for
+            // a churning chat — it would otherwise spam the console on every
+            // refused resend.
+            debug!(
                 "Refusing resend of {} to {} in {}: exceeds resend cap {}",
                 message_id,
                 info.requester.observe(),
