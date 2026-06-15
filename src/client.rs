@@ -194,6 +194,9 @@ pub struct MemoryDiagnostics {
     // -- Capacity-only caches (no TTL) --
     pub session_locks: u64,
     pub chat_lanes: u64,
+    pub resend_rate_limiter_chats: u64,
+    /// Total outbound resends dropped by the per-chat rate limiter since start.
+    pub resends_throttled_total: u64,
     // -- Unbounded collections --
     pub response_waiters: usize,
     pub node_waiters: usize,
@@ -239,6 +242,16 @@ impl std::fmt::Display for MemoryDiagnostics {
         writeln!(f, "--- Capacity-only caches ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
+        writeln!(
+            f,
+            "  resend_rl_chats:        {}",
+            self.resend_rate_limiter_chats
+        )?;
+        writeln!(
+            f,
+            "  resends_throttled:      {}",
+            self.resends_throttled_total
+        )?;
         writeln!(f, "--- Unbounded collections ---")?;
         writeln!(f, "  response_waiters:       {}", self.response_waiters)?;
         writeln!(f, "  node_waiters:           {}", self.node_waiters)?;
@@ -454,6 +467,11 @@ pub struct Client {
     /// stay stuck. This map throttles the fallback so a noisy peer can't
     /// loop us through prekey fetches.
     pub(crate) session_recreate_history: Cache<wacore_binary::jid::Jid, wacore::time::Instant>,
+
+    /// Per-chat outbound resend rate limiter: bounds the aggregate resend rate
+    /// to a chat (the anti-abuse signal) so a PN to LID fan-out cannot storm into
+    /// AccountLocked. Throttled devices still recover via the fresh-SKDM mark.
+    pub(crate) resend_rate_limiter: crate::resend_rate_limiter::ResendRateLimiter,
 
     /// Dispatch-once gate for `UndecryptableMessage`: a server resend of a
     /// failed id re-enters the failure path and would otherwise fire a

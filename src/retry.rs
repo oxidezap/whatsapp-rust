@@ -488,6 +488,22 @@ impl Client {
             return Ok(());
         }
 
+        // Bound the aggregate resend rate per group (the anti-abuse signal): a
+        // PN to LID fan-out has many distinct devices retry the same messages,
+        // which per-device/per-message caps miss. Group-only: the requester was
+        // marked for fresh SKDM above so future messages recover, and it
+        // re-requests this one on its own timer once the bucket refills. DMs have
+        // no SKDM fallback, so they keep the unconditional resend (bounded by
+        // MAX_RETRY_COUNT) rather than risk dropping a delivery.
+        if info.chat.is_group() && !self.resend_rate_limiter.try_acquire(&info.chat).await {
+            debug!(
+                "Throttling resend of {} to {}: per-chat resend rate cap reached",
+                message_id,
+                info.chat.observe()
+            );
+            return Ok(());
+        }
+
         info!(
             "Resending message {} to {} (retry #{})",
             message_id,
@@ -2208,6 +2224,124 @@ mod tests {
             count <= cap,
             "capacity must bound the throttle history (got {count}, cap {cap}); \
              a still-recent entry can be evicted under heavy peer load"
+        );
+    }
+
+    /// The resend rate limiter is reachable and tunable through the public
+    /// `Client` API, and its drops surface on `resends_throttled_total`. Covers
+    /// the wiring the `handle_retry_receipt` hook relies on; the bucket logic
+    /// itself is unit-tested in `resend_rate_limiter`.
+    #[tokio::test]
+    async fn client_resend_rate_limiter_is_wired_and_tunable() {
+        let client =
+            crate::test_utils::create_test_client_with_failing_http("resend_rl_wired").await;
+        let chat: Jid = "120363021033254949@g.us".parse().unwrap();
+
+        // Tight ceiling, no refill: the bucket holds exactly `burst` tokens.
+        client.set_resend_rate_limit(3, 0);
+        let mut allowed = 0;
+        for _ in 0..10 {
+            if client.resend_rate_limiter.try_acquire(&chat).await {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 3, "client honors the configured per-chat burst");
+        assert_eq!(
+            client.resends_throttled_total(),
+            7,
+            "public counter tracks dropped resends"
+        );
+
+        // Disabling restores unthrottled behavior.
+        client.set_resend_rate_limit(0, 0);
+        let other: Jid = "120363000000000001@g.us".parse().unwrap();
+        for _ in 0..50 {
+            assert!(client.resend_rate_limiter.try_acquire(&other).await);
+        }
+    }
+
+    /// End-to-end: a throttled group retry drops the resend (returns Ok, sends
+    /// nothing) while the path up to the limiter still runs, and the cached
+    /// message is retained for the device's later re-request. Exercises the hook
+    /// placement and the no-resend-on-refusal semantics the unit tests cannot.
+    #[tokio::test]
+    async fn handle_retry_receipt_drops_throttled_group_resend() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(PersistenceManager::new(backend).await.unwrap());
+        let mut config = crate::cache_config::CacheConfig::default();
+        config.recent_messages.capacity = 1_000;
+        let (client, _rx) = Client::new_with_cache_config(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+            config,
+        )
+        .await;
+
+        let group: Jid = "120363021033254949@g.us".parse().unwrap();
+        let msg_id = "RLMSG001";
+        client
+            .add_recent_message(
+                &group,
+                msg_id,
+                &wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        // Drain the single token so the incoming retry must be throttled; the
+        // throttle returns before any network resend, keeping the test offline.
+        client.set_resend_rate_limit(1, 0);
+        assert!(client.resend_rate_limiter.try_acquire(&group).await);
+
+        // Inbound group retry from a device-0 LID participant: has_device's
+        // device-0 fast path makes it known, LID skips rotateKey, and no <keys>
+        // leaves update_local_signal_session a noop on a missing session.
+        let node = NodeBuilder::new("receipt")
+            .attr("participant", "555000111@lid")
+            .children([NodeBuilder::new("retry")
+                .attr("id", msg_id)
+                .attr("count", "1")
+                .build()])
+            .build();
+        let node_ref = crate::test_utils::node_to_owned_ref(&node);
+        let receipt = Receipt {
+            source: crate::types::message::MessageSource {
+                chat: group.clone(),
+                sender: "555000111@lid".parse().unwrap(),
+                is_group: true,
+                ..Default::default()
+            },
+            message_ids: vec![msg_id.to_string()],
+            timestamp: wacore::time::now_utc(),
+            r#type: crate::types::presence::ReceiptType::Retry,
+            offline: false,
+        };
+
+        let result = client.handle_retry_receipt(&receipt, &node_ref).await;
+        assert!(
+            result.is_ok(),
+            "a throttled retry returns Ok(()), not an error"
+        );
+        assert_eq!(
+            client.resends_throttled_total(),
+            1,
+            "the resend was dropped by the limiter"
+        );
+        assert!(
+            client.peek_recent_message(&group, msg_id).await.is_some(),
+            "throttling keeps the message cached for the device's re-request"
+        );
+        assert_eq!(
+            client.pending_retries.lock().unwrap().len(),
+            0,
+            "the in-progress marker is cleared after the throttled return"
         );
     }
 

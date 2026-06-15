@@ -185,6 +185,12 @@ impl Client {
 
             session_recreate_history: cache_config.session_recreate_history.build_with_ttl(),
 
+            resend_rate_limiter: crate::resend_rate_limiter::ResendRateLimiter::new(
+                cache_config.resend_rate_limiter_capacity,
+                crate::resend_rate_limiter::DEFAULT_RESEND_BURST,
+                crate::resend_rate_limiter::DEFAULT_RESEND_REFILL_PER_MIN,
+            ),
+
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
 
             offline_sync_metrics: Arc::new(OfflineSyncMetrics {

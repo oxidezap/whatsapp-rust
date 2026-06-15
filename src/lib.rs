@@ -27,6 +27,7 @@ pub use waproto;
 
 pub mod cache;
 pub mod portable_cache;
+pub(crate) mod resend_rate_limiter;
 
 pub mod cache_config;
 pub use cache_config::{

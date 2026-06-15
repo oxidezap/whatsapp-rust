@@ -492,6 +492,7 @@ pub struct BotBuilder<
     initial_push_name: Option<String>,
     cache_config: CacheConfig,
     wanted_pre_key_count: Option<usize>,
+    resend_rate_limit: Option<(u32, u32)>,
     _marker: PhantomData<(B, T, H, R)>,
 }
 
@@ -512,6 +513,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             initial_push_name: None,
             cache_config: CacheConfig::default(),
             wanted_pre_key_count: None,
+            resend_rate_limit: None,
             _marker: PhantomData,
         }
     }
@@ -536,6 +538,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
             wanted_pre_key_count: self.wanted_pre_key_count,
+            resend_rate_limit: self.resend_rate_limit,
             _marker: PhantomData,
         }
     }
@@ -834,6 +837,22 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Tune the per-chat outbound resend rate limiter.
+    ///
+    /// Outbound retry resends to a chat are bounded by a token bucket: `burst`
+    /// is the instantaneous allowance, `refill_per_min` the sustained ceiling
+    /// per chat. This caps the aggregate resend rate WhatsApp's anti-abuse
+    /// penalizes during a PN to LID migration fan-out, while throttled devices
+    /// still recover via the fresh-SKDM mark. A `burst` of 0 disables it.
+    ///
+    /// Defaults are conservative (burst 20, refill 10/min) and apply without
+    /// calling this. Can also be retuned live via
+    /// [`Client::set_resend_rate_limit`](crate::Client::set_resend_rate_limit).
+    pub fn with_resend_rate_limit(mut self, burst: u32, refill_per_min: u32) -> Self {
+        self.resend_rate_limit = Some((burst, refill_per_min));
+        self
+    }
+
     /// Set an initial push name on the device before connecting.
     ///
     /// This is included in the `ClientPayload` during registration, allowing the
@@ -953,6 +972,10 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
 
         if let Some(count) = self.wanted_pre_key_count {
             client.set_wanted_pre_key_count(count);
+        }
+
+        if let Some((burst, refill_per_min)) = self.resend_rate_limit {
+            client.set_resend_rate_limit(burst, refill_per_min);
         }
 
         Ok(Bot {
