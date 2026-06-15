@@ -843,10 +843,25 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     let their_ephemeral = ciphertext.sender_ratchet_key();
     let counter = ciphertext.counter();
 
-    // Transactional decrypt — roll back chain advance / new-chain DH
-    // step on any failure so the next msg derives from an
-    // uncorrupted ratchet. See `SessionState::decrypt_snapshot`.
-    let snapshot = state.decrypt_snapshot();
+    // Transactional decrypt — roll back chain advance / new-chain DH step on any
+    // failure so the next msg derives from an uncorrupted ratchet.
+    //
+    // Fast path for the common in-order message on an existing receiver chain
+    // (counter == the chain's current index): the only mutation is a single
+    // `set_receiver_chain_key` advance — no DH ratchet, no skipped-key caching,
+    // no chain eviction — so saving the old `ChainKey` (a `Copy`) is a complete
+    // rollback and avoids cloning the whole receiver-chain set. Every other case
+    // (new chain, skip-ahead, out-of-order key removal) and any lookup error
+    // falls through to the full `decrypt_snapshot`, unchanged.
+    let fast_rollback: Option<ChainKey> = match state.get_receiver_chain_key(their_ephemeral) {
+        Ok(Some(chain_key)) if chain_key.index() == counter => Some(chain_key),
+        _ => None,
+    };
+    let full_snapshot = match fast_rollback {
+        Some(_) => None,
+        None => Some(state.decrypt_snapshot()),
+    };
+
     let result = decrypt_with_pending_state(
         current_or_previous,
         state,
@@ -859,12 +874,18 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     );
     match result {
         Ok(ptext) => {
-            drop(snapshot);
+            drop(full_snapshot);
             state.clear_unacknowledged_pre_key_message();
             Ok(ptext)
         }
         Err(e) => {
-            state.restore_decrypt_snapshot(snapshot);
+            if let Some(chain_key) = fast_rollback {
+                // The chain still exists (in-order decrypt never removes it), so
+                // restoring its key cannot fail; keep the original decrypt error.
+                let _ = state.set_receiver_chain_key(their_ephemeral, &chain_key);
+            } else if let Some(snapshot) = full_snapshot {
+                state.restore_decrypt_snapshot(snapshot);
+            }
             Err(e)
         }
     }
@@ -1621,6 +1642,111 @@ mod tests {
                 matches!(err, SignalProtocolError::BadMac(_)),
                 "expected BadMac, got: {err}"
             );
+        });
+    }
+
+    /// Fast-path rollback: a MAC failure on an in-order message (the path that
+    /// now rolls back via the single saved chain key instead of the full
+    /// `decrypt_snapshot` clone) must leave the receiver chain untouched, so the
+    /// next legitimate message on the same chain still decrypts. A regressed
+    /// rollback would leave the chain advanced and surface `DuplicatedMessage`.
+    #[test]
+    fn inorder_macfail_rolls_back_chain_and_recovers() {
+        let mut tp = setup_established_session();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+        futures::executor::block_on(async {
+            // Bob replies so Alice clears her pending prekey and sends plain
+            // SignalMessages from here on.
+            let bob_reply = message_encrypt(
+                b"ack",
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+            )
+            .await
+            .expect("Bob encrypt reply");
+            let bob_msg =
+                SignalMessage::try_from(bob_reply.serialize()).expect("reply is a SignalMessage");
+            message_decrypt_signal(
+                &bob_msg,
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+                &mut rng,
+            )
+            .await
+            .expect("Alice decrypts reply");
+
+            // Alice sends two consecutive messages on the same sending chain.
+            let m1 = message_encrypt(
+                b"first",
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+            )
+            .await
+            .expect("encrypt m1");
+            let m2 = message_encrypt(
+                b"second",
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+            )
+            .await
+            .expect("encrypt m2");
+            assert!(
+                matches!(m2, CiphertextMessage::SignalMessage(_)),
+                "m2 should be a SignalMessage"
+            );
+
+            // Bob decrypts m1 → advances the receiver chain, so m2 is an in-order
+            // message on an existing chain (the fast path).
+            let m1_sig = SignalMessage::try_from(m1.serialize()).expect("m1 SignalMessage");
+            let p1 = message_decrypt_signal(
+                &m1_sig,
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+                &mut rng,
+            )
+            .await
+            .expect("Bob decrypts m1");
+            assert_eq!(p1.plaintext, b"first");
+
+            // Corrupt m2's MAC and decrypt → BadMac, exercising the fast-path rollback.
+            let raw = m2.serialize();
+            let mut corrupted = raw.to_vec();
+            let off = corrupted.len() - 4;
+            corrupted[off] ^= 0xFF;
+            let corrupted_msg =
+                SignalMessage::try_from(corrupted.as_slice()).expect("protobuf intact");
+            let err = message_decrypt_signal(
+                &corrupted_msg,
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+                &mut rng,
+            )
+            .await
+            .expect_err("corrupted m2 must fail");
+            assert!(
+                matches!(err, SignalProtocolError::BadMac(_)),
+                "expected BadMac, got: {err}"
+            );
+
+            // The legit m2 must still decrypt — proving the chain key was rolled back.
+            let m2_sig = SignalMessage::try_from(m2.serialize()).expect("m2 SignalMessage");
+            let p2 = message_decrypt_signal(
+                &m2_sig,
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+                &mut rng,
+            )
+            .await
+            .expect("Bob decrypts legit m2 after rollback");
+            assert_eq!(p2.plaintext, b"second");
         });
     }
 
