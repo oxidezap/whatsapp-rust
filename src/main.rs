@@ -180,6 +180,10 @@ async fn handle_send_command(ctx: &MessageContext, args: &str) {
         return;
     };
     let text = text.trim_start();
+    if text.is_empty() {
+        error!("Usage: {SEND_TRIGGER} <jid> <text>");
+        return;
+    }
 
     let jid: Jid = match target.parse() {
         Ok(jid) => jid,
