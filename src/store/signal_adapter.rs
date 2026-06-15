@@ -285,13 +285,14 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
     > {
         let device = self.0.device.read().await;
         // group_decrypt mutates the loaded record (catch-up + ratchet) and stores
-        // it back, so the trait needs an owned copy. The cache keeps its `Arc`, so
-        // this clones the inner record (unchanged from the prior behavior).
+        // it back, so the trait needs an owned copy. checkout_sender_key takes the
+        // record out of the cache (leaving it CheckedOut), so the common case is a
+        // move rather than a deep clone of the message-key backlog; store_sender_key
+        // puts it back. Same checkout pattern as sessions' load_session.
         self.0
             .cache
-            .get_sender_key(sender_key_name, &*device.backend)
+            .checkout_sender_key(sender_key_name, &*device.backend)
             .await
-            .map(|opt| opt.map(std::sync::Arc::unwrap_or_clone))
             .map_err(signal_err("backend"))
     }
 

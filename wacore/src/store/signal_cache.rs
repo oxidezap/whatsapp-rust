@@ -169,11 +169,20 @@ impl SessionStoreState {
 
 // === Sender key object cache (same pattern as sessions) ===
 
+/// Mirrors [`SessionEntry`]: the cache holds an `Arc` so a read-only
+/// `get_sender_key` peek bumps a refcount instead of deep-cloning the record's
+/// `VecDeque<SenderKeyState>` (up to `MAX_MESSAGE_KEYS` message keys each).
+enum SenderKeyEntry {
+    Present(Arc<SenderKeyRecord>),
+    /// Negative cache: known to not exist in the backend.
+    Absent,
+    /// Taken by `checkout_sender_key` (the decrypt/encrypt load); flush and
+    /// eviction skip it and a peek reports it as absent until it is put back.
+    CheckedOut,
+}
+
 struct SenderKeyStoreState {
-    // `Arc`-wrapped so a warm `get_sender_key` (the per-send peek reads and the
-    // per-decrypt load) bumps a refcount instead of deep-cloning the record's
-    // `VecDeque<SenderKeyState>` with up to `MAX_MESSAGE_KEYS` message keys each.
-    cache: HashMap<Arc<str>, Option<Arc<SenderKeyRecord>>>,
+    cache: HashMap<Arc<str>, SenderKeyEntry>,
     dirty: HashSet<Arc<str>>,
 }
 
@@ -194,13 +203,14 @@ impl SenderKeyStoreState {
 
     fn put(&mut self, address: &str, record: SenderKeyRecord) {
         let addr = self.key_for(address);
-        self.cache.insert(addr.clone(), Some(Arc::new(record)));
+        self.cache
+            .insert(addr.clone(), SenderKeyEntry::Present(Arc::new(record)));
         self.dirty.insert(addr.clone());
     }
 
     fn delete(&mut self, address: &str) {
         let addr = self.key_for(address);
-        self.cache.insert(addr.clone(), None);
+        self.cache.insert(addr.clone(), SenderKeyEntry::Absent);
         self.dirty.insert(addr);
     }
 
@@ -210,7 +220,25 @@ impl SenderKeyStoreState {
     }
 
     fn evict_if_needed(&mut self, max_entries: usize) {
-        evict_clean_entries(&mut self.cache, &self.dirty, None, max_entries);
+        if self.cache.len() <= high_watermark(max_entries) {
+            return;
+        }
+        let overflow = self.cache.len().saturating_sub(max_entries);
+        let mut negative = Vec::with_capacity(overflow);
+        let mut positive = Vec::with_capacity(overflow);
+        for (k, v) in self.cache.iter() {
+            if self.dirty.contains(k.as_ref()) {
+                continue;
+            }
+            match v {
+                SenderKeyEntry::CheckedOut => continue, // never evict checked-out
+                SenderKeyEntry::Absent => negative.push(k.clone()),
+                SenderKeyEntry::Present(_) => positive.push(k.clone()),
+            }
+        }
+        for key in negative.into_iter().chain(positive).take(overflow) {
+            self.cache.remove(&key);
+        }
     }
 }
 
@@ -508,27 +536,106 @@ impl SignalStoreCache {
 
     // === Sender Keys ===
 
-    /// Returns a shared (`Arc`) handle to the cached sender-key record. A warm hit
-    /// is a refcount bump, not a deep clone of the message-key backlog. Callers
-    /// that need to mutate clone the inner record (e.g. via the trait
-    /// `load_sender_key`), so the cache copy is never mutated through this handle.
+    /// Read-only peek: returns a shared (`Arc`) handle to the cached sender-key
+    /// record without taking it out of the cache. A warm hit is a refcount bump,
+    /// not a deep clone of the message-key backlog. Mirrors [`Self::peek_session`].
+    /// The mutating decrypt/encrypt load uses [`Self::checkout_sender_key`]; a
+    /// record checked out by that path reads here as absent (no current caller
+    /// peeks a key while it is being decrypted — peeks are on the local sending
+    /// key, the load is on a remote sender's key).
     pub async fn get_sender_key(
         &self,
         name: &SenderKeyName,
         backend: &dyn SignalStore,
     ) -> Result<Option<Arc<SenderKeyRecord>>> {
         let key = name.cache_key();
-        let mut state = self.sender_keys.lock().await;
-        if let Some(cached) = state.cache.get(key) {
-            return Ok(cached.clone());
+        {
+            let state = self.sender_keys.lock().await;
+            if let Some(entry) = state.cache.get(key) {
+                return match entry {
+                    SenderKeyEntry::Present(record) => Ok(Some(record.clone())),
+                    SenderKeyEntry::Absent | SenderKeyEntry::CheckedOut => Ok(None),
+                };
+            }
         }
-        let record = match backend.get_sender_key(key).await? {
-            Some(bytes) => Some(Arc::new(SenderKeyRecord::deserialize(&bytes)?)),
-            None => None,
-        };
-        state.cache.insert(Arc::from(key), record.clone());
-        state.evict_if_needed(self.max_entries);
-        Ok(record)
+        // Backend I/O outside the lock.
+        let backend_result = backend.get_sender_key(key).await?;
+        let mut state = self.sender_keys.lock().await;
+        match backend_result {
+            Some(bytes) => {
+                let record = Arc::new(SenderKeyRecord::deserialize(&bytes)?);
+                if !state.cache.contains_key(key) {
+                    state
+                        .cache
+                        .insert(Arc::from(key), SenderKeyEntry::Present(record.clone()));
+                    state.evict_if_needed(self.max_entries);
+                }
+                Ok(Some(record))
+            }
+            None => {
+                if !state.cache.contains_key(key) {
+                    state.cache.insert(Arc::from(key), SenderKeyEntry::Absent);
+                    state.evict_if_needed(self.max_entries);
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Take the cached sender-key record out as an owned value for the mutating
+    /// load path ([`SenderKeyStore::load_sender_key`]): `group_decrypt`/group
+    /// encrypt advance and store it back via [`Self::put_sender_key`]. The slot
+    /// is left [`SenderKeyEntry::CheckedOut`] for the borrow window. When the
+    /// cached `Arc` is unique (the common case) this moves the record instead of
+    /// deep-cloning its message-key backlog. Mirrors [`Self::get_session`].
+    pub async fn checkout_sender_key(
+        &self,
+        name: &SenderKeyName,
+        backend: &dyn SignalStore,
+    ) -> Result<Option<SenderKeyRecord>> {
+        let key = name.cache_key();
+        {
+            let mut state = self.sender_keys.lock().await;
+            if let Some(entry) = state.cache.get_mut(key) {
+                if matches!(entry, SenderKeyEntry::Present(_)) {
+                    let SenderKeyEntry::Present(record) =
+                        std::mem::replace(entry, SenderKeyEntry::CheckedOut)
+                    else {
+                        unreachable!()
+                    };
+                    // Unique unless a peek's Arc is still alive, so this is a move.
+                    return Ok(Some(
+                        Arc::try_unwrap(record).unwrap_or_else(|arc| (*arc).clone()),
+                    ));
+                }
+                return Ok(None);
+            }
+        }
+        // Backend I/O outside the lock.
+        let backend_result = backend.get_sender_key(key).await?;
+        let mut state = self.sender_keys.lock().await;
+        match backend_result {
+            Some(bytes) => {
+                if state.cache.contains_key(key) {
+                    // Another task populated the slot while we loaded; defer to it
+                    // and return a fresh owned copy without caching.
+                    return Ok(Some(SenderKeyRecord::deserialize(&bytes)?));
+                }
+                let record = SenderKeyRecord::deserialize(&bytes)?;
+                state
+                    .cache
+                    .insert(Arc::from(key), SenderKeyEntry::CheckedOut);
+                state.evict_if_needed(self.max_entries);
+                Ok(Some(record))
+            }
+            None => {
+                if !state.cache.contains_key(key) {
+                    state.cache.insert(Arc::from(key), SenderKeyEntry::Absent);
+                    state.evict_if_needed(self.max_entries);
+                }
+                Ok(None)
+            }
+        }
     }
 
     pub async fn put_sender_key(&self, name: &SenderKeyName, record: SenderKeyRecord) {
@@ -729,16 +836,19 @@ impl SignalStoreCache {
             let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::new();
             for name in &dirty_keys {
                 match state.cache.get(name.as_ref()) {
-                    Some(Some(record)) => {
+                    Some(SenderKeyEntry::Present(record)) => {
                         let bytes = record
                             .serialize()
                             .map_err(|e| anyhow::anyhow!("sender key serialize for {name}: {e}"))?;
                         batch.push((name.clone(), bytes::Bytes::from(bytes)));
                     }
-                    Some(None) => {
+                    Some(SenderKeyEntry::Absent) => {
                         backend.delete_sender_key(name).await?;
                     }
-                    None => {}
+                    // CheckedOut: the live record is owned by an in-flight decrypt;
+                    // it stays dirty (below) and flushes once stored back. Absent
+                    // from cache: nothing to persist.
+                    Some(SenderKeyEntry::CheckedOut) | None => {}
                 }
             }
             if !batch.is_empty() {
@@ -746,7 +856,12 @@ impl SignalStoreCache {
             }
 
             for key in &dirty_keys {
-                state.dirty.remove(key);
+                if !matches!(
+                    state.cache.get(key.as_ref()),
+                    Some(SenderKeyEntry::CheckedOut)
+                ) {
+                    state.dirty.remove(key);
+                }
             }
             state.evict_if_needed(self.max_entries);
         }
@@ -834,6 +949,124 @@ mod sender_key_lock_tests {
         // A warm sender-key hit returns a refcount bump of the same allocation,
         // not a deep copy of the message-key backlog.
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[tokio::test]
+    async fn checkout_sender_key_takes_out_then_put_restores() {
+        use crate::store::in_memory::InMemoryBackend;
+        let cache = SignalStoreCache::new();
+        let backend = InMemoryBackend::new();
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+
+        // Checkout takes the record out as an owned value; the slot is CheckedOut.
+        let rec = cache
+            .checkout_sender_key(&name, &backend)
+            .await
+            .unwrap()
+            .expect("checked out");
+
+        // While checked out, a peek and a second checkout both report absent (the
+        // live copy is owned by the in-flight decrypt). No real caller hits this —
+        // peeks are on the local sending key, the load on a remote sender's key.
+        assert!(
+            cache
+                .get_sender_key(&name, &backend)
+                .await
+                .unwrap()
+                .is_none(),
+            "peek during checkout reports absent"
+        );
+        assert!(
+            cache
+                .checkout_sender_key(&name, &backend)
+                .await
+                .unwrap()
+                .is_none(),
+            "second checkout while checked out reports absent"
+        );
+
+        // Storing it back restores a queryable entry.
+        cache.put_sender_key(&name, rec).await;
+        assert!(
+            cache
+                .get_sender_key(&name, &backend)
+                .await
+                .unwrap()
+                .is_some(),
+            "put_sender_key restores the entry after checkout"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_sender_key_loads_from_backend_when_cache_cold() {
+        use crate::store::in_memory::InMemoryBackend;
+        let cache = SignalStoreCache::new();
+        let backend = InMemoryBackend::new();
+        let name = SenderKeyName::from_parts("g@g.us", "cold@s.whatsapp.net:0");
+
+        // Persist to the backend, then drop the cache so the checkout is cold.
+        cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+        cache.flush(&backend).await.unwrap();
+        cache.clear().await;
+
+        let rec = cache.checkout_sender_key(&name, &backend).await.unwrap();
+        assert!(rec.is_some(), "cold checkout loads from the backend");
+        assert!(
+            cache
+                .get_sender_key(&name, &backend)
+                .await
+                .unwrap()
+                .is_none(),
+            "the cold-loaded slot is left checked out"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_defers_checked_out_sender_key() {
+        use crate::store::in_memory::InMemoryBackend;
+        use crate::store::traits::SignalStore;
+        let cache = SignalStoreCache::new();
+        let backend = InMemoryBackend::new();
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+        let rec = cache
+            .checkout_sender_key(&name, &backend)
+            .await
+            .unwrap()
+            .expect("checked out");
+
+        // A flush in the borrow window must not persist (or drop) the record; it
+        // stays dirty and is deferred until it is stored back.
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            backend
+                .get_sender_key(name.cache_key())
+                .await
+                .unwrap()
+                .is_none(),
+            "a checked-out sender key is not flushed"
+        );
+
+        // Once stored back, the next flush persists it.
+        cache.put_sender_key(&name, rec).await;
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            backend
+                .get_sender_key(name.cache_key())
+                .await
+                .unwrap()
+                .is_some(),
+            "the sender key flushes once stored back"
+        );
     }
 }
 
