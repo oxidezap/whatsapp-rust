@@ -84,4 +84,20 @@ pub mod codec {
     pub fn message_context_info_to_vec(mci: &whatsapp::MessageContextInfo) -> Vec<u8> {
         mci.encode_to_vec()
     }
+
+    /// Merge wire bytes into an existing `MessageContextInfo` (prost merge
+    /// semantics: later-set fields win).
+    ///
+    /// Merges through a `&mut &mut &[u8]` buffer — the exact shape
+    /// `Message::decode` threads into its nested `MessageContextInfo` — so the
+    /// `BotMetadata` decode subtree reuses that instantiation instead of
+    /// emitting a second ~67 KiB copy in a distinct buffer-type shape.
+    #[inline(never)]
+    pub fn message_context_info_merge(
+        mci: &mut whatsapp::MessageContextInfo,
+        bytes: &[u8],
+    ) -> Result<(), prost::DecodeError> {
+        let mut cursor = bytes;
+        mci.merge(&mut &mut cursor)
+    }
 }

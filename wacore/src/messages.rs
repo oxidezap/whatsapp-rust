@@ -1,7 +1,8 @@
 use crate::libsignal::crypto::CryptographicHash;
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
-use prost::Message as ProtoMessage;
+#[cfg(test)]
+use prost::Message as _;
 use waproto::whatsapp as wa;
 
 pub struct MessageUtils;
@@ -98,8 +99,11 @@ impl MessageUtils {
                 let ctx = owned
                     .message_context_info
                     .get_or_insert_with(Default::default);
-                ctx.merge(waproto::codec::message_context_info_to_vec(extra).as_slice())
-                    .expect("merge MessageContextInfo");
+                waproto::codec::message_context_info_merge(
+                    ctx,
+                    &waproto::codec::message_context_info_to_vec(extra),
+                )
+                .expect("merge MessageContextInfo");
             }
             return Self::encode_dm_plaintexts_owned(owned, destination_jid);
         }
