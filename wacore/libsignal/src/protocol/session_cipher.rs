@@ -52,6 +52,13 @@ impl EncryptionBuffer {
         &mut self.buffer
     }
 }
+
+/// Current capacity of this thread's encrypt buffer. Test-only: lets the
+/// oversized-buffer-release regression test observe the thread-local.
+#[cfg(test)]
+fn encryption_buffer_capacity() -> usize {
+    ENCRYPTION_BUFFER.with(|b| b.borrow().buffer.capacity())
+}
 use crate::protocol::consts::MAX_FORWARD_JUMPS;
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, UsePQRatchet};
@@ -208,6 +215,13 @@ async fn message_encrypt_inner(
                 &their_identity_key,
             )?)
         };
+        // A plaintext whose ciphertext exceeds MAX_CAPACITY leaves an oversized
+        // buffer in thread-local storage; release it now (the old take+realloc
+        // path did this implicitly) so a single large send doesn't pin memory
+        // per worker thread until get_buffer's periodic shrink fires.
+        if buf.capacity() > EncryptionBuffer::MAX_CAPACITY {
+            *buf = Vec::with_capacity(EncryptionBuffer::INITIAL_CAPACITY);
+        }
         Ok::<CiphertextMessage, SignalProtocolError>(message)
     })?;
 
@@ -1752,6 +1766,32 @@ mod tests {
             .await
             .expect("Bob decrypts legit m2 after rollback");
             assert_eq!(p2.plaintext, b"second");
+        });
+    }
+
+    /// Reusing the encrypt buffer must not pin an oversized allocation: a
+    /// plaintext larger than MAX_CAPACITY grows the thread-local buffer, which
+    /// has to be released after the message is built (the old take+realloc path
+    /// did this implicitly).
+    #[test]
+    fn encrypt_releases_oversized_buffer() {
+        let mut tp = setup_established_session();
+        futures::executor::block_on(async {
+            let big = vec![7u8; 32 * 1024]; // ciphertext far exceeds MAX_CAPACITY (16 KiB)
+            message_encrypt(
+                &big,
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+            )
+            .await
+            .expect("encrypt large message");
+
+            let cap = encryption_buffer_capacity();
+            assert!(
+                cap <= EncryptionBuffer::INITIAL_CAPACITY,
+                "encrypt buffer should be released after an oversized send, got capacity {cap}"
+            );
         });
     }
 
