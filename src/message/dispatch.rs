@@ -15,10 +15,9 @@ impl Client {
 
         let mut info = Arc::clone(info);
         if info.ephemeral_expiration.is_none()
-            && msg.get_base_message().get_ephemeral_expiration().is_some()
+            && let Some(exp) = msg.get_base_message().get_ephemeral_expiration()
         {
-            Arc::make_mut(&mut info).ephemeral_expiration =
-                msg.get_base_message().get_ephemeral_expiration();
+            Arc::make_mut(&mut info).ephemeral_expiration = Some(exp);
         }
 
         // Keep this ordered with dispatch; add-on messages can immediately
