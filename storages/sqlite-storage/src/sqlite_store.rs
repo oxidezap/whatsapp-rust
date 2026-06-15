@@ -160,8 +160,15 @@ impl SqliteStore {
 
         let pool_size = 2;
 
+        // Local SQLite file connections don't spontaneously drop, so r2d2's
+        // default per-checkout liveness probe (a SELECT 1 via Diesel's
+        // is_valid) is pure overhead on every store op: any real failure
+        // surfaces as a StoreError on the next actual query, so the probe
+        // guards nothing here. Skipping it saves a cached SELECT 1 (reset+step)
+        // per pool.get().
         let pool = Pool::builder()
             .max_size(pool_size)
+            .test_on_check_out(false)
             .connection_customizer(Box::new(ConnectionOptions))
             .build(manager)
             .map_err(|e| StoreError::Connection(Box::new(e)))?;
