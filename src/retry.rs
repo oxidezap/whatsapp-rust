@@ -287,13 +287,14 @@ impl Client {
         });
 
         // Hard cap on real resends. MAX_RETRY_COUNT above trusts the peer's
-        // echoed `count`, which a looping device can keep low; this counts what
-        // we actually resent and stops the storm before it trips AccountLocked.
-        let resends = next_resend_count(self.resend_counts.get(&resend_key).await);
-        self.resend_counts.insert(resend_key, resends).await;
-        if resends > MAX_RESENDS_PER_MESSAGE {
+        // echoed `count`, which a looping device can keep low; this counts the
+        // resends we actually commit to (tallied past the early returns below)
+        // and stops the storm before it trips AccountLocked. Check only here —
+        // the tally happens once the send is committed, so cache-miss/status
+        // early returns don't consume the budget.
+        if self.resend_counts.get(&resend_key).await.unwrap_or(0) >= MAX_RESENDS_PER_MESSAGE {
             warn!(
-                "Refusing resend #{resends} of {} to {} in {}: exceeds resend cap {}",
+                "Refusing resend of {} to {} in {}: exceeds resend cap {}",
                 message_id,
                 info.requester.observe(),
                 info.chat.observe(),
@@ -525,6 +526,13 @@ impl Client {
             info.chat.observe(),
             retry_count
         );
+
+        // Tally now that a real resend is committed (cache-miss and status
+        // early returns above don't reach here). Counting a committed attempt —
+        // not only a successful send_node — is deliberate: a session-prepare
+        // loop that keeps erroring is exactly the churn the cap must bound.
+        let resends = next_resend_count(self.resend_counts.get(&resend_key).await);
+        self.resend_counts.insert(resend_key, resends).await;
 
         if info.chat.is_group() {
             // Group retry: pairwise encrypt to failing device only (RetryMsgJob.js:71).
