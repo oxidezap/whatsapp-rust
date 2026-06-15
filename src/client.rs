@@ -188,6 +188,7 @@ pub struct MemoryDiagnostics {
     pub recent_messages: u64,
     pub sender_key_device_cache: u64,
     pub message_retry_counts: u64,
+    pub resend_counts: u64,
     pub undecryptable_dispatched: u64,
     pub pdo_pending_requests: u64,
     pub pdo_requested: u64,
@@ -229,6 +230,7 @@ impl std::fmt::Display for MemoryDiagnostics {
             self.sender_key_device_cache
         )?;
         writeln!(f, "  message_retry_counts:   {}", self.message_retry_counts)?;
+        writeln!(f, "  resend_counts:          {}", self.resend_counts)?;
         writeln!(
             f,
             "  undec_dispatched:       {}",
@@ -454,6 +456,12 @@ pub struct Client {
     /// stay stuck. This map throttles the fallback so a noisy peer can't
     /// loop us through prekey fetches.
     pub(crate) session_recreate_history: Cache<wacore_binary::jid::Jid, wacore::time::Instant>,
+
+    /// Hard cap on outbound resends keyed by "{chat}:{msg_id}:{requester}":
+    /// counts the resends we actually performed, independent of the peer's
+    /// echoed `count`. A looping device under PN→LID churn can keep the
+    /// echoed count low; this is the real ceiling that stops the resend storm.
+    pub(crate) resend_counts: Cache<String, u32>,
 
     /// Dispatch-once gate for `UndecryptableMessage`: a server resend of a
     /// failed id re-enters the failure path and would otherwise fire a

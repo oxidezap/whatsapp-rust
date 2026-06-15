@@ -185,6 +185,8 @@ impl Client {
 
             session_recreate_history: cache_config.session_recreate_history.build_with_ttl(),
 
+            resend_counts: cache_config.resend_counts.build_with_ttl(),
+
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
 
             offline_sync_metrics: Arc::new(OfflineSyncMetrics {

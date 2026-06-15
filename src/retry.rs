@@ -75,6 +75,13 @@ fn extract_registration_id_from_node_ref(node: &NodeRef<'_>) -> Option<u32> {
 /// We refuse to resend if the requester has already retried this many times.
 const MAX_RETRY_COUNT: u8 = 5;
 
+/// Hard ceiling on resends we actually perform per (chat, msg, requester),
+/// independent of the peer-echoed `count`. A device looping retry receipts
+/// (common under PN→LID churn) keeps the echoed count low, so MAX_RETRY_COUNT
+/// alone never fires; this is the real cap that stops the resend storm that
+/// trips AccountLocked. Generous enough for legitimate spaced redeliveries.
+const MAX_RESENDS_PER_MESSAGE: u32 = 8;
+
 /// Minimum retry count before we start tracking base keys.
 /// WhatsApp Web saves base key on retry 2, checks on retry > 2.
 const MIN_RETRY_FOR_BASE_KEY_CHECK: u8 = 2;
@@ -190,6 +197,13 @@ fn validate_retry_prekey_presence(
 
 // No retry_count in the key: concurrent receipts for the same participant must
 // serialize, otherwise two update_local_signal_session calls race on session state.
+/// Next resend tally for a (chat,msg,requester) key. Saturates so a wrapped
+/// counter can't silently re-open the cap.
+#[inline]
+fn next_resend_count(prev: Option<u32>) -> u32 {
+    prev.unwrap_or(0).saturating_add(1)
+}
+
 fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Jid) -> String {
     let mut key = String::with_capacity(message_id.len() + 64);
     chat.push_to(&mut key);
@@ -261,8 +275,9 @@ impl Client {
             log::debug!("Ignoring retry for {processing_key}: a retry is already in progress.");
             return Ok(());
         }
-        // processing_key isn't needed by name after this point — move it into
-        // the scopeguard instead of cloning again.
+        // Clone once for the resend cap below; the original moves into the
+        // scopeguard that clears the in-progress marker.
+        let resend_key = processing_key.clone();
         let pending = Arc::clone(&self.pending_retries);
         let _guard = scopeguard::guard((), move |()| {
             pending
@@ -270,6 +285,22 @@ impl Client {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&processing_key);
         });
+
+        // Hard cap on real resends. MAX_RETRY_COUNT above trusts the peer's
+        // echoed `count`, which a looping device can keep low; this counts what
+        // we actually resent and stops the storm before it trips AccountLocked.
+        let resends = next_resend_count(self.resend_counts.get(&resend_key).await);
+        self.resend_counts.insert(resend_key, resends).await;
+        if resends > MAX_RESENDS_PER_MESSAGE {
+            warn!(
+                "Refusing resend #{resends} of {} to {} in {}: exceeds resend cap {}",
+                message_id,
+                info.requester.observe(),
+                info.chat.observe(),
+                MAX_RESENDS_PER_MESSAGE
+            );
+            return Ok(());
+        }
 
         // A retry from a device missing from our registry signals a stale device
         // list for this user, so refresh it (rate-limited, dedup'd) to learn the
@@ -1252,6 +1283,28 @@ mod tests {
     use crate::store::persistence_manager::PersistenceManager;
     use crate::test_utils::MockHttpClient;
     use std::borrow::Cow;
+
+    #[test]
+    fn resend_cap_refuses_after_threshold() {
+        // Counts 1..=cap stay within the ceiling; the next one exceeds it.
+        let mut prev = None;
+        for expected in 1..=MAX_RESENDS_PER_MESSAGE {
+            let n = next_resend_count(prev);
+            assert_eq!(n, expected);
+            assert!(n <= MAX_RESENDS_PER_MESSAGE);
+            prev = Some(n);
+        }
+        let over = next_resend_count(prev);
+        assert_eq!(over, MAX_RESENDS_PER_MESSAGE + 1);
+        assert!(over > MAX_RESENDS_PER_MESSAGE);
+    }
+
+    #[test]
+    fn next_resend_count_saturates() {
+        assert_eq!(next_resend_count(None), 1);
+        assert_eq!(next_resend_count(Some(7)), 8);
+        assert_eq!(next_resend_count(Some(u32::MAX)), u32::MAX);
+    }
     use std::sync::Arc;
     use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair};
     use wacore::types::jid::JidExt as _;

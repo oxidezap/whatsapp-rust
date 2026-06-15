@@ -195,6 +195,12 @@ pub struct CacheConfig {
     /// Session-recreate throttle history (time_to_live). Default: 1h TTL, 256
     /// entries. Replaces a global `Mutex<HashMap>` scanned O(n) per retry receipt.
     pub session_recreate_history: CacheEntryConfig,
+    /// Outbound resend cap per (chat, msg, requester): a hard ceiling on how
+    /// many times we re-encrypt+resend a message in response to peer retry
+    /// receipts, independent of the peer-echoed `count`. Without it a single
+    /// looping device under PN→LID churn drives a resend storm into
+    /// AccountLocked. Default: 10m TTL, 10000 entries.
+    pub resend_counts: CacheEntryConfig,
 
     // --- Coordination caches (capacity-only, no TTL) ---
     /// Per-device Signal session lock capacity. Default: 10000.
@@ -271,6 +277,7 @@ impl std::fmt::Debug for CacheConfig {
             .field("pdo_requested", &self.pdo_requested)
             .field("sender_key_devices_cache", &self.sender_key_devices_cache)
             .field("session_recreate_history", &self.session_recreate_history)
+            .field("resend_counts", &self.resend_counts)
             .field("session_locks_capacity", &self.session_locks_capacity)
             .field("chat_lanes_capacity", &self.chat_lanes_capacity)
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
@@ -324,6 +331,9 @@ impl Default for CacheConfig {
             pdo_requested: CacheEntryConfig::new(Some(Duration::from_secs(24 * 3600)), 512),
             sender_key_devices_cache: CacheEntryConfig::new(one_hour, 500),
             session_recreate_history: CacheEntryConfig::new(one_hour, 256),
+            // 10m covers a message's realistic retry window; 10k entries is
+            // sized for a storm spanning many (chat,msg,device) keys at once.
+            resend_counts: CacheEntryConfig::new(Some(Duration::from_secs(600)), 10_000),
             // Coordination caches hold live mutexes/senders; capacity eviction
             // while a reference is held creates a second lock for the same key,
             // breaking serialization. Size generously to avoid eviction pressure.

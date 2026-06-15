@@ -90,6 +90,7 @@ impl Client {
             recent_messages: self.recent_messages.entry_count(),
             sender_key_device_cache: self.sender_key_device_cache.entry_count(),
             message_retry_counts: self.message_retry_counts.entry_count(),
+            resend_counts: self.resend_counts.entry_count(),
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
             pdo_pending_requests: self.pdo_pending_requests.entry_count(),
             pdo_requested: self.pdo_requested.entry_count(),
