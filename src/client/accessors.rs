@@ -60,6 +60,26 @@ impl Client {
         self.wanted_pre_key_count.load(Ordering::Relaxed)
     }
 
+    /// Retune the per-chat outbound resend rate limiter live (no reconnect).
+    ///
+    /// Outbound resends to a chat are bounded by a token bucket: `burst` is the
+    /// instantaneous allowance and `refill_per_min` the sustained ceiling per
+    /// chat. This caps the aggregate resend rate that WhatsApp's anti-abuse
+    /// penalizes during a PN to LID migration fan-out, while throttled devices
+    /// still recover via the fresh-SKDM mark. A `burst` of 0 disables the limiter.
+    ///
+    /// Takes effect on each chat's next retry; a lowered `burst` clamps a live
+    /// bucket on its next access.
+    pub fn set_resend_rate_limit(&self, burst: u32, refill_per_min: u32) {
+        self.resend_rate_limiter.set_rate(burst, refill_per_min);
+    }
+
+    /// Total outbound resends dropped by the per-chat rate limiter since start.
+    /// Surfaces storm chats without the `debug-diagnostics` feature.
+    pub fn resends_throttled_total(&self) -> u64 {
+        self.resend_rate_limiter.throttled_total()
+    }
+
     /// Returns a snapshot of all internal collection sizes for memory leak detection.
     ///
     /// Moka caches report approximate counts (pending evictions may not be reflected).
@@ -95,6 +115,8 @@ impl Client {
             pdo_requested: self.pdo_requested.entry_count(),
             session_locks: self.session_locks.entry_count(),
             chat_lanes: self.chat_lanes.entry_count(),
+            resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
+            resends_throttled_total: self.resend_rate_limiter.throttled_total(),
             response_waiters: self.response_waiters.lock().await.len(),
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,

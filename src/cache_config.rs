@@ -201,6 +201,12 @@ pub struct CacheConfig {
     pub session_locks_capacity: u64,
     /// Per-chat lane capacity (combined lock + queue). Default: 5000.
     pub chat_lanes_capacity: u64,
+    /// Per-chat resend rate-limiter capacity: one token-bucket entry per group
+    /// recently driving retry resends. Keep above the count of concurrently
+    /// storming groups: eviction is FIFO and fail-open (an evicted bucket is
+    /// recreated full), so undersizing only forgives rate, never over-throttles.
+    /// Default: 4096.
+    pub resend_rate_limiter_capacity: u64,
 
     // --- Sent message DB cleanup ---
     /// TTL in seconds for sent messages in DB before periodic cleanup. Must
@@ -273,6 +279,10 @@ impl std::fmt::Debug for CacheConfig {
             .field("session_recreate_history", &self.session_recreate_history)
             .field("session_locks_capacity", &self.session_locks_capacity)
             .field("chat_lanes_capacity", &self.chat_lanes_capacity)
+            .field(
+                "resend_rate_limiter_capacity",
+                &self.resend_rate_limiter_capacity,
+            )
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
             .field("msg_secret_policy", &self.msg_secret_policy)
             .field("msg_secret_retention", &self.msg_secret_retention)
@@ -329,6 +339,7 @@ impl Default for CacheConfig {
             // breaking serialization. Size generously to avoid eviction pressure.
             session_locks_capacity: 10_000,
             chat_lanes_capacity: 5_000,
+            resend_rate_limiter_capacity: 4_096,
             sent_message_ttl_secs: 7200,
             // Bounded by default: seed only the still-relevant slice of history
             // and prune by per-add-on-kind event-time horizons, so the store no
