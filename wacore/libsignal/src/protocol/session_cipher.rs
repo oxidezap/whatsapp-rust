@@ -1787,9 +1787,14 @@ mod tests {
             .await
             .expect("encrypt large message");
 
+            // The fix's contract is "buffer must not exceed MAX_CAPACITY after a
+            // send". Asserting against MAX (not INITIAL) keeps the test robust:
+            // Vec::with_capacity only guarantees a lower bound, so an allocator
+            // that rounds up must not flake this. A 32 KiB plaintext without the
+            // release leaves the buffer well above MAX (~32 KiB).
             let cap = encryption_buffer_capacity();
             assert!(
-                cap <= EncryptionBuffer::INITIAL_CAPACITY,
+                cap <= EncryptionBuffer::MAX_CAPACITY,
                 "encrypt buffer should be released after an oversized send, got capacity {cap}"
             );
         });
