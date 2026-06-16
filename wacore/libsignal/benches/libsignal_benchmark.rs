@@ -1474,6 +1474,77 @@ fn bench_group_out_of_order_decrypt_worst_case(bencher: divan::Bencher) {
         });
 }
 
+/// In-order group decrypt while a large skipped-key backlog is still buffered.
+/// Once a receiver falls ~2000 messages behind and catches up, the backlog
+/// persists; every subsequent in-order message ratchets the chain forward
+/// without ever reading the backlog, yet `load_sender_key` still clones the
+/// whole backlog-sized record. The backlog fill and the catch-up run in
+/// `with_inputs` (untimed); only the in-order decrypt — whose sole backlog cost
+/// is that load clone — is measured.
+fn setup_group_in_order_decrypt_with_backlog() -> (User, SenderKeyName, Vec<u8>) {
+    // Fill just under MAX_MESSAGE_KEYS so the whole backlog survives intact
+    // (eviction only starts past MAX + MESSAGE_KEY_PRUNE_THRESHOLD), then send
+    // one more message that bob decrypts in order on top of that backlog.
+    const N: u32 = (consts::MAX_MESSAGE_KEYS - 1) as u32;
+
+    let (mut alice, mut bob, sender_key_name) = setup_group_with_distribution();
+
+    let bob_sender_key_name = SenderKeyName::new(
+        sender_key_name.group_id().to_string(),
+        alice.address.name().to_string(),
+    );
+
+    let in_order_ct = futures::executor::block_on(async {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ciphertexts: Vec<Vec<u8>> = Vec::with_capacity((N + 2) as usize);
+        for i in 0..=(N + 1) {
+            let skm = group_encrypt(
+                &mut alice.sender_key_store,
+                &sender_key_name,
+                format!("group msg {i}").as_bytes(),
+                &mut rng,
+            )
+            .await
+            .expect("group encrypt");
+            ciphertexts.push(skm.serialized().to_vec());
+        }
+
+        // Decrypting message N first ratchets bob's chain to N+1 and buffers the
+        // N skipped keys (iterations 0..N-1) in the backlog.
+        group_decrypt(
+            &ciphertexts[N as usize],
+            &mut bob.sender_key_store,
+            &bob_sender_key_name,
+        )
+        .await
+        .expect("group decrypt newest");
+
+        // Message N+1 is exactly in order (jump == 0): it advances the chain and
+        // never touches the buffered backlog.
+        ciphertexts[(N + 1) as usize].clone()
+    });
+
+    (bob, bob_sender_key_name, in_order_ct)
+}
+
+#[divan::bench(sample_count = 30)]
+fn bench_group_in_order_decrypt_with_backlog(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_in_order_decrypt_with_backlog)
+        .bench_refs(|(bob, sender_key_name, ciphertext)| {
+            let plaintext = futures::executor::block_on(async {
+                group_decrypt(
+                    black_box(ciphertext.as_slice()),
+                    &mut bob.sender_key_store,
+                    sender_key_name,
+                )
+                .await
+                .expect("group decrypt in order with backlog")
+            });
+            black_box(plaintext);
+        });
+}
+
 /// SKDM ingest: installing a sender's distribution message into a fresh
 /// receiver store, the work done on the first group message from each new
 /// sender and on every sender-key rotation. The SKDM build and the fresh empty
