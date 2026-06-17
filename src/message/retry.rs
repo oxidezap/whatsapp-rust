@@ -247,15 +247,16 @@ impl Client {
                 reason
             );
         }
-        if retry_count >= MAX_DECRYPT_RETRIES {
-            // Parity with WA Web's MessageHighRetryCount WAM event (id 3132),
-            // which commits at retryCount >= MAX from the send-receipt path.
-            wacore::telemetry::high_retry(reason.as_str());
-        }
-
         let retry_sent = match self.send_retry_receipt(info, retry_count, reason).await {
             Ok(()) => {
                 wacore::telemetry::retry_receipt(reason.as_str());
+                if retry_count >= MAX_DECRYPT_RETRIES {
+                    // Parity with WA Web's MessageHighRetryCount WAM event (id
+                    // 3132): committed after the retry receipt is sent, not
+                    // before — WAWebHandleMsgSendReceipt awaits sendRetryReceipt
+                    // and only then calls maybePostMessageHighRetryCountMetric.
+                    wacore::telemetry::high_retry(reason.as_str());
+                }
                 debug!(
                     "Sent retry receipt #{} for message {} in chat {} from {} [{:?}]",
                     retry_count,
