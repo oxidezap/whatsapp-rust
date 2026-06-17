@@ -201,7 +201,7 @@ fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Ji
 }
 
 impl Client {
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.handle_receipt", level = "debug", skip_all, fields(chat = %receipt.source.chat.observe(), sender = %receipt.source.sender.observe()), err(Debug)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.handle_receipt", level = "debug", skip_all, fields(chat = %receipt.source.chat.observe(), sender = %receipt.source.sender.observe(), count = tracing::field::Empty), err(Debug)))]
     pub(crate) async fn handle_retry_receipt(
         self: &Arc<Self>,
         receipt: &Receipt,
@@ -222,6 +222,10 @@ impl Client {
             .map(|v| v.as_str())
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
+        // Record the count on the span so retry-storm depth is aggregable per
+        // sender even when the cap refuses early below.
+        #[cfg(feature = "tracing")]
+        tracing::Span::current().record("count", retry_count);
 
         // Refuse to handle retries that have exceeded the maximum attempts.
         // This prevents infinite retry loops and matches WhatsApp Web's behavior.
