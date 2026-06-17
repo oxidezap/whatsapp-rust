@@ -247,6 +247,11 @@ impl Client {
                 reason
             );
         }
+        if retry_count >= MAX_DECRYPT_RETRIES {
+            // Parity with WA Web's MessageHighRetryCount WAM event (id 3132),
+            // which commits at retryCount >= MAX from the send-receipt path.
+            wacore::telemetry::high_retry(reason.as_str());
+        }
 
         let retry_sent = match self.send_retry_receipt(info, retry_count, reason).await {
             Ok(()) => {

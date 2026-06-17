@@ -37,6 +37,11 @@ mod imp {
     pub fn retry_receipt(reason: &'static str) {
         counter!("wa_retry_receipt_total", "reason" => reason).increment(1);
     }
+    /// Retry receipt sent at the high-retry watermark (count >= MAX), by reason.
+    /// Mirrors WA Web's MessageHighRetryCount WAM event (id 3132).
+    pub fn high_retry(reason: &'static str) {
+        counter!("wa_high_retry_total", "reason" => reason).increment(1);
+    }
     /// IQ request completed, by result (`ok`/`timeout`/`error`). Emitted at the
     /// single request chokepoint, so it covers both raw and spec-based IQs.
     pub fn iq(result: &'static str) {
@@ -111,6 +116,11 @@ mod imp {
             "Retry receipts sent, by reason"
         );
         describe_counter!(
+            "wa_high_retry_total",
+            Unit::Count,
+            "Retry receipts sent at the high-retry watermark (count >= MAX), by reason"
+        );
+        describe_counter!(
             "wa_iq_total",
             Unit::Count,
             "IQ requests by result (ok/timeout/error)"
@@ -179,6 +189,8 @@ mod imp {
     pub fn send(_kind: &'static str) {}
     #[inline]
     pub fn retry_receipt(_reason: &'static str) {}
+    #[inline]
+    pub fn high_retry(_reason: &'static str) {}
     #[inline]
     pub fn iq(_result: &'static str) {}
     #[inline]
