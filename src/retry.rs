@@ -225,8 +225,10 @@ impl Client {
 
         // Refuse to handle retries that have exceeded the maximum attempts.
         // This prevents infinite retry loops and matches WhatsApp Web's behavior.
+        // Logged at debug: remote-driven, expected and fully handled — WA Web
+        // emits this refusal via WALogger.LOG (informational), not WARN.
         if retry_count >= MAX_RETRY_COUNT {
-            warn!(
+            debug!(
                 "Refusing retry #{} for message {} from {}: exceeds max attempts ({})",
                 retry_count,
                 message_id,
