@@ -235,6 +235,7 @@ impl Client {
                 receipt.source.sender.observe(),
                 MAX_RETRY_COUNT
             );
+            wacore::telemetry::retry_refused();
             return Ok(());
         }
 
@@ -779,6 +780,7 @@ impl Client {
                         message_id,
                         retry_count
                     );
+                    wacore::telemetry::base_key_collision();
                     let _ = device_snapshot
                         .backend
                         .delete_base_key(addr_str, message_id)
