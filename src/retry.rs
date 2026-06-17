@@ -760,10 +760,15 @@ impl Client {
                 .await
             {
                 Ok(true) => {
-                    warn!(
-                        "Base key collision detected for {} at retry #{}. \
+                    // Informational, not WARN: this is the corrective action WA
+                    // Web takes here too (WAWebUpdateLocalSignalSession logs the
+                    // same-base-key delete via WALogger.LOG), and the three
+                    // sibling branches of this routine already log at info.
+                    info!(
+                        "Base key collision detected for {} (msg {}) at retry #{}. \
                          Session hasn't been regenerated. Forcing fresh session.",
                         wacore::types::jid::observe_protocol_address(&signal_address),
+                        message_id,
                         retry_count
                     );
                     let _ = device_snapshot
@@ -782,8 +787,9 @@ impl Client {
                 }
                 Ok(false) => {
                     info!(
-                        "Base key changed for {} at retry #{} - session regenerated",
+                        "Base key changed for {} (msg {}) at retry #{} - session regenerated",
                         wacore::types::jid::observe_protocol_address(&signal_address),
+                        message_id,
                         retry_count
                     );
                     let _ = device_snapshot
