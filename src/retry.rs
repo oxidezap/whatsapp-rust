@@ -282,6 +282,14 @@ impl Client {
             .has_device(&info.requester.user, sender_device_id)
             .await;
         if !device_known {
+            // Parity with WA Web's MdRetryFromUnknownDevice WAM (id 2178), which
+            // commits here only — not from the shared inbound device sync, which
+            // schedule_unknown_device_sync is also called from elsewhere.
+            wacore::telemetry::retry_unknown_device(if sender_device_id == 0 {
+                "primary"
+            } else {
+                "companion"
+            });
             self.schedule_unknown_device_sync(info.requester.to_non_ad(), receipt.offline)
                 .await;
         }
