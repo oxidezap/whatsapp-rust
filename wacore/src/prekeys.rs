@@ -28,9 +28,16 @@ pub fn compute_key_bundle_digest(
     hasher.finalize().to_vec()
 }
 
-/// Extract the `publicKey` field (tag 2) from a protobuf-encoded PreKeyRecordStructure
-/// without full prost decode. Uses last-one-wins semantics per protobuf spec.
-/// Skips unknown fields gracefully.
+/// Extract the `publicKey` field (tag 2) from a protobuf-encoded
+/// PreKeyRecordStructure without a full prost decode.
+///
+/// Validates the record framing end-to-end: a malformed varint, a truncated
+/// length-delimited/fixed field, or an unsupported wire type (e.g. the
+/// deprecated group types) yields `None` — the same records a full
+/// `PreKeyRecordStructure::decode` rejects. This keeps callers that skip on
+/// `None` (the pre-key upload and the digestKey check) from admitting a record
+/// this device could not later decode. Uses last-one-wins semantics for a
+/// repeated `publicKey` field, per the protobuf spec.
 pub fn extract_prekey_public_key(record: &[u8]) -> Option<&[u8]> {
     let mut pos = 0;
     let mut result: Option<&[u8]> = None;
@@ -51,7 +58,7 @@ pub fn extract_prekey_public_key(record: &[u8]) -> Option<&[u8]> {
                 pos += c;
                 let len = len as usize;
                 if pos + len > record.len() {
-                    return result;
+                    return None;
                 }
                 if field_number == 2 {
                     result = Some(&record[pos..pos + len]);
@@ -61,19 +68,19 @@ pub fn extract_prekey_public_key(record: &[u8]) -> Option<&[u8]> {
             // fixed64
             1 => {
                 if pos + 8 > record.len() {
-                    return result;
+                    return None;
                 }
                 pos += 8;
             }
             // fixed32
             5 => {
                 if pos + 4 > record.len() {
-                    return result;
+                    return None;
                 }
                 pos += 4;
             }
-            // Unknown wire type -- skip gracefully
-            _ => return result,
+            // Unsupported / invalid wire type (groups, reserved): reject the record.
+            _ => return None,
         }
     }
     result
@@ -411,6 +418,32 @@ mod tests {
     use crate::protocol::ProtocolNode;
 
     use wacore_binary::NodeValue;
+
+    #[test]
+    fn extract_prekey_public_key_matches_full_decode_validation() {
+        use prost::Message;
+        let public_key = vec![0x05u8; 33];
+        let record = waproto::whatsapp::PreKeyRecordStructure {
+            id: Some(1),
+            public_key: Some(public_key.clone()),
+            private_key: Some(vec![0x09u8; 32]),
+        }
+        .encode_to_vec();
+
+        // Well-formed record: the extractor returns the public key.
+        assert_eq!(
+            extract_prekey_public_key(&record),
+            Some(public_key.as_slice())
+        );
+
+        // Truncating into the trailing private_key field leaves a valid publicKey
+        // earlier in the buffer but a malformed tail. A full prost decode rejects
+        // it; the extractor must agree (return None) so the upload path never ships
+        // a record the consume path's full decode would later reject.
+        let truncated = &record[..record.len() - 1];
+        assert!(waproto::whatsapp::PreKeyRecordStructure::decode(truncated).is_err());
+        assert_eq!(extract_prekey_public_key(truncated), None);
+    }
 
     fn create_mock_bundle(device_id: u32) -> PreKeyBundle {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();

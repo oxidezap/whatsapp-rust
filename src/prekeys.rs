@@ -558,11 +558,15 @@ impl Client {
                 // upload only needs the public key, while a full decode also copies
                 // the private key into its own Vec. At the default batch of 812 keys
                 // that is ~2 throwaway allocations per record on the connect path.
+                // The extractor validates the record framing, so a malformed record
+                // returns None and is skipped here — same rejection the consume path
+                // (`get_pre_key`'s full decode) makes, so we never upload a key this
+                // device couldn't later decode with.
                 let public_key = match wacore::prekeys::extract_prekey_public_key(record) {
                     Some(raw) => {
                         PublicKey::from_djb_public_key_bytes(raw).map_err(anyhow::Error::from)
                     }
-                    None => Err(anyhow::anyhow!("record missing public key")),
+                    None => Err(anyhow::anyhow!("record missing or malformed public key")),
                 };
                 match public_key {
                     Ok(public_key) => pairs.push((*id, public_key)),
