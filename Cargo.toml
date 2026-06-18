@@ -226,3 +226,6 @@ strip = false
 inherits = "release"
 debug = 1
 strip = false
+
+[patch.crates-io]
+libsqlite3-sys = { git = "https://github.com/jlucaso1/libsqlite3-libsql-sys" }
