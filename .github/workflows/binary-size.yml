@@ -36,7 +36,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-04-05
+          toolchain: nightly-2026-06-16
 
       - name: Install tools (protoc, cargo-binstall)
         uses: taiki-e/install-action@v2
@@ -168,7 +168,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-04-05
+          toolchain: nightly-2026-06-16
 
       - name: Install tools (protoc, cargo-binstall)
         uses: taiki-e/install-action@v2

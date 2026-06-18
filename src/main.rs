@@ -158,7 +158,7 @@ async fn handle_text_ping(ctx: &MessageContext) {
     let duration = format!("{:.2?}", start.elapsed());
     info!(
         "Send took {}. Editing message {}...",
-        duration, &sent.message_id
+        duration, sent.message_id
     );
 
     let edit = wa::Message {
