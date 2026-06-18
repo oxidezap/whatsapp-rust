@@ -50,11 +50,11 @@ struct Pair {
 }
 
 // Separate pairs for the sender-only and round-trip benches. `send_message`
-// never drains client `b`, so its delivered messages accumulate in `b`'s
-// unbounded event channel; sharing one pair would force `send_and_receive`'s
-// measured `wait_for_text` to discard that backlog first, leaking the send
+// never reads client `b`, so sharing one pair would force `send_and_receive`'s
+// measured `wait_for_text` to discard the send backlog first, leaking the send
 // bench's iteration count into the round-trip result. Dedicated pairs keep each
-// bench's measurement independent of the other (and of divan's run order).
+// bench independent of the other (and of divan's run order); the send pair also
+// drains `b` in the background so its queue stays bounded (see below).
 static PAIR_SEND: OnceLock<Mutex<Pair>> = OnceLock::new();
 static PAIR_RECV: OnceLock<Mutex<Pair>> = OnceLock::new();
 
@@ -70,7 +70,14 @@ fn unique_body(tag: &str) -> String {
 /// Connect two clients and warm their Signal session with one throwaway
 /// round-trip, so measured sends exercise steady state (plain `msg`), not the
 /// first-message pre-key path.
-fn connect_warmed_pair(prefix_a: &str, prefix_b: &str) -> Mutex<Pair> {
+///
+/// `drain_b` spawns a background task that keeps draining `b`'s event channel.
+/// The sender-only `send_message` bench never reads `b`, so without this its
+/// unbounded channel would retain every delivered message and grow across
+/// samples, making CodSpeed memory/simulation numbers depend on how many sends
+/// ran earlier. The round-trip pair must leave it off — `send_and_receive`
+/// consumes `b` itself via `wait_for_text`.
+fn connect_warmed_pair(prefix_a: &str, prefix_b: &str, drain_b: bool) -> Mutex<Pair> {
     rt().block_on(async {
         let a = TestClient::connect(prefix_a)
             .await
@@ -87,16 +94,22 @@ fn connect_warmed_pair(prefix_a: &str, prefix_b: &str) -> Mutex<Pair> {
             .expect("send warmup message");
         b.wait_for_text(&warm, 30).await.expect("receive warmup");
 
+        // Started after warmup so it can't steal the warmup receipt above.
+        if drain_b {
+            let rx = b.event_rx.clone();
+            tokio::spawn(async move { while rx.recv().await.is_ok() {} });
+        }
+
         Mutex::new(Pair { a, b, jid_b })
     })
 }
 
 fn pair_send() -> &'static Mutex<Pair> {
-    PAIR_SEND.get_or_init(|| connect_warmed_pair("bench_send_a", "bench_send_b"))
+    PAIR_SEND.get_or_init(|| connect_warmed_pair("bench_send_a", "bench_send_b", true))
 }
 
 fn pair_recv() -> &'static Mutex<Pair> {
-    PAIR_RECV.get_or_init(|| connect_warmed_pair("bench_recv_a", "bench_recv_b"))
+    PAIR_RECV.get_or_init(|| connect_warmed_pair("bench_recv_a", "bench_recv_b", false))
 }
 
 // x20 coverage: divan's `args` runs the bench once per value and reports each
