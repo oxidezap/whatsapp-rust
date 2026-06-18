@@ -215,10 +215,11 @@ fn send_and_receive(bencher: divan::Bencher, n: u64) {
 /// once outside the measured region; only `reconnect_and_wait` is measured.
 #[divan::bench]
 fn reconnect(bencher: divan::Bencher) {
+    let rt = rt();
     let client: &'static Mutex<TestClient> = {
         static RECONNECT: OnceLock<Mutex<TestClient>> = OnceLock::new();
         RECONNECT.get_or_init(|| {
-            rt().block_on(async {
+            rt.block_on(async {
                 Mutex::new(
                     TestClient::connect("bench_reconn")
                         .await
@@ -228,14 +229,25 @@ fn reconnect(bencher: divan::Bencher) {
         })
     };
 
-    bencher.bench_local(|| {
-        rt().block_on(async {
-            client
-                .lock()
-                .await
-                .reconnect_and_wait()
-                .await
-                .expect("reconnect and wait");
+    bencher
+        // Drain events buffered since the previous reconnect (late init-IQ
+        // responses) in unmeasured setup, so `reconnect_and_wait`'s own
+        // start-of-call `try_recv` drain doesn't charge the prior sample's
+        // leftovers to this one.
+        .with_inputs(|| {
+            rt.block_on(async {
+                let guard = client.lock().await;
+                while guard.event_rx.try_recv().is_ok() {}
+            });
+        })
+        .bench_local_values(|()| {
+            rt.block_on(async {
+                client
+                    .lock()
+                    .await
+                    .reconnect_and_wait()
+                    .await
+                    .expect("reconnect and wait");
+            });
         });
-    });
 }
