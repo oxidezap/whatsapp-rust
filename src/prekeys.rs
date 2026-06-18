@@ -473,13 +473,14 @@ impl Client {
                 // Seed one CSPRNG and advance it per key, rather than reseeding from
                 // entropy on every iteration.
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-                // Encode each record into the shared buffer and drop it immediately, so
-                // the full batch of PreKeyRecordStructures (each owning two heap Vecs for
-                // its key bytes) is never resident at once — that batch was the dominant
-                // controllable peak on the connect path. A record is at most 73 wire bytes
-                // (id field <=5B + two 34B key fields), so reserving by that bound keeps
-                // the buffer at a single allocation.
-                const MAX_RECORD_LEN: usize = 73;
+                // Encode each record into the shared buffer and drop it immediately so the
+                // whole batch of PreKeyRecordStructures (each owns two heap Vecs of key bytes)
+                // is never resident at once — that batch was the dominant controllable peak on
+                // the connect path. MAX_RECORD_LEN keeps the buffer to a single allocation;
+                // being just a capacity hint, it uses the type-level upper bound (1-byte id
+                // tag + <=5-byte u32 varint + two 34 B key fields = 74) rather than depending
+                // on the tighter 24-bit id cap.
+                const MAX_RECORD_LEN: usize = 74;
                 let mut pubkeys = Vec::with_capacity(gen_count);
                 let mut offsets = Vec::with_capacity(gen_count);
                 let mut buf = Vec::with_capacity(gen_count * MAX_RECORD_LEN);
