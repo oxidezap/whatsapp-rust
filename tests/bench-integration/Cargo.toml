@@ -19,19 +19,10 @@ anyhow = { workspace = true }
 dhat = { version = "0.3", optional = true }
 e2e-tests = { path = "../e2e" }
 env_logger = { workspace = true }
-log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 wacore = { path = "../../wacore" }
-whatsapp-rust = { path = "../..", default-features = false, features = [
-  "danger-skip-tls-verify",
-  "debug-diagnostics",
-  "simd",
-  "tokio-runtime",
-  "tokio-native",
-  "signal",
-] }
 
 [lints]
 workspace = true

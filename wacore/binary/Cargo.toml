@@ -10,6 +10,10 @@ description = "Binary data and constants for WhatsApp protocol"
 [package.metadata.cargo-shear]
 ignored = ["hashify"]
 
+# `hashify` is used only through its lookup macros, so static analysers miss it.
+[package.metadata.cargo-machete]
+ignored = ["hashify"]
+
 [lib]
 crate-type = ["rlib"]
 

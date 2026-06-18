@@ -1,9 +1,8 @@
-use aes_gcm::Aes256Gcm;
-use aes_gcm::aead::{Aead, KeyInit, Payload};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use wacore::handshake::NoiseHandshake;
 use wacore::libsignal::crypto::CryptographicHash;
+use wacore::libsignal::crypto::aes_256_gcm_decrypt;
 use wacore::libsignal::protocol::{PrivateKey, PublicKey};
 use wacore::noise::generate_iv;
 use wacore_binary::consts::{NOISE_PATTERN_XX, WA_CONN_HEADER};
@@ -69,17 +68,16 @@ fn test_server_static_key_decryption_with_go_values() {
         "Derived SALT does not match Go's value!"
     );
 
-    let cipher =
-        Aes256Gcm::new_from_slice(&rust_key_for_decrypt).expect("Failed to prepare GCM cipher");
-
     let iv = generate_iv(0);
-    let payload = Payload {
-        msg: &ciphertext,
-        aad: &aad_for_decrypt,
-    };
-
-    let rust_plaintext = cipher.decrypt((&iv).into(), payload)
-        .expect("AEAD DECRYPTION FAILED! The test inputs are correct, so the GCM primitive or its inputs are flawed.");
+    let mut rust_plaintext = Vec::new();
+    aes_256_gcm_decrypt(
+        &rust_key_for_decrypt,
+        &iv,
+        &aad_for_decrypt,
+        &ciphertext,
+        &mut rust_plaintext,
+    )
+    .expect("AEAD DECRYPTION FAILED! The test inputs are correct, so the GCM primitive or its inputs are flawed.");
 
     assert_eq!(
         hex::encode(rust_plaintext),
@@ -92,32 +90,25 @@ fn test_server_static_key_decryption_with_go_values() {
 
 #[test]
 fn test_live_decryption_with_go_values() {
-    use aes_gcm::aead::{Aead, Payload};
-    use hex;
-
     let go_derived_key_hex = "0e34efece6dc4516c05c53bb7e0c2128bc66c053da4e0b18afb0afe8e648c05d";
     let go_aad_hex = "78b3c79d1c15cf84ec402678ac0478106a6f201a77e4d2364de1e096d65c7bfe";
     let go_ciphertext_hex = "920d8096b1c0e4376e0667c877d746fb2697c72b940beb73e89f87cc79e43aae6a23ed5c5ec7a4e37f04a9c4a9a25f02";
     let go_expected_plaintext_hex =
         "5854d333d8e13975abd6597bbaddd49d6935ced25c93a44bd3ade508f2bec330";
 
-    let go_derived_key = hex::decode(go_derived_key_hex).expect("test hex data should be valid");
+    let go_derived_key: [u8; 32] = hex::decode(go_derived_key_hex)
+        .expect("test hex data should be valid")
+        .try_into()
+        .expect("derived key should be 32 bytes");
     let aad = hex::decode(go_aad_hex).expect("test hex data should be valid");
     let ciphertext = hex::decode(go_ciphertext_hex).expect("test hex data should be valid");
     let expected_plaintext =
         hex::decode(go_expected_plaintext_hex).expect("test hex data should be valid");
 
-    let cipher = Aes256Gcm::new_from_slice(&go_derived_key).expect("Failed to prepare GCM cipher");
-
     let iv = generate_iv(0);
 
-    let payload = Payload {
-        msg: &ciphertext,
-        aad: &aad,
-    };
-
-    let rust_plaintext = cipher
-        .decrypt((&iv).into(), payload)
+    let mut rust_plaintext = Vec::new();
+    aes_256_gcm_decrypt(&go_derived_key, &iv, &aad, &ciphertext, &mut rust_plaintext)
         .expect("AEAD DECRYPTION FAILED! The GCM primitive or its inputs are flawed.");
 
     assert_eq!(

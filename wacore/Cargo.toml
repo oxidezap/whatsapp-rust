@@ -7,6 +7,11 @@ license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
 description = "Core WhatsApp protocol implementation without runtime dependencies"
 
+# `getrandom` is pulled only to forward the `js` feature (wasm getrandom backend);
+# there is no direct `use`, so static analysers flag it as unused.
+[package.metadata.cargo-machete]
+ignored = ["getrandom"]
+
 [features]
 default = ["simd"]
 simd = ["wacore-appstate/simd"]
@@ -67,7 +72,6 @@ wacore-noise = { workspace = true }
 waproto = { workspace = true }
 
 [dev-dependencies]
-aes-gcm = { workspace = true }
 divan = { workspace = true }
 futures = { workspace = true, features = ["executor", "thread-pool"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
