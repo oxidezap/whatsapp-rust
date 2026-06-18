@@ -35,42 +35,6 @@ fn get_bytes_content_ref<'a>(node: &'a NodeRef<'_>) -> Option<&'a [u8]> {
     }
 }
 
-/// Helper to extract registration ID from a Node (used in tests).
-#[cfg(test)]
-fn extract_registration_id_from_node(node: &Node) -> Option<u32> {
-    let registration_node = node.get_optional_child("registration")?;
-    let bytes = get_bytes_content(registration_node)?;
-
-    if bytes.len() >= 4 {
-        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    } else if !bytes.is_empty() {
-        let mut arr = [0u8; 4];
-        let start = 4 - bytes.len();
-        arr[start..].copy_from_slice(bytes);
-        Some(u32::from_be_bytes(arr))
-    } else {
-        None
-    }
-}
-
-/// Helper to extract registration ID from a NodeRef (4 bytes big-endian).
-fn extract_registration_id_from_node_ref(node: &NodeRef<'_>) -> Option<u32> {
-    let registration_node = node.get_optional_child("registration")?;
-    let bytes = get_bytes_content_ref(registration_node)?;
-
-    if bytes.len() >= 4 {
-        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    } else if !bytes.is_empty() {
-        // Handle variable-length encoding.
-        let mut arr = [0u8; 4];
-        let start = 4 - bytes.len();
-        arr[start..].copy_from_slice(bytes);
-        Some(u32::from_be_bytes(arr))
-    } else {
-        None
-    }
-}
-
 /// Maximum retry attempts we'll honor (matches WhatsApp Web's MAX_RETRY = 5).
 /// We refuse to resend if the requester has already retried this many times.
 const MAX_RETRY_COUNT: u8 = 5;
@@ -694,7 +658,9 @@ impl Client {
                 );
             }
 
-            if let Some(received_reg_id) = extract_registration_id_from_node_ref(node) {
+            if let Some(received_reg_id) =
+                wacore::protocol::retry::extract_registration_id_from_node_ref(node)
+            {
                 let signal_address = resolved_jid.to_protocol_address();
                 let device_snapshot = self.persistence_manager.get_device_snapshot();
                 let session = self
@@ -2561,59 +2527,67 @@ mod tests {
 
     #[test]
     fn extract_registration_id_from_node_test() {
+        use wacore::protocol::retry::{
+            extract_registration_id_from_node, extract_registration_id_from_node_ref,
+        };
         use wacore_binary::{Attrs, Node};
 
-        // Test with 4-byte registration ID
-        let reg_bytes = vec![0x00, 0x01, 0x02, 0x03]; // = 66051
-        let reg_node = Node {
-            tag: Cow::Borrowed("registration"),
-            attrs: Attrs::new(),
-            content: Some(NodeContent::Bytes(reg_bytes)),
-        };
-        let parent = Node {
+        let reg_receipt = |bytes: Vec<u8>| Node {
             tag: Cow::Borrowed("receipt"),
             attrs: Attrs::new(),
-            content: Some(NodeContent::Nodes(vec![reg_node])),
+            content: Some(NodeContent::Nodes(vec![Node {
+                tag: Cow::Borrowed("registration"),
+                attrs: Attrs::new(),
+                content: Some(NodeContent::Bytes(bytes)),
+            }])),
         };
-        assert_eq!(extract_registration_id_from_node(&parent), Some(0x00010203));
 
-        // Test with 3-byte registration ID (variable length)
-        let reg_bytes_short = vec![0x01, 0x02, 0x03]; // = 66051
-        let reg_node_short = Node {
-            tag: Cow::Borrowed("registration"),
-            attrs: Attrs::new(),
-            content: Some(NodeContent::Bytes(reg_bytes_short)),
-        };
-        let parent_short = Node {
-            tag: Cow::Borrowed("receipt"),
-            attrs: Attrs::new(),
-            content: Some(NodeContent::Nodes(vec![reg_node_short])),
-        };
+        // 4-byte registration ID.
+        let parent = reg_receipt(vec![0x00, 0x01, 0x02, 0x03]);
+        assert_eq!(extract_registration_id_from_node(&parent), Some(0x00010203));
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent.as_node_ref()),
+            Some(0x00010203)
+        );
+
+        // 3-byte registration ID (variable length, left zero-padded).
+        let parent_short = reg_receipt(vec![0x01, 0x02, 0x03]);
         assert_eq!(
             extract_registration_id_from_node(&parent_short),
             Some(0x00010203)
         );
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent_short.as_node_ref()),
+            Some(0x00010203)
+        );
 
-        // Test with no registration node
+        // Oversized (>4 byte) payload: rejected, not truncated, on both paths.
+        let parent_oversized = reg_receipt(vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(extract_registration_id_from_node(&parent_oversized), None);
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent_oversized.as_node_ref()),
+            None
+        );
+
+        // No registration node.
         let parent_no_reg = Node {
             tag: Cow::Borrowed("receipt"),
             attrs: Attrs::new(),
             content: Some(NodeContent::Nodes(vec![])),
         };
         assert_eq!(extract_registration_id_from_node(&parent_no_reg), None);
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent_no_reg.as_node_ref()),
+            None
+        );
 
-        // Test with empty bytes
-        let reg_node_empty = Node {
-            tag: Cow::Borrowed("registration"),
-            attrs: Attrs::new(),
-            content: Some(NodeContent::Bytes(vec![])),
-        };
-        let parent_empty = Node {
-            tag: Cow::Borrowed("receipt"),
-            attrs: Attrs::new(),
-            content: Some(NodeContent::Nodes(vec![reg_node_empty])),
-        };
+        // Empty bytes.
+        let parent_empty = reg_receipt(vec![]);
         assert_eq!(extract_registration_id_from_node(&parent_empty), None);
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent_empty.as_node_ref()),
+            None
+        );
     }
 
     #[test]

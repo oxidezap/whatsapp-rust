@@ -9,7 +9,7 @@ use crate::iq::prekeys::{OneTimePreKeyNode, SignedPreKeyNode};
 use crate::libsignal::protocol::PublicKey;
 use crate::protocol::ProtocolNode;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::{Node, NodeContent};
+use wacore_binary::{Node, NodeContent, NodeRef};
 
 /// Maximum retry attempts we'll honor (matches WhatsApp Web's MAX_RETRY = 5).
 /// We refuse to resend if the requester has already retried this many times.
@@ -91,29 +91,38 @@ pub fn get_bytes_content(node: &Node) -> Option<&[u8]> {
     }
 }
 
+/// Parses a `<registration>` payload as a big-endian `u32`. Registration IDs are
+/// u32, so payloads longer than 4 bytes are rejected rather than silently
+/// truncated; shorter payloads (1-3 bytes) are left-zero-padded.
+fn parse_registration_id(bytes: &[u8]) -> Option<u32> {
+    match bytes.len() {
+        4 => Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        // Reject oversized payloads rather than silently truncating.
+        n if n > 4 => None,
+        0 => None,
+        _ => {
+            let mut arr = [0u8; 4];
+            let start = 4 - bytes.len();
+            arr[start..].copy_from_slice(bytes);
+            Some(u32::from_be_bytes(arr))
+        }
+    }
+}
+
 /// Helper to extract registration ID from a node (4 bytes big-endian).
 ///
 /// Looks for a `<registration>` child node and parses its bytes content
-/// as a big-endian `u32`. Handles variable-length encoding (1-4 bytes)
-/// by zero-padding on the left.
+/// as a big-endian `u32`. See [`parse_registration_id`] for the parse rules.
 pub fn extract_registration_id_from_node(node: &Node) -> Option<u32> {
     let registration_node = node.get_optional_child("registration")?;
-    let bytes = get_bytes_content(registration_node)?;
+    parse_registration_id(get_bytes_content(registration_node)?)
+}
 
-    if bytes.len() == 4 {
-        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    } else if bytes.len() > 4 {
-        // Registration IDs are u32; reject oversized payloads rather than silently truncating.
-        None
-    } else if !bytes.is_empty() {
-        // Handle variable-length encoding.
-        let mut arr = [0u8; 4];
-        let start = 4 - bytes.len();
-        arr[start..].copy_from_slice(bytes);
-        Some(u32::from_be_bytes(arr))
-    } else {
-        None
-    }
+/// `NodeRef` counterpart of [`extract_registration_id_from_node`]; shares the
+/// same parse rules via [`parse_registration_id`].
+pub fn extract_registration_id_from_node_ref(node: &NodeRef<'_>) -> Option<u32> {
+    let registration_node = node.get_optional_child("registration")?;
+    parse_registration_id(registration_node.content_bytes()?)
 }
 
 /// Returns whether keys should be included in a retry receipt for the given
@@ -266,6 +275,61 @@ mod tests {
             content: Some(NodeContent::Nodes(vec![reg_node])),
         };
         assert_eq!(extract_registration_id_from_node(&parent), None);
+    }
+
+    // Registration IDs are u32; an oversized payload must be rejected, not truncated
+    // to its first 4 bytes.
+    #[test]
+    fn extract_registration_id_rejects_oversized() {
+        let reg_node = Node {
+            tag: Cow::Borrowed("registration"),
+            attrs: Attrs::new(),
+            content: Some(NodeContent::Bytes(vec![0x01, 0x02, 0x03, 0x04, 0x05])),
+        };
+        let parent = Node {
+            tag: Cow::Borrowed("receipt"),
+            attrs: Attrs::new(),
+            content: Some(NodeContent::Nodes(vec![reg_node])),
+        };
+        assert_eq!(extract_registration_id_from_node(&parent), None);
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent.as_node_ref()),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_registration_id_from_node_ref_matches_owned() {
+        let reg_node = Node {
+            tag: Cow::Borrowed("registration"),
+            attrs: Attrs::new(),
+            content: Some(NodeContent::Bytes(vec![0x00, 0x01, 0x02, 0x03])),
+        };
+        let parent = Node {
+            tag: Cow::Borrowed("receipt"),
+            attrs: Attrs::new(),
+            content: Some(NodeContent::Nodes(vec![reg_node])),
+        };
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent.as_node_ref()),
+            Some(0x00010203)
+        );
+
+        // Variable-length (3-byte) payloads zero-pad on the left, same as the owned path.
+        let reg_node_short = Node {
+            tag: Cow::Borrowed("registration"),
+            attrs: Attrs::new(),
+            content: Some(NodeContent::Bytes(vec![0x01, 0x02, 0x03])),
+        };
+        let parent_short = Node {
+            tag: Cow::Borrowed("receipt"),
+            attrs: Attrs::new(),
+            content: Some(NodeContent::Nodes(vec![reg_node_short])),
+        };
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent_short.as_node_ref()),
+            Some(0x00010203)
+        );
     }
 
     #[test]
