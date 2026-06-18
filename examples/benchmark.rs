@@ -1,3 +1,7 @@
+// See the matching note in lib.rs: instrumented large async fns need a deeper
+// recursion limit when the `--all-features` paths (tracing + tracing-pii) combine.
+#![recursion_limit = "512"]
+
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;

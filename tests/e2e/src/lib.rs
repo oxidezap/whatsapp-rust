@@ -1,3 +1,8 @@
+// `--all-features` feature-unifies extra deps onto `whatsapp-rust`, enlarging the
+// `send_and_expect_text()` future past the default layout-query depth. Matches the
+// `512` already used in `src/lib.rs` / `examples/demo.rs`.
+#![recursion_limit = "512"]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

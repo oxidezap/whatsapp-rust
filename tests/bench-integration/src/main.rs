@@ -1,3 +1,7 @@
+// See the matching note in lib.rs: large async fns need a deeper recursion limit
+// when the `--all-features` paths (tracing + tracing-pii) combine.
+#![recursion_limit = "512"]
+
 #[cfg(not(feature = "dhat-heap"))]
 mod counting_alloc;
 

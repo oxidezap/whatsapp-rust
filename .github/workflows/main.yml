@@ -70,7 +70,34 @@ jobs:
       - name: Build project
         run: cargo build --workspace --exclude e2e-tests --all-targets --verbose
       - name: Run tests
-        run: cargo test --workspace --exclude e2e-tests --verbose -- --no-capture
+        run: cargo test --workspace --exclude e2e-tests --verbose -- --nocapture
+
+  test-all-features:
+    name: Build & Lint (all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache Rust registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+      - name: Build (all features)
+        run: cargo build --workspace --exclude e2e-tests --all-features --all-targets --verbose
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --exclude e2e-tests --all-features --all-targets -- -D warnings
+      # No `cargo test --all-features` here: `--all-features` turns on
+      # `danger-skip-cert-chain-verify` / `danger-skip-tls-verify`, which disable security
+      # verification (the cert-chain negative test is even `#![cfg]`'d out under it), so the
+      # suite would change behavior rather than catch rot. Build + clippy already cover that goal.
 
   test-stable:
     name: Test Stable (no-simd)
