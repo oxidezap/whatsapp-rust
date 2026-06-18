@@ -551,17 +551,19 @@ impl Client {
         }
 
         let pre_key_pairs = {
-            use prost::Message;
             let mut pairs: Vec<(u32, PublicKey)> = Vec::with_capacity(rows.len());
             for (id, record) in &rows {
-                let public_key = waproto::whatsapp::PreKeyRecordStructure::decode(&record[..])
-                    .map_err(anyhow::Error::from)
-                    .and_then(|structure| {
-                        let raw = structure
-                            .public_key
-                            .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
-                        Ok(PublicKey::from_djb_public_key_bytes(&raw)?)
-                    });
+                // Pull the public key straight out of the encoded record (field 2)
+                // rather than a full prost decode of the PreKeyRecordStructure: the
+                // upload only needs the public key, while a full decode also copies
+                // the private key into its own Vec. At the default batch of 812 keys
+                // that is ~2 throwaway allocations per record on the connect path.
+                let public_key = match wacore::prekeys::extract_prekey_public_key(record) {
+                    Some(raw) => {
+                        PublicKey::from_djb_public_key_bytes(raw).map_err(anyhow::Error::from)
+                    }
+                    None => Err(anyhow::anyhow!("record missing public key")),
+                };
                 match public_key {
                     Ok(public_key) => pairs.push((*id, public_key)),
                     Err(e) => log::warn!("skipping undecodable prekey record {id}: {e:?}"),
