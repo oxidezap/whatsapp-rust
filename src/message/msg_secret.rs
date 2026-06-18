@@ -781,6 +781,7 @@ impl Client {
         target_key: &wa::MessageKey,
     ) -> Result<(Jid, Vec<u8>), crate::send::SendError> {
         use crate::send::SendError;
+        use wacore_binary::JidExt;
 
         let target_id = target_key
             .id
@@ -794,6 +795,12 @@ impl Client {
             self.addon_self_jid_for_chat(chat)
                 .await
                 .ok_or(SendError::NotLoggedIn)?
+        } else if chat.is_group() {
+            // For group parents remote_jid is the group, not the author, so it
+            // can't identify the sender whose messageSecret we need.
+            return Err(SendError::InvalidRequest(
+                "target message key missing participant for group parent".into(),
+            ));
         } else {
             target_key
                 .remote_jid

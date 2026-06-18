@@ -57,7 +57,7 @@ impl Client {
     pub(crate) async fn is_community_announce_group(
         &self,
         chat: &Jid,
-    ) -> Result<bool, anyhow::Error> {
+    ) -> Result<bool, crate::features::GroupError> {
         if let Some(flag) = self.groups().query_info(chat).await?.is_community_announce {
             return Ok(flag);
         }
