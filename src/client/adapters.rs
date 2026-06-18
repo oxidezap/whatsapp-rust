@@ -59,10 +59,16 @@ impl Client {
     /// Flush the in-memory signal cache to the database backend.
     /// Called after each message is decrypted or after encryption operations.
     pub(crate) async fn flush_signal_cache(&self) -> Result<(), anyhow::Error> {
-        let device = self.persistence_manager.get_device_arc().await;
-        let device_guard = device.read().await;
+        // Clone the backend Arc out of the snapshot and hold no device lock across
+        // the flush: this batched SQLite write runs per message, and a device guard
+        // held for its duration would block every concurrent Device write.
+        let backend = self
+            .persistence_manager
+            .get_device_snapshot()
+            .backend
+            .clone();
         self.signal_cache
-            .flush(&*device_guard.backend)
+            .flush(&*backend)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to flush signal cache: {e}"))
     }
