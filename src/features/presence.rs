@@ -1,4 +1,4 @@
-use crate::client::Client;
+use crate::client::{Client, ClientError};
 use log::{debug, warn};
 use thiserror::Error;
 use wacore::WireEnum;
@@ -12,6 +12,10 @@ use wacore_binary::builder::NodeBuilder;
 pub enum PresenceError {
     #[error("cannot send presence without a push name set")]
     PushNameEmpty,
+    /// Connection/transport failure sending the `<presence>` stanza.
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    /// Catch-all for internal failures with no dedicated variant.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -106,10 +110,8 @@ impl<'a> Presence<'a> {
                 .unwrap_or("")
         );
 
-        self.client
-            .send_node(node)
-            .await
-            .map_err(|e| PresenceError::Other(anyhow::Error::from(e)))
+        self.client.send_node(node).await?;
+        Ok(())
     }
 
     /// Set presence to available (online).
@@ -133,21 +135,18 @@ impl<'a> Presence<'a> {
     ///   <tctoken><!-- raw token bytes --></tctoken>
     /// </presence>
     /// ```
-    pub async fn subscribe(&self, jid: impl Into<Jid>) -> Result<(), anyhow::Error> {
+    pub async fn subscribe(&self, jid: impl Into<Jid>) -> Result<(), PresenceError> {
         let jid = &jid.into();
         debug!("presence subscribe: subscribing to {}", jid);
         let node = self.build_subscription_node(jid).await;
-        self.client
-            .send_node(node)
-            .await
-            .map_err(anyhow::Error::from)?;
+        self.client.send_node(node).await?;
         self.client.track_presence_subscription(jid.clone()).await;
         Ok(())
     }
 
     /// Re-subscribe presence if the JID has an active subscription.
     /// Does not modify the tracking set.
-    pub(crate) async fn re_subscribe_when_active(&self, jid: &Jid) -> Result<(), anyhow::Error> {
+    pub(crate) async fn re_subscribe_when_active(&self, jid: &Jid) -> Result<(), PresenceError> {
         if !self
             .client
             .presence_subscriptions
@@ -159,10 +158,7 @@ impl<'a> Presence<'a> {
         }
 
         let node = self.build_subscription_node(jid).await;
-        self.client
-            .send_node(node)
-            .await
-            .map_err(anyhow::Error::from)?;
+        self.client.send_node(node).await?;
         Ok(())
     }
 
@@ -174,13 +170,10 @@ impl<'a> Presence<'a> {
     /// ```xml
     /// <presence type="unsubscribe" to="user@s.whatsapp.net"/>
     /// ```
-    pub async fn unsubscribe(&self, jid: &Jid) -> Result<(), anyhow::Error> {
+    pub async fn unsubscribe(&self, jid: &Jid) -> Result<(), PresenceError> {
         debug!("presence unsubscribe: unsubscribing from {}", jid);
         let node = self.build_unsubscription_node(jid);
-        self.client
-            .send_node(node)
-            .await
-            .map_err(anyhow::Error::from)?;
+        self.client.send_node(node).await?;
         self.client.untrack_presence_subscription(jid).await;
         Ok(())
     }
@@ -353,8 +346,8 @@ mod tests {
                 e
             );
             assert!(
-                matches!(e, PresenceError::Other(_)),
-                "Expected connection error (Other), got: {}",
+                matches!(e, PresenceError::Client(_)),
+                "Expected connection error (Client), got: {}",
                 e
             );
         }

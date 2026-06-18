@@ -159,10 +159,10 @@ async fn bench_send_message(results: &mut BenchResults) -> anyhow::Result<()> {
 
     // -- Single send --
     let m = measure(async || {
-        client_a
+        Ok(client_a
             .client
             .send_message(jid_b.clone(), text_msg("bench-send-single"))
-            .await
+            .await?)
     })
     .await?;
 

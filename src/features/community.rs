@@ -4,16 +4,34 @@
 //! Uses the `w:g2` IQ namespace for mutations and MEX (GraphQL) for metadata queries.
 
 use crate::client::Client;
+use crate::features::groups::GroupError;
 use crate::features::groups::GroupMetadata;
 use crate::features::groups::GroupParticipant;
 use crate::features::mex::{MexError, mex_request};
+use crate::request::IqError;
 use log::warn;
+use thiserror::Error;
 use wacore::iq::groups::{
     DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateIq, GroupCreateOptions,
     JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
 use wacore::iq::mex_operations::{fetch_all_subgroups, query_subgroup_participant_count};
 use wacore_binary::Jid;
+
+/// Error returned by community operations.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum CommunityError {
+    /// A `w:g2` IQ to the server failed.
+    #[error(transparent)]
+    Iq(#[from] IqError),
+    /// A MEX (GraphQL) metadata query/mutation failed or returned bad data.
+    #[error(transparent)]
+    Mex(#[from] MexError),
+    /// A delegated group operation failed (e.g. setting the community description).
+    #[error(transparent)]
+    Group(#[from] GroupError),
+}
 
 // Types
 
@@ -125,7 +143,7 @@ impl<'a> Community<'a> {
     pub async fn create(
         &self,
         options: CreateCommunityOptions,
-    ) -> Result<CreateCommunityResult, anyhow::Error> {
+    ) -> Result<CreateCommunityResult, CommunityError> {
         let description = options.description.clone();
 
         let create_options = GroupCreateOptions {
@@ -157,7 +175,7 @@ impl<'a> Community<'a> {
     }
 
     /// Deactivate (delete) a community. Subgroups are unlinked but not deleted.
-    pub async fn deactivate(&self, community_jid: impl Into<Jid>) -> Result<(), anyhow::Error> {
+    pub async fn deactivate(&self, community_jid: impl Into<Jid>) -> Result<(), CommunityError> {
         let community_jid = &community_jid.into();
         self.client
             .execute(DeleteCommunityIq::new(community_jid))
@@ -170,7 +188,7 @@ impl<'a> Community<'a> {
         &self,
         community_jid: impl Into<Jid>,
         subgroup_jids: &[Jid],
-    ) -> Result<LinkSubgroupsResult, anyhow::Error> {
+    ) -> Result<LinkSubgroupsResult, CommunityError> {
         let community_jid = &community_jid.into();
         let response = self
             .client
@@ -200,7 +218,7 @@ impl<'a> Community<'a> {
         community_jid: impl Into<Jid>,
         subgroup_jids: &[Jid],
         remove_orphan_members: bool,
-    ) -> Result<UnlinkSubgroupsResult, anyhow::Error> {
+    ) -> Result<UnlinkSubgroupsResult, CommunityError> {
         let community_jid = &community_jid.into();
         let response = self
             .client
@@ -232,7 +250,7 @@ impl<'a> Community<'a> {
     pub async fn get_subgroups(
         &self,
         community_jid: &Jid,
-    ) -> Result<Vec<CommunitySubgroup>, MexError> {
+    ) -> Result<Vec<CommunitySubgroup>, CommunityError> {
         let response = self
             .client
             .mex()
@@ -277,7 +295,7 @@ impl<'a> Community<'a> {
     pub async fn get_subgroup_participant_counts(
         &self,
         community_jid: &Jid,
-    ) -> Result<Vec<(Jid, u32)>, MexError> {
+    ) -> Result<Vec<(Jid, u32)>, CommunityError> {
         let response = self
             .client
             .mex()
@@ -328,7 +346,7 @@ impl<'a> Community<'a> {
         &self,
         community_jid: impl Into<Jid>,
         subgroup_jid: impl Into<Jid>,
-    ) -> Result<GroupMetadata, anyhow::Error> {
+    ) -> Result<GroupMetadata, CommunityError> {
         let community_jid = &community_jid.into();
         let subgroup_jid = &subgroup_jid.into();
         let response = self
@@ -343,7 +361,7 @@ impl<'a> Community<'a> {
         &self,
         community_jid: impl Into<Jid>,
         subgroup_jid: impl Into<Jid>,
-    ) -> Result<GroupMetadata, anyhow::Error> {
+    ) -> Result<GroupMetadata, CommunityError> {
         let community_jid = &community_jid.into();
         let subgroup_jid = &subgroup_jid.into();
         let response = self
@@ -357,7 +375,7 @@ impl<'a> Community<'a> {
     pub async fn get_linked_groups_participants(
         &self,
         community_jid: impl Into<Jid>,
-    ) -> Result<Vec<GroupParticipant>, anyhow::Error> {
+    ) -> Result<Vec<GroupParticipant>, CommunityError> {
         let community_jid = &community_jid.into();
         let response = self
             .client

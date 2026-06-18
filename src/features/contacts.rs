@@ -5,9 +5,9 @@
 
 use crate::client::Client;
 use crate::request::IqError;
-use anyhow::{Result, bail};
 use log::debug;
 use std::collections::HashMap;
+use thiserror::Error;
 use wacore::iq::contacts::{ProfilePictureSpec, ProfilePictureType};
 use wacore::iq::usync::{IsOnWhatsAppQueryType, IsOnWhatsAppSpec, IsOnWhatsAppUser, UserInfoSpec};
 use wacore_binary::{Jid, JidExt};
@@ -17,9 +17,24 @@ pub use wacore::iq::contacts::ProfilePicture;
 pub use wacore::iq::usync::{IsOnWhatsAppResult, UserInfo, UsyncSubprotocolError};
 pub use wacore::stanza::business::VerifiedName;
 
-fn ensure_is_on_whatsapp_jids_supported(jids: &[Jid]) -> Result<()> {
+/// Error returned by contact-information operations (existence checks,
+/// profile pictures, user info).
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ContactError {
+    /// The usync/profile IQ to the server failed.
+    #[error(transparent)]
+    Iq(#[from] IqError),
+    /// An input JID is not supported for this query (only PN and LID are).
+    #[error("unsupported contact JID: {0}")]
+    InvalidJid(String),
+}
+
+fn ensure_is_on_whatsapp_jids_supported(jids: &[Jid]) -> Result<(), ContactError> {
     if let Some(jid) = jids.iter().find(|jid| !jid.is_pn() && !jid.is_lid()) {
-        bail!("is_on_whatsapp only supports PN and LID JIDs, got {jid}");
+        return Err(ContactError::InvalidJid(format!(
+            "is_on_whatsapp only supports PN and LID JIDs, got {jid}"
+        )));
     }
     Ok(())
 }
@@ -96,7 +111,10 @@ impl<'a> Contacts<'a> {
     /// Accepts both PN JIDs (`Jid::pn("1234567890")`) and LID JIDs (`Jid::lid("100000001")`).
     /// PN and LID queries use different protocols (matching WA Web ExistsJob), so mixed
     /// inputs are split into separate requests.
-    pub async fn is_on_whatsapp(&self, jids: &[Jid]) -> Result<Vec<IsOnWhatsAppResult>> {
+    pub async fn is_on_whatsapp(
+        &self,
+        jids: &[Jid],
+    ) -> Result<Vec<IsOnWhatsAppResult>, ContactError> {
         if jids.is_empty() {
             return Ok(Vec::new());
         }
@@ -153,7 +171,7 @@ impl<'a> Contacts<'a> {
         &self,
         jid: &Jid,
         preview: bool,
-    ) -> Result<Option<ProfilePicture>> {
+    ) -> Result<Option<ProfilePicture>, ContactError> {
         debug!(
             "get_profile_picture: fetching {} picture for {}",
             if preview { "preview" } else { "full" },
@@ -201,7 +219,10 @@ impl<'a> Contacts<'a> {
         }
     }
 
-    pub async fn get_user_info(&self, jids: &[Jid]) -> Result<HashMap<Jid, UserInfo>> {
+    pub async fn get_user_info(
+        &self,
+        jids: &[Jid],
+    ) -> Result<HashMap<Jid, UserInfo>, ContactError> {
         if jids.is_empty() {
             return Ok(HashMap::new());
         }

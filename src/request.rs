@@ -33,8 +33,10 @@ pub enum IqError {
     Socket(#[from] SocketError),
     #[error("encrypted send pipeline failed")]
     EncryptSend(#[from] EncryptSendError),
+    // Boxed to break the `ClientError::Iq(IqError)` <-> `IqError::ClientState`
+    // type cycle (both would otherwise be infinitely sized).
     #[error("client state prevented send")]
-    ClientState(#[source] ClientError),
+    ClientState(#[source] Box<ClientError>),
     #[error("received disconnect node during IQ wait: {0:?}")]
     Disconnected(Box<Node>),
     #[error("received a server error response: code={code}, text='{text}'")]
@@ -282,9 +284,10 @@ impl Client {
                 ClientError::Socket(s_err) => Err(IqError::Socket(s_err)),
                 ClientError::EncryptSend(es_err) => Err(IqError::EncryptSend(es_err)),
                 ClientError::NotConnected => Err(IqError::NotConnected),
-                other @ (ClientError::AlreadyConnected | ClientError::NotLoggedIn) => {
-                    Err(IqError::ClientState(other))
-                }
+                // The send future only ever yields the transport/state errors
+                // above; any other (incl. future #[non_exhaustive]) variant is
+                // surfaced as a client-state failure.
+                other => Err(IqError::ClientState(Box::new(other))),
             };
         }
 

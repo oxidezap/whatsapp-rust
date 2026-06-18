@@ -289,6 +289,13 @@ impl std::fmt::Display for MemoryDiagnostics {
     }
 }
 
+/// Shared base error for transport/connection concerns.
+///
+/// The DRY foundation every per-domain error builds on (each domain embeds it
+/// via `#[from]`): it carries the cases common to every network operation —
+/// `NotConnected`, `NotLoggedIn`, IQ failures, socket / encrypt-send errors. It
+/// is NOT an umbrella over the whole API; the per-domain typed errors remain
+/// the public return types.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ClientError {
@@ -302,6 +309,13 @@ pub enum ClientError {
     AlreadyConnected,
     #[error("client is not logged in")]
     NotLoggedIn,
+    #[error("IQ request failed: {0}")]
+    Iq(#[from] crate::request::IqError),
+    /// Last-resort catch-all for internal failures threaded through `?` that do
+    /// not (yet) have a dedicated variant. Transparent so the underlying
+    /// error's `Display`/source chain is preserved.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
 }
 
 impl ClientError {

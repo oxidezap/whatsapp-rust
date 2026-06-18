@@ -1,7 +1,9 @@
 use crate::client::Client;
 use crate::features::mex::{MexError, mex_request};
+use crate::request::IqError;
 use std::collections::HashMap;
 use std::sync::Arc;
+use thiserror::Error;
 use wacore::client::context::GroupInfo;
 use wacore::iq::contacts::SetProfilePictureSpec;
 // Returned by set/remove_profile_picture; re-exported so callers don't reach
@@ -29,6 +31,27 @@ pub use wacore::iq::groups::{
     MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
     MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
 };
+
+/// Error returned by group operations (metadata queries, participant and
+/// settings mutations, invites, profile pictures).
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum GroupError {
+    /// A `w:g2` IQ to the server failed (transport, timeout, server rejection).
+    #[error(transparent)]
+    Iq(#[from] IqError),
+    /// A MEX (GraphQL) group-property mutation failed.
+    #[error(transparent)]
+    Mex(#[from] MexError),
+    /// The request was malformed (e.g. empty invite code, batch over the limit,
+    /// expired V4 invite, non-group JID where one is required).
+    #[error("invalid group request: {0}")]
+    InvalidRequest(String),
+    /// Catch-all for internal failures (LID/PN resolution, the protocol-message
+    /// send path behind `update_member_label`, cache plumbing).
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
 
 /// Typed `update` payload for the `update_group_property` mex mutation. The
 /// generated mirror types this op's `update` as a `String`, but it is a one-of
@@ -219,7 +242,7 @@ impl<'a> Groups<'a> {
         Self { client }
     }
 
-    pub async fn query_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, anyhow::Error> {
+    pub async fn query_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, GroupError> {
         if let Some(cached) = self.client.get_group_cache().await.get(jid).await {
             return Ok(cached);
         }
@@ -244,7 +267,9 @@ impl<'a> Groups<'a> {
         {
             GroupInfoOutcome::NotModified => {
                 let info = Arc::new(persisted.ok_or_else(|| {
-                    anyhow::anyhow!("server returned not-modified group but nothing was cached")
+                    GroupError::InvalidRequest(
+                        "server returned not-modified group but nothing was cached".into(),
+                    )
                 })?);
                 self.client
                     .get_group_cache()
@@ -323,7 +348,7 @@ impl<'a> Groups<'a> {
         Ok(info)
     }
 
-    pub async fn get_participating(&self) -> Result<HashMap<Jid, GroupMetadata>, anyhow::Error> {
+    pub async fn get_participating(&self) -> Result<HashMap<Jid, GroupMetadata>, GroupError> {
         let response = self.client.execute(GroupParticipatingIq::new()).await?;
 
         let result = response
@@ -339,12 +364,12 @@ impl<'a> Groups<'a> {
         Ok(result)
     }
 
-    pub async fn get_metadata(&self, jid: &Jid) -> Result<GroupMetadata, anyhow::Error> {
+    pub async fn get_metadata(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
         // No phash is sent, so the server always returns the full group.
         match self.client.execute(GroupQueryIq::new(jid)).await? {
             GroupInfoOutcome::Full(group) => Ok(GroupMetadata::from(*group)),
-            GroupInfoOutcome::NotModified => Err(anyhow::anyhow!(
-                "group query returned not-modified without a phash"
+            GroupInfoOutcome::NotModified => Err(GroupError::InvalidRequest(
+                "group query returned not-modified without a phash".into(),
             )),
         }
     }
@@ -352,7 +377,7 @@ impl<'a> Groups<'a> {
     pub async fn create_group(
         &self,
         mut options: GroupCreateOptions,
-    ) -> Result<CreateGroupResult, anyhow::Error> {
+    ) -> Result<CreateGroupResult, GroupError> {
         // Resolve phone numbers for LID participants that don't have one
         let mut resolved_participants = Vec::with_capacity(options.participants.len());
 
@@ -363,7 +388,10 @@ impl<'a> Groups<'a> {
                     .get_lid_pn_entry(&participant.jid)
                     .await?
                     .ok_or_else(|| {
-                        anyhow::anyhow!("Missing phone number mapping for LID {}", participant.jid)
+                        GroupError::InvalidRequest(format!(
+                            "missing phone number mapping for LID {}",
+                            participant.jid
+                        ))
                     })?;
                 participant.with_phone_number(Jid::pn(&*entry.phone_number))
             } else {
@@ -395,7 +423,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         subject: GroupSubject,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -412,7 +440,7 @@ impl<'a> Groups<'a> {
         jid: impl Into<Jid>,
         description: Option<GroupDescription>,
         prev: Option<&str>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -420,7 +448,7 @@ impl<'a> Groups<'a> {
             .await?)
     }
 
-    pub async fn leave(&self, jid: impl Into<Jid>) -> Result<(), anyhow::Error> {
+    pub async fn leave(&self, jid: impl Into<Jid>) -> Result<(), GroupError> {
         let jid = &jid.into();
         self.client.execute(LeaveGroupIq::new(jid)).await?;
         self.client.get_group_cache().await.invalidate(jid).await;
@@ -442,7 +470,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         participants: &[Jid],
-    ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+    ) -> Result<Vec<ParticipantChangeResponse>, GroupError> {
         let jid = &jid.into();
         let iq = if self
             .client
@@ -481,7 +509,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         participants: &[Jid],
-    ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+    ) -> Result<Vec<ParticipantChangeResponse>, GroupError> {
         let jid = &jid.into();
         let result = self
             .client
@@ -514,7 +542,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         participants: &[Jid],
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -526,7 +554,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         participants: &[Jid],
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -538,7 +566,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         reset: bool,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<String, GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -547,7 +575,7 @@ impl<'a> Groups<'a> {
     }
 
     /// Lock the group so only admins can change group info.
-    pub async fn set_locked(&self, jid: impl Into<Jid>, locked: bool) -> Result<(), anyhow::Error> {
+    pub async fn set_locked(&self, jid: impl Into<Jid>, locked: bool) -> Result<(), GroupError> {
         let jid = &jid.into();
         let spec = if locked {
             SetGroupLockedIq::lock(jid)
@@ -562,7 +590,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         announce: bool,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let jid = &jid.into();
         let spec = if announce {
             SetGroupAnnouncementIq::announce(jid)
@@ -580,7 +608,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         expiration: u32,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let jid = &jid.into();
         let spec = match std::num::NonZeroU32::new(expiration) {
             Some(exp) => SetGroupEphemeralIq::enable(jid, exp),
@@ -594,7 +622,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         mode: MembershipApprovalMode,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -603,12 +631,9 @@ impl<'a> Groups<'a> {
     }
 
     /// Join a group using an invite code.
-    pub async fn join_with_invite_code(
-        &self,
-        code: &str,
-    ) -> Result<JoinGroupResult, anyhow::Error> {
+    pub async fn join_with_invite_code(&self, code: &str) -> Result<JoinGroupResult, GroupError> {
         let code = extract_invite_code(code)
-            .ok_or_else(|| anyhow::anyhow!("invalid or empty invite code"))?;
+            .ok_or_else(|| GroupError::InvalidRequest("invalid or empty invite code".into()))?;
         Ok(self.client.execute(AcceptGroupInviteIq::new(code)).await?)
     }
 
@@ -619,13 +644,15 @@ impl<'a> Groups<'a> {
         code: &str,
         expiration: i64,
         admin_jid: impl Into<Jid>,
-    ) -> Result<JoinGroupResult, anyhow::Error> {
+    ) -> Result<JoinGroupResult, GroupError> {
         let group_jid = &group_jid.into();
         let admin_jid = &admin_jid.into();
         if expiration > 0 {
             let now = wacore::time::now_millis() / 1000;
             if expiration < now {
-                anyhow::bail!("V4 invite has expired (expiration={expiration}, now={now})");
+                return Err(GroupError::InvalidRequest(format!(
+                    "V4 invite has expired (expiration={expiration}, now={now})"
+                )));
             }
         }
         Ok(self
@@ -640,9 +667,9 @@ impl<'a> Groups<'a> {
     }
 
     /// Get group metadata from an invite code without joining.
-    pub async fn get_invite_info(&self, code: &str) -> Result<GroupMetadata, anyhow::Error> {
+    pub async fn get_invite_info(&self, code: &str) -> Result<GroupMetadata, GroupError> {
         let code = extract_invite_code(code)
-            .ok_or_else(|| anyhow::anyhow!("invalid or empty invite code"))?;
+            .ok_or_else(|| GroupError::InvalidRequest("invalid or empty invite code".into()))?;
         let group = self.client.execute(GetGroupInviteInfoIq::new(code)).await?;
         Ok(GroupMetadata::from(group))
     }
@@ -651,7 +678,7 @@ impl<'a> Groups<'a> {
     pub async fn get_membership_requests(
         &self,
         jid: impl Into<Jid>,
-    ) -> Result<Vec<MembershipRequest>, anyhow::Error> {
+    ) -> Result<Vec<MembershipRequest>, GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -664,7 +691,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         participants: &[Jid],
-    ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+    ) -> Result<Vec<ParticipantChangeResponse>, GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -677,7 +704,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         participants: &[Jid],
-    ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+    ) -> Result<Vec<ParticipantChangeResponse>, GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -690,7 +717,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         mode: MemberAddMode,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -703,7 +730,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         restrict: bool,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -716,7 +743,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         allow: bool,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -729,7 +756,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         enabled: bool,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -742,13 +769,14 @@ impl<'a> Groups<'a> {
         &self,
         jid: &Jid,
         mode: MemberLinkMode,
-    ) -> Result<(), MexError> {
+    ) -> Result<(), GroupError> {
         let value = match mode {
             MemberLinkMode::AdminLink => "ADMIN_LINK",
             MemberLinkMode::AllMemberLink => "ALL_MEMBER_LINK",
         };
-        self.mex_update_group_property(jid, GroupPropertyUpdate::MemberLinkMode(value))
-            .await
+        Ok(self
+            .mex_update_group_property(jid, GroupPropertyUpdate::MemberLinkMode(value))
+            .await?)
     }
 
     /// Set who can share message history with new members (via MEX).
@@ -756,25 +784,27 @@ impl<'a> Groups<'a> {
         &self,
         jid: &Jid,
         mode: MemberShareHistoryMode,
-    ) -> Result<(), MexError> {
+    ) -> Result<(), GroupError> {
         let value = match mode {
             MemberShareHistoryMode::AdminShare => "ADMIN_SHARE",
             MemberShareHistoryMode::AllMemberShare => "ALL_MEMBER_SHARE",
         };
-        self.mex_update_group_property(jid, GroupPropertyUpdate::MemberShareGroupHistoryMode(value))
-            .await
+        Ok(self
+            .mex_update_group_property(jid, GroupPropertyUpdate::MemberShareGroupHistoryMode(value))
+            .await?)
     }
 
     /// Enable or disable limit sharing in the group (via MEX).
-    pub async fn set_limit_sharing(&self, jid: &Jid, enabled: bool) -> Result<(), MexError> {
-        self.mex_update_group_property(
-            jid,
-            GroupPropertyUpdate::LimitSharing(LimitSharingUpdate {
-                limit_sharing_enabled: enabled,
-                limit_sharing_trigger: "CHAT_SETTING",
-            }),
-        )
-        .await
+    pub async fn set_limit_sharing(&self, jid: &Jid, enabled: bool) -> Result<(), GroupError> {
+        Ok(self
+            .mex_update_group_property(
+                jid,
+                GroupPropertyUpdate::LimitSharing(LimitSharingUpdate {
+                    limit_sharing_enabled: enabled,
+                    limit_sharing_trigger: "CHAT_SETTING",
+                }),
+            )
+            .await?)
     }
 
     /// Cancel pending membership requests (from the requesting user's side).
@@ -782,7 +812,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         participants: &[Jid],
-    ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+    ) -> Result<Vec<ParticipantChangeResponse>, GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -795,7 +825,7 @@ impl<'a> Groups<'a> {
         &self,
         jid: impl Into<Jid>,
         participants: &[Jid],
-    ) -> Result<Vec<ParticipantChangeResponse>, anyhow::Error> {
+    ) -> Result<Vec<ParticipantChangeResponse>, GroupError> {
         let jid = &jid.into();
         Ok(self
             .client
@@ -804,7 +834,7 @@ impl<'a> Groups<'a> {
     }
 
     /// Acknowledge a group notification.
-    pub async fn acknowledge(&self, jid: impl Into<Jid>) -> Result<(), anyhow::Error> {
+    pub async fn acknowledge(&self, jid: impl Into<Jid>) -> Result<(), GroupError> {
         let jid = &jid.into();
         Ok(self.client.execute(AcknowledgeGroupIq::new(jid)).await?)
     }
@@ -813,13 +843,14 @@ impl<'a> Groups<'a> {
     pub async fn batch_get_info(
         &self,
         jids: Vec<Jid>,
-    ) -> Result<Vec<BatchGroupResult>, anyhow::Error> {
-        anyhow::ensure!(
-            jids.len() <= wacore::iq::groups::BATCH_GROUP_INFO_LIMIT,
-            "batch_get_info: {} groups exceeds limit of {}",
-            jids.len(),
-            wacore::iq::groups::BATCH_GROUP_INFO_LIMIT,
-        );
+    ) -> Result<Vec<BatchGroupResult>, GroupError> {
+        if jids.len() > wacore::iq::groups::BATCH_GROUP_INFO_LIMIT {
+            return Err(GroupError::InvalidRequest(format!(
+                "batch_get_info: {} groups exceeds limit of {}",
+                jids.len(),
+                wacore::iq::groups::BATCH_GROUP_INFO_LIMIT,
+            )));
+        }
         let raw = self.client.execute(BatchGetGroupInfoIq::new(jids)).await?;
         Ok(raw
             .into_iter()
@@ -839,13 +870,14 @@ impl<'a> Groups<'a> {
         &self,
         group_jids: Vec<Jid>,
         picture_type: PictureType,
-    ) -> Result<Vec<GroupProfilePicture>, anyhow::Error> {
-        anyhow::ensure!(
-            group_jids.len() <= wacore::iq::groups::BATCH_PROFILE_PICTURES_LIMIT,
-            "get_profile_pictures: {} groups exceeds limit of {}",
-            group_jids.len(),
-            wacore::iq::groups::BATCH_PROFILE_PICTURES_LIMIT,
-        );
+    ) -> Result<Vec<GroupProfilePicture>, GroupError> {
+        if group_jids.len() > wacore::iq::groups::BATCH_PROFILE_PICTURES_LIMIT {
+            return Err(GroupError::InvalidRequest(format!(
+                "get_profile_pictures: {} groups exceeds limit of {}",
+                group_jids.len(),
+                wacore::iq::groups::BATCH_PROFILE_PICTURES_LIMIT,
+            )));
+        }
         let groups = group_jids
             .into_iter()
             .map(|jid| (jid, picture_type))
@@ -872,7 +904,7 @@ impl<'a> Groups<'a> {
         &self,
         group_jid: impl Into<Jid>,
         image_data: Vec<u8>,
-    ) -> Result<SetProfilePictureResponse, anyhow::Error> {
+    ) -> Result<SetProfilePictureResponse, GroupError> {
         let group_jid = &group_jid.into();
         Ok(self
             .client
@@ -884,7 +916,7 @@ impl<'a> Groups<'a> {
     pub async fn remove_profile_picture(
         &self,
         group_jid: impl Into<Jid>,
-    ) -> Result<SetProfilePictureResponse, anyhow::Error> {
+    ) -> Result<SetProfilePictureResponse, GroupError> {
         let group_jid = &group_jid.into();
         Ok(self
             .client
@@ -933,12 +965,12 @@ impl<'a> Groups<'a> {
         &self,
         group_jid: impl Into<Jid>,
         label: impl Into<String>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), GroupError> {
         let group_jid = &group_jid.into();
         if !group_jid.is_group() {
-            return Err(anyhow::anyhow!(
+            return Err(GroupError::InvalidRequest(format!(
                 "update_member_label requires a group JID, got {group_jid}"
-            ));
+            )));
         }
         let msg = wacore::send::build_member_label_message(label.into(), wacore::time::now_secs());
         // This low-level send bypasses send_message_with_options (no reporting
@@ -957,7 +989,8 @@ impl<'a> Groups<'a> {
                 meta.into_iter().collect(),
                 None,
             )
-            .await
+            .await?;
+        Ok(())
     }
 
     async fn resolve_participant_tokens(&self, jids: &[Jid]) -> Vec<GroupParticipantOptions> {

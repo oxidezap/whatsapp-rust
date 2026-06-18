@@ -61,7 +61,7 @@ impl Client {
         to: impl Into<Jid>,
         original_id: impl Into<String>,
         new_content: wa::Message,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<String, crate::send::SendError> {
         self.edit_message_inner(to.into(), original_id.into(), new_content)
             .await
     }
@@ -72,7 +72,7 @@ impl Client {
         to: Jid,
         original_id: String,
         new_content: wa::Message,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<String, crate::send::SendError> {
         // WhatsApp Web uses getMeUserLidOrJidForChat(chat, EditMessage) which
         // returns LID for LID-addressing groups and PN otherwise.
         let participant = if to.is_group() {
@@ -84,7 +84,7 @@ impl Client {
             )
         } else {
             if self.get_pn().is_none() {
-                return Err(anyhow::Error::from(ClientError::NotLoggedIn));
+                return Err(crate::send::SendError::NotLoggedIn);
             }
             None
         };
@@ -131,7 +131,7 @@ impl Client {
         original_id: impl Into<String>,
         message_secret: &[u8],
         new_content: wa::Message,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<String, crate::send::SendError> {
         self.edit_message_encrypted_inner(
             to.into(),
             original_id.into(),
@@ -148,26 +148,28 @@ impl Client {
         original_id: String,
         message_secret: &[u8],
         new_content: wa::Message,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<String, crate::send::SendError> {
+        use crate::send::SendError;
         // Newsletters/channels are plaintext (no message-secret addon crypto) and the
         // E2E send path rejects them, so an encrypted edit can't apply there; fail with
         // a clear boundary error instead of the cryptic downstream rejection.
-        anyhow::ensure!(
-            !to.is_newsletter(),
-            "edit_message_encrypted is not valid for newsletters/channels; use edit_message"
-        );
-        anyhow::ensure!(
-            message_secret.len() == 32,
-            "message_secret must be exactly 32 bytes, got {}",
-            message_secret.len()
-        );
+        if to.is_newsletter() {
+            return Err(SendError::InvalidRequest(
+                "edit_message_encrypted is not valid for newsletters/channels; use edit_message"
+                    .into(),
+            ));
+        }
+        if message_secret.len() != 32 {
+            return Err(SendError::InvalidRequest(format!(
+                "message_secret must be exactly 32 bytes, got {}",
+                message_secret.len()
+            )));
+        }
 
         let self_jid = if to.is_group() {
             self.get_own_jid_for_group(&to).await?.to_non_ad()
         } else {
-            self.get_pn()
-                .ok_or_else(|| anyhow::Error::from(ClientError::NotLoggedIn))?
-                .to_non_ad()
+            self.get_pn().ok_or(SendError::NotLoggedIn)?.to_non_ad()
         };
         let participant = if to.is_group() {
             Some(self_jid.to_string())

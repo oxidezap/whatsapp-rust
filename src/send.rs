@@ -14,6 +14,41 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 
+use crate::client::ClientError;
+use crate::request::IqError;
+use thiserror::Error;
+
+/// Error returned by the message send path ([`Client::send_message`],
+/// [`Client::send_text`], [`Client::forward_message`], reactions, edits,
+/// revokes, pins, polls, events, comments, status) and the bot
+/// [`crate::bot::MessageContext`] helpers.
+///
+/// Wraps the shared [`ClientError`] (transport/connection/IQ) and surfaces the
+/// actionable send-time failure modes explicitly. `Internal` is the last-resort
+/// catch-all for crypto/encoding paths that still thread `anyhow` internally.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SendError {
+    /// Connection/transport/IQ failure (embeds the shared base error).
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    /// The client has no PN/LID identity yet (not paired / mid LID migration).
+    #[error("client is not logged in")]
+    NotLoggedIn,
+    /// An IQ issued as part of the send (e.g. a group-info query) failed.
+    #[error("IQ request failed: {0}")]
+    Iq(#[from] IqError),
+    /// The recipient JID or send arguments are invalid for this operation
+    /// (e.g. a newsletter JID on the E2E path, an empty status recipient list).
+    #[error("invalid send request: {0}")]
+    InvalidRequest(String),
+    /// Catch-all for internal send failures (Signal encrypt, protobuf, group
+    /// resolution) that have no dedicated variant yet. Transparent so the
+    /// underlying error's `Display`/source chain is preserved.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
 /// Returns a `GroupInfo` whose participant list is guaranteed to contain our own
 /// sending JID, without deep-cloning the shared (cached) metadata in the common
 /// case where the server's participant list already includes us.
@@ -412,7 +447,7 @@ impl Client {
         &self,
         to: impl Into<Jid>,
         message: wa::Message,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         self.send_message_with_options_inner(to.into(), message, SendOptions::default())
             .await
     }
@@ -422,7 +457,7 @@ impl Client {
         &self,
         to: impl Into<Jid>,
         text: impl Into<String>,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         use wacore::proto_helpers::MessageBuilderExt;
         self.send_message_with_options_inner(
             to.into(),
@@ -444,7 +479,7 @@ impl Client {
         &self,
         to: impl Into<Jid>,
         message: &wa::Message,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         use wacore::proto_helpers::MessageExt;
         let body = *message.get_base_message().prepare_for_forward();
         self.send_message_with_options_inner(to.into(), body, SendOptions::default())
@@ -457,7 +492,7 @@ impl Client {
         to: impl Into<Jid>,
         message: wa::Message,
         options: SendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         // Thin generic shim: the large async body below stays monomorphic so
         // each `Into<Jid>` instantiation does not duplicate the state machine.
         self.send_message_with_options_inner(to.into(), message, options)
@@ -470,7 +505,7 @@ impl Client {
         to: Jid,
         mut message: wa::Message,
         options: SendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
         wacore::telemetry::send(match to.server {
             wacore_binary::Server::Group => "group",
@@ -562,12 +597,14 @@ impl Client {
         message: wa::Message,
         recipients: &[Jid],
         options: crate::features::status::StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         use wacore::client::context::GroupInfo;
         use wacore_binary::builder::NodeBuilder;
 
         if recipients.is_empty() {
-            return Err(anyhow!("Cannot send status with no recipients"));
+            return Err(SendError::InvalidRequest(
+                "cannot send status with no recipients".into(),
+            ));
         }
 
         // Status posts don't go through send_message_with_options, so count them here.
@@ -580,17 +617,15 @@ impl Client {
         // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let account_info = &device_snapshot.account;
-        let own_jid = device_snapshot
-            .pn
-            .as_ref()
-            .ok_or(crate::client::ClientError::NotLoggedIn)?;
+        let own_jid = device_snapshot.pn.as_ref().ok_or(SendError::NotLoggedIn)?;
         // Status is LID-addressed (matches WA Web post-LID-migration). Without
         // a real device LID we can't sign or fan out correctly; refuse rather
         // than silently emit `addressing_mode="lid"` with a PN sender.
         let own_lid = device_snapshot.lid.as_ref().ok_or_else(|| {
-            anyhow!(
-                "Cannot send status: device has no LID yet. Finish pairing / LID \
+            SendError::InvalidRequest(
+                "cannot send status: device has no LID yet. Finish pairing / LID \
                  migration before posting status."
+                    .into(),
             )
         })?;
 
@@ -599,11 +634,10 @@ impl Client {
         // programming bug, not something to silently drop during resolution.
         for jid in recipients {
             if !(jid.is_pn() || jid.is_lid()) {
-                return Err(anyhow!(
-                    "Invalid status recipient {}: must be a user JID (PN or LID), \
-                     not a group/broadcast/newsletter/hosted/etc.",
-                    jid
-                ));
+                return Err(SendError::InvalidRequest(format!(
+                    "invalid status recipient {jid}: must be a user JID (PN or LID), \
+                     not a group/broadcast/newsletter/hosted/etc."
+                )));
             }
         }
 
@@ -754,7 +788,7 @@ impl Client {
                     )
                     .await?
                 } else {
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         };
@@ -1135,7 +1169,7 @@ impl Client {
         to: impl Into<Jid>,
         message_id: impl Into<String>,
         revoke_type: RevokeType,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), SendError> {
         self.revoke_message_inner(to.into(), message_id.into(), revoke_type)
             .await
     }
@@ -1146,7 +1180,7 @@ impl Client {
         to: Jid,
         message_id: String,
         revoke_type: RevokeType,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), SendError> {
         self.require_pn()?;
 
         let (from_me, participant, edit_attr) = match &revoke_type {
@@ -1162,7 +1196,9 @@ impl Client {
             RevokeType::Admin { original_sender } => {
                 // Admin revoke requires group context
                 if !to.is_group() {
-                    return Err(anyhow!("Admin revoke is only valid for group chats"));
+                    return Err(SendError::InvalidRequest(
+                        "admin revoke is only valid for group chats".into(),
+                    ));
                 }
                 // The protocolMessageKey.participant should match the original message's key exactly
                 // Do NOT convert LID to PN - pass through unchanged like WhatsApp Web does
@@ -1198,7 +1234,8 @@ impl Client {
             vec![],
             None,
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     /// Keep (or un-keep) a message in a disappearing chat for everyone.
@@ -1213,7 +1250,7 @@ impl Client {
         chat: impl Into<Jid>,
         key: wa::MessageKey,
         keep: bool,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         let chat = chat.into();
         let message = wacore::proto_helpers::build_keep_in_chat_message(
             key,
@@ -1229,7 +1266,7 @@ impl Client {
         chat: impl Into<Jid>,
         key: wa::MessageKey,
         duration: PinDuration,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), SendError> {
         self.send_pin(
             chat.into(),
             key,
@@ -1244,7 +1281,7 @@ impl Client {
         &self,
         chat: impl Into<Jid>,
         key: wa::MessageKey,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), SendError> {
         self.send_pin(
             chat.into(),
             key,
@@ -1261,7 +1298,7 @@ impl Client {
         key: wa::MessageKey,
         pin_type: wa::message::pin_in_chat_message::Type,
         duration_secs: u32,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), SendError> {
         let message = wa::Message {
             pin_in_chat_message: Some(Box::new(wa::message::PinInChatMessage {
                 key: Some(key),
@@ -1285,7 +1322,8 @@ impl Client {
             vec![],
             None,
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.impl", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]

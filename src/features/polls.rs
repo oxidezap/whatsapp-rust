@@ -2,15 +2,34 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Result, anyhow};
+use thiserror::Error;
 use wacore::poll;
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
 use crate::client::Client;
-use crate::send::SendResult;
+use crate::send::{SendError, SendResult};
 
 pub use wacore::poll::PollVoteCiphertext;
+
+/// Errors from poll operations (creation, voting, and vote decryption).
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum PollError {
+    /// Sending the poll/vote stanza failed (embeds the send path error).
+    #[error(transparent)]
+    Send(#[from] SendError),
+    /// The poll definition is invalid (option count, duplicate names, bad
+    /// quiz index, selectable count out of range).
+    #[error("invalid poll: {0}")]
+    InvalidPoll(String),
+    /// The client is not logged in, so the voter identity can't be resolved.
+    #[error("client is not logged in")]
+    NotLoggedIn,
+    /// Vote decryption/encryption (HKDF/GCM) failed.
+    #[error("poll vote crypto failed: {0}")]
+    Crypto(#[source] anyhow::Error),
+}
 
 #[derive(Debug, Clone)]
 pub struct PollOptionResult {
@@ -34,7 +53,7 @@ impl<'a> Polls<'a> {
         name: &str,
         options: &[String],
         selectable_count: u32,
-    ) -> Result<(SendResult, Vec<u8>)> {
+    ) -> Result<(SendResult, Vec<u8>), PollError> {
         let to = &to.into();
         self.create_inner(to, name, options, selectable_count, None)
             .await
@@ -51,7 +70,7 @@ impl<'a> Polls<'a> {
         name: &str,
         options: &[String],
         correct_index: usize,
-    ) -> Result<(SendResult, Vec<u8>)> {
+    ) -> Result<(SendResult, Vec<u8>), PollError> {
         let to = &to.into();
         self.create_inner(to, name, options, 1, Some(correct_index))
             .await
@@ -64,7 +83,7 @@ impl<'a> Polls<'a> {
         options: &[String],
         selectable_count: u32,
         correct_index: Option<usize>,
-    ) -> Result<(SendResult, Vec<u8>)> {
+    ) -> Result<(SendResult, Vec<u8>), PollError> {
         let poll_msg = build_poll_creation_message(name, options, selectable_count, correct_index)?;
 
         // WA Web: v3 for single-select, v1 for multi-select (GeneratePollCreationMessageProto.js:39-41)
@@ -105,12 +124,9 @@ impl<'a> Polls<'a> {
         poll_creator_jid: &Jid,
         message_secret: &[u8],
         option_names: &[String],
-    ) -> Result<SendResult> {
+    ) -> Result<SendResult, PollError> {
         let chat_jid = &chat_jid.into();
-        let my_jid = self
-            .client
-            .get_pn()
-            .ok_or_else(|| anyhow!("Not logged in — cannot determine own JID"))?;
+        let my_jid = self.client.get_pn().ok_or(PollError::NotLoggedIn)?;
         let my_base = my_jid.to_non_ad();
 
         let voter_jid = self
@@ -130,7 +146,8 @@ impl<'a> Polls<'a> {
             poll_msg_id,
             &creator_jid_str,
             &voter_jid_str,
-        )?;
+        )
+        .map_err(PollError::Crypto)?;
 
         let from_me = my_base.is_same_user_as(poll_creator_jid);
 
@@ -160,7 +177,7 @@ impl<'a> Polls<'a> {
             ..Default::default()
         };
 
-        self.client.send_message(chat_jid, message).await
+        Ok(self.client.send_message(chat_jid, message).await?)
     }
 
     /// The voter (self) JID keys the vote's HKDF/AAD, so it must use the poll
@@ -198,7 +215,7 @@ impl<'a> Polls<'a> {
         poll_msg_id: &str,
         poll_creator_jid: &Jid,
         voter_jid: &Jid,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<Vec<u8>>, PollError> {
         let creator = poll_creator_jid.to_non_ad();
         let voter = voter_jid.to_non_ad();
         let creator_str = creator.to_string();
@@ -218,6 +235,7 @@ impl<'a> Polls<'a> {
             },
             fallback,
         )
+        .map_err(PollError::Crypto)
     }
 
     /// Non-AD LID/PN counterpart of a user JID, or `None` when unmapped.
@@ -257,7 +275,7 @@ impl<'a> Polls<'a> {
         message_secret: &[u8],
         poll_msg_id: &str,
         poll_creator_jid: &Jid,
-    ) -> Result<Vec<PollOptionResult>> {
+    ) -> Result<Vec<PollOptionResult>, PollError> {
         let option_hashes: Vec<([u8; 32], &str)> = poll_options
             .iter()
             .map(|name| (poll::compute_option_hash(name), name.as_str()))
@@ -343,35 +361,41 @@ fn build_poll_creation_message(
     options: &[String],
     selectable_count: u32,
     correct_index: Option<usize>,
-) -> Result<wa::message::PollCreationMessage> {
+) -> Result<wa::message::PollCreationMessage, PollError> {
     if options.len() < 2 {
-        return Err(anyhow!("Poll must have at least 2 options"));
+        return Err(PollError::InvalidPoll(
+            "poll must have at least 2 options".into(),
+        ));
     }
     if options.len() > 12 {
-        return Err(anyhow!("Polls can have a maximum of 12 options"));
+        return Err(PollError::InvalidPoll(
+            "polls can have a maximum of 12 options".into(),
+        ));
     }
     if selectable_count < 1 || selectable_count > options.len() as u32 {
-        return Err(anyhow!(
+        return Err(PollError::InvalidPoll(format!(
             "selectable_count must be between 1 and {} (got {selectable_count})",
             options.len()
-        ));
+        )));
     }
 
     // Duplicate names would produce identical SHA-256 hashes, making votes indistinguishable
     let mut seen = std::collections::HashSet::new();
     for opt in options {
         if !seen.insert(opt) {
-            return Err(anyhow!("Duplicate option name: {opt}"));
+            return Err(PollError::InvalidPoll(format!(
+                "duplicate option name: {opt}"
+            )));
         }
     }
 
     let (poll_type, correct_answer) = match correct_index {
         Some(idx) => {
             let correct = options.get(idx).ok_or_else(|| {
-                anyhow!(
+                PollError::InvalidPoll(format!(
                     "correct_index {idx} out of range (poll has {} options)",
                     options.len()
-                )
+                ))
             })?;
             let answer = wa::message::poll_creation_message::Option {
                 option_name: Some(correct.clone()),

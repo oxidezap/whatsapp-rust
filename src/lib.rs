@@ -44,6 +44,9 @@ pub mod types;
 pub mod client;
 pub(crate) mod flush_scope;
 pub use client::Client;
+/// Shared base error for transport/connection concerns; the per-domain error
+/// types embed it.
+pub use client::ClientError;
 #[cfg(feature = "debug-diagnostics")]
 pub use client::MemoryDiagnostics;
 pub use client::NodeFilter;
@@ -59,13 +62,14 @@ pub(crate) mod msg_secret_buffer;
 pub mod pair;
 pub mod pair_code;
 pub mod request;
+pub use request::IqError;
 #[cfg(feature = "tokio-runtime")]
 pub mod runtime_impl;
 #[cfg(feature = "tokio-runtime")]
 pub use runtime_impl::TokioRuntime;
 pub use wacore::runtime::Runtime;
 pub mod send;
-pub use send::{PinDuration, RevokeType, SendOptions, SendResult};
+pub use send::{PinDuration, RevokeType, SendError, SendOptions, SendResult};
 pub use wacore::send::StanzaType;
 pub mod media;
 pub mod session;
@@ -87,21 +91,23 @@ pub mod usync;
 
 pub mod features;
 pub use features::{
-    BatchGroupResult, Blocking, BlocklistEntry, ChatActions, ChatStateType, Chatstate, Comments,
-    Community, CommunitySubgroup, Contacts, CreateCommunityOptions, CreateCommunityResult,
+    AppStateError, BatchGroupResult, Blocking, BlockingError, BlocklistEntry, ChatActions,
+    ChatStateError, ChatStateType, Chatstate, Comments, Community, CommunityError,
+    CommunitySubgroup, ContactError, Contacts, CreateCommunityOptions, CreateCommunityResult,
     CreateGroupResult, EncryptedEdit, EventCreationParams, EventResponseType, Events,
-    GroupCreateOptions, GroupDescription, GroupJoinError, GroupMetadata, GroupParticipant,
-    GroupParticipantOptions, GroupProfilePicture, GroupSubject, GroupType, Groups, GrowthLockInfo,
-    InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult,
-    MediaRetryResult, MediaReupload, MediaReuploadRequest, MemberAddMode, MemberLinkMode,
-    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, Mex, MexError,
-    MexErrorExtensions, MexRequest, MexResponse, Newsletter, NewsletterMessage,
-    NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount, NewsletterRole,
-    NewsletterState, NewsletterVerification, ParticipantChangeResponse, ParticipantType,
-    PictureType, Presence, PresenceError, PresenceStatus, Profile, ProfilePicture, SecretEncKind,
-    SecretEncrypted, SetProfilePictureResponse, Signal, Status, StatusPrivacySetting,
-    StatusSendOptions, SyncActionMessageRange, TcToken, UnlinkSubgroupsResult, UserInfo,
-    UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
+    GroupCreateOptions, GroupDescription, GroupError, GroupJoinError, GroupMetadata,
+    GroupParticipant, GroupParticipantOptions, GroupProfilePicture, GroupSubject, GroupType,
+    Groups, GrowthLockInfo, InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels,
+    LinkSubgroupsResult, MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest,
+    MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
+    MembershipRequest, Mex, MexError, MexErrorExtensions, MexRequest, MexResponse, Newsletter,
+    NewsletterError, NewsletterMessage, NewsletterMessageType, NewsletterMetadata,
+    NewsletterReactionCount, NewsletterRole, NewsletterState, NewsletterVerification,
+    ParticipantChangeResponse, ParticipantType, PictureType, PollError, Presence, PresenceError,
+    PresenceStatus, Profile, ProfileError, ProfilePicture, SecretEncKind, SecretEncrypted,
+    SetProfilePictureResponse, Signal, SignalError, Status, StatusPrivacySetting,
+    StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult,
+    UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
 };
 
 pub mod bot;
@@ -114,10 +120,11 @@ pub mod version;
 /// `use whatsapp_rust::prelude::*;`.
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, MessageContext};
-    pub use crate::client::Client;
+    pub use crate::client::{Client, ClientError};
+    pub use crate::request::IqError;
     #[cfg(feature = "tokio-runtime")]
     pub use crate::runtime_impl::TokioRuntime;
-    pub use crate::send::{SendOptions, SendResult};
+    pub use crate::send::{SendError, SendOptions, SendResult};
     #[cfg(feature = "sqlite-storage")]
     pub use crate::store::SqliteStore;
     pub use crate::types::events::{Event, EventKind};

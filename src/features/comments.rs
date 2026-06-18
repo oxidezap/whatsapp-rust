@@ -11,12 +11,11 @@
 //! dispatched as their inner body `Message`; the parent post key surfaces on
 //! `MessageInfo::comment_target`.
 
-use anyhow::{Result, anyhow};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
 use crate::client::Client;
-use crate::send::SendResult;
+use crate::send::{SendError, SendResult};
 
 pub struct Comments<'a> {
     client: &'a Client,
@@ -38,7 +37,7 @@ impl<'a> Comments<'a> {
         chat: impl Into<Jid>,
         parent_key: wa::MessageKey,
         text: &str,
-    ) -> Result<SendResult> {
+    ) -> Result<SendResult, SendError> {
         let chat = &chat.into();
         // WA Web encryptExtendedTextComment: the body is an extendedTextMessage.
         let body = wa::Message {
@@ -57,7 +56,7 @@ impl<'a> Comments<'a> {
         chat: impl Into<Jid>,
         mut parent_key: wa::MessageKey,
         body: wa::Message,
-    ) -> Result<SendResult> {
+    ) -> Result<SendResult, SendError> {
         let chat = &chat.into();
         let client = self.client;
         let (author, secret) = client
@@ -66,14 +65,14 @@ impl<'a> Comments<'a> {
         let parent_id = parent_key
             .id
             .clone()
-            .ok_or_else(|| anyhow!("parent message key missing id"))?;
+            .ok_or_else(|| SendError::InvalidRequest("parent message key missing id".into()))?;
         // WA Web comments are authored under the LID identity
         // (getMeLidUserOrThrow); fall back to PN only when no LID is known.
         let commenter = client
             .get_lid()
             .or_else(|| client.get_pn())
             .map(|j| j.to_non_ad())
-            .ok_or_else(|| anyhow!("not logged in"))?;
+            .ok_or(SendError::NotLoggedIn)?;
 
         let (enc_payload, iv) = wacore::comment::encrypt_comment_with_secret(
             &body,

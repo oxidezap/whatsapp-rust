@@ -2,10 +2,10 @@
 //!
 //! Encryption, decryption, session management, and participant node creation.
 
-use anyhow::{Result, anyhow};
+use thiserror::Error;
 use wacore::libsignal::protocol::{
-    CiphertextMessage, PreKeySignalMessage, SignalMessage, UsePQRatchet, message_decrypt,
-    message_encrypt,
+    CiphertextMessage, PreKeySignalMessage, SignalMessage, SignalProtocolError, UsePQRatchet,
+    message_decrypt, message_encrypt,
 };
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
@@ -14,6 +14,22 @@ use wacore_binary::Jid;
 use wacore_binary::Node;
 
 use crate::client::Client;
+
+/// Error returned by the low-level Signal protocol operations.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SignalError {
+    /// A Signal protocol primitive (encrypt/decrypt/session) failed.
+    #[error(transparent)]
+    Protocol(#[from] SignalProtocolError),
+    /// The requested operation is not valid for this input (e.g. a sender-key
+    /// or message-secret envelope passed to the pairwise decrypt path).
+    #[error("unsupported signal operation: {0}")]
+    Unsupported(String),
+    /// Catch-all for internal failures (device resolution, cache flush).
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
 
 /// Feature handle for Signal protocol operations.
 pub struct Signal<'a> {
@@ -32,7 +48,11 @@ impl<'a> Signal<'a> {
     ///
     /// PN JIDs are resolved to LID when a LID session exists, matching
     /// the internal send path.
-    pub async fn encrypt_message(&self, jid: &Jid, plaintext: &[u8]) -> Result<(EncType, Vec<u8>)> {
+    pub async fn encrypt_message(
+        &self,
+        jid: &Jid,
+        plaintext: &[u8],
+    ) -> Result<(EncType, Vec<u8>), SignalError> {
         // Resolve PN→LID to use the correct Signal session (matches send path)
         let encryption_jid = self.client.resolve_encryption_jid(jid).await;
         let signal_addr = encryption_jid.to_protocol_address();
@@ -53,7 +73,7 @@ impl<'a> Signal<'a> {
         self.client.flush_signal_cache().await?;
 
         let (_, is_prekey, bytes) = wacore::send::extract_ciphertext(encrypted)
-            .ok_or_else(|| anyhow!("unexpected ciphertext variant"))?;
+            .ok_or_else(|| SignalError::Unsupported("unexpected ciphertext variant".into()))?;
         let enc_type = if is_prekey {
             EncType::PreKeyMessage
         } else {
@@ -74,7 +94,7 @@ impl<'a> Signal<'a> {
         jid: &Jid,
         enc_type: EncType,
         ciphertext: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, SignalError> {
         let parsed = match enc_type {
             EncType::PreKeyMessage => {
                 CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(ciphertext)?)
@@ -83,11 +103,13 @@ impl<'a> Signal<'a> {
                 CiphertextMessage::SignalMessage(SignalMessage::try_from(ciphertext)?)
             }
             EncType::SenderKey => {
-                return Err(anyhow!("use decrypt_group_message for sender-key messages"));
+                return Err(SignalError::Unsupported(
+                    "use decrypt_group_message for sender-key messages".into(),
+                ));
             }
             EncType::MessageSecret => {
-                return Err(anyhow!(
-                    "msmsg envelopes are not Signal messages; use the bot_message path"
+                return Err(SignalError::Unsupported(
+                    "msmsg envelopes are not Signal messages; use the bot_message path".into(),
                 ));
             }
         };
@@ -141,7 +163,7 @@ impl<'a> Signal<'a> {
         &self,
         group_jid: &Jid,
         plaintext: &[u8],
-    ) -> Result<(Option<Vec<u8>>, Vec<u8>)> {
+    ) -> Result<(Option<Vec<u8>>, Vec<u8>), SignalError> {
         let own_jid = self.client.get_own_jid_for_group(group_jid).await?;
         let sender_addr = own_jid.to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_addr);
@@ -203,7 +225,7 @@ impl<'a> Signal<'a> {
         group_jid: &Jid,
         sender_jid: &Jid,
         ciphertext: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, SignalError> {
         let sender_key_name =
             make_sender_key_name(group_jid, &sender_jid.to_non_ad().to_protocol_address());
 
@@ -225,7 +247,7 @@ impl<'a> Signal<'a> {
     ///
     /// PN JIDs are resolved to LID when a LID mapping exists, matching
     /// the encrypt/decrypt paths.
-    pub async fn validate_session(&self, jid: &Jid) -> Result<bool> {
+    pub async fn validate_session(&self, jid: &Jid) -> Result<bool, SignalError> {
         let resolved = self.client.resolve_encryption_jid(jid).await;
         let signal_addr = resolved.to_protocol_address();
         let device_snapshot = self.client.persistence_manager.get_device_snapshot();
@@ -233,7 +255,7 @@ impl<'a> Signal<'a> {
             .signal_cache
             .has_session(&signal_addr, &*device_snapshot.backend)
             .await
-            .map_err(|e| anyhow!("session check failed: {e}"))
+            .map_err(|e| SignalError::Internal(anyhow::anyhow!("session check failed: {e}")))
     }
 
     /// Delete Signal sessions and identity keys for the given JIDs.
@@ -244,7 +266,7 @@ impl<'a> Signal<'a> {
     ///
     /// PN JIDs are resolved to LID when a LID mapping exists, matching
     /// the encrypt/decrypt paths.
-    pub async fn delete_sessions(&self, jids: &[Jid]) -> Result<()> {
+    pub async fn delete_sessions(&self, jids: &[Jid]) -> Result<(), SignalError> {
         for jid in jids {
             let resolved = self.client.resolve_encryption_jid(jid).await;
             let addr = resolved.to_protocol_address();
@@ -271,7 +293,7 @@ impl<'a> Signal<'a> {
         &self,
         recipient_jids: &[Jid],
         message: &waproto::whatsapp::Message,
-    ) -> Result<(Vec<Node>, bool)> {
+    ) -> Result<(Vec<Node>, bool), SignalError> {
         let device_jids = self.client.get_user_devices(recipient_jids).await?;
         self.client.ensure_e2e_sessions(&device_jids).await?;
 
@@ -307,13 +329,14 @@ impl<'a> Signal<'a> {
     }
 
     /// Ensure E2E sessions exist for the given JIDs.
-    pub async fn assert_sessions(&self, jids: &[Jid]) -> Result<()> {
-        self.client.ensure_e2e_sessions(jids).await
+    pub async fn assert_sessions(&self, jids: &[Jid]) -> Result<(), SignalError> {
+        self.client.ensure_e2e_sessions(jids).await?;
+        Ok(())
     }
 
     /// Get all known device JIDs for the given user JIDs via usync.
-    pub async fn get_user_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>> {
-        self.client.get_user_devices(jids).await
+    pub async fn get_user_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, SignalError> {
+        Ok(self.client.get_user_devices(jids).await?)
     }
 }
 

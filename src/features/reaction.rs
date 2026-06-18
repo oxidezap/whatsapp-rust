@@ -8,12 +8,11 @@
 //! message's `messageSecret` and emits an `enc_reaction_message` envelope.
 //! [`Client::send_reaction`] applies the same gate transparently.
 
-use anyhow::anyhow;
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
 use crate::client::Client;
-use crate::send::SendResult;
+use crate::send::{SendError, SendResult};
 
 impl Client {
     /// React to a DM, group, or status@broadcast message.
@@ -37,7 +36,7 @@ impl Client {
         chat: impl Into<Jid>,
         target_key: wa::MessageKey,
         emoji: &str,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         let chat = &chat.into();
         if chat.is_group() && self.is_community_announce_group(chat).await? {
             return self.send_enc_reaction(chat, target_key, emoji).await;
@@ -70,14 +69,14 @@ impl Client {
         chat: &Jid,
         mut target_key: wa::MessageKey,
         emoji: &str,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         let (author, secret) = self
             .resolve_outgoing_addon_parent(chat, &target_key)
             .await?;
         let target_id = target_key
             .id
             .clone()
-            .ok_or_else(|| anyhow!("target message key missing id"))?;
+            .ok_or_else(|| SendError::InvalidRequest("target message key missing id".into()))?;
         // Receivers derive the addon key with the STANZA sender, which in a
         // CAG is our LID identity regardless of the parent author's namespace;
         // mirror the comment path (WA Web authors CAG addons under LID).
@@ -85,7 +84,7 @@ impl Client {
             .get_lid()
             .or_else(|| self.get_pn())
             .map(|j| j.to_non_ad())
-            .ok_or_else(|| anyhow!("not logged in"))?;
+            .ok_or(SendError::NotLoggedIn)?;
 
         let (enc_payload, iv) = wacore::reaction::encrypt_reaction_with_secret(
             emoji,

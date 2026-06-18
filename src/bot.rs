@@ -122,7 +122,7 @@ impl MessageContext {
     pub async fn send_message(
         &self,
         message: wa::Message,
-    ) -> Result<crate::send::SendResult, anyhow::Error> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.client
             .send_message(&self.info.source.chat, message)
             .await
@@ -132,7 +132,7 @@ impl MessageContext {
     pub async fn reply(
         &self,
         text: impl Into<String>,
-    ) -> Result<crate::send::SendResult, anyhow::Error> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.send_message(wa::Message::text(text)).await
     }
 
@@ -140,7 +140,7 @@ impl MessageContext {
     pub async fn reply_quoting(
         &self,
         text: impl Into<String>,
-    ) -> Result<crate::send::SendResult, anyhow::Error> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         let context = self.build_quote_context();
         self.send_message(wa::Message::text_with_context(text, context))
             .await
@@ -178,7 +178,7 @@ impl MessageContext {
         &self,
         original_message_id: impl Into<String>,
         new_message: wa::Message,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<String, crate::send::SendError> {
         self.client
             .edit_message(&self.info.source.chat, original_message_id, new_message)
             .await
@@ -190,7 +190,7 @@ impl MessageContext {
         &self,
         message_id: impl Into<String>,
         revoke_type: crate::send::RevokeType,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), crate::send::SendError> {
         self.client
             .revoke_message(&self.info.source.chat, message_id, revoke_type)
             .await
@@ -200,7 +200,10 @@ impl MessageContext {
     /// reaction. The target key (including the group/status participant) is
     /// taken from [`MessageContext::message_key`].
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.react", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
-    pub async fn react(&self, emoji: &str) -> Result<crate::send::SendResult, anyhow::Error> {
+    pub async fn react(
+        &self,
+        emoji: &str,
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.client
             .send_reaction(&self.info.source.chat, self.message_key(), emoji)
             .await

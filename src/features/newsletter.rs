@@ -6,8 +6,10 @@
 
 use wacore::WireEnum;
 
-use crate::client::Client;
+use crate::client::{Client, ClientError};
 use crate::features::mex::{MexError, mex_request};
+use crate::request::IqError;
+use thiserror::Error;
 use wacore::iq::mex_operations::{
     create_newsletter, fetch_all_newsletters_metadata, fetch_newsletter, join_newsletter,
     leave_newsletter, update_newsletter, update_newsletter_user_setting,
@@ -19,6 +21,28 @@ use wacore_binary::JidExt as _;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 use waproto::whatsapp as wa;
+
+/// Error returned by newsletter (channel) operations.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum NewsletterError {
+    /// A MEX (GraphQL) query/mutation failed or returned malformed data.
+    #[error(transparent)]
+    Mex(#[from] MexError),
+    /// An IQ (message history, live updates) failed.
+    #[error(transparent)]
+    Iq(#[from] IqError),
+    /// Connection/transport failure sending a plaintext stanza (edit/revoke).
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    /// The request was malformed (e.g. a non-newsletter JID, an empty target
+    /// message id, or a missing element in the server response).
+    #[error("invalid newsletter request: {0}")]
+    InvalidRequest(String),
+    /// Catch-all for internal failures with no dedicated variant.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
 
 // Types
 
@@ -124,7 +148,7 @@ impl<'a> Newsletter<'a> {
     }
 
     /// List all newsletters the user is subscribed to.
-    pub async fn list_subscribed(&self) -> Result<Vec<NewsletterMetadata>, MexError> {
+    pub async fn list_subscribed(&self) -> Result<Vec<NewsletterMetadata>, NewsletterError> {
         let response = self
             .client
             .mex()
@@ -135,18 +159,18 @@ impl<'a> Newsletter<'a> {
 
         let data = response
             .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data".into()))?;
+            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
         let newsletters = data["xwa2_newsletter_subscribed"]
             .as_array()
             .ok_or_else(|| {
-                MexError::PayloadParsing("missing xwa2_newsletter_subscribed array".into())
+                NewsletterError::InvalidRequest("missing xwa2_newsletter_subscribed array".into())
             })?;
 
         newsletters.iter().map(parse_newsletter_metadata).collect()
     }
 
     /// Fetch metadata for a newsletter by its JID.
-    pub async fn get_metadata(&self, jid: &Jid) -> Result<NewsletterMetadata, MexError> {
+    pub async fn get_metadata(&self, jid: &Jid) -> Result<NewsletterMetadata, NewsletterError> {
         let response = self
             .client
             .mex()
@@ -165,10 +189,10 @@ impl<'a> Newsletter<'a> {
 
         let data = response
             .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data".into()))?;
+            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
         let newsletter = &data["xwa2_newsletter"];
         if newsletter.is_null() {
-            return Err(MexError::PayloadParsing(format!(
+            return Err(NewsletterError::InvalidRequest(format!(
                 "newsletter not found: {}",
                 jid
             )));
@@ -183,7 +207,7 @@ impl<'a> Newsletter<'a> {
         &self,
         name: &str,
         description: Option<&str>,
-    ) -> Result<NewsletterMetadata, MexError> {
+    ) -> Result<NewsletterMetadata, NewsletterError> {
         let response = self
             .client
             .mex()
@@ -198,10 +222,10 @@ impl<'a> Newsletter<'a> {
 
         let data = response
             .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data".into()))?;
+            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
         let newsletter = &data["xwa2_newsletter_create"];
         if newsletter.is_null() {
-            return Err(MexError::PayloadParsing(
+            return Err(NewsletterError::InvalidRequest(
                 "newsletter creation failed".into(),
             ));
         }
@@ -211,7 +235,7 @@ impl<'a> Newsletter<'a> {
     /// Join (subscribe to) a newsletter.
     ///
     /// Returns the newsletter metadata with the viewer's role set to `Subscriber`.
-    pub async fn join(&self, jid: &Jid) -> Result<NewsletterMetadata, MexError> {
+    pub async fn join(&self, jid: &Jid) -> Result<NewsletterMetadata, NewsletterError> {
         let response = self
             .client
             .mex()
@@ -222,10 +246,10 @@ impl<'a> Newsletter<'a> {
 
         let data = response
             .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data".into()))?;
+            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
         let newsletter = &data["xwa2_newsletter_join_v2"];
         if newsletter.is_null() {
-            return Err(MexError::PayloadParsing(format!(
+            return Err(NewsletterError::InvalidRequest(format!(
                 "failed to join newsletter: {}",
                 jid
             )));
@@ -234,7 +258,7 @@ impl<'a> Newsletter<'a> {
     }
 
     /// Leave (unsubscribe from) a newsletter.
-    pub async fn leave(&self, jid: &Jid) -> Result<(), MexError> {
+    pub async fn leave(&self, jid: &Jid) -> Result<(), NewsletterError> {
         let response = self
             .client
             .mex()
@@ -245,9 +269,9 @@ impl<'a> Newsletter<'a> {
 
         let data = response
             .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data".into()))?;
+            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
         if data["xwa2_newsletter_leave_v2"].is_null() {
-            return Err(MexError::PayloadParsing(format!(
+            return Err(NewsletterError::InvalidRequest(format!(
                 "failed to leave newsletter: {}",
                 jid
             )));
@@ -261,7 +285,7 @@ impl<'a> Newsletter<'a> {
         jid: &Jid,
         name: Option<&str>,
         description: Option<&str>,
-    ) -> Result<NewsletterMetadata, MexError> {
+    ) -> Result<NewsletterMetadata, NewsletterError> {
         let response = self
             .client
             .mex()
@@ -278,10 +302,10 @@ impl<'a> Newsletter<'a> {
 
         let data = response
             .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data".into()))?;
+            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
         let newsletter = &data["xwa2_newsletter_update"];
         if newsletter.is_null() {
-            return Err(MexError::PayloadParsing(format!(
+            return Err(NewsletterError::InvalidRequest(format!(
                 "failed to update newsletter: {}",
                 jid
             )));
@@ -291,14 +315,14 @@ impl<'a> Newsletter<'a> {
 
     /// Mute or unmute a newsletter's follower-activity notifications
     /// (WA Web's `MUTE_FOLLOWER_ACTIVITY`). `muted = true` silences them.
-    pub async fn set_follower_mute(&self, jid: &Jid, muted: bool) -> Result<(), MexError> {
+    pub async fn set_follower_mute(&self, jid: &Jid, muted: bool) -> Result<(), NewsletterError> {
         self.set_user_setting_mute(jid, "MUTE_FOLLOWER_ACTIVITY", muted)
             .await
     }
 
     /// Mute or unmute a newsletter's admin-activity notifications
     /// (WA Web's `MUTE_ADMIN_ACTIVITY`). Only meaningful for owners/admins.
-    pub async fn set_admin_mute(&self, jid: &Jid, muted: bool) -> Result<(), MexError> {
+    pub async fn set_admin_mute(&self, jid: &Jid, muted: bool) -> Result<(), NewsletterError> {
         self.set_user_setting_mute(jid, "MUTE_ADMIN_ACTIVITY", muted)
             .await
     }
@@ -308,7 +332,7 @@ impl<'a> Newsletter<'a> {
         jid: &Jid,
         mute_type: &str,
         muted: bool,
-    ) -> Result<(), MexError> {
+    ) -> Result<(), NewsletterError> {
         let response = self
             .client
             .mex()
@@ -320,9 +344,9 @@ impl<'a> Newsletter<'a> {
 
         let data = response
             .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data".into()))?;
+            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
         if data["xwa2_newsletter_update_user_setting"].is_null() {
-            return Err(MexError::PayloadParsing(format!(
+            return Err(NewsletterError::InvalidRequest(format!(
                 "failed to update newsletter user setting: {jid}"
             )));
         }
@@ -333,7 +357,7 @@ impl<'a> Newsletter<'a> {
     pub async fn get_metadata_by_invite(
         &self,
         invite_code: &str,
-    ) -> Result<NewsletterMetadata, MexError> {
+    ) -> Result<NewsletterMetadata, NewsletterError> {
         let response = self
             .client
             .mex()
@@ -352,10 +376,10 @@ impl<'a> Newsletter<'a> {
 
         let data = response
             .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data".into()))?;
+            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
         let newsletter = &data["xwa2_newsletter"];
         if newsletter.is_null() {
-            return Err(MexError::PayloadParsing(format!(
+            return Err(NewsletterError::InvalidRequest(format!(
                 "newsletter not found for invite: {}",
                 invite_code
             )));
@@ -370,7 +394,10 @@ impl<'a> Newsletter<'a> {
     /// The server will send `<notification type="newsletter">` stanzas with
     /// `<live_updates>` children, dispatched as `Event::NewsletterLiveUpdate`.
     /// Returns the subscription duration in seconds.
-    pub async fn subscribe_live_updates(&self, jid: impl Into<Jid>) -> Result<u64, anyhow::Error> {
+    pub async fn subscribe_live_updates(
+        &self,
+        jid: impl Into<Jid>,
+    ) -> Result<u64, NewsletterError> {
         let jid = &jid.into();
         let iq = InfoQuery::set(
             NEWSLETTER_XMLNS,
@@ -401,10 +428,11 @@ impl<'a> Newsletter<'a> {
         jid: &Jid,
         server_id: u64,
         reaction: &str,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), NewsletterError> {
         self.client
             .send_server_reaction(jid, server_id, reaction)
-            .await
+            .await?;
+        Ok(())
     }
 
     /// Edit a message in a newsletter (channel). Channels are plaintext (not E2E).
@@ -419,16 +447,16 @@ impl<'a> Newsletter<'a> {
         jid: &Jid,
         message_id: impl Into<String>,
         new_content: wa::Message,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), NewsletterError> {
         if !jid.is_newsletter() {
-            return Err(anyhow::anyhow!(
-                "edit_message is only valid for newsletter (channel) JIDs; use Client::edit_message for DM/group"
+            return Err(NewsletterError::InvalidRequest(
+                "edit_message is only valid for newsletter (channel) JIDs; use Client::edit_message for DM/group".into(),
             ));
         }
         let id = message_id.into();
         if id.is_empty() {
-            return Err(anyhow::anyhow!(
-                "newsletter edit needs a target message_id (NewsletterMessage.message_id is empty when the server omits the id)"
+            return Err(NewsletterError::InvalidRequest(
+                "newsletter edit needs a target message_id (NewsletterMessage.message_id is empty when the server omits the id)".into(),
             ));
         }
         let node = crate::send::build_newsletter_edit_node(
@@ -448,16 +476,16 @@ impl<'a> Newsletter<'a> {
         &self,
         jid: &Jid,
         message_id: impl Into<String>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), NewsletterError> {
         if !jid.is_newsletter() {
-            return Err(anyhow::anyhow!(
-                "revoke_message is only valid for newsletter (channel) JIDs; use Client::revoke_message for DM/group"
+            return Err(NewsletterError::InvalidRequest(
+                "revoke_message is only valid for newsletter (channel) JIDs; use Client::revoke_message for DM/group".into(),
             ));
         }
         let id = message_id.into();
         if id.is_empty() {
-            return Err(anyhow::anyhow!(
-                "newsletter revoke needs a target message_id (NewsletterMessage.message_id is empty when the server omits the id)"
+            return Err(NewsletterError::InvalidRequest(
+                "newsletter revoke needs a target message_id (NewsletterMessage.message_id is empty when the server omits the id)".into(),
             ));
         }
         let node =
@@ -475,7 +503,7 @@ impl<'a> Newsletter<'a> {
         jid: impl Into<Jid>,
         count: u32,
         before: Option<u64>,
-    ) -> Result<Vec<NewsletterMessage>, anyhow::Error> {
+    ) -> Result<Vec<NewsletterMessage>, NewsletterError> {
         let jid = &jid.into();
         let mut messages_node = NodeBuilder::new("messages").attr("count", count);
         if let Some(before_id) = before {
@@ -503,11 +531,15 @@ impl Client {
 
 // JSON parsing helper
 
-fn parse_newsletter_metadata(value: &serde_json::Value) -> Result<NewsletterMetadata, MexError> {
+fn parse_newsletter_metadata(
+    value: &serde_json::Value,
+) -> Result<NewsletterMetadata, NewsletterError> {
     let jid_str = value["id"]
         .as_str()
-        .ok_or_else(|| MexError::PayloadParsing("missing newsletter id".into()))?;
-    let jid: Jid = jid_str.parse()?;
+        .ok_or_else(|| NewsletterError::InvalidRequest("missing newsletter id".into()))?;
+    let jid: Jid = jid_str
+        .parse()
+        .map_err(|e| NewsletterError::InvalidRequest(format!("invalid newsletter id: {e}")))?;
 
     let thread = &value["thread_metadata"];
 
@@ -614,11 +646,11 @@ pub(crate) fn parse_reaction_counts(node: &NodeRef<'_>) -> Vec<NewsletterReactio
 /// ```
 fn parse_newsletter_messages_response(
     response: &NodeRef<'_>,
-) -> Result<Vec<NewsletterMessage>, anyhow::Error> {
+) -> Result<Vec<NewsletterMessage>, NewsletterError> {
     // Response is the IQ result node; find <messages> child
-    let messages_node = response
-        .get_optional_child("messages")
-        .ok_or_else(|| anyhow::anyhow!("missing <messages> in newsletter response"))?;
+    let messages_node = response.get_optional_child("messages").ok_or_else(|| {
+        NewsletterError::InvalidRequest("missing <messages> in newsletter response".into())
+    })?;
 
     let children = match messages_node.children() {
         Some(c) => c,

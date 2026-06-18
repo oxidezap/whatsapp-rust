@@ -1,10 +1,20 @@
 //! Chat state (typing indicators) feature.
 
-use crate::client::Client;
+use crate::client::{Client, ClientError};
 use log::debug;
+use thiserror::Error;
 use wacore::WireEnum;
 use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
+
+/// Error returned by chat-state (typing indicator) operations.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ChatStateError {
+    /// Connection/transport failure sending the `<chatstate>` stanza.
+    #[error(transparent)]
+    Client(#[from] ClientError),
+}
 
 /// Chat state type for typing indicators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -29,26 +39,23 @@ impl<'a> Chatstate<'a> {
     }
 
     /// Send a chat state update to a recipient.
-    pub async fn send(
-        &self,
-        to: &Jid,
-        state: ChatStateType,
-    ) -> Result<(), crate::client::ClientError> {
+    pub async fn send(&self, to: &Jid, state: ChatStateType) -> Result<(), ChatStateError> {
         debug!(target: "Chatstate", "Sending {} to {}", state, to);
 
         let node = self.build_chatstate_node(to, state);
-        self.client.send_node(node).await
+        self.client.send_node(node).await?;
+        Ok(())
     }
 
-    pub async fn send_composing(&self, to: &Jid) -> Result<(), crate::client::ClientError> {
+    pub async fn send_composing(&self, to: &Jid) -> Result<(), ChatStateError> {
         self.send(to, ChatStateType::Composing).await
     }
 
-    pub async fn send_recording(&self, to: &Jid) -> Result<(), crate::client::ClientError> {
+    pub async fn send_recording(&self, to: &Jid) -> Result<(), ChatStateError> {
         self.send(to, ChatStateType::Recording).await
     }
 
-    pub async fn send_paused(&self, to: &Jid) -> Result<(), crate::client::ClientError> {
+    pub async fn send_paused(&self, to: &Jid) -> Result<(), ChatStateError> {
         self.send(to, ChatStateType::Paused).await
     }
 

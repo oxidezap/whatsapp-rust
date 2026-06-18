@@ -49,7 +49,7 @@ impl SendContextResolver for Client {
     }
 
     async fn resolve_group_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, anyhow::Error> {
-        self.groups().query_info(jid).await
+        Ok(self.groups().query_info(jid).await?)
     }
 
     async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {

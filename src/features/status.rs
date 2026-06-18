@@ -3,7 +3,7 @@ use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
 use crate::client::Client;
-use crate::send::SendResult;
+use crate::send::{SendError, SendResult};
 use crate::upload::UploadResponse;
 
 /// Privacy setting sent in the `<meta>` node of the status stanza.
@@ -51,7 +51,7 @@ impl<'a> Status<'a> {
         font: i32,
         recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         let message = wa::Message {
             extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
                 text: Some(text.to_string()),
@@ -78,7 +78,7 @@ impl<'a> Status<'a> {
         caption: Option<&str>,
         recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         let message = crate::media::image_message(
             upload,
             crate::media::ImageOptions {
@@ -105,7 +105,7 @@ impl<'a> Status<'a> {
         caption: Option<&str>,
         recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         let message = crate::media::video_message(
             upload,
             crate::media::VideoOptions {
@@ -130,7 +130,7 @@ impl<'a> Status<'a> {
         message: wa::Message,
         recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         self.client
             .send_status_message(message, recipients, options)
             .await
@@ -145,7 +145,7 @@ impl<'a> Status<'a> {
         message_id: impl Into<String>,
         recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         let message_id = message_id.into();
         let to = Jid::status_broadcast();
 

@@ -10,7 +10,7 @@
 
 use crate::appstate_sync::Mutation;
 use crate::client::Client;
-use anyhow::Result;
+use crate::features::chat_actions::AppStateError;
 use log::debug;
 use wacore::appstate::schemas;
 use wacore::types::events::{Event, LabelAssociationUpdate, LabelEditUpdate};
@@ -103,12 +103,21 @@ impl<'a> Labels<'a> {
     /// Create or update a label. App state is an upsert keyed by `label_id`, so
     /// this both creates a new label and renames/recolors an existing one.
     /// `color` is a WhatsApp color index.
-    pub async fn create_label(&self, label_id: &str, name: &str, color: i32) -> Result<()> {
+    pub async fn create_label(
+        &self,
+        label_id: &str,
+        name: &str,
+        color: i32,
+    ) -> Result<(), AppStateError> {
         if label_id.is_empty() {
-            anyhow::bail!("label_id cannot be empty");
+            return Err(AppStateError::InvalidRequest(
+                "label_id cannot be empty".into(),
+            ));
         }
         if name.is_empty() {
-            anyhow::bail!("label name cannot be empty");
+            return Err(AppStateError::InvalidRequest(
+                "label name cannot be empty".into(),
+            ));
         }
         // Don't log the label name (user content); the id/color are enough to trace.
         debug!(
@@ -132,9 +141,11 @@ impl<'a> Labels<'a> {
 
     /// Delete a label. Chats keep their association rows; WA Web prunes them
     /// from the local DB on receipt of the delete.
-    pub async fn delete_label(&self, label_id: &str) -> Result<()> {
+    pub async fn delete_label(&self, label_id: &str) -> Result<(), AppStateError> {
         if label_id.is_empty() {
-            anyhow::bail!("label_id cannot be empty");
+            return Err(AppStateError::InvalidRequest(
+                "label_id cannot be empty".into(),
+            ));
         }
         debug!("Deleting label {label_id}");
         let value = wa::SyncActionValue {
@@ -151,18 +162,33 @@ impl<'a> Labels<'a> {
     }
 
     /// Associate a label with a chat.
-    pub async fn add_chat_label(&self, label_id: &str, chat_jid: &Jid) -> Result<()> {
+    pub async fn add_chat_label(
+        &self,
+        label_id: &str,
+        chat_jid: &Jid,
+    ) -> Result<(), AppStateError> {
         self.send_association(label_id, chat_jid, true).await
     }
 
     /// Remove a label association from a chat.
-    pub async fn remove_chat_label(&self, label_id: &str, chat_jid: &Jid) -> Result<()> {
+    pub async fn remove_chat_label(
+        &self,
+        label_id: &str,
+        chat_jid: &Jid,
+    ) -> Result<(), AppStateError> {
         self.send_association(label_id, chat_jid, false).await
     }
 
-    async fn send_association(&self, label_id: &str, chat_jid: &Jid, labeled: bool) -> Result<()> {
+    async fn send_association(
+        &self,
+        label_id: &str,
+        chat_jid: &Jid,
+        labeled: bool,
+    ) -> Result<(), AppStateError> {
         if label_id.is_empty() {
-            anyhow::bail!("label_id cannot be empty");
+            return Err(AppStateError::InvalidRequest(
+                "label_id cannot be empty".into(),
+            ));
         }
         debug!(
             "{} label {label_id} {} chat {chat_jid}",
