@@ -55,7 +55,7 @@ impl SendError {
     /// `SendError`, recovering the concrete [`ClientError`]. Without this the
     /// blanket `#[from] anyhow::Error` would funnel a logged-out
     /// `ClientError::NotLoggedIn` into the un-matchable `Internal` catch-all.
-    fn from_anyhow(err: anyhow::Error) -> Self {
+    pub(crate) fn from_anyhow(err: anyhow::Error) -> Self {
         // A validation deeper in the pipeline may already be a typed `SendError`
         // (e.g. send_message_impl's newsletter/status guards); recover it so it
         // stays matchable instead of collapsing into `Internal`.
@@ -65,6 +65,9 @@ impl SendError {
         };
         match err.downcast::<ClientError>() {
             Ok(ClientError::NotLoggedIn) => SendError::NotLoggedIn,
+            // Flatten so IQ failures are reachable only as `SendError::Iq`, never
+            // also as `SendError::Client(ClientError::Iq(..))`.
+            Ok(ClientError::Iq(iq)) => SendError::Iq(iq),
             Ok(client) => SendError::Client(client),
             Err(other) => match other.downcast::<IqError>() {
                 Ok(iq) => SendError::Iq(iq),

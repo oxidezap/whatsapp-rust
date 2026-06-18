@@ -78,7 +78,8 @@ impl Client {
         let participant = if to.is_group() {
             Some(
                 self.get_own_jid_for_group(&to)
-                    .await?
+                    .await
+                    .map_err(crate::send::SendError::from_anyhow)?
                     .to_non_ad()
                     .to_string(),
             )
@@ -167,7 +168,10 @@ impl Client {
         }
 
         let self_jid = if to.is_group() {
-            self.get_own_jid_for_group(&to).await?.to_non_ad()
+            self.get_own_jid_for_group(&to)
+                .await
+                .map_err(SendError::from_anyhow)?
+                .to_non_ad()
         } else {
             self.get_pn().ok_or(SendError::NotLoggedIn)?.to_non_ad()
         };

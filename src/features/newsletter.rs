@@ -44,6 +44,23 @@ pub enum NewsletterError {
     Internal(#[from] anyhow::Error),
 }
 
+impl NewsletterError {
+    /// Recover the concrete typed error from an `anyhow` bubbled up by a helper
+    /// that still threads `anyhow` (e.g. `send_server_reaction`), so transport
+    /// failures stay matchable as `Client`/`Iq` instead of collapsing into the
+    /// `Internal` catch-all via the blanket `#[from] anyhow::Error`.
+    pub(crate) fn from_anyhow(err: anyhow::Error) -> Self {
+        match err.downcast::<ClientError>() {
+            Ok(ClientError::Iq(iq)) => NewsletterError::Iq(iq),
+            Ok(client) => NewsletterError::Client(client),
+            Err(other) => match other.downcast::<IqError>() {
+                Ok(iq) => NewsletterError::Iq(iq),
+                Err(other) => NewsletterError::Internal(other),
+            },
+        }
+    }
+}
+
 // Types
 
 #[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
@@ -431,7 +448,8 @@ impl<'a> Newsletter<'a> {
     ) -> Result<(), NewsletterError> {
         self.client
             .send_server_reaction(jid, server_id, reaction)
-            .await?;
+            .await
+            .map_err(NewsletterError::from_anyhow)?;
         Ok(())
     }
 
