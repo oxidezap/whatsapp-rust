@@ -63,6 +63,32 @@ impl MessageUtils {
         buf
     }
 
+    /// Same wire output as [`encode_and_pad_with_context`](Self::encode_and_pad_with_context)
+    /// but the message is already encoded into `content`. The DM send path shares one
+    /// encode between the reporting token (field extraction) and the wire plaintext, so
+    /// the shared bytes are spliced + padded here instead of re-encoding the message.
+    /// `content` must be the message's encoding with no reporting context spliced on (the
+    /// caller only takes this path when the message has no top-level message_context_info).
+    pub fn pad_with_context_from_encoded(
+        content: &[u8],
+        extra_context: Option<&wa::MessageContextInfo>,
+    ) -> Vec<u8> {
+        let pad = Self::random_pad_len();
+        let extra_len = extra_context.map_or(0, |c| {
+            len_delimited_len(
+                TAG_MESSAGE_CONTEXT_INFO,
+                waproto::codec::message_context_info_encoded_len(c),
+            )
+        });
+        let mut buf = Vec::with_capacity(content.len() + extra_len + pad as usize);
+        buf.extend_from_slice(content);
+        if let Some(c) = extra_context {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, c, &mut buf);
+        }
+        buf.resize(buf.len() + pad as usize, pad);
+        buf
+    }
+
     /// Build both DM plaintexts (recipient and own-device DeviceSentMessage) from a
     /// single encode of the shared message content, splicing in the reporting-token
     /// `extra_context` (message_secret + reporting_token_version) without cloning the
@@ -147,6 +173,52 @@ impl MessageUtils {
         }
 
         // Finish the recipient now that its content has been spliced into own_devices.
+        if let Some(extra) = extra_context {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, extra, &mut recipient);
+        }
+
+        DmPlaintexts {
+            recipient: Self::pad_message_v2(recipient),
+            own_devices: Self::pad_message_v2(own_devices),
+        }
+    }
+
+    /// Same wire output as [`encode_dm_plaintexts`](Self::encode_dm_plaintexts)'s common
+    /// (no top-level message_context_info) path, but the shared content is already encoded
+    /// into `content`. The DM send path reuses the single message encode it also feeds to
+    /// the reporting token, so the message is no longer encoded twice per send. `content`
+    /// must be the message's encoding with no reporting context spliced on.
+    pub fn dm_plaintexts_from_encoded(
+        content: &[u8],
+        extra_context: Option<&wa::MessageContextInfo>,
+        destination_jid: &str,
+    ) -> DmPlaintexts {
+        const MAX_PAD: usize = 16;
+
+        let mci_field_len = extra_context.map_or(0, |m| {
+            len_delimited_len(
+                TAG_MESSAGE_CONTEXT_INFO,
+                waproto::codec::message_context_info_encoded_len(m),
+            )
+        });
+        let content_len = content.len();
+        let dest = destination_jid.as_bytes();
+
+        let mut recipient = Vec::with_capacity(content_len + mci_field_len + MAX_PAD);
+        recipient.extend_from_slice(content);
+
+        let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest.len())
+            + len_delimited_len(TAG_DSM_MESSAGE, content_len);
+        let own_cap = len_delimited_len(TAG_DEVICE_SENT_MESSAGE, dsm_len) + mci_field_len + MAX_PAD;
+        let mut own_devices = Vec::with_capacity(own_cap);
+        push_varint((TAG_DEVICE_SENT_MESSAGE << 3) | 2, &mut own_devices); // field 31 key
+        push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
+        push_len_delimited(TAG_DSM_DESTINATION_JID, dest, &mut own_devices);
+        push_len_delimited(TAG_DSM_MESSAGE, content, &mut own_devices);
+        if let Some(extra) = extra_context {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, extra, &mut own_devices);
+        }
+
         if let Some(extra) = extra_context {
             push_message_field(TAG_MESSAGE_CONTEXT_INFO, extra, &mut recipient);
         }
@@ -1435,6 +1507,68 @@ mod device_sent_tests {
                     decode_padded(&recipient_only),
                     decode_padded(&dm_recipient),
                     "recipient-only encode diverged from encode_dm_plaintexts ({message:?}, extra={extra:?})"
+                );
+            }
+        }
+    }
+
+    /// The `_from_encoded` encoders let the DM send path reuse the single message encode
+    /// it also feeds to the reporting token. They must produce byte-identical wire output
+    /// (modulo random padding) to re-encoding the message via `encode_and_pad_with_context`
+    /// / `encode_dm_plaintexts`, or the shared-encode send path would corrupt the payload.
+    /// Their precondition is a message with no top-level mci, so only those shapes apply.
+    #[test]
+    fn from_encoded_encoders_match_reencoding_without_top_level_mci() {
+        let dest = "5511999998888:3@s.whatsapp.net";
+        let reporting_ctx = reporting_context(&[0x5Au8; 32]);
+
+        let unpad = |b: &[u8]| MessageUtils::unpad_message_ref(b, 2).unwrap().to_vec();
+
+        let shapes = [
+            wa::Message {
+                conversation: Some("ping".into()),
+                ..Default::default()
+            },
+            wa::Message {
+                conversation: Some("héllo 🚀 ".repeat(500)),
+                ..Default::default()
+            },
+            wa::Message {
+                image_message: Some(Box::new(wa::message::ImageMessage {
+                    url: Some("https://mmg.example/abc".into()),
+                    media_key: Some(vec![9u8; 32]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ];
+
+        for message in shapes {
+            assert!(
+                message.message_context_info.is_none(),
+                "the _from_encoded path only applies to messages without a top-level mci"
+            );
+            let content = waproto::codec::message_to_vec(&message);
+            for extra in [None, Some(&reporting_ctx)] {
+                assert_eq!(
+                    unpad(&MessageUtils::pad_with_context_from_encoded(
+                        &content, extra
+                    )),
+                    unpad(&MessageUtils::encode_and_pad_with_context(&message, extra)),
+                    "pad_with_context_from_encoded diverged ({message:?}, extra={extra:?})"
+                );
+
+                let from_encoded = MessageUtils::dm_plaintexts_from_encoded(&content, extra, dest);
+                let reencoded = MessageUtils::encode_dm_plaintexts(&message, extra, dest);
+                assert_eq!(
+                    unpad(&from_encoded.recipient),
+                    unpad(&reencoded.recipient),
+                    "dm_plaintexts_from_encoded recipient diverged ({message:?}, extra={extra:?})"
+                );
+                assert_eq!(
+                    unpad(&from_encoded.own_devices),
+                    unpad(&reencoded.own_devices),
+                    "dm_plaintexts_from_encoded own_devices diverged ({message:?}, extra={extra:?})"
                 );
             }
         }

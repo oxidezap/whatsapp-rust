@@ -61,19 +61,34 @@ pub async fn prepare_dm_stanza(
     extra_stanza_nodes: &[Node],
     all_devices: Vec<Jid>,
 ) -> Result<PreparedDmStanza> {
+    // Encode the message once and thread those bytes through both the reporting token
+    // (whitelisted-field extraction) and the wire plaintext below, instead of encoding it
+    // twice per send. The rare mci-hoist path (message carries a top-level
+    // message_context_info) can't share: its plaintext folds the reporting secret into the
+    // existing mci, diverging from the bytes the token is computed over, so it re-encodes.
+    let shared_content = message
+        .message_context_info
+        .is_none()
+        .then(|| waproto::codec::message_to_vec(message));
+
     // sender is the author's own jid, remote is the chat jid (WAWebReportingTokenUtils:
     // getSender vs e.to). Both previously used to_jid, conflating sender with remote.
     // Reuse the message's own secret when the caller set one (e.g. polls), instead of
     // minting a fresh one that would overwrite it: WA Web derives the reporting token
     // from the message's existing messageSecret (`p ?? e.messageSecret`), and a poll's
     // creator must keep the secret that ends up on the wire to decrypt later votes.
-    let reporting_result = generate_reporting_token(
-        message,
-        &request_id,
-        own_jid,
-        &to_jid,
-        crate::reporting_token::extract_message_secret(message),
-    );
+    let existing_secret = crate::reporting_token::extract_message_secret(message);
+    let reporting_result = match &shared_content {
+        Some(content) => generate_reporting_token_from_encoded(
+            message,
+            content,
+            &request_id,
+            own_jid,
+            &to_jid,
+            existing_secret,
+        ),
+        None => generate_reporting_token(message, &request_id, own_jid, &to_jid, existing_secret),
+    };
 
     // The reporting token's MessageContextInfo (message_secret + version) is spliced
     // straight onto the encoded plaintexts instead of deep-cloning the whole message
@@ -91,25 +106,27 @@ pub async fn prepare_dm_stanza(
     )
     .ok();
 
-    // Encode the shared content once and splice it into both the recipient plaintext
-    // and the own-device DeviceSentMessage plaintext, instead of encoding the message
-    // twice (recipient + DSM) and boxing it via wrap_device_sent.
-    //
-    // With no own companion devices (e.g. an account with nothing else linked), the
-    // DeviceSentMessage plaintext — and the destination-jid stringify it needs — would
-    // be built only to go unused below, so encode just the recipient. The mci-hoist
-    // path (message carries a top-level message_context_info) keeps the exact shared
-    // splice so its on-wire recipient encoding is unchanged.
+    // Splice the shared content into the recipient plaintext and, when present, the
+    // own-device DeviceSentMessage plaintext. With no own companion devices (e.g. an
+    // account with nothing else linked), the DSM plaintext — and the destination-jid
+    // stringify it needs — would be built only to go unused, so encode just the recipient.
+    // The mci-hoist path re-encodes via `encode_dm_plaintexts` (see `shared_content`).
     let crate::messages::DmPlaintexts {
         recipient: recipient_plaintext,
         own_devices: own_devices_plaintext,
-    } = if own_other_devices.is_empty() && message.message_context_info.is_none() {
-        crate::messages::DmPlaintexts {
-            recipient: MessageUtils::encode_and_pad_with_context(message, extra_context.as_ref()),
+    } = match &shared_content {
+        Some(content) if own_other_devices.is_empty() => crate::messages::DmPlaintexts {
+            recipient: MessageUtils::pad_with_context_from_encoded(content, extra_context.as_ref()),
             own_devices: Vec::new(),
+        },
+        Some(content) => MessageUtils::dm_plaintexts_from_encoded(
+            content,
+            extra_context.as_ref(),
+            &to_jid.to_string(),
+        ),
+        None => {
+            MessageUtils::encode_dm_plaintexts(message, extra_context.as_ref(), &to_jid.to_string())
         }
-    } else {
-        MessageUtils::encode_dm_plaintexts(message, extra_context.as_ref(), &to_jid.to_string())
     };
 
     let mut participant_nodes = Vec::with_capacity(total_devices);

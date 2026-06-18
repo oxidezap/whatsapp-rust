@@ -7,7 +7,8 @@ use crate::libsignal::protocol::{
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::messages::MessageUtils;
 use crate::reporting_token::{
-    build_reporting_node, generate_reporting_token, reporting_context_info,
+    build_reporting_node, generate_reporting_token, generate_reporting_token_from_encoded,
+    reporting_context_info,
 };
 use crate::runtime::{AbortHandle, Runtime};
 use crate::types::jid::JidExt;
