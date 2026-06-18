@@ -40,17 +40,23 @@ fn rt() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// A connected, session-warmed client pair reused across all send/receive
-/// iterations. Connecting + warming a pair is far more expensive than the
-/// measured send, so it is done once (unmeasured) and shared. `wait_for_text`
-/// needs `&mut`, hence the `Mutex`.
+/// A connected, session-warmed client pair. Connecting + warming a pair is far
+/// more expensive than the measured send, so it is done once (unmeasured) and
+/// reused across iterations. `wait_for_text` needs `&mut`, hence the `Mutex`.
 struct Pair {
     a: TestClient,
     b: TestClient,
     jid_b: Jid,
 }
 
-static PAIR: OnceLock<Mutex<Pair>> = OnceLock::new();
+// Separate pairs for the sender-only and round-trip benches. `send_message`
+// never drains client `b`, so its delivered messages accumulate in `b`'s
+// unbounded event channel; sharing one pair would force `send_and_receive`'s
+// measured `wait_for_text` to discard that backlog first, leaking the send
+// bench's iteration count into the round-trip result. Dedicated pairs keep each
+// bench's measurement independent of the other (and of divan's run order).
+static PAIR_SEND: OnceLock<Mutex<Pair>> = OnceLock::new();
+static PAIR_RECV: OnceLock<Mutex<Pair>> = OnceLock::new();
 
 /// Monotonic counter producing a unique body per measured iteration. The mock
 /// server dedupes identical message bodies, so reusing one would let later
@@ -64,27 +70,33 @@ fn unique_body(tag: &str) -> String {
 /// Connect two clients and warm their Signal session with one throwaway
 /// round-trip, so measured sends exercise steady state (plain `msg`), not the
 /// first-message pre-key path.
-fn pair() -> &'static Mutex<Pair> {
-    PAIR.get_or_init(|| {
-        rt().block_on(async {
-            let a = TestClient::connect("bench_pair_a")
-                .await
-                .expect("connect client a");
-            let mut b = TestClient::connect("bench_pair_b")
-                .await
-                .expect("connect client b");
-            let jid_b = b.jid().await;
+fn connect_warmed_pair(prefix_a: &str, prefix_b: &str) -> Mutex<Pair> {
+    rt().block_on(async {
+        let a = TestClient::connect(prefix_a)
+            .await
+            .expect("connect client a");
+        let mut b = TestClient::connect(prefix_b)
+            .await
+            .expect("connect client b");
+        let jid_b = b.jid().await;
 
-            let warm = unique_body("warmup");
-            a.client
-                .send_message(jid_b.clone(), text_msg(&warm))
-                .await
-                .expect("send warmup message");
-            b.wait_for_text(&warm, 30).await.expect("receive warmup");
+        let warm = unique_body("warmup");
+        a.client
+            .send_message(jid_b.clone(), text_msg(&warm))
+            .await
+            .expect("send warmup message");
+        b.wait_for_text(&warm, 30).await.expect("receive warmup");
 
-            Mutex::new(Pair { a, b, jid_b })
-        })
+        Mutex::new(Pair { a, b, jid_b })
     })
+}
+
+fn pair_send() -> &'static Mutex<Pair> {
+    PAIR_SEND.get_or_init(|| connect_warmed_pair("bench_send_a", "bench_send_b"))
+}
+
+fn pair_recv() -> &'static Mutex<Pair> {
+    PAIR_RECV.get_or_init(|| connect_warmed_pair("bench_recv_a", "bench_recv_b"))
 }
 
 // x20 coverage: divan's `args` runs the bench once per value and reports each
@@ -119,7 +131,7 @@ fn connect_to_ready(bencher: divan::Bencher) {
 #[divan::bench(args = BATCH_SIZES)]
 fn send_message(bencher: divan::Bencher, n: u64) {
     let rt = rt();
-    let pair = pair();
+    let pair = pair_send();
     bencher.bench_local(|| {
         rt.block_on(async {
             let guard = pair.lock().await;
@@ -141,7 +153,7 @@ fn send_message(bencher: divan::Bencher, n: u64) {
 #[divan::bench(args = BATCH_SIZES)]
 fn send_and_receive(bencher: divan::Bencher, n: u64) {
     let rt = rt();
-    let pair = pair();
+    let pair = pair_recv();
     bencher.bench_local(|| {
         rt.block_on(async {
             let mut guard = pair.lock().await;
