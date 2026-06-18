@@ -58,12 +58,13 @@ fn main() {
     divan::main();
 }
 
-// A single current-thread runtime shared by every bench. CodSpeed runs only the
-// Valgrind simulation+memory instruments, which serialize threads onto one core, so a
-// multi-thread scheduler buys no measurable signal — only variance, since its worker
-// count tracks the runner's CPU count (per-runner thread stacks + scheduling). The
-// client has no `block_in_place`, so current_thread drives it fine. Built once so
-// runtime startup isn't charged to the measured region.
+// A single multi-thread runtime pinned to a fixed worker count, shared by every
+// bench. The default worker count tracks the runner's CPU count, so thread stacks and
+// scheduling varied per runner; pinning it makes the benches runner-independent. A
+// fixed count rather than current_thread because the background event drainers
+// (connect_warmed_pair) must keep draining between divan samples to preserve
+// cross-sample isolation, and current_thread freezes spawned tasks outside block_on.
+// Built once so runtime startup isn't charged to the measured region.
 static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn rt() -> &'static tokio::runtime::Runtime {
@@ -73,10 +74,11 @@ fn rt() -> &'static tokio::runtime::Runtime {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
             .try_init()
             .ok();
-        tokio::runtime::Builder::new_current_thread()
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
-            .expect("build current-thread bench runtime")
+            .expect("build bench runtime")
     })
 }
 
