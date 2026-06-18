@@ -880,25 +880,10 @@ impl Client {
             .ok_or_else(|| anyhow::anyhow!("<keys> child missing from retry receipt"))?;
         validate_retry_prekey_presence(keys_node, is_fbid_bot_retry)?;
 
-        let registration_node = node.get_optional_child("registration");
-
-        // Extract registration ID (4 bytes big-endian).
-        let registration_id = registration_node
-            .and_then(get_bytes_content_ref)
-            .map(|bytes| {
-                if bytes.len() >= 4 {
-                    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-                } else if !bytes.is_empty() {
-                    // Handle variable-length encoding.
-                    let mut arr = [0u8; 4];
-                    let start = 4 - bytes.len();
-                    arr[start..].copy_from_slice(bytes);
-                    u32::from_be_bytes(arr)
-                } else {
-                    0
-                }
-            })
-            .unwrap_or(0);
+        // Use the centralized extractor so the >4-byte rejection rule applies
+        // here too, not just on the no-keys retry path.
+        let registration_id =
+            wacore::protocol::retry::extract_registration_id_from_node_ref(node).unwrap_or(0);
 
         if registration_id == 0 {
             return Err(anyhow::anyhow!("Invalid registration ID in retry receipt"));
