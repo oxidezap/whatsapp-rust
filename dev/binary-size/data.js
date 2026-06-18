@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781790730150,
+  "lastUpdate": 1781795536896,
   "repoUrl": "https://github.com/oxidezap/whatsapp-rust",
   "entries": {
     "whatsapp-rust binary size": [
@@ -3843,6 +3843,130 @@ window.BENCHMARK_DATA = {
           {
             "name": "deps crates (Cargo.lock)",
             "value": 349,
+            "unit": "crates"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "55464917+jlucaso1@users.noreply.github.com",
+            "name": "João Lucas",
+            "username": "jlucaso1"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b88629b438d118db6afc4668bf8a88a4a234b76f",
+          "message": "chore(deps): prune the aes-gcm dev-dep and tidy dependency declarations (#899)",
+          "timestamp": "2026-06-18T12:06:14-03:00",
+          "tree_id": "bb10eda4aed212df3d8f1ac5dd5ce84ae5459018",
+          "url": "https://github.com/oxidezap/whatsapp-rust/commit/b88629b438d118db6afc4668bf8a88a4a234b76f"
+        },
+        "date": 1781795535478,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "bin size (stripped)",
+            "value": 11101688,
+            "unit": "bytes"
+          },
+          {
+            "name": "bin .text",
+            "value": 9122550,
+            "unit": "bytes"
+          },
+          {
+            "name": "bin allocated (text+data+bss)",
+            "value": 11099473,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text whatsapp_rust",
+            "value": 1511433,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text wacore",
+            "value": 530072,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text wacore_binary",
+            "value": 160494,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text wacore_libsignal",
+            "value": 170629,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text wacore_appstate",
+            "value": 37871,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text wacore_noise",
+            "value": 28375,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text waproto",
+            "value": 897244,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text whatsapp_rust_sqlite_storage",
+            "value": 212464,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text whatsapp_rust_tokio_transport",
+            "value": 33271,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text whatsapp_rust_ureq_http_client",
+            "value": 6076,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text std",
+            "value": 1189803,
+            "unit": "bytes"
+          },
+          {
+            "name": ".text other deps",
+            "value": 4271244,
+            "unit": "bytes"
+          },
+          {
+            "name": "llvm-lines wacore",
+            "value": 639574,
+            "unit": "lines"
+          },
+          {
+            "name": "llvm-lines wacore copies",
+            "value": 17666,
+            "unit": "copies"
+          },
+          {
+            "name": "llvm-lines whatsapp-rust lib",
+            "value": 654850,
+            "unit": "lines"
+          },
+          {
+            "name": "llvm-lines whatsapp-rust lib copies",
+            "value": 20155,
+            "unit": "copies"
+          },
+          {
+            "name": "deps crates (Cargo.lock)",
+            "value": 347,
             "unit": "crates"
           }
         ]
