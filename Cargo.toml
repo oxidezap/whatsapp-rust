@@ -47,7 +47,6 @@ disallowed_methods = "deny"
 [workspace.dependencies]
 # Shared dependencies
 aes = "0.9.0"
-aes-gcm = { version = "0.11.0-rc.3", default-features = false, features = ["aes", "alloc", "bytes"] }
 anyhow = { version = "1.0", default-features = false }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
 async-lock = { version = "3", default-features = false }
@@ -55,6 +54,7 @@ async-trait = "0.1.89"
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 bytemuck = { version = "1.22", default-features = false }
 bytes = { version = "1.5", default-features = false }
+cbc = { version = "0.2", features = ["alloc"] }
 chrono = { version = "0.4", default-features = false }
 compact_str = { version = "0.9", default-features = false }
 ctr = { version = "0.10", default-features = false }
@@ -170,7 +170,7 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
 aes = { workspace = true }
-cbc = { version = "0.2", features = ["alloc", "block-padding"] }
+cbc = { workspace = true, features = ["block-padding"] }
 env_logger = { workspace = true }
 flate2 = { workspace = true }
 hkdf = { workspace = true }

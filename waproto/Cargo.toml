@@ -7,6 +7,11 @@ license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
 description = "Protocol Buffers definitions for WhatsApp"
 
+# `serde` is referenced only by derives injected into the generated code by
+# `build.rs` (`#[derive(serde::Serialize)]`), so static analysers miss it.
+[package.metadata.cargo-machete]
+ignored = ["serde"]
+
 [features]
 default = []
 serde-deserialize = []
