@@ -49,6 +49,21 @@ pub enum SendError {
     Internal(#[from] anyhow::Error),
 }
 
+impl SendError {
+    /// Map an `anyhow::Error` bubbled up from a helper that still threads
+    /// `anyhow` (e.g. `send_message_impl`, `require_pn`) into a typed
+    /// `SendError`, recovering the concrete [`ClientError`]. Without this the
+    /// blanket `#[from] anyhow::Error` would funnel a logged-out
+    /// `ClientError::NotLoggedIn` into the un-matchable `Internal` catch-all.
+    fn from_anyhow(err: anyhow::Error) -> Self {
+        match err.downcast::<ClientError>() {
+            Ok(ClientError::NotLoggedIn) => SendError::NotLoggedIn,
+            Ok(client) => SendError::Client(client),
+            Err(other) => SendError::Internal(other),
+        }
+    }
+}
+
 /// Returns a `GroupInfo` whose participant list is guaranteed to contain our own
 /// sending JID, without deep-cloning the shared (cached) metadata in the common
 /// case where the server's participant list already includes us.
@@ -578,7 +593,8 @@ impl Client {
             extra_nodes,
             stanza_type_override,
         )
-        .await?;
+        .await
+        .map_err(SendError::from_anyhow)?;
         Ok(result)
     }
 
@@ -1181,7 +1197,7 @@ impl Client {
         message_id: String,
         revoke_type: RevokeType,
     ) -> Result<(), SendError> {
-        self.require_pn()?;
+        self.require_pn().map_err(SendError::from_anyhow)?;
 
         let (from_me, participant, edit_attr) = match &revoke_type {
             RevokeType::Sender => {
@@ -1234,7 +1250,8 @@ impl Client {
             vec![],
             None,
         )
-        .await?;
+        .await
+        .map_err(SendError::from_anyhow)?;
         Ok(())
     }
 
@@ -1322,7 +1339,8 @@ impl Client {
             vec![],
             None,
         )
-        .await?;
+        .await
+        .map_err(SendError::from_anyhow)?;
         Ok(())
     }
 
@@ -2432,6 +2450,30 @@ mod tests {
         assert!(
             msg.contains("reaction_message") || msg.contains("status"),
             "unexpected error: {msg}"
+        );
+    }
+
+    // A logged-out send goes through send_message_impl, whose internal
+    // `ClientError::NotLoggedIn` is threaded as `anyhow`. The wrapper must
+    // surface the typed `SendError::NotLoggedIn`, not the `Internal` catch-all,
+    // so callers can match it (regression test for r3432644890).
+    #[tokio::test]
+    async fn send_message_logged_out_dm_returns_not_logged_in() {
+        let client = crate::test_utils::create_test_client().await;
+        let to: Jid = "111111111111@s.whatsapp.net".parse().unwrap();
+        let err = client
+            .send_message(
+                to,
+                wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("logged-out DM send must error");
+        assert!(
+            matches!(err, SendError::NotLoggedIn),
+            "expected SendError::NotLoggedIn, got: {err:?}"
         );
     }
 
