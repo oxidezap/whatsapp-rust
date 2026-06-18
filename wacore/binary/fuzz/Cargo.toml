@@ -1,0 +1,32 @@
+[package]
+name = "wacore-binary-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the parent cargo workspace. The fuzz crate depends on
+# `libfuzzer-sys` (nightly + libFuzzer) and must never be pulled into
+# `cargo build --workspace`, clippy, or the binary-size CI. An empty
+# `[workspace]` table makes this directory its own workspace root.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.wacore-binary]
+path = ".."
+
+[[bin]]
+name = "unmarshal_ref"
+path = "fuzz_targets/unmarshal_ref.rs"
+test = false
+doc = false
+bench = false
+
+# libFuzzer needs debug info and benefits from optimization; mirror the
+# defaults `cargo fuzz init` generates.
+[profile.release]
+debug = 1
