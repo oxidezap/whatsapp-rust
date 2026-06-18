@@ -1,6 +1,6 @@
 # Binary Size CI
 
-`binary-size.yml` tracks the size of the `whatsapp-rust` bin (default features, real release profile) on every PR and main push, so heavy new dependencies and monomorphization regressions surface before they accumulate.
+`binary-size.yml` tracks the size of the `demo` example — the default-feature binary entry point that links the whole library, since the package no longer ships a bin — (default features, real release profile) on every PR and main push, so heavy new dependencies and monomorphization regressions surface before they accumulate.
 
 ## What is measured
 

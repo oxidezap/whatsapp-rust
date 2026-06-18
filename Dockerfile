@@ -53,8 +53,10 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN rustc -vV | sed -n 's/^host: //p' > /rust-target && test -s /rust-target
 RUN cargo chef cook --release --recipe-path recipe.json --target "$(cat /rust-target)"
 COPY . .
-RUN cargo build --release --target "$(cat /rust-target)" \
-    && cp "target/$(cat /rust-target)/release/whatsapp-rust" /app/whatsapp-rust-bin
+# The client lives in examples/demo.rs (the package no longer ships a bin); the
+# example artifact lands under release/examples/. Default features cover it.
+RUN cargo build --release --example demo --target "$(cat /rust-target)" \
+    && cp "target/$(cat /rust-target)/release/examples/demo" /app/whatsapp-rust-bin
 
 # --- Runtime: static binary on empty image ---
 FROM scratch

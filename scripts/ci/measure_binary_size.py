@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Measure binary-size metrics for the size-tracking CI job.
 
-Builds the `whatsapp-rust` bin with the real release profile (fat LTO,
+Builds the `demo` example (the package's default-feature entry point, which
+links the whole library) with the real release profile (fat LTO,
 codegen-units=1) but with symbols kept, then derives every metric from that
 single build:
 
@@ -26,7 +27,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-BIN_NAME = "whatsapp-rust"
+# The demo example is the default-feature binary entry point (the package no
+# longer ships a `whatsapp-rust` bin); it links the whole library, so it is the
+# size proxy. The artifact lands at target/release/examples/<EXAMPLE_NAME>.
+EXAMPLE_NAME = "demo"
 # Workspace crates tracked as individual series; everything else is summed
 # into "other deps" so the series set stays stable as dependencies churn.
 WORKSPACE_CRATES = [
@@ -63,7 +67,7 @@ def build_env():
 
 
 def measure_stripped_size(bin_path: Path, out_dir: Path) -> int:
-    stripped = out_dir / f"{BIN_NAME}-stripped"
+    stripped = out_dir / f"{EXAMPLE_NAME}-stripped"
     shutil.copy2(bin_path, stripped)
     run(["strip", "--strip-all", str(stripped)])
     size = stripped.stat().st_size
@@ -91,7 +95,7 @@ def measure_sections(bin_path: Path) -> tuple[int, int]:
 
 def run_cargo_bloat(env) -> dict:
     proc = run(
-        ["cargo", "bloat", "--release", "--bin", BIN_NAME, "--crates",
+        ["cargo", "bloat", "--release", "--example", EXAMPLE_NAME, "--crates",
          "--message-format", "json", "-n", "0"],
         capture_output=True, text=True, env=env,
     )
@@ -140,10 +144,11 @@ def main():
     env = build_env()
 
     if not args.skip_build:
-        run(["cargo", "build", "--release", "--locked", "--bin", BIN_NAME], env=env)
+        run(["cargo", "build", "--release", "--locked", "--example", EXAMPLE_NAME],
+            env=env)
 
     target_dir = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
-    bin_path = target_dir / "release" / BIN_NAME
+    bin_path = target_dir / "release" / "examples" / EXAMPLE_NAME
     if not bin_path.exists():
         raise RuntimeError(f"binary not found at {bin_path}")
 

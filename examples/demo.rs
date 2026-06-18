@@ -12,11 +12,11 @@ const PONG_TEXT: &str = "🏓 Pong!";
 const REACTION_EMOJI: &str = "🏓";
 
 // Usage:
-//   cargo run                                      # QR code pairing only
-//   cargo run -- --phone 15551234567               # Pair code + QR code (concurrent)
-//   cargo run -- -p 15551234567                    # Short form
-//   cargo run -- -p 15551234567 --code MYCODE12    # Custom 8-char pair code
-//   cargo run -- -p 15551234567 -c MYCODE12        # Short form
+//   cargo run --example demo                                      # QR code pairing only
+//   cargo run --example demo -- --phone 15551234567               # Pair code + QR code (concurrent)
+//   cargo run --example demo -- -p 15551234567                    # Short form
+//   cargo run --example demo -- -p 15551234567 --code MYCODE12    # Custom 8-char pair code
+//   cargo run --example demo -- -p 15551234567 -c MYCODE12        # Short form
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let phone_number = parse_arg(&args, "--phone", "-p");

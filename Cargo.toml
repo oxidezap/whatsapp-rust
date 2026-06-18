@@ -138,7 +138,6 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
-env_logger = { workspace = true }
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }
 hex = { workspace = true }
@@ -172,6 +171,7 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 [dev-dependencies]
 aes = { workspace = true }
 cbc = { version = "0.2", features = ["alloc", "block-padding"] }
+env_logger = { workspace = true }
 flate2 = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
@@ -186,6 +186,11 @@ wacore-noise = { path = "./wacore/noise", features = [
 
 [lints]
 workspace = true
+
+# The demo client. Needs only the package default features, so a plain
+# `cargo build --example demo` works without `required-features`.
+[[example]]
+name = "demo"
 
 [[example]]
 name = "benchmark"

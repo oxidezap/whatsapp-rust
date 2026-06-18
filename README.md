@@ -96,9 +96,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Run the included demo bot:
 
 ```bash
-cargo run                              # QR code only
-cargo run -- -p 15551234567            # Pair code + QR code
-cargo run -- -p 15551234567 -c MYCODE  # Custom pair code
+cargo run --example demo                              # QR code only
+cargo run --example demo -- -p 15551234567            # Pair code + QR code
+cargo run --example demo -- -p 15551234567 -c MYCODE  # Custom pair code
 ```
 
 ## Project Structure
