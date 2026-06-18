@@ -13,7 +13,7 @@ arrayref = "0.3.9"
 async-lock = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
-cbc = { version = "0.2", features = ["alloc"] }
+cbc = { workspace = true }
 chrono = { workspace = true, features = ["now"] }
 ctr = { workspace = true }
 curve25519-dalek = "5.0.0-rc.0"
@@ -29,7 +29,7 @@ rand = { workspace = true }
 serde = { workspace = true, features = ["alloc"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-subtle = "2.6.1"
+subtle = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 waproto = { workspace = true }

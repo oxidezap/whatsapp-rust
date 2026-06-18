@@ -18,17 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "aead"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1973cfbc1a2daf9cf550e74e1f088c28e7f7d8c1e1418fb6c9dc5184b7e84c99"
-dependencies = [
- "bytes",
- "crypto-common",
- "inout",
-]
-
-[[package]]
 name = "aes"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -37,20 +26,6 @@ dependencies = [
  "cipher",
  "cpubits",
  "cpufeatures",
-]
-
-[[package]]
-name = "aes-gcm"
-version = "0.11.0-rc.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da8c919c118108f144adecad74b425b804ad075580d605d9b33c2d6d1c62a2f8"
-dependencies = [
- "aead",
- "aes",
- "cipher",
- "ctr",
- "ghash",
- "subtle",
 ]
 
 [[package]]
@@ -195,12 +170,10 @@ dependencies = [
  "dhat",
  "e2e-tests",
  "env_logger",
- "log",
  "serde",
  "serde_json",
  "tokio",
  "wacore",
- "whatsapp-rust",
 ]
 
 [[package]]
@@ -2812,7 +2785,6 @@ name = "wacore"
 version = "0.6.0"
 dependencies = [
  "aes",
- "aes-gcm",
  "anyhow",
  "async-channel",
  "async-lock",
