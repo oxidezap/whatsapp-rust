@@ -473,24 +473,25 @@ impl Client {
                 // Seed one CSPRNG and advance it per key, rather than reseeding from
                 // entropy on every iteration.
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-                let mut records = Vec::with_capacity(gen_count);
+                // Encode each record into the shared buffer and drop it immediately, so
+                // the full batch of PreKeyRecordStructures (each owning two heap Vecs for
+                // its key bytes) is never resident at once — that batch was the dominant
+                // controllable peak on the connect path. A record is at most 73 wire bytes
+                // (id field <=5B + two 34B key fields), so reserving by that bound keeps
+                // the buffer at a single allocation.
+                const MAX_RECORD_LEN: usize = 73;
                 let mut pubkeys = Vec::with_capacity(gen_count);
+                let mut offsets = Vec::with_capacity(gen_count);
+                let mut buf = Vec::with_capacity(gen_count * MAX_RECORD_LEN);
                 for i in 0..gen_count {
                     let pre_key_id = gen_start + i as u32;
                     let key_pair = KeyPair::generate(&mut rng);
-                    pubkeys.push((pre_key_id, key_pair.public_key));
-                    records.push((pre_key_id, new_pre_key_record(pre_key_id, &key_pair)));
-                }
-
-                let total_len: usize = records.iter().map(|(_, r)| r.encoded_len()).sum();
-                let mut buf = Vec::with_capacity(total_len);
-                let mut offsets = Vec::with_capacity(records.len());
-                for (id, record) in &records {
                     let start = buf.len();
-                    record
+                    new_pre_key_record(pre_key_id, &key_pair)
                         .encode(&mut buf)
                         .expect("prost encode into pre-sized Vec");
-                    offsets.push((*id, start..buf.len()));
+                    offsets.push((pre_key_id, start..buf.len()));
+                    pubkeys.push((pre_key_id, key_pair.public_key));
                 }
                 let shared = bytes::Bytes::from(buf);
                 let encoded_batch: Vec<(u32, bytes::Bytes)> = offsets
