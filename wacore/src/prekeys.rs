@@ -443,6 +443,22 @@ mod tests {
         let truncated = &record[..record.len() - 1];
         assert!(waproto::whatsapp::PreKeyRecordStructure::decode(truncated).is_err());
         assert_eq!(extract_prekey_public_key(truncated), None);
+
+        // A malformed varint in a trailing field (10 continuation bytes that never
+        // terminate): a full decode errors on the bad varint, and the extractor
+        // agrees even though a valid publicKey precedes it.
+        let mut bad_varint = record.clone();
+        bad_varint.push(0x08); // field 1, wire type 0 (varint)
+        bad_varint.extend_from_slice(&[0xFF; 10]);
+        assert!(waproto::whatsapp::PreKeyRecordStructure::decode(&bad_varint[..]).is_err());
+        assert_eq!(extract_prekey_public_key(&bad_varint), None);
+
+        // An unsupported wire type (3 = start group): prost rejects the dangling
+        // group, and the extractor rejects every wire type it cannot frame.
+        let mut bad_wire = record.clone();
+        bad_wire.push(0x0B); // field 1, wire type 3 (start group)
+        assert!(waproto::whatsapp::PreKeyRecordStructure::decode(&bad_wire[..]).is_err());
+        assert_eq!(extract_prekey_public_key(&bad_wire), None);
     }
 
     fn create_mock_bundle(device_id: u32) -> PreKeyBundle {

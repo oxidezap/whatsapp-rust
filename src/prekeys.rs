@@ -455,6 +455,11 @@ impl Client {
             wanted,
         );
 
+        // Public keys of the freshly generated batch, kept from generation so the
+        // upload never reads them back out of the store and never decodes protobuf
+        // to recover a key it just held in hand. Empty when the plan only re-offers
+        // leftover window keys (gen_count == 0).
+        let mut fresh_pre_keys: Vec<(u32, PublicKey)> = Vec::new();
         if plan.gen_count > 0 {
             let gen_start = plan.gen_start;
             let gen_count = plan.gen_count as usize;
@@ -462,16 +467,18 @@ impl Client {
             // batch size is caller-configurable, so offload the whole batch to keep
             // the async executor responsive. Records are encoded into one contiguous
             // buffer with zero-copy Bytes slices instead of an alloc per record.
-            let encoded_batch = wacore::runtime::blocking(&*self.runtime, move || {
+            let (encoded_batch, generated) = wacore::runtime::blocking(&*self.runtime, move || {
                 use prost::Message;
 
                 // Seed one CSPRNG and advance it per key, rather than reseeding from
                 // entropy on every iteration.
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
                 let mut records = Vec::with_capacity(gen_count);
+                let mut pubkeys = Vec::with_capacity(gen_count);
                 for i in 0..gen_count {
                     let pre_key_id = gen_start + i as u32;
                     let key_pair = KeyPair::generate(&mut rng);
+                    pubkeys.push((pre_key_id, key_pair.public_key));
                     records.push((pre_key_id, new_pre_key_record(pre_key_id, &key_pair)));
                 }
 
@@ -490,7 +497,7 @@ impl Client {
                     .into_iter()
                     .map(|(id, range)| (id, shared.slice(range)))
                     .collect();
-                encoded_batch
+                (encoded_batch, pubkeys)
             })
             .await;
 
@@ -500,6 +507,7 @@ impl Client {
             // Propagate errors — uploading a key we can't store locally would cause
             // decryption failures when the server hands it out.
             backend.store_prekeys_batch(&encoded_batch, false).await?;
+            fresh_pre_keys = generated;
         }
 
         // Advance NEXT at GENERATION time (WA Web savePreKeys) and initialise
@@ -522,57 +530,64 @@ impl Client {
             .await
             .map_err(|e| anyhow::anyhow!("failed to flush prekey watermarks: {e:?}"))?;
 
-        // Load the upload window: leftover keys plus the fresh ones. Gaps are
-        // tolerated (a window key consumed via a retry receipt leaves a hole).
-        let window_ids: Vec<u32> = (0..wanted as u32).map(|i| plan.window_start + i).collect();
-        let mut rows = backend.load_prekeys_batch(&window_ids).await?;
-        rows.sort_unstable_by_key(|(id, _)| *id);
-        if rows.is_empty() {
-            // A fully consumed/missing window with no generation would bail
-            // forever (available > 0 keeps gen_count at 0). Collapse the
-            // window and rerun the pass so a one-shot caller still uploads.
-            if plan.gen_count == 0 {
-                self.persistence_manager
-                    .process_command(DeviceCommand::SetPreKeyWatermarks {
-                        next_pre_key_id: plan.new_next,
-                        first_unupload_pre_key_id: plan.new_next,
-                    })
-                    .await;
-                if allow_collapse_retry {
-                    log::warn!(
-                        "prekey window [{}, {}) fully missing; collapsed, regenerating",
-                        plan.window_start,
-                        plan.new_next
-                    );
-                    return Box::pin(self.upload_pre_keys_pass(false)).await;
-                }
+        // Only the leftover (already-stored) window keys are read back and decoded;
+        // the fresh ones are already in `fresh_pre_keys`. On the common connect path
+        // the window is all-fresh, so this reads and decodes nothing. Leftover gaps
+        // are tolerated (a window key consumed via a retry receipt leaves a hole).
+        let leftover_ids: Vec<u32> = (0..plan.available).map(|i| plan.window_start + i).collect();
+        let mut leftover_rows = if leftover_ids.is_empty() {
+            Vec::new()
+        } else {
+            backend.load_prekeys_batch(&leftover_ids).await?
+        };
+        leftover_rows.sort_unstable_by_key(|(id, _)| *id);
+
+        if plan.gen_count == 0 && leftover_rows.is_empty() {
+            // A fully consumed/missing leftover window with no generation would bail
+            // forever (available > 0 keeps gen_count at 0). Collapse the window and
+            // rerun the pass so a one-shot caller still uploads.
+            self.persistence_manager
+                .process_command(DeviceCommand::SetPreKeyWatermarks {
+                    next_pre_key_id: plan.new_next,
+                    first_unupload_pre_key_id: plan.new_next,
+                })
+                .await;
+            if allow_collapse_retry {
+                log::warn!(
+                    "prekey window [{}, {}) fully missing; collapsed, regenerating",
+                    plan.window_start,
+                    plan.new_next
+                );
+                return Box::pin(self.upload_pre_keys_pass(false)).await;
             }
             anyhow::bail!("no prekey available to upload");
         }
 
         let pre_key_pairs = {
-            let mut pairs: Vec<(u32, PublicKey)> = Vec::with_capacity(rows.len());
-            for (id, record) in &rows {
-                // Pull the public key straight out of the encoded record (field 2)
-                // rather than a full prost decode of the PreKeyRecordStructure: the
-                // upload only needs the public key, while a full decode also copies
-                // the private key into its own Vec. At the default batch of 812 keys
-                // that is ~2 throwaway allocations per record on the connect path.
-                // The extractor validates the record framing, so a malformed record
-                // returns None and is skipped here — same rejection the consume path
-                // (`get_pre_key`'s full decode) makes, so we never upload a key this
-                // device couldn't later decode with.
-                let public_key = match wacore::prekeys::extract_prekey_public_key(record) {
-                    Some(raw) => {
-                        PublicKey::from_djb_public_key_bytes(raw).map_err(anyhow::Error::from)
-                    }
-                    None => Err(anyhow::anyhow!("record missing or malformed public key")),
-                };
+            let mut pairs: Vec<(u32, PublicKey)> =
+                Vec::with_capacity(leftover_rows.len() + fresh_pre_keys.len());
+            // Leftover keys live only in the store, so decode them in full — the same
+            // `PreKeyRecordStructure::decode` the consume path runs, so a record
+            // accepted here is one this device can later decrypt with. Fresh keys skip
+            // decode entirely; their public keys never left memory.
+            use prost::Message;
+            for (id, record) in &leftover_rows {
+                let public_key = waproto::whatsapp::PreKeyRecordStructure::decode(&record[..])
+                    .map_err(anyhow::Error::from)
+                    .and_then(|s| {
+                        let raw = s
+                            .public_key
+                            .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
+                        PublicKey::from_djb_public_key_bytes(&raw).map_err(anyhow::Error::from)
+                    });
                 match public_key {
                     Ok(public_key) => pairs.push((*id, public_key)),
                     Err(e) => log::warn!("skipping undecodable prekey record {id}: {e:?}"),
                 }
             }
+            // Fresh ids exceed every leftover id and were generated in ascending
+            // order, so appending keeps `pairs` sorted (last_id reads the tail).
+            pairs.extend(fresh_pre_keys);
             if pairs.is_empty() {
                 anyhow::bail!("no decodable prekey available to upload");
             }
