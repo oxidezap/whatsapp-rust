@@ -958,11 +958,9 @@ impl Client {
                 // WA Web parity (ParticipantStore.js skDistribList): a device is
                 // warm only when it AND its primary (device 0) hold the key, so a
                 // forgotten primary redistributes the whole user while a forgotten
-                // companion redistributes only itself.
-                !cached_map
-                    .device_has_key(&device.user, device.device)
-                    .unwrap_or(false)
-                    || !cached_map.device_has_key(&device.user, 0).unwrap_or(false)
+                // companion redistributes only itself. One inner-map resolution
+                // per device (single user-string hash) instead of two.
+                !cached_map.device_and_primary_warm(&device.user, device.device)
             })
             .cloned()
             .collect();

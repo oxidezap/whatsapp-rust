@@ -42,8 +42,23 @@ impl SenderKeyDeviceMap {
         self.devices.is_empty()
     }
 
+    /// Single (user, device) lookup. Retained for tests that cross-check the
+    /// warm gate; production resolves both lookups via `device_and_primary_warm`.
+    #[cfg(test)]
     pub fn device_has_key(&self, user: &str, device: u16) -> Option<bool> {
         self.devices.get(user)?.get(&device).copied()
+    }
+
+    /// WA Web warm gate (ParticipantStore.js): a device is warm only when it AND
+    /// its primary (device 0) hold the key. Resolves the per-user inner map once
+    /// so the two device lookups share a single outer (user-string) hash instead
+    /// of re-hashing the user per call. A missing entry counts as cold (`?? false`).
+    pub fn device_and_primary_warm(&self, user: &str, device: u16) -> bool {
+        let Some(by_device) = self.devices.get(user) else {
+            return false;
+        };
+        by_device.get(&device).copied().unwrap_or(false)
+            && by_device.get(&0).copied().unwrap_or(false)
     }
 }
 
