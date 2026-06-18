@@ -15,6 +15,7 @@ use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 
 use crate::client::ClientError;
+use crate::features::GroupError;
 use crate::request::IqError;
 use thiserror::Error;
 
@@ -30,8 +31,10 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum SendError {
     /// Connection/transport/IQ failure (embeds the shared base error).
+    // No `#[from]`: the manual `From<ClientError>` impl flattens a bare `?` so
+    // `NotLoggedIn`/`Iq` stay matchable instead of nesting under `Client(..)`.
     #[error(transparent)]
-    Client(#[from] ClientError),
+    Client(ClientError),
     /// The client has no PN/LID identity yet (not paired / mid LID migration).
     #[error("client is not logged in")]
     NotLoggedIn,
@@ -63,16 +66,42 @@ impl SendError {
             Ok(send) => return send,
             Err(other) => other,
         };
+        // A group-metadata IQ in the send path (e.g. query_info) bubbles up as
+        // `GroupError`; flatten it before the `ClientError` check so an IQ
+        // failure surfaces as `SendError::Iq`, not the `Internal` catch-all.
+        let err = match err.downcast::<GroupError>() {
+            Ok(group) => return group.into(),
+            Err(other) => other,
+        };
         match err.downcast::<ClientError>() {
-            Ok(ClientError::NotLoggedIn) => SendError::NotLoggedIn,
-            // Flatten so IQ failures are reachable only as `SendError::Iq`, never
-            // also as `SendError::Client(ClientError::Iq(..))`.
-            Ok(ClientError::Iq(iq)) => SendError::Iq(iq),
-            Ok(client) => SendError::Client(client),
+            Ok(client) => client.into(),
             Err(other) => match other.downcast::<IqError>() {
                 Ok(iq) => SendError::Iq(iq),
                 Err(other) => SendError::Internal(other),
             },
+        }
+    }
+}
+
+impl From<ClientError> for SendError {
+    fn from(err: ClientError) -> Self {
+        match err {
+            ClientError::NotLoggedIn => SendError::NotLoggedIn,
+            ClientError::Iq(iq) => SendError::Iq(iq),
+            client => SendError::Client(client),
+        }
+    }
+}
+
+impl From<GroupError> for SendError {
+    fn from(err: GroupError) -> Self {
+        match err {
+            GroupError::Iq(iq) => SendError::Iq(iq),
+            GroupError::InvalidRequest(msg) => SendError::InvalidRequest(msg),
+            GroupError::Internal(e) => SendError::from_anyhow(e),
+            // No dedicated variant for MEX mutations; preserve the full typed
+            // error as the `Internal` source so its Display/source chain survives.
+            group @ GroupError::Mex(_) => SendError::Internal(group.into()),
         }
     }
 }

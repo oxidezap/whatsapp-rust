@@ -156,7 +156,7 @@ impl Client {
         // a clear boundary error instead of the cryptic downstream rejection.
         if to.is_newsletter() {
             return Err(SendError::InvalidRequest(
-                "edit_message_encrypted is not valid for newsletters/channels; use edit_message"
+                "edit_message_encrypted is not valid for newsletters/channels; use newsletter().edit_message"
                     .into(),
             ));
         }

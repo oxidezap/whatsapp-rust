@@ -255,7 +255,7 @@ impl<'a> Signal<'a> {
             .signal_cache
             .has_session(&signal_addr, &*device_snapshot.backend)
             .await
-            .map_err(|e| SignalError::Internal(anyhow::anyhow!("session check failed: {e}")))
+            .map_err(|e| SignalError::Internal(e.context("session check failed")))
     }
 
     /// Delete Signal sessions and identity keys for the given JIDs.
