@@ -779,26 +779,34 @@ impl Client {
         &self,
         chat: &Jid,
         target_key: &wa::MessageKey,
-    ) -> Result<(Jid, Vec<u8>), anyhow::Error> {
-        use anyhow::{Context, anyhow};
+    ) -> Result<(Jid, Vec<u8>), crate::send::SendError> {
+        use crate::send::SendError;
 
         let target_id = target_key
             .id
             .as_deref()
-            .ok_or_else(|| anyhow!("target message key missing id"))?;
+            .ok_or_else(|| SendError::InvalidRequest("target message key missing id".into()))?;
         let author: Jid = if let Some(p) = target_key.participant.as_deref() {
-            p.parse().context("invalid participant in target key")?
+            p.parse().map_err(|e| {
+                SendError::InvalidRequest(format!("invalid participant in target key: {e}"))
+            })?
         } else if target_key.from_me == Some(true) {
             self.addon_self_jid_for_chat(chat)
                 .await
-                .ok_or_else(|| anyhow!("not logged in"))?
+                .ok_or(SendError::NotLoggedIn)?
         } else {
             target_key
                 .remote_jid
                 .as_deref()
-                .ok_or_else(|| anyhow!("target message key missing participant and remote_jid"))?
+                .ok_or_else(|| {
+                    SendError::InvalidRequest(
+                        "target message key missing participant and remote_jid".into(),
+                    )
+                })?
                 .parse()
-                .context("invalid remote_jid in target key")?
+                .map_err(|e| {
+                    SendError::InvalidRequest(format!("invalid remote_jid in target key: {e}"))
+                })?
         };
 
         let backend = self.persistence_manager.backend();
@@ -842,11 +850,11 @@ impl Client {
                 )
                 .await
                 .ok_or_else(|| {
-                    anyhow!(
+                    SendError::InvalidRequest(format!(
                         "no messageSecret stored for target {target_id}; the parent \
                          message was not captured (received before this session, or \
                          msg_secret_policy disabled without a resolver)"
-                    )
+                    ))
                 })?
             }
         };

@@ -113,7 +113,8 @@ impl Client {
             vec![],
             None,
         )
-        .await?;
+        .await
+        .map_err(crate::send::SendError::from_anyhow)?;
 
         Ok(original_id)
     }
@@ -200,7 +201,8 @@ impl Client {
             vec![],
             None,
         )
-        .await?;
+        .await
+        .map_err(SendError::from_anyhow)?;
 
         Ok(original_id)
     }
