@@ -4,26 +4,11 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
-[package.metadata.cargo-shear]
-ignored = ["dhat"]
-
-[[bin]]
-name = "bench-integration"
-path = "src/main.rs"
-
-[features]
-dhat-heap = ["dep:dhat"]
-
 [dependencies]
-anyhow = { workspace = true }
-dhat = { version = "0.3", optional = true }
+divan = { workspace = true }
 e2e-tests = { path = "../e2e" }
 env_logger = { workspace = true }
-log = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
-wacore = { path = "../../wacore" }
 whatsapp-rust = { path = "../..", default-features = false, features = [
   "danger-skip-tls-verify",
   "debug-diagnostics",
@@ -32,6 +17,10 @@ whatsapp-rust = { path = "../..", default-features = false, features = [
   "tokio-native",
   "signal",
 ] }
+
+[[bench]]
+name = "integration"
+harness = false
 
 [lints]
 workspace = true

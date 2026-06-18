@@ -191,15 +191,10 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "bench-integration"
 version = "0.0.0"
 dependencies = [
- "anyhow",
- "dhat",
+ "codspeed-divan-compat",
  "e2e-tests",
  "env_logger",
- "log",
- "serde",
- "serde_json",
  "tokio",
- "wacore",
  "whatsapp-rust",
 ]
 
