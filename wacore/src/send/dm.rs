@@ -80,15 +80,8 @@ pub async fn prepare_dm_stanza(
     // via prepare_message_with_context just to attach two fields.
     let extra_context = reporting_result.as_ref().map(reporting_context_info);
 
-    // Encode the shared content once and splice it into both the recipient
-    // plaintext and the own-device DeviceSentMessage plaintext, instead of encoding
-    // the message twice (recipient + DSM) and boxing it via wrap_device_sent.
-    let crate::messages::DmPlaintexts {
-        recipient: recipient_plaintext,
-        own_devices: own_devices_plaintext,
-    } = MessageUtils::encode_dm_plaintexts(message, extra_context.as_ref(), &to_jid.to_string());
-
-    // Partition first so phash reflects the actual sent set (sender excluded)
+    // Partition first so phash reflects the actual sent set (sender excluded) and so
+    // the own-device plaintext can be skipped when there's nothing to send it to.
     let total_devices = all_devices.len();
     let (recipient_devices, own_other_devices) =
         partition_dm_devices(all_devices, own_jid, own_lid);
@@ -97,6 +90,27 @@ pub async fn prepare_dm_stanza(
         recipient_devices.iter().chain(own_other_devices.iter()),
     )
     .ok();
+
+    // Encode the shared content once and splice it into both the recipient plaintext
+    // and the own-device DeviceSentMessage plaintext, instead of encoding the message
+    // twice (recipient + DSM) and boxing it via wrap_device_sent.
+    //
+    // With no own companion devices (e.g. an account with nothing else linked), the
+    // DeviceSentMessage plaintext — and the destination-jid stringify it needs — would
+    // be built only to go unused below, so encode just the recipient. The mci-hoist
+    // path (message carries a top-level message_context_info) keeps the exact shared
+    // splice so its on-wire recipient encoding is unchanged.
+    let crate::messages::DmPlaintexts {
+        recipient: recipient_plaintext,
+        own_devices: own_devices_plaintext,
+    } = if own_other_devices.is_empty() && message.message_context_info.is_none() {
+        crate::messages::DmPlaintexts {
+            recipient: MessageUtils::encode_and_pad_with_context(message, extra_context.as_ref()),
+            own_devices: Vec::new(),
+        }
+    } else {
+        MessageUtils::encode_dm_plaintexts(message, extra_context.as_ref(), &to_jid.to_string())
+    };
 
     let mut participant_nodes = Vec::with_capacity(total_devices);
     let mut includes_prekey_message = false;

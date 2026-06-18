@@ -1395,6 +1395,51 @@ mod device_sent_tests {
         }
     }
 
+    /// `prepare_dm_stanza` skips the DeviceSentMessage buffer (and its destination-jid
+    /// stringify) when there are no own companion devices, encoding the recipient via
+    /// `encode_and_pad_with_context` instead of `encode_dm_plaintexts`. That swap is only
+    /// sound while both agree on the recipient bytes for messages without a top-level
+    /// `message_context_info` — exactly the gate `prepare_dm_stanza` uses. Pin that
+    /// agreement (with and without a reporting context) so a change to either encoder
+    /// can't silently corrupt the no-own-device send path.
+    #[test]
+    fn recipient_only_encode_matches_dm_recipient_without_top_level_mci() {
+        let dest = "5511999998888:3@s.whatsapp.net";
+        let reporting_ctx = reporting_context(&[0x5Au8; 32]);
+
+        let shapes = [
+            wa::Message {
+                conversation: Some("ping".into()),
+                ..Default::default()
+            },
+            wa::Message {
+                image_message: Some(Box::new(wa::message::ImageMessage {
+                    url: Some("https://mmg.example/abc".into()),
+                    media_key: Some(vec![9u8; 32]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ];
+
+        for message in shapes {
+            assert!(
+                message.message_context_info.is_none(),
+                "fast path only applies to messages without a top-level mci"
+            );
+            for extra in [None, Some(&reporting_ctx)] {
+                let recipient_only = MessageUtils::encode_and_pad_with_context(&message, extra);
+                let dm_recipient =
+                    MessageUtils::encode_dm_plaintexts(&message, extra, dest).recipient;
+                assert_eq!(
+                    decode_padded(&recipient_only),
+                    decode_padded(&dm_recipient),
+                    "recipient-only encode diverged from encode_dm_plaintexts ({message:?}, extra={extra:?})"
+                );
+            }
+        }
+    }
+
     /// `encode_and_pad_with_context` (the group path) with a reporting context must
     /// decode to `prepare_message_with_context(msg, secret)` encoded by prost; with
     /// `None` it must equal plain `encode_and_pad`.
