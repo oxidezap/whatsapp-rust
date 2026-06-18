@@ -151,20 +151,27 @@ fn connect_to_ready(bencher: divan::Bencher) {
 fn send_message(bencher: divan::Bencher, n: u64) {
     let rt = rt();
     let pair = pair_send();
-    bencher.bench_local(|| {
-        rt.block_on(async {
-            let guard = pair.lock().await;
-            for _ in 0..n {
-                let body = unique_body("send");
-                guard
-                    .a
-                    .client
-                    .send_message(guard.jid_b.clone(), text_msg(&body))
-                    .await
-                    .expect("send message");
-            }
+    bencher
+        // Build the unique messages in unmeasured setup so the body `format!`
+        // and protobuf `String` allocations aren't charged to the send path.
+        .with_inputs(|| {
+            (0..n)
+                .map(|_| text_msg(&unique_body("send")))
+                .collect::<Vec<_>>()
+        })
+        .bench_local_values(|msgs| {
+            rt.block_on(async {
+                let guard = pair.lock().await;
+                for msg in msgs {
+                    guard
+                        .a
+                        .client
+                        .send_message(guard.jid_b.clone(), msg)
+                        .await
+                        .expect("send message");
+                }
+            });
         });
-    });
 }
 
 /// Full send + receive round-trip on the warmed pair. Runtime and pair are
@@ -173,25 +180,35 @@ fn send_message(bencher: divan::Bencher, n: u64) {
 fn send_and_receive(bencher: divan::Bencher, n: u64) {
     let rt = rt();
     let pair = pair_recv();
-    bencher.bench_local(|| {
-        rt.block_on(async {
-            let mut guard = pair.lock().await;
-            for _ in 0..n {
-                let body = unique_body("recv");
-                guard
-                    .a
-                    .client
-                    .send_message(guard.jid_b.clone(), text_msg(&body))
-                    .await
-                    .expect("send message");
-                guard
-                    .b
-                    .wait_for_text(&body, 30)
-                    .await
-                    .expect("receive text");
-            }
+    bencher
+        // Messages are built in unmeasured setup (see `send_message`); the body
+        // is kept alongside to match the delivered text in `wait_for_text`.
+        .with_inputs(|| {
+            (0..n)
+                .map(|_| {
+                    let body = unique_body("recv");
+                    (text_msg(&body), body)
+                })
+                .collect::<Vec<_>>()
+        })
+        .bench_local_values(|items| {
+            rt.block_on(async {
+                let mut guard = pair.lock().await;
+                for (msg, body) in items {
+                    guard
+                        .a
+                        .client
+                        .send_message(guard.jid_b.clone(), msg)
+                        .await
+                        .expect("send message");
+                    guard
+                        .b
+                        .wait_for_text(&body, 30)
+                        .await
+                        .expect("receive text");
+                }
+            });
         });
-    });
 }
 
 /// A reconnect cycle (disconnect -> reconnect -> ready). The client is created
