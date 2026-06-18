@@ -71,7 +71,14 @@ impl<'a> Blocking<'a> {
     /// and resolved through the mapping.
     pub async fn unblock(&self, jid: &Jid) -> Result<(), BlockingError> {
         debug!(target: "Blocking", "Unblocking contact");
-        let (lid_jid, _) = self.resolve_lid_pn(jid.to_non_ad()).await?;
+        // The unblock stanza only needs the LID, so a LID input must not require a
+        // PN↔LID mapping (resolve_lid_pn hard-fails when none exists).
+        let bare = jid.to_non_ad();
+        let lid_jid = if bare.is_lid() {
+            bare
+        } else {
+            self.resolve_lid_pn(bare).await?.0
+        };
         self.client
             .execute(UpdateBlocklistSpec::unblock(&lid_jid))
             .await?;

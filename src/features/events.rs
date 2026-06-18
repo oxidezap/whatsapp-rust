@@ -80,6 +80,14 @@ impl<'a> Events<'a> {
         extra_guest_count: Option<i32>,
     ) -> Result<SendResult, SendError> {
         let chat_jid = &chat_jid.into();
+        // The event secret keys the RSVP's HKDF; a wrong length is caller error,
+        // not an internal failure, so reject it before the encrypt call.
+        if message_secret.len() != 32 {
+            return Err(SendError::InvalidRequest(format!(
+                "event message_secret must be 32 bytes, got {}",
+                message_secret.len()
+            )));
+        }
         let my_jid = self.client.get_pn().ok_or(SendError::NotLoggedIn)?;
         let my_base = my_jid.to_non_ad();
 

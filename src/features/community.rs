@@ -31,6 +31,9 @@ pub enum CommunityError {
     /// A delegated group operation failed (e.g. setting the community description).
     #[error(transparent)]
     Group(#[from] GroupError),
+    /// The request was malformed or the server response was missing required data.
+    #[error("invalid community request: {0}")]
+    InvalidRequest(String),
 }
 
 // Types
@@ -260,9 +263,9 @@ impl<'a> Community<'a> {
             }))
             .await?;
 
-        let data = response
-            .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data field".into()))?;
+        let data = response.data.ok_or_else(|| {
+            CommunityError::InvalidRequest("MEX response missing data field".into())
+        })?;
 
         let group_query = &data["xwa2_group_query_by_id"];
         let mut subgroups = Vec::new();
@@ -307,9 +310,9 @@ impl<'a> Community<'a> {
             }))
             .await?;
 
-        let data = response
-            .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data field".into()))?;
+        let data = response.data.ok_or_else(|| {
+            CommunityError::InvalidRequest("MEX response missing data field".into())
+        })?;
 
         let group_query = &data["xwa2_group_query_by_id"];
         let edges_ref = group_query

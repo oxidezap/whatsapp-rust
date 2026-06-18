@@ -56,6 +56,13 @@ impl SendError {
     /// blanket `#[from] anyhow::Error` would funnel a logged-out
     /// `ClientError::NotLoggedIn` into the un-matchable `Internal` catch-all.
     fn from_anyhow(err: anyhow::Error) -> Self {
+        // A validation deeper in the pipeline may already be a typed `SendError`
+        // (e.g. send_message_impl's newsletter/status guards); recover it so it
+        // stays matchable instead of collapsing into `Internal`.
+        let err = match err.downcast::<SendError>() {
+            Ok(send) => return send,
+            Err(other) => other,
+        };
         match err.downcast::<ClientError>() {
             Ok(ClientError::NotLoggedIn) => SendError::NotLoggedIn,
             Ok(client) => SendError::Client(client),
@@ -1366,10 +1373,12 @@ impl Client {
         // / revoke_message). A newsletter JID here is a mis-routed pin/edit/revoke
         // (pin is not a channel op), so reject it.
         if to.is_newsletter() {
-            return Err(anyhow!(
+            return Err(SendError::InvalidRequest(
                 "newsletter JIDs are not valid on the E2E send path; use \
                  newsletter().edit_message/revoke_message (pin is unsupported on channels)"
-            ));
+                    .into(),
+            )
+            .into());
         }
 
         // status@broadcast reactions fan out pairwise to the author's devices;
@@ -1383,10 +1392,11 @@ impl Client {
                 .and_then(|p| p.parse::<Jid>().ok())
                 .filter(|jid| jid.is_pn() || jid.is_lid())
                 .ok_or_else(|| {
-                    anyhow!(
+                    SendError::InvalidRequest(
                         "send_message to status@broadcast requires \
                          reaction_message.key.participant = status author (user JID). \
                          Use client.status() for posting new statuses."
+                            .into(),
                     )
                 })?;
             (author, true)
