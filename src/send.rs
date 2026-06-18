@@ -59,7 +59,10 @@ impl SendError {
         match err.downcast::<ClientError>() {
             Ok(ClientError::NotLoggedIn) => SendError::NotLoggedIn,
             Ok(client) => SendError::Client(client),
-            Err(other) => SendError::Internal(other),
+            Err(other) => match other.downcast::<IqError>() {
+                Ok(iq) => SendError::Iq(iq),
+                Err(other) => SendError::Internal(other),
+            },
         }
     }
 }
