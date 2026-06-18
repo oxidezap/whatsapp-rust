@@ -94,60 +94,72 @@ fn pair() -> &'static Mutex<Pair> {
 // in for the old hand-divided amortized number.
 const BATCH_SIZES: [u64; 2] = [1, 20];
 
-/// Client creation through Connected (ready). The cheap disconnect is inside
-/// the measured region on purpose: the connect handshake dominates its cost,
-/// and tearing the client down each iteration stops sessions leaking across
-/// iterations on the mock server.
+/// Client creation through Connected (ready). The runtime is initialized
+/// outside the measured closure so first-call thread-pool/logger startup is not
+/// charged to the result. The cheap disconnect stays inside on purpose: the
+/// connect handshake dominates its cost, and tearing the client down each
+/// iteration stops sessions leaking across iterations on the mock server.
 #[divan::bench]
-fn connect_to_ready() {
-    rt().block_on(async {
-        let c = TestClient::connect("bench_connect")
-            .await
-            .expect("connect client");
-        c.disconnect().await;
+fn connect_to_ready(bencher: divan::Bencher) {
+    let rt = rt();
+    bencher.bench_local(|| {
+        rt.block_on(async {
+            let c = TestClient::connect("bench_connect")
+                .await
+                .expect("connect client");
+            c.disconnect().await;
+        });
     });
 }
 
 /// Sending a single DM (sender side only, matching the original — no
 /// `wait_for_text` here). Covers protobuf encode, Signal encrypt, node marshal
-/// and the WebSocket write.
+/// and the WebSocket write. The runtime and warmed pair are initialized outside
+/// the measured closure so connect + Signal warmup are not charged to the send.
 #[divan::bench(args = BATCH_SIZES)]
-fn send_message(n: u64) {
+fn send_message(bencher: divan::Bencher, n: u64) {
+    let rt = rt();
     let pair = pair();
-    rt().block_on(async {
-        let guard = pair.lock().await;
-        for _ in 0..n {
-            let body = unique_body("send");
-            guard
-                .a
-                .client
-                .send_message(guard.jid_b.clone(), text_msg(&body))
-                .await
-                .expect("send message");
-        }
+    bencher.bench_local(|| {
+        rt.block_on(async {
+            let guard = pair.lock().await;
+            for _ in 0..n {
+                let body = unique_body("send");
+                guard
+                    .a
+                    .client
+                    .send_message(guard.jid_b.clone(), text_msg(&body))
+                    .await
+                    .expect("send message");
+            }
+        });
     });
 }
 
-/// Full send + receive round-trip on the warmed pair.
+/// Full send + receive round-trip on the warmed pair. Runtime and pair are
+/// initialized outside the measured closure (see `send_message`).
 #[divan::bench(args = BATCH_SIZES)]
-fn send_and_receive(n: u64) {
+fn send_and_receive(bencher: divan::Bencher, n: u64) {
+    let rt = rt();
     let pair = pair();
-    rt().block_on(async {
-        let mut guard = pair.lock().await;
-        for _ in 0..n {
-            let body = unique_body("recv");
-            guard
-                .a
-                .client
-                .send_message(guard.jid_b.clone(), text_msg(&body))
-                .await
-                .expect("send message");
-            guard
-                .b
-                .wait_for_text(&body, 30)
-                .await
-                .expect("receive text");
-        }
+    bencher.bench_local(|| {
+        rt.block_on(async {
+            let mut guard = pair.lock().await;
+            for _ in 0..n {
+                let body = unique_body("recv");
+                guard
+                    .a
+                    .client
+                    .send_message(guard.jid_b.clone(), text_msg(&body))
+                    .await
+                    .expect("send message");
+                guard
+                    .b
+                    .wait_for_text(&body, 30)
+                    .await
+                    .expect("receive text");
+            }
+        });
     });
 }
 

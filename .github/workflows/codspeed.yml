@@ -118,6 +118,9 @@ jobs:
       - name: Build the benchmark targets
         run: cargo codspeed build -m simulation -m memory -p bench-integration
 
+      # `-p bench-integration` is required: `tests/bench-integration` is not a
+      # workspace default-member, so a bare `cargo codspeed run` discovers no
+      # benchmarks for it ("No benchmarks found for the simulation mode").
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
         env:
@@ -125,4 +128,4 @@ jobs:
           RUST_LOG: warn
         with:
           mode: simulation,memory
-          run: cargo codspeed run
+          run: cargo codspeed run -p bench-integration
