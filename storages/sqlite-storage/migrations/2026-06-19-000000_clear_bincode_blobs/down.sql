@@ -1,2 +1,0 @@
--- Irreversible: the cleared bincode-encoded rows cannot be reconstructed.
--- This migration is up-only; the data re-populates from the server at runtime.

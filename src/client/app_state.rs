@@ -76,12 +76,23 @@ impl Client {
                     return Ok(());
                 }
                 Err(e) => {
-                    if e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
-                        .is_some_and(|ase| {
-                            matches!(ase, crate::appstate_sync::AppStateSyncError::KeyNotFound(_))
-                        })
+                    if let Some(crate::appstate_sync::AppStateSyncError::KeyNotFound(id_b64)) =
+                        e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
                         && attempt == 1
                     {
+                        // The stored key is missing (e.g. an old bincode row that no
+                        // longer decodes). Patch/snapshot processing fails on the
+                        // missing key before the normal get_missing_key_ids request
+                        // path runs, so request it explicitly here; the primary
+                        // re-shares it and the retry below picks it up.
+                        {
+                            use base64::Engine as _;
+                            if let Ok(key_id) =
+                                base64::engine::general_purpose::STANDARD_NO_PAD.decode(id_b64)
+                            {
+                                self.request_missing_keys_with_dedup(vec![key_id]).await;
+                            }
+                        }
                         if !self.initial_app_state_keys_received.load(Ordering::Relaxed) {
                             debug!(target: "Client/AppState", "App state key missing for {:?}; waiting up to 10s for key share then retrying", name);
                             if rt_timeout(

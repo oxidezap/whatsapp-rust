@@ -984,7 +984,20 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(Box::new(e)))??;
 
         if let Some(data) = res {
-            Ok(Some(crate::wire::decode_app_state_sync_key(&data)?))
+            // An undecodable blob (an old bincode row or genuine corruption) is
+            // treated as absent: the app-state sync path then re-requests the key,
+            // the primary re-shares it, and the next set overwrites it as protobuf.
+            match crate::wire::decode_app_state_sync_key(&data) {
+                Ok(key) => Ok(Some(key)),
+                Err(e) => {
+                    warn!(
+                        "app_state_sync_key blob ({} bytes) failed to decode: {e}; \
+                         treating as absent, key will be re-requested",
+                        data.len()
+                    );
+                    Ok(None)
+                }
+            }
         } else {
             Ok(None)
         }
@@ -1070,7 +1083,19 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(Box::new(e)))??;
 
         if let Some(data) = res {
-            Ok(crate::wire::decode_hash_state(&data)?)
+            // An undecodable blob (an old bincode row or corruption) resets the
+            // collection to default, which simply re-syncs it from version 0.
+            match crate::wire::decode_hash_state(&data) {
+                Ok(state) => Ok(state),
+                Err(e) => {
+                    warn!(
+                        "app_state_version blob ({} bytes) failed to decode: {e}; \
+                         resetting to default, collection will re-sync from 0",
+                        data.len()
+                    );
+                    Ok(HashState::default())
+                }
+            }
         } else {
             Ok(HashState::default())
         }
