@@ -358,13 +358,40 @@ impl<'a> Groups<'a> {
         if meta.addressing_mode != AddressingMode::Lid {
             return;
         }
-        for p in meta.participants.iter_mut() {
-            if p.phone_number.is_none()
-                && p.jid.is_lid()
-                && let Ok(Some(entry)) = self.client.get_lid_pn_entry(&p.jid).await
-            {
-                p.phone_number = Some(Jid::pn(&*entry.phone_number));
-            }
+        // Participants the server left PN-less, kept with their index.
+        let pending: Vec<(usize, Jid)> = meta
+            .participants
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                (p.phone_number.is_none() && p.jid.is_lid()).then(|| (i, p.jid.clone()))
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+
+        // Cache hits are in-memory, but a cold cache falls back to the DB and a
+        // large group would otherwise serialize those lookups — bounded fan-out.
+        use futures::StreamExt;
+        let resolved: Vec<(usize, Jid)> = futures::stream::iter(pending)
+            .map(|(i, jid)| async move {
+                let pn = self
+                    .client
+                    .get_lid_pn_entry(&jid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|e| Jid::pn(&*e.phone_number));
+                (i, pn)
+            })
+            .buffer_unordered(16)
+            .filter_map(|(i, pn)| async move { pn.map(|pn| (i, pn)) })
+            .collect()
+            .await;
+
+        for (i, pn) in resolved {
+            meta.participants[i].phone_number = Some(pn);
         }
     }
 
