@@ -363,9 +363,8 @@ impl<'a> Groups<'a> {
             .participants
             .iter()
             .enumerate()
-            .filter_map(|(i, p)| {
-                (p.phone_number.is_none() && p.jid.is_lid()).then(|| (i, p.jid.clone()))
-            })
+            .filter(|(_, p)| p.phone_number.is_none() && p.jid.is_lid())
+            .map(|(i, p)| (i, p.jid.clone()))
             .collect();
         if pending.is_empty() {
             return;
