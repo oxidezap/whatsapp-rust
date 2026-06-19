@@ -237,23 +237,6 @@ pub struct Groups<'a> {
     client: &'a Client,
 }
 
-/// Fills each LID participant's `phone_number` from a preloaded
-/// `LID user-part → PN user-part` map. No-op outside LID-addressed groups or
-/// when the participant already has a PN.
-fn fill_participant_pns(meta: &mut GroupMetadata, lid_to_pn: &HashMap<String, String>) {
-    if meta.addressing_mode != AddressingMode::Lid {
-        return;
-    }
-    for p in meta.participants.iter_mut() {
-        if p.phone_number.is_none()
-            && p.jid.is_lid()
-            && let Some(pn) = lid_to_pn.get(p.jid.user.as_str())
-        {
-            p.phone_number = Some(Jid::pn(pn.as_str()));
-        }
-    }
-}
-
 impl<'a> Groups<'a> {
     pub(crate) fn new(client: &'a Client) -> Self {
         Self { client }
@@ -365,36 +348,24 @@ impl<'a> Groups<'a> {
         Ok(info)
     }
 
-    /// Loads the full `LID user-part → PN user-part` map from the backend.
-    /// Empty on error/absence so the caller degrades to PN-less metadata.
-    async fn load_lid_pn_map(&self) -> HashMap<String, String> {
-        match self
-            .client
-            .persistence_manager
-            .backend()
-            .get_all_lid_mappings()
-            .await
-        {
-            Ok(entries) => entries
-                .into_iter()
-                .map(|e| (e.lid, e.phone_number))
-                .collect(),
-            Err(e) => {
-                log::warn!("load_lid_pn_map: get_all_lid_mappings failed: {e}");
-                HashMap::new()
+    /// Backfills each LID participant's `phone_number` from the client's LID-PN
+    /// cache (`get_lid_pn_entry`, same warm-cache + backend path `create_group`
+    /// uses). The server often omits the attribute on `<participant>` nodes of
+    /// LID-addressed groups, so consumers keying data by PN would treat current
+    /// members as absent. No-op outside LID-addressed groups or when the PN is
+    /// already present; unknown mappings leave the participant untouched.
+    async fn fill_participant_pns(&self, meta: &mut GroupMetadata) {
+        if meta.addressing_mode != AddressingMode::Lid {
+            return;
+        }
+        for p in meta.participants.iter_mut() {
+            if p.phone_number.is_none()
+                && p.jid.is_lid()
+                && let Ok(Some(entry)) = self.client.get_lid_pn_entry(&p.jid).await
+            {
+                p.phone_number = Some(Jid::pn(&*entry.phone_number));
             }
         }
-    }
-
-    /// True if any metadata needs PN backfill: a LID-addressed group with a LID
-    /// participant whose `phone_number` is absent (server omitted it in the stanza).
-    fn needs_pn_fill<'m>(metas: impl Iterator<Item = &'m GroupMetadata>) -> bool {
-        metas.into_iter().any(|m| {
-            m.addressing_mode == AddressingMode::Lid
-                && m.participants
-                    .iter()
-                    .any(|p| p.phone_number.is_none() && p.jid.is_lid())
-        })
     }
 
     pub async fn get_participating(&self) -> Result<HashMap<Jid, GroupMetadata>, GroupError> {
@@ -409,18 +380,8 @@ impl<'a> Groups<'a> {
             })
             .collect();
 
-        // The server often omits `phone_number` on `<participant>` nodes of
-        // LID-addressed groups, so consumers that key data by PN would treat
-        // current members as absent. Backfill from the persisted mapping the lib
-        // already learned (one load + join), instead of forcing each consumer to
-        // re-resolve LID→PN themselves.
-        if Self::needs_pn_fill(result.values()) {
-            let lid_to_pn = self.load_lid_pn_map().await;
-            if !lid_to_pn.is_empty() {
-                for meta in result.values_mut() {
-                    fill_participant_pns(meta, &lid_to_pn);
-                }
-            }
+        for meta in result.values_mut() {
+            self.fill_participant_pns(meta).await;
         }
 
         Ok(result)
@@ -431,12 +392,7 @@ impl<'a> Groups<'a> {
         match self.client.execute(GroupQueryIq::new(jid)).await? {
             GroupInfoOutcome::Full(group) => {
                 let mut meta = GroupMetadata::from(*group);
-                if Self::needs_pn_fill(std::iter::once(&meta)) {
-                    let lid_to_pn = self.load_lid_pn_map().await;
-                    if !lid_to_pn.is_empty() {
-                        fill_participant_pns(&mut meta, &lid_to_pn);
-                    }
-                }
+                self.fill_participant_pns(&mut meta).await;
                 Ok(meta)
             }
             GroupInfoOutcome::NotModified => Err(GroupError::InvalidRequest(
@@ -1282,50 +1238,56 @@ mod tests {
         assert!(!metadata.participants[0].is_super_admin());
     }
 
-    #[test]
-    fn fill_participant_pns_backfills_lid_from_mapping() {
-        use std::collections::HashMap;
+    #[tokio::test]
+    async fn fill_participant_pns_backfills_from_cache() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
         use wacore_binary::jid::{Jid, Server};
 
-        let lid = Jid::new("26263000000099", Server::Lid);
+        let client = crate::test_utils::create_test_client().await;
+        // Warm the LID-PN cache with a mapping the server didn't echo on the
+        // participant stanza.
+        let entry = LidPnEntry::new(
+            "26263000000099".to_string(),
+            "5521900000099".to_string(),
+            LearningSource::Usync,
+        );
+        client.lid_pn_cache.add(&entry).await;
+
         let mut meta = GroupMetadata {
             id: "120399@g.us".parse().unwrap(),
             participants: vec![GroupParticipant {
-                jid: lid,
+                jid: Jid::new("26263000000099", Server::Lid),
                 phone_number: None,
                 participant_type: ParticipantType::Member,
             }],
             addressing_mode: AddressingMode::Lid,
             ..Default::default()
         };
-        let map = HashMap::from([("26263000000099".to_string(), "5521900000099".to_string())]);
-        fill_participant_pns(&mut meta, &map);
+        client.groups().fill_participant_pns(&mut meta).await;
         assert_eq!(
             meta.participants[0].phone_number,
             Some(Jid::pn("5521900000099")),
-            "LID participant should receive phone_number from the mapping"
+            "LID participant should receive its PN from the warm cache"
         );
     }
 
-    #[test]
-    fn fill_participant_pns_noop_in_pn_group() {
-        use std::collections::HashMap;
+    #[tokio::test]
+    async fn fill_participant_pns_noop_in_pn_group() {
         use wacore_binary::jid::{Jid, Server};
 
+        let client = crate::test_utils::create_test_client().await;
         // PN-addressed group: untouched (jid already is the PN).
-        let pn = Jid::new("5521900000098", Server::Pn);
         let mut meta = GroupMetadata {
             id: "120398@g.us".parse().unwrap(),
             participants: vec![GroupParticipant {
-                jid: pn,
+                jid: Jid::new("5521900000098", Server::Pn),
                 phone_number: None,
                 participant_type: ParticipantType::Member,
             }],
             addressing_mode: AddressingMode::Pn,
             ..Default::default()
         };
-        let map = HashMap::from([("5521900000098".to_string(), "5521900000098".to_string())]);
-        fill_participant_pns(&mut meta, &map);
+        client.groups().fill_participant_pns(&mut meta).await;
         assert_eq!(meta.participants[0].phone_number, None);
     }
 
