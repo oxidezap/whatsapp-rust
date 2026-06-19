@@ -5,5 +5,6 @@
 
 mod schema;
 mod sqlite_store;
+mod wire;
 
 pub use sqlite_store::SqliteStore;

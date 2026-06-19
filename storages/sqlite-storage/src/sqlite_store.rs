@@ -353,12 +353,7 @@ impl SqliteStore {
         let server_cert_chain: Option<Arc<[u8]>> = device_data
             .server_cert_chain
             .as_ref()
-            .map(|chain| {
-                bincode::serde::encode_to_vec(chain, bincode::config::standard())
-                    .map(Arc::from)
-                    .map_err(|e| StoreError::Serialization(Box::new(e)))
-            })
-            .transpose()?;
+            .map(|chain| Arc::from(crate::wire::encode_server_cert_chain(chain)));
         let login_counter = device_data.login_counter;
         let new_lid: Arc<str> = Arc::from(
             device_data
@@ -629,11 +624,8 @@ impl SqliteStore {
                         // change between versions) must NOT block startup —
                         // log it and degrade to None so the next connect
                         // simply pays one XX handshake to repopulate.
-                        match bincode::serde::decode_from_slice(
-                            bytes,
-                            bincode::config::standard(),
-                        ) {
-                            Ok((chain, _)) => Some(chain),
+                        match crate::wire::decode_server_cert_chain(bytes) {
+                            Ok(chain) => Some(chain),
                             Err(e) => {
                                 log::warn!(
                                     "device {} server_cert_chain blob ({} bytes) failed to decode: {e}; \
@@ -992,9 +984,20 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(Box::new(e)))??;
 
         if let Some(data) = res {
-            let (key, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())
-                .map_err(|e| StoreError::Serialization(Box::new(e)))?;
-            Ok(Some(key))
+            // A blob that no longer decodes (old format, corruption) is treated
+            // as absent rather than fatal: the caller re-requests the key from
+            // the primary device and the next set overwrites the stale bytes.
+            match crate::wire::decode_app_state_sync_key(&data) {
+                Ok(key) => Ok(Some(key)),
+                Err(e) => {
+                    warn!(
+                        "app_state_sync_key blob ({} bytes) failed to decode: {e}; \
+                         treating as absent, key will be re-requested",
+                        data.len()
+                    );
+                    Ok(None)
+                }
+            }
         } else {
             Ok(None)
         }
@@ -1008,8 +1011,7 @@ impl SqliteStore {
     ) -> Result<()> {
         let pool = self.pool.clone();
         let key_id = key_id.to_vec();
-        let data = bincode::serde::encode_to_vec(&key, bincode::config::standard())
-            .map_err(|e| StoreError::Serialization(Box::new(e)))?;
+        let data = crate::wire::encode_app_state_sync_key(&key);
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
@@ -1081,9 +1083,20 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(Box::new(e)))??;
 
         if let Some(data) = res {
-            let (state, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())
-                .map_err(|e| StoreError::Serialization(Box::new(e)))?;
-            Ok(state)
+            // An undecodable blob (old format, corruption) resets the collection
+            // to the default state, which simply re-syncs it from version 0
+            // rather than failing the read.
+            match crate::wire::decode_hash_state(&data) {
+                Ok(state) => Ok(state),
+                Err(e) => {
+                    warn!(
+                        "app_state_version blob ({} bytes) failed to decode: {e}; \
+                         resetting to default, collection will re-sync from 0",
+                        data.len()
+                    );
+                    Ok(HashState::default())
+                }
+            }
         } else {
             Ok(HashState::default())
         }
@@ -1096,8 +1109,7 @@ impl SqliteStore {
         device_id: i32,
     ) -> Result<()> {
         let name = name.to_string();
-        let data = bincode::serde::encode_to_vec(&state, bincode::config::standard())
-            .map_err(|e| StoreError::Serialization(Box::new(e)))?;
+        let data = crate::wire::encode_hash_state(&state);
         self.with_retry("set_app_state_version", || {
             let name = name.clone();
             let data = data.clone();
@@ -3744,7 +3756,7 @@ mod tests {
     /// Round-trips a `CachedServerCertChain` through the SQLite schema:
     /// save → close store → reopen on the same db_name → load. Exercises
     /// the `2026-04-26-000000_add_server_cert_chain` migration plus the
-    /// bincode encode/decode path in `save_device_data_for_device` /
+    /// protobuf encode/decode path in `save_device_data_for_device` /
     /// `load_device_data_for_device` (the part that the in-memory backend
     /// integration tests don't reach).
     #[tokio::test]
@@ -3801,7 +3813,7 @@ mod tests {
 
         // Second store on the SAME shared-cache db: this exercises the
         // exact path a fresh-process load would take — schema migration
-        // already applied, BLOB column present, and the bincode-encoded
+        // already applied, BLOB column present, and the protobuf-encoded
         // chain decoded by the load path.
         let store = SqliteStore::new_for_device(&db_name, device_id)
             .await

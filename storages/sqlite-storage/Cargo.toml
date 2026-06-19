@@ -18,7 +18,6 @@ bundled-sqlite = ["libsqlite3-sys/bundled"]
 
 [dependencies]
 async-trait = { workspace = true }
-bincode = { version = "2.0.1", features = ["serde"] }
 bytes = { workspace = true }
 diesel = { version = "2.3.10", default-features = false, features = [
     "sqlite",
@@ -30,6 +29,7 @@ diesel_migrations = { version = "2.3.1", default-features = false, features = [
 ] }
 libsqlite3-sys = { version = "0.37", default-features = false, optional = true }
 log = { workspace = true }
+prost = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 wacore = { workspace = true }
