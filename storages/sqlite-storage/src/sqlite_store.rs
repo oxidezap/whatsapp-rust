@@ -984,20 +984,7 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(Box::new(e)))??;
 
         if let Some(data) = res {
-            // A blob that no longer decodes (old format, corruption) is treated
-            // as absent rather than fatal: the caller re-requests the key from
-            // the primary device and the next set overwrites the stale bytes.
-            match crate::wire::decode_app_state_sync_key(&data) {
-                Ok(key) => Ok(Some(key)),
-                Err(e) => {
-                    warn!(
-                        "app_state_sync_key blob ({} bytes) failed to decode: {e}; \
-                         treating as absent, key will be re-requested",
-                        data.len()
-                    );
-                    Ok(None)
-                }
-            }
+            Ok(Some(crate::wire::decode_app_state_sync_key(&data)?))
         } else {
             Ok(None)
         }
@@ -1083,20 +1070,7 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(Box::new(e)))??;
 
         if let Some(data) = res {
-            // An undecodable blob (old format, corruption) resets the collection
-            // to the default state, which simply re-syncs it from version 0
-            // rather than failing the read.
-            match crate::wire::decode_hash_state(&data) {
-                Ok(state) => Ok(state),
-                Err(e) => {
-                    warn!(
-                        "app_state_version blob ({} bytes) failed to decode: {e}; \
-                         resetting to default, collection will re-sync from 0",
-                        data.len()
-                    );
-                    Ok(HashState::default())
-                }
-            }
+            Ok(crate::wire::decode_hash_state(&data)?)
         } else {
             Ok(HashState::default())
         }
