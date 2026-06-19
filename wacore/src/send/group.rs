@@ -142,17 +142,32 @@ pub async fn prepare_group_stanza(
         crate::types::message::AddressingMode::Pn => (own_jid.clone(), "pn"),
     };
 
-    // Generate reporting token if the message type supports it
+    // Encode the message once and thread those bytes through both the reporting token
+    // (whitelisted-field extraction) and the skmsg wire plaintext below, instead of
+    // encoding it twice per send. The rare mci-hoist path (message carries a top-level
+    // message_context_info) can't share: its plaintext folds the reporting secret into the
+    // existing mci, diverging from the bytes the token is computed over, so it re-encodes.
+    let shared_content = message
+        .message_context_info
+        .is_none()
+        .then(|| waproto::codec::message_to_vec(message));
+
+    // Generate reporting token if the message type supports it.
     // For groups, both sender_jid and remote_jid are the group JID (to_jid) per Baileys implementation.
     // Reuse the message's own secret when the caller set one (e.g. polls) instead of minting a fresh
     // one that would overwrite it, matching WA Web (the reporting token derives from messageSecret).
-    let reporting_result = generate_reporting_token(
-        message,
-        &request_id,
-        &to_jid,
-        &to_jid,
-        crate::reporting_token::extract_message_secret(message),
-    );
+    let existing_secret = crate::reporting_token::extract_message_secret(message);
+    let reporting_result = match &shared_content {
+        Some(content) => generate_reporting_token_from_encoded(
+            message,
+            content,
+            &request_id,
+            &to_jid,
+            &to_jid,
+            existing_secret,
+        ),
+        None => generate_reporting_token(message, &request_id, &to_jid, &to_jid, existing_secret),
+    };
 
     // The reporting token's MessageContextInfo (message_secret + version) is spliced
     // onto the encoded plaintext instead of deep-cloning the whole message via
@@ -442,7 +457,14 @@ pub async fn prepare_group_stanza(
         }
     }
 
-    let plaintext = MessageUtils::encode_and_pad_with_context(message, reporting_context.as_ref());
+    // Reuse the shared encode (also fed to the reporting token) for the skmsg plaintext
+    // instead of encoding the message a second time; the mci-hoist path re-encodes.
+    let plaintext = match &shared_content {
+        Some(content) => {
+            MessageUtils::pad_with_context_from_encoded(content, reporting_context.as_ref())
+        }
+        None => MessageUtils::encode_and_pad_with_context(message, reporting_context.as_ref()),
+    };
     let skmsg = encrypt_group_message(
         stores.sender_key_store,
         &sender_key_name,

@@ -3035,6 +3035,113 @@ mod mark_full_distribution_list {
         );
     }
 
+    /// The group send shares one message encode between the reporting token and the skmsg
+    /// plaintext (gated on no top-level `message_context_info`). The byte-equivalence of
+    /// the shared-encode helpers is locked in `messages`/`reporting_token`; pin the
+    /// group-level wiring here: a token-bearing send still mints a secret and attaches the
+    /// `<reporting>` node via that path, while an excluded type (reaction) omits both.
+    #[tokio::test]
+    async fn group_send_attaches_reporting_token_via_shared_encode() {
+        let group: Jid = "120363000000000003@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000000@lid".parse().unwrap();
+        let a: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let group_info =
+            GroupInfo::new(vec![own_jid.to_non_ad(), a.to_non_ad()], AddressingMode::Pn);
+
+        async fn prepare(
+            group: &Jid,
+            own_jid: &Jid,
+            own_lid: &Jid,
+            a: &Jid,
+            group_info: &GroupInfo,
+            msg: &wa::Message,
+            req: &str,
+        ) -> (wacore_binary::Node, bool) {
+            let (mut ss, mut is) = established_stores(a).await;
+            let mut sks = MemSenderKeyStore::default();
+            let mut pks = UnusedPreKeyStore;
+            let spks = UnusedSignedPreKeyStore;
+            let mut stores = SignalStores {
+                sender_key_store: &mut sks,
+                session_store: &mut ss,
+                identity_store: &mut is,
+                prekey_store: &mut pks,
+                signed_prekey_store: &spks,
+            };
+            let resolver = MockSendContextResolver::new();
+            let rt = TokioTestRuntime;
+            let prepared = prepare_group_stanza(
+                &rt,
+                &mut stores,
+                &resolver,
+                group_info,
+                own_jid,
+                own_lid,
+                None,
+                group.clone(),
+                msg,
+                req.into(),
+                false,
+                Some(vec![a.clone()]),
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("prepare_group_stanza should succeed");
+            (prepared.node, prepared.message_secret.is_some())
+        }
+
+        // Token-bearing message → secret minted + <reporting> node carrying a token.
+        let text = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        let (node, has_secret) = prepare(
+            &group,
+            &own_jid,
+            &own_lid,
+            &a,
+            &group_info,
+            &text,
+            "REQTEXT",
+        )
+        .await;
+        assert!(has_secret, "token-bearing send must mint a message secret");
+        let reporting = node
+            .get_optional_child("reporting")
+            .expect("token-bearing group send must carry a <reporting> node");
+        assert!(
+            reporting.get_optional_child("reporting_token").is_some(),
+            "reporting node must contain a reporting_token"
+        );
+
+        // Excluded type (reaction) → no secret, no <reporting> node.
+        let reaction = wa::Message {
+            reaction_message: Some(Box::new(wa::message::ReactionMessage {
+                text: Some("👍".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let (node, has_secret) = prepare(
+            &group,
+            &own_jid,
+            &own_lid,
+            &a,
+            &group_info,
+            &reaction,
+            "REQREACT",
+        )
+        .await;
+        assert!(!has_secret, "excluded type must not mint a secret");
+        assert!(
+            node.get_optional_child("reporting").is_none(),
+            "excluded type must not carry a reporting node"
+        );
+    }
+
     /// Regression: the prekey fetch (network RTT) must run BEFORE the
     /// sender-key chain lock is taken, so concurrent sends to the same group
     /// don't serialize behind a slow fetch. The probe try_locks the actual
