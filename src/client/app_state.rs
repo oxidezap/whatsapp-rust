@@ -81,27 +81,22 @@ impl Client {
                         && attempt == 1
                     {
                         // The stored key is missing (e.g. an old bincode row that no
-                        // longer decodes). Patch/snapshot processing fails on the
-                        // missing key before the normal get_missing_key_ids request
-                        // path runs, so request it explicitly here; the primary
-                        // re-shares it and the retry below picks it up.
+                        // longer decodes, or one rejected as corrupt). Patch/snapshot
+                        // processing fails on it before the normal get_missing_key_ids
+                        // path runs, so request it explicitly. Arm the listener before
+                        // sending so a fast key-share can't fire before we wait, then
+                        // wait for the primary to re-share. Every share notifies, so
+                        // repairing multiple missing keys works one share at a time.
+                        use base64::Engine as _;
+                        if let Ok(key_id) =
+                            base64::engine::general_purpose::STANDARD_NO_PAD.decode(id_b64)
                         {
-                            use base64::Engine as _;
-                            if let Ok(key_id) =
-                                base64::engine::general_purpose::STANDARD_NO_PAD.decode(id_b64)
-                            {
-                                self.request_missing_keys_with_dedup(vec![key_id]).await;
-                            }
-                        }
-                        if !self.initial_app_state_keys_received.load(Ordering::Relaxed) {
-                            debug!(target: "Client/AppState", "App state key missing for {:?}; waiting up to 10s for key share then retrying", name);
-                            if rt_timeout(
-                                &*self.runtime,
-                                Duration::from_secs(10),
-                                self.initial_keys_synced_notifier.listen(),
-                            )
-                            .await
-                            .is_err()
+                            let listener = self.initial_keys_synced_notifier.listen();
+                            self.request_missing_keys_with_dedup(vec![key_id]).await;
+                            debug!(target: "Client/AppState", "App state key missing for {:?}; requested it, waiting up to 10s for key share then retrying", name);
+                            if rt_timeout(&*self.runtime, Duration::from_secs(10), listener)
+                                .await
+                                .is_err()
                             {
                                 warn!(target: "Client/AppState", "Timeout waiting for key share for {:?}; retrying anyway", name);
                             }

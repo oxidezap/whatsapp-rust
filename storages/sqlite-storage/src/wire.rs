@@ -19,6 +19,8 @@ use wacore::store::traits::AppStateSyncKey;
 const NOISE_KEY_LEN: usize = 32;
 /// App-state hash length in `HashState`.
 const HASH_STATE_LEN: usize = 128;
+/// App-state master key length (the HKDF input for `expand_app_state_keys`).
+const APP_STATE_KEY_LEN: usize = 32;
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct NoiseCert {
@@ -126,6 +128,17 @@ pub(crate) fn encode_app_state_sync_key(k: &AppStateSyncKey) -> Vec<u8> {
 
 pub(crate) fn decode_app_state_sync_key(bytes: &[u8]) -> Result<AppStateSyncKey, StoreError> {
     let w = AppStateSyncKeyWire::decode(bytes).map_err(decode_err)?;
+    // An old bincode row (or a corrupt blob) can occasionally parse as protobuf
+    // with garbage key material. Reject anything that isn't a 32-byte master
+    // key so the caller treats it as absent and re-requests it, rather than
+    // deriving bad sub-keys that later fail with MAC/decrypt errors.
+    if w.key_data.len() != APP_STATE_KEY_LEN {
+        return Err(bad_len(
+            "app_state_sync_key.key_data",
+            APP_STATE_KEY_LEN,
+            w.key_data.len(),
+        ));
+    }
     Ok(AppStateSyncKey {
         key_data: w.key_data,
         fingerprint: w.fingerprint,
@@ -202,7 +215,7 @@ mod tests {
     #[test]
     fn app_state_sync_key_roundtrips() {
         let key = AppStateSyncKey {
-            key_data: vec![1, 2, 3, 4],
+            key_data: vec![7u8; 32],
             fingerprint: vec![9, 8, 7],
             timestamp: 1_700_000_123,
         };
@@ -210,6 +223,20 @@ mod tests {
         assert_eq!(decoded.key_data, key.key_data);
         assert_eq!(decoded.fingerprint, key.fingerprint);
         assert_eq!(decoded.timestamp, key.timestamp);
+    }
+
+    #[test]
+    fn app_state_sync_key_rejects_wrong_key_len() {
+        // An old bincode row can parse as protobuf with garbage key material;
+        // non-32-byte key data must error so it is treated as absent and
+        // re-requested, not used to derive bad sub-keys.
+        let bytes = AppStateSyncKeyWire {
+            key_data: vec![0u8; 16],
+            fingerprint: vec![1, 2, 3],
+            timestamp: 1,
+        }
+        .encode_to_vec();
+        assert!(decode_app_state_sync_key(&bytes).is_err());
     }
 
     #[test]

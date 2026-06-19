@@ -113,13 +113,12 @@ impl Client {
             );
         }
 
-        // Notify any waiters (initial full sync) that at least one key share was processed.
-        if stored_count > 0
-            && !self
-                .initial_app_state_keys_received
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            // First time setting; notify any waiters
+        // Mark that keys have arrived (idempotent) and wake every waiter. Notifying
+        // on each share, not just the first, lets the app-state retry loop repair
+        // multiple missing keys one share at a time.
+        if stored_count > 0 {
+            self.initial_app_state_keys_received
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.initial_keys_synced_notifier.notify(usize::MAX);
         }
     }
