@@ -239,4 +239,16 @@ mod tests {
         assert_eq!(decoded.hash, [0u8; 128]);
         assert!(decoded.index_value_map.is_empty());
     }
+
+    #[test]
+    fn hash_state_rejects_wrong_hash_len() {
+        // A wire blob whose hash is not 128 bytes must error, not silently truncate.
+        let bytes = HashStateWire {
+            version: 1,
+            hash: vec![0u8; 64],
+            index_value_map: HashMap::new(),
+        }
+        .encode_to_vec();
+        assert!(decode_hash_state(&bytes).is_err());
+    }
 }
