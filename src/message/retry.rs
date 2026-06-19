@@ -137,14 +137,13 @@ impl Client {
         let cache_key = cache_key.to_owned();
         let current = self.message_retry_counts.get(&cache_key).await;
         let new_count = match current {
-            Some(count) if count >= MAX_DECRYPT_RETRIES => return None,
-            Some(count) => count + 1,
+            Some((count, _)) if count >= MAX_DECRYPT_RETRIES => return None,
+            Some((count, _)) => count + 1,
             None => 1,
         };
         self.message_retry_counts
-            .insert(cache_key.clone(), new_count)
+            .insert(cache_key, (new_count, Some(reason)))
             .await;
-        self.recent_retry_reasons.insert(cache_key, reason).await;
         Some(new_count)
     }
 
@@ -185,7 +184,9 @@ impl Client {
     /// This asks our primary phone to share the already-decrypted message content.
     /// PDO is NOT spawned on subsequent retries to avoid duplicate requests.
     ///
-    /// When max retries is reached, an immediate PDO request is sent as a last resort.
+    /// When max retries is reached, a PDO request is attempted as a last resort;
+    /// the `pdo_requested` memo makes it a no-op if one already went out for
+    /// this message, so capped redeliveries cannot re-ask the phone.
     ///
     /// # Arguments
     /// * `info` - The message info for the failed message
@@ -220,8 +221,12 @@ impl Client {
             .await;
 
         let Some(retry_count) = self.increment_retry_count(&cache_key, reason).await else {
-            log::info!(
-                "Max retries ({}) reached for message {} from {} [{:?}]. Sending immediate PDO request.",
+            // Every further redelivery of a capped message lands here, so
+            // keep it at debug; the high-retry warn already fired on the way
+            // to the cap, and the PDO is a once-per-message no-op after the
+            // first request.
+            log::debug!(
+                "Max retries ({}) reached for message {} from {} [{:?}]. Requesting PDO fallback.",
                 MAX_DECRYPT_RETRIES,
                 info.id,
                 info.source.sender.observe(),
@@ -242,10 +247,16 @@ impl Client {
                 reason
             );
         }
-
         let retry_sent = match self.send_retry_receipt(info, retry_count, reason).await {
             Ok(()) => {
                 wacore::telemetry::retry_receipt(reason.as_str());
+                if retry_count >= MAX_DECRYPT_RETRIES {
+                    // Parity with WA Web's MessageHighRetryCount WAM event (id
+                    // 3132): committed after the retry receipt is sent, not
+                    // before — WAWebHandleMsgSendReceipt awaits sendRetryReceipt
+                    // and only then calls maybePostMessageHighRetryCountMetric.
+                    wacore::telemetry::high_retry(reason.as_str());
+                }
                 debug!(
                     "Sent retry receipt #{} for message {} in chat {} from {} [{:?}]",
                     retry_count,

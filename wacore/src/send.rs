@@ -7,7 +7,8 @@ use crate::libsignal::protocol::{
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::messages::MessageUtils;
 use crate::reporting_token::{
-    build_reporting_node, generate_reporting_token, reporting_context_info,
+    build_reporting_node, generate_reporting_token, generate_reporting_token_from_encoded,
+    reporting_context_info,
 };
 use crate::runtime::{AbortHandle, Runtime};
 use crate::types::jid::JidExt;
@@ -21,7 +22,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::{Jid, JidExt as _};
+use wacore_binary::{CompactString, Jid, JidExt as _};
 use wacore_libsignal::crypto::aes_256_cbc_encrypt_into;
 use waproto::whatsapp as wa;
 
@@ -68,6 +69,7 @@ mod dm;
 mod encrypt;
 mod group;
 mod peer;
+mod resolved_devices;
 mod status;
 
 pub use classify::*;
@@ -78,6 +80,7 @@ pub use dm::*;
 pub use encrypt::*;
 pub use group::*;
 pub use peer::*;
+pub use resolved_devices::ResolvedGroupDevices;
 pub use status::*;
 
 #[cfg(test)]

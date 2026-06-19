@@ -50,7 +50,6 @@ disallowed_methods = "deny"
 [workspace.dependencies]
 # Shared dependencies
 aes = "0.9.0"
-aes-gcm = { version = "0.11.0-rc.3", default-features = false, features = ["aes", "alloc", "bytes"] }
 anyhow = { version = "1.0", default-features = false }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
 async-lock = { version = "3", default-features = false }
@@ -58,24 +57,27 @@ async-trait = "0.1.89"
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 bytemuck = { version = "1.22", default-features = false }
 bytes = { version = "1.5", default-features = false }
+cbc = { version = "0.2", features = ["alloc"] }
 chrono = { version = "0.4", default-features = false }
 compact_str = { version = "0.9", default-features = false }
 ctr = { version = "0.10", default-features = false }
+divan = { package = "codspeed-divan-compat", version = "4.7.0" }
 env_logger = { version = "0.11", default-features = false }
 event-listener = { version = "5", default-features = false }
 flate2 = { version = "1.1.5", default-features = false, features = ["zlib-rs"] }
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 getrandom = { version = "0.4", default-features = false }
+heck = "0.5"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 hkdf = { version = "0.13.0", default-features = false }
 hmac = { version = "0.13.0", default-features = false }
-iai-callgrind = "0.16"
 itoa = "1"
 log = "0.4"
 metrics = "0.24"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
-prost = { version = "0.14.3", default-features = false, features = ["std"] }
+prost = { version = "0.14.4", default-features = false, features = ["std"] }
 prost-build = { version = "0.14.3", default-features = false }
+prost-types = { version = "0.14.3", default-features = false, features = ["std"] }
 rand = "0.10"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
@@ -115,7 +117,6 @@ tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
 danger-skip-cert-chain-verify = ["wacore/danger-skip-cert-chain-verify"]
 default = [
-    "moka-cache",
     "simd",
     "sqlite-storage",
     "tokio-transport",
@@ -124,7 +125,6 @@ default = [
     "tokio-native",
     "signal",
 ]
-moka-cache = ["dep:moka"]
 simd = ["wacore/simd"]
 ureq-client = ["dep:whatsapp-rust-ureq-http-client"]
 tokio-transport = ["dep:whatsapp-rust-tokio-transport"]
@@ -141,7 +141,6 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
-env_logger = { workspace = true }
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }
 hex = { workspace = true }
@@ -172,20 +171,14 @@ whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, features = ["wasm_js"] }
 
-# moka is thread-based (crossbeam/uuid) and does not build on wasm32, so it is
-# scoped to non-wasm targets. The `moka-cache` feature can still be enabled on
-# wasm32 (it stays in `default`); `dep:moka` is simply inert there and the cache
-# falls back to PortableCache via the target gate in src/cache.rs.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-moka = { version = "0.12.12", features = ["future"], optional = true }
-
 [dev-dependencies]
 aes = { workspace = true }
-cbc = { version = "0.2", features = ["alloc", "block-padding"] }
+cbc = { workspace = true, features = ["block-padding"] }
+env_logger = { workspace = true }
 flate2 = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18"
 sha2 = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }
@@ -196,6 +189,11 @@ wacore-noise = { path = "./wacore/noise", features = [
 
 [lints]
 workspace = true
+
+# The demo client. Needs only the package default features, so a plain
+# `cargo build --example demo` works without `required-features`.
+[[example]]
+name = "demo"
 
 [[example]]
 name = "benchmark"
@@ -218,7 +216,8 @@ panic = "abort"
 strip = true
 incremental = false
 
-# Benchmark profile: optimized but without aggressive LTO that breaks iai-callgrind
+# Benchmark profile: release-grade codegen, but thin LTO keeps bench builds
+# fast (release uses fat LTO) and debug symbols stay for local profiling.
 [profile.bench]
 inherits = "release"
 lto = "thin"

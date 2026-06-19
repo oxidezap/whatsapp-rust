@@ -1,7 +1,9 @@
-//! Portable in-process cache (moka replacement for WASM).
+//! Portable in-process cache: the client's sole cache backend, on every target
+//! including wasm32.
 //!
-//! Uses [`wacore::time::now_millis`] for time checks — no `std::time::Instant`.
-//! API mirrors moka's [`Cache`](moka::future::Cache).
+//! TTL/TTI use the monotonic [`wacore::time::Instant`] (not the wall clock),
+//! so expiry is immune to system-clock jumps. Provides capacity + TTL/TTI
+//! eviction and an async, single-flight `get_with`.
 //!
 //! `get_with` / `get_with_by_ref` are single-flight: concurrent inits for the
 //! same missing key run the initializer once.
@@ -12,11 +14,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
+use wacore::time::Instant;
 
 struct CacheEntry<V> {
     value: V,
-    inserted_at: i64,
-    last_accessed_at: i64,
+    // Monotonic instants (not wall-clock) so TTL/TTI are immune to clock jumps,
+    // matching moka's timer semantics.
+    inserted_at: Instant,
+    last_accessed_at: Instant,
     /// FIFO sequence number; the key for this entry in `CacheInner::order`.
     seq: u64,
 }
@@ -31,8 +36,8 @@ pub struct PortableCache<K, V> {
     /// Per-key init locks for single-flight `get_with`.
     init_locks: Arc<AsyncMutex<HashMap<K, Arc<AsyncMutex<()>>>>>,
     max_capacity: Option<u64>,
-    ttl_ms: Option<i64>,
-    tti_ms: Option<i64>,
+    ttl: Option<Duration>,
+    tti: Option<Duration>,
 }
 
 struct CacheInner<K, V> {
@@ -66,7 +71,7 @@ where
     /// Insert a brand-new entry (the caller has already confirmed the key is
     /// absent), evicting the oldest entries first if at capacity. Assigns and
     /// records the FIFO sequence.
-    fn insert_new(&mut self, key: K, value: V, now_ms: i64, max_capacity: Option<u64>) {
+    fn insert_new(&mut self, key: K, value: V, now: Instant, max_capacity: Option<u64>) {
         if let Some(cap) = max_capacity {
             while self.map.len() as u64 >= cap {
                 match self.order.pop_first() {
@@ -85,8 +90,8 @@ where
             key,
             CacheEntry {
                 value,
-                inserted_at: now_ms,
-                last_accessed_at: now_ms,
+                inserted_at: now,
+                last_accessed_at: now,
                 seq,
             },
         );
@@ -136,8 +141,8 @@ where
             inner: Arc::new(RwLock::new(CacheInner::new())),
             init_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             max_capacity: self.max_capacity,
-            ttl_ms: self.ttl.map(|d| d.as_millis() as i64),
-            tti_ms: self.tti.map(|d| d.as_millis() as i64),
+            ttl: self.ttl,
+            tti: self.tti,
         }
     }
 }
@@ -153,14 +158,14 @@ where
         PortableCacheBuilder::new()
     }
 
-    fn is_expired(&self, entry: &CacheEntry<V>, now_ms: i64) -> bool {
-        if let Some(ttl_ms) = self.ttl_ms
-            && now_ms - entry.inserted_at >= ttl_ms
+    fn is_expired(&self, entry: &CacheEntry<V>, now: Instant) -> bool {
+        if let Some(ttl) = self.ttl
+            && now.saturating_duration_since(entry.inserted_at) >= ttl
         {
             return true;
         }
-        if let Some(tti_ms) = self.tti_ms
-            && now_ms - entry.last_accessed_at >= tti_ms
+        if let Some(tti) = self.tti
+            && now.saturating_duration_since(entry.last_accessed_at) >= tti
         {
             return true;
         }
@@ -180,18 +185,18 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let now_ms = wacore::time::now_millis();
+        let now = Instant::now();
 
         // Fast path (no TTI): read lock only, no write needed.
-        if self.tti_ms.is_none() {
+        if self.tti.is_none() {
             let guard = self.inner.read().await;
             let entry = guard.map.get(key)?;
-            if self.is_expired(entry, now_ms) {
+            if self.is_expired(entry, now) {
                 let owned_key = Self::find_key(&guard, key)?;
                 drop(guard);
                 let mut wguard = self.inner.write().await;
                 if let Some(e) = wguard.map.get(key)
-                    && self.is_expired(e, now_ms)
+                    && self.is_expired(e, now)
                 {
                     wguard.remove_key(&owned_key);
                 }
@@ -203,23 +208,23 @@ where
         // TTI path: write lock to update last_accessed_at.
         let mut guard = self.inner.write().await;
         let entry = guard.map.get_mut(key)?;
-        if self.is_expired(entry, now_ms) {
+        if self.is_expired(entry, now) {
             let owned_key = Self::find_key(&guard, key)?;
             guard.remove_key(&owned_key);
             return None;
         }
-        entry.last_accessed_at = now_ms;
+        entry.last_accessed_at = now;
         Some(entry.value.clone())
     }
 
     pub async fn insert(&self, key: K, value: V) {
-        let now_ms = wacore::time::now_millis();
+        let now = Instant::now();
         let mut guard = self.inner.write().await;
 
         if let Some(entry) = guard.map.get_mut(&key) {
             entry.value = value;
-            entry.inserted_at = now_ms;
-            entry.last_accessed_at = now_ms;
+            entry.inserted_at = now;
+            entry.last_accessed_at = now;
             return;
         }
 
@@ -227,19 +232,19 @@ where
             return;
         }
 
-        guard.insert_new(key, value, now_ms, self.max_capacity);
+        guard.insert_new(key, value, now, self.max_capacity);
     }
 
     /// Insert and return a clone of the value in one write lock.
     async fn insert_and_return(&self, key: K, value: V) -> V {
-        let now_ms = wacore::time::now_millis();
+        let now = Instant::now();
         let mut guard = self.inner.write().await;
 
         if let Some(entry) = guard.map.get_mut(&key) {
             let ret = value.clone();
             entry.value = value;
-            entry.inserted_at = now_ms;
-            entry.last_accessed_at = now_ms;
+            entry.inserted_at = now;
+            entry.last_accessed_at = now;
             return ret;
         }
 
@@ -248,7 +253,7 @@ where
         }
 
         let ret = value.clone();
-        guard.insert_new(key, value, now_ms, self.max_capacity);
+        guard.insert_new(key, value, now, self.max_capacity);
         ret
     }
 
@@ -257,11 +262,11 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let now_ms = wacore::time::now_millis();
+        let now = Instant::now();
         let mut guard = self.inner.write().await;
         let owned_key = Self::find_key(&guard, key)?;
         let entry = guard.remove_key(&owned_key)?;
-        if self.is_expired(&entry, now_ms) {
+        if self.is_expired(&entry, now) {
             None
         } else {
             Some(entry.value)
@@ -279,7 +284,19 @@ where
         }
     }
 
-    /// Sync invalidate (moka-compatible). Spins briefly if lock is held.
+    /// Reliably remove all entries, awaiting the write lock. Prefer this in
+    /// async contexts over [`invalidate_all`](Self::invalidate_all), whose
+    /// best-effort sync spin can skip the clear under sustained write
+    /// contention.
+    pub async fn clear(&self) {
+        let mut guard = self.inner.write().await;
+        guard.map.clear();
+        guard.order.clear();
+    }
+
+    /// Sync invalidate. Spins briefly if the lock is held; kept for moka API
+    /// parity. In async contexts prefer [`clear`](Self::clear), which can't
+    /// silently skip the clear.
     pub fn invalidate_all(&self) {
         for _ in 0..64 {
             if let Some(mut guard) = self.inner.try_write() {
@@ -299,11 +316,21 @@ where
             .unwrap_or(0)
     }
 
-    /// Eager snapshot iterator over `(Arc<K>, V)` — matches `moka::Cache::iter`'s
-    /// shape but diverges on semantics: snapshot, not lazy. Includes
+    /// Reliable awaited snapshot of `(Arc<K>, V)` pairs. Prefer this over
+    /// [`iter`](Self::iter) in async contexts: `iter` is best-effort (a
+    /// `try_read` spin that yields an empty snapshot under write contention),
+    /// which would silently skip entries an invalidation pass must see.
+    pub async fn snapshot_entries(&self) -> Vec<(Arc<K>, V)> {
+        let guard = self.inner.read().await;
+        Self::snapshot(&guard)
+    }
+
+    /// Eager snapshot iterator over `(Arc<K>, V)`: snapshot, not lazy. Includes
     /// expired-but-not-yet-evicted entries (consistent with `entry_count`).
-    /// Caller must not `.await` with the writer guard held from the same task —
-    /// would deadlock on single-threaded runtimes.
+    /// Best-effort (`try_read` spin); use [`snapshot_entries`](Self::snapshot_entries)
+    /// when missing an entry would be a correctness bug. Caller must not `.await`
+    /// with the writer guard held from the same task — would deadlock on
+    /// single-threaded runtimes.
     pub fn iter(&self) -> std::vec::IntoIter<(Arc<K>, V)> {
         for _ in 0..1024 {
             if let Some(guard) = self.inner.try_read() {
@@ -343,14 +370,18 @@ where
                 .clone()
         };
 
-        let _init_guard = init_mutex.lock().await;
+        let value = {
+            let _init_guard = init_mutex.lock().await;
+            // Double-check after acquiring per-key lock.
+            if let Some(v) = self.get(&key).await {
+                v
+            } else {
+                self.insert_and_return(key.clone(), init.await).await
+            }
+        };
 
-        // Double-check after acquiring per-key lock.
-        if let Some(v) = self.get(&key).await {
-            return v;
-        }
-
-        self.insert_and_return(key, init.await).await
+        self.reclaim_init_lock(&key, &init_mutex).await;
+        value
     }
 
     /// Get or insert (single-flight). Takes key by reference — only allocates
@@ -374,21 +405,41 @@ where
                 .clone()
         };
 
-        let _init_guard = init_mutex.lock().await;
+        let value = {
+            let _init_guard = init_mutex.lock().await;
+            if let Some(v) = self.get(key).await {
+                v
+            } else {
+                self.insert_and_return(owned_key.clone(), init.await).await
+            }
+        };
 
-        if let Some(v) = self.get(key).await {
-            return v;
+        self.reclaim_init_lock(&owned_key, &init_mutex).await;
+        value
+    }
+
+    /// Drop a single-flight init lock once no other caller is using it, so
+    /// `init_locks` can't grow without bound across distinct keys (it is
+    /// otherwise only reclaimed by [`run_pending_tasks`], which several hot
+    /// `get_with` caches never call). `strong_count <= 2` means only this
+    /// caller's clone and the map entry remain; the `ptr_eq` guard avoids
+    /// dropping a newer lock a racing caller may have inserted.
+    async fn reclaim_init_lock(&self, key: &K, init_mutex: &Arc<AsyncMutex<()>>) {
+        let mut locks = self.init_locks.lock().await;
+        if Arc::strong_count(init_mutex) <= 2
+            && let Some(existing) = locks.get(key)
+            && Arc::ptr_eq(existing, init_mutex)
+        {
+            locks.remove(key);
         }
-
-        self.insert_and_return(owned_key, init.await).await
     }
 
     /// Evict expired entries and clean up unused init locks.
     pub async fn run_pending_tasks(&self) {
-        let now_ms = wacore::time::now_millis();
+        let now = Instant::now();
         let mut guard = self.inner.write().await;
 
-        guard.map.retain(|_, entry| !self.is_expired(entry, now_ms));
+        guard.map.retain(|_, entry| !self.is_expired(entry, now));
 
         // Drop order entries whose keys were just expired out of the map.
         // Borrow fields separately to satisfy the borrow checker.
@@ -409,8 +460,8 @@ impl<K, V> Clone for PortableCache<K, V> {
             inner: Arc::clone(&self.inner),
             init_locks: Arc::clone(&self.init_locks),
             max_capacity: self.max_capacity,
-            ttl_ms: self.ttl_ms,
-            tti_ms: self.tti_ms,
+            ttl: self.ttl,
+            tti: self.tti,
         }
     }
 }
@@ -735,20 +786,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_pending_tasks_cleans_init_locks() {
+    async fn test_get_with_reclaims_init_lock_eagerly() {
+        // A completed single-flight `get_with` must not leave its per-key init
+        // lock behind — otherwise high-cardinality caches (session locks, chat
+        // lanes, dedup) that never call run_pending_tasks leak one lock per key.
         let cache: PortableCache<String, u32> = PortableCache::builder().max_capacity(100).build();
 
         let _ = cache.get_with("key1".to_string(), async { 1 }).await;
+        let _ = cache.get_with_by_ref("key2", async { 2 }).await;
 
-        {
-            let locks = cache.init_locks.lock().await;
-            assert!(locks.contains_key("key1"));
-        }
-
-        cache.run_pending_tasks().await;
-        {
-            let locks = cache.init_locks.lock().await;
-            assert!(!locks.contains_key("key1"));
-        }
+        let locks = cache.init_locks.lock().await;
+        assert!(
+            locks.is_empty(),
+            "init locks must be reclaimed after get_with"
+        );
     }
 }

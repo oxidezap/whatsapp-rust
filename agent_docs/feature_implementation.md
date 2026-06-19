@@ -20,7 +20,7 @@ When adding a new feature, follow this flow that mirrors WhatsApp Web behavior w
 
 4. **Keep state changes behind the PersistenceManager**
    - Use `DeviceCommand` + `PersistenceManager::process_command()` for mutations
-   - Use `get_device_snapshot()` for read access
+   - Use `get_device_snapshot()` for read access — sync, returns a cached `Arc<Device>` (refcount bump, no Device clone, no lock); hold it and borrow fields rather than cloning them
 
 5. **Confirm concurrency requirements**
    - Network I/O stays async

@@ -3,6 +3,7 @@ mod adapters;
 mod app_state;
 mod context_impl;
 mod device_registry;
+pub(crate) mod device_topology;
 mod iq_ops;
 mod lid_pn;
 mod lifecycle;
@@ -172,7 +173,7 @@ const TRANSPORT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Snapshot of internal collection sizes for memory leak detection.
 ///
-/// All counts are approximate (moka caches may have pending evictions).
+/// All counts are approximate (caches may have pending evictions).
 /// Call [`Client::memory_diagnostics`] to obtain a snapshot.
 ///
 /// Requires the `debug-diagnostics` feature.
@@ -189,9 +190,13 @@ pub struct MemoryDiagnostics {
     pub message_retry_counts: u64,
     pub undecryptable_dispatched: u64,
     pub pdo_pending_requests: u64,
-    // -- Moka caches (capacity-only, no TTL) --
+    pub pdo_requested: u64,
+    // -- Capacity-only caches (no TTL) --
     pub session_locks: u64,
     pub chat_lanes: u64,
+    pub resend_rate_limiter_chats: u64,
+    /// Total outbound resends dropped by the per-chat rate limiter since start.
+    pub resends_throttled_total: u64,
     // -- Unbounded collections --
     pub response_waiters: usize,
     pub node_waiters: usize,
@@ -211,7 +216,7 @@ pub struct MemoryDiagnostics {
 impl std::fmt::Display for MemoryDiagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "=== Memory Diagnostics ===")?;
-        writeln!(f, "--- Moka caches (TTL-bounded) ---")?;
+        writeln!(f, "--- TTL-bounded caches ---")?;
         writeln!(f, "  group_cache:            {}", self.group_cache)?;
         writeln!(
             f,
@@ -233,9 +238,20 @@ impl std::fmt::Display for MemoryDiagnostics {
             self.undecryptable_dispatched
         )?;
         writeln!(f, "  pdo_pending_requests:   {}", self.pdo_pending_requests)?;
-        writeln!(f, "--- Moka caches (capacity-only) ---")?;
+        writeln!(f, "  pdo_requested:          {}", self.pdo_requested)?;
+        writeln!(f, "--- Capacity-only caches ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
+        writeln!(
+            f,
+            "  resend_rl_chats:        {}",
+            self.resend_rate_limiter_chats
+        )?;
+        writeln!(
+            f,
+            "  resends_throttled:      {}",
+            self.resends_throttled_total
+        )?;
         writeln!(f, "--- Unbounded collections ---")?;
         writeln!(f, "  response_waiters:       {}", self.response_waiters)?;
         writeln!(f, "  node_waiters:           {}", self.node_waiters)?;
@@ -273,6 +289,13 @@ impl std::fmt::Display for MemoryDiagnostics {
     }
 }
 
+/// Shared base error for transport/connection concerns.
+///
+/// The DRY foundation every per-domain error builds on (each domain embeds it
+/// via `#[from]`): it carries the cases common to every network operation —
+/// `NotConnected`, `NotLoggedIn`, IQ failures, socket / encrypt-send errors. It
+/// is NOT an umbrella over the whole API; the per-domain typed errors remain
+/// the public return types.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ClientError {
@@ -286,6 +309,13 @@ pub enum ClientError {
     AlreadyConnected,
     #[error("client is not logged in")]
     NotLoggedIn,
+    #[error("IQ request failed: {0}")]
+    Iq(#[from] crate::request::IqError),
+    /// Last-resort catch-all for internal failures threaded through `?` that do
+    /// not (yet) have a dedicated variant. Transparent so the underlying
+    /// error's `Display`/source chain is preserved.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
 }
 
 impl ClientError {
@@ -293,6 +323,14 @@ impl ClientError {
         match self {
             ClientError::NotConnected => true,
             ClientError::EncryptSend(e) => e.is_transport_unavailable(),
+            // Transport loss can now arrive wrapped in an IQ failure (the base
+            // error gained `Iq`); unwrap it so retry/reconnect still triggers.
+            ClientError::Iq(e) => match e {
+                crate::request::IqError::NotConnected => true,
+                crate::request::IqError::EncryptSend(e) => e.is_transport_unavailable(),
+                crate::request::IqError::ClientState(client) => client.is_transport_unavailable(),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -315,6 +353,9 @@ pub struct Client {
     pub(crate) core: wacore::client::CoreClient,
 
     pub(crate) persistence_manager: Arc<PersistenceManager>,
+    /// Write-behind buffer for inbound messageSecret captures; readers check
+    /// it before the backend so the durable write can leave the receive lane.
+    pub(crate) msg_secret_buffer: Arc<crate::msg_secret_buffer::MsgSecretWriteBuffer>,
     pub(crate) media_conn: Arc<RwLock<Option<crate::mediaconn::MediaConn>>>,
 
     pub(crate) is_logged_in: Arc<AtomicBool>,
@@ -420,7 +461,7 @@ pub struct Client {
     pub(crate) connection_generation: Arc<AtomicU64>,
 
     /// Cache for recent messages (serialized bytes) for retry functionality.
-    /// Uses moka cache with TTL and max capacity for automatic eviction.
+    /// Uses an in-process cache with TTL and max capacity for automatic eviction.
     pub(crate) recent_messages: Cache<ChatMessageId, Arc<Vec<u8>>>,
 
     pub(crate) sender_key_device_cache: crate::sender_key_device_cache::SenderKeyDeviceCache,
@@ -430,15 +471,16 @@ pub struct Client {
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
 
     /// Track retry attempts per message to prevent infinite retry loops.
-    /// Key: "{chat}:{msg_id}:{sender}", Value: retry count
-    /// Matches WhatsApp Web's MAX_RETRY = 5 behavior.
-    pub(crate) message_retry_counts: Cache<String, u8>,
-
-    /// Most recent `RetryReason` we attached to a retry receipt for this
-    /// message (same key shape as `message_retry_counts`). Lets diagnostics
-    /// and regression tests distinguish which decrypt-failure arm actually
-    /// ran (the count alone can't separate NoSession from BadMac etc.).
-    pub(crate) recent_retry_reasons: Cache<String, wacore::protocol::retry::RetryReason>,
+    /// Key: "{chat}:{msg_id}:{sender}", Value: retry count plus the most
+    /// recent `RetryReason` we attached, fused so the decrypt-failure path
+    /// does one cache write and the binary carries one cache instantiation
+    /// instead of two. The reason is `None` when the count was learned from
+    /// the sender's echoed stanza `count` attribute rather than a local
+    /// decrypt failure; diagnostics and regression tests read it to tell
+    /// which failure arm ran (the count alone can't separate NoSession from
+    /// BadMac etc.). Matches WhatsApp Web's MAX_RETRY = 5 behavior.
+    pub(crate) message_retry_counts:
+        Cache<String, (u8, Option<wacore::protocol::retry::RetryReason>)>,
 
     /// Per-peer timestamp of the last forced session recreate via the
     /// "no keys + retry≥2 + >1h since last" path (whatsmeow parity).
@@ -447,6 +489,11 @@ pub struct Client {
     /// stay stuck. This map throttles the fallback so a noisy peer can't
     /// loop us through prekey fetches.
     pub(crate) session_recreate_history: Cache<wacore_binary::jid::Jid, wacore::time::Instant>,
+
+    /// Per-chat outbound resend rate limiter: bounds the aggregate resend rate
+    /// to a chat (the anti-abuse signal) so a PN to LID fan-out cannot storm into
+    /// AccountLocked. Throttled devices still recover via the fresh-SKDM mark.
+    pub(crate) resend_rate_limiter: crate::resend_rate_limiter::ResendRateLimiter,
 
     /// Dispatch-once gate for `UndecryptableMessage`: a server resend of a
     /// failed id re-enters the failure path and would otherwise fire a
@@ -474,6 +521,11 @@ pub struct Client {
     pub(crate) offline_sync_notifier: Arc<event_listener::Event>,
     /// Flag indicating offline sync has completed (received ib offline stanza).
     pub(crate) offline_sync_completed: Arc<AtomicBool>,
+    /// Delivery receipts buffered during offline sync, flushed as aggregate
+    /// `<receipt>` stanzas at completion (WA Web `sendAggregateOfflineReceipts`).
+    /// Empty (zero capacity) outside the offline window.
+    pub(crate) offline_receipt_buffer:
+        std::sync::Mutex<Vec<Arc<crate::types::message::MessageInfo>>>,
     /// Number of history sync tasks currently queued or running.
     pub(crate) history_sync_tasks_in_flight: Arc<AtomicUsize>,
     /// Notifier triggered when history sync work becomes idle.
@@ -506,8 +558,10 @@ pub struct Client {
     /// Tracks the pending pair code request and ephemeral keys.
     pub(crate) pair_code_state: Arc<Mutex<wacore::pair_code::PairCodeState>>,
 
-    /// Custom handlers for encrypted message types
-    pub custom_enc_handlers: Arc<async_lock::RwLock<HashMap<String, Arc<dyn EncHandler>>>>,
+    /// Custom handlers for encrypted message types. Set once at `Bot::build` and
+    /// immutable afterward, so the receive hot path reads it with a plain
+    /// `OnceLock::get` (no lock) and no per-node guard acquisition.
+    pub custom_enc_handlers: std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>,
 
     /// Chat state (typing indicator) handlers registered by external consumers.
     /// Each handler receives a `ChatStateEvent` describing the chat, optional participant and state.
@@ -516,11 +570,35 @@ pub struct Client {
     pub(crate) pdo_pending_requests:
         Cache<wacore::types::message::ChatMessageId, crate::pdo::PendingPdoRequest>,
 
+    /// Messages already covered by a placeholder-resend PDO request. Mirrors
+    /// the session-lifetime set in
+    /// `WAWebNonMessageDataRequestPlaceholderMessageResendUtils`: at most one
+    /// request per message, no matter how many times the server redelivers
+    /// the undecryptable original. Entries are dropped on send failure so a
+    /// transient error does not block the next attempt.
+    pub(crate) pdo_requested: Cache<wacore::types::message::ChatMessageId, ()>,
+
     /// LRU cache for device registry (matches WhatsApp Web's 5000 entry limit).
     /// Maps user ID to DeviceListRecord for fast device existence checks.
     /// Backed by persistent storage.
-    pub(crate) device_registry_cache:
-        TypedCache<String, Arc<wacore::store::traits::DeviceListRecord>>,
+    /// Device registry fused with its topology tracker: every write records
+    /// the change by construction, so the group-devices memo below can never
+    /// be left stale by a forgotten bump.
+    pub(crate) device_registry_cache: crate::client::device_topology::DeviceRegistryCache,
+    /// Shared topology tracker (generation + changed-users log). LidPnCache
+    /// records mapping changes into it; the memo validates against it.
+    pub(crate) device_topology: Arc<crate::client::device_topology::DeviceTopology>,
+    /// Whether the group-devices memo may be used: false when the registry
+    /// or LID-PN caches are store-backed (a shared external store can be
+    /// written by other processes, which the in-process topology tracker
+    /// cannot observe).
+    pub(crate) group_devices_memo_enabled: bool,
+    /// Per-group memo of the fully resolved (LID-converted) device list,
+    /// validated by GroupInfo identity + the device topology. Serves the
+    /// per-send full-set resolution in `resolve_skdm_targets` so a warm
+    /// repeat send skips the per-member cache fan-out.
+    pub(crate) group_devices_memo:
+        Cache<Jid, Arc<crate::client::device_registry::GroupDevicesMemo>>,
 
     /// Router for dispatching stanzas to their appropriate handlers
     pub(crate) stanza_router: crate::handlers::router::StanzaRouter,

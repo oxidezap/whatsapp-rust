@@ -8,6 +8,7 @@ use crate::appstate_sync::Mutation;
 use crate::client::Client;
 use anyhow::Result;
 use log::debug;
+use thiserror::Error;
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::appstate::schemas::{self, IndexPart, Schema};
 use wacore::types::events::{
@@ -16,6 +17,21 @@ use wacore::types::events::{
 };
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
+
+/// Error returned by app-state (syncd) mutations — the shared failure domain
+/// of chat actions ([`ChatActions`]) and labels ([`crate::Labels`]).
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum AppStateError {
+    /// The mutation arguments are invalid (e.g. a past mute timestamp, a
+    /// non-phone-number contact id, a missing group participant, an empty
+    /// label id).
+    #[error("invalid app-state request: {0}")]
+    InvalidRequest(String),
+    /// Encoding, key lookup, or sending the app-state patch failed.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
 
 /// WA Web uses `-1` for indefinite mute.
 const MUTE_INDEFINITE: i64 = -1;
@@ -375,7 +391,7 @@ impl<'a> ChatActions<'a> {
         &self,
         jid: &Jid,
         message_range: Option<SyncActionMessageRange>,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         debug!("Archiving chat {jid}");
         self.send_archive_mutation(jid, true, message_range).await
     }
@@ -384,45 +400,49 @@ impl<'a> ChatActions<'a> {
         &self,
         jid: &Jid,
         message_range: Option<SyncActionMessageRange>,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         debug!("Unarchiving chat {jid}");
         self.send_archive_mutation(jid, false, message_range).await
     }
 
-    pub async fn pin_chat(&self, jid: &Jid) -> Result<()> {
+    pub async fn pin_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
         debug!("Pinning chat {jid}");
         self.send_pin_mutation(jid, true).await
     }
 
-    pub async fn unpin_chat(&self, jid: &Jid) -> Result<()> {
+    pub async fn unpin_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
         debug!("Unpinning chat {jid}");
         self.send_pin_mutation(jid, false).await
     }
 
-    pub async fn mute_chat(&self, jid: &Jid) -> Result<()> {
+    pub async fn mute_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
         debug!("Muting chat {jid} indefinitely");
         self.send_mute_mutation(jid, true, MUTE_INDEFINITE).await
     }
 
     /// Must be in the future. Use [`mute_chat`](Self::mute_chat) for indefinite.
-    pub async fn mute_chat_until(&self, jid: &Jid, mute_end_timestamp_ms: i64) -> Result<()> {
+    pub async fn mute_chat_until(
+        &self,
+        jid: &Jid,
+        mute_end_timestamp_ms: i64,
+    ) -> Result<(), AppStateError> {
         if mute_end_timestamp_ms <= 0 {
-            anyhow::bail!(
-                "mute_end_timestamp_ms must be a positive future timestamp (use mute_chat() for indefinite)"
-            );
+            return Err(AppStateError::InvalidRequest(
+                "mute_end_timestamp_ms must be a positive future timestamp (use mute_chat() for indefinite)".into(),
+            ));
         }
         let now_ms = wacore::time::now_millis();
         if mute_end_timestamp_ms <= now_ms {
-            anyhow::bail!(
+            return Err(AppStateError::InvalidRequest(format!(
                 "mute_end_timestamp_ms is in the past ({mute_end_timestamp_ms} <= {now_ms})"
-            );
+            )));
         }
         debug!("Muting chat {jid} until {mute_end_timestamp_ms}");
         self.send_mute_mutation(jid, true, mute_end_timestamp_ms)
             .await
     }
 
-    pub async fn unmute_chat(&self, jid: &Jid) -> Result<()> {
+    pub async fn unmute_chat(&self, jid: &Jid) -> Result<(), AppStateError> {
         debug!("Unmuting chat {jid}");
         self.send_mute_mutation(jid, false, 0).await
     }
@@ -434,7 +454,7 @@ impl<'a> ChatActions<'a> {
         participant_jid: Option<&Jid>,
         message_id: &str,
         from_me: bool,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         debug!("Starring message {message_id} in {chat_jid}");
         self.send_star_mutation(chat_jid, participant_jid, message_id, from_me, true)
             .await
@@ -446,7 +466,7 @@ impl<'a> ChatActions<'a> {
         participant_jid: Option<&Jid>,
         message_id: &str,
         from_me: bool,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         debug!("Unstarring message {message_id} in {chat_jid}");
         self.send_star_mutation(chat_jid, participant_jid, message_id, from_me, false)
             .await
@@ -458,7 +478,7 @@ impl<'a> ChatActions<'a> {
         jid: &Jid,
         read: bool,
         message_range: Option<SyncActionMessageRange>,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         debug!(
             "Marking chat {jid} as {}",
             if read { "read" } else { "unread" }
@@ -482,7 +502,7 @@ impl<'a> ChatActions<'a> {
         jid: &Jid,
         delete_media: bool,
         message_range: Option<SyncActionMessageRange>,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         debug!("Deleting chat {jid}");
         let delete_media_str = if delete_media { "1" } else { "0" };
         let value = wa::SyncActionValue {
@@ -510,7 +530,7 @@ impl<'a> ChatActions<'a> {
         delete_starred: bool,
         delete_media: bool,
         message_range: Option<SyncActionMessageRange>,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         debug!("Clearing chat {jid}");
         // WA Web's $ClearChatSync$p_3 encodes both flags as "1"/"0".
         let delete_starred_str = if delete_starred { "1" } else { "0" };
@@ -532,7 +552,7 @@ impl<'a> ChatActions<'a> {
 
     /// Mute or unmute a contact/group/newsletter's status updates across devices
     /// (WA Web's userStatusMute). `muted = true` hides their status.
-    pub async fn set_user_status_mute(&self, jid: &Jid, muted: bool) -> Result<()> {
+    pub async fn set_user_status_mute(&self, jid: &Jid, muted: bool) -> Result<(), AppStateError> {
         debug!("Setting userStatusMute for {jid} -> {muted}");
         let value = wa::SyncActionValue {
             user_status_mute_action: Some(wa::sync_action_value::UserStatusMuteAction {
@@ -557,7 +577,7 @@ impl<'a> ChatActions<'a> {
         from_me: bool,
         delete_media: bool,
         message_timestamp: Option<i64>,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         debug!("Deleting message {message_id} for me in {chat_jid}");
         let (chat, participant) = message_key_owned(chat_jid, participant_jid, from_me)?;
         let value = wa::SyncActionValue {
@@ -598,11 +618,11 @@ impl<'a> ChatActions<'a> {
         full_name: Option<String>,
         first_name: Option<String>,
         save_on_primary_addressbook: bool,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         if !is_valid_contact_id(jid) {
-            anyhow::bail!(
-                "save_contact: contact id must be a bare phone-number JID (not a LID, group, or device-specific JID)"
-            );
+            return Err(AppStateError::InvalidRequest(
+                "save_contact: contact id must be a bare phone-number JID (not a LID, group, or device-specific JID)".into(),
+            ));
         }
         debug!("Saving contact {jid}");
         let value = wa::SyncActionValue {
@@ -626,7 +646,7 @@ impl<'a> ChatActions<'a> {
         jid: &Jid,
         archived: bool,
         message_range: Option<SyncActionMessageRange>,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         let value = wa::SyncActionValue {
             archive_chat_action: Some(wa::sync_action_value::ArchiveChatAction {
                 archived: Some(archived),
@@ -641,7 +661,7 @@ impl<'a> ChatActions<'a> {
             .await
     }
 
-    async fn send_pin_mutation(&self, jid: &Jid, pinned: bool) -> Result<()> {
+    async fn send_pin_mutation(&self, jid: &Jid, pinned: bool) -> Result<(), AppStateError> {
         let value = wa::SyncActionValue {
             pin_action: Some(wa::sync_action_value::PinAction {
                 pinned: Some(pinned),
@@ -660,7 +680,7 @@ impl<'a> ChatActions<'a> {
         jid: &Jid,
         muted: bool,
         mute_end_timestamp_ms: i64,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         // -1 = indefinite, 0 = unmuted, positive = expiry ms
         let mute_end = if muted {
             Some(mute_end_timestamp_ms)
@@ -689,7 +709,7 @@ impl<'a> ChatActions<'a> {
         message_id: &str,
         from_me: bool,
         starred: bool,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         let (chat, participant) = message_key_owned(chat_jid, participant_jid, from_me)?;
         let value = wa::SyncActionValue {
             star_action: Some(wa::sync_action_value::StarAction {
@@ -727,7 +747,7 @@ impl Client {
         index: &[u8],
         value: &wa::SyncActionValue,
         version: i32,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         use rand::Rng;
         use wacore::appstate::encode::encode_record;
 
@@ -737,8 +757,13 @@ impl Client {
             .get_latest_sync_key_id()
             .await
             .map_err(|e| anyhow::anyhow!(e))?
-            .ok_or_else(|| anyhow::anyhow!("No app state sync key available"))?;
-        let keys = proc.get_app_state_key(&key_id).await?;
+            .ok_or_else(|| {
+                AppStateError::InvalidRequest("no app state sync key available".into())
+            })?;
+        let keys = proc
+            .get_app_state_key(&key_id)
+            .await
+            .map_err(|e| AppStateError::Internal(e.into()))?;
 
         let mut iv = [0u8; 16];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
@@ -754,7 +779,8 @@ impl Client {
         );
 
         self.send_app_state_patch(collection.as_str(), vec![mutation])
-            .await
+            .await?;
+        Ok(())
     }
 
     /// Send any app-state (syncd) `Set` action, driven by a generated
@@ -792,7 +818,7 @@ impl Client {
         schema: &Schema,
         index_args: &[&str],
         value: &wa::SyncActionValue,
-    ) -> Result<()> {
+    ) -> Result<(), AppStateError> {
         let index = build_action_index(schema, index_args)?;
         let collection = collection_patch_name(schema.collection);
         self.send_app_state_mutation(collection, &index, value, schema.version as i32)

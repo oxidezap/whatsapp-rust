@@ -34,6 +34,10 @@ mod tests {
         latest_key_id: Arc<Mutex<Option<Vec<u8>>>>,
         // Fault injection: when set, clear_mutation_macs fails (transient store error).
         fail_clear_macs: Arc<Mutex<bool>>,
+        // Call counters distinguishing the batched MAC prefetch from per-item
+        // lookups, so tests can pin which path the processor takes.
+        singular_mac_calls: Arc<std::sync::atomic::AtomicU64>,
+        batch_mac_calls: Arc<std::sync::atomic::AtomicU64>,
     }
 
     // Implement SignalStore - Signal protocol cryptographic operations
@@ -65,6 +69,9 @@ mod tests {
             Ok(None)
         }
         async fn remove_prekey(&self, _: u32) -> StoreResult<()> {
+            Ok(())
+        }
+        async fn mark_prekeys_uploaded(&self, _: &[u32]) -> StoreResult<()> {
             Ok(())
         }
         async fn get_max_prekey_id(&self) -> StoreResult<u32> {
@@ -135,12 +142,32 @@ mod tests {
             name: &str,
             index_mac: &[u8],
         ) -> StoreResult<Option<Vec<u8>>> {
+            self.singular_mac_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self
                 .macs
                 .lock()
                 .await
                 .get(&(name.to_string(), index_mac.to_vec()))
                 .cloned())
+        }
+        // Real batch override (not the default singular-loop fallback) so the
+        // counters can prove which path the processor used.
+        async fn get_mutation_macs(
+            &self,
+            name: &str,
+            index_macs: &[Vec<u8>],
+        ) -> StoreResult<HashMap<Vec<u8>, Vec<u8>>> {
+            self.batch_mac_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let macs = self.macs.lock().await;
+            Ok(index_macs
+                .iter()
+                .filter_map(|index_mac| {
+                    macs.get(&(name.to_string(), index_mac.clone()))
+                        .map(|mac| (index_mac.clone(), mac.clone()))
+                })
+                .collect())
         }
         async fn delete_mutation_macs(&self, _: &str, _: &[Vec<u8>]) -> StoreResult<()> {
             Ok(())
@@ -535,6 +562,224 @@ mod tests {
         };
 
         (backend, processor, patch_list, stale_index_mac)
+    }
+
+    /// Locks the move-and-restore handoff: the snapshot and each patch move into
+    /// blocking closures (instead of being deep-cloned for the 'static bound) and
+    /// must come back on the returned PatchList, because the caller reads
+    /// pl.snapshot/pl.patches afterwards (get_missing_key_ids, has_more bookkeeping).
+    #[tokio::test]
+    async fn process_patch_list_returns_snapshot_and_patches_to_caller() {
+        let (_backend, processor, mut patch_list, _) = snapshot_resync_scenario().await;
+
+        let key_id_bytes = b"snap_key_id".to_vec();
+        let master_key = [9u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let plaintext = wa::SyncActionData {
+            value: Some(wa::SyncActionValue {
+                timestamp: Some(3000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        for (version, index_mac) in [(3u64, [0x22u8; 32]), (4, [0x33; 32])] {
+            let mutation = create_encrypted_mutation(
+                wa::syncd_mutation::SyncdOperation::Set,
+                &index_mac,
+                &plaintext,
+                &keys,
+                &key_id_bytes,
+            );
+            patch_list.patches.push(wa::SyncdPatch {
+                mutations: vec![mutation],
+                version: Some(wa::SyncdVersion {
+                    version: Some(version),
+                }),
+                key_id: Some(wa::KeyId {
+                    id: Some(key_id_bytes.clone()),
+                }),
+                ..Default::default()
+            });
+        }
+
+        let (mutations, state, pl) = processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("snapshot + patches should process");
+
+        assert_eq!(state.version, 4);
+        assert_eq!(
+            mutations.len(),
+            3,
+            "snapshot record + one mutation per patch"
+        );
+
+        let snapshot = pl.snapshot.as_ref().expect("snapshot handed back");
+        assert_eq!(
+            snapshot.version.as_ref().and_then(|v| v.version),
+            Some(2),
+            "the same snapshot must come back, not a substitute"
+        );
+        assert_eq!(snapshot.records.len(), 1, "snapshot records preserved");
+
+        let patch_versions: Vec<_> = pl
+            .patches
+            .iter()
+            .map(|p| p.version.as_ref().and_then(|v| v.version))
+            .collect();
+        assert_eq!(
+            patch_versions,
+            vec![Some(3), Some(4)],
+            "patches handed back in processing order"
+        );
+        let patch_index_macs: Vec<_> = pl
+            .patches
+            .iter()
+            .map(|p| {
+                p.mutations[0]
+                    .record
+                    .as_ref()
+                    .and_then(|r| r.index.as_ref())
+                    .and_then(|i| i.blob.as_deref())
+                    .map(|b| b[0])
+            })
+            .collect();
+        assert_eq!(
+            patch_index_macs,
+            vec![Some(0x22), Some(0x33)],
+            "each patch keeps its own mutations through the handoff"
+        );
+    }
+
+    /// Locks that build_patch consults the previous value MACs (now via the
+    /// batched get_mutation_macs): a SET overwriting an existing index must
+    /// produce the subtract-then-add ltHash. If the prefetch wiring broke and
+    /// returned nothing, the old MAC would never be subtracted and the
+    /// emitted snapshot_mac would diverge.
+    #[tokio::test]
+    async fn build_patch_subtracts_previous_macs_fetched_in_batch() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let collection_name = WAPatchName::Regular;
+        let index_mac = vec![4; 32];
+        let key_id_bytes = b"patch_key_id".to_vec();
+        let master_key = [11u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+
+        backend
+            .set_sync_key(
+                &key_id_bytes,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept sync key");
+
+        let second_index_mac = vec![5; 32];
+        let old_value_macs: HashMap<Vec<u8>, Vec<u8>> = HashMap::from([
+            (index_mac.clone(), vec![0xAA; 32]),
+            (second_index_mac.clone(), vec![0xBB; 32]),
+        ]);
+        backend
+            .set_version(
+                collection_name.as_str(),
+                HashState {
+                    version: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept version");
+        backend
+            .put_mutation_macs(
+                collection_name.as_str(),
+                1,
+                &old_value_macs
+                    .iter()
+                    .map(|(index_mac, value_mac)| AppStateMutationMAC {
+                        index_mac: index_mac.clone(),
+                        value_mac: value_mac.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .expect("test backend should accept mutation MACs");
+
+        let plaintext = wa::SyncActionData {
+            value: Some(wa::SyncActionValue {
+                timestamp: Some(5000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mutations: Vec<wa::SyncdMutation> = [&index_mac, &second_index_mac]
+            .into_iter()
+            .map(|mac| {
+                create_encrypted_mutation(
+                    wa::syncd_mutation::SyncdOperation::Set,
+                    mac,
+                    &plaintext,
+                    &keys,
+                    &key_id_bytes,
+                )
+            })
+            .collect();
+
+        let singular_before = backend
+            .singular_mac_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let batch_before = backend
+            .batch_mac_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let (patch_bytes, base_version) = processor
+            .build_patch(collection_name.as_str(), mutations.clone())
+            .await
+            .expect("build_patch should succeed");
+        assert_eq!(base_version, 1);
+
+        // The prefetch must be ONE batched round-trip, never per-mutation
+        // singular lookups (the N+1 this change removes).
+        assert_eq!(
+            backend
+                .batch_mac_calls
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - batch_before,
+            1,
+            "previous MACs must be fetched via a single get_mutation_macs call"
+        );
+        assert_eq!(
+            backend
+                .singular_mac_calls
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - singular_before,
+            0,
+            "build_patch must not fall back to per-mutation get_mutation_mac"
+        );
+
+        // Recompute the expected post-patch state with the seeded prev MACs.
+        let mut expected_state = HashState {
+            version: 1,
+            ..Default::default()
+        };
+        let (hash_result, res) =
+            expected_state.update_hash(&mutations, |mac, _| Ok(old_value_macs.get(mac).cloned()));
+        assert!(res.is_ok() && !hash_result.has_missing_remove);
+        expected_state.version = 2;
+        let expected_snapshot_mac =
+            expected_state.generate_snapshot_mac(collection_name.as_str(), &keys.snapshot_mac);
+
+        let patch = wa::SyncdPatch::decode(patch_bytes.as_slice()).expect("patch should decode");
+        assert_eq!(
+            patch.snapshot_mac.as_deref(),
+            Some(expected_snapshot_mac.as_slice()),
+            "snapshot_mac must reflect subtract(old)+add(new); a broken prev-MAC prefetch diverges here"
+        );
     }
 
     #[tokio::test]

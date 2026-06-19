@@ -247,8 +247,8 @@ impl Client {
         use anyhow::anyhow;
 
         let storage_entry = LidPnMappingEntry {
-            lid: entry.lid,
-            phone_number: entry.phone_number,
+            lid: entry.lid.to_string(),
+            phone_number: entry.phone_number.to_string(),
             created_at: entry.created_at,
             updated_at: entry.created_at,
             learning_source: entry.learning_source.as_str().to_string(),
@@ -296,8 +296,8 @@ impl Client {
         let storage: Vec<LidPnMappingEntry> = entries
             .into_iter()
             .map(|entry| LidPnMappingEntry {
-                lid: entry.lid,
-                phone_number: entry.phone_number,
+                lid: entry.lid.to_string(),
+                phone_number: entry.phone_number.to_string(),
                 created_at: entry.created_at,
                 updated_at: entry.created_at,
                 learning_source: entry.learning_source.as_str().to_string(),
@@ -420,6 +420,10 @@ impl Client {
     /// Callers must NOT hold `session_lock_for(<lid_addr>)` for any device
     /// in [0, 100) — `async_lock::Mutex` is not reentrant. The decrypt path
     /// drops its address lock around the call (`try_pn_to_lid_migration_decrypt`).
+    ///
+    /// Returns whether anything moved into a LID slot. When `false`, decrypt
+    /// state is unchanged, so a failed decrypt retried after this call is
+    /// guaranteed to fail identically and callers can skip the retry.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -428,7 +432,11 @@ impl Client {
             skip_all
         )
     )]
-    pub(crate) async fn migrate_signal_sessions_on_lid_discovery(&self, pn: &str, lid: &str) {
+    pub(crate) async fn migrate_signal_sessions_on_lid_discovery(
+        &self,
+        pn: &str,
+        lid: &str,
+    ) -> bool {
         use log::{info, warn};
         use wacore::types::jid::JidExt;
 
@@ -443,8 +451,10 @@ impl Client {
             .has_state_for_user(pn, backend.as_ref())
             .await
         {
-            return;
+            return false;
         }
+
+        let mut migrated = false;
 
         for device_id in 0..MIGRATION_DEVICE_RANGE {
             // `&str` → `CompactString` is inline for ≤24-byte user parts
@@ -479,6 +489,7 @@ impl Client {
             {
                 self.signal_cache.put_session(&lid_proto, session).await;
                 self.signal_cache.delete_session(&pn_proto).await;
+                migrated = true;
                 info!(
                     "Migrated session {} -> {} (PN wins on conflict)",
                     pn_proto, lid_proto
@@ -511,6 +522,7 @@ impl Client {
                             .put_identity(&lid_proto, &identity_data)
                             .await;
                         self.signal_cache.delete_identity(&pn_proto).await;
+                        migrated = true;
                         info!("Migrated identity {} -> {}", pn_proto, lid_proto);
                     }
                     Ok(Some(_)) => {
@@ -532,6 +544,7 @@ impl Client {
         if let Err(e) = self.signal_cache.flush(backend.as_ref()).await {
             warn!("Failed to flush signal cache after migration: {e:?}");
         }
+        migrated
     }
 
     /// Look up the LID↔phone mapping for a JID. Cache-aside: falls back to
@@ -585,7 +598,7 @@ impl Client {
             return None;
         }
         match self.get_lid_pn_entry(jid).await {
-            Ok(Some(entry)) => Some(Jid::new(entry.lid, wacore_binary::Server::Lid)),
+            Ok(Some(entry)) => Some(Jid::new(&*entry.lid, wacore_binary::Server::Lid)),
             Ok(None) => None,
             Err(e) => {
                 log::warn!(
@@ -723,8 +736,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(entry.lid, lid);
-        assert_eq!(entry.phone_number, pn);
+        assert_eq!(&*entry.lid, lid);
+        assert_eq!(&*entry.phone_number, pn);
     }
 
     #[tokio::test]
@@ -751,8 +764,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(entry.lid, lid);
-        assert_eq!(entry.phone_number, pn);
+        assert_eq!(&*entry.lid, lid);
+        assert_eq!(&*entry.phone_number, pn);
     }
 
     /// Cache-aside fallback: if the in-memory cache is missing an entry the
@@ -783,8 +796,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(entry.lid, lid);
-        assert_eq!(entry.phone_number, pn);
+        assert_eq!(&*entry.lid, lid);
+        assert_eq!(&*entry.phone_number, pn);
 
         // Subsequent lookup served from cache.
         let entry = client
@@ -792,7 +805,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(entry.lid, lid);
+        assert_eq!(&*entry.lid, lid);
     }
 
     /// `learn_lid_pn_mapping_fast` must leave the in-memory cache populated
@@ -957,7 +970,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .lid,
-            lid
+            lid.into()
         );
     }
 
@@ -1290,6 +1303,56 @@ mod tests {
             session_guard.is_some(),
             "guard must be re-held after the dance so the next batch payload \
              stays serialized on the address lock"
+        );
+    }
+
+    /// `try_pn_to_lid_migration_decrypt` skips its retry decrypt when the
+    /// migration reports nothing moved: with decrypt state unchanged, the
+    /// retry would fail identically and log a second decrypt error for
+    /// every redelivered copy of an undecryptable message.
+    #[tokio::test]
+    async fn migration_reports_whether_anything_moved() {
+        use wacore::libsignal::protocol::SessionRecord;
+        use wacore::types::jid::JidExt as _;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000001111";
+        let lid = "122222222222222";
+
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+
+        assert!(
+            !client
+                .migrate_signal_sessions_on_lid_discovery(pn, lid)
+                .await,
+            "no PN signal state, so nothing can move"
+        );
+
+        let pn_addr = Jid::pn_device(pn.to_string(), 0).to_protocol_address();
+        client
+            .signal_cache
+            .put_session(
+                &pn_addr,
+                SessionRecord::deserialize(&tagged_session_blob(7)).expect("blob deserializes"),
+            )
+            .await;
+        let backend = client.persistence_manager.backend();
+        client.signal_cache.flush(backend.as_ref()).await.unwrap();
+
+        assert!(
+            client
+                .migrate_signal_sessions_on_lid_discovery(pn, lid)
+                .await,
+            "a PN session moved into the LID slot"
+        );
+        assert!(
+            !client
+                .migrate_signal_sessions_on_lid_discovery(pn, lid)
+                .await,
+            "second call finds the PN side already drained"
         );
     }
 }

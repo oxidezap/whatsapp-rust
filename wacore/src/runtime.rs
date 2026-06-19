@@ -59,6 +59,14 @@ pub trait Runtime: Send + Sync + 'static {
     }
 }
 
+/// Boxed future with the target-correct thread bound: `Send` on native
+/// (multi-threaded executors), none on wasm32 (single-threaded). Use this for
+/// type-erased entry-point futures so the same signature builds on both.
+#[cfg(not(target_arch = "wasm32"))]
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+#[cfg(target_arch = "wasm32")]
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+
 /// Bound for futures a [`Runtime`] can spawn: `Send + 'static` on native
 /// (work-stealing executors move tasks across threads), just `'static` on wasm
 /// (single-threaded). Generic spawn helpers carry this one bound so they stay

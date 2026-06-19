@@ -1,7 +1,7 @@
 //! Memory soak tests — aggressive stress tests to detect unbounded memory growth.
 //!
 //! Track both internal collection sizes and process RSS to catch leaks that
-//! escape moka/HashMap tracking.
+//! escape cache/HashMap tracking.
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -58,7 +58,7 @@ async fn snapshot(label: &str, round: usize, client: &whatsapp_rust::client::Cli
     let heap_bytes = dhat::HeapStats::get().curr_bytes;
 
     info!(
-        "[round {round:>4}] {label} | RSS={rss}K | moka(recent_msg={},session_locks={},chat_lanes={},device_reg={}) | unbounded(signal_sess={},signal_id={},signal_sk={},resp_waiters={},pending_retries={},presence_subs={},app_state_kr={},app_state_sync={})",
+        "[round {round:>4}] {label} | RSS={rss}K | bounded(recent_msg={},session_locks={},chat_lanes={},device_reg={}) | unbounded(signal_sess={},signal_id={},signal_sk={},resp_waiters={},pending_retries={},presence_subs={},app_state_kr={},app_state_sync={})",
         diag.recent_messages,
         diag.session_locks,
         diag.chat_lanes,
@@ -312,8 +312,8 @@ async fn test_heavy_dm_soak() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("soak2_dm_a").await?;
     let mut client_b = TestClient::connect("soak2_dm_b").await?;
 
-    let jid_a = client_a.client.get_pn().await.expect("A JID").to_non_ad();
-    let jid_b = client_b.client.get_pn().await.expect("B JID").to_non_ad();
+    let jid_a = client_a.client.get_pn().expect("A JID").to_non_ad();
+    let jid_b = client_b.client.get_pn().expect("B JID").to_non_ad();
 
     // Warm-up
     for i in 0..5 {
@@ -374,8 +374,8 @@ async fn test_heavy_group_soak() -> anyhow::Result<()> {
     let mut client_b = TestClient::connect("soak2_grp_b").await?;
     let mut client_c = TestClient::connect("soak2_grp_c").await?;
 
-    let jid_b = client_b.client.get_pn().await.expect("B JID").to_non_ad();
-    let jid_c = client_c.client.get_pn().await.expect("C JID").to_non_ad();
+    let jid_b = client_b.client.get_pn().expect("B JID").to_non_ad();
+    let jid_c = client_c.client.get_pn().expect("C JID").to_non_ad();
 
     // Create group 1: A + B + C
     let g1 = client_a
@@ -518,9 +518,9 @@ async fn test_heavy_mixed_soak() -> anyhow::Result<()> {
     let mut client_b = TestClient::connect("soak2_mix_b").await?;
     let mut client_c = TestClient::connect("soak2_mix_c").await?;
 
-    let jid_a = client_a.client.get_pn().await.expect("A JID").to_non_ad();
-    let jid_b = client_b.client.get_pn().await.expect("B JID").to_non_ad();
-    let jid_c = client_c.client.get_pn().await.expect("C JID").to_non_ad();
+    let jid_a = client_a.client.get_pn().expect("A JID").to_non_ad();
+    let jid_b = client_b.client.get_pn().expect("B JID").to_non_ad();
+    let jid_c = client_c.client.get_pn().expect("C JID").to_non_ad();
 
     // Create group
     let group_jid = client_a
@@ -664,7 +664,7 @@ async fn test_many_peers_soak() -> anyhow::Result<()> {
     let mut peer_jids: Vec<Jid> = Vec::new();
     for i in 0..num_peers {
         let peer = TestClient::connect(&format!("soak2_peers_p{i}")).await?;
-        let jid = peer.client.get_pn().await.expect("peer JID").to_non_ad();
+        let jid = peer.client.get_pn().expect("peer JID").to_non_ad();
         peer_jids.push(jid);
         peers.push(peer);
     }
@@ -732,8 +732,8 @@ async fn test_heavy_reconnect_soak() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("soak2_recon_a").await?;
     let mut client_b = TestClient::connect("soak2_recon_b").await?;
 
-    let jid_a = client_a.client.get_pn().await.expect("A JID").to_non_ad();
-    let jid_b = client_b.client.get_pn().await.expect("B JID").to_non_ad();
+    let jid_a = client_a.client.get_pn().expect("A JID").to_non_ad();
+    let jid_b = client_b.client.get_pn().expect("B JID").to_non_ad();
 
     let mut snaps: Vec<Snapshot> = Vec::new();
     snaps.push(snapshot("A-recon", 0, &client_a.client).await);

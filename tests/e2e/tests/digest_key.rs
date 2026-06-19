@@ -46,7 +46,7 @@ async fn test_digest_key_hash_matches_server() -> anyhow::Result<()> {
 
     // Load local key material to reproduce the hash
     let pm = tc.client.persistence_manager();
-    let device = pm.get_device_snapshot().await;
+    let device = pm.get_device_snapshot();
 
     assert_eq!(
         response.reg_id, device.registration_id,

@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Max groups with a cached resolved-device snapshot. LRU eviction covers
+/// accounts in more groups; an evicted entry just recomputes on next send.
+const GROUP_DEVICES_MEMO_CAPACITY: u64 = 64;
+
 impl Client {
     pub fn shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
         self.shutdown_notifier.subscribe()
@@ -102,14 +106,19 @@ impl Client {
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
 
-        let device_snapshot = persistence_manager.get_device_snapshot().await;
+        let device_snapshot = persistence_manager.get_device_snapshot();
         let core = wacore::client::CoreClient::new(device_snapshot.core.clone());
 
         let (tx, rx) = async_channel::bounded(32);
 
+        let device_topology = crate::client::device_topology::DeviceTopology::new();
         let this = Self {
             runtime: runtime.clone(),
             core,
+            msg_secret_buffer: crate::msg_secret_buffer::MsgSecretWriteBuffer::new(
+                persistence_manager.backend(),
+                runtime.clone(),
+            ),
             persistence_manager: persistence_manager.clone(),
             media_conn: Arc::new(RwLock::new(None)),
             is_logged_in: Arc::new(AtomicBool::new(false)),
@@ -174,9 +183,13 @@ impl Client {
 
             message_retry_counts: cache_config.message_retry_counts.build_with_ttl(),
 
-            recent_retry_reasons: cache_config.message_retry_counts.build_with_ttl(),
-
             session_recreate_history: cache_config.session_recreate_history.build_with_ttl(),
+
+            resend_rate_limiter: crate::resend_rate_limiter::ResendRateLimiter::new(
+                cache_config.resend_rate_limiter_capacity,
+                crate::resend_rate_limiter::DEFAULT_RESEND_BURST,
+                crate::resend_rate_limiter::DEFAULT_RESEND_REFILL_PER_MIN,
+            ),
 
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
 
@@ -201,6 +214,7 @@ impl Client {
             prekey_upload_lock: Arc::new(async_lock::Mutex::new(())),
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
+            offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             history_sync_tasks_in_flight: Arc::new(AtomicUsize::new(0)),
             history_sync_idle_notifier: Arc::new(event_listener::Event::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
@@ -211,13 +225,23 @@ impl Client {
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
-            custom_enc_handlers: Arc::new(async_lock::RwLock::new(HashMap::new())),
+            custom_enc_handlers: std::sync::OnceLock::new(),
             chatstate_handlers: Arc::new(RwLock::new(Vec::new())),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
-            device_registry_cache: cache_config.device_registry_cache.build_typed_ttl(
-                cache_config.cache_stores.device_registry_cache.clone(),
-                "device_registry",
+            pdo_requested: cache_config.pdo_requested.build_with_ttl(),
+            device_registry_cache: crate::client::device_topology::DeviceRegistryCache::new(
+                cache_config.device_registry_cache.build_typed_ttl(
+                    cache_config.cache_stores.device_registry_cache.clone(),
+                    "device_registry",
+                ),
+                Arc::clone(&device_topology),
             ),
+            device_topology,
+            group_devices_memo_enabled: cache_config.cache_stores.device_registry_cache.is_none()
+                && cache_config.cache_stores.lid_pn_cache.is_none(),
+            group_devices_memo: Cache::builder()
+                .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
+                .build(),
             stanza_router: Self::create_stanza_router(),
             synchronous_ack: false,
             http_client,
@@ -231,6 +255,10 @@ impl Client {
         };
 
         let arc = Arc::new(this);
+        // Mapping changes alter which canonical record a device lookup
+        // resolves to, so LidPnCache records into the same topology tracker.
+        arc.lid_pn_cache
+            .attach_topology(Arc::clone(&arc.device_topology));
         let _ = arc.self_weak.set(Arc::downgrade(&arc));
 
         // Warm up the LID-PN cache from persistent storage
@@ -271,7 +299,7 @@ impl Client {
         // Tag the session-root span with our own (pseudonymous) account id so
         // connection-lifecycle traces are attributable per account.
         #[cfg(feature = "tracing")]
-        if let Some(lid) = self.get_lid().await {
+        if let Some(lid) = self.get_lid() {
             tracing::Span::current().record("account", tracing::field::display(lid.observe()));
         }
         while self.is_running.load(Ordering::Relaxed) {
@@ -353,11 +381,25 @@ impl Client {
         info!("Client run loop has shut down.");
     }
 
+    /// Boxed barrier: see [`crate::bot::Bot::run`]. Coroutines are LocalCopy
+    /// across crates, so consumers awaiting the connect graph directly would
+    /// re-codegen it; the box makes them poll through a vtable instead.
+    pub async fn connect(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+        self.connect_boxed().await
+    }
+
+    #[inline(never)]
+    fn connect_boxed(
+        self: &Arc<Self>,
+    ) -> wacore::runtime::BoxFuture<'_, Result<(), anyhow::Error>> {
+        Box::pin(self.connect_graph())
+    }
+
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.conn.connect", level = "info", skip_all, err(Debug))
     )]
-    pub async fn connect(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+    async fn connect_graph(self: &Arc<Self>) -> Result<(), anyhow::Error> {
         if self.is_connecting.swap(true, Ordering::SeqCst) {
             return Err(ClientError::AlreadyConnected.into());
         }
@@ -378,6 +420,7 @@ impl Client {
         self.is_ready.store(false, Ordering::Relaxed);
         self.is_connected.store(false, Ordering::Relaxed);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.clear_offline_receipt_buffer();
         self.offline_batch.reset();
         self.outbound_flush.reopen();
 
@@ -459,7 +502,7 @@ impl Client {
         self.enable_auto_reconnect.store(false, Ordering::Relaxed);
 
         if self.is_connected()
-            && let Ok(jid) = self.require_pn().await
+            && let Ok(jid) = self.require_pn()
             && let Err(e) = self.execute(RemoveCompanionDeviceSpec::new(&jid)).await
         {
             warn!("Failed to send logout IQ: {e}");
@@ -488,6 +531,15 @@ impl Client {
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
 
+        // Drain buffered offline receipts into the flush window before
+        // closing it, so a disconnect mid-offline-sync still acks the
+        // already-processed backlog (issue #571 semantics). close() only stops
+        // outbound task spawns, not buffering, so a message still in flight can
+        // re-buffer after this drain; those entries are dropped by the
+        // connection-state reset (clear_offline_receipt_buffer) and the server
+        // redelivers their messages on the next connect, where they are
+        // re-acked fresh.
+        self.flush_offline_receipts();
         // Prevent late receipt producers from escaping the drain window.
         self.outbound_flush.close();
         self.outbound_flush
@@ -504,6 +556,14 @@ impl Client {
             transport.disconnect().await;
         }
         self.cleanup_connection_state().await;
+
+        // The write-behind secret drain is detached; a clean exit right after
+        // a capture must not lose the only copy. Sealing first degrades any
+        // straggler capture (a lane worker still draining its backlog) to an
+        // inline write, so nothing can land on the detached drain after the
+        // final flush below and then be acked.
+        self.msg_secret_buffer.seal();
+        self.msg_secret_buffer.flush().await;
     }
 
     /// Backoff step used by [`reconnect()`] to create an offline window.
@@ -537,6 +597,7 @@ impl Client {
         self.auto_reconnect_errors
             .store(Self::RECONNECT_BACKOFF_STEP, Ordering::Relaxed);
 
+        self.flush_offline_receipts();
         self.outbound_flush.close();
         self.outbound_flush
             .flush(&*self.runtime, std::time::Duration::from_secs(2))
@@ -561,6 +622,7 @@ impl Client {
         info!("Reconnecting immediately (expected disconnect).");
         self.expected_disconnect.store(true, Ordering::Relaxed);
 
+        self.flush_offline_receipts();
         self.outbound_flush.close();
         self.outbound_flush
             .flush(&*self.runtime, std::time::Duration::from_secs(2))
@@ -613,8 +675,10 @@ impl Client {
         let _ =
             self.send_active_receipts
                 .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
-        // Drop per-chat lanes so workers exit via channel close.
-        self.chat_lanes.invalidate_all();
+        // Drop per-chat lanes so workers exit via channel close. Reliable
+        // (awaited) clear: a skipped invalidation would leave a stale ChatLane
+        // whose worker exits on the generation check after reconnect.
+        self.chat_lanes.clear().await;
         // Clear pending retries so stale keys from detached scopeguard
         // cleanup don't suppress the first retry after reconnect.
         self.pending_retries
@@ -641,6 +705,7 @@ impl Client {
         self.pending_device_sync.clear().await;
         // Reset offline sync state for next connection
         self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.clear_offline_receipt_buffer();
         self.offline_batch.reset();
         self.offline_sync_metrics
             .active

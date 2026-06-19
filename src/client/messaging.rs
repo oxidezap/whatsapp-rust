@@ -56,27 +56,36 @@ impl Client {
         }
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn edit_message(
         &self,
-        to: Jid,
+        to: impl Into<Jid>,
         original_id: impl Into<String>,
         new_content: wa::Message,
-    ) -> Result<String, anyhow::Error> {
-        let original_id = original_id.into();
+    ) -> Result<String, crate::send::SendError> {
+        self.edit_message_inner(to.into(), original_id.into(), new_content)
+            .await
+    }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
+    async fn edit_message_inner(
+        &self,
+        to: Jid,
+        original_id: String,
+        new_content: wa::Message,
+    ) -> Result<String, crate::send::SendError> {
         // WhatsApp Web uses getMeUserLidOrJidForChat(chat, EditMessage) which
         // returns LID for LID-addressing groups and PN otherwise.
         let participant = if to.is_group() {
             Some(
                 self.get_own_jid_for_group(&to)
-                    .await?
+                    .await
+                    .map_err(crate::send::SendError::from_anyhow)?
                     .to_non_ad()
                     .to_string(),
             )
         } else {
-            if self.get_pn().await.is_none() {
-                return Err(anyhow::Error::from(ClientError::NotLoggedIn));
+            if self.get_pn().is_none() {
+                return Err(crate::send::SendError::NotLoggedIn);
             }
             None
         };
@@ -104,7 +113,8 @@ impl Client {
             vec![],
             None,
         )
-        .await?;
+        .await
+        .map_err(crate::send::SendError::from_anyhow)?;
 
         Ok(original_id)
     }
@@ -117,35 +127,54 @@ impl Client {
     /// `message_secret` is the *original* message's 32-byte secret (you generated it when
     /// you sent that message). You can only edit your own messages, so the original
     /// sender and the editor are both you.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit_encrypted", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn edit_message_encrypted(
         &self,
-        to: Jid,
+        to: impl Into<Jid>,
         original_id: impl Into<String>,
         message_secret: &[u8],
         new_content: wa::Message,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<String, crate::send::SendError> {
+        self.edit_message_encrypted_inner(
+            to.into(),
+            original_id.into(),
+            message_secret,
+            new_content,
+        )
+        .await
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit_encrypted", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
+    async fn edit_message_encrypted_inner(
+        &self,
+        to: Jid,
+        original_id: String,
+        message_secret: &[u8],
+        new_content: wa::Message,
+    ) -> Result<String, crate::send::SendError> {
+        use crate::send::SendError;
         // Newsletters/channels are plaintext (no message-secret addon crypto) and the
         // E2E send path rejects them, so an encrypted edit can't apply there; fail with
         // a clear boundary error instead of the cryptic downstream rejection.
-        anyhow::ensure!(
-            !to.is_newsletter(),
-            "edit_message_encrypted is not valid for newsletters/channels; use edit_message"
-        );
-        anyhow::ensure!(
-            message_secret.len() == 32,
-            "message_secret must be exactly 32 bytes, got {}",
-            message_secret.len()
-        );
-        let original_id = original_id.into();
+        if to.is_newsletter() {
+            return Err(SendError::InvalidRequest(
+                "edit_message_encrypted is not valid for newsletters/channels; use newsletter().edit_message"
+                    .into(),
+            ));
+        }
+        if message_secret.len() != 32 {
+            return Err(SendError::InvalidRequest(format!(
+                "message_secret must be exactly 32 bytes, got {}",
+                message_secret.len()
+            )));
+        }
 
         let self_jid = if to.is_group() {
-            self.get_own_jid_for_group(&to).await?.to_non_ad()
-        } else {
-            self.get_pn()
+            self.get_own_jid_for_group(&to)
                 .await
-                .ok_or_else(|| anyhow::Error::from(ClientError::NotLoggedIn))?
+                .map_err(SendError::from_anyhow)?
                 .to_non_ad()
+        } else {
+            self.get_pn().ok_or(SendError::NotLoggedIn)?.to_non_ad()
         };
         let participant = if to.is_group() {
             Some(self_jid.to_string())
@@ -172,7 +201,8 @@ impl Client {
             vec![],
             None,
         )
-        .await?;
+        .await
+        .map_err(SendError::from_anyhow)?;
 
         Ok(original_id)
     }
@@ -185,7 +215,7 @@ impl Client {
         server_id: u64,
         reaction: &str,
     ) -> Result<(), anyhow::Error> {
-        let request_id = self.generate_message_id().await;
+        let request_id = self.generate_message_id();
 
         let stanza = NodeBuilder::new("message")
             .attr("to", to)
@@ -236,7 +266,7 @@ impl Client {
         if id.is_empty() {
             return;
         }
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         if let Some(own_jid) = &device_snapshot.pn {
             // Single source of truth for the wire mapping (ReceiptType::Sent is a derived
             // incoming-only state and is never sent by us).
@@ -389,7 +419,7 @@ fn build_secret_message_edit(
         wacore::message_edit::encrypt_message_edit(&inner, message_secret, &ctx)?;
 
     Ok(wa::Message {
-        secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
             target_message_key: Some(wa::MessageKey {
                 remote_jid: Some(to.to_string()),
                 from_me: Some(true),
@@ -402,11 +432,11 @@ fn build_secret_message_edit(
                 wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
             ),
             remote_key_id: None,
-        }),
-        message_context_info: Some(wa::MessageContextInfo {
+        })),
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(message_secret.to_vec()),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     })
 }

@@ -22,7 +22,6 @@
 //! that already handle `protocolMessage.editedMessage` can reuse their code.
 
 use anyhow::{Result, anyhow};
-use prost::Message;
 
 use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
 
@@ -66,7 +65,7 @@ pub fn encrypt_message_edit(
     ctx: &MessageEditContext<'_>,
 ) -> Result<(Vec<u8>, [u8; IV_SIZE])> {
     let mut plaintext = Vec::new();
-    inner_message.encode(&mut plaintext)?;
+    waproto::codec::message_encode_into(inner_message, &mut plaintext);
     encrypt_addon(&plaintext, message_secret, &ctx.as_addon_ctx())
 }
 
@@ -100,7 +99,7 @@ pub fn decrypt_secret_encrypted(
         modification_type,
     };
     let plaintext = decrypt_addon(enc_payload, iv, message_secret, &addon)?;
-    waproto::whatsapp::Message::decode(&plaintext[..])
+    waproto::codec::message_decode(&plaintext[..])
         .map_err(|e| anyhow!("Failed to decode inner secret-encrypted Message: {e}"))
 }
 
@@ -180,6 +179,7 @@ pub fn decrypt_message_edit_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message as _;
     use waproto::whatsapp as wa;
 
     fn make_inner_edit(new_text: &str) -> wa::Message {
@@ -289,7 +289,6 @@ mod tests {
     #[test]
     fn general_decrypt_roundtrips_non_edit_use_case() {
         use crate::secret_enc_addon::{AddonContext, ModificationType, encrypt_addon};
-        use prost::Message as _;
 
         // A POLL_EDIT envelope: same shape as MESSAGE_EDIT, different use-case.
         let secret = [0x71u8; 32];

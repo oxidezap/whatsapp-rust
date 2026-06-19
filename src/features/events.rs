@@ -1,6 +1,5 @@
 //! Event creation and response (RSVP).
 
-use anyhow::{Result, anyhow};
 use wacore::event;
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
@@ -8,7 +7,7 @@ use waproto::whatsapp as wa;
 pub use waproto::whatsapp::message::event_response_message::EventResponseType;
 
 use crate::client::Client;
-use crate::send::SendResult;
+use crate::send::{SendError, SendResult};
 
 /// Parameters for creating an event message. Only `name` is required.
 #[derive(Debug, Clone, Default)]
@@ -36,11 +35,14 @@ impl<'a> Events<'a> {
     /// later responses (RSVPs) via [`wacore::event::decrypt_event_response_with_secret`].
     pub async fn create(
         &self,
-        to: &Jid,
+        to: impl Into<Jid>,
         params: EventCreationParams,
-    ) -> Result<(SendResult, Vec<u8>)> {
+    ) -> Result<(SendResult, Vec<u8>), SendError> {
+        let to = &to.into();
         if params.name.trim().is_empty() {
-            return Err(anyhow!("Event name must not be empty"));
+            return Err(SendError::InvalidRequest(
+                "event name must not be empty".into(),
+            ));
         }
 
         let mut message = wa::Message {
@@ -57,12 +59,12 @@ impl<'a> Events<'a> {
             rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut secret);
             secret
         };
-        message.message_context_info = Some(wa::MessageContextInfo {
+        message.message_context_info = Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(message_secret.clone()),
             ..Default::default()
-        });
+        }));
 
-        let result = self.client.send_message(to.clone(), message).await?;
+        let result = self.client.send_message(to, message).await?;
         Ok((result, message_secret))
     }
 
@@ -70,18 +72,23 @@ impl<'a> Events<'a> {
     /// message); `event_creator_jid` is who created the event.
     pub async fn respond(
         &self,
-        chat_jid: &Jid,
+        chat_jid: impl Into<Jid>,
         event_msg_id: &str,
         event_creator_jid: &Jid,
         message_secret: &[u8],
         response: EventResponseType,
         extra_guest_count: Option<i32>,
-    ) -> Result<SendResult> {
-        let my_jid = self
-            .client
-            .get_pn()
-            .await
-            .ok_or_else(|| anyhow!("Not logged in — cannot determine own JID"))?;
+    ) -> Result<SendResult, SendError> {
+        let chat_jid = &chat_jid.into();
+        // The event secret keys the RSVP's HKDF; a wrong length is caller error,
+        // not an internal failure, so reject it before the encrypt call.
+        if message_secret.len() != 32 {
+            return Err(SendError::InvalidRequest(format!(
+                "event message_secret must be 32 bytes, got {}",
+                message_secret.len()
+            )));
+        }
+        let my_jid = self.client.get_pn().ok_or(SendError::NotLoggedIn)?;
         let my_base = my_jid.to_non_ad();
 
         let responder = self
@@ -121,11 +128,11 @@ impl<'a> Events<'a> {
         };
 
         let message = wa::Message {
-            enc_event_response_message: Some(enc),
+            enc_event_response_message: Some(Box::new(enc)),
             ..Default::default()
         };
 
-        self.client.send_message(chat_jid.clone(), message).await
+        self.client.send_message(chat_jid, message).await
     }
 
     /// The responder (self) JID keys the RSVP's HKDF/AAD, so it must use the event
@@ -135,7 +142,7 @@ impl<'a> Events<'a> {
         if !event_creator_jid.is_lid() {
             return own_pn.clone();
         }
-        match self.client.get_lid().await {
+        match self.client.get_lid() {
             Some(lid) => lid.to_non_ad(),
             None => own_pn.clone(),
         }

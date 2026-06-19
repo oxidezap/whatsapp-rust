@@ -86,7 +86,7 @@ pub enum IqError {
     #[error("client is not connected")]
     NotConnected,
     #[error("received disconnect node during IQ wait: {0:?}")]
-    Disconnected(Node),
+    Disconnected(Box<Node>),
     #[error("received a server error response: code={code}, text='{text}'")]
     ServerError {
         code: u16,
@@ -97,6 +97,8 @@ pub enum IqError {
         /// WA Web honors this (`setProtocolBackoffMs`) before retrying throttled IQs.
         backoff: Option<u32>,
     },
+    #[error("received unexpected IQ response type: {got:?}")]
+    UnexpectedResponseType { got: Option<String> },
     #[error("internal channel closed unexpectedly")]
     InternalChannelClosed,
 }
@@ -209,11 +211,14 @@ impl RequestUtils {
 
     pub fn parse_iq_response(&self, response_node: &NodeRef<'_>) -> Result<(), IqError> {
         if response_node.tag == "stream:error" || response_node.tag == "xmlstreamend" {
-            return Err(IqError::Disconnected(response_node.to_owned()));
+            return Err(IqError::Disconnected(Box::new(response_node.to_owned())));
         }
 
-        if let Some(res_type) = response_node.get_attr("type")
-            && res_type.as_str() == "error"
+        let response_type = response_node.get_attr("type");
+
+        if response_type
+            .as_ref()
+            .is_some_and(|res_type| res_type.as_str() == "error")
         {
             let error_child = response_node.get_optional_child_by_tag(&["error"]);
             if let Some(error_node) = error_child {
@@ -244,6 +249,11 @@ impl RequestUtils {
                 error_type: None,
                 backoff: None,
             });
+        }
+
+        let got = response_type.map(|res_type| res_type.to_string());
+        if got.as_deref() != Some("result") {
+            return Err(IqError::UnexpectedResponseType { got });
         }
 
         Ok(())
@@ -306,6 +316,43 @@ mod iq_error_tests {
                 assert!(backoff.is_none());
             }
             other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_iq_response_accepts_result_type() {
+        let node = NodeBuilder::new("iq").attr("type", "result").build();
+
+        RequestUtils::new("t".to_string())
+            .parse_iq_response(&node.as_node_ref())
+            .unwrap();
+    }
+
+    #[test]
+    fn parse_iq_response_rejects_unexpected_type() {
+        let node = NodeBuilder::new("iq").attr("type", "get").build();
+
+        let err = RequestUtils::new("t".to_string())
+            .parse_iq_response(&node.as_node_ref())
+            .unwrap_err();
+
+        match err {
+            IqError::UnexpectedResponseType { got } => assert_eq!(got.as_deref(), Some("get")),
+            other => panic!("expected UnexpectedResponseType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_iq_response_rejects_missing_type() {
+        let node = NodeBuilder::new("iq").build();
+
+        let err = RequestUtils::new("t".to_string())
+            .parse_iq_response(&node.as_node_ref())
+            .unwrap_err();
+
+        match err {
+            IqError::UnexpectedResponseType { got } => assert!(got.is_none()),
+            other => panic!("expected UnexpectedResponseType, got {other:?}"),
         }
     }
 }

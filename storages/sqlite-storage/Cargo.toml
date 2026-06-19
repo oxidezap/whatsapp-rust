@@ -7,6 +7,11 @@ license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
 description = "SQLite storage backend for whatsapp-rust"
 
+# `libsqlite3-sys` is pulled only to activate its `bundled` feature (compile
+# SQLite in-tree); there is no direct `use`, so static analysers flag it.
+[package.metadata.cargo-machete]
+ignored = ["libsqlite3-sys"]
+
 [features]
 default = ["bundled-sqlite"]
 bundled-sqlite = ["libsqlite3-sys/bundled"]
@@ -15,7 +20,7 @@ bundled-sqlite = ["libsqlite3-sys/bundled"]
 async-trait = { workspace = true }
 bincode = { version = "2.0.1", features = ["serde"] }
 bytes = { workspace = true }
-diesel = { version = "2.3.7", default-features = false, features = [
+diesel = { version = "2.3.10", default-features = false, features = [
     "sqlite",
     "r2d2",
     "32-column-tables",

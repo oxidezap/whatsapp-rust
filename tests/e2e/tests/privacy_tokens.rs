@@ -124,7 +124,6 @@ async fn test_issue_tokens_api_delivers_notification_and_updates_index() -> anyh
     let jid_b_lid = client_b
         .client
         .get_lid()
-        .await
         .expect("B should have LID after connect");
     let issued = client_a
         .client
@@ -237,8 +236,8 @@ async fn test_tc_token_notification_reaches_all_connected_devices() -> anyhow::R
     let mut client_b1 = TestClient::connect_as("e2e_tctok_multi_b1", &shared_b_name).await?;
     let client_b2 = TestClient::connect_as("e2e_tctok_multi_b2", &shared_b_name).await?;
 
-    let phone_b1 = client_b1.client.get_pn().await.expect("B1 should have JID");
-    let phone_b2 = client_b2.client.get_pn().await.expect("B2 should have JID");
+    let phone_b1 = client_b1.client.get_pn().expect("B1 should have JID");
+    let phone_b2 = client_b2.client.get_pn().expect("B2 should have JID");
     assert_eq!(
         phone_b1.user, phone_b2.user,
         "B devices should share a phone"
@@ -397,7 +396,6 @@ async fn test_only_nct_send_ab_without_salt_still_receives_463() -> anyhow::Resu
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let msg_id = format!("E2ECSNEG1{}", uuid::Uuid::new_v4().simple());
     let sent_msg_id = msg_id.clone();
@@ -457,7 +455,6 @@ async fn test_send_and_syncd_ab_without_delivery_still_receives_463() -> anyhow:
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let msg_id = format!("E2ECSNEG2{}", uuid::Uuid::new_v4().simple());
     let sent_msg_id = msg_id.clone();
@@ -518,7 +515,6 @@ async fn test_history_sync_nct_salt_enables_cstoken_first_contact() -> anyhow::R
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
@@ -585,7 +581,6 @@ async fn test_cstoken_only_first_contact_succeeds_when_tctoken_disabled() -> any
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
@@ -646,7 +641,6 @@ async fn test_syncd_nct_salt_enables_cstoken_first_contact() -> anyhow::Result<(
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
@@ -704,7 +698,6 @@ async fn test_clearing_nct_salt_locally_makes_first_contact_fail_again() -> anyh
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     client_b
         .client
@@ -734,7 +727,6 @@ async fn test_clearing_nct_salt_locally_makes_first_contact_fail_again() -> anyh
     let jid_c_lid = client_c
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     send_first_message_and_expect_463(
         &client_b,
@@ -844,7 +836,6 @@ async fn test_nct_salt_survives_reconnect_and_still_allows_first_contact() -> an
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b

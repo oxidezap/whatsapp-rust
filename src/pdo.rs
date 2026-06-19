@@ -17,7 +17,6 @@
 use crate::client::Client;
 use crate::types::message::MessageInfo;
 use log::{debug, info, warn};
-use prost::Message;
 use std::sync::Arc;
 use wacore::types::message::{
     ChatMessageId, EditAttribute, MessageCategory, MessageSource, MsgMetaInfo,
@@ -65,7 +64,7 @@ impl Client {
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
     ) -> Result<(), anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
         // Resolve to LID for the MessageKey when LID-migrated, matching WA Web's
@@ -97,6 +96,32 @@ impl Client {
             info.source.chat.clone()
         };
         let cache_key = ChatMessageId::new(cache_chat, info.id.clone());
+
+        // One request per message, like WA Web's session-lifetime set in
+        // WAWebNonMessageDataRequestPlaceholderMessageResendUtils. The
+        // pending cache below only covers in-flight requests; once the phone
+        // answers (even without content) it empties, and a sender that keeps
+        // redelivering the same undecryptable message would otherwise trigger
+        // a fresh request per copy. Claimed via the single-flight `get_with`
+        // (same arm as `dispatch_undecryptable_event`): decrypt-failure tasks
+        // are detached per copy, so a get-then-insert would let two
+        // concurrent copies both pass the gate, and only the claim winner may
+        // release the slot on send failure below.
+        let claimed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let claimed_clone = claimed.clone();
+        self.pdo_requested
+            .get_with(cache_key.clone(), async move {
+                claimed_clone.store(true, std::sync::atomic::Ordering::Release);
+            })
+            .await;
+        if !claimed.load(std::sync::atomic::Ordering::Acquire) {
+            debug!(
+                "PDO request already sent for message {} from {}; not re-requesting",
+                info.id,
+                info.source.sender.observe()
+            );
+            return Ok(());
+        }
 
         if self.pdo_pending_requests.get(&cache_key).await.is_some() {
             debug!(
@@ -157,16 +182,20 @@ impl Client {
             peer_target.observe()
         );
 
+        // A failed send must not consume the once-per-message slot, or a
+        // transient error would permanently block recovery for this message.
         if let Err(e) = self
             .ensure_e2e_sessions(std::slice::from_ref(&peer_target))
             .await
         {
             self.pdo_pending_requests.remove(&cache_key).await;
+            self.pdo_requested.remove(&cache_key).await;
             return Err(e);
         }
 
         if let Err(e) = self.send_peer_message(peer_target, &msg).await {
             self.pdo_pending_requests.remove(&cache_key).await;
+            self.pdo_requested.remove(&cache_key).await;
             warn!(
                 "Failed to send PDO request for message {}: {:?}",
                 info.id, e
@@ -188,7 +217,7 @@ impl Client {
         oldest_msg_timestamp_ms: i64,
         count: i32,
     ) -> Result<String, anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
         let pdo_request = wa::message::PeerDataOperationRequestMessage {
@@ -241,7 +270,7 @@ impl Client {
         to: Jid,
         msg: &wa::Message,
     ) -> Result<String, anyhow::Error> {
-        let msg_id = self.generate_message_id().await;
+        let msg_id = self.generate_message_id();
 
         // Send with peer category and high priority
         self.send_message_impl(
@@ -305,13 +334,14 @@ impl Client {
             return;
         };
 
-        let web_msg_info = match wa::WebMessageInfo::decode(web_message_info_bytes.as_slice()) {
-            Ok(info) => info,
-            Err(e) => {
-                warn!("Failed to decode WebMessageInfo from PDO response: {:?}", e);
-                return;
-            }
-        };
+        let web_msg_info =
+            match waproto::codec::web_message_info_decode(web_message_info_bytes.as_slice()) {
+                Ok(info) => info,
+                Err(e) => {
+                    warn!("Failed to decode WebMessageInfo from PDO response: {:?}", e);
+                    return;
+                }
+            };
 
         let key = &web_msg_info.key;
         let remote_jid_str = key.remote_jid.as_deref().unwrap_or("");
@@ -356,7 +386,9 @@ impl Client {
         };
 
         let Some(message) = web_msg_info.message else {
-            warn!("PDO response WebMessageInfo missing message content");
+            // Expected when the phone could not decrypt the message either;
+            // WA Web only counts this outcome in telemetry, with no warning.
+            info!("PDO response WebMessageInfo missing message content");
             return;
         };
 
@@ -383,7 +415,7 @@ impl Client {
         self.core
             .event_bus
             .dispatch(wacore::types::events::Event::Message(
-                Arc::new(message),
+                Arc::from(message),
                 message_info,
             ));
     }
@@ -416,7 +448,6 @@ impl Client {
         } else if is_from_me {
             self.persistence_manager
                 .get_device_snapshot()
-                .await
                 .pn
                 .clone()
                 .unwrap_or_else(|| remote_jid.clone())
@@ -461,6 +492,7 @@ impl Client {
             verified_level: None,
             verified_name_serial: None,
             peer_recipient_pn: None,
+            comment_target: None,
             bcl_participants: Vec::new(),
         })
     }
@@ -683,5 +715,156 @@ mod tests {
         // path reconstructs without panic.
         assert_eq!(info.source.chat.to_string(), peer_lid);
         assert!(info.source.is_from_me);
+    }
+
+    // Once-per-message memo tests: WA Web sends at most one placeholder
+    // resend request per message per session
+    // (WAWebNonMessageDataRequestPlaceholderMessageResendUtils); these pin
+    // the same contract onto `pdo_requested`.
+
+    fn make_group_message_info(
+        chat: &str,
+        sender: &str,
+        id: &str,
+    ) -> std::sync::Arc<wacore::types::message::MessageInfo> {
+        use wacore::types::message::{MessageInfo, MessageSource};
+        std::sync::Arc::new(MessageInfo {
+            id: id.to_owned(),
+            source: MessageSource {
+                chat: chat.parse().expect("chat jid"),
+                sender: sender.parse().expect("sender jid"),
+                is_group: true,
+                ..Default::default()
+            },
+            timestamp: wacore::time::now_utc(),
+            ..Default::default()
+        })
+    }
+
+    async fn set_own_pn(client: &std::sync::Arc<crate::client::Client>) {
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                "5511777776666:2@s.whatsapp.net".parse().expect("own jid"),
+            )))
+            .await;
+    }
+
+    /// A message that already went through one placeholder resend must not
+    /// trigger another request, no matter how many times the server
+    /// redelivers the undecryptable original.
+    #[tokio::test]
+    async fn pdo_request_skipped_when_already_requested() {
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+
+        let info = make_group_message_info(
+            "120363000000000001@g.us",
+            "203040904720543@lid",
+            "PDO_ONCE_1",
+        );
+        let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+        client.pdo_requested.insert(key.clone(), ()).await;
+
+        let res = client.send_pdo_placeholder_resend_request(&info).await;
+
+        assert!(res.is_ok(), "gated path reports success: {res:?}");
+        assert!(
+            client.pdo_pending_requests.get(&key).await.is_none(),
+            "gated request must not register a pending entry"
+        );
+    }
+
+    /// A transient send failure must release the once-per-message slot, or
+    /// one bad send would permanently block recovery for that message.
+    #[tokio::test]
+    async fn pdo_request_failure_releases_once_per_message_slot() {
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+        // A live client has finished offline sync long before any PDO; skip
+        // the offline-delivery wait so the send failure surfaces immediately.
+        client
+            .offline_sync_completed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let info = make_group_message_info(
+            "120363000000000001@g.us",
+            "203040904720543@lid",
+            "PDO_ONCE_2",
+        );
+        let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.send_pdo_placeholder_resend_request(&info),
+        )
+        .await
+        .expect("send attempt must resolve fast without a live transport");
+
+        assert!(res.is_err(), "no live transport, the send must fail");
+        assert!(
+            client.pdo_requested.get(&key).await.is_none(),
+            "failed send must release the once-per-message slot"
+        );
+        assert!(
+            client.pdo_pending_requests.get(&key).await.is_none(),
+            "failed send must clear the pending entry"
+        );
+    }
+
+    /// A phone response without content consumes the pending slot but keeps
+    /// the memo: the phone has nothing to share for this message, so
+    /// re-asking on the next redelivery cannot produce content either.
+    #[tokio::test]
+    async fn pdo_missing_content_response_clears_pending_but_keeps_memo() {
+        use prost::Message as _;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        let chat = "5511999998888@s.whatsapp.net";
+        let msg_id = "PDO_ONCE_3";
+        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+
+        client.pdo_requested.insert(key.clone(), ()).await;
+        client
+            .pdo_pending_requests
+            .insert(
+                key.clone(),
+                super::PendingPdoRequest {
+                    message_info: make_group_message_info(chat, chat, msg_id),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: waproto::whatsapp::MessageKey {
+                remote_jid: Some(chat.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.to_owned()),
+                participant: None,
+            },
+            ..Default::default()
+        };
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
+        };
+
+        client
+            .handle_placeholder_resend_response(&response, "req-1")
+            .await;
+
+        assert!(
+            client.pdo_pending_requests.get(&key).await.is_none(),
+            "response consumes the pending slot"
+        );
+        assert!(
+            client.pdo_requested.get(&key).await.is_some(),
+            "memo must survive a content-less response"
+        );
     }
 }

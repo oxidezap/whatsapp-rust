@@ -2825,3 +2825,55 @@ async fn terminal_disconnect_propagates_to_per_connection_signal() {
         "disconnect must also fire terminal"
     );
 }
+
+// Counting allocator for the empirical allocation guard below. Process-wide
+// for the unit-test binary, but the only cost is one relaxed atomic add per
+// alloc; tests that never read the counter are unaffected.
+mod counting_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(super) static ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    struct CountingAlloc;
+
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAlloc = CountingAlloc;
+}
+
+/// Locks the zero-allocation property of the ack miss path: id resolution and
+/// the waiter probe must borrow from the node buffer. An `into_owned()` here
+/// costs one String per received ack, which the e2e dhat profile caught live.
+#[tokio::test]
+async fn ack_miss_path_does_not_heap_allocate() {
+    let client = crate::test_utils::create_test_client().await;
+
+    let ack_node = NodeBuilder::new("ack")
+        .attr("id", "3EB0A9252A8F12B7E2")
+        .attr("from", SERVER_JID)
+        .build();
+    let node_ref = ack_node.as_node_ref();
+
+    // Min-delta over many windows: sibling tests share the process-global
+    // counter, but their allocations are sporadic. A per-call String shows up
+    // in every window, so the minimum only reaches 0 when the path is clean.
+    let mut min_delta = u64::MAX;
+    for _ in 0..100 {
+        let before = counting_alloc::ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
+        let handled = client.handle_ack_response(&node_ref).await;
+        let after = counting_alloc::ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(!handled, "no waiter is registered for this id");
+        min_delta = min_delta.min(after - before);
+    }
+    assert_eq!(min_delta, 0, "ack miss path must not allocate");
+}

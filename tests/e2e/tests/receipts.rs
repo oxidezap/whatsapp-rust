@@ -373,7 +373,7 @@ async fn test_delivery_receipts_flushed_on_disconnect() -> anyhow::Result<()> {
     let mut msg_ids: Vec<String> = Vec::with_capacity(N);
     let mut receipt_waiters = Vec::with_capacity(N);
     for i in 0..N {
-        let id = client_a.client.generate_message_id().await;
+        let id = client_a.client.generate_message_id();
         let receipt_waiter = client_b
             .client
             .wait_for_sent_node(NodeFilter::tag("receipt").attr("id", id.clone()));

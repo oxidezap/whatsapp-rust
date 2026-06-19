@@ -1,0 +1,6 @@
+# Generated from whatsapp.desc at build time; see build.rs.
+# The tracked source of truth is whatsapp.proto + whatsapp.desc.
+whatsapp.rs
+src/whatsapp.rs
+tags.rs
+src/tags.rs

@@ -237,6 +237,93 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 use curve25519_dalek::scalar::Scalar;
 use std::sync::OnceLock;
 
+use curve25519_dalek::edwards::EdwardsPoint;
+use curve25519_dalek::montgomery::MontgomeryPoint;
+
+/// A verifying view of a [`PublicKey`] that caches the per-key XEdDSA
+/// derivations: the Montgomery-to-Edwards conversion and its compressed
+/// encoding, per sign bit (the bit travels in each signature, and a given
+/// signer always produces the same one). Repeat verifications of one key,
+/// e.g. every incoming message under a group sender key, skip two field
+/// inversions per signature.
+///
+/// Clones carry initialized entries, so a warmed instance stays warm through
+/// the per-use clones of whatever memoizes it.
+/// `(-A, A_compressed)` for one sign bit of a verifying key.
+type PreparedEdwards = (EdwardsPoint, [u8; 32]);
+
+#[derive(Clone)]
+pub struct PreparedVerifyingKey {
+    mont: [u8; 32],
+    /// Per sign bit; `None` when the key has no Edwards form for that bit
+    /// (such a signature can never verify). Behind an `Arc` so the many
+    /// per-use clones of a memoizing holder share one allocation and one
+    /// warm state, instead of each clone copying (or re-deriving) entries.
+    cached: std::sync::Arc<[OnceLock<Option<PreparedEdwards>>; 2]>,
+}
+
+impl PreparedVerifyingKey {
+    pub fn new(key: &PublicKey) -> Self {
+        let PublicKeyData::DjbPublicKey(mont) = key.key;
+        Self {
+            mont,
+            cached: std::sync::Arc::new([OnceLock::new(), OnceLock::new()]),
+        }
+    }
+
+    /// Derives both sign-bit entries now. The signature's sign bit is fixed
+    /// per signer but unknowable from the Montgomery key alone, so a
+    /// receive-side holder warms both once instead of paying the derivation
+    /// inside the first verification.
+    pub fn precompute(&self) {
+        let _ = self.entry(0);
+        let _ = self.entry(1);
+    }
+
+    fn entry(&self, sign: u8) -> Option<&(EdwardsPoint, [u8; 32])> {
+        self.cached[usize::from(sign & 1)]
+            .get_or_init(|| {
+                MontgomeryPoint(self.mont)
+                    .to_edwards(sign)
+                    .map(|point| (-point, point.compress().to_bytes()))
+            })
+            .as_ref()
+    }
+
+    pub fn verify_signature(&self, message: &[u8], signature: &[u8]) -> bool {
+        self.verify_signature_for_multipart_message(&[message], signature)
+    }
+
+    pub fn verify_signature_for_multipart_message(
+        &self,
+        message: &[&[u8]],
+        signature: &[u8],
+    ) -> bool {
+        let Ok(signature) = <&[u8; 64]>::try_from(signature) else {
+            return false;
+        };
+        let sign = (signature[63] & 0b1000_0000_u8) >> 7;
+        let Some((minus_cap_a, cap_a_bytes)) = self.entry(sign) else {
+            return false;
+        };
+        curve25519::verify_signature_prepared(minus_cap_a, cap_a_bytes, message, signature)
+    }
+}
+
+impl From<&PublicKey> for PreparedVerifyingKey {
+    fn from(key: &PublicKey) -> Self {
+        Self::new(key)
+    }
+}
+
+impl std::fmt::Debug for PreparedVerifyingKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedVerifyingKey")
+            .field("mont", &hex::encode(self.mont))
+            .finish_non_exhaustive()
+    }
+}
+
 /// Cached data for XEdDSA signing.
 /// This avoids an expensive scalar multiplication on every signature
 /// and caches the scalar representation to avoid repeated modular reduction.
@@ -300,6 +387,21 @@ impl PrivateKey {
                     }
                 })
             }
+        }
+    }
+
+    /// Pre-derives the XEdDSA signing cache (scalar + Edwards point). Clones
+    /// of this key carry the warm cache, so warming once at rest lets every
+    /// later signature skip the basepoint multiplication.
+    pub fn precompute_signing_cache(&self) {
+        let _ = self.get_edwards_cache();
+    }
+
+    /// Test-only visibility into the lazy cache, to pin the warm-clone contract.
+    #[cfg(test)]
+    pub(crate) fn has_warm_signing_cache(&self) -> bool {
+        match &self.key {
+            PrivateKeyData::DjbPrivateKey { edwards_cache, .. } => edwards_cache.get().is_some(),
         }
     }
 
@@ -494,6 +596,72 @@ mod tests {
 
     fn rng() -> impl rand::CryptoRng {
         rand::make_rng::<rand::rngs::StdRng>()
+    }
+
+    /// The cached verifier must agree with the plain path on every input:
+    /// valid signatures under both sign bits, corrupted signatures and
+    /// messages, garbage keys, and wrong-length signatures.
+    #[test]
+    fn prepared_verifier_matches_plain_verify() {
+        let mut csprng = rng();
+        let message: &[u8] = b"mensagem para verificar";
+
+        let mut seen_signs = [false; 2];
+        for _ in 0..32 {
+            let keypair = KeyPair::generate(&mut csprng);
+            let prepared = PreparedVerifyingKey::new(&keypair.public_key);
+            let signature = keypair
+                .calculate_signature(message, &mut csprng)
+                .expect("sign");
+            seen_signs[usize::from(signature[63] >> 7)] = true;
+
+            assert!(keypair.public_key.verify_signature(message, &signature));
+            assert!(prepared.verify_signature(message, &signature));
+
+            // Corrupted signature and corrupted message reject on both paths.
+            let mut bad_sig = signature;
+            bad_sig[7] ^= 0x40;
+            assert!(!keypair.public_key.verify_signature(message, &bad_sig));
+            assert!(!prepared.verify_signature(message, &bad_sig));
+            assert!(!keypair.public_key.verify_signature(b"outra", &signature));
+            assert!(!prepared.verify_signature(b"outra", &signature));
+
+            // Flipped sign bit must agree between paths too.
+            let mut flipped = signature;
+            flipped[63] ^= 0x80;
+            assert_eq!(
+                keypair.public_key.verify_signature(message, &flipped),
+                prepared.verify_signature(message, &flipped)
+            );
+
+            // Wrong-length signatures reject on both paths.
+            assert!(
+                !keypair
+                    .public_key
+                    .verify_signature(message, &signature[..63])
+            );
+            assert!(!prepared.verify_signature(message, &signature[..63]));
+
+            // A warmed CLONE must verify identically (the memoized instance
+            // hands out its state by reference, but clones must stay correct).
+            assert!(prepared.clone().verify_signature(message, &signature));
+        }
+        assert!(
+            seen_signs[0] && seen_signs[1],
+            "corpus must exercise both signature sign bits, got {seen_signs:?}"
+        );
+
+        // Garbage key bytes: both paths must reject the same way without panicking.
+        let mut garbage = [0u8; 33];
+        garbage[0] = 0x05;
+        garbage[1..].fill(0xFF);
+        let bad_key = PublicKey::deserialize(&garbage).expect("type-tagged bytes parse");
+        let prepared_bad = PreparedVerifyingKey::new(&bad_key);
+        let some_sig = [0x11u8; 64];
+        assert_eq!(
+            bad_key.verify_signature(message, &some_sig),
+            prepared_bad.verify_signature(message, &some_sig)
+        );
     }
 
     #[test]

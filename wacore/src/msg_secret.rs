@@ -347,10 +347,10 @@ mod tests {
         assert!(is_bot_context(true, &wa::Message::default()));
         // bot_metadata on a non-bot (e.g. group) chat is still a bot context.
         let prompt = wa::Message {
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 bot_metadata: Some(wa::BotMetadata::default()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert!(is_bot_context(false, &prompt));

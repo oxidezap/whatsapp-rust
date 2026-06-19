@@ -1,4 +1,4 @@
-use crate::types::events::{Event, EventKind, LazyHistorySync};
+use crate::types::events::{Event, LazyHistorySync};
 use std::sync::Arc;
 use wacore::history_sync::{HistoryMsgSecretRecord, TcTokenCandidate, process_history_sync};
 use wacore::store::traits::{MsgSecretEntry, TcTokenEntry};
@@ -93,12 +93,6 @@ impl Client {
             return;
         }
 
-        // file_length is the decrypted (but still zlib-compressed) blob size, not
-        // the final decompressed size. We still pass it as a hint — the decompressor
-        // uses it with a 4x multiplier, which is a better estimate than guessing
-        // from the encrypted size (which includes MAC/padding overhead).
-        let compressed_size_hint = notification.file_length.filter(|&s| s > 0);
-
         // Use take() to avoid cloning large payloads - moves ownership instead
         let compressed_data = if let Some(inline_payload) =
             notification.initial_hist_bootstrap_inline_payload.take()
@@ -143,16 +137,14 @@ impl Client {
         };
 
         let own_user = {
-            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
             device_snapshot.pn.as_ref().map(|j| j.to_non_ad().user)
         };
 
-        // Retain (and fully decompress) the blob only when a handler actually
-        // wants HistorySync. A message-only bot leaves this false, so the
-        // streaming decompress-and-parse path runs instead of materializing the
-        // whole payload just to drop it at dispatch.
-        let retain_history_blob = self.core.event_bus.has_handler_for(EventKind::HistorySync);
-
+        // Always carry the compressed input through (a move, no copy or extra
+        // inflate); handler interest is evaluated at dispatch time below, so a
+        // handler that registers while a large blob is being parsed still gets
+        // the event instead of racing a pre-parse snapshot.
         // Small blobs (PushName, Recent): decode inline to avoid spawn_blocking overhead.
         // Large blobs: use blocking thread to avoid stalling the async runtime.
         const INLINE_THRESHOLD: usize = 256 * 1024;
@@ -160,18 +152,12 @@ impl Client {
             Some(process_history_sync(
                 compressed_data,
                 own_user.as_deref(),
-                retain_history_blob,
-                compressed_size_hint,
+                true,
             ))
         } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
-                let result = process_history_sync(
-                    compressed_data,
-                    own_user.as_deref(),
-                    retain_history_blob,
-                    compressed_size_hint,
-                );
+                let result = process_history_sync(compressed_data, own_user.as_deref(), true);
                 let _ = result_tx.send(result);
             }));
             self.runtime
@@ -225,9 +211,15 @@ impl Client {
                 self.store_history_sync_msg_secrets(sync_result.msg_secret_records)
                     .await;
 
-                if let Some(decompressed) = sync_result.decompressed_bytes {
+                // No interest pre-check: dispatch() evaluates handler interest
+                // against a single bus snapshot (and skips materializing the
+                // Arc when nobody listens), so deferring to it removes the
+                // check-to-dispatch race window entirely. Building the event
+                // is just a Bytes refcount move plus metadata.
+                if let Some(compressed) = sync_result.compressed_bytes {
                     let lazy_hs = LazyHistorySync::new(
-                        decompressed,
+                        compressed,
+                        sync_result.decompressed_size,
                         notification.sync_type().into(),
                         notification.chunk_order,
                         notification.progress,
@@ -273,7 +265,7 @@ impl Client {
         let retention = &self.cache_config.msg_secret_retention;
         let now = wacore::time::now_secs();
 
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_pn = device_snapshot.pn.as_ref().map(|j| j.to_non_ad());
         let own_lid = device_snapshot.lid.as_ref().map(|j| j.to_non_ad());
 
@@ -324,8 +316,8 @@ impl Client {
 
             let sender_count = senders.len();
             let mut chat_id = chat.to_non_ad_string();
-            let mut msg_id = record.msg_id;
-            let mut secret = record.secret;
+            let mut msg_id = record.msg_id.into_string();
+            let mut secret = record.secret.into_vec();
             for (idx, sender) in senders.into_iter().enumerate() {
                 let last_sender = idx + 1 == sender_count;
                 entries.push(MsgSecretEntry {
@@ -385,7 +377,6 @@ impl Client {
     ) -> Result<(), anyhow::Error> {
         let own_jid = self
             .get_pn()
-            .await
             .ok_or(crate::client::ClientError::NotLoggedIn)?
             .to_non_ad();
         let (ciphertext, iv) =
@@ -530,20 +521,20 @@ mod tests {
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
+                    message: Some(Box::new(wa::WebMessageInfo {
                         key: wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
                             id: Some(parent_id.to_string()),
                             participant: None,
                         },
-                        message: Some(wa::Message {
+                        message: Some(Box::new(wa::Message {
                             conversation: Some("historical".to_string()),
                             ..Default::default()
-                        }),
+                        })),
                         message_secret: Some(secret.clone()),
                         ..Default::default()
-                    }),
+                    })),
                     msg_order_id: Some(1),
                 }],
                 ..Default::default()
@@ -572,6 +563,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_history_sync_task_dispatches_compressed_lazy_event() {
+        let client = crate::test_utils::create_test_client_with_name("history_lazy_event").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let chat = "5511777776666@s.whatsapp.net";
+        let history_sync = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            conversations: vec![wa::Conversation {
+                id: chat.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let raw_len = history_sync.encode_to_vec().len();
+        let compressed = compress_history_sync(&history_sync);
+        let compressed_copy = compressed.clone();
+        let notification = HistorySyncNotification {
+            file_length: Some(compressed.len() as u64),
+            sync_type: Some(wa::message::HistorySyncType::InitialBootstrap as i32),
+            initial_hist_bootstrap_inline_payload: Some(compressed),
+            ..Default::default()
+        };
+
+        // Register a handler BEFORE the task so retain_blob is true.
+        let (handler, event_rx) = wacore::types::events::ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+
+        client
+            .process_history_sync_task("HIST_LAZY_EVENT".to_string(), notification)
+            .await;
+
+        let event = event_rx.try_recv().expect("HistorySync event dispatched");
+        let crate::types::events::Event::HistorySync(lazy) = &*event else {
+            panic!("expected HistorySync event, got {event:?}");
+        };
+
+        // The event carries the original compressed payload plus the exact
+        // inflated size, and every consumption path works.
+        assert_eq!(lazy.compressed_bytes().as_ref(), &compressed_copy[..]);
+        assert_eq!(lazy.decompressed_size(), raw_len);
+        let decoded = lazy.get().expect("decodes");
+        assert_eq!(decoded.conversations[0].id, chat);
+        let mut stream = lazy.stream();
+        assert_eq!(
+            stream.next_conversation().unwrap().unwrap().id,
+            chat,
+            "stream still works after get()"
+        );
+    }
+
+    #[tokio::test]
     async fn process_history_sync_task_stores_bot_dm_secret_alias() {
         let client =
             crate::test_utils::create_test_client_with_name("history_bot_msg_secret").await;
@@ -591,20 +633,20 @@ mod tests {
             conversations: vec![wa::Conversation {
                 id: chat.to_string(),
                 messages: vec![wa::HistorySyncMsg {
-                    message: Some(wa::WebMessageInfo {
+                    message: Some(Box::new(wa::WebMessageInfo {
                         key: wa::MessageKey {
                             remote_jid: Some(chat.to_string()),
                             from_me: Some(false),
                             id: Some(parent_id.to_string()),
                             participant: None,
                         },
-                        message: Some(wa::Message {
+                        message: Some(Box::new(wa::Message {
                             conversation: Some("bot historical".to_string()),
                             ..Default::default()
-                        }),
+                        })),
                         message_secret: Some(secret.clone()),
                         ..Default::default()
-                    }),
+                    })),
                     msg_order_id: Some(1),
                 }],
                 ..Default::default()
@@ -655,18 +697,18 @@ mod tests {
             }
         };
         wa::HistorySyncMsg {
-            message: Some(wa::WebMessageInfo {
+            message: Some(Box::new(wa::WebMessageInfo {
                 key: wa::MessageKey {
                     remote_jid: Some(chat.to_string()),
                     from_me: Some(false),
                     id: Some(msg_id.to_string()),
                     participant: None,
                 },
-                message: Some(message),
+                message: Some(Box::new(message)),
                 message_secret: Some(secret.to_vec()),
                 message_timestamp: Some(ts_secs),
                 ..Default::default()
-            }),
+            })),
             msg_order_id: Some(1),
         }
     }
@@ -937,33 +979,35 @@ mod tests {
         ts_secs: u64,
         bot_prompt: bool,
     ) -> wa::HistorySyncMsg {
-        let message_context_info = bot_prompt.then(|| wa::MessageContextInfo {
-            bot_metadata: Some(wa::BotMetadata {
-                persona_id: Some("867051314767696".into()),
+        let message_context_info = bot_prompt.then(|| {
+            Box::new(wa::MessageContextInfo {
+                bot_metadata: Some(wa::BotMetadata {
+                    persona_id: Some("867051314767696".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
+            })
         });
         wa::HistorySyncMsg {
-            message: Some(wa::WebMessageInfo {
+            message: Some(Box::new(wa::WebMessageInfo {
                 key: wa::MessageKey {
                     remote_jid: Some(chat.to_string()),
                     from_me: Some(false),
                     id: Some(msg_id.to_string()),
                     participant: Some(participant.to_string()),
                 },
-                message: Some(wa::Message {
+                message: Some(Box::new(wa::Message {
                     extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
                         text: Some("hi".into()),
                         ..Default::default()
                     })),
                     message_context_info,
                     ..Default::default()
-                }),
+                })),
                 message_secret: Some(secret.to_vec()),
                 message_timestamp: Some(ts_secs),
                 ..Default::default()
-            }),
+            })),
             msg_order_id: Some(1),
         }
     }

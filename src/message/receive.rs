@@ -62,7 +62,7 @@ impl Client {
 
         let participants = nr.get_optional_child_by_tag(&["participants"]);
         if let Some(participants_node) = participants {
-            let own_jid = self.get_pn().await;
+            let own_jid = self.get_pn();
             let to_nodes = participants_node.get_children_by_tag("to");
             for to_node in to_nodes {
                 let to_jid = match to_node.attrs().optional_jid("jid") {
@@ -131,6 +131,11 @@ impl Client {
         let mut had_unknown_enc = false;
         let mut had_custom_handler = false;
 
+        // Custom enc handlers are set once at Bot::build and immutable after, so
+        // read the map lock-free once instead of acquiring an async RwLock guard
+        // per enc node. `None` (the common zero-handler bot) skips the lookup.
+        let custom_enc_handlers = self.custom_enc_handlers.get();
+
         for enc_node in &all_enc_nodes {
             // Parse sender retry count (WA Web: e.maybeAttrInt("count") ?? 0)
             // Clamp to MAX_DECRYPT_RETRIES to prevent u64→u8 truncation on unexpected values.
@@ -159,12 +164,8 @@ impl Client {
                 }
             };
 
-            if let Some(handler) = self
-                .custom_enc_handlers
-                .read()
-                .await
-                .get(enc_type.as_ref())
-                .cloned()
+            if let Some(handler) =
+                custom_enc_handlers.and_then(|m| m.get(enc_type.as_ref()).cloned())
             {
                 let handler_clone = handler;
                 let client_clone = self.clone();
@@ -290,10 +291,12 @@ impl Client {
             let cache_key = self
                 .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
                 .await;
-            let existing = self.message_retry_counts.get(&cache_key).await.unwrap_or(0);
-            if max_sender_retry_count > existing {
+            let existing = self.message_retry_counts.get(&cache_key).await;
+            if max_sender_retry_count > existing.map_or(0, |(count, _)| count) {
+                // Keep any locally recorded reason; the echoed count carries none.
+                let reason = existing.and_then(|(_, reason)| reason);
                 self.message_retry_counts
-                    .insert(cache_key, max_sender_retry_count)
+                    .insert(cache_key, (max_sender_retry_count, reason))
                     .await;
             }
             log::debug!(
@@ -415,8 +418,11 @@ impl Client {
                             info.source.sender.observe()
                         );
                     } else {
-                        log::log!(
-                            decrypt_fail_log_level(decrypt_fail_mode),
+                        // WA Web skips the skmsg silently after a retryable
+                        // pkmsg failure (canDecryptNext in
+                        // WAWebMsgProcessingDecryptionHandler); the pkmsg
+                        // failure itself is already logged and retried.
+                        log::debug!(
                             "Skipping skmsg decryption for message {} from {} because pkmsg failed to decrypt.",
                             info.id,
                             info.source.sender.observe()
@@ -1235,14 +1241,26 @@ impl Client {
     /// WA Web: online → `syncDeviceListJob`, offline → `OfflinePendingDeviceCache`.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.unknown_device_sync", level = "debug", skip_all, fields(sender = %info.source.sender.observe(), msg_id = %info.id)))]
     async fn handle_unknown_device_sync(self: &Arc<Self>, info: &MessageInfo) {
-        let user_jid = info.source.sender.to_non_ad();
+        self.schedule_unknown_device_sync(info.source.sender.to_non_ad(), info.is_offline)
+            .await;
+    }
 
+    /// Refresh a user's device list after encountering one of their devices that
+    /// is missing from our registry. Dedups per user (skips a sync already
+    /// pending/in-flight), then offline → batch for `doPendingDeviceSync`, online
+    /// → invalidate + usync immediately. WA Web: online `syncDeviceListJob`,
+    /// offline `OfflinePendingDeviceCache`.
+    pub(crate) async fn schedule_unknown_device_sync(
+        self: &Arc<Self>,
+        user_jid: Jid,
+        is_offline: bool,
+    ) {
         // Dedup: skip if we already have a sync pending/in-flight for this user
-        if !self.pending_device_sync.add(user_jid.clone()).await {
+        if !self.pending_device_sync.add(&user_jid).await {
             return;
         }
 
-        if info.is_offline {
+        if is_offline {
             log::debug!(
                 "Queueing {} for pending device sync (offline)",
                 user_jid.observe()
@@ -1433,11 +1451,24 @@ impl Client {
         // Release the address lock so the migration loop can acquire it for
         // the matching device without re-entering.
         *session_guard = None;
-        self.migrate_signal_sessions_on_lid_discovery(&pn, &sender_jid.user)
+        let migrated = self
+            .migrate_signal_sessions_on_lid_discovery(&pn, &sender_jid.user)
             .await;
         // Re-acquire for the retry decrypt and hand the guard back to the
         // caller for subsequent payloads in the batch.
         *session_guard = Some(session_mutex.lock_arc().await);
+
+        // Nothing moved namespaces, so the retry would hit the exact same
+        // state, fail identically, and log a second decrypt failure for
+        // every redelivered copy of an undecryptable message.
+        if !migrated {
+            log::debug!(
+                "[msg:{}] No PN state to migrate for {}; skipping migration retry decrypt",
+                info.id,
+                info.source.sender.observe()
+            );
+            return MigrationDecryptOutcome::default();
+        }
 
         match message_decrypt(
             parsed_message,
@@ -1553,13 +1584,36 @@ impl Client {
         &self,
         node: &wacore_binary::NodeRef<'_>,
     ) -> Result<MessageInfo, anyhow::Error> {
-        let (own_pn, own_lid) = {
-            let arc = self.persistence_manager.get_device_arc().await;
-            let guard = arc.read().await;
-            (guard.pn.clone(), guard.lid.clone())
-        };
+        // Per-message path: borrow pn/lid from the snapshot, no lock, no clones.
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let default_jid = Jid::default();
-        let own_jid = own_pn.as_ref().unwrap_or(&default_jid);
-        wacore::messages::parse_message_info(node, own_jid, own_lid.as_ref())
+        let own_jid = device_snapshot.pn.as_ref().unwrap_or(&default_jid);
+        wacore::messages::parse_message_info(node, own_jid, device_snapshot.lid.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_utils::create_test_client_with_failing_http;
+    use wacore_binary::Jid;
+
+    // The offline path batches the user for a deferred usync and dedups repeated
+    // requests, so a retry storm from one unknown device cannot fan out into a
+    // usync storm.
+    #[tokio::test]
+    async fn schedule_unknown_device_sync_batches_and_dedups() {
+        let client = create_test_client_with_failing_http("schedule_resync").await;
+        let user: Jid = "12345678901234@lid".parse().unwrap();
+
+        client
+            .schedule_unknown_device_sync(user.clone(), true)
+            .await;
+        // Same user again is deduped, not enqueued twice.
+        client
+            .schedule_unknown_device_sync(user.clone(), true)
+            .await;
+
+        let pending = client.pending_device_sync.take_all().await;
+        assert_eq!(pending, vec![user]);
     }
 }

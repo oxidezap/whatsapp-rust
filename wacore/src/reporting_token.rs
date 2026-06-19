@@ -17,10 +17,11 @@
 //! without seeing the full message content. Only specific fields are extracted
 //! based on a predefined whitelist matching WhatsApp Web behavior.
 
+use std::sync::LazyLock;
+
 use anyhow::{Result, anyhow};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
-use prost::Message;
 use sha2::Sha256;
 use wacore_binary::Jid;
 use wacore_binary::Node;
@@ -256,11 +257,20 @@ pub const REPORTING_TOKEN_SIZE: usize = 16;
 /// This string is appended to the HKDF info as per WhatsApp Web implementation.
 const USE_CASE_REPORT_TOKEN: &str = "Report Token";
 
+/// HKDF-Extract with no salt is `HMAC-SHA256(zero_block, ikm)`, so the zero-key
+/// ipad/opad schedule is constant across every send. Cache it once and clone per
+/// derivation instead of re-running `Hkdf::new(None, ..)`'s two compressions each
+/// time. Same trick as the libsignal message-key extract and the appstate ltHash.
+static REPORTING_TOKEN_EXTRACT_HMAC: LazyLock<Hmac<Sha256>> =
+    LazyLock::new(|| Hmac::<Sha256>::new_from_slice(&[0u8; 32]).expect("32-byte HMAC key"));
+
 /// Generate a random message secret (32 bytes)
 pub fn generate_message_secret() -> [u8; MESSAGE_SECRET_SIZE] {
     use rand::RngExt;
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-    rng.random()
+    // Pull straight from the thread RNG (an auto-reseeding CSPRNG) rather than
+    // seeding a fresh StdRng per call; the discarded per-send ChaCha reseed
+    // showed up as ~16% of the small-message send-token cost in the flamegraph.
+    rand::rng().random()
 }
 
 /// Build the HKDF info bytes for reporting token key derivation.
@@ -303,9 +313,15 @@ pub fn derive_reporting_token_key(
 
     let info = build_hkdf_info(stanza_id, sender_jid, remote_jid);
 
-    let hk = Hkdf::<Sha256>::new(None, message_secret);
+    // No-salt extract via the cached zero-keyed HMAC; output is byte-identical to
+    // `Hkdf::new(None, message_secret)` but skips the constant ipad/opad schedule.
+    let mut extract = REPORTING_TOKEN_EXTRACT_HMAC.clone();
+    extract.update(message_secret);
+    let prk = extract.finalize().into_bytes();
     let mut key = [0u8; REPORTING_TOKEN_KEY_SIZE];
-    hk.expand(&info, &mut key)
+    Hkdf::<Sha256>::from_prk(&prk)
+        .expect("PRK is hash-sized")
+        .expand(&info, &mut key)
         .map_err(|e| anyhow!("HKDF expand failed: {}", e))?;
 
     Ok(key)
@@ -512,7 +528,7 @@ pub fn generate_reporting_token_content(message: &wa::Message) -> Option<Vec<u8>
     if !should_include_reporting_token(message) {
         return None;
     }
-    let message_bytes = message.encode_to_vec();
+    let message_bytes = waproto::codec::message_to_vec(message);
     extract_reporting_token_content(&message_bytes, REPORTING_FIELDS)
 }
 
@@ -553,6 +569,41 @@ pub fn generate_reporting_token(
     remote_jid: &Jid,
     existing_secret: Option<&[u8]>,
 ) -> Option<ReportingTokenResult> {
+    // Message types that carry no reporting token (reactions, poll votes, keep-in-chat)
+    // bail before encoding the message / minting a secret / deriving the key: the field
+    // extraction below would return None and discard all of it.
+    if !should_include_reporting_token(message) {
+        return None;
+    }
+    let encoded = waproto::codec::message_to_vec(message);
+    generate_reporting_token_from_encoded(
+        message,
+        &encoded,
+        stanza_id,
+        sender_jid,
+        remote_jid,
+        existing_secret,
+    )
+}
+
+/// Like [`generate_reporting_token`] but reuses `encoded_message` (the protobuf encoding
+/// of `message`, with no reporting context spliced on) instead of encoding `message`
+/// again. The DM send path encodes the message once for the wire plaintext and threads
+/// those same bytes here, so a token-bearing DM no longer encodes its message a second
+/// time per send just to extract the token's whitelisted fields.
+pub fn generate_reporting_token_from_encoded(
+    message: &wa::Message,
+    encoded_message: &[u8],
+    stanza_id: &str,
+    sender_jid: &Jid,
+    remote_jid: &Jid,
+    existing_secret: Option<&[u8]>,
+) -> Option<ReportingTokenResult> {
+    if !should_include_reporting_token(message) {
+        return None;
+    }
+    let content = extract_reporting_token_content(encoded_message, REPORTING_FIELDS)?;
+
     let message_secret: [u8; MESSAGE_SECRET_SIZE] = if let Some(secret) = existing_secret {
         if secret.len() != MESSAGE_SECRET_SIZE {
             log::warn!("Invalid existing secret size, generating new one");
@@ -571,7 +622,6 @@ pub fn generate_reporting_token(
         derive_reporting_token_key(&message_secret, stanza_id, &sender_jid_str, &remote_jid_str)
             .ok()?;
 
-    let content = generate_reporting_token_content(message)?;
     let token = calculate_reporting_token(&key, &content).ok()?;
 
     Some(ReportingTokenResult {
@@ -628,6 +678,7 @@ pub fn extract_message_secret(message: &wa::Message) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
 
     #[test]
     fn test_generate_message_secret() {
@@ -649,10 +700,10 @@ mod tests {
         let secret = [0x42u8; MESSAGE_SECRET_SIZE];
         let msg = wa::Message {
             conversation: Some("hi".into()),
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_secret: Some(secret.to_vec()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         let to: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
@@ -689,6 +740,30 @@ mod tests {
         let key3 = derive_reporting_token_key(&secret, "different_id", sender_jid, remote_jid)
             .expect("valid secret should derive key successfully");
         assert_ne!(key, key3);
+    }
+
+    #[test]
+    fn derive_key_matches_plain_hkdf_extract() {
+        // The cached zero-keyed HMAC extract must produce a key byte-identical to
+        // `Hkdf::new(None, secret)` across a spread of secrets.
+        let stanza_id = "3EB0E0E5F2D4F618589C0B";
+        let sender_jid = "5511999887766@s.whatsapp.net";
+        let remote_jid = "5511888776655@s.whatsapp.net";
+        let info = build_hkdf_info(stanza_id, sender_jid, remote_jid);
+
+        for seed in 0u8..32 {
+            let secret = [seed.wrapping_mul(37).wrapping_add(11); MESSAGE_SECRET_SIZE];
+
+            let mut expected = [0u8; REPORTING_TOKEN_KEY_SIZE];
+            Hkdf::<Sha256>::new(None, &secret)
+                .expand(&info, &mut expected)
+                .expect("valid output length");
+
+            let got = derive_reporting_token_key(&secret, stanza_id, sender_jid, remote_jid)
+                .expect("valid secret should derive key successfully");
+
+            assert_eq!(got, expected, "mismatch for seed {seed}");
+        }
     }
 
     #[test]
@@ -776,18 +851,18 @@ mod tests {
 
         // Reaction message should NOT include token
         let reaction_message = wa::Message {
-            reaction_message: Some(wa::message::ReactionMessage {
+            reaction_message: Some(Box::new(wa::message::ReactionMessage {
                 key: None,
                 text: Some("👍".to_string()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&reaction_message));
 
         // Poll update should NOT include token
         let poll_update = wa::Message {
-            poll_update_message: Some(wa::message::PollUpdateMessage::default()),
+            poll_update_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&poll_update));
@@ -897,6 +972,60 @@ mod tests {
     }
 
     #[test]
+    fn from_encoded_matches_generate_and_skips_excluded_types() {
+        let sender = Jid::pn("5511999887766");
+        let remote = Jid::pn("5511888776655");
+        let secret = [0x5Au8; MESSAGE_SECRET_SIZE];
+
+        // Token-bearing message: feeding the message's own encoding to the _from_encoded
+        // variant yields the same token the all-in-one path derives — the contract the DM
+        // send path relies on when it shares one encode between the token and the plaintext.
+        let message = wa::Message {
+            conversation: Some("Test message".to_string()),
+            ..Default::default()
+        };
+        let encoded = waproto::codec::message_to_vec(&message);
+        let direct = generate_reporting_token(&message, "SID", &sender, &remote, Some(&secret))
+            .expect("token-bearing message");
+        let shared = generate_reporting_token_from_encoded(
+            &message,
+            &encoded,
+            "SID",
+            &sender,
+            &remote,
+            Some(&secret),
+        )
+        .expect("token-bearing message");
+        assert_eq!(direct.reporting_token, shared.reporting_token);
+        assert_eq!(direct.message_secret, shared.message_secret);
+
+        // Excluded type (reaction): both paths bail before extraction/secret/key (the
+        // reorder makes that skip explicit) and return None.
+        let reaction = wa::Message {
+            reaction_message: Some(Box::new(wa::message::ReactionMessage {
+                text: Some("👍".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let reaction_encoded = waproto::codec::message_to_vec(&reaction);
+        assert!(
+            generate_reporting_token(&reaction, "SID", &sender, &remote, Some(&secret)).is_none()
+        );
+        assert!(
+            generate_reporting_token_from_encoded(
+                &reaction,
+                &reaction_encoded,
+                "SID",
+                &sender,
+                &remote,
+                Some(&secret)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn test_build_reporting_node() {
         use wacore_binary::NodeContent;
 
@@ -966,10 +1095,10 @@ mod tests {
     fn test_extract_message_secret() {
         let secret = vec![0x55u8; MESSAGE_SECRET_SIZE];
         let message = wa::Message {
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 message_secret: Some(secret.clone()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
 
@@ -1304,29 +1433,29 @@ mod tests {
         // Verify all excluded message types return None/false
 
         let reaction = wa::Message {
-            reaction_message: Some(wa::message::ReactionMessage {
+            reaction_message: Some(Box::new(wa::message::ReactionMessage {
                 text: Some("👍".to_string()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&reaction));
         assert!(generate_reporting_token_content(&reaction).is_none());
 
         let enc_reaction = wa::Message {
-            enc_reaction_message: Some(wa::message::EncReactionMessage::default()),
+            enc_reaction_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&enc_reaction));
 
         let poll_update = wa::Message {
-            poll_update_message: Some(wa::message::PollUpdateMessage::default()),
+            poll_update_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&poll_update));
 
         let keep_in_chat = wa::Message {
-            keep_in_chat_message: Some(wa::message::KeepInChatMessage::default()),
+            keep_in_chat_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&keep_in_chat));
@@ -1378,10 +1507,10 @@ mod tests {
         // If message already has MessageContextInfo, we should update it, not replace
         let original = wa::Message {
             conversation: Some("Test".to_string()),
-            message_context_info: Some(wa::MessageContextInfo {
+            message_context_info: Some(Box::new(wa::MessageContextInfo {
                 device_list_metadata_version: Some(42), // Some existing field
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
 

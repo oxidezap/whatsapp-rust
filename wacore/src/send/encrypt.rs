@@ -77,12 +77,48 @@ where
     Ok(skm)
 }
 
-pub struct SignalStores<'a, S, I, P, SP> {
+/// Object-safe `SessionStore` that can clone itself into an owned box. The
+/// encrypt fan-out hands each spawned task its own owned store handle; erasing
+/// the concrete type here (instead of a generic `S: Clone`) keeps the whole
+/// encrypt tree as a single instantiation instead of one ~60 KiB copy per
+/// concrete adapter set. Blanket-impl'd for every `Clone` store, so concrete
+/// adapters need no changes.
+pub trait CloneableSessionStore: crate::libsignal::protocol::SessionStore {
+    fn clone_box(&self) -> Box<dyn CloneableSessionStore + Send + Sync>;
+}
+
+impl<T> CloneableSessionStore for T
+where
+    T: crate::libsignal::protocol::SessionStore + Clone + Send + Sync + 'static,
+{
+    fn clone_box(&self) -> Box<dyn CloneableSessionStore + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+/// See [`CloneableSessionStore`].
+pub trait CloneableIdentityStore: crate::libsignal::protocol::IdentityKeyStore {
+    fn clone_box(&self) -> Box<dyn CloneableIdentityStore + Send + Sync>;
+}
+
+impl<T> CloneableIdentityStore for T
+where
+    T: crate::libsignal::protocol::IdentityKeyStore + Clone + Send + Sync + 'static,
+{
+    fn clone_box(&self) -> Box<dyn CloneableIdentityStore + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+/// Borrowed handles to the Signal stores for one send. The stores are
+/// type-erased (`dyn`) so the encrypt/session functions compile to a single
+/// instantiation rather than one per concrete adapter set.
+pub struct SignalStores<'a> {
     pub sender_key_store: &'a mut (dyn crate::libsignal::protocol::SenderKeyStore + Send + Sync),
-    pub session_store: &'a mut S,
-    pub identity_store: &'a mut I,
-    pub prekey_store: &'a mut P,
-    pub signed_prekey_store: &'a SP,
+    pub session_store: &'a mut (dyn CloneableSessionStore + Send + Sync),
+    pub identity_store: &'a mut (dyn CloneableIdentityStore + Send + Sync),
+    pub prekey_store: &'a mut (dyn crate::libsignal::protocol::PreKeyStore + Send + Sync),
+    pub signed_prekey_store: &'a (dyn crate::libsignal::protocol::SignedPreKeyStore + Send + Sync),
 }
 
 /// Check if an anyhow error is a 406 "not-acceptable" server error (device unregistered).
@@ -286,24 +322,57 @@ fn push_encrypt_result(
 /// by [`ENCRYPT_FANOUT_CONCURRENCY`]. Each task clones the store handles
 /// (Arc bumps under the hood); the shared cache provides interior mutability.
 ///
+/// Composition of [`ensure_sessions_for_devices`] (network: prekey fetch +
+/// X3DH for missing sessions) and [`encrypt_for_devices_with_sessions`]
+/// (CPU: the pairwise encrypt fan-out). Callers that must not hold a lock
+/// across network I/O (the group sender-key chain lock) call the two phases
+/// directly with the lock taken only around the second.
+///
 /// Callers must hold per-device session locks before calling this function —
 /// concurrent ratchet mutations will corrupt Signal session state.
-#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
-pub async fn encrypt_for_devices<'a, S, I, P, SP>(
+pub async fn encrypt_for_devices(
     runtime: &dyn Runtime,
-    stores: &mut SignalStores<'a, S, I, P, SP>,
+    stores: &mut SignalStores<'_>,
     resolver: &dyn SendContextResolver,
     devices: &[Jid],
     plaintext_to_encrypt: &[u8],
     hide_decrypt_fail: bool,
     mediatype: Option<&str>,
-) -> Result<EncryptResult>
-where
-    S: crate::libsignal::protocol::SessionStore + Clone + Send + Sync + 'static,
-    I: crate::libsignal::protocol::IdentityKeyStore + Clone + Send + Sync + 'static,
-    P: crate::libsignal::protocol::PreKeyStore + Send + Sync,
-    SP: crate::libsignal::protocol::SignedPreKeyStore + Send + Sync,
-{
+) -> Result<EncryptResult> {
+    let plan = ensure_sessions_for_devices(runtime, stores, resolver, devices).await?;
+    encrypt_for_devices_with_sessions(
+        runtime,
+        stores,
+        devices,
+        plaintext_to_encrypt,
+        hide_decrypt_fail,
+        mediatype,
+        plan,
+    )
+    .await
+}
+
+/// Session material prepared for one encrypt fan-out: per-index LID
+/// encryption overrides (mirroring the `devices` slice it was built from)
+/// plus whether any device 406'd during prekey fetch. Produced only by
+/// [`ensure_sessions_for_devices`]; consumed by
+/// [`encrypt_for_devices_with_sessions`] over the same `devices` slice.
+pub struct SessionPlan {
+    encryption_overrides: Vec<Option<Jid>>,
+    pub had_unregistered_device: bool,
+}
+
+/// Resolve LID overrides and establish missing Signal sessions (prekey
+/// fetch + X3DH) for `devices`. This is the network half of the encrypt
+/// fan-out and touches only session/identity state — never a sender-key
+/// chain — so group sends run it before taking the chain lock.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.ensure_sessions", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
+pub async fn ensure_sessions_for_devices(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'_>,
+    resolver: &dyn SendContextResolver,
+    devices: &[Jid],
+) -> Result<SessionPlan> {
     // Per-device LID upgrade map: encryption_overrides[i] mirrors devices[i].
     // None = use devices[i] as-is; Some(jid) = use this LID-upgraded version.
     // The Vec replaces a HashMap<&Jid, Jid> that paid hash + alloc per insert
@@ -382,7 +451,9 @@ where
         {
             Ok(bundles) => bundles,
             Err(e) if is_device_unregistered_error(&e) => {
-                log::warn!(
+                // No server prekeys for these devices this round; the next send
+                // re-fetches. Debug, not warn — a batch 406 would otherwise flood the log.
+                log::debug!(
                     "Prekey fetch returned 406 for {} device(s); skipping them this round",
                     jids_for_fetch.len()
                 );
@@ -418,15 +489,17 @@ where
 
             let lookup_jid = device_jid.normalize_for_prekey_bundle();
             let bundles = prekey_bundles.clone();
-            let mut session_store = stores.session_store.clone();
-            let mut identity_store = stores.identity_store.clone();
+            let mut session_store = stores.session_store.clone_box();
+            let mut identity_store = stores.identity_store.clone_box();
 
             spawn_oneshot(runtime, async move {
                 let mut addr = crate::types::jid::make_reusable_protocol_address();
                 encryption_jid.reset_protocol_address(&mut addr);
 
                 let Some(bundle) = bundles.get(&lookup_jid) else {
-                    log::warn!(
+                    // No key material this round (usually the 406 cascade); the next
+                    // send re-fetches. Debug avoids one warn per skipped device.
+                    log::debug!(
                         "No pre-key bundle returned for device {}. This device will be skipped for encryption.",
                         addr
                     );
@@ -439,8 +512,8 @@ where
                 // process_prekey_bundle persists rotations transparently.
                 match process_prekey_bundle(
                     &addr,
-                    &mut session_store,
-                    &mut identity_store,
+                    &mut *session_store,
+                    &mut *identity_store,
                     bundle,
                     &mut rng,
                     UsePQRatchet::No,
@@ -485,6 +558,38 @@ where
         }
     }
 
+    Ok(SessionPlan {
+        encryption_overrides,
+        had_unregistered_device: had_406,
+    })
+}
+
+/// CPU half of the encrypt fan-out: pairwise-encrypt `plaintext_to_encrypt`
+/// for each device using sessions prepared by [`ensure_sessions_for_devices`]
+/// over the same `devices` slice. No resolver, no network — safe to run
+/// under locks that must not span I/O. A device whose session is still
+/// missing (e.g. its bundle was absent) fails its encrypt and is skipped,
+/// matching the combined path's behavior.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
+pub async fn encrypt_for_devices_with_sessions(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'_>,
+    devices: &[Jid],
+    plaintext_to_encrypt: &[u8],
+    hide_decrypt_fail: bool,
+    mediatype: Option<&str>,
+    plan: SessionPlan,
+) -> Result<EncryptResult> {
+    debug_assert_eq!(
+        plan.encryption_overrides.len(),
+        devices.len(),
+        "SessionPlan built for a different device list"
+    );
+    let SessionPlan {
+        encryption_overrides,
+        had_unregistered_device,
+    } = plan;
+
     let mut participant_nodes = Vec::with_capacity(devices.len());
     let mut includes_prekey_message = false;
     let mut encrypted_devices = Vec::with_capacity(devices.len());
@@ -498,8 +603,9 @@ where
         // a FuturesUnordered, and two store clones), with no parallelism to gain.
         // Encrypt inline.
         let device_jid = devices[0].clone();
-        let addr = encryption_overrides[0]
-            .as_ref()
+        let addr = encryption_overrides
+            .first()
+            .and_then(|o| o.as_ref())
             .unwrap_or(&devices[0])
             .to_protocol_address();
         let res = encrypt_one_device(
@@ -532,20 +638,21 @@ where
             // The encryption JID is only needed to build the Signal address, so
             // derive it here from a borrow rather than cloning the whole Jid into
             // the task (device_jid is still cloned because it's returned).
-            let addr = encryption_overrides[idx]
-                .as_ref()
+            let addr = encryption_overrides
+                .get(idx)
+                .and_then(|o| o.as_ref())
                 .unwrap_or(&devices[idx])
                 .to_protocol_address();
             let plaintext = plaintext_arc.clone();
-            let mut session_store = stores.session_store.clone();
-            let mut identity_store = stores.identity_store.clone();
+            let mut session_store = stores.session_store.clone_box();
+            let mut identity_store = stores.identity_store.clone_box();
 
             spawn_oneshot(runtime, async move {
                 encrypt_one_device(
                     &plaintext,
                     &addr,
-                    &mut session_store,
-                    &mut identity_store,
+                    &mut *session_store,
+                    &mut *identity_store,
                     device_jid,
                     hide_decrypt_fail,
                 )
@@ -583,6 +690,6 @@ where
         participant_nodes,
         includes_prekey_message,
         encrypted_devices,
-        had_unregistered_device: had_406,
+        had_unregistered_device,
     })
 }

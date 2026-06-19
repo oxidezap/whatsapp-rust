@@ -1,3 +1,6 @@
+// Compile-checks the README examples as doctests, so the advertised quick
+// start can never silently rot.
+#![doc = include_str!("../README.md")]
 // Instrumenting large async fns (e.g. process_sync_task) wraps them in deep
 // `Instrumented` future types; the default depth limit overflows when the
 // `tracing` + `tracing-pii` paths combine. Raise it (compile-time only).
@@ -14,13 +17,17 @@ pub use wacore_binary::CompactString;
 pub use wacore_binary::OwnedNodeRef;
 pub use wacore_binary::builder::NodeBuilder;
 pub use wacore_binary::{Jid, Server};
+
+// Whole-crate re-exports so a git consumer needs a single dependency:
+// every `wacore::…`/`wacore_binary::…`/`waproto::…` path is reachable as
+// `whatsapp_rust::wacore::…` (etc.) without declaring the sibling crates.
+pub use wacore;
+pub use wacore_binary;
 pub use waproto;
 
 pub mod cache;
-// Available whenever the cache falls back to PortableCache: moka off, or wasm32
-// (where moka can't build) even if `moka-cache` is enabled. Mirrors src/cache.rs.
-#[cfg(any(not(feature = "moka-cache"), target_arch = "wasm32"))]
 pub mod portable_cache;
+pub(crate) mod resend_rate_limiter;
 
 pub mod cache_config;
 pub use cache_config::{
@@ -37,6 +44,9 @@ pub mod types;
 pub mod client;
 pub(crate) mod flush_scope;
 pub use client::Client;
+/// Shared base error for transport/connection concerns; the per-domain error
+/// types embed it.
+pub use client::ClientError;
 #[cfg(feature = "debug-diagnostics")]
 pub use client::MemoryDiagnostics;
 pub use client::NodeFilter;
@@ -48,16 +58,18 @@ pub mod jid_utils;
 pub mod keepalive;
 pub mod mediaconn;
 pub mod message;
+pub(crate) mod msg_secret_buffer;
 pub mod pair;
 pub mod pair_code;
 pub mod request;
+pub use request::IqError;
 #[cfg(feature = "tokio-runtime")]
 pub mod runtime_impl;
 #[cfg(feature = "tokio-runtime")]
 pub use runtime_impl::TokioRuntime;
 pub use wacore::runtime::Runtime;
 pub mod send;
-pub use send::{PinDuration, RevokeType, SendOptions, SendResult};
+pub use send::{PinDuration, RevokeType, SendError, SendOptions, SendResult};
 pub use wacore::send::StanzaType;
 pub mod media;
 pub mod session;
@@ -79,21 +91,23 @@ pub mod usync;
 
 pub mod features;
 pub use features::{
-    BatchGroupResult, Blocking, BlocklistEntry, ChatActions, ChatStateType, Chatstate, Community,
-    CommunitySubgroup, Contacts, CreateCommunityOptions, CreateCommunityResult, CreateGroupResult,
-    EncryptedEdit, EventCreationParams, EventResponseType, Events, GroupCreateOptions,
-    GroupDescription, GroupJoinError, GroupMetadata, GroupParticipant, GroupParticipantOptions,
-    GroupProfilePicture, GroupSubject, GroupType, Groups, GrowthLockInfo, InviteInfoError,
-    IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult, MediaRetryResult,
-    MediaReupload, MediaReuploadRequest, MemberAddMode, MemberLinkMode, MemberShareHistoryMode,
-    MembershipApprovalMode, MembershipRequest, Mex, MexError, MexErrorExtensions, MexRequest,
-    MexResponse, Newsletter, NewsletterMessage, NewsletterMessageType, NewsletterMetadata,
+    AppStateError, BatchGroupResult, Blocking, BlockingError, BlocklistEntry, ChatActions,
+    ChatStateError, ChatStateType, Chatstate, Comments, Community, CommunityError,
+    CommunitySubgroup, ContactError, Contacts, CreateCommunityOptions, CreateCommunityResult,
+    CreateGroupResult, EncryptedEdit, EventCreationParams, EventResponseType, Events,
+    GroupCreateOptions, GroupDescription, GroupError, GroupJoinError, GroupMetadata,
+    GroupParticipant, GroupParticipantOptions, GroupProfilePicture, GroupSubject, GroupType,
+    Groups, GrowthLockInfo, InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels,
+    LinkSubgroupsResult, MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest,
+    MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
+    MembershipRequest, Mex, MexError, MexErrorExtensions, MexRequest, MexResponse, Newsletter,
+    NewsletterError, NewsletterMessage, NewsletterMessageType, NewsletterMetadata,
     NewsletterReactionCount, NewsletterRole, NewsletterState, NewsletterVerification,
-    ParticipantChangeResponse, ParticipantType, PictureType, Presence, PresenceError,
-    PresenceStatus, Profile, ProfilePicture, SecretEncKind, SecretEncrypted,
-    SetProfilePictureResponse, Signal, Status, StatusPrivacySetting, StatusSendOptions,
-    SyncActionMessageRange, TcToken, UnlinkSubgroupsResult, UserInfo, VerifiedName, group_type,
-    message_key, message_range,
+    ParticipantChangeResponse, ParticipantType, PictureType, PollError, Presence, PresenceError,
+    PresenceStatus, Profile, ProfileError, ProfilePicture, SecretEncKind, SecretEncrypted,
+    SetProfilePictureResponse, Signal, SignalError, Status, StatusPrivacySetting,
+    StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult,
+    UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
 };
 
 pub mod bot;
@@ -101,6 +115,25 @@ pub mod lid_pn_cache;
 pub mod spam_report;
 pub mod sync_task;
 pub mod version;
+
+/// One-import surface for the common bot path:
+/// `use whatsapp_rust::prelude::*;`.
+pub mod prelude {
+    pub use crate::bot::{Bot, BotBuilder, BotHandle, MessageContext};
+    pub use crate::client::{Client, ClientError};
+    pub use crate::request::IqError;
+    #[cfg(feature = "tokio-runtime")]
+    pub use crate::runtime_impl::TokioRuntime;
+    pub use crate::send::{SendError, SendOptions, SendResult};
+    #[cfg(feature = "sqlite-storage")]
+    pub use crate::store::SqliteStore;
+    pub use crate::types::events::{Event, EventKind};
+    pub use crate::types::message::MessageInfo;
+    pub use crate::{Jid, Server};
+    pub use wacore::proto_helpers::{MessageBuilderExt, MessageExt};
+    /// The protobuf namespace (`wa::Message`, `wa::message::*`).
+    pub use waproto::whatsapp as wa;
+}
 
 pub use spam_report::{SpamFlow, SpamReportRequest, SpamReportResult};
 

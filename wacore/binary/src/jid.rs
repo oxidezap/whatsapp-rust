@@ -607,18 +607,27 @@ impl Jid {
     }
 
     pub fn to_ad_string(&self) -> String {
-        if self.user.is_empty() {
-            return self.server.as_str().to_string();
-        }
         let mut s = String::with_capacity(self.user.len() + 20);
-        s.push_str(&self.user);
-        s.push('.');
-        s.push_str(itoa::Buffer::new().format(self.agent));
-        s.push(':');
-        s.push_str(itoa::Buffer::new().format(self.device));
-        s.push('@');
-        s.push_str(self.server.as_str());
+        self.push_ad_to(&mut s);
         s
+    }
+
+    /// Append the AD-string form (`user.agent:device@server`) to `buf`, for
+    /// callers that batch many JIDs into one shared buffer instead of paying
+    /// a heap `String` per JID (see `participant_list_hash`).
+    #[inline]
+    pub fn push_ad_to(&self, buf: &mut String) {
+        if self.user.is_empty() {
+            buf.push_str(self.server.as_str());
+            return;
+        }
+        buf.push_str(&self.user);
+        buf.push('.');
+        buf.push_str(itoa::Buffer::new().format(self.agent));
+        buf.push(':');
+        buf.push_str(itoa::Buffer::new().format(self.device));
+        buf.push('@');
+        buf.push_str(self.server.as_str());
     }
 
     /// Append the Display representation to `buf` using direct push operations,
@@ -838,9 +847,63 @@ pub fn push_jid_to_compact(
     write_jid!(infallible buf, user, server, agent, device);
 }
 
+/// Stack writer sized for any realistic JID, so `Display` can emit a single
+/// `write_str`: a `ToString`-backed `String` then reserves once at the exact
+/// length instead of reallocating per fragment. Overflow errors out and the
+/// caller falls back to direct fragment writes.
+struct JidStackWriter {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl JidStackWriter {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0; 64],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        // Whole `&str` fragments are appended, never split, so the bytes
+        // stay valid UTF-8.
+        std::str::from_utf8(&self.buf[..self.len]).expect("concatenated str fragments")
+    }
+}
+
+impl fmt::Write for JidStackWriter {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        if end > self.buf.len() {
+            return Err(fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+#[inline]
+fn write_jid_fallible<W: fmt::Write>(
+    w: &mut W,
+    user: &str,
+    server: Server,
+    agent: u8,
+    device: u16,
+) -> fmt::Result {
+    write_jid!(fallible w, user, server, agent, device)
+}
+
 impl fmt::Display for Jid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_jid!(fallible f, &*self.user, self.server, self.agent, self.device)
+        let mut w = JidStackWriter::new();
+        if write_jid_fallible(&mut w, &self.user, self.server, self.agent, self.device).is_ok() {
+            return f.write_str(w.as_str());
+        }
+        write_jid_fallible(f, &self.user, self.server, self.agent, self.device)
     }
 }
 
@@ -944,13 +1007,26 @@ impl fmt::Display for ObservedJid<'_> {
 
 impl<'a> fmt::Display for JidRef<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_jid!(fallible f, &*self.user, self.server, self.agent, self.device)
+        let mut w = JidStackWriter::new();
+        if write_jid_fallible(&mut w, &self.user, self.server, self.agent, self.device).is_ok() {
+            return f.write_str(w.as_str());
+        }
+        write_jid_fallible(f, &self.user, self.server, self.agent, self.device)
     }
 }
 
 impl From<Jid> for String {
     fn from(jid: Jid) -> Self {
         jid.to_string()
+    }
+}
+
+/// Lets `impl Into<Jid>` APIs accept `&Jid` transparently: borrow-callers pay
+/// one cheap clone (the user part is inline for typical numeric ids), owned
+/// callers move for free.
+impl From<&Jid> for Jid {
+    fn from(jid: &Jid) -> Self {
+        jid.clone()
     }
 }
 

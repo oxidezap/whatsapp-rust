@@ -14,6 +14,101 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 
+use crate::client::ClientError;
+use crate::features::GroupError;
+use crate::request::IqError;
+use thiserror::Error;
+
+mod actions;
+mod tctoken_lifecycle;
+
+/// Error returned by the message send path ([`Client::send_message`],
+/// [`Client::send_text`], [`Client::forward_message`], reactions, edits,
+/// revokes, pins, polls, events, comments, status) and the bot
+/// [`crate::bot::MessageContext`] helpers.
+///
+/// Wraps the shared [`ClientError`] (transport/connection/IQ) and surfaces the
+/// actionable send-time failure modes explicitly. `Internal` is the last-resort
+/// catch-all for crypto/encoding paths that still thread `anyhow` internally.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SendError {
+    /// Connection/transport/IQ failure (embeds the shared base error).
+    // No `#[from]`: the manual `From<ClientError>` impl flattens a bare `?` so
+    // `NotLoggedIn`/`Iq` stay matchable instead of nesting under `Client(..)`.
+    #[error(transparent)]
+    Client(ClientError),
+    /// The client has no PN/LID identity yet (not paired / mid LID migration).
+    #[error("client is not logged in")]
+    NotLoggedIn,
+    /// An IQ issued as part of the send (e.g. a group-info query) failed.
+    #[error("IQ request failed: {0}")]
+    Iq(#[from] IqError),
+    /// The recipient JID or send arguments are invalid for this operation
+    /// (e.g. a newsletter JID on the E2E path, an empty status recipient list).
+    #[error("invalid send request: {0}")]
+    InvalidRequest(String),
+    /// Catch-all for internal send failures (Signal encrypt, protobuf, group
+    /// resolution) that have no dedicated variant yet. Transparent so the
+    /// underlying error's `Display`/source chain is preserved.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+impl SendError {
+    /// Map an `anyhow::Error` bubbled up from a helper that still threads
+    /// `anyhow` (e.g. `send_message_impl`, `require_pn`) into a typed
+    /// `SendError`, recovering the concrete [`ClientError`]. Without this the
+    /// blanket `#[from] anyhow::Error` would funnel a logged-out
+    /// `ClientError::NotLoggedIn` into the un-matchable `Internal` catch-all.
+    pub(crate) fn from_anyhow(err: anyhow::Error) -> Self {
+        // A validation deeper in the pipeline may already be a typed `SendError`
+        // (e.g. send_message_impl's newsletter/status guards); recover it so it
+        // stays matchable instead of collapsing into `Internal`.
+        let err = match err.downcast::<SendError>() {
+            Ok(send) => return send,
+            Err(other) => other,
+        };
+        // A group-metadata IQ in the send path (e.g. query_info) bubbles up as
+        // `GroupError`; flatten it before the `ClientError` check so an IQ
+        // failure surfaces as `SendError::Iq`, not the `Internal` catch-all.
+        let err = match err.downcast::<GroupError>() {
+            Ok(group) => return group.into(),
+            Err(other) => other,
+        };
+        match err.downcast::<ClientError>() {
+            Ok(client) => client.into(),
+            Err(other) => match other.downcast::<IqError>() {
+                Ok(iq) => SendError::Iq(iq),
+                Err(other) => SendError::Internal(other),
+            },
+        }
+    }
+}
+
+impl From<ClientError> for SendError {
+    fn from(err: ClientError) -> Self {
+        match err {
+            ClientError::NotLoggedIn => SendError::NotLoggedIn,
+            ClientError::Iq(iq) => SendError::Iq(iq),
+            client => SendError::Client(client),
+        }
+    }
+}
+
+impl From<GroupError> for SendError {
+    fn from(err: GroupError) -> Self {
+        match err {
+            GroupError::Iq(iq) => SendError::Iq(iq),
+            GroupError::InvalidRequest(msg) => SendError::InvalidRequest(msg),
+            GroupError::Internal(e) => SendError::from_anyhow(e),
+            // No dedicated variant for MEX mutations; preserve the full typed
+            // error as the `Internal` source so its Display/source chain survives.
+            group @ GroupError::Mex(_) => SendError::Internal(group.into()),
+        }
+    }
+}
+
 /// Returns a `GroupInfo` whose participant list is guaranteed to contain our own
 /// sending JID, without deep-cloning the shared (cached) metadata in the common
 /// case where the server's participant list already includes us.
@@ -53,6 +148,7 @@ pub struct SendOptions {
 
 /// Result of a successfully sent message.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SendResult {
     pub message_id: String,
     pub to: Jid,
@@ -350,7 +446,6 @@ pub(crate) fn build_newsletter_edit_node(
     op: NewsletterEdit<'_>,
 ) -> Node {
     use crate::types::message::EditAttribute;
-    use prost::Message as _;
     let mut plaintext = NodeBuilder::new("plaintext");
     let (edit, stanza_type, body) = match op {
         NewsletterEdit::Edit(m) => {
@@ -360,7 +455,7 @@ pub(crate) fn build_newsletter_edit_node(
             (
                 EditAttribute::AdminEdit,
                 wacore::send::stanza_type_from_message(m),
-                m.encode_to_vec(),
+                waproto::codec::message_to_vec(m),
             )
         }
         NewsletterEdit::Revoke => (EditAttribute::AdminRevoke, "text", Vec::new()),
@@ -410,11 +505,26 @@ impl Client {
     /// For status/story updates use [`Client::status()`] instead.
     pub async fn send_message(
         &self,
-        to: Jid,
+        to: impl Into<Jid>,
         message: wa::Message,
-    ) -> Result<SendResult, anyhow::Error> {
-        self.send_message_with_options(to, message, SendOptions::default())
+    ) -> Result<SendResult, SendError> {
+        self.send_message_with_options_inner(to.into(), message, SendOptions::default())
             .await
+    }
+
+    /// Plain-text convenience over [`Client::send_message`].
+    pub async fn send_text(
+        &self,
+        to: impl Into<Jid>,
+        text: impl Into<String>,
+    ) -> Result<SendResult, SendError> {
+        use wacore::proto_helpers::MessageBuilderExt;
+        self.send_message_with_options_inner(
+            to.into(),
+            wa::Message::text(text),
+            SendOptions::default(),
+        )
+        .await
     }
 
     /// Forward an existing message to a chat.
@@ -427,22 +537,35 @@ impl Client {
     /// from the same CDN blob rather than re-uploaded.
     pub async fn forward_message(
         &self,
-        to: Jid,
+        to: impl Into<Jid>,
         message: &wa::Message,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         use wacore::proto_helpers::MessageExt;
         let body = *message.get_base_message().prepare_for_forward();
-        self.send_message(to, body).await
+        self.send_message_with_options_inner(to.into(), body, SendOptions::default())
+            .await
     }
 
     /// Send a message with additional options.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub async fn send_message_with_options(
+        &self,
+        to: impl Into<Jid>,
+        message: wa::Message,
+        options: SendOptions,
+    ) -> Result<SendResult, SendError> {
+        // Thin generic shim: the large async body below stays monomorphic so
+        // each `Into<Jid>` instantiation does not duplicate the state machine.
+        self.send_message_with_options_inner(to.into(), message, options)
+            .await
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
+    async fn send_message_with_options_inner(
         &self,
         to: Jid,
         mut message: wa::Message,
         options: SendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
         wacore::telemetry::send(match to.server {
             wacore_binary::Server::Group => "group",
@@ -463,7 +586,7 @@ impl Client {
         let stanza_type_override = options.stanza_type_override;
         let request_id = match options.message_id {
             Some(id) => id,
-            None => self.generate_message_id().await,
+            None => self.generate_message_id(),
         };
         // Both paths below consume `to` and `request_id`, so save copies for the result.
         let result = SendResult {
@@ -474,7 +597,6 @@ impl Client {
         // Newsletters are not E2E encrypted — send as plaintext via SMAX stanza.
         // Matches WA Web's OutMessagePublishNewsletterRequest + ContentType mixins.
         if to.is_newsletter() {
-            use prost::Message as _;
             let stanza_type = stanza_type_override
                 .map(StanzaType::as_wire)
                 .unwrap_or_else(|| wacore::send::stanza_type_from_message(&message));
@@ -483,7 +605,11 @@ impl Client {
             if let Some(mt) = wacore::send::media_type_from_message(&message) {
                 plaintext_builder = plaintext_builder.attr("mediatype", mt);
             }
-            let mut children = vec![plaintext_builder.bytes(message.encode_to_vec()).build()];
+            let mut children = vec![
+                plaintext_builder
+                    .bytes(waproto::codec::message_to_vec(&message))
+                    .build(),
+            ];
             children.extend(meta_node);
             children.extend(options.extra_stanza_nodes);
             let stanza = NodeBuilder::new("message")
@@ -512,7 +638,8 @@ impl Client {
             extra_nodes,
             stanza_type_override,
         )
-        .await?;
+        .await
+        .map_err(SendError::from_anyhow)?;
         Ok(result)
     }
 
@@ -531,12 +658,14 @@ impl Client {
         message: wa::Message,
         recipients: &[Jid],
         options: crate::features::status::StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         use wacore::client::context::GroupInfo;
         use wacore_binary::builder::NodeBuilder;
 
         if recipients.is_empty() {
-            return Err(anyhow!("Cannot send status with no recipients"));
+            return Err(SendError::InvalidRequest(
+                "cannot send status with no recipients".into(),
+            ));
         }
 
         // Status posts don't go through send_message_with_options, so count them here.
@@ -544,21 +673,20 @@ impl Client {
         wacore::telemetry::send("status");
 
         let to = Jid::status_broadcast();
-        let request_id = self.generate_message_id().await;
+        let request_id = self.generate_message_id();
 
-        let mut device_snapshot = self.persistence_manager.get_device_snapshot().await;
-        let account_info = device_snapshot.account.take();
-        let own_jid = device_snapshot
-            .pn
-            .take()
-            .ok_or(crate::client::ClientError::NotLoggedIn)?;
+        // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let account_info = &device_snapshot.account;
+        let own_jid = device_snapshot.pn.as_ref().ok_or(SendError::NotLoggedIn)?;
         // Status is LID-addressed (matches WA Web post-LID-migration). Without
         // a real device LID we can't sign or fan out correctly; refuse rather
         // than silently emit `addressing_mode="lid"` with a PN sender.
-        let own_lid = device_snapshot.lid.take().ok_or_else(|| {
-            anyhow!(
-                "Cannot send status: device has no LID yet. Finish pairing / LID \
+        let own_lid = device_snapshot.lid.as_ref().ok_or_else(|| {
+            SendError::InvalidRequest(
+                "cannot send status: device has no LID yet. Finish pairing / LID \
                  migration before posting status."
+                    .into(),
             )
         })?;
 
@@ -567,11 +695,10 @@ impl Client {
         // programming bug, not something to silently drop during resolution.
         for jid in recipients {
             if !(jid.is_pn() || jid.is_lid()) {
-                return Err(anyhow!(
-                    "Invalid status recipient {}: must be a user JID (PN or LID), \
-                     not a group/broadcast/newsletter/hosted/etc.",
-                    jid
-                ));
+                return Err(SendError::InvalidRequest(format!(
+                    "invalid status recipient {jid}: must be a user JID (PN or LID), \
+                     not a group/broadcast/newsletter/hosted/etc."
+                )));
             }
         }
 
@@ -591,7 +718,7 @@ impl Client {
         }
         lid_to_pn_map.insert(own_lid.user.clone(), own_jid.to_non_ad());
 
-        let participants = wacore::send::assemble_status_participants(resolved, &own_lid)?;
+        let participants = wacore::send::assemble_status_participants(resolved, own_lid)?;
         let mut group_info =
             GroupInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn_map);
 
@@ -609,10 +736,9 @@ impl Client {
             let sender_address = own_lid.to_protocol_address();
             let sender_key_name = SenderKeyName::from_parts(&to_str, sender_address.as_str());
 
-            let device_guard = device_store_arc.read().await;
             let key_exists = self
                 .signal_cache
-                .get_sender_key(&sender_key_name, &*device_guard.backend)
+                .get_sender_key(&sender_key_name, &*device_snapshot.backend)
                 .await?
                 .is_some();
 
@@ -628,7 +754,7 @@ impl Client {
         let skdm_target_devices: Option<Vec<Jid>> = if force_skdm {
             None
         } else {
-            self.resolve_skdm_targets(&to_str, &group_info, &own_lid)
+            self.resolve_skdm_targets(&to_str, &group_info, own_lid)
                 .await
                 .map(|(_all, needs)| needs)
         };
@@ -664,8 +790,8 @@ impl Client {
             &mut stores,
             self,
             &group_info,
-            &own_jid,
-            &own_lid,
+            own_jid,
+            own_lid,
             account_info.as_deref(),
             to.clone(),
             &message,
@@ -709,8 +835,8 @@ impl Client {
                         &mut stores_retry,
                         self,
                         &group_info,
-                        &own_jid,
-                        &own_lid,
+                        own_jid,
+                        own_lid,
                         account_info.as_deref(),
                         to.clone(),
                         &message,
@@ -723,7 +849,7 @@ impl Client {
                     )
                     .await?
                 } else {
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         };
@@ -780,21 +906,18 @@ impl Client {
     /// For LID mode, uses `group_info.phone_jid_for_lid_user` to query devices
     /// via PN when available (LID usync is unreliable for own JID), then
     /// converts the result back to LID. Same fallback as `prepare_group_stanza`.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
-    async fn resolve_skdm_targets(
+    /// Load (or lazily build) the per-group sender-key device map.
+    ///
+    /// Atomic get-or-init: if another task invalidated the cache during our
+    /// DB read, get_or_init's single-flight guarantee means the stale data
+    /// won't be inserted — the invalidation wins and the next caller re-inits.
+    async fn skdm_device_map(
         &self,
         group_jid: &str,
-        group_info: &wacore::client::context::GroupInfo,
-        own_sending_jid: &Jid,
-    ) -> Option<(Vec<Jid>, Vec<Jid>)> {
+    ) -> std::sync::Arc<crate::sender_key_device_cache::SenderKeyDeviceMap> {
         use crate::sender_key_device_cache::SenderKeyDeviceMap;
-
-        // Atomic get-or-init: if another task invalidated the cache during our
-        // DB read, get_or_init's single-flight guarantee means the stale data
-        // won't be inserted — the invalidation wins and the next caller re-inits.
         let pm = self.persistence_manager.clone();
-        let cached_map = self
-            .sender_key_device_cache
+        self.sender_key_device_cache
             .get_or_init(group_jid, async {
                 let db_rows = pm
                     .get_sender_key_devices(group_jid)
@@ -809,10 +932,59 @@ impl Client {
                     });
                 std::sync::Arc::new(SenderKeyDeviceMap::from_db_rows(&db_rows))
             })
-            .await;
+            .await
+    }
 
-        // No empty-cache early-exit: WA Web iterates an empty `senderKey` Map
-        // as `false` per participant, so the filter below must run unconditionally.
+    /// Filter the resolved device set down to the subset still needing SKDM.
+    ///
+    /// No empty-cache early-exit: WA Web iterates an empty `senderKey` Map
+    /// as `false` per participant, so the filter must run unconditionally.
+    fn filter_skdm_targets(
+        &self,
+        group_jid: &str,
+        all_devices: &[Jid],
+        cached_map: &crate::sender_key_device_cache::SenderKeyDeviceMap,
+        own_sending_jid: &Jid,
+    ) -> Vec<Jid> {
+        let needs_skdm: Vec<Jid> = all_devices
+            .iter()
+            .filter(|device| {
+                if device.is_hosted() {
+                    return false;
+                }
+                if device.user == own_sending_jid.user && device.device == own_sending_jid.device {
+                    return false;
+                }
+                // WA Web parity (ParticipantStore.js skDistribList): a device is
+                // warm only when it AND its primary (device 0) hold the key, so a
+                // forgotten primary redistributes the whole user while a forgotten
+                // companion redistributes only itself. One inner-map resolution
+                // per device (single user-string hash) instead of two.
+                !cached_map.device_and_primary_warm(&device.user, device.device)
+            })
+            .cloned()
+            .collect();
+
+        log::debug!(
+            "Resolved {} devices ({} need SKDM) for {}",
+            all_devices.len(),
+            needs_skdm.len(),
+            group_jid
+        );
+        needs_skdm
+    }
+
+    /// SKDM target resolution for the status path, whose `GroupInfo` is built
+    /// fresh per send (no stable identity to memoize against).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
+    async fn resolve_skdm_targets(
+        &self,
+        group_jid: &str,
+        group_info: &wacore::client::context::GroupInfo,
+        own_sending_jid: &Jid,
+    ) -> Option<(std::sync::Arc<wacore::send::ResolvedGroupDevices>, Vec<Jid>)> {
+        let cached_map = self.skdm_device_map(group_jid).await;
+
         let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
         let jids_to_resolve: Vec<Jid> = group_info
             .participants
@@ -838,35 +1010,49 @@ impl Client {
                 } else {
                     all_devices
                 };
+                let all_devices =
+                    std::sync::Arc::new(wacore::send::ResolvedGroupDevices::new(all_devices));
+                let needs_skdm = self.filter_skdm_targets(
+                    group_jid,
+                    all_devices.devices(),
+                    &cached_map,
+                    own_sending_jid,
+                );
+                Some((all_devices, needs_skdm))
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to resolve devices for SKDM check in {}: {:?}",
+                    group_jid,
+                    e
+                );
+                None
+            }
+        }
+    }
 
-                // Borrow for the filter so `all_devices` survives to feed the
-                // phash (the full set), while `needs_skdm` is just the subset
-                // still missing the key.
-                let needs_skdm: Vec<Jid> = all_devices
-                    .iter()
-                    .filter(|device| {
-                        if device.is_hosted() {
-                            return false;
-                        }
-                        if device.user == own_sending_jid.user
-                            && device.device == own_sending_jid.device
-                        {
-                            return false;
-                        }
-                        // O(1) lookups into pre-indexed cache
-                        !cached_map
-                            .device_has_key(&device.user, device.device)
-                            .unwrap_or(false)
-                            || cached_map.is_user_forgotten(&device.user)
-                    })
-                    .cloned()
-                    .collect();
-
-                log::debug!(
-                    "Resolved {} devices ({} need SKDM) for {}",
-                    all_devices.len(),
-                    needs_skdm.len(),
-                    group_jid
+    /// SKDM target resolution for cached-group sends: the full device set
+    /// comes from the per-group memo (`resolve_group_devices_memoized`), so a
+    /// warm repeat send skips the per-member registry fan-out entirely.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets_memoized", level = "debug", skip_all, fields(group = %group_jid)))]
+    async fn resolve_skdm_targets_memoized(
+        &self,
+        group: &Jid,
+        group_jid: &str,
+        group_info: &std::sync::Arc<wacore::client::context::GroupInfo>,
+        own_sending_jid: &Jid,
+    ) -> Option<(std::sync::Arc<wacore::send::ResolvedGroupDevices>, Vec<Jid>)> {
+        let cached_map = self.skdm_device_map(group_jid).await;
+        match self
+            .resolve_group_devices_memoized(group, group_info, own_sending_jid)
+            .await
+        {
+            Ok(all_devices) => {
+                let needs_skdm = self.filter_skdm_targets(
+                    group_jid,
+                    all_devices.devices(),
+                    &cached_map,
+                    own_sending_jid,
                 );
                 Some((all_devices, needs_skdm))
             }
@@ -975,7 +1161,7 @@ impl Client {
         // (WA Web: syncDeviceListJob([recipient, me]))
         if !jid.is_group() && !jid.is_status_broadcast() {
             self.invalidate_device_cache(&jid.user).await;
-            if let Some(own_pn) = &self.persistence_manager.get_device_snapshot().await.pn {
+            if let Some(own_pn) = &self.persistence_manager.get_device_snapshot().pn {
                 self.invalidate_device_cache(&own_pn.user).await;
             }
         }
@@ -997,7 +1183,7 @@ impl Client {
                 );
                 use wacore::libsignal::store::sender_key_name::SenderKeyName;
                 use wacore::types::jid::JidExt;
-                let snapshot = self.persistence_manager.get_device_snapshot().await;
+                let snapshot = self.persistence_manager.get_device_snapshot();
                 for own in snapshot.lid.iter().chain(snapshot.pn.iter()) {
                     let sk =
                         SenderKeyName::from_parts(&jid_str, own.to_protocol_address().as_str());
@@ -1027,160 +1213,6 @@ impl Client {
         Ok(wacore::send::ensure_status_participants(stanza, group_info))
     }
 
-    /// Delete a message for everyone in the chat (revoke).
-    ///
-    /// This sends a revoke protocol message that removes the message for all participants.
-    /// The message will show as "This message was deleted" for recipients.
-    ///
-    /// # Arguments
-    /// * `to` - The chat JID (DM or group)
-    /// * `message_id` - The ID of the message to delete
-    /// * `revoke_type` - Use `RevokeType::Sender` to delete your own message,
-    ///   or `RevokeType::Admin { original_sender }` to delete another user's message as group admin
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.revoke", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
-    pub async fn revoke_message(
-        &self,
-        to: Jid,
-        message_id: impl Into<String>,
-        revoke_type: RevokeType,
-    ) -> Result<(), anyhow::Error> {
-        let message_id = message_id.into();
-        self.require_pn().await?;
-
-        let (from_me, participant, edit_attr) = match &revoke_type {
-            RevokeType::Sender => {
-                // For sender revoke, participant is NOT set (from_me=true identifies it)
-                // This matches whatsmeow's BuildMessageKey behavior
-                (
-                    true,
-                    None,
-                    crate::types::message::EditAttribute::SenderRevoke,
-                )
-            }
-            RevokeType::Admin { original_sender } => {
-                // Admin revoke requires group context
-                if !to.is_group() {
-                    return Err(anyhow!("Admin revoke is only valid for group chats"));
-                }
-                // The protocolMessageKey.participant should match the original message's key exactly
-                // Do NOT convert LID to PN - pass through unchanged like WhatsApp Web does
-                let participant_str = original_sender.to_non_ad_string();
-                log::debug!(
-                    "Admin revoke: using participant {} for MessageKey",
-                    participant_str
-                );
-                (
-                    false,
-                    Some(participant_str),
-                    crate::types::message::EditAttribute::AdminRevoke,
-                )
-            }
-        };
-
-        let revoke_message = build_revoke_message(&to, from_me, message_id, participant);
-
-        // The revoke message stanza needs a NEW unique ID, not the message ID being revoked
-        // The message_id being revoked is already in protocolMessage.key.id
-        // Passing None generates a fresh stanza ID
-        //
-        // For admin revokes, force SKDM distribution to get the proper message structure
-        // with phash, <participants>, and <device-identity> that WhatsApp Web uses
-        let force_skdm = matches!(revoke_type, RevokeType::Admin { .. });
-        self.send_message_impl(
-            to,
-            &revoke_message,
-            None,
-            false,
-            force_skdm,
-            Some(edit_attr),
-            vec![],
-            None,
-        )
-        .await
-    }
-
-    /// Keep (or un-keep) a message in a disappearing chat for everyone.
-    ///
-    /// Sends a `keepInChatMessage` add-on (WA Web `WAWebKeepInChatMsgAction`):
-    /// `keep = true` requests `KEEP_FOR_ALL`, `keep = false` requests
-    /// `UNDO_KEEP_FOR_ALL`. `key` is the target (kept) message's key; the keep
-    /// message itself is sent with a fresh id. The send path classifies this as a
-    /// text add-on and maps the undo case to a sender-revoke edit attribute.
-    pub async fn keep_message(
-        &self,
-        chat: Jid,
-        key: wa::MessageKey,
-        keep: bool,
-    ) -> Result<SendResult, anyhow::Error> {
-        let message = wacore::proto_helpers::build_keep_in_chat_message(
-            key,
-            keep,
-            wacore::time::now_millis(),
-        );
-        self.send_message(chat, message).await
-    }
-
-    /// Pin a message in a chat for all participants.
-    pub async fn pin_message(
-        &self,
-        chat: Jid,
-        key: wa::MessageKey,
-        duration: PinDuration,
-    ) -> Result<(), anyhow::Error> {
-        self.send_pin(
-            chat,
-            key,
-            wa::message::pin_in_chat_message::Type::PinForAll,
-            duration.as_secs(),
-        )
-        .await
-    }
-
-    /// Unpin a previously pinned message.
-    pub async fn unpin_message(&self, chat: Jid, key: wa::MessageKey) -> Result<(), anyhow::Error> {
-        self.send_pin(
-            chat,
-            key,
-            wa::message::pin_in_chat_message::Type::UnpinForAll,
-            0,
-        )
-        .await
-    }
-
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.pin", level = "debug", skip_all, fields(chat = %chat.observe()), err(Debug)))]
-    async fn send_pin(
-        &self,
-        chat: Jid,
-        key: wa::MessageKey,
-        pin_type: wa::message::pin_in_chat_message::Type,
-        duration_secs: u32,
-    ) -> Result<(), anyhow::Error> {
-        let message = wa::Message {
-            pin_in_chat_message: Some(wa::message::PinInChatMessage {
-                key: Some(key),
-                r#type: Some(pin_type as i32),
-                sender_timestamp_ms: Some(wacore::time::now_millis()),
-            }),
-            message_context_info: Some(wa::MessageContextInfo {
-                message_add_on_duration_in_secs: Some(duration_secs),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        self.send_message_impl(
-            chat,
-            &message,
-            None,
-            false,
-            false,
-            Some(crate::types::message::EditAttribute::PinInChat),
-            vec![],
-            None,
-        )
-        .await
-    }
-
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.impl", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_message_impl(
@@ -1200,10 +1232,12 @@ impl Client {
         // / revoke_message). A newsletter JID here is a mis-routed pin/edit/revoke
         // (pin is not a channel op), so reject it.
         if to.is_newsletter() {
-            return Err(anyhow!(
+            return Err(SendError::InvalidRequest(
                 "newsletter JIDs are not valid on the E2E send path; use \
                  newsletter().edit_message/revoke_message (pin is unsupported on channels)"
-            ));
+                    .into(),
+            )
+            .into());
         }
 
         // status@broadcast reactions fan out pairwise to the author's devices;
@@ -1217,10 +1251,11 @@ impl Client {
                 .and_then(|p| p.parse::<Jid>().ok())
                 .filter(|jid| jid.is_pn() || jid.is_lid())
                 .ok_or_else(|| {
-                    anyhow!(
+                    SendError::InvalidRequest(
                         "send_message to status@broadcast requires \
                          reaction_message.key.participant = status author (user JID). \
                          Use client.status() for posting new statuses."
+                            .into(),
                     )
                 })?;
             (author, true)
@@ -1231,7 +1266,7 @@ impl Client {
         // Generate request ID early (doesn't need lock)
         let request_id = match request_id_override {
             Some(id) => id,
-            None => self.generate_message_id().await,
+            None => self.generate_message_id(),
         };
         // `request_id` is moved into the branch-specific stanza builders below;
         // keep a copy for the post-send messageSecret persistence (the secret
@@ -1269,7 +1304,7 @@ impl Client {
 
             let mut store_adapter = self.signal_adapter().await;
 
-            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
             wacore::send::prepare_peer_stanza(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
@@ -1285,15 +1320,16 @@ impl Client {
             // sender-key chain advance per (group, sender) at the cipher.
             let group_info = self.groups().query_info(&to).await?;
 
-            let mut device_snapshot = self.persistence_manager.get_device_snapshot().await;
-            let account_info = device_snapshot.account.take();
+            // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
+            let account_info = &device_snapshot.account;
             let own_jid = device_snapshot
                 .pn
-                .take()
+                .as_ref()
                 .ok_or(crate::client::ClientError::NotLoggedIn)?;
             let own_lid = device_snapshot
                 .lid
-                .take()
+                .as_ref()
                 .ok_or_else(|| anyhow!("LID not set, cannot send to group"))?;
 
             // Store serialized message bytes for retry (lightweight)
@@ -1307,6 +1343,11 @@ impl Client {
                 crate::types::message::AddressingMode::Pn => (own_jid.clone(), "pn"),
             };
 
+            // Memo identity must be the CACHED Arc: ensure_self_in_group clones
+            // a fresh GroupInfo whenever self is absent from the snapshot, which
+            // would make the memo miss on every send to such groups. The memoized
+            // resolver applies the same self-append internally.
+            let group_info_for_memo = std::sync::Arc::clone(&group_info);
             // resolve_skdm_targets and prepare_group_stanza both read the
             // participant list and expect self to be present.
             let group_info = ensure_self_in_group(group_info, &own_sending_jid);
@@ -1316,10 +1357,9 @@ impl Client {
                 let sender_address = own_sending_jid.to_protocol_address();
                 let sender_key_name = SenderKeyName::from_parts(&to_str, sender_address.as_str());
 
-                let device_guard = device_store_arc.read().await;
                 let record = self
                     .signal_cache
-                    .get_sender_key(&sender_key_name, &*device_guard.backend)
+                    .get_sender_key(&sender_key_name, &*device_snapshot.backend)
                     .await?;
                 let key_exists = record.is_some();
 
@@ -1335,7 +1375,6 @@ impl Client {
                     .and_then(|state| state.sender_chain_key())
                     .map(|ck| ck.iteration())
                     .is_some_and(|iter| iter >= SENDER_KEY_ROTATION_THRESHOLD);
-                drop(device_guard);
 
                 if needs_rotation {
                     log::info!(
@@ -1369,26 +1408,33 @@ impl Client {
             // phash on every group send); `skdm_target_devices` is the subset
             // still missing the key. On the cold/`force_skdm` path both are
             // `None` and `prepare_group_stanza` resolves the set itself.
-            let (all_devices_for_phash, skdm_target_devices): (Option<Vec<Jid>>, Option<Vec<Jid>>) =
-                if force_skdm {
-                    (None, None)
-                } else {
-                    match self
-                        .resolve_skdm_targets(&to_str, &group_info, &own_sending_jid)
-                        .await
-                    {
-                        Some((all, needs)) => (Some(all), Some(needs)),
-                        None => (None, None),
-                    }
-                };
+            let (all_devices_for_phash, skdm_target_devices): (
+                Option<std::sync::Arc<wacore::send::ResolvedGroupDevices>>,
+                Option<Vec<Jid>>,
+            ) = if force_skdm {
+                (None, None)
+            } else {
+                match self
+                    .resolve_skdm_targets_memoized(
+                        &to,
+                        &to_str,
+                        &group_info_for_memo,
+                        &own_sending_jid,
+                    )
+                    .await
+                {
+                    Some((all, needs)) => (Some(all), Some(needs)),
+                    None => (None, None),
+                }
+            };
 
             match wacore::send::prepare_group_stanza(
                 &*self.runtime,
                 &mut stores,
                 self,
                 &group_info,
-                &own_jid,
-                &own_lid,
+                own_jid,
+                own_lid,
                 account_info.as_deref(),
                 to.clone(),
                 message,
@@ -1438,8 +1484,8 @@ impl Client {
                             &mut stores_retry,
                             self,
                             &group_info,
-                            &own_jid,
-                            &own_lid,
+                            own_jid,
+                            own_lid,
                             account_info.as_deref(),
                             to,
                             message,
@@ -1478,7 +1524,7 @@ impl Client {
                 self.add_recent_message(&to, &request_id, message).await;
             }
 
-            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
             let own_jid = device_snapshot
                 .pn
                 .as_ref()
@@ -1789,14 +1835,9 @@ impl Client {
             expires_at,
             message_ts: now,
         };
-        if let Err(e) = self
-            .persistence_manager
-            .backend()
-            .put_msg_secrets(vec![entry])
-            .await
-        {
-            log::warn!("Failed to persist outbound messageSecret for {msg_id}: {e:?}");
-        }
+        // Same write-behind buffer as inbound captures: visible immediately,
+        // flushed off the send path (msmsg replies read buffer-first).
+        self.msg_secret_buffer.queue(vec![entry]).await;
     }
 
     /// Decide the identity (LID vs PN) under which an outbound DM's
@@ -1804,333 +1845,9 @@ impl Client {
     /// `PreparedGroupStanza.sender_identity` directly instead of this.
     pub(crate) async fn dm_sender_identity_for(&self, to: &Jid) -> Option<Jid> {
         if to.server == wacore_binary::Server::Bot {
-            self.get_lid().await
+            self.get_lid()
         } else {
-            self.get_pn().await
-        }
-    }
-
-    /// Look up and include a privacy token in outgoing 1:1 message stanza nodes.
-    ///
-    /// Follows WA Web's fallback chain (MsgCreateFanoutStanza.js):
-    ///   1. tctoken — from stored trusted contact token (if valid, non-expired)
-    ///   2. cstoken — HMAC-SHA256(nct_salt, recipient_lid) fallback for first-contact
-    ///   3. No token — message sent without token (server may return 463)
-    ///
-    /// Returns whether we should issue a new tc token after send, and the cache key
-    /// of the attached valid tc token when that token should be marked as used.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.maybe_tc_token", level = "debug", skip_all, fields(to = %to.observe())))]
-    async fn maybe_include_tc_token(
-        &self,
-        to: &Jid,
-        extra_nodes: &mut Vec<Node>,
-    ) -> (bool, Option<String>) {
-        use wacore::iq::abprops::web;
-        use wacore::iq::tctoken::{
-            build_cs_token_node, build_tc_token_node, compute_cs_token, is_tc_token_expired_with,
-            should_send_new_tc_token_with,
-        };
-
-        // Skip for own JID — no need to send privacy token to ourselves
-        let snapshot = self.persistence_manager.get_device_snapshot().await;
-        let is_self = snapshot
-            .pn
-            .as_ref()
-            .is_some_and(|pn| pn.is_same_user_as(to))
-            || snapshot
-                .lid
-                .as_ref()
-                .is_some_and(|lid| lid.is_same_user_as(to));
-        if is_self {
-            return (false, None);
-        }
-
-        // Bots and status broadcast don't participate in the privacy token system
-        if to.is_bot() || to.is_status_broadcast() {
-            return (false, None);
-        }
-
-        // Resolve the destination to a LID user string once — reused for
-        // tctoken lookup, issuance, and cstoken HMAC input.
-        let cached_lid = if to.is_lid() {
-            None
-        } else {
-            self.lid_pn_cache.get_current_lid(&to.user).await
-        };
-        let resolved_lid_user: Option<&str> = if to.is_lid() {
-            Some(&to.user)
-        } else {
-            cached_lid.as_deref()
-        };
-        let token_jid: &str = resolved_lid_user.unwrap_or(&to.user);
-
-        let backend = self.persistence_manager.backend();
-        let tc_config = self.tc_token_config().await;
-
-        // Look up existing tctoken
-        let existing = match backend.get_tc_token(token_jid).await {
-            Ok(entry) => entry,
-            Err(e) => {
-                log::warn!(target: "Client/TcToken", "Failed to get tc_token for {}: {e}", token_jid);
-                None
-            }
-        };
-
-        // Issuance scheduling is independent of the AB prop — WA Web's sendTcToken
-        // in MsgJob.js fires regardless of whether a token was attached to the stanza
-        let should_issue_after_send = should_send_new_tc_token_with(
-            existing.as_ref().and_then(|entry| entry.sender_timestamp),
-            &tc_config,
-        );
-
-        // AB prop gates stanza inclusion only (not issuance scheduling)
-        let token_send_enabled = self
-            .ab_props
-            .is_enabled(web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES)
-            .await;
-
-        if token_send_enabled {
-            match existing {
-                Some(ref entry)
-                    if !is_tc_token_expired_with(entry.token_timestamp, &tc_config)
-                        && !entry.token.is_empty() =>
-                {
-                    extra_nodes.push(build_tc_token_node(&entry.token));
-                    return (should_issue_after_send, Some(token_jid.to_string()));
-                }
-                _ => {
-                    // cstoken fallback — gated by wa_nct_token_send_enabled
-                    let nct_send_enabled = self
-                        .ab_props
-                        .is_enabled(web::WA_NCT_TOKEN_SEND_ENABLED)
-                        .await;
-
-                    if nct_send_enabled
-                        && let Some(salt) = &snapshot.nct_salt
-                        && let Some(lid_user) = &resolved_lid_user
-                    {
-                        // HMAC input is "user@lid" (account LID without device suffix),
-                        // matching WA Web's accountLid.toString()
-                        let recipient_lid =
-                            wacore_binary::Jid::new(*lid_user, Server::Lid).to_string();
-                        let cs_token = compute_cs_token(salt, &recipient_lid);
-                        extra_nodes.push(build_cs_token_node(&cs_token));
-                        log::debug!(target: "Client/CsToken", "Attached cstoken for {} (NCT fallback)", to.observe());
-                    } else {
-                        log::debug!(target: "Client/CsToken", "No tctoken or NCT salt/LID available for {}", to.observe());
-                    }
-                }
-            }
-        }
-
-        (should_issue_after_send, None)
-    }
-
-    /// Returns `true` if the issuance IQ succeeded.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.issue_tc_token", level = "debug", skip_all, fields(to = %to.observe())))]
-    async fn issue_tc_token_after_send(&self, to: &Jid) -> bool {
-        use wacore::iq::tctoken::IssuePrivacyTokensSpec;
-
-        // Bots and status broadcast don't participate in the privacy token system
-        if to.is_bot() || to.is_status_broadcast() {
-            return false;
-        }
-
-        let issuance_jid = self.resolve_issuance_jid(to).await;
-        let Ok(response) = self
-            .execute(IssuePrivacyTokensSpec::new(std::slice::from_ref(
-                &issuance_jid,
-            )))
-            .await
-        else {
-            log::debug!(target: "Client/TcToken", "Failed to issue tc_token for {}", issuance_jid.observe());
-            return false;
-        };
-
-        self.store_issued_tc_tokens(&response.tokens).await
-    }
-
-    /// Returns true if at least one token was persisted.
-    pub(crate) async fn store_issued_tc_tokens(
-        &self,
-        tokens: &[wacore::iq::tctoken::ReceivedTcToken],
-    ) -> bool {
-        use wacore::store::traits::TcTokenEntry;
-
-        if tokens.is_empty() {
-            return false;
-        }
-
-        let backend = self.persistence_manager.backend();
-        let now = wacore::time::now_secs();
-        let mut any_stored = false;
-        for received in tokens {
-            if received.token.is_empty() {
-                log::warn!(target: "Client/TcToken", "Server returned empty tc_token for {}, skipping", received.jid.observe());
-                continue;
-            }
-
-            let entry = TcTokenEntry {
-                token: received.token.clone(),
-                token_timestamp: received.timestamp,
-                sender_timestamp: Some(now),
-            };
-
-            if let Err(e) = backend.put_tc_token(&received.jid.user, &entry).await {
-                log::warn!(target: "Client/TcToken", "Failed to store issued tc_token: {e}");
-            } else {
-                any_stored = true;
-            }
-        }
-        any_stored
-    }
-
-    /// Variant of [`store_issued_tc_tokens`] that preserves the original
-    /// sender_timestamp for identity-change re-issuance (bucket continuity).
-    async fn store_issued_tc_tokens_with_sender_ts(
-        &self,
-        tokens: &[wacore::iq::tctoken::ReceivedTcToken],
-        sender_ts: i64,
-    ) {
-        use wacore::store::traits::TcTokenEntry;
-
-        let backend = self.persistence_manager.backend();
-        for received in tokens {
-            if received.token.is_empty() {
-                continue;
-            }
-            let entry = TcTokenEntry {
-                token: received.token.clone(),
-                token_timestamp: received.timestamp,
-                sender_timestamp: Some(sender_ts),
-            };
-            if let Err(e) = backend.put_tc_token(&received.jid.user, &entry).await {
-                log::warn!(target: "Client/TcToken", "Failed to store re-issued tc_token: {e}");
-            }
-        }
-    }
-
-    async fn mark_tc_token_used_after_send(&self, token_key: &str) {
-        use wacore::store::traits::TcTokenEntry;
-
-        let backend = self.persistence_manager.backend();
-        let existing = match backend.get_tc_token(token_key).await {
-            Ok(entry) => entry,
-            Err(e) => {
-                log::warn!(target: "Client/TcToken", "Failed to reload tc_token for {}: {e}", token_key);
-                return;
-            }
-        };
-
-        let Some(entry) = existing else {
-            return;
-        };
-        if entry.token.is_empty() {
-            return;
-        }
-
-        let updated_entry = TcTokenEntry {
-            sender_timestamp: Some(wacore::time::now_secs()),
-            ..entry
-        };
-        if let Err(e) = backend.put_tc_token(token_key, &updated_entry).await {
-            log::warn!(target: "Client/TcToken", "Failed to update sender_timestamp for {}: {e}", token_key);
-        }
-    }
-
-    /// Re-issue tctoken after a contact's device identity changes.
-    /// Only re-issues if we previously sent a token (sender_timestamp valid).
-    /// Uses session_locks to deduplicate concurrent spawns for the same sender.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.reissue_tc_token", level = "debug", skip_all, fields(sender = %sender.observe())))]
-    pub(crate) async fn reissue_tc_token_after_identity_change(&self, sender: &Jid) {
-        use wacore::iq::tctoken::{IssuePrivacyTokensSpec, is_sender_tc_token_expired};
-
-        // Dedup via session_locks — bare JID won't collide with protocol addresses ("user:device")
-        let bare = sender.to_non_ad_string();
-        let mutex = self.session_lock_for(&bare).await;
-        let Some(_guard) = mutex.try_lock() else {
-            return;
-        };
-
-        let resolved_lid = if sender.is_lid() {
-            None
-        } else {
-            self.lid_pn_cache.get_current_lid(&sender.user).await
-        };
-        let token_jid: &str = resolved_lid.as_deref().unwrap_or(&sender.user);
-
-        let backend = self.persistence_manager.backend();
-        let entry = match backend.get_tc_token(token_jid).await {
-            Ok(Some(e)) => e,
-            _ => return,
-        };
-
-        let Some(sender_ts) = entry.sender_timestamp else {
-            return;
-        };
-
-        // Sender-side expiration (may use different bucket config than receiver)
-        let tc_config = self.tc_token_config().await;
-        if is_sender_tc_token_expired(sender_ts, &tc_config) {
-            return;
-        }
-
-        // Use stored sender_ts so the bucket window isn't advanced
-        let issuance_jid = self.resolve_issuance_jid(sender).await;
-        match self
-            .execute(IssuePrivacyTokensSpec::with_timestamp(
-                std::slice::from_ref(&issuance_jid),
-                sender_ts,
-            ))
-            .await
-        {
-            Ok(response) => {
-                // Keep original sender_ts so the bucket window isn't advanced
-                self.store_issued_tc_tokens_with_sender_ts(&response.tokens, sender_ts)
-                    .await;
-                log::debug!(
-                    target: "Client/TcToken",
-                    "Re-issued tctoken after identity change for {}",
-                    sender.observe()
-                );
-            }
-            Err(e) => {
-                log::debug!(
-                    target: "Client/TcToken",
-                    "Failed to re-issue tctoken after identity change for {}: {e}",
-                    sender.observe()
-                );
-            }
-        }
-    }
-
-    /// Look up a valid (non-expired) tctoken for a JID. Returns the raw token bytes if found.
-    ///
-    /// Used by profile picture, presence subscribe, and other features that need tctoken gating.
-    pub(crate) async fn lookup_tc_token_for_jid(&self, jid: &Jid) -> Option<Vec<u8>> {
-        use wacore::iq::tctoken::is_tc_token_expired_with;
-
-        let resolved_lid = if jid.is_lid() {
-            None
-        } else {
-            self.lid_pn_cache.get_current_lid(&jid.user).await
-        };
-        let token_jid: &str = resolved_lid.as_deref().unwrap_or(&jid.user);
-
-        let tc_config = self.tc_token_config().await;
-        let backend = self.persistence_manager.backend();
-        match backend.get_tc_token(token_jid).await {
-            Ok(Some(entry))
-                if !entry.token.is_empty()
-                    && !is_tc_token_expired_with(entry.token_timestamp, &tc_config) =>
-            {
-                Some(entry.token)
-            }
-            Ok(_) => None,
-            Err(e) => {
-                log::warn!(target: "Client/TcToken", "Failed to get tc_token for {}: {e}", token_jid);
-                None
-            }
+            self.get_pn()
         }
     }
 
@@ -2160,59 +1877,6 @@ impl Client {
             mutexes.push(self.session_lock_for(&buf).await);
         }
         mutexes
-    }
-
-    /// Build tctoken timing config from AB props, falling back to defaults.
-    pub(crate) async fn tc_token_config(&self) -> wacore::iq::tctoken::TcTokenConfig {
-        use wacore::iq::abprops::web;
-        use wacore::iq::tctoken::TcTokenConfig;
-
-        TcTokenConfig {
-            bucket_duration: self.ab_props.get_int(web::TCTOKEN_DURATION).await,
-            num_buckets: self.ab_props.get_int(web::TCTOKEN_NUM_BUCKETS).await,
-            sender_bucket_duration: self.ab_props.get_int(web::TCTOKEN_DURATION_SENDER).await,
-            sender_num_buckets: self.ab_props.get_int(web::TCTOKEN_NUM_BUCKETS_SENDER).await,
-        }
-        .clamped()
-    }
-
-    /// Resolve a JID to its LID form for tc_token storage.
-    async fn resolve_to_lid_jid(&self, jid: &Jid) -> Jid {
-        if jid.is_lid() {
-            return jid.to_non_ad();
-        }
-
-        if let Some(lid_user) = self.lid_pn_cache.get_current_lid(&jid.user).await {
-            Jid::new(lid_user, Server::Lid)
-        } else {
-            jid.to_non_ad()
-        }
-    }
-
-    /// Resolve the target JID for privacy token issuance.
-    /// Gated by `lid_trusted_token_issue_to_lid` — LID when true, PN when false.
-    async fn resolve_issuance_jid(&self, jid: &Jid) -> Jid {
-        use wacore::iq::abprops::web;
-
-        // Matches the upstream default (false); the server overrides per-account.
-        let issue_to_lid = self
-            .ab_props
-            .is_enabled(web::LID_TRUSTED_TOKEN_ISSUE_TO_LID)
-            .await;
-
-        let resolved = if issue_to_lid {
-            self.resolve_to_lid_jid(jid).await
-        } else if jid.is_lid() {
-            if let Some(pn) = self.lid_pn_cache.get_phone_number(&jid.user).await {
-                Jid::new(&pn, Server::Pn)
-            } else {
-                jid.to_non_ad()
-            }
-        } else {
-            jid.to_non_ad()
-        };
-        // Issuance targets bare account JIDs, not device-scoped ones
-        resolved.into_non_ad()
     }
 }
 
@@ -2284,6 +1948,30 @@ mod tests {
         );
     }
 
+    // A logged-out send goes through send_message_impl, whose internal
+    // `ClientError::NotLoggedIn` is threaded as `anyhow`. The wrapper must
+    // surface the typed `SendError::NotLoggedIn`, not the `Internal` catch-all,
+    // so callers can match it (regression test for r3432644890).
+    #[tokio::test]
+    async fn send_message_logged_out_dm_returns_not_logged_in() {
+        let client = crate::test_utils::create_test_client().await;
+        let to: Jid = "111111111111@s.whatsapp.net".parse().unwrap();
+        let err = client
+            .send_message(
+                to,
+                wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("logged-out DM send must error");
+        assert!(
+            matches!(err, SendError::NotLoggedIn),
+            "expected SendError::NotLoggedIn, got: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn send_message_to_status_reaction_rejects_non_user_participant() {
         let client = crate::test_utils::create_test_client().await;
@@ -2292,7 +1980,7 @@ mod tests {
             .send_message(
                 to,
                 wa::Message {
-                    reaction_message: Some(wa::message::ReactionMessage {
+                    reaction_message: Some(Box::new(wa::message::ReactionMessage {
                         key: Some(wa::MessageKey {
                             remote_jid: Some("status@broadcast".into()),
                             from_me: Some(false),
@@ -2302,7 +1990,7 @@ mod tests {
                         text: Some("❤️".into()),
                         sender_timestamp_ms: Some(1),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -2322,7 +2010,7 @@ mod tests {
             .send_message(
                 to,
                 wa::Message {
-                    reaction_message: Some(wa::message::ReactionMessage {
+                    reaction_message: Some(Box::new(wa::message::ReactionMessage {
                         key: Some(wa::MessageKey {
                             remote_jid: Some("status@broadcast".into()),
                             from_me: Some(false),
@@ -2332,7 +2020,7 @@ mod tests {
                         text: Some("❤️".into()),
                         sender_timestamp_ms: Some(1),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -2817,7 +2505,6 @@ mod tests {
 
         let map = SenderKeyDeviceMap::from_db_rows(&[]);
         assert_eq!(map.device_has_key("271060335329480", 0), None);
-        assert!(!map.is_user_forgotten("271060335329480"));
 
         let all_resolved_devices: Vec<Jid> = [
             "271060335329480@lid",
@@ -2833,7 +2520,7 @@ mod tests {
             .filter(|device| {
                 !map.device_has_key(&device.user, device.device)
                     .unwrap_or(false)
-                    || map.is_user_forgotten(&device.user)
+                    || !map.device_has_key(&device.user, 0).unwrap_or(false)
             })
             .collect();
 
@@ -2867,7 +2554,7 @@ mod tests {
             };
             client
                 .device_registry_cache
-                .insert((*user).into(), Arc::new(record))
+                .raw_insert_for_tests((*user).into(), Arc::new(record))
                 .await;
         }
 
@@ -2886,10 +2573,10 @@ mod tests {
         // Empty cache → every participant needs SKDM, and the full set equals
         // the target set on this cold path.
         assert_eq!(needs_skdm.len(), participants.len());
-        assert_eq!(all_devices.len(), participants.len());
+        assert_eq!(all_devices.devices().len(), participants.len());
         for user in &participant_users {
             assert!(needs_skdm.iter().any(|j| j.user == *user));
-            assert!(all_devices.iter().any(|j| j.user == *user));
+            assert!(all_devices.devices().iter().any(|j| j.user == *user));
         }
     }
 
@@ -2899,7 +2586,6 @@ mod tests {
 
         let map = SenderKeyDeviceMap::from_db_rows(&[("271060335329480@lid".to_string(), false)]);
         assert_eq!(map.device_has_key("271060335329480", 0), Some(false));
-        assert!(map.is_user_forgotten("271060335329480"));
 
         let all_resolved_devices: Vec<Jid> = [
             "271060335329480@lid",
@@ -2915,7 +2601,7 @@ mod tests {
             .filter(|device| {
                 !map.device_has_key(&device.user, device.device)
                     .unwrap_or(false)
-                    || map.is_user_forgotten(&device.user)
+                    || !map.device_has_key(&device.user, 0).unwrap_or(false)
             })
             .collect();
 
@@ -2924,6 +2610,56 @@ mod tests {
             3,
             "after retry inserts one row, ALL devices correctly flagged for SKDM \
              (this is what unblocks redistribution on the SECOND message)"
+        );
+    }
+
+    /// WA Web primary-device gate (ParticipantStore.js): a companion is warm only
+    /// when it AND its primary (device 0) hold the key. A forgotten companion
+    /// redistributes only itself (no per-user amplification); a forgotten primary
+    /// redistributes the whole user. Drives the real `filter_skdm_targets`.
+    #[tokio::test]
+    async fn filter_skdm_targets_uses_primary_device_gate() {
+        use crate::sender_key_device_cache::SenderKeyDeviceMap;
+
+        let client = crate::test_utils::create_test_client().await;
+        let group = "120363161500776365@g.us";
+        let own = Jid::from_str("999999999999999:1@lid").unwrap();
+
+        // Companion forgotten, primary warm: only the companion redistributes.
+        let map = SenderKeyDeviceMap::from_db_rows(&[
+            ("100100100100100@lid".to_string(), true),
+            ("100100100100100:5@lid".to_string(), false),
+        ]);
+        let devices = [
+            Jid::from_str("100100100100100@lid").unwrap(),
+            Jid::from_str("100100100100100:5@lid").unwrap(),
+        ];
+        let needs = client.filter_skdm_targets(group, &devices, &map, &own);
+        assert_eq!(needs.len(), 1, "warm primary keeps the keyed companion out");
+        assert_eq!(needs[0].device, 5);
+
+        // Primary forgotten, companion warm: the whole user redistributes (WA Web
+        // marks a companion cold when its primary is cold).
+        let map = SenderKeyDeviceMap::from_db_rows(&[
+            ("200200200200200@lid".to_string(), false),
+            ("200200200200200:5@lid".to_string(), true),
+        ]);
+        let devices = [
+            Jid::from_str("200200200200200@lid").unwrap(),
+            Jid::from_str("200200200200200:5@lid").unwrap(),
+        ];
+        let needs = client.filter_skdm_targets(group, &devices, &map, &own);
+        assert_eq!(needs.len(), 2, "cold primary redistributes the whole user");
+
+        // Companion warm but the primary row is absent (None): WA Web's `?? false`
+        // treats a missing primary as cold, so the companion still redistributes.
+        let map = SenderKeyDeviceMap::from_db_rows(&[("300300300300300:5@lid".to_string(), true)]);
+        let devices = [Jid::from_str("300300300300300:5@lid").unwrap()];
+        let needs = client.filter_skdm_targets(group, &devices, &map, &own);
+        assert_eq!(
+            needs.len(),
+            1,
+            "absent primary is cold, companion redistributes"
         );
     }
 
@@ -2974,7 +2710,7 @@ mod tests {
         #[test]
         fn pin_returns_edit_attribute() {
             let msg = wa::Message {
-                pin_in_chat_message: Some(wa::message::PinInChatMessage::default()),
+                pin_in_chat_message: Some(Box::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3093,10 +2829,10 @@ mod tests {
         #[test]
         fn poll_vote_returns_meta_node() {
             let msg = wa::Message {
-                poll_update_message: Some(wa::message::PollUpdateMessage {
+                poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
                     vote: Some(wa::message::PollEncValue::default()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3137,7 +2873,7 @@ mod tests {
         #[test]
         fn event_response_returns_meta_node() {
             let msg = wa::Message {
-                enc_event_response_message: Some(Default::default()),
+                enc_event_response_message: Some(Box::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3154,10 +2890,10 @@ mod tests {
         #[test]
         fn poll_update_without_vote_returns_none() {
             let msg = wa::Message {
-                poll_update_message: Some(wa::message::PollUpdateMessage {
+                poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
                     vote: None,
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3168,10 +2904,10 @@ mod tests {
         #[test]
         fn revoked_reaction_returns_sender_revoke() {
             let msg = wa::Message {
-                reaction_message: Some(wa::message::ReactionMessage {
+                reaction_message: Some(Box::new(wa::message::ReactionMessage {
                     text: Some(String::new()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -3181,14 +2917,14 @@ mod tests {
         #[test]
         fn keep_in_chat_undo_returns_sender_revoke() {
             let msg = wa::Message {
-                keep_in_chat_message: Some(wa::message::KeepInChatMessage {
+                keep_in_chat_message: Some(Box::new(wa::message::KeepInChatMessage {
                     key: Some(wa::MessageKey {
                         from_me: Some(true),
                         ..Default::default()
                     }),
                     keep_type: Some(wa::KeepType::UndoKeepForAll as i32),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -3198,12 +2934,12 @@ mod tests {
         #[test]
         fn secret_encrypted_message_edit_returns_message_edit() {
             let msg = wa::Message {
-                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                     secret_enc_type: Some(
                         wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
                     ),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -3215,12 +2951,12 @@ mod tests {
             // EVENT_EDIT is the one case where the edit attribute AND the
             // meta node both fire: `event_type=edit` meta + `edit="1"` attr.
             let msg = wa::Message {
-                secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+                secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                     secret_enc_type: Some(
                         wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32,
                     ),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -4452,6 +4188,7 @@ mod tests {
                 wacore::msg_secret::RetentionClass::Text,
             )
             .await;
+        client.msg_secret_buffer.wait_flushed().await;
         let got = client
             .persistence_manager
             .backend()
@@ -4479,6 +4216,7 @@ mod tests {
                 wacore::msg_secret::RetentionClass::Text,
             )
             .await;
+        client.msg_secret_buffer.wait_flushed().await;
         let got = client
             .persistence_manager
             .backend()
@@ -4560,6 +4298,7 @@ mod tests {
                 wacore::msg_secret::RetentionClass::Text,
             )
             .await;
+        client.msg_secret_buffer.wait_flushed().await;
         let got = client
             .persistence_manager
             .backend()
@@ -4620,5 +4359,66 @@ mod tests {
             message_secret: Some(result.message_secret),
         };
         assert_eq!(prepared.message_secret.as_ref().unwrap().len(), 32);
+    }
+}
+
+#[cfg(test)]
+mod jid_into_convention {
+    use super::*;
+
+    /// Compile-time guard for the `impl Into<Jid>` convention: every core
+    /// method must accept BOTH an owned `Jid` (move, zero copy) and a `&Jid`
+    /// (one clone via `From<&Jid>`). Never executed; compilation is the test.
+    #[allow(dead_code)]
+    async fn both_call_styles_compile(client: &crate::client::Client, jid: Jid) {
+        let msg = wa::Message::default();
+        let _ = client.send_message(&jid, msg.clone()).await;
+        let _ = client
+            .send_message_with_options(&jid, msg.clone(), SendOptions::default())
+            .await;
+        let _ = client.forward_message(&jid, &msg).await;
+        let _ = client
+            .edit_message(&jid, "ID", wa::Message::default())
+            .await;
+        let _ = client.revoke_message(&jid, "ID", RevokeType::Sender).await;
+        let _ = client
+            .pin_message(&jid, wa::MessageKey::default(), PinDuration::default())
+            .await;
+        let _ = client.unpin_message(&jid, wa::MessageKey::default()).await;
+        let _ = client
+            .send_reaction(&jid, wa::MessageKey::default(), "x")
+            .await;
+        let _ = client
+            .keep_message(&jid, wa::MessageKey::default(), true)
+            .await;
+        // Owned style: moves, no clone. Each method consumes its own copy so
+        // the whole core surface is pinned, not just send_message.
+        let _ = client.send_message(jid.clone(), msg.clone()).await;
+        let _ = client
+            .send_message_with_options(jid.clone(), msg.clone(), SendOptions::default())
+            .await;
+        let _ = client.forward_message(jid.clone(), &msg).await;
+        let _ = client
+            .edit_message(jid.clone(), "ID", wa::Message::default())
+            .await;
+        let _ = client
+            .revoke_message(jid.clone(), "ID", RevokeType::Sender)
+            .await;
+        let _ = client
+            .pin_message(
+                jid.clone(),
+                wa::MessageKey::default(),
+                PinDuration::default(),
+            )
+            .await;
+        let _ = client
+            .unpin_message(jid.clone(), wa::MessageKey::default())
+            .await;
+        let _ = client
+            .send_reaction(jid.clone(), wa::MessageKey::default(), "x")
+            .await;
+        let _ = client
+            .keep_message(jid, wa::MessageKey::default(), true)
+            .await;
     }
 }

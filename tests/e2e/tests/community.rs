@@ -381,13 +381,11 @@ async fn test_community_join_subgroup() -> anyhow::Result<()> {
     let jid_b_pn = client_b
         .client
         .get_pn()
-        .await
         .expect("Client B should have a PN JID")
         .to_non_ad();
     let jid_b_lid = client_b
         .client
         .get_lid()
-        .await
         .expect("Client B should have a LID JID")
         .to_non_ad();
 
@@ -492,13 +490,11 @@ async fn test_community_get_linked_groups_participants() -> anyhow::Result<()> {
     let own_pn = client
         .client
         .get_pn()
-        .await
         .expect("should have PN JID")
         .to_non_ad();
     let own_lid = client
         .client
         .get_lid()
-        .await
         .expect("should have LID JID")
         .to_non_ad();
 

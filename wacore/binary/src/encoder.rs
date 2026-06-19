@@ -310,33 +310,30 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         (user_combined, None)
     };
 
-    let (user_end, agent_override) = if let Some(underscore_idx) = user_agent.find('_') {
+    let user_end = if let Some(underscore_idx) = user_agent.find('_') {
         let agent_part = &user_agent[underscore_idx + 1..];
-        if let Ok(parsed_agent) = agent_part.parse::<u8>() {
-            (underscore_idx, Some(parsed_agent))
+        if agent_part.parse::<u8>().is_ok() {
+            underscore_idx
         } else {
-            (user_agent.len(), None)
+            user_agent.len()
         }
     } else {
-        (user_agent.len(), None)
+        user_agent.len()
     };
 
-    let agent_byte = agent_override.unwrap_or(0);
-    let domain_type = if server == jid::HIDDEN_USER_SERVER {
-        1
-    } else if server == jid::HOSTED_SERVER {
-        128
-    } else if server == jid::HOSTED_LID_SERVER {
-        129
-    } else {
-        agent_byte
+    let server_kind = jid::Server::try_from(server).ok();
+    let domain_type = match server_kind {
+        Some(jid::Server::Pn) => 0,
+        Some(jid::Server::Lid) => 1,
+        Some(jid::Server::Hosted) => 128,
+        Some(jid::Server::HostedLid) => 129,
+        _ => 0,
     };
 
     // Single source of truth: only servers whose `domain_type` the decoder
     // round-trips back can use AD_JID. For everyone else drop the device
     // and fall through to JID_PAIR (which preserves the server name).
-    let device = jid::Server::try_from(server)
-        .ok()
+    let device = server_kind
         .filter(|s| server_supports_ad_jid(*s))
         .and(device);
 
@@ -361,29 +358,27 @@ fn split_jid_from_meta(input: &str, meta: ParsedJidMeta) -> (&str, &str) {
 ///   128 = hosted
 ///   129 = hosted.lid
 ///
-/// For unmapped servers, falls back to `agent` to match the string-path
-/// behavior in `parse_jid_meta` (which uses `agent_byte` as the default).
-///
 /// WARNING: This must stay in sync with the string-path mapping in
 /// `classify_string_hint` / `parse_jid_meta` and the inverse mapping in
 /// `decoder.rs read_ad_jid`. Writing `jid.agent` unconditionally here
 /// (instead of only as a fallback) was the root cause of a regression
 /// where LID group messages were silently rejected by the server (error 421).
 #[inline]
-fn server_to_domain_type(server: jid::Server, agent: u8) -> u8 {
+fn server_to_domain_type(server: jid::Server) -> u8 {
     match server {
+        jid::Server::Pn => 0,
         jid::Server::Lid => 1,
         jid::Server::Hosted => 128,
         jid::Server::HostedLid => 129,
-        _ => agent,
+        _ => 0,
     }
 }
 
 /// AD_JID round-trips back to a server via `domain_type` only for the four
 /// servers the decoder explicitly maps. For everything else (bot, group,
-/// broadcast, newsletter, call, interop, msgr, legacy) the decoder collapses
-/// the byte to Pn and the original server string is lost. Writers must check
-/// this and emit JID_PAIR for non-AD-capable servers even when `device > 0`.
+/// broadcast, newsletter, call, interop, msgr, legacy) no valid AD_JID domain
+/// type exists. Writers must check this and emit JID_PAIR for non-AD-capable
+/// servers even when `device > 0`.
 /// Matches whatsmeow `writeJID` and WA Web `WAWap.De`.
 #[inline]
 fn server_supports_ad_jid(server: jid::Server) -> bool {
@@ -787,7 +782,7 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
                 BinaryError::AttrParse(format!("AD_JID device id out of range: {}", jid.device))
             })?;
             self.write_u8(token::AD_JID)?;
-            self.write_u8(server_to_domain_type(jid.server, jid.agent))?;
+            self.write_u8(server_to_domain_type(jid.server))?;
             self.write_u8(device)?;
             self.write_string(&jid.user)?;
         } else {
@@ -812,7 +807,7 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
                 BinaryError::AttrParse(format!("AD_JID device id out of range: {}", jid.device))
             })?;
             self.write_u8(token::AD_JID)?;
-            self.write_u8(server_to_domain_type(jid.server, jid.agent))?;
+            self.write_u8(server_to_domain_type(jid.server))?;
             self.write_u8(device)?;
             self.write_string(&jid.user)?;
         } else {
@@ -1387,6 +1382,40 @@ mod tests {
             domain_type, 0,
             "s.whatsapp.net JID must encode domain_type=0, got {domain_type}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ad_jid_domain_type_whatsapp_ignores_hidden_agent() -> TestResult {
+        use crate::decoder::Decoder;
+
+        let mut pn_jid = Jid::pn_device("551199887766", 33);
+        pn_jid.agent = 2;
+        let node = NodeBuilder::new("to").attr("jid", pn_jid.clone()).build();
+
+        let mut buffer = Vec::new();
+        let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+        encoder.write_node(&node)?;
+
+        let ad_jid_pos = buffer
+            .iter()
+            .position(|&b| b == token::AD_JID)
+            .expect("AD_JID token must be present for device JID");
+
+        assert_eq!(
+            buffer[ad_jid_pos + 1],
+            0,
+            "PN JID must encode the WA Web domain_type=0 even if a hidden agent is present"
+        );
+
+        let decoded = Decoder::new(&buffer[1..]).read_node_ref()?.to_owned();
+        let decoded_jid = decoded
+            .attrs()
+            .optional_jid("jid")
+            .expect("jid attr must decode");
+        assert!(pn_jid.is_same_chat_as(&decoded_jid));
+        assert_eq!(decoded_jid.agent, 0);
 
         Ok(())
     }

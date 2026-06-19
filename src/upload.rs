@@ -263,6 +263,7 @@ where
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UploadResponse {
     pub url: String,
     pub direct_path: String,

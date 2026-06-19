@@ -15,7 +15,10 @@ impl Client {
         let mut all_devices = Vec::with_capacity(jids.len() * 2);
 
         for jid in jids.iter().map(|j| j.to_non_ad()) {
-            // Device registry (in-memory cache + DB) is the single source of truth
+            // Device registry (in-memory cache + DB) is the single source of truth.
+            // get_devices_from_registry returns None for an empty record (never a
+            // valid set — WA Web always keeps device 0), so a corrupted empty row
+            // falls through to the network here instead of being trusted.
             if let Some(devices) = self.get_devices_from_registry(&jid).await {
                 all_devices.extend(devices);
                 continue;
@@ -184,6 +187,14 @@ impl Client {
                 fetched_devices.push(jid);
             }
 
+            // An empty device list is never valid — WA Web always keeps the primary
+            // (device 0), so a usync returning no devices for a user is transient or
+            // corrupt. Persisting it would clobber a good cached record, or store an
+            // empty one that get_user_devices then re-fetches on every send.
+            if devices.is_empty() {
+                continue;
+            }
+
             device_records.push(wacore::store::traits::DeviceListRecord {
                 user: user_list.user.user.to_string(),
                 devices,
@@ -218,7 +229,7 @@ impl Client {
         )
     )]
     pub(crate) async fn sync_own_device_list(&self) -> Result<(), anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         let mut jids = Vec::with_capacity(2);
         let mut hashes: std::collections::HashMap<Jid, (String, i64)> =
@@ -286,7 +297,7 @@ impl Client {
                     "Pending device sync failed, re-enqueueing {} users: {e:?}",
                     pending.len()
                 );
-                for jid in pending {
+                for jid in &pending {
                     self.pending_device_sync.add(jid).await;
                 }
             }
@@ -393,6 +404,32 @@ mod tests {
         assert_eq!(devices[0].device, 5);
     }
 
+    // A present-but-empty device record is local corruption and must not be
+    // treated as authoritative: get_user_devices falls through to the network so
+    // the list can self-heal. Offline, that surfaces as an error, which proves the
+    // fetch was attempted (the old behavior returned Ok([]) with no fetch).
+    #[tokio::test]
+    async fn test_empty_device_record_falls_through_to_network() {
+        let client = create_test_client().await;
+
+        let user_jid: Jid = "5551230000@s.whatsapp.net".parse().unwrap();
+
+        let record = DeviceListRecord {
+            user: "5551230000".into(),
+            devices: vec![],
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+            raw_id: None,
+        };
+        client.update_device_list(record).await.unwrap();
+
+        let result = client.get_user_devices(&[user_jid]).await;
+        assert!(
+            result.is_err(),
+            "empty record must fall through to the network, got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_cache_size_eviction() {
         use crate::cache::Cache;
@@ -474,6 +511,67 @@ mod tests {
             b_devices.len(),
             2,
             "omitted user's devices must be preserved"
+        );
+    }
+
+    /// A usync that returns an empty device list for a user is transient or
+    /// corrupt (WA Web always keeps device 0). `process_device_list_response`
+    /// must not persist it: a good cached record stays intact instead of being
+    /// clobbered with an empty list that `get_user_devices` then re-fetches on
+    /// every send.
+    #[tokio::test]
+    async fn process_response_skips_empty_device_list() {
+        use wacore::usync::UserDeviceList;
+
+        let client = create_test_client().await;
+
+        client
+            .update_device_list(DeviceListRecord {
+                user: "3333333333".into(),
+                devices: vec![
+                    DeviceInfo {
+                        device_id: 0,
+                        key_index: None,
+                    },
+                    DeviceInfo {
+                        device_id: 4,
+                        key_index: None,
+                    },
+                ],
+                timestamp: wacore::time::now_secs(),
+                phash: Some("3:old".to_string()),
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+
+        // The same user comes back from usync with no devices.
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: "3333333333@s.whatsapp.net".parse().unwrap(),
+                devices: vec![],
+                phash: Some("3:empty".to_string()),
+                key_index_bytes: None,
+            }],
+            lid_mappings: vec![],
+        };
+
+        let fetched = client.process_device_list_response(&response).await;
+        assert!(
+            !fetched.iter().any(|j| j.user == "3333333333"),
+            "an empty returned list contributes no devices"
+        );
+
+        // The good cached record survives — not clobbered with an empty list.
+        let jid: Jid = "3333333333@s.whatsapp.net".parse().unwrap();
+        let devices = client
+            .get_devices_from_registry(&jid)
+            .await
+            .expect("the good record must survive an empty usync response");
+        assert_eq!(
+            devices.len(),
+            2,
+            "empty response must not clobber the record"
         );
     }
 

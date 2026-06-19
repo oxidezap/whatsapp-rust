@@ -114,15 +114,9 @@ pub struct PreparedGroupStanza {
 
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.group_prepare", level = "debug", skip_all, fields(to = %to_jid.observe()), err(Debug)))]
 #[allow(clippy::too_many_arguments)]
-pub async fn prepare_group_stanza<
-    'a,
-    S: crate::libsignal::protocol::SessionStore + Clone + Send + Sync + 'static,
-    I: crate::libsignal::protocol::IdentityKeyStore + Clone + Send + Sync + 'static,
-    P: crate::libsignal::protocol::PreKeyStore + Send + Sync,
-    SP: crate::libsignal::protocol::SignedPreKeyStore + Send + Sync,
->(
+pub async fn prepare_group_stanza(
     runtime: &dyn Runtime,
-    stores: &mut SignalStores<'a, S, I, P, SP>,
+    stores: &mut SignalStores<'_>,
     resolver: &dyn SendContextResolver,
     // Caller guarantees `own_base_jid` is already present in `participants`, so
     // this reads the shared (Arc-backed) metadata without cloning it.
@@ -139,7 +133,7 @@ pub async fn prepare_group_stanza<
     // sends so the phash covers every device + self even when no SKDM is sent;
     // `None` on the cold `force_skdm` path (the set is resolved here) and for
     // status broadcasts (which keep the prior phash behavior).
-    all_devices_for_phash: Option<Vec<Jid>>,
+    all_devices_for_phash: Option<std::sync::Arc<super::ResolvedGroupDevices>>,
     edit: Option<crate::types::message::EditAttribute>,
     extra_stanza_nodes: &[Node],
 ) -> Result<PreparedGroupStanza> {
@@ -148,17 +142,32 @@ pub async fn prepare_group_stanza<
         crate::types::message::AddressingMode::Pn => (own_jid.clone(), "pn"),
     };
 
-    // Generate reporting token if the message type supports it
+    // Encode the message once and thread those bytes through both the reporting token
+    // (whitelisted-field extraction) and the skmsg wire plaintext below, instead of
+    // encoding it twice per send. The rare mci-hoist path (message carries a top-level
+    // message_context_info) can't share: its plaintext folds the reporting secret into the
+    // existing mci, diverging from the bytes the token is computed over, so it re-encodes.
+    let shared_content = message
+        .message_context_info
+        .is_none()
+        .then(|| waproto::codec::message_to_vec(message));
+
+    // Generate reporting token if the message type supports it.
     // For groups, both sender_jid and remote_jid are the group JID (to_jid) per Baileys implementation.
     // Reuse the message's own secret when the caller set one (e.g. polls) instead of minting a fresh
     // one that would overwrite it, matching WA Web (the reporting token derives from messageSecret).
-    let reporting_result = generate_reporting_token(
-        message,
-        &request_id,
-        &to_jid,
-        &to_jid,
-        crate::reporting_token::extract_message_secret(message),
-    );
+    let existing_secret = crate::reporting_token::extract_message_secret(message);
+    let reporting_result = match &shared_content {
+        Some(content) => generate_reporting_token_from_encoded(
+            message,
+            content,
+            &request_id,
+            &to_jid,
+            &to_jid,
+            existing_secret,
+        ),
+        None => generate_reporting_token(message, &request_id, &to_jid, &to_jid, existing_secret),
+    };
 
     // The reporting token's MessageContextInfo (message_secret + version) is spliced
     // onto the encoded plaintext instead of deep-cloning the whole message via
@@ -169,20 +178,12 @@ pub async fn prepare_group_stanza<
 
     let mut message_children: Vec<Node> = Vec::new();
     let mut includes_prekey_message = false;
-    let mut phash_for_stanza: Option<String> = None;
+    let mut phash_for_stanza: Option<CompactString> = None;
     let mut skdm_encrypted_devices: Vec<Jid> = Vec::new();
 
-    // Build the chain name once and hold its lock across SKDM creation + the
-    // skmsg encrypt, so concurrent same-(group, sender) sends can't split the
-    // key between the SKDM and the skmsg (nor reuse a chain iteration).
-    let sender_key_name = make_sender_key_name(&to_jid, &own_sending_jid.to_protocol_address());
-    let chain_lock = stores
-        .sender_key_store
-        .sender_key_lock(&sender_key_name)
-        .await;
-    let _chain_guard = chain_lock.lock().await;
-
-    // Determine if we need to distribute SKDM and to which devices
+    // Determine if we need to distribute SKDM and to which devices.
+    // Resolved before the chain lock below: device resolution is network I/O
+    // on state independent of the sender-key chain.
     let distribution_list: Option<Vec<Jid>> = if let Some(target_devices) = skdm_target_devices {
         // Use the specific list of devices that need SKDM
         if target_devices.is_empty() {
@@ -310,16 +311,16 @@ pub async fn prepare_group_stanza<
     // broadcasts keep the prior behavior (phash over the distribution list only,
     // when distributing); WA Web's status path does not augment with self.
     if to_jid.is_group() {
-        // Warm/partial sends pass the complete set in `all_devices_for_phash`;
-        // the cold `force_skdm` path leaves it None and `distribution_list`
-        // already holds the full resolved set.
-        if let Some(src) = all_devices_for_phash
-            .as_deref()
-            .or(distribution_list.as_deref())
-        {
+        // Warm/partial sends pass the complete set in `all_devices_for_phash`,
+        // whose phash memo serves repeat sends with an inline copy; the cold
+        // `force_skdm` path leaves it None and `distribution_list` already
+        // holds the full resolved set.
+        if let Some(resolved) = all_devices_for_phash.as_deref() {
+            phash_for_stanza = resolved.phash(&own_sending_jid);
+        } else if let Some(src) = distribution_list.as_deref() {
             let phash_set = build_group_phash_set(src, &own_sending_jid);
             match MessageUtils::participant_list_hash(&phash_set) {
-                Ok(phash) => phash_for_stanza = Some(phash),
+                Ok(phash) => phash_for_stanza = Some(CompactString::new(&phash)),
                 Err(e) => {
                     log::warn!(
                         "Failed to compute group phash for {}: {:?}",
@@ -331,82 +332,139 @@ pub async fn prepare_group_stanza<
         }
     } else if let Some(ref distribution_list) = distribution_list {
         match MessageUtils::participant_list_hash(distribution_list) {
-            Ok(phash) => phash_for_stanza = Some(phash),
+            Ok(phash) => phash_for_stanza = Some(CompactString::new(&phash)),
             Err(e) => log::warn!("Failed to compute phash for {}: {:?}", to_jid.observe(), e),
         }
     }
 
     let mut had_unregistered_devices = false;
 
+    let sender_key_name = make_sender_key_name(&to_jid, &own_sending_jid.to_protocol_address());
+
+    // Establish missing pairwise sessions (prekey fetch + X3DH) for the SKDM
+    // targets before taking the chain lock, so the chain critical section
+    // below never spans a network RTT — concurrent sends to the same group
+    // would otherwise serialize behind it. The setup lock serializes this
+    // phase per group instead: two cold sends can't race fetch + X3DH writes
+    // to the same per-device sessions, while warm sends (no SKDM) never take
+    // it. WA Web's GroupSkmsgJob wraps ensureE2ESessions in try/catch — logs
+    // but does NOT rethrow: a session setup failure must not prevent the
+    // group message from being sent.
+    let session_plan = match distribution_list.as_deref() {
+        Some(list) => {
+            let setup_lock = stores
+                .sender_key_store
+                .session_setup_lock(&sender_key_name)
+                .await;
+            let _setup_guard = setup_lock.lock().await;
+            match ensure_sessions_for_devices(runtime, stores, resolver, list).await {
+                Ok(plan) => Some(plan),
+                Err(e) => {
+                    log::warn!(
+                        "SKDM session setup failed for group {}, continuing without distribution: {e}",
+                        to_jid.observe()
+                    );
+                    if is_device_unregistered_error(&e) {
+                        had_unregistered_devices = true;
+                    }
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Hold the chain lock across SKDM creation + the skmsg encrypt, so
+    // concurrent same-(group, sender) sends can't split the key between the
+    // SKDM and the skmsg (nor reuse a chain iteration). The lock covers only
+    // chain-touching steps; session setup and device resolution stay outside.
+    let chain_lock = stores
+        .sender_key_store
+        .sender_key_lock(&sender_key_name)
+        .await;
+    let _chain_guard = chain_lock.lock().await;
+
     if let Some(ref distribution_list) = distribution_list {
+        // Created even when session setup failed (plan None): the sender-key
+        // record must exist so the skmsg below still encrypts, preserving the
+        // continue-without-distribution semantics.
         let axolotl_skdm_bytes = create_sender_key_distribution_message_for_group(
             stores.sender_key_store,
             &sender_key_name,
         )
         .await?;
 
-        let skdm_wrapper_msg = wa::Message {
-            sender_key_distribution_message: Some(wa::message::SenderKeyDistributionMessage {
-                group_id: Some(to_jid.to_string()),
-                axolotl_sender_key_distribution_message: Some(axolotl_skdm_bytes),
-            }),
-            ..Default::default()
-        };
-        let skdm_plaintext_to_encrypt = MessageUtils::encode_and_pad(&skdm_wrapper_msg);
+        if let Some(plan) = session_plan {
+            let skdm_wrapper_msg = wa::Message {
+                sender_key_distribution_message: Some(wa::message::SenderKeyDistributionMessage {
+                    group_id: Some(to_jid.to_string()),
+                    axolotl_sender_key_distribution_message: Some(axolotl_skdm_bytes),
+                }),
+                ..Default::default()
+            };
+            let skdm_plaintext_to_encrypt = MessageUtils::encode_and_pad(&skdm_wrapper_msg);
 
-        // WA Web's GroupSkmsgJob wraps ensureE2ESessions in try/catch — logs error
-        // but does NOT rethrow. SKDM distribution failure must not prevent the group
-        // message from being sent. Only successfully encrypted devices are tracked.
-        // Must match the rule applied to the main skmsg payload below: if SKDM carries
-        // `decrypt-fail="hide"` but the payload does not (e.g. AdminRevoke), recipients
-        // without a sender key never decrypt the skmsg and the revoke is silently dropped.
-        let skdm_hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
-        match encrypt_for_devices(
-            runtime,
-            stores,
-            resolver,
-            distribution_list,
-            &skdm_plaintext_to_encrypt,
-            skdm_hide_decrypt_fail,
-            None,
-        )
-        .await
-        {
-            Ok(result) => {
-                includes_prekey_message = includes_prekey_message || result.includes_prekey_message;
-                if result.had_unregistered_device {
-                    had_unregistered_devices = true;
-                }
-                skdm_encrypted_devices = result.encrypted_devices;
+            // SKDM distribution failure must not prevent the group message from
+            // being sent. Only successfully encrypted devices are tracked.
+            // Must match the rule applied to the main skmsg payload below: if SKDM carries
+            // `decrypt-fail="hide"` but the payload does not (e.g. AdminRevoke), recipients
+            // without a sender key never decrypt the skmsg and the revoke is silently dropped.
+            let skdm_hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
+            match encrypt_for_devices_with_sessions(
+                runtime,
+                stores,
+                distribution_list,
+                &skdm_plaintext_to_encrypt,
+                skdm_hide_decrypt_fail,
+                None,
+                plan,
+            )
+            .await
+            {
+                Ok(result) => {
+                    includes_prekey_message =
+                        includes_prekey_message || result.includes_prekey_message;
+                    if result.had_unregistered_device {
+                        had_unregistered_devices = true;
+                    }
+                    skdm_encrypted_devices = result.encrypted_devices;
 
-                if !result.participant_nodes.is_empty() {
-                    message_children.push(
-                        NodeBuilder::new("participants")
-                            .children(result.participant_nodes)
-                            .build(),
-                    );
-                    if includes_prekey_message && let Some(acc) = account {
+                    if !result.participant_nodes.is_empty() {
                         message_children.push(
-                            NodeBuilder::new("device-identity")
-                                .bytes(acc.encode_to_vec())
+                            NodeBuilder::new("participants")
+                                .children(result.participant_nodes)
                                 .build(),
                         );
+                        if includes_prekey_message && let Some(acc) = account {
+                            message_children.push(
+                                NodeBuilder::new("device-identity")
+                                    .bytes(acc.encode_to_vec())
+                                    .build(),
+                            );
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                log::warn!(
-                    "SKDM distribution failed for group {}, continuing without it: {e}",
-                    to_jid.observe()
-                );
-                if is_device_unregistered_error(&e) {
-                    had_unregistered_devices = true;
+                Err(e) => {
+                    log::warn!(
+                        "SKDM distribution failed for group {}, continuing without it: {e}",
+                        to_jid.observe()
+                    );
+                    if is_device_unregistered_error(&e) {
+                        had_unregistered_devices = true;
+                    }
                 }
             }
         }
     }
 
-    let plaintext = MessageUtils::encode_and_pad_with_context(message, reporting_context.as_ref());
+    // Reuse the shared encode (also fed to the reporting token) for the skmsg plaintext
+    // instead of encoding the message a second time; the mci-hoist path re-encodes.
+    let plaintext = match &shared_content {
+        Some(content) => {
+            MessageUtils::pad_with_context_from_encoded(content, reporting_context.as_ref())
+        }
+        None => MessageUtils::encode_and_pad_with_context(message, reporting_context.as_ref()),
+    };
     let skmsg = encrypt_group_message(
         stores.sender_key_store,
         &sender_key_name,

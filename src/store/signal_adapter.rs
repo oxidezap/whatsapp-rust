@@ -70,15 +70,7 @@ impl SignalProtocolStoreAdapter {
         }
     }
 
-    pub fn as_signal_stores(
-        &mut self,
-    ) -> wacore::send::SignalStores<
-        '_,
-        SessionAdapter,
-        IdentityAdapter,
-        PreKeyAdapter,
-        SignedPreKeyAdapter,
-    > {
+    pub fn as_signal_stores(&mut self) -> wacore::send::SignalStores<'_> {
         wacore::send::SignalStores {
             session_store: &mut self.session_store,
             identity_store: &mut self.identity_store,
@@ -308,6 +300,13 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
         sender_key_name: &SenderKeyName,
     ) -> std::sync::Arc<async_lock::Mutex<()>> {
         self.0.cache.sender_key_lock(sender_key_name).await
+    }
+
+    async fn session_setup_lock(
+        &self,
+        sender_key_name: &SenderKeyName,
+    ) -> std::sync::Arc<async_lock::Mutex<()>> {
+        self.0.cache.session_setup_lock(sender_key_name).await
     }
 }
 

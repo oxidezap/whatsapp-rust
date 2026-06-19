@@ -60,6 +60,26 @@ impl Client {
         self.wanted_pre_key_count.load(Ordering::Relaxed)
     }
 
+    /// Retune the per-chat outbound resend rate limiter live (no reconnect).
+    ///
+    /// Outbound resends to a chat are bounded by a token bucket: `burst` is the
+    /// instantaneous allowance and `refill_per_min` the sustained ceiling per
+    /// chat. This caps the aggregate resend rate that WhatsApp's anti-abuse
+    /// penalizes during a PN to LID migration fan-out, while throttled devices
+    /// still recover via the fresh-SKDM mark. A `burst` of 0 disables the limiter.
+    ///
+    /// Takes effect on each chat's next retry; a lowered `burst` clamps a live
+    /// bucket on its next access.
+    pub fn set_resend_rate_limit(&self, burst: u32, refill_per_min: u32) {
+        self.resend_rate_limiter.set_rate(burst, refill_per_min);
+    }
+
+    /// Total outbound resends dropped by the per-chat rate limiter since start.
+    /// Surfaces storm chats without the `debug-diagnostics` feature.
+    pub fn resends_throttled_total(&self) -> u64 {
+        self.resend_rate_limiter.throttled_total()
+    }
+
     /// Returns a snapshot of all internal collection sizes for memory leak detection.
     ///
     /// Moka caches report approximate counts (pending evictions may not be reflected).
@@ -92,8 +112,11 @@ impl Client {
             message_retry_counts: self.message_retry_counts.entry_count(),
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
             pdo_pending_requests: self.pdo_pending_requests.entry_count(),
+            pdo_requested: self.pdo_requested.entry_count(),
             session_locks: self.session_locks.entry_count(),
             chat_lanes: self.chat_lanes.entry_count(),
+            resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
+            resends_throttled_total: self.resend_rate_limiter.throttled_total(),
             response_waiters: self.response_waiters.lock().await.len(),
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,
@@ -104,7 +127,7 @@ impl Client {
             signal_cache_identities: sig_identities,
             signal_cache_sender_keys: sig_sender_keys,
             chatstate_handlers: self.chatstate_handlers.read().await.len(),
-            custom_enc_handlers: self.custom_enc_handlers.read().await.len(),
+            custom_enc_handlers: self.custom_enc_handlers.get().map_or(0, |m| m.len()),
         }
     }
 
@@ -114,38 +137,27 @@ impl Client {
         self.persistence_manager.clone()
     }
 
-    pub async fn get_push_name(&self) -> String {
+    // The owned returns below are the only clones left: the snapshot read
+    // itself is an Arc refcount bump (no lock against writers). Callers that
+    // only need a borrow can hold `persistence_manager().get_device_snapshot()`
+    // and read fields directly.
+    pub fn get_push_name(&self) -> String {
         self.persistence_manager
-            .get_device_arc()
-            .await
-            .read()
-            .await
+            .get_device_snapshot()
             .push_name
             .clone()
     }
 
-    pub async fn get_pn(&self) -> Option<Jid> {
-        self.persistence_manager
-            .get_device_arc()
-            .await
-            .read()
-            .await
-            .pn
-            .clone()
+    pub fn get_pn(&self) -> Option<Jid> {
+        self.persistence_manager.get_device_snapshot().pn.clone()
     }
 
-    pub async fn get_lid(&self) -> Option<Jid> {
-        self.persistence_manager
-            .get_device_arc()
-            .await
-            .read()
-            .await
-            .lid
-            .clone()
+    pub fn get_lid(&self) -> Option<Jid> {
+        self.persistence_manager.get_device_snapshot().lid.clone()
     }
 
-    pub(crate) async fn require_pn(&self) -> Result<Jid> {
-        self.get_pn().await.ok_or(ClientError::NotLoggedIn.into())
+    pub(crate) fn require_pn(&self) -> Result<Jid> {
+        self.get_pn().ok_or(ClientError::NotLoggedIn.into())
     }
 
     /// Resolve our own JID for a group, respecting its addressing mode.
@@ -156,7 +168,7 @@ impl Client {
         &self,
         group_jid: &Jid,
     ) -> Result<Jid, anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_pn = device_snapshot
             .pn
             .clone()
@@ -178,7 +190,7 @@ impl Client {
     }
 
     pub(crate) async fn update_push_name_and_notify(self: &Arc<Self>, new_name: String) {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let old_name = device_snapshot.push_name.clone();
 
         if old_name == new_name {

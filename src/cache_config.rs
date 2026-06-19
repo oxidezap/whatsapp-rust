@@ -11,7 +11,7 @@ pub use wacore::store::cache::CacheStore;
 
 /// Configuration for a single cache instance.
 ///
-/// Controls the expiry timeout and maximum capacity of a moka cache.
+/// Controls the expiry timeout and maximum capacity of an in-process cache.
 /// The `timeout` field is used as either TTL (`build_with_ttl`) or TTI
 /// (`build_with_tti`) depending on which builder method is called.
 /// Set `timeout` to `None` to disable time-based expiry (entries stay until
@@ -56,7 +56,7 @@ impl CacheEntryConfig {
     {
         match store {
             Some(s) => TypedCache::from_store(s, namespace, self.timeout),
-            None => TypedCache::from_moka(self.build_with_ttl()),
+            None => TypedCache::from_local(self.build_with_ttl()),
         }
     }
 
@@ -77,7 +77,7 @@ impl CacheEntryConfig {
 /// Per-cache custom store overrides.
 ///
 /// Each field is an optional [`CacheStore`] for that specific cache. When
-/// `None`, the default in-process moka cache is used.
+/// `None`, the default in-process cache is used.
 ///
 /// # Example — group and device registry on Redis
 ///
@@ -166,7 +166,7 @@ pub struct CacheConfig {
     /// LID-to-phone cache. WAWebLidPnCache uses plain Maps with no expiry
     /// and no size cap; evicting a still-valid mapping silently downgrades
     /// Signal addresses to `@c.us`. Default: no timeout, capacity u64::MAX
-    /// (effectively unbounded — moka doesn't expose an `unbounded()` builder).
+    /// (effectively unbounded — the cache has no dedicated `unbounded()` builder).
     pub lid_pn_cache: CacheEntryConfig,
     /// Optional L1 in-memory cache for sent messages (retry support).
     /// Default: capacity 0 (disabled — DB-only, matching WA Web).
@@ -181,6 +181,14 @@ pub struct CacheConfig {
     pub undecryptable_dispatched: CacheEntryConfig,
     /// PDO pending requests (time_to_live). Default: 30s TTL, 200 entries.
     pub pdo_pending_requests: CacheEntryConfig,
+    /// Messages already covered by a placeholder-resend PDO request
+    /// (time_to_live). WA Web keeps a session-lifetime set
+    /// (`WAWebNonMessageDataRequestPlaceholderMessageResendUtils`) so each
+    /// message triggers at most one request; without it, every redelivery of
+    /// an undecryptable message re-asks the phone (a stuck sender resending
+    /// every ~11s produced ~700 requests in 3h). The TTL stands in for
+    /// "session lifetime" with bounded memory. Default: 24h TTL, 512 entries.
+    pub pdo_requested: CacheEntryConfig,
     /// Sender key device tracking cache (time_to_idle). Default: 1h TTI, 500 entries.
     /// Caches per-group SKDM distribution state to avoid DB reads on every group send.
     pub sender_key_devices_cache: CacheEntryConfig,
@@ -193,6 +201,12 @@ pub struct CacheConfig {
     pub session_locks_capacity: u64,
     /// Per-chat lane capacity (combined lock + queue). Default: 5000.
     pub chat_lanes_capacity: u64,
+    /// Per-chat resend rate-limiter capacity: one token-bucket entry per group
+    /// recently driving retry resends. Keep above the count of concurrently
+    /// storming groups: eviction is FIFO and fail-open (an evicted bucket is
+    /// recreated full), so undersizing only forgives rate, never over-throttles.
+    /// Default: 4096.
+    pub resend_rate_limiter_capacity: u64,
 
     // --- Sent message DB cleanup ---
     /// TTL in seconds for sent messages in DB before periodic cleanup. Must
@@ -240,8 +254,8 @@ pub struct CacheConfig {
     /// Per-cache custom store overrides.
     ///
     /// For each field set to `Some(store)`, the corresponding cache uses that
-    /// backend instead of the default in-process moka cache. Fields left as
-    /// `None` keep the default moka behaviour.
+    /// backend instead of the default in-process cache. Fields left as
+    /// `None` keep the default in-process behaviour.
     ///
     /// Coordination caches (`session_locks`, `chat_lanes`), the signal write-behind
     /// cache, and `pdo_pending_requests` always stay in-process — they hold live Rust
@@ -260,10 +274,15 @@ impl std::fmt::Debug for CacheConfig {
             .field("message_retry_counts", &self.message_retry_counts)
             .field("undecryptable_dispatched", &self.undecryptable_dispatched)
             .field("pdo_pending_requests", &self.pdo_pending_requests)
+            .field("pdo_requested", &self.pdo_requested)
             .field("sender_key_devices_cache", &self.sender_key_devices_cache)
             .field("session_recreate_history", &self.session_recreate_history)
             .field("session_locks_capacity", &self.session_locks_capacity)
             .field("chat_lanes_capacity", &self.chat_lanes_capacity)
+            .field(
+                "resend_rate_limiter_capacity",
+                &self.resend_rate_limiter_capacity,
+            )
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
             .field("msg_secret_policy", &self.msg_secret_policy)
             .field("msg_secret_retention", &self.msg_secret_retention)
@@ -312,6 +331,7 @@ impl Default for CacheConfig {
             message_retry_counts: CacheEntryConfig::new(one_hour, 500),
             undecryptable_dispatched: CacheEntryConfig::new(five_min, 1_000),
             pdo_pending_requests: CacheEntryConfig::new(Some(Duration::from_secs(30)), 200),
+            pdo_requested: CacheEntryConfig::new(Some(Duration::from_secs(24 * 3600)), 512),
             sender_key_devices_cache: CacheEntryConfig::new(one_hour, 500),
             session_recreate_history: CacheEntryConfig::new(one_hour, 256),
             // Coordination caches hold live mutexes/senders; capacity eviction
@@ -319,6 +339,7 @@ impl Default for CacheConfig {
             // breaking serialization. Size generously to avoid eviction pressure.
             session_locks_capacity: 10_000,
             chat_lanes_capacity: 5_000,
+            resend_rate_limiter_capacity: 4_096,
             sent_message_ttl_secs: 7200,
             // Bounded by default: seed only the still-relevant slice of history
             // and prune by per-add-on-kind event-time horizons, so the store no

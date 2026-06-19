@@ -31,7 +31,7 @@ pub enum TokenKind {
 include!(concat!(env!("OUT_DIR"), "/token_maps.rs"));
 
 pub fn index_of_token(token: &str) -> Option<TokenKind> {
-    hashify_lookup(token.as_bytes()).copied()
+    hashify_lookup(token.as_bytes())
 }
 
 pub fn get_single_token(index: u8) -> Option<&'static str> {
@@ -119,5 +119,59 @@ mod tests {
         assert!(get_double_token(4, 0).is_none());
         assert!(get_double_token(5, 100).is_none());
         assert!(get_double_token(255, 0).is_none());
+    }
+
+    /// Exhaustive equivalence guard: against a reference map built from the token
+    /// tables, every one-byte input and every single-byte mutation (all 256
+    /// values) of every token must resolve to the reference value (the token or
+    /// `None`). Probes the length-bucketed lookup for any discriminator collision
+    /// that would silently map a non-token (a JID/id) onto a token and corrupt the
+    /// wire, and stays durable against future token-set edits.
+    #[test]
+    fn lookup_matches_reference_under_byte_mutation() {
+        use std::collections::HashMap;
+
+        let mut reference: HashMap<Vec<u8>, TokenKind> = HashMap::new();
+        for i in 0u8..=235 {
+            if let Some(t) = get_single_token(i) {
+                reference
+                    .entry(t.as_bytes().to_vec())
+                    .or_insert(TokenKind::Single(i));
+            }
+        }
+        for dict in 0..4u8 {
+            for idx in 0..=255u8 {
+                if let Some(t) = get_double_token(dict, idx) {
+                    reference
+                        .entry(t.as_bytes().to_vec())
+                        .or_insert(TokenKind::Double(dict, idx));
+                }
+            }
+        }
+
+        let check = |bytes: &[u8]| {
+            assert_eq!(
+                hashify_lookup(bytes),
+                reference.get(bytes).copied(),
+                "lookup disagrees with reference for {bytes:?}",
+            );
+        };
+
+        for b in 0u8..=255 {
+            check(&[b]);
+        }
+
+        let keys: Vec<Vec<u8>> = reference.keys().cloned().collect();
+        for key in &keys {
+            let mut m = key.clone();
+            for pos in 0..m.len() {
+                let orig = m[pos];
+                for b in 0u8..=255 {
+                    m[pos] = b;
+                    check(&m);
+                }
+                m[pos] = orig;
+            }
+        }
     }
 }

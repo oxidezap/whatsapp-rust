@@ -110,18 +110,36 @@ pub enum PreKeyFetchReason {
 pub struct PreKeyFetchSpec {
     pub jids: Vec<Jid>,
     pub reason: Option<PreKeyFetchReason>,
+    /// Per-companion-JID account (device 0) identity keys, used as the ADV
+    /// `account_signature_key` fallback when the server omits it from
+    /// `<device-identity>`. Empty when the caller has no stored fallback.
+    pub account_identities: std::collections::HashMap<Jid, [u8; 32]>,
 }
 
 impl PreKeyFetchSpec {
     pub fn new(jids: Vec<Jid>) -> Self {
-        Self { jids, reason: None }
+        Self {
+            jids,
+            reason: None,
+            account_identities: std::collections::HashMap::new(),
+        }
     }
 
     pub fn with_reason(jids: Vec<Jid>, reason: PreKeyFetchReason) -> Self {
         Self {
             jids,
             reason: Some(reason),
+            account_identities: std::collections::HashMap::new(),
         }
+    }
+
+    /// Attach the ADV account-identity fallbacks (see [`Self::account_identities`]).
+    pub fn with_account_identities(
+        mut self,
+        account_identities: std::collections::HashMap<Jid, [u8; 32]>,
+    ) -> Self {
+        self.account_identities = account_identities;
+        self
     }
 }
 
@@ -142,7 +160,7 @@ impl IqSpec for PreKeyFetchSpec {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
-        PreKeyUtils::parse_prekeys_response(response)
+        PreKeyUtils::parse_prekeys_response(response, &self.account_identities)
     }
 }
 

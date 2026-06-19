@@ -12,6 +12,11 @@ use wacore::runtime::{AbortHandle, Runtime, ShutdownSignal, wait_for_shutdown};
 
 pub struct PersistenceManager {
     device: Arc<RwLock<Device>>,
+    /// Read-mostly snapshot, rebuilt under the device write guard in
+    /// `modify_device` so it can never lag a committed mutation. Turns every
+    /// `get_device_snapshot` into an Arc refcount bump instead of a full
+    /// Device clone (the snapshot is read on every inbound message).
+    device_snapshot: std::sync::RwLock<Arc<Device>>,
     backend: Arc<dyn Backend>,
     dirty: Arc<AtomicBool>,
     save_notify: Arc<Event>,
@@ -50,8 +55,10 @@ impl PersistenceManager {
             Device::new(backend.clone())
         };
 
+        let snapshot = Arc::new(device.clone());
         Ok(Self {
             device: Arc::new(RwLock::new(device)),
+            device_snapshot: std::sync::RwLock::new(snapshot),
             backend,
             dirty: Arc::new(AtomicBool::new(false)),
             save_notify: Arc::new(Event::new()),
@@ -59,12 +66,20 @@ impl PersistenceManager {
         })
     }
 
+    /// Handle for store adapters that need `&mut Device` trait access.
+    /// For plain reads, prefer [`get_device_snapshot`](Self::get_device_snapshot).
     pub async fn get_device_arc(&self) -> Arc<RwLock<Device>> {
         self.device.clone()
     }
 
-    pub async fn get_device_snapshot(&self) -> Device {
-        self.device.read().await.clone()
+    /// Cheap point-in-time view of the device state: an Arc refcount bump,
+    /// no locking against writers and no Device clone. Always reflects the
+    /// last committed `modify_device`/`process_command` mutation.
+    pub fn get_device_snapshot(&self) -> Arc<Device> {
+        self.device_snapshot
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn backend(&self) -> Arc<dyn Backend> {
@@ -83,7 +98,19 @@ impl PersistenceManager {
         let mut device_guard = self.device.write().await;
         let result = modifier(&mut device_guard);
 
+        // Dirty BEFORE the snapshot rebuild: a shutdown flush racing this
+        // window must see the store dirty, or it would exit clean and drop
+        // the committed mutation (the clone below is not free).
         self.dirty.store(true, Ordering::Relaxed);
+
+        // Rebuild while still holding the write guard so no reader can
+        // observe post-mutation effects with a pre-mutation snapshot.
+        *self
+            .device_snapshot
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Arc::new(device_guard.clone());
+        drop(device_guard);
+
         self.save_notify.notify(1);
 
         result

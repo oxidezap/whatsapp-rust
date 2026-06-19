@@ -7,9 +7,9 @@
 //! Reference: WAWebRequestMediaReuploadManager.
 
 use crate::client::{Client, ClientError, NodeFilter};
-use anyhow::Result;
 use log::debug;
 use std::time::Duration;
+use thiserror::Error;
 pub use wacore::media_retry::MediaRetryResult;
 use wacore::media_retry::{
     build_media_retry_receipt, encrypt_media_retry_receipt, parse_media_retry_notification,
@@ -17,6 +17,28 @@ use wacore::media_retry::{
 use wacore_binary::{Jid, JidExt as _};
 
 const MEDIA_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Error returned by the media reupload request flow.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum MediaReuploadError {
+    /// Connection/transport failure sending the server-error receipt.
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    /// The client is not logged in.
+    #[error("client is not logged in")]
+    NotLoggedIn,
+    /// The request is not applicable to this message (e.g. a newsletter message
+    /// carries no media keys).
+    #[error("invalid media reupload request: {0}")]
+    InvalidRequest(String),
+    /// The server did not return a `mediaretry` notification in time.
+    #[error("media retry notification timed out")]
+    Timeout,
+    /// Catch-all for internal failures (receipt encryption, response parsing).
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
 
 /// Parameters for a media reupload request.
 pub struct MediaReuploadRequest<'a> {
@@ -51,12 +73,16 @@ impl<'a> MediaReupload<'a> {
     /// 2. Send `<receipt type="server-error">` with encrypted payload + `<rmr>` metadata
     /// 3. Wait for `<notification type="mediaretry">` response
     /// 4. Decrypt response and extract new `directPath`
-    pub async fn request(&self, req: &MediaReuploadRequest<'_>) -> Result<MediaRetryResult> {
+    pub async fn request(
+        &self,
+        req: &MediaReuploadRequest<'_>,
+    ) -> Result<MediaRetryResult, MediaReuploadError> {
         // WA Web: ServerErrorReceiptJob rejects newsletter messages (no media keys).
-        anyhow::ensure!(
-            !req.chat_jid.is_newsletter(),
-            "media reupload is not supported for newsletter messages"
-        );
+        if req.chat_jid.is_newsletter() {
+            return Err(MediaReuploadError::InvalidRequest(
+                "media reupload is not supported for newsletter messages".into(),
+            ));
+        }
 
         debug!(
             "[media][rmr] Requesting media reupload for msg {} in chat {}",
@@ -67,8 +93,11 @@ impl<'a> MediaReupload<'a> {
         let (ciphertext, iv) = encrypt_media_retry_receipt(req.media_key, req.msg_id)?;
 
         // Get own JID for the receipt's `to` attribute
-        let device_snapshot = self.client.persistence_manager.get_device_snapshot().await;
-        let own_jid = device_snapshot.pn.clone().ok_or(ClientError::NotLoggedIn)?;
+        let device_snapshot = self.client.persistence_manager.get_device_snapshot();
+        let own_jid = device_snapshot
+            .pn
+            .as_ref()
+            .ok_or(MediaReuploadError::NotLoggedIn)?;
 
         // Register waiter BEFORE sending (to avoid race)
         let waiter = self.client.wait_for_node(
@@ -79,7 +108,7 @@ impl<'a> MediaReupload<'a> {
 
         // Build and send the receipt node
         let receipt_node = build_media_retry_receipt(
-            &own_jid,
+            own_jid,
             req.msg_id,
             req.chat_jid,
             req.is_from_me,
@@ -99,8 +128,10 @@ impl<'a> MediaReupload<'a> {
         let notification_node =
             wacore::runtime::timeout(&*self.client.runtime, MEDIA_RETRY_TIMEOUT, waiter)
                 .await
-                .map_err(|_| anyhow::anyhow!("media retry notification timed out after 30s"))?
-                .map_err(|_| anyhow::anyhow!("media retry waiter cancelled"))?;
+                .map_err(|_| MediaReuploadError::Timeout)?
+                .map_err(|_| {
+                    MediaReuploadError::Internal(anyhow::anyhow!("media retry waiter cancelled"))
+                })?;
 
         debug!(
             "[media][rmr] Received mediaretry notification for {}",
@@ -108,7 +139,10 @@ impl<'a> MediaReupload<'a> {
         );
 
         // Parse and decrypt the response
-        parse_media_retry_notification(notification_node.get(), req.media_key)
+        Ok(parse_media_retry_notification(
+            notification_node.get(),
+            req.media_key,
+        )?)
     }
 }
 

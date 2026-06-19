@@ -4,10 +4,10 @@ use whatsapp_rust::features::{GroupCreateOptions, GroupParticipantOptions};
 
 /// Verify that group messaging continues to work after a reconnect.
 ///
-/// The first send populates the device registry (moka cache + SQLite DB).
-/// After reconnect the moka cache is still warm (same Client object), so
+/// The first send populates the device registry (in-process cache + SQLite DB).
+/// After reconnect the cache is still warm (same Client object), so
 /// this exercises the registry-based resolution path end-to-end. The SQLite
-/// DB fallback (cold moka) is covered by unit test
+/// DB fallback (cold cache) is covered by unit test
 /// `test_device_registry_db_fallback` in `usync.rs`.
 #[tokio::test]
 async fn test_group_send_uses_registry_cache_after_reconnect() -> anyhow::Result<()> {
@@ -38,7 +38,7 @@ async fn test_group_send_uses_registry_cache_after_reconnect() -> anyhow::Result
     client_b.wait_for_group_text(&group_jid, text_1, 30).await?;
     info!("B received pre-reconnect message");
 
-    // Reconnect A — moka cache stays warm (same Client), SQLite DB also persists
+    // Reconnect A — in-process cache stays warm (same Client), SQLite DB also persists
     client_a.reconnect_and_wait().await?;
     info!("A reconnected");
 

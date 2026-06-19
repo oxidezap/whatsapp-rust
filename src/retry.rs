@@ -8,10 +8,7 @@ use wacore::types::message::MessageCategory;
 use scopeguard;
 use std::sync::Arc;
 use wacore::iq::prekeys::{OneTimePreKeyNode, SignedPreKeyNode};
-use wacore::libsignal::protocol::{
-    KeyPair, PreKeyBundle, PublicKey, UsePQRatchet, process_prekey_bundle,
-};
-use wacore::libsignal::store::PreKeyStore;
+use wacore::libsignal::protocol::{PreKeyBundle, PublicKey, UsePQRatchet, process_prekey_bundle};
 use wacore::protocol::ProtocolNode;
 use wacore::types::jid::JidExt;
 use wacore_binary::JidExt as _;
@@ -35,42 +32,6 @@ fn get_bytes_content_ref<'a>(node: &'a NodeRef<'_>) -> Option<&'a [u8]> {
     match node.content.as_deref() {
         Some(NodeContentRef::Bytes(b)) => Some(b.as_ref()),
         _ => None,
-    }
-}
-
-/// Helper to extract registration ID from a Node (used in tests).
-#[cfg(test)]
-fn extract_registration_id_from_node(node: &Node) -> Option<u32> {
-    let registration_node = node.get_optional_child("registration")?;
-    let bytes = get_bytes_content(registration_node)?;
-
-    if bytes.len() >= 4 {
-        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    } else if !bytes.is_empty() {
-        let mut arr = [0u8; 4];
-        let start = 4 - bytes.len();
-        arr[start..].copy_from_slice(bytes);
-        Some(u32::from_be_bytes(arr))
-    } else {
-        None
-    }
-}
-
-/// Helper to extract registration ID from a NodeRef (4 bytes big-endian).
-fn extract_registration_id_from_node_ref(node: &NodeRef<'_>) -> Option<u32> {
-    let registration_node = node.get_optional_child("registration")?;
-    let bytes = get_bytes_content_ref(registration_node)?;
-
-    if bytes.len() >= 4 {
-        Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    } else if !bytes.is_empty() {
-        // Handle variable-length encoding.
-        let mut arr = [0u8; 4];
-        let start = 4 - bytes.len();
-        arr[start..].copy_from_slice(bytes);
-        Some(u32::from_be_bytes(arr))
-    } else {
-        None
     }
 }
 
@@ -102,6 +63,12 @@ struct RetryChatInfo {
     recipient: Option<Jid>,
     /// True if the requester is a bot JID (skip namespace normalization).
     is_bot: bool,
+    /// WA Web's `bot_retry` parser path: only primary `@bot` JIDs, not legacy PN bots.
+    is_fbid_bot_retry: bool,
+}
+
+fn is_fbid_bot_retry_jid(jid: &Jid) -> bool {
+    jid.server == wacore_binary::Server::Bot && jid.device() == 0
 }
 
 /// Resolve the chat and requester JIDs from a retry receipt, separating
@@ -112,23 +79,25 @@ fn resolve_retry_chat_info(
     node: &NodeRef<'_>,
     own_pn: Option<&Jid>,
     own_lid: Option<&Jid>,
-) -> RetryChatInfo {
+) -> Option<RetryChatInfo> {
     let from = &receipt.source.chat;
 
     if from.is_group() || from.is_status_broadcast() {
         // Groups/status: chat is already the group/broadcast JID.
         // Requester is the participant attr (the actual retrying device).
-        let requester = node
-            .attrs()
-            .optional_jid("participant")
-            .unwrap_or_else(|| receipt.source.sender.clone());
-        RetryChatInfo {
+        let participant = node.attrs().optional_jid("participant");
+        let is_fbid_bot_retry =
+            from.is_group() && participant.as_ref().is_some_and(is_fbid_bot_retry_jid);
+        let requester = participant.unwrap_or_else(|| receipt.source.sender.clone());
+        let is_bot = requester.is_bot();
+        Some(RetryChatInfo {
             chat: from.clone(),
             requester,
             original_from: from.clone(),
             recipient: node.attrs().optional_jid("recipient"),
-            is_bot: false,
-        }
+            is_bot,
+            is_fbid_bot_retry,
+        })
     } else {
         // DM: resolve chat target via getTargetChat logic.
         let recipient = node.attrs().optional_jid("recipient");
@@ -138,9 +107,6 @@ fn resolve_retry_chat_info(
         // 1. Bot + recipient → chat = recipient
         // 2. Peer device + recipient → chat = recipient
         // 3. Peer device without recipient → WA Web aborts (returns null).
-        //    We log+fall back to `from.to_non_ad()` rather than dropping
-        //    the receipt; the message lookup will likely miss but the
-        //    retry receipt is at least acknowledged downstream.
         // 4. Normal user → chat = asUserWidOrThrow(from) = from.to_non_ad()
         let is_peer = own_pn.is_some_and(|pn| from.is_same_user_as(pn))
             || own_lid.is_some_and(|lid| from.is_same_user_as(lid));
@@ -150,13 +116,9 @@ fn resolve_retry_chat_info(
         } else if is_peer {
             match recipient.as_ref() {
                 Some(r) => r.to_non_ad(),
-                // No recipient on peer retry — chat will be our own JID,
-                // message lookup will likely fail. WA Web returns null here.
                 None => {
-                    log::warn!(
-                        "Peer device retry without recipient attr — message lookup may fail"
-                    );
-                    from.to_non_ad()
+                    log::warn!("Ignoring peer device retry without recipient attr");
+                    return None;
                 }
             }
         } else {
@@ -169,14 +131,25 @@ fn resolve_retry_chat_info(
             from.clone()
         };
 
-        RetryChatInfo {
+        Some(RetryChatInfo {
             chat,
             requester,
             original_from: from.clone(),
             recipient,
             is_bot,
-        }
+            is_fbid_bot_retry: is_fbid_bot_retry_jid(from),
+        })
     }
+}
+
+fn validate_retry_prekey_presence(
+    keys_node: &NodeRef<'_>,
+    is_fbid_bot_retry: bool,
+) -> Result<(), anyhow::Error> {
+    if !is_fbid_bot_retry && keys_node.get_optional_child("key").is_none() {
+        anyhow::bail!("regular retry key bundle missing one-time prekey");
+    }
+    Ok(())
 }
 
 // No retry_count in the key: concurrent receipts for the same participant must
@@ -192,7 +165,7 @@ fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Ji
 }
 
 impl Client {
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.handle_receipt", level = "debug", skip_all, fields(chat = %receipt.source.chat.observe(), sender = %receipt.source.sender.observe()), err(Debug)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.handle_receipt", level = "debug", skip_all, fields(chat = %receipt.source.chat.observe(), sender = %receipt.source.sender.observe(), count = tracing::field::Empty), err(Debug)))]
     pub(crate) async fn handle_retry_receipt(
         self: &Arc<Self>,
         receipt: &Receipt,
@@ -213,27 +186,36 @@ impl Client {
             .map(|v| v.as_str())
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
+        // Record the count on the span so retry-storm depth is aggregable per
+        // sender even when the cap refuses early below.
+        #[cfg(feature = "tracing")]
+        tracing::Span::current().record("count", retry_count);
 
         // Refuse to handle retries that have exceeded the maximum attempts.
         // This prevents infinite retry loops and matches WhatsApp Web's behavior.
+        // Logged at debug: remote-driven, expected and fully handled — WA Web
+        // emits this refusal via WALogger.LOG (informational), not WARN.
         if retry_count >= MAX_RETRY_COUNT {
-            warn!(
+            debug!(
                 "Refusing retry #{} for message {} from {}: exceeds max attempts ({})",
                 retry_count,
                 message_id,
                 receipt.source.sender.observe(),
                 MAX_RETRY_COUNT
             );
+            wacore::telemetry::retry_refused();
             return Ok(());
         }
 
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
-        let mut info = resolve_retry_chat_info(
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let Some(mut info) = resolve_retry_chat_info(
             receipt,
             nr,
             device_snapshot.pn.as_ref(),
             device_snapshot.lid.as_ref(),
-        );
+        ) else {
+            return Ok(());
+        };
         let is_group_or_status = info.chat.is_group() || info.chat.is_status_broadcast();
 
         // WA Web doesn't dedupe receipts (Message/Queue.js just serializes per-chat);
@@ -259,6 +241,27 @@ impl Client {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&processing_key);
         });
+
+        // A retry from a device missing from our registry signals a stale device
+        // list for this user, so refresh it (rate-limited, dedup'd) to learn the
+        // device for the next send. Done before the message-cache lookup so an
+        // evicted retry still triggers it.
+        let sender_device_id = info.requester.device() as u32;
+        let device_known = self
+            .has_device(&info.requester.user, sender_device_id)
+            .await;
+        if !device_known {
+            // Parity with WA Web's MdRetryFromUnknownDevice WAM (id 2178), which
+            // commits here only — not from the shared inbound device sync, which
+            // schedule_unknown_device_sync is also called from elsewhere.
+            wacore::telemetry::retry_unknown_device(if sender_device_id == 0 {
+                "primary"
+            } else {
+                "companion"
+            });
+            self.schedule_unknown_device_sync(info.requester.to_non_ad(), receipt.offline)
+                .await;
+        }
 
         // Peek keeps the message in the cache, so we avoid the decode + re-encode
         // and the background DB delete + re-store that take + re-add did on every
@@ -306,11 +309,11 @@ impl Client {
             self.resolve_encryption_jid(&info.requester).await
         };
 
-        let sender_device_id = info.requester.device() as u32;
-        if !self
-            .has_device(&info.requester.user, sender_device_id)
-            .await
-        {
+        let keys_node_present = nr.get_optional_child("keys").is_some();
+        if wacore::protocol::retry::should_drop_unknown_device_retry(
+            keys_node_present,
+            device_known,
+        ) {
             warn!(
                 "handle_retry_receipt: device not found for device={}, user={}",
                 sender_device_id, info.requester.user
@@ -409,21 +412,25 @@ impl Client {
         // Mirror WAWebUpdateLocalSignalSession for all chat types: markForgetSenderKey
         // (group/status) + processKeyBundle + regId-mismatch delete + base-key logic.
         // Must run before ensureE2ESessions so any session deletion here is rebuilt there.
-        self.update_local_signal_session(
-            &info,
-            &resolved_jid,
-            &message_id,
-            retry_count,
-            nr,
-            is_peer,
-        )
-        .await;
+        if !self
+            .update_local_signal_session(
+                &info,
+                &resolved_jid,
+                &message_id,
+                retry_count,
+                nr,
+                is_peer,
+            )
+            .await
+        {
+            return Ok(());
+        }
 
         // Whatsmeow parity (`retry.go:284`). WA Web's regId/base-key check
         // doesn't catch silently-diverged sessions; this fallback does.
         if nr.get_optional_child("keys").is_none() {
             // Hold the per-peer session lock across the throttle check+stamp AND
-            // the delete so the recreate decision is atomic per peer. The moka
+            // the delete so the recreate decision is atomic per peer. The
             // `session_recreate_history` get+insert is not atomic on its own,
             // and retry receipts for different message_ids from the same peer
             // dispatch concurrently (detached spawn in `handle_receipt`), so
@@ -460,6 +467,22 @@ impl Client {
             return Ok(());
         }
 
+        // Bound the aggregate resend rate per group (the anti-abuse signal): a
+        // PN to LID fan-out has many distinct devices retry the same messages,
+        // which per-device/per-message caps miss. Group-only: the requester was
+        // marked for fresh SKDM above so future messages recover, and it
+        // re-requests this one on its own timer once the bucket refills. DMs have
+        // no SKDM fallback, so they keep the unconditional resend (bounded by
+        // MAX_RETRY_COUNT) rather than risk dropping a delivery.
+        if info.chat.is_group() && !self.resend_rate_limiter.try_acquire(&info.chat).await {
+            debug!(
+                "Throttling resend of {} to {}: per-chat resend rate cap reached",
+                message_id,
+                info.chat.observe()
+            );
+            return Ok(());
+        }
+
         info!(
             "Resending message {} to {} (retry #{})",
             message_id,
@@ -478,7 +501,7 @@ impl Client {
             self.ensure_e2e_sessions_resolved(std::slice::from_ref(&resolved_jid))
                 .await?;
 
-            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
 
             let addressing_mode = cached_group_info
                 .as_ref()
@@ -517,7 +540,7 @@ impl Client {
             self.ensure_e2e_sessions_resolved(std::slice::from_ref(&resolved_jid))
                 .await?;
 
-            let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
             let signal_address = resolved_jid.to_protocol_address();
             let session_mutex = self.session_lock_for(signal_address.as_str()).await;
             let _session_guard = session_mutex.lock().await;
@@ -572,7 +595,7 @@ impl Client {
         retry_count: u8,
         node: &NodeRef<'_>,
         is_peer: bool,
-    ) {
+    ) -> bool {
         // 1. markForgetSenderKey (WA Web L33-38). Rust unifies group and status
         //    under a single storage (chat JID as the key) — markForgetSenderKey
         //    handles both `@g.us` and `status@broadcast` as opaque group_jid.
@@ -608,7 +631,7 @@ impl Client {
         //    `!is_status_broadcast()`; WA Web runs it unconditionally.
         let keys_node_present = node.get_optional_child("keys").is_some();
         let key_bundle_result = self
-            .process_retry_key_bundle(node, resolved_jid, is_peer)
+            .process_retry_key_bundle(node, resolved_jid, is_peer, info.is_fbid_bot_retry)
             .await;
         let key_bundle_processed = key_bundle_result.is_ok();
 
@@ -618,10 +641,11 @@ impl Client {
         //    doesn't trigger destructive session deletion as a side effect.
         if !key_bundle_processed && keys_node_present {
             log::warn!(
-                "Key bundle present but rejected for {}: {:?} — skipping regId mismatch deletion",
+                "Key bundle present but rejected for {}: {:?} — aborting retry resend",
                 resolved_jid.observe(),
                 key_bundle_result.as_ref().err()
             );
+            return false;
         }
         if !key_bundle_processed && !keys_node_present {
             if let Err(ref e) = key_bundle_result {
@@ -634,17 +658,17 @@ impl Client {
                 );
             }
 
-            if let Some(received_reg_id) = extract_registration_id_from_node_ref(node) {
+            if let Some(received_reg_id) =
+                wacore::protocol::retry::extract_registration_id_from_node_ref(node)
+            {
                 let signal_address = resolved_jid.to_protocol_address();
-                let device_store = self.persistence_manager.get_device_arc().await;
-                let device_guard = device_store.read().await;
+                let device_snapshot = self.persistence_manager.get_device_snapshot();
                 let session = self
                     .signal_cache
-                    .peek_session(&signal_address, &*device_guard.backend)
+                    .peek_session(&signal_address, &*device_snapshot.backend)
                     .await
                     .ok()
                     .flatten();
-                drop(device_guard);
 
                 if let Some(session) = session
                     && let Ok(stored_reg_id) = session.remote_registration_id()
@@ -671,26 +695,25 @@ impl Client {
         // 4-5. Base-key collision logic (WA Web L66-80). Applied to ALL chat
         //      types now — previously only ran in the DM branch.
         let signal_address = resolved_jid.to_protocol_address();
-        let device_store = self.persistence_manager.get_device_arc().await;
-        let device_guard = device_store.read().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let session = self
             .signal_cache
-            .peek_session(&signal_address, &*device_guard.backend)
+            .peek_session(&signal_address, &*device_snapshot.backend)
             .await
             .ok()
             .flatten();
 
         let Some(session) = session else {
-            return;
+            return true;
         };
         let Ok(current_base_key) = session.alice_base_key() else {
-            return;
+            return true;
         };
 
         let addr_str = signal_address.as_str();
         if retry_count == MIN_RETRY_FOR_BASE_KEY_CHECK {
             // retry == 2: save base key, do NOT delete (WA Web L66-67).
-            match device_guard
+            match device_snapshot
                 .backend
                 .save_base_key(addr_str, message_id, current_base_key)
                 .await
@@ -706,27 +729,32 @@ impl Client {
                     e
                 ),
             }
-            return;
+            return true;
         }
 
         if retry_count > MIN_RETRY_FOR_BASE_KEY_CHECK {
-            match device_guard
+            match device_snapshot
                 .backend
                 .has_same_base_key(addr_str, message_id, current_base_key)
                 .await
             {
                 Ok(true) => {
-                    warn!(
-                        "Base key collision detected for {} at retry #{}. \
+                    // Informational, not WARN: this is the corrective action WA
+                    // Web takes here too (WAWebUpdateLocalSignalSession logs the
+                    // same-base-key delete via WALogger.LOG), and the three
+                    // sibling branches of this routine already log at info.
+                    info!(
+                        "Base key collision detected for {} (msg {}) at retry #{}. \
                          Session hasn't been regenerated. Forcing fresh session.",
                         wacore::types::jid::observe_protocol_address(&signal_address),
+                        message_id,
                         retry_count
                     );
-                    let _ = device_guard
+                    wacore::telemetry::base_key_collision();
+                    let _ = device_snapshot
                         .backend
                         .delete_base_key(addr_str, message_id)
                         .await;
-                    drop(device_guard);
                     let lock = self.session_lock_for(signal_address.as_str()).await;
                     let _guard = lock.lock().await;
                     self.signal_cache.delete_session(&signal_address).await;
@@ -739,11 +767,12 @@ impl Client {
                 }
                 Ok(false) => {
                     info!(
-                        "Base key changed for {} at retry #{} - session regenerated",
+                        "Base key changed for {} (msg {}) at retry #{} - session regenerated",
                         wacore::types::jid::observe_protocol_address(&signal_address),
+                        message_id,
                         retry_count
                     );
-                    let _ = device_guard
+                    let _ = device_snapshot
                         .backend
                         .delete_base_key(addr_str, message_id)
                         .await;
@@ -757,6 +786,7 @@ impl Client {
                 }
             }
         }
+        true
     }
 
     /// Mirrors whatsmeow's `shouldRecreateSession`. Returns `Some(reason)`
@@ -784,14 +814,13 @@ impl Client {
         now: wacore::time::Instant,
     ) -> Option<&'static str> {
         let signal_address = jid.to_protocol_address();
-        let device_store = self.persistence_manager.get_device_arc().await;
-        let device_guard = device_store.read().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         // Whatsmeow returns `false` on `ContainsSession` errors so a transient
         // backend read failure doesn't masquerade as "no session" and trigger
         // an unnecessary delete + prekey fetch (`retry.go:161-163`).
         let has_session = match self
             .signal_cache
-            .has_session(&signal_address, &*device_guard.backend)
+            .has_session(&signal_address, &*device_snapshot.backend)
             .await
         {
             Ok(present) => present,
@@ -803,7 +832,6 @@ impl Client {
                 return None;
             }
         };
-        drop(device_guard);
 
         let history = &self.session_recreate_history;
 
@@ -818,9 +846,9 @@ impl Client {
 
         // Throttle: skip if this peer was recreated within the timeout. This
         // explicit age check against the injectable `now` is the authoritative,
-        // deterministic gate. moka's 1h TTL on `session_recreate_history` is
-        // only a real-wall-clock memory backstop (it evicts on moka's own clock,
-        // which tests don't advance and which the stored `now` doesn't drive).
+        // deterministic gate. The cache's 1h TTL on `session_recreate_history`
+        // is only a memory backstop (lazy eviction independent of the stored
+        // `now`, so it can't drive the throttle decision).
         // Do NOT drop this check as "redundant with the TTL".
         if let Some(prev) = history.get(jid).await
             && now.saturating_duration_since(prev) < RECREATE_SESSION_TIMEOUT
@@ -839,36 +867,23 @@ impl Client {
     /// * `node` - The retry receipt node containing the key bundle
     /// * `requester_jid` - The JID of the device requesting the retry
     /// * `is_peer` - Whether this is a peer device (our own device)
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.process_key_bundle", level = "debug", skip_all, fields(peer = %requester_jid.observe(), is_peer), err(Debug)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.process_key_bundle", level = "debug", skip_all, fields(peer = %requester_jid.observe(), is_peer, is_fbid_bot_retry), err(Debug)))]
     async fn process_retry_key_bundle(
         &self,
         node: &NodeRef<'_>,
         requester_jid: &wacore_binary::Jid,
         is_peer: bool,
+        is_fbid_bot_retry: bool,
     ) -> Result<(), anyhow::Error> {
         let keys_node = node
             .get_optional_child("keys")
             .ok_or_else(|| anyhow::anyhow!("<keys> child missing from retry receipt"))?;
+        validate_retry_prekey_presence(keys_node, is_fbid_bot_retry)?;
 
-        let registration_node = node.get_optional_child("registration");
-
-        // Extract registration ID (4 bytes big-endian).
-        let registration_id = registration_node
-            .and_then(get_bytes_content_ref)
-            .map(|bytes| {
-                if bytes.len() >= 4 {
-                    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-                } else if !bytes.is_empty() {
-                    // Handle variable-length encoding.
-                    let mut arr = [0u8; 4];
-                    let start = 4 - bytes.len();
-                    arr[start..].copy_from_slice(bytes);
-                    u32::from_be_bytes(arr)
-                } else {
-                    0
-                }
-            })
-            .unwrap_or(0);
+        // Use the centralized extractor so the >4-byte rejection rule applies
+        // here too, not just on the no-keys retry path.
+        let registration_id =
+            wacore::protocol::retry::extract_registration_id_from_node_ref(node).unwrap_or(0);
 
         if registration_id == 0 {
             return Err(anyhow::anyhow!("Invalid registration ID in retry receipt"));
@@ -882,15 +897,13 @@ impl Client {
         // Check if the registration ID changed (indicates device reinstall).
         // Read session through cache for consistent state.
         {
-            let device_store = self.persistence_manager.get_device_arc().await;
-            let device_guard = device_store.read().await;
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
             let session = self
                 .signal_cache
-                .peek_session(&signal_address, &*device_guard.backend)
+                .peek_session(&signal_address, &*device_snapshot.backend)
                 .await
                 .ok()
                 .flatten();
-            drop(device_guard);
 
             if let Some(session) = session {
                 let existing_reg_id = session.remote_registration_id()?;
@@ -923,7 +936,10 @@ impl Client {
 
         // Companion devices ADV-bind the fetched identity via <device-identity>;
         // reject a present-but-invalid one so a relay can't swap in a forged key.
-        // Mirrors the prekey-fetch path; a missing one is logged, not fatal.
+        // Mirrors the prekey-fetch path. The account key is the in-blob
+        // `account_signature_key` or, when the server omits it, the contact's
+        // primary (device 0) identity from the store. An unverifiable-for-lack-of-key
+        // chain or a missing device-identity is logged, not fatal.
         if requester_jid.device != 0
             && let Some(device_identity) = keys_node
                 .get_optional_child("device-identity")
@@ -932,10 +948,21 @@ impl Client {
             let fetched_identity: [u8; 32] = identity_bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("identity key in retry receipt is not 32 bytes"))?;
-            if !wacore::adv::validate_adv_with_identity_key(device_identity, &fetched_identity) {
-                return Err(anyhow::anyhow!(
-                    "device-identity ADV validation failed for companion {requester_jid}"
-                ));
+            let account_identity = self.load_account_identity(requester_jid).await;
+            match wacore::adv::validate_adv_with_identity_key(
+                device_identity,
+                &fetched_identity,
+                account_identity.as_ref(),
+            ) {
+                wacore::adv::AdvValidation::Valid => {}
+                wacore::adv::AdvValidation::Invalid => {
+                    return Err(anyhow::anyhow!(
+                        "device-identity ADV validation failed for companion {requester_jid}"
+                    ));
+                }
+                wacore::adv::AdvValidation::NoAccountKey => log::debug!(
+                    "retry key bundle for companion {requester_jid} omits account_signature_key and no stored account identity; proceeding without ADV validation"
+                ),
             }
         } else if requester_jid.device != 0 {
             log::warn!(
@@ -1023,7 +1050,7 @@ impl Client {
         retry_count: u8,
         reason: RetryReason,
     ) -> Result<(), anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         // WA Web's sendRetryReceipt aborts only when `!to.isBot() && participant.isBot()`,
         // with participant null for DMs. A bot DM is chat == sender == bot, so it is NOT
@@ -1069,27 +1096,15 @@ impl Client {
             .build();
 
         let keys_node = if wacore::protocol::retry::should_include_keys(retry_count, reason) {
-            // Allocate the one-time prekey from the same monotonic NEXT_PK_ID counter as the
-            // upload path (WA Web's getOrGenSinglePreKey) so it can never overwrite a live pool
-            // key. Hold prekey_upload_lock to serialize the allocate+bump with uploads.
+            // WA Web's getOrGenSinglePreKey = getOrGenPreKeys(1): the retry
+            // prekey is the first unuploaded window key (reused when one is
+            // left over, freshly generated and stored otherwise) and the next
+            // batch upload re-offers it to the server pool. Hold
+            // prekey_upload_lock to serialize the watermark math with uploads.
             let prekey_guard = self.prekey_upload_lock.lock().await;
-            let new_prekey_id = self.allocate_next_one_time_prekey_id().await?;
-            let new_prekey_keypair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
-            let new_prekey_record = wacore::libsignal::store::record_helpers::new_pre_key_record(
-                new_prekey_id,
-                &new_prekey_keypair,
-            );
-            // This key is not uploaded to the server pool, so mark as false
-            let device_store = self.persistence_manager.get_device_arc().await;
-            let device_guard = device_store.read().await;
-            if let Err(e) = device_guard
-                .store_prekey(new_prekey_id, new_prekey_record, false)
-                .await
-            {
-                warn!("Failed to store new prekey for retry receipt: {e:?}");
-            }
-            drop(device_guard);
+            let (new_prekey_id, new_prekey_public) = self.get_or_gen_single_pre_key().await?;
             drop(prekey_guard);
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
 
             let device_identity_bytes = device_snapshot
                 .account
@@ -1100,7 +1115,7 @@ impl Client {
             Some(wacore::protocol::retry::build_retry_keys_node(
                 &device_snapshot.identity_key.public_key,
                 new_prekey_id,
-                &new_prekey_keypair.public_key,
+                &new_prekey_public,
                 device_snapshot.signed_pre_key_id,
                 &device_snapshot.signed_pre_key.public_key,
                 device_snapshot.signed_pre_key_signature.to_vec(),
@@ -1186,7 +1201,7 @@ impl Client {
         call_creator: &wacore_binary::Jid,
         retry_count: u8,
     ) -> Result<(), anyhow::Error> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         let registration_id_bytes = device_snapshot.registration_id.to_be_bytes().to_vec();
 
@@ -1227,9 +1242,29 @@ mod tests {
     use crate::test_utils::MockHttpClient;
     use std::borrow::Cow;
     use std::sync::Arc;
+    use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair};
     use wacore::types::jid::JidExt as _;
     use wacore_binary::{Jid, JidExt};
     use waproto::whatsapp as wa;
+
+    fn resolve_retry_chat_info(
+        receipt: &Receipt,
+        node: &NodeRef<'_>,
+        own_pn: Option<&Jid>,
+        own_lid: Option<&Jid>,
+    ) -> RetryChatInfo {
+        super::resolve_retry_chat_info(receipt, node, own_pn, own_lid)
+            .expect("retry should resolve a target chat")
+    }
+
+    fn maybe_resolve_retry_chat_info(
+        receipt: &Receipt,
+        node: &NodeRef<'_>,
+        own_pn: Option<&Jid>,
+        own_lid: Option<&Jid>,
+    ) -> Option<RetryChatInfo> {
+        super::resolve_retry_chat_info(receipt, node, own_pn, own_lid)
+    }
 
     #[tokio::test]
     async fn recent_message_cache_insert_and_take() {
@@ -1806,6 +1841,7 @@ mod tests {
             original_from: resolved_jid.clone(),
             recipient: None,
             is_bot: false,
+            is_fbid_bot_retry: false,
         }
     }
 
@@ -2029,6 +2065,7 @@ mod tests {
             original_from: group_chat,
             recipient: None,
             is_bot: false,
+            is_fbid_bot_retry: false,
         };
 
         let node = build_retry_receipt_without_keys();
@@ -2134,9 +2171,9 @@ mod tests {
         );
     }
 
-    /// The moka `session_recreate_history` is capacity-bounded (256), unlike the
+    /// The `session_recreate_history` is capacity-bounded (256), unlike the
     /// old age-only prune which never evicted a still-recent entry. Under more
-    /// than that many distinct peers retrying within the window, moka can evict
+    /// than that many distinct peers retrying within the window, the cache can evict
     /// a recent entry, costing at most one extra recreate for that peer
     /// (bounded and self-healing: re-stamped on the next receipt), never the
     /// unbounded prekey loop the throttle prevents. Documents that trade-off.
@@ -2163,8 +2200,126 @@ mod tests {
         );
     }
 
+    /// The resend rate limiter is reachable and tunable through the public
+    /// `Client` API, and its drops surface on `resends_throttled_total`. Covers
+    /// the wiring the `handle_retry_receipt` hook relies on; the bucket logic
+    /// itself is unit-tested in `resend_rate_limiter`.
+    #[tokio::test]
+    async fn client_resend_rate_limiter_is_wired_and_tunable() {
+        let client =
+            crate::test_utils::create_test_client_with_failing_http("resend_rl_wired").await;
+        let chat: Jid = "120363021033254949@g.us".parse().unwrap();
+
+        // Tight ceiling, no refill: the bucket holds exactly `burst` tokens.
+        client.set_resend_rate_limit(3, 0);
+        let mut allowed = 0;
+        for _ in 0..10 {
+            if client.resend_rate_limiter.try_acquire(&chat).await {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 3, "client honors the configured per-chat burst");
+        assert_eq!(
+            client.resends_throttled_total(),
+            7,
+            "public counter tracks dropped resends"
+        );
+
+        // Disabling restores unthrottled behavior.
+        client.set_resend_rate_limit(0, 0);
+        let other: Jid = "120363000000000001@g.us".parse().unwrap();
+        for _ in 0..50 {
+            assert!(client.resend_rate_limiter.try_acquire(&other).await);
+        }
+    }
+
+    /// End-to-end: a throttled group retry drops the resend (returns Ok, sends
+    /// nothing) while the path up to the limiter still runs, and the cached
+    /// message is retained for the device's later re-request. Exercises the hook
+    /// placement and the no-resend-on-refusal semantics the unit tests cannot.
+    #[tokio::test]
+    async fn handle_retry_receipt_drops_throttled_group_resend() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(PersistenceManager::new(backend).await.unwrap());
+        let mut config = crate::cache_config::CacheConfig::default();
+        config.recent_messages.capacity = 1_000;
+        let (client, _rx) = Client::new_with_cache_config(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+            config,
+        )
+        .await;
+
+        let group: Jid = "120363021033254949@g.us".parse().unwrap();
+        let msg_id = "RLMSG001";
+        client
+            .add_recent_message(
+                &group,
+                msg_id,
+                &wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        // Drain the single token so the incoming retry must be throttled; the
+        // throttle returns before any network resend, keeping the test offline.
+        client.set_resend_rate_limit(1, 0);
+        assert!(client.resend_rate_limiter.try_acquire(&group).await);
+
+        // Inbound group retry from a device-0 LID participant: has_device's
+        // device-0 fast path makes it known, LID skips rotateKey, and no <keys>
+        // leaves update_local_signal_session a noop on a missing session.
+        let node = NodeBuilder::new("receipt")
+            .attr("participant", "555000111@lid")
+            .children([NodeBuilder::new("retry")
+                .attr("id", msg_id)
+                .attr("count", "1")
+                .build()])
+            .build();
+        let node_ref = crate::test_utils::node_to_owned_ref(&node);
+        let receipt = Receipt {
+            source: crate::types::message::MessageSource {
+                chat: group.clone(),
+                sender: "555000111@lid".parse().unwrap(),
+                is_group: true,
+                ..Default::default()
+            },
+            message_ids: vec![msg_id.to_string()],
+            timestamp: wacore::time::now_utc(),
+            r#type: crate::types::presence::ReceiptType::Retry,
+            offline: false,
+        };
+
+        let result = client.handle_retry_receipt(&receipt, &node_ref).await;
+        assert!(
+            result.is_ok(),
+            "a throttled retry returns Ok(()), not an error"
+        );
+        assert_eq!(
+            client.resends_throttled_total(),
+            1,
+            "the resend was dropped by the limiter"
+        );
+        assert!(
+            client.peek_recent_message(&group, msg_id).await.is_some(),
+            "throttling keeps the message cached for the device's re-request"
+        );
+        assert_eq!(
+            client.pending_retries.lock().unwrap().len(),
+            0,
+            "the in-progress marker is cleared after the throttled return"
+        );
+    }
+
     /// Atomicity guard for the per-peer session lock the retry caller wraps
-    /// around the recreate check+stamp. moka's get+insert is not atomic, and
+    /// around the recreate check+stamp. The cache's get+insert is not atomic, and
     /// same-peer retries for different message_ids dispatch concurrently, so
     /// without the lock both could observe a cold history and recreate. Holding
     /// `session_lock_for` serializes the decision: exactly one recreate fires.
@@ -2247,6 +2402,88 @@ mod tests {
             .expect("no-op when session exists");
     }
 
+    #[tokio::test]
+    async fn retry_key_bundle_requires_one_time_prekey_except_fbid_bot() {
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        let (client, _sync_rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+        )
+        .await;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let remote_identity = IdentityKeyPair::generate(&mut rng);
+        let signed_prekey = KeyPair::generate(&mut rng);
+        let signed_prekey_signature = remote_identity
+            .private_key()
+            .calculate_signature(&signed_prekey.public_key.serialize(), &mut rng)
+            .expect("signed prekey signature should be valid");
+
+        let regular_requester = Jid::pn_device("559922223333", 1);
+        let keys = NodeBuilder::new("keys")
+            .children([
+                NodeBuilder::new("type").bytes(vec![5]).build(),
+                NodeBuilder::new("identity")
+                    .bytes(
+                        remote_identity
+                            .identity_key()
+                            .public_key()
+                            .public_key_bytes()
+                            .to_vec(),
+                    )
+                    .build(),
+                SignedPreKeyNode::new(
+                    100,
+                    signed_prekey.public_key.public_key_bytes().to_vec(),
+                    signed_prekey_signature.to_vec(),
+                )
+                .into_node(),
+            ])
+            .build();
+        let receipt = NodeBuilder::new("receipt")
+            .children([
+                NodeBuilder::new("registration")
+                    .bytes(12345u32.to_be_bytes().to_vec())
+                    .build(),
+                keys,
+            ])
+            .build();
+
+        let err = client
+            .process_retry_key_bundle(&receipt.as_node_ref(), &regular_requester, false, false)
+            .await
+            .expect_err("regular retry without one-time prekey must be rejected");
+        assert!(
+            err.to_string()
+                .contains("regular retry key bundle missing one-time prekey")
+        );
+
+        let fbid_bot_requester = Jid::new("200000000000002", wacore_binary::Server::Bot);
+        client
+            .process_retry_key_bundle(&receipt.as_node_ref(), &fbid_bot_requester, false, true)
+            .await
+            .expect("fbid bot retry without one-time prekey should establish a session");
+
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        let session = client
+            .signal_cache
+            .peek_session(
+                &fbid_bot_requester.to_protocol_address(),
+                &*snapshot.backend,
+            )
+            .await
+            .expect("session lookup should succeed");
+        assert!(session.is_some());
+    }
+
     #[test]
     fn bot_jid_detection() {
         // Test bot JID detection for bot message filtering
@@ -2275,59 +2512,67 @@ mod tests {
 
     #[test]
     fn extract_registration_id_from_node_test() {
+        use wacore::protocol::retry::{
+            extract_registration_id_from_node, extract_registration_id_from_node_ref,
+        };
         use wacore_binary::{Attrs, Node};
 
-        // Test with 4-byte registration ID
-        let reg_bytes = vec![0x00, 0x01, 0x02, 0x03]; // = 66051
-        let reg_node = Node {
-            tag: Cow::Borrowed("registration"),
-            attrs: Attrs::new(),
-            content: Some(NodeContent::Bytes(reg_bytes)),
-        };
-        let parent = Node {
+        let reg_receipt = |bytes: Vec<u8>| Node {
             tag: Cow::Borrowed("receipt"),
             attrs: Attrs::new(),
-            content: Some(NodeContent::Nodes(vec![reg_node])),
+            content: Some(NodeContent::Nodes(vec![Node {
+                tag: Cow::Borrowed("registration"),
+                attrs: Attrs::new(),
+                content: Some(NodeContent::Bytes(bytes)),
+            }])),
         };
-        assert_eq!(extract_registration_id_from_node(&parent), Some(0x00010203));
 
-        // Test with 3-byte registration ID (variable length)
-        let reg_bytes_short = vec![0x01, 0x02, 0x03]; // = 66051
-        let reg_node_short = Node {
-            tag: Cow::Borrowed("registration"),
-            attrs: Attrs::new(),
-            content: Some(NodeContent::Bytes(reg_bytes_short)),
-        };
-        let parent_short = Node {
-            tag: Cow::Borrowed("receipt"),
-            attrs: Attrs::new(),
-            content: Some(NodeContent::Nodes(vec![reg_node_short])),
-        };
+        // 4-byte registration ID.
+        let parent = reg_receipt(vec![0x00, 0x01, 0x02, 0x03]);
+        assert_eq!(extract_registration_id_from_node(&parent), Some(0x00010203));
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent.as_node_ref()),
+            Some(0x00010203)
+        );
+
+        // 3-byte registration ID (variable length, left zero-padded).
+        let parent_short = reg_receipt(vec![0x01, 0x02, 0x03]);
         assert_eq!(
             extract_registration_id_from_node(&parent_short),
             Some(0x00010203)
         );
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent_short.as_node_ref()),
+            Some(0x00010203)
+        );
 
-        // Test with no registration node
+        // Oversized (>4 byte) payload: rejected, not truncated, on both paths.
+        let parent_oversized = reg_receipt(vec![0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(extract_registration_id_from_node(&parent_oversized), None);
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent_oversized.as_node_ref()),
+            None
+        );
+
+        // No registration node.
         let parent_no_reg = Node {
             tag: Cow::Borrowed("receipt"),
             attrs: Attrs::new(),
             content: Some(NodeContent::Nodes(vec![])),
         };
         assert_eq!(extract_registration_id_from_node(&parent_no_reg), None);
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent_no_reg.as_node_ref()),
+            None
+        );
 
-        // Test with empty bytes
-        let reg_node_empty = Node {
-            tag: Cow::Borrowed("registration"),
-            attrs: Attrs::new(),
-            content: Some(NodeContent::Bytes(vec![])),
-        };
-        let parent_empty = Node {
-            tag: Cow::Borrowed("receipt"),
-            attrs: Attrs::new(),
-            content: Some(NodeContent::Nodes(vec![reg_node_empty])),
-        };
+        // Empty bytes.
+        let parent_empty = reg_receipt(vec![]);
         assert_eq!(extract_registration_id_from_node(&parent_empty), None);
+        assert_eq!(
+            extract_registration_id_from_node_ref(&parent_empty.as_node_ref()),
+            None
+        );
     }
 
     #[test]
@@ -2686,6 +2931,58 @@ mod tests {
     }
 
     #[test]
+    fn resolve_retry_chat_info_group_bot_device_marks_bot_namespace_only() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt")
+            .attr("participant", "somebot:4@bot")
+            .build();
+        let receipt = Receipt {
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "somebot:4@bot".parse().unwrap(),
+                ..Default::default()
+            },
+            message_ids: vec!["MSG001".to_string()],
+            timestamp: wacore::time::now_utc(),
+            r#type: crate::types::presence::ReceiptType::Retry,
+            offline: false,
+        };
+
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        assert!(info.chat.is_group());
+        assert!(info.is_bot);
+        assert!(!info.is_fbid_bot_retry);
+    }
+
+    #[test]
+    fn resolve_retry_chat_info_group_primary_fbid_bot_marks_bot_retry() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt")
+            .attr("participant", "somebot@bot")
+            .build();
+        let receipt = Receipt {
+            source: crate::types::message::MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "somebot@bot".parse().unwrap(),
+                ..Default::default()
+            },
+            message_ids: vec!["MSG001".to_string()],
+            timestamp: wacore::time::now_utc(),
+            r#type: crate::types::presence::ReceiptType::Retry,
+            offline: false,
+        };
+
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        assert!(info.chat.is_group());
+        assert!(info.is_bot);
+        assert!(info.is_fbid_bot_retry);
+    }
+
+    #[test]
     fn resolve_retry_chat_info_status_broadcast() {
         use wacore_binary::builder::NodeBuilder;
 
@@ -2915,8 +3212,8 @@ mod tests {
         client
             .lid_pn_cache
             .add(&wacore::types::lid_pn::LidPnEntry {
-                lid: lid_jid.user.to_string(),
-                phone_number: pn_jid.user.to_string(),
+                lid: lid_jid.user.as_str().into(),
+                phone_number: pn_jid.user.as_str().into(),
                 created_at: 0,
                 learning_source: wacore::types::lid_pn::LearningSource::Usync,
             })
@@ -2964,8 +3261,8 @@ mod tests {
         client
             .lid_pn_cache
             .add(&wacore::types::lid_pn::LidPnEntry {
-                lid: lid_jid.user.to_string(),
-                phone_number: pn_jid.user.to_string(),
+                lid: lid_jid.user.as_str().into(),
+                phone_number: pn_jid.user.as_str().into(),
                 created_at: 0,
                 learning_source: wacore::types::lid_pn::LearningSource::Usync,
             })
@@ -3032,8 +3329,8 @@ mod tests {
         client
             .lid_pn_cache
             .add(&wacore::types::lid_pn::LidPnEntry {
-                lid: lid_jid.user.to_string(),
-                phone_number: pn_jid.user.to_string(),
+                lid: lid_jid.user.as_str().into(),
+                phone_number: pn_jid.user.as_str().into(),
                 created_at: 0,
                 learning_source: wacore::types::lid_pn::LearningSource::Usync,
             })
@@ -3130,8 +3427,8 @@ mod tests {
         client
             .lid_pn_cache
             .add(&wacore::types::lid_pn::LidPnEntry {
-                lid: lid_jid.user.to_string(),
-                phone_number: pn_jid.user.to_string(),
+                lid: lid_jid.user.as_str().into(),
+                phone_number: pn_jid.user.as_str().into(),
                 created_at: 0,
                 learning_source: wacore::types::lid_pn::LearningSource::Usync,
             })
@@ -3171,16 +3468,15 @@ mod tests {
     fn resolve_retry_chat_info_peer_device_without_recipient() {
         use wacore_binary::builder::NodeBuilder;
 
-        // Peer retry without recipient attr — should fall back to from
+        // Peer retry without recipient attr has no target chat in WA Web.
         let our_pn: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
         let node = NodeBuilder::new("receipt").build();
         let receipt = make_test_receipt("5511999999999:2@s.whatsapp.net");
 
-        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), Some(&our_pn), None);
+        let info =
+            maybe_resolve_retry_chat_info(&receipt, &node.as_node_ref(), Some(&our_pn), None);
 
-        // Falls back to from.to_non_ad() (our own bare JID)
-        assert_eq!(info.chat.user, our_pn.user);
-        assert_eq!(info.chat.device(), 0);
+        assert!(info.is_none());
     }
 
     #[test]
@@ -3196,6 +3492,10 @@ mod tests {
         let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
 
         assert!(info.is_bot, "bot JID should be detected");
+        assert!(
+            !info.is_fbid_bot_retry,
+            "legacy PN bots use the regular retry parser"
+        );
         // Chat should be the recipient
         assert_eq!(info.chat.user, "5522888888888");
         assert_eq!(info.chat.device(), 0);
@@ -3212,8 +3512,25 @@ mod tests {
         let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
 
         assert!(info.is_bot);
+        assert!(!info.is_fbid_bot_retry);
         // Without recipient, falls to from.to_non_ad()
         assert_eq!(info.chat.user, "131355500001");
+    }
+
+    #[test]
+    fn resolve_retry_chat_info_fbid_bot_dm_marks_bot_retry() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt")
+            .attr("recipient", "5522888888888@s.whatsapp.net")
+            .build();
+        let receipt = make_test_receipt("200000000000002@bot");
+
+        let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
+
+        assert!(info.is_bot);
+        assert!(info.is_fbid_bot_retry);
+        assert_eq!(info.chat.user, "5522888888888");
     }
 
     #[test]

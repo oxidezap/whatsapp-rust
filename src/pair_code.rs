@@ -156,7 +156,7 @@ impl Client {
         let ephemeral_keypair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
 
         // Get device state for noise key
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let noise_static_pub: [u8; 32] = device_snapshot
             .noise_key
             .public_key
@@ -334,7 +334,7 @@ pub(crate) async fn handle_pair_code_notification(
     };
 
     // Get device keys
-    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+    let device_snapshot = client.persistence_manager.get_device_snapshot();
 
     // Prepare encrypted key bundle (includes rotated adv_secret_key)
     let (wrapped_bundle, new_adv_secret) = match PairCodeUtils::prepare_key_bundle(

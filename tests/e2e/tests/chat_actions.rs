@@ -18,7 +18,6 @@ async fn test_archive_chat() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -46,7 +45,6 @@ async fn test_unarchive_chat() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -84,7 +82,6 @@ async fn test_pin_chat() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -108,7 +105,6 @@ async fn test_unpin_chat() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -137,7 +133,6 @@ async fn test_mute_chat_indefinite() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -161,7 +156,6 @@ async fn test_mute_chat_with_expiry() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -192,7 +186,6 @@ async fn test_unmute_chat() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -222,7 +215,6 @@ async fn test_star_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -265,7 +257,6 @@ async fn test_unstar_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -315,7 +306,6 @@ async fn test_multiple_chat_actions() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -366,7 +356,6 @@ async fn test_mark_chat_as_read() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -401,7 +390,6 @@ async fn test_delete_chat() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -429,7 +417,6 @@ async fn test_delete_message_for_me() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 

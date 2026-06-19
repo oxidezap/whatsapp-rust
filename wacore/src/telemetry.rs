@@ -37,6 +37,26 @@ mod imp {
     pub fn retry_receipt(reason: &'static str) {
         counter!("wa_retry_receipt_total", "reason" => reason).increment(1);
     }
+    /// Retry receipt sent at the high-retry watermark (count >= MAX), by reason.
+    /// Mirrors WA Web's MessageHighRetryCount WAM event (id 3132).
+    pub fn high_retry(reason: &'static str) {
+        counter!("wa_high_retry_total", "reason" => reason).increment(1);
+    }
+    /// Retry receipt from a device not in our registry, by sender type
+    /// (`primary`/`companion`). Mirrors WA Web's MdRetryFromUnknownDevice WAM (id 2178).
+    pub fn retry_unknown_device(sender_type: &'static str) {
+        counter!("wa_retry_unknown_device_total", "sender_type" => sender_type).increment(1);
+    }
+    /// Retry refused at the MAX_RETRY loop guard. Aggregate health signal for a
+    /// chronically thrashing peer (WA Web logs this via WALogger.LOG, no WAM).
+    pub fn retry_refused() {
+        counter!("wa_retry_refused_total").increment(1);
+    }
+    /// Base-key collision that forced a fresh session (same base key after a
+    /// re-key, so the session was deleted and recreated).
+    pub fn base_key_collision() {
+        counter!("wa_base_key_collision_total").increment(1);
+    }
     /// IQ request completed, by result (`ok`/`timeout`/`error`). Emitted at the
     /// single request chokepoint, so it covers both raw and spec-based IQs.
     pub fn iq(result: &'static str) {
@@ -111,6 +131,26 @@ mod imp {
             "Retry receipts sent, by reason"
         );
         describe_counter!(
+            "wa_high_retry_total",
+            Unit::Count,
+            "Retry receipts sent at the high-retry watermark (count >= MAX), by reason"
+        );
+        describe_counter!(
+            "wa_retry_unknown_device_total",
+            Unit::Count,
+            "Retries from devices not in our registry, by sender type"
+        );
+        describe_counter!(
+            "wa_retry_refused_total",
+            Unit::Count,
+            "Retries refused at the MAX_RETRY loop guard"
+        );
+        describe_counter!(
+            "wa_base_key_collision_total",
+            Unit::Count,
+            "Base-key collisions that forced a fresh session"
+        );
+        describe_counter!(
             "wa_iq_total",
             Unit::Count,
             "IQ requests by result (ok/timeout/error)"
@@ -179,6 +219,14 @@ mod imp {
     pub fn send(_kind: &'static str) {}
     #[inline]
     pub fn retry_receipt(_reason: &'static str) {}
+    #[inline]
+    pub fn high_retry(_reason: &'static str) {}
+    #[inline]
+    pub fn retry_unknown_device(_sender_type: &'static str) {}
+    #[inline]
+    pub fn retry_refused() {}
+    #[inline]
+    pub fn base_key_collision() {}
     #[inline]
     pub fn iq(_result: &'static str) {}
     #[inline]

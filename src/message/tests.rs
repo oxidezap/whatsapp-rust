@@ -737,7 +737,7 @@ impl AlicePeer {
 /// `create_test_client_with_name` returns an unpaired client by default
 /// so `device_snapshot.lid` / `.pn` are both `None`.
 async fn ensure_bob_paired(client: &Arc<Client>) {
-    let snapshot = client.persistence_manager.get_device_snapshot().await;
+    let snapshot = client.persistence_manager.get_device_snapshot();
     if snapshot.lid.is_some() || snapshot.pn.is_some() {
         return;
     }
@@ -761,7 +761,7 @@ async fn ensure_bob_paired(client: &Arc<Client>) {
 async fn bobs_prekey_bundle(client: &Arc<Client>) -> (PreKeyBundle, Jid) {
     use wacore::libsignal::protocol::GenericSignedPreKey;
     ensure_bob_paired(client).await;
-    let snapshot = client.persistence_manager.get_device_snapshot().await;
+    let snapshot = client.persistence_manager.get_device_snapshot();
     let identity_kp = snapshot.core.identity_key.clone();
     let reg_id = snapshot.core.registration_id;
 
@@ -1011,7 +1011,11 @@ async fn migration_plaintext_failure_nacks_without_signal_retry() {
         .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
         .await;
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         None,
         "local protobuf failure after migration must not request Signal retry"
     );
@@ -1032,39 +1036,29 @@ async fn test_badmac_preserves_session() {
     let (bob_bundle, _) = bobs_prekey_bundle(&client).await;
     alice
         .install_bob_session(
-            &client
-                .persistence_manager
-                .get_device_snapshot()
-                .await
-                .lid
-                .clone()
-                .or(client
-                    .persistence_manager
-                    .get_device_snapshot()
-                    .await
-                    .pn
-                    .clone())
-                .expect("own jid")
-                .to_protocol_address(),
+            &{
+                let snapshot = client.persistence_manager.get_device_snapshot();
+                snapshot
+                    .lid
+                    .as_ref()
+                    .or(snapshot.pn.as_ref())
+                    .expect("own jid")
+                    .to_protocol_address()
+            },
             &bob_bundle,
         )
         .await;
 
     // First message: pkmsg lands on Bob and installs Bob's reciprocal session.
-    let bob_addr = client
-        .persistence_manager
-        .get_device_snapshot()
-        .await
-        .lid
-        .clone()
-        .or(client
-            .persistence_manager
-            .get_device_snapshot()
-            .await
-            .pn
-            .clone())
-        .expect("own jid")
-        .to_protocol_address();
+    let bob_addr = {
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        snapshot
+            .lid
+            .as_ref()
+            .or(snapshot.pn.as_ref())
+            .expect("own jid")
+            .to_protocol_address()
+    };
     let pkmsg = alice.encrypt_text(&bob_addr, "hello").await;
     let (s1, _, _, still1) = submit_and_check_session(&client, &alice.jid, &pkmsg).await;
     assert!(s1, "pkmsg should establish session and decrypt");
@@ -1166,21 +1160,18 @@ async fn await_retry_receipt(
         .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
         .await;
     for _ in 0..200 {
-        if let (Some(c), Some(r)) = (
-            client.message_retry_counts.get(&cache_key).await,
-            client.recent_retry_reasons.get(&cache_key).await,
-        ) && c == expected_count
+        if let Some((c, Some(r))) = client.message_retry_counts.get(&cache_key).await
+            && c == expected_count
             && r == expected_reason
         {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    let count = client.message_retry_counts.get(&cache_key).await;
-    let reason = client.recent_retry_reasons.get(&cache_key).await;
+    let state = client.message_retry_counts.get(&cache_key).await;
     panic!(
         "expected retry ({expected_count}, {expected_reason:?}) for {cache_key}, \
-             got ({count:?}, {reason:?})"
+             got {state:?}"
     );
 }
 
@@ -1210,20 +1201,15 @@ async fn test_prod_scenario_pkmsg_archives_old_session_after_badmac() {
 
     // X3DH round 1 — Alice initiates with Bob's bundle, sends pkmsg.
     let (bundle_v1, _) = bobs_prekey_bundle(&client).await;
-    let bob_addr = client
-        .persistence_manager
-        .get_device_snapshot()
-        .await
-        .lid
-        .clone()
-        .or(client
-            .persistence_manager
-            .get_device_snapshot()
-            .await
-            .pn
-            .clone())
-        .expect("own jid")
-        .to_protocol_address();
+    let bob_addr = {
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        snapshot
+            .lid
+            .as_ref()
+            .or(snapshot.pn.as_ref())
+            .expect("own jid")
+            .to_protocol_address()
+    };
     alice.install_bob_session(&bob_addr, &bundle_v1).await;
     let pkmsg_v1 = alice.encrypt_text(&bob_addr, "v1").await;
     let (s1, _, _, _) = submit_and_check_session(&client, &alice.jid, &pkmsg_v1).await;
@@ -1768,9 +1754,7 @@ async fn test_parse_message_info_sender_alt_extraction() {
     );
 
     // Set up own phone number and LID
-    {
-        let device_arc = pm.get_device_arc().await;
-        let mut device = device_arc.write().await;
+    pm.modify_device(|device| {
         device.pn = Some(
             "15551234567@s.whatsapp.net"
                 .parse()
@@ -1781,7 +1765,8 @@ async fn test_parse_message_info_sender_alt_extraction() {
                 .parse()
                 .expect("test JID should be valid"),
         );
-    }
+    })
+    .await;
 
     let (client, _sync_rx) = Client::new(
         Arc::new(crate::runtime_impl::TokioRuntime),
@@ -2468,9 +2453,7 @@ async fn test_parse_message_info_self_sent_dm_via_lid() {
     );
 
     // Set up own phone number and LID
-    {
-        let device_arc = pm.get_device_arc().await;
-        let mut device = device_arc.write().await;
+    pm.modify_device(|device| {
         device.pn = Some(
             "15551234567@s.whatsapp.net"
                 .parse()
@@ -2481,7 +2464,8 @@ async fn test_parse_message_info_self_sent_dm_via_lid() {
                 .parse()
                 .expect("test JID should be valid"),
         );
-    }
+    })
+    .await;
 
     let (client, _sync_rx) = Client::new(
         Arc::new(crate::runtime_impl::TokioRuntime),
@@ -2567,9 +2551,7 @@ async fn test_parse_message_info_dm_from_other_via_lid() {
     );
 
     // Set up own phone number and LID
-    {
-        let device_arc = pm.get_device_arc().await;
-        let mut device = device_arc.write().await;
+    pm.modify_device(|device| {
         device.pn = Some(
             "15551234567@s.whatsapp.net"
                 .parse()
@@ -2580,7 +2562,8 @@ async fn test_parse_message_info_dm_from_other_via_lid() {
                 .parse()
                 .expect("test JID should be valid"),
         );
-    }
+    })
+    .await;
 
     let (client, _sync_rx) = Client::new(
         Arc::new(crate::runtime_impl::TokioRuntime),
@@ -2662,9 +2645,7 @@ async fn test_parse_message_info_dm_to_self() {
     );
 
     // Set up own phone number and LID
-    {
-        let device_arc = pm.get_device_arc().await;
-        let mut device = device_arc.write().await;
+    pm.modify_device(|device| {
         device.pn = Some(
             "15551234567@s.whatsapp.net"
                 .parse()
@@ -2675,7 +2656,8 @@ async fn test_parse_message_info_dm_to_self() {
                 .parse()
                 .expect("test JID should be valid"),
         );
-    }
+    })
+    .await;
 
     let (client, _sync_rx) = Client::new(
         Arc::new(crate::runtime_impl::TokioRuntime),
@@ -3405,6 +3387,7 @@ fn create_test_message_info(chat: &str, msg_id: &str, sender: &str) -> MessageIn
         verified_level: None,
         verified_name_serial: None,
         peer_recipient_pn: None,
+        comment_target: None,
         bcl_participants: Vec::new(),
     }
 }
@@ -3457,7 +3440,11 @@ async fn test_increment_retry_count_starts_at_one() {
     assert_eq!(count, Some(1), "First retry should be count 1");
 
     // Verify it's stored in cache
-    let stored = client.message_retry_counts.get(cache_key).await;
+    let stored = client
+        .message_retry_counts
+        .get(cache_key)
+        .await
+        .map(|(c, _)| c);
     assert_eq!(stored, Some(1), "Cache should store count 1");
 }
 
@@ -3507,7 +3494,11 @@ async fn test_increment_retry_count_respects_max_retries() {
     );
 
     // Verify cache still has max value
-    let stored = client.message_retry_counts.get(cache_key).await;
+    let stored = client
+        .message_retry_counts
+        .get(cache_key)
+        .await
+        .map(|(c, _)| c);
     assert_eq!(stored, Some(5), "Cache should retain max count");
 }
 
@@ -3542,9 +3533,18 @@ async fn test_retry_count_different_messages_are_independent() {
         .await; // key3 = 2
 
     // Verify each has independent counts
-    assert_eq!(client.message_retry_counts.get(key1).await, Some(3));
-    assert_eq!(client.message_retry_counts.get(key2).await, Some(1));
-    assert_eq!(client.message_retry_counts.get(key3).await, Some(2));
+    assert_eq!(
+        client.message_retry_counts.get(key1).await.map(|(c, _)| c),
+        Some(3)
+    );
+    assert_eq!(
+        client.message_retry_counts.get(key2).await.map(|(c, _)| c),
+        Some(1)
+    );
+    assert_eq!(
+        client.message_retry_counts.get(key3).await.map(|(c, _)| c),
+        Some(2)
+    );
 }
 
 #[tokio::test]
@@ -3633,7 +3633,11 @@ async fn test_concurrent_retry_increments() {
     );
 
     // Final count should be 5 (max)
-    let final_count = client.message_retry_counts.get(cache_key).await;
+    let final_count = client
+        .message_retry_counts
+        .get(cache_key)
+        .await
+        .map(|(c, _)| c);
     assert_eq!(final_count, Some(5), "Final count should be capped at 5");
 }
 
@@ -3698,7 +3702,11 @@ async fn test_retry_count_cache_expiration() {
     assert_eq!(count, Some(1));
 
     // Entry should still exist immediately after
-    let stored = client.message_retry_counts.get(cache_key).await;
+    let stored = client
+        .message_retry_counts
+        .get(cache_key)
+        .await
+        .map(|(c, _)| c);
     assert!(
         stored.is_some(),
         "Entry should exist immediately after insert"
@@ -3721,7 +3729,12 @@ async fn test_spawn_retry_receipt_basic_flow() {
 
     // Verify count starts at 0
     assert!(
-        client.message_retry_counts.get(&cache_key).await.is_none(),
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c)
+            .is_none(),
         "Cache should be empty initially"
     );
 
@@ -3733,7 +3746,11 @@ async fn test_spawn_retry_receipt_basic_flow() {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Verify count was incremented (the actual send will fail due to no connection, but count should update)
-    let stored = client.message_retry_counts.get(&cache_key).await;
+    let stored = client
+        .message_retry_counts
+        .get(&cache_key)
+        .await
+        .map(|(c, _)| c);
     assert_eq!(stored, Some(1), "Retry count should be 1 after spawn");
 }
 
@@ -3751,12 +3768,16 @@ async fn test_spawn_retry_receipt_respects_max_retries() {
     // Pre-fill cache to max retries
     client
         .message_retry_counts
-        .insert(cache_key.clone(), MAX_DECRYPT_RETRIES)
+        .insert(cache_key.clone(), (MAX_DECRYPT_RETRIES, None))
         .await;
 
     // Verify count is at max
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(MAX_DECRYPT_RETRIES)
     );
 
@@ -3768,7 +3789,11 @@ async fn test_spawn_retry_receipt_respects_max_retries() {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Count should still be at max (not incremented)
-    let stored = client.message_retry_counts.get(&cache_key).await;
+    let stored = client
+        .message_retry_counts
+        .get(&cache_key)
+        .await
+        .map(|(c, _)| c);
     assert_eq!(
         stored,
         Some(MAX_DECRYPT_RETRIES),
@@ -3831,12 +3856,12 @@ async fn test_multiple_senders_same_message_id_tracked_separately() {
 
     // Verify independent tracking
     assert_eq!(
-        client.message_retry_counts.get(&key1).await,
+        client.message_retry_counts.get(&key1).await.map(|(c, _)| c),
         Some(3),
         "Sender1 should have 3 retries"
     );
     assert_eq!(
-        client.message_retry_counts.get(&key2).await,
+        client.message_retry_counts.get(&key2).await.map(|(c, _)| c),
         Some(1),
         "Sender2 should have 1 retry"
     );
@@ -4130,12 +4155,22 @@ async fn test_no_sender_key_sends_immediate_retry() {
         .await;
     for _ in 0..20 {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        if client.message_retry_counts.get(&retry_key).await.is_some() {
+        if client
+            .message_retry_counts
+            .get(&retry_key)
+            .await
+            .map(|(c, _)| c)
+            .is_some()
+        {
             break;
         }
     }
     assert_eq!(
-        client.message_retry_counts.get(&retry_key).await,
+        client
+            .message_retry_counts
+            .get(&retry_key)
+            .await
+            .map(|(c, _)| c),
         Some(1),
         "NoSenderKeyState should immediately trigger retry receipt (count=1)"
     );
@@ -4160,7 +4195,7 @@ fn test_is_sender_key_distribution_only() {
     // SKDM + message_context_info → still true (context_info is metadata)
     assert!(is_sender_key_distribution_only(&mut wa::Message {
         sender_key_distribution_message: Some(skdm.clone()),
-        message_context_info: Some(wa::MessageContextInfo::default()),
+        message_context_info: Some(Box::default()),
         ..Default::default()
     }));
 
@@ -4200,10 +4235,10 @@ fn skdm_only_detection_restores_carrier_fields() {
                 axolotl_sender_key_distribution_message: Some(vec![4, 5, 6]),
             },
         ),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![9, 8, 7]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
 
@@ -4242,10 +4277,10 @@ fn test_unwrap_device_sent_extracts_reaction() {
         device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
             destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
             message: Some(Box::new(wa::Message {
-                reaction_message: Some(wa::message::ReactionMessage {
+                reaction_message: Some(Box::new(wa::message::ReactionMessage {
                     text: Some("\u{2764}".to_string()),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             })),
             phash: None,
@@ -4309,20 +4344,20 @@ fn test_unwrap_device_sent_passthrough() {
 fn test_unwrap_device_sent_merges_context_info() {
     let wrapped = wa::Message {
         // Outer message_context_info (from the DSM envelope)
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![10, 20, 30]),
             limit_sharing_v2: Some(wa::LimitSharing::default()),
             ..Default::default()
-        }),
+        })),
         device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
             destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
             message: Some(Box::new(wa::Message {
                 conversation: Some("hello".to_string()),
                 // Inner has its own message_secret but no limit_sharing_v2
-                message_context_info: Some(wa::MessageContextInfo {
+                message_context_info: Some(Box::new(wa::MessageContextInfo {
                     message_secret: Some(vec![1, 2, 3]),
                     ..Default::default()
-                }),
+                })),
                 ..Default::default()
             })),
             phash: None,
@@ -4348,10 +4383,10 @@ fn test_unwrap_device_sent_merges_context_info() {
 #[test]
 fn test_unwrap_device_sent_secret_fallback() {
     let wrapped = wa::Message {
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![10, 20, 30]),
             ..Default::default()
-        }),
+        })),
         device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
             destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
             message: Some(Box::new(wa::Message {
@@ -4493,7 +4528,11 @@ async fn test_revoked_message_still_retries() {
         .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
         .await;
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(1),
         "revoked message should still have retry count 1 (WA Web retries all messages)"
     );
@@ -4511,16 +4550,26 @@ async fn test_enc_count_preseeds_retry_cache() {
     let cache_key = client
         .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
         .await;
-    // Insert only if absent (portable alternative to moka's entry_by_ref().or_insert())
-    if client.message_retry_counts.get(&cache_key).await.is_none() {
+    // Insert only if absent (get-then-insert; the cache has no atomic upsert)
+    if client
+        .message_retry_counts
+        .get(&cache_key)
+        .await
+        .map(|(c, _)| c)
+        .is_none()
+    {
         client
             .message_retry_counts
-            .insert(cache_key.clone(), max_sender_retry_count)
+            .insert(cache_key.clone(), (max_sender_retry_count, None))
             .await;
     }
 
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(3),
         "cache should be pre-seeded with sender retry count"
     );
@@ -4539,10 +4588,16 @@ async fn test_enc_no_count_cache_empty() {
         let cache_key = client
             .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
             .await;
-        if client.message_retry_counts.get(&cache_key).await.is_none() {
+        if client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c)
+            .is_none()
+        {
             client
                 .message_retry_counts
-                .insert(cache_key, max_sender_retry_count)
+                .insert(cache_key, (max_sender_retry_count, None))
                 .await;
         }
     }
@@ -4551,7 +4606,12 @@ async fn test_enc_no_count_cache_empty() {
         .make_retry_cache_key(&chat_jid, msg_id, &chat_jid)
         .await;
     assert!(
-        client.message_retry_counts.get(&cache_key).await.is_none(),
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c)
+            .is_none(),
         "cache should be empty when no count attribute"
     );
 }
@@ -4570,7 +4630,7 @@ async fn test_enc_count_does_not_overwrite_higher() {
     // Pre-insert a higher value
     client
         .message_retry_counts
-        .insert(cache_key.clone(), 4)
+        .insert(cache_key.clone(), (4, None))
         .await;
 
     // max(existing, incoming) should NOT overwrite with a lower value
@@ -4579,16 +4639,21 @@ async fn test_enc_count_does_not_overwrite_higher() {
         .message_retry_counts
         .get(&cache_key)
         .await
+        .map(|(c, _)| c)
         .unwrap_or(0);
     if max_sender_retry_count > existing {
         client
             .message_retry_counts
-            .insert(cache_key.clone(), max_sender_retry_count)
+            .insert(cache_key.clone(), (max_sender_retry_count, None))
             .await;
     }
 
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(4),
         "should not overwrite existing higher value"
     );
@@ -4608,7 +4673,7 @@ async fn test_enc_count_updates_when_sender_higher() {
     // Pre-insert a lower value
     client
         .message_retry_counts
-        .insert(cache_key.clone(), 1)
+        .insert(cache_key.clone(), (1, None))
         .await;
 
     // max(existing, incoming) SHOULD update with a higher value
@@ -4617,16 +4682,21 @@ async fn test_enc_count_updates_when_sender_higher() {
         .message_retry_counts
         .get(&cache_key)
         .await
+        .map(|(c, _)| c)
         .unwrap_or(0);
     if max_sender_retry_count > existing {
         client
             .message_retry_counts
-            .insert(cache_key.clone(), max_sender_retry_count)
+            .insert(cache_key.clone(), (max_sender_retry_count, None))
             .await;
     }
 
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(3),
         "should update to higher sender count"
     );
@@ -4897,7 +4967,14 @@ async fn test_undecryptable_fires_before_retry_task() {
         .await;
 
     assert!(recorder.undecryptable().is_empty());
-    assert!(client.message_retry_counts.get(&cache_key).await.is_none());
+    assert!(
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c)
+            .is_none()
+    );
 
     let _ = client
         .handle_decrypt_failure(&info, RetryReason::InvalidKeyId, DecryptFailMode::Show)
@@ -4909,13 +4986,22 @@ async fn test_undecryptable_fires_before_retry_task() {
         "UndecryptableMessage dispatched inside handle_decrypt_failure",
     );
     assert!(
-        client.message_retry_counts.get(&cache_key).await.is_none(),
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c)
+            .is_none(),
         "retry task has not progressed yet",
     );
 
     tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
     assert_eq!(
-        client.message_retry_counts.get(&cache_key).await,
+        client
+            .message_retry_counts
+            .get(&cache_key)
+            .await
+            .map(|(c, _)| c),
         Some(1),
         "retry task runs after the dispatch",
     );
@@ -7053,11 +7139,16 @@ async fn custom_handler_only_skips_fallback_ack() {
     let handler = Arc::new(NoopHandler {
         calls: Arc::clone(&calls),
     });
-    client
-        .custom_enc_handlers
-        .write()
-        .await
-        .insert("frskmsg".to_string(), handler as Arc<dyn EncHandler>);
+    // custom_enc_handlers is set-once (immutable after build); capturing_client
+    // builds via Client::new and leaves it unset, so set it here.
+    let mut handlers = std::collections::HashMap::new();
+    handlers.insert("frskmsg".to_string(), handler as Arc<dyn EncHandler>);
+    // set() returns Err(map) on the already-set path; the map isn't Debug, so
+    // assert via is_ok() rather than expect().
+    assert!(
+        client.custom_enc_handlers.set(handlers).is_ok(),
+        "custom_enc_handlers not yet set"
+    );
 
     let node = NodeBuilder::new("message")
         .attr("from", "5511777776666@s.whatsapp.net")
@@ -7239,9 +7330,11 @@ fn inner_message_edit(text: &str, next_secret: Option<Vec<u8>>) -> wa::Message {
             timestamp_ms: Some(1_770_000_000_000),
             ..Default::default()
         })),
-        message_context_info: next_secret.map(|secret| wa::MessageContextInfo {
-            message_secret: Some(secret),
-            ..Default::default()
+        message_context_info: next_secret.map(|secret| {
+            Box::new(wa::MessageContextInfo {
+                message_secret: Some(secret),
+                ..Default::default()
+            })
         }),
         ..Default::default()
     }
@@ -7269,7 +7362,7 @@ fn encrypted_message_edit(
     .expect("test edit encryption");
 
     wa::Message {
-        secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
             target_message_key: Some(target_key),
             enc_payload: Some(enc_payload),
             enc_iv: Some(enc_iv.to_vec()),
@@ -7277,7 +7370,7 @@ fn encrypted_message_edit(
                 wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
             ),
             remote_key_id: None,
-        }),
+        })),
         ..Default::default()
     }
 }
@@ -7636,6 +7729,7 @@ async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         Some(second_secret.to_vec()),
     );
     client.dispatch_parsed_message(first_msg, &first_info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     let stored = client
         .persistence_manager
@@ -7823,6 +7917,7 @@ async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
         Some(second_secret.to_vec()),
     );
     client.dispatch_parsed_message(first_msg, &first_info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     for sender in [sender_lid, sender_pn] {
         let stored = client
@@ -8553,13 +8648,14 @@ async fn maybe_capture_inbound_msg_secret_persists_for_bot_chats() {
     });
     let msg = wa::Message {
         conversation: Some("hi bot".into()),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0xAB; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     let mut got = None;
     for _ in 0..40 {
@@ -8592,13 +8688,14 @@ async fn maybe_capture_inbound_msg_secret_persists_for_non_bot_chats() {
     });
     let msg = wa::Message {
         conversation: Some("hi".into()),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0xCD; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     let got = client
         .persistence_manager
@@ -8648,13 +8745,14 @@ async fn maybe_capture_inbound_msg_secret_persists_for_group_with_bot_mention() 
             })),
             ..Default::default()
         })),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0xEE; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     let mut got = None;
     for _ in 0..40 {
@@ -8705,13 +8803,14 @@ async fn maybe_capture_inbound_msg_secret_skips_forwarded() {
             })),
             ..Default::default()
         })),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0xFF; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     for _ in 0..16 {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -8759,17 +8858,18 @@ async fn maybe_capture_inbound_msg_secret_via_bot_metadata_without_mention() {
             // No mention at all — just bot_metadata signals the invocation.
             ..Default::default()
         })),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0x7B; 32]),
             bot_metadata: Some(wa::BotMetadata {
                 persona_id: Some("867051314767696".into()),
                 ..Default::default()
             }),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     // Group (non-bot chat) → keyed under info.source.sender (our LID in a
     // LID group), which is what the bot reply's target_sender_jid echoes.
@@ -8820,15 +8920,16 @@ async fn bot_only_captures_group_bot_prompt_skips_plain() {
     });
     let plain_msg = wa::Message {
         conversation: Some("hi".into()),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0x01; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client
         .maybe_capture_inbound_msg_secret(&plain_msg, &plain_info)
         .await;
+    client.msg_secret_buffer.wait_flushed().await;
     assert!(
         client
             .persistence_manager
@@ -8857,19 +8958,20 @@ async fn bot_only_captures_group_bot_prompt_skips_plain() {
             text: Some("continue".into()),
             ..Default::default()
         })),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0x02; 32]),
             bot_metadata: Some(wa::BotMetadata {
                 persona_id: Some("867051314767696".into()),
                 ..Default::default()
             }),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client
         .maybe_capture_inbound_msg_secret(&bot_msg, &bot_info)
         .await;
+    client.msg_secret_buffer.wait_flushed().await;
     assert_eq!(
         client
             .persistence_manager
@@ -8909,13 +9011,14 @@ async fn maybe_capture_inbound_msg_secret_keys_under_other_participant() {
             })),
             ..Default::default()
         })),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(vec![0x5A; 32]),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     // Keyed under the participant (non-AD), NOT under our own PN/LID.
     let under_participant = client
@@ -9022,6 +9125,7 @@ async fn maybe_capture_inbound_msg_secret_skips_when_secret_absent() {
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
+    client.msg_secret_buffer.wait_flushed().await;
 
     for _ in 0..16 {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -9267,15 +9371,16 @@ async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
     });
     let fanout_msg = wa::Message {
         conversation: Some("hi bot".into()),
-        message_context_info: Some(wa::MessageContextInfo {
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
             message_secret: Some(secret.to_vec()),
             ..Default::default()
-        }),
+        })),
         ..Default::default()
     };
     client
         .maybe_capture_inbound_msg_secret(&fanout_msg, &fanout_info)
         .await;
+    client.msg_secret_buffer.wait_flushed().await;
     // Write is awaited inline now, so the secret is already durable here.
     for _ in 0..40 {
         if client
@@ -9550,4 +9655,302 @@ async fn msmsg_without_meta_target_id_nacks_495() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     assert_eq!(code, Some(495));
+}
+
+/// Incoming CAG encrypted reaction: decrypted inline and surfaced in the
+/// plaintext-reaction shape, with the key filled from the envelope's target.
+#[tokio::test]
+async fn enc_reaction_inbound_decrypts_to_plaintext_shape() {
+    use wacore::types::message::{MessageInfo, MessageSource};
+
+    let client = crate::test_utils::create_test_client_with_name("enc_reaction_inbound").await;
+    ensure_bob_paired(&client).await;
+
+    let group: Jid = "120363400000000001@g.us".parse().expect("group");
+    let author: Jid = "5511888887777@s.whatsapp.net".parse().expect("author");
+    let reactor: Jid = "5511777776666@s.whatsapp.net".parse().expect("reactor");
+    let secret = [0x5Au8; 32];
+    const PARENT_ID: &str = "3EB0PARENTPOST1";
+
+    client
+        .persistence_manager
+        .backend()
+        .put_msg_secrets(vec![wacore::store::traits::MsgSecretEntry {
+            chat: group.to_non_ad_string(),
+            sender: author.to_non_ad_string(),
+            msg_id: PARENT_ID.to_string(),
+            secret: secret.to_vec(),
+            expires_at: 0,
+            message_ts: 0,
+        }])
+        .await
+        .expect("persist parent secret");
+
+    let (payload, iv) = wacore::reaction::encrypt_reaction_with_secret(
+        "\u{1F525}",
+        1_700_000_000_000,
+        &secret,
+        PARENT_ID,
+        &author.to_non_ad_string(),
+        &reactor.to_non_ad_string(),
+    )
+    .expect("encrypt");
+
+    let target_key = wa::MessageKey {
+        remote_jid: Some(group.to_string()),
+        from_me: Some(false),
+        id: Some(PARENT_ID.to_string()),
+        participant: Some(author.to_string()),
+    };
+    let msg = wa::Message {
+        enc_reaction_message: Some(Box::new(wa::message::EncReactionMessage {
+            target_message_key: Some(target_key.clone()),
+            enc_payload: Some(payload),
+            enc_iv: Some(iv.to_vec()),
+        })),
+        ..Default::default()
+    };
+    let info = Arc::new(MessageInfo {
+        id: "REACT1".to_string(),
+        source: MessageSource {
+            chat: group.clone(),
+            sender: reactor.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        timestamp: wacore::time::now_utc(),
+        ..Default::default()
+    });
+
+    let out = client
+        .maybe_decrypt_secret_encrypted_message(&msg, &info)
+        .await
+        .expect("reaction must decrypt");
+    let rm = out.reaction_message.expect("plaintext reaction shape");
+    assert_eq!(rm.text.as_deref(), Some("\u{1F525}"));
+    assert_eq!(rm.sender_timestamp_ms, Some(1_700_000_000_000));
+    assert_eq!(
+        rm.key.as_ref().and_then(|k| k.id.as_deref()),
+        Some(PARENT_ID),
+        "key must be filled from the envelope target"
+    );
+    assert_eq!(
+        rm.key.as_ref().and_then(|k| k.participant.as_deref()),
+        Some(author.to_string().as_str())
+    );
+}
+
+/// Incoming CAG encrypted comment: dispatched as the decrypted body with the
+/// parent post key carried on `MessageInfo::comment_target`, and the comment's
+/// own secret persisted under the comment's id (not the parent's).
+#[tokio::test]
+async fn enc_comment_inbound_dispatches_body_with_parent_link() {
+    use wacore::types::events::ChannelEventHandler;
+    use wacore::types::message::{MessageInfo, MessageSource};
+
+    let (client, _transport) = capturing_client("enc_comment_inbound").await;
+    ensure_bob_paired(&client).await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.add_handler(handler);
+
+    let group: Jid = "120363400000000002@g.us".parse().expect("group");
+    let author: Jid = "5511888887777@s.whatsapp.net".parse().expect("author");
+    let commenter: Jid = "5511777776666@s.whatsapp.net".parse().expect("commenter");
+    let secret = [0x6Bu8; 32];
+    let comment_secret = [0x7Cu8; 32];
+    const PARENT_ID: &str = "3EB0PARENTPOST2";
+    const COMMENT_ID: &str = "3EB0COMMENT1";
+
+    client
+        .persistence_manager
+        .backend()
+        .put_msg_secrets(vec![wacore::store::traits::MsgSecretEntry {
+            chat: group.to_non_ad_string(),
+            sender: author.to_non_ad_string(),
+            msg_id: PARENT_ID.to_string(),
+            secret: secret.to_vec(),
+            expires_at: 0,
+            message_ts: 0,
+        }])
+        .await
+        .expect("persist parent secret");
+
+    let body = wa::Message {
+        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            text: Some("great post".to_string()),
+            ..Default::default()
+        })),
+        // Present but secret-less: the outer secret must merge in, not be
+        // dropped because a context already exists.
+        message_context_info: Some(Box::default()),
+        ..Default::default()
+    };
+    let (payload, iv) = wacore::comment::encrypt_comment_with_secret(
+        &body,
+        &secret,
+        PARENT_ID,
+        &author.to_non_ad_string(),
+        &commenter.to_non_ad_string(),
+    )
+    .expect("encrypt");
+
+    let msg = wa::Message {
+        enc_comment_message: Some(Box::new(wa::message::EncCommentMessage {
+            target_message_key: Some(wa::MessageKey {
+                remote_jid: Some(group.to_string()),
+                from_me: Some(false),
+                id: Some(PARENT_ID.to_string()),
+                participant: Some(author.to_string()),
+            }),
+            enc_payload: Some(payload),
+            enc_iv: Some(iv.to_vec()),
+        })),
+        // WA Web ships the comment's own secret on the OUTER envelope (the
+        // comment msgData), not inside the encrypted body.
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
+            message_secret: Some(comment_secret.to_vec()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let info = Arc::new(MessageInfo {
+        id: COMMENT_ID.to_string(),
+        source: MessageSource {
+            chat: group.clone(),
+            sender: commenter.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        timestamp: wacore::time::now_utc(),
+        ..Default::default()
+    });
+
+    client.dispatch_parsed_message(msg, &info).await;
+
+    // Deadline-poll instead of a fixed sleep so a slow CI cannot race the
+    // event delivery.
+    let mut seen = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    'outer: while tokio::time::Instant::now() < deadline {
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Message(msg, info) = event.as_ref()
+                && info.id == COMMENT_ID
+            {
+                seen = true;
+                assert_eq!(
+                    msg.extended_text_message
+                        .as_ref()
+                        .and_then(|m| m.text.as_deref()),
+                    Some("great post"),
+                    "the decrypted body must be dispatched"
+                );
+                assert!(
+                    msg.enc_comment_message.is_none(),
+                    "the envelope must not survive substitution"
+                );
+                assert_eq!(
+                    info.comment_target.as_ref().and_then(|k| k.id.as_deref()),
+                    Some(PARENT_ID),
+                    "the parent post key must surface on the info"
+                );
+                assert_eq!(
+                    msg.message_context_info
+                        .as_ref()
+                        .and_then(|m| m.message_secret.as_deref()),
+                    Some(comment_secret.as_slice()),
+                    "the comment's own secret must survive substitution for app-managed storage"
+                );
+                break 'outer;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(seen, "the decrypted comment must be dispatched");
+
+    // The comment's own secret keys add-ons on the COMMENT, so it must be
+    // stored under the comment's id and sender, never the parent's. The
+    // write-behind buffer is drained first so the backend read is settled.
+    client.msg_secret_buffer.wait_flushed().await;
+    let stored = client
+        .persistence_manager
+        .backend()
+        .get_msg_secret(
+            &group.to_non_ad_string(),
+            &commenter.to_non_ad_string(),
+            COMMENT_ID,
+        )
+        .await
+        .expect("lookup");
+    assert_eq!(stored.as_deref(), Some(comment_secret.as_slice()));
+    let mis_keyed = client
+        .persistence_manager
+        .backend()
+        .get_msg_secret(
+            &group.to_non_ad_string(),
+            &author.to_non_ad_string(),
+            PARENT_ID,
+        )
+        .await
+        .expect("lookup");
+    assert_eq!(
+        mis_keyed.as_deref(),
+        Some(secret.as_slice()),
+        "the parent's own secret must stay untouched"
+    );
+}
+
+/// The write-behind buffer must keep the receive-lane ordering semantic: an
+/// add-on referencing the secret of the stanza captured just before it must
+/// decrypt, with no flush in between (the lookup is served buffer-first).
+#[tokio::test]
+async fn addon_decrypts_right_after_capture_without_flush() {
+    use wacore::types::message::{MessageInfo, MessageSource};
+
+    let client = crate::test_utils::create_test_client_with_name("secret_l1_visibility").await;
+    ensure_bob_paired(&client).await;
+    let chat = "5511777776666@s.whatsapp.net";
+    let parent_id = "PARENT_L1";
+    let secret = [0x33u8; 32];
+
+    let parent_msg = wa::Message {
+        conversation: Some("hello".to_string()),
+        message_context_info: Some(Box::new(wa::MessageContextInfo {
+            message_secret: Some(secret.to_vec()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let mk_info = |id: &str| {
+        Arc::new(MessageInfo {
+            id: id.to_string(),
+            source: MessageSource {
+                chat: chat.parse().expect("chat"),
+                sender: chat.parse().expect("sender"),
+                ..Default::default()
+            },
+            timestamp: wacore::time::now_utc(),
+            ..Default::default()
+        })
+    };
+    client
+        .maybe_capture_inbound_msg_secret(&parent_msg, &mk_info(parent_id))
+        .await;
+
+    // Deliberately NO wait_flushed here: the next message in the lane reads
+    // through the buffer.
+    let target_key = wa::MessageKey {
+        remote_jid: Some(chat.to_string()),
+        from_me: Some(false),
+        id: Some(parent_id.to_string()),
+        participant: None,
+    };
+    let edit_msg =
+        encrypted_message_edit(target_key, chat, chat, parent_id, &secret, "edited", None);
+    let out = client
+        .maybe_decrypt_secret_encrypted_message(&edit_msg, &mk_info("EDIT_L1"))
+        .await;
+    assert!(
+        out.is_some(),
+        "an add-on right after the capture must find the secret"
+    );
 }

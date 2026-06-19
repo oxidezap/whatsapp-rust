@@ -10,13 +10,17 @@ description = "Binary data and constants for WhatsApp protocol"
 [package.metadata.cargo-shear]
 ignored = ["hashify"]
 
+# `hashify` is used only through its lookup macros, so static analysers miss it.
+[package.metadata.cargo-machete]
+ignored = ["hashify"]
+
 [lib]
 crate-type = ["rlib"]
 
 [features]
 default = ["simd"]
 simd = []
-serde = ["dep:serde", "compact_str/serde"]
+serde = ["dep:serde", "compact_str/serde", "smallvec/serde"]
 # Render raw phone numbers in `Jid::observe()` instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.
 tracing-pii = []
@@ -28,6 +32,7 @@ flate2 = { workspace = true }
 hashify = { version = "0.2.9", default-features = false }
 itoa = { workspace = true }
 serde = { workspace = true, optional = true }
+smallvec = "1.15"
 stable_deref_trait = "1.2.0"
 yoke = { workspace = true }
 
@@ -36,7 +41,8 @@ serde = { workspace = true, features = ["alloc"] }
 serde_json = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
-iai-callgrind = { workspace = true }
+divan = { workspace = true }
+proptest = "1.11.0"
 serde_json = { workspace = true, features = ["std"] }
 
 [[bench]]
@@ -44,7 +50,7 @@ name = "binary_benchmark"
 harness = false
 
 [[bench]]
-name = "numeric_attr_benchmark"
+name = "jid_benchmark"
 harness = false
 
 [lints]

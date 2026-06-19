@@ -222,10 +222,10 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_reaction() {
         let msg = wa::Message {
-            reaction_message: Some(wa::message::ReactionMessage {
+            reaction_message: Some(Box::new(wa::message::ReactionMessage {
                 text: Some("💚".into()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert!(
@@ -237,7 +237,7 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_enc_reaction() {
         let msg = wa::Message {
-            enc_reaction_message: Some(wa::message::EncReactionMessage::default()),
+            enc_reaction_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
@@ -272,7 +272,7 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_reaction_inside_ephemeral_wrapper() {
         let inner = wa::Message {
-            reaction_message: Some(wa::message::ReactionMessage::default()),
+            reaction_message: Some(Box::default()),
             ..Default::default()
         };
         let msg = wa::Message {
@@ -348,6 +348,18 @@ fn build_member_label_message_preserves_unicode() {
     assert_eq!(ml.label.as_deref(), Some("🚀 BOT"));
 }
 
+/// Probe installed by chain-lock tests: records whether the sender-key chain
+/// lock was held while `fetch_prekeys_for_identity_check` ran (it must not be
+/// — the fetch is network I/O hoisted out of the chain critical section).
+#[derive(Clone, Default)]
+struct ChainLockProbe {
+    lock: std::sync::Arc<async_lock::Mutex<()>>,
+    setup_lock: std::sync::Arc<async_lock::Mutex<()>>,
+    fetched_under_lock: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fetched_without_setup_lock: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fetch_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
 /// Mock implementation of SendContextResolver for testing
 struct MockSendContextResolver {
     /// Pre-key bundles to return: JID -> Option<PreKeyBundle>
@@ -358,6 +370,7 @@ struct MockSendContextResolver {
     phone_to_lid: HashMap<String, String>,
     /// JIDs reported via `on_local_identity_change` (send-path detection).
     identity_changes: std::sync::Mutex<Vec<Jid>>,
+    chain_lock_probe: Option<ChainLockProbe>,
 }
 
 impl MockSendContextResolver {
@@ -367,7 +380,13 @@ impl MockSendContextResolver {
             devices: Vec::new(),
             phone_to_lid: HashMap::new(),
             identity_changes: std::sync::Mutex::new(Vec::new()),
+            chain_lock_probe: None,
         }
+    }
+
+    fn with_chain_lock_probe(mut self, probe: ChainLockProbe) -> Self {
+        self.chain_lock_probe = Some(probe);
+        self
     }
 
     fn captured_identity_changes(&self) -> Vec<Jid> {
@@ -417,6 +436,22 @@ impl SendContextResolver for MockSendContextResolver {
         &self,
         jids: &[Jid],
     ) -> Result<HashMap<Jid, PreKeyBundle>> {
+        if let Some(probe) = &self.chain_lock_probe {
+            probe
+                .fetch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if probe.lock.try_lock().is_none() {
+                probe
+                    .fetched_under_lock
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            // The setup lock must be HELD here (try_lock succeeds = violation).
+            if probe.setup_lock.try_lock().is_some() {
+                probe
+                    .fetched_without_setup_lock
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         let mut result = HashMap::new();
         for jid in jids {
             if let Some(bundle_opt) = self.prekey_bundles.get(jid)
@@ -2084,7 +2119,7 @@ mod decrypt_fail {
     #[test]
     fn reaction() {
         let msg = wa::Message {
-            reaction_message: Some(Default::default()),
+            reaction_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2093,7 +2128,7 @@ mod decrypt_fail {
     #[test]
     fn pin() {
         let msg = wa::Message {
-            pin_in_chat_message: Some(Default::default()),
+            pin_in_chat_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2102,10 +2137,10 @@ mod decrypt_fail {
     #[test]
     fn poll_vote() {
         let msg = wa::Message {
-            poll_update_message: Some(wa::message::PollUpdateMessage {
+            poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
                 vote: Some(Default::default()),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2114,7 +2149,7 @@ mod decrypt_fail {
     #[test]
     fn poll_update_without_vote() {
         let msg = wa::Message {
-            poll_update_message: Some(Default::default()),
+            poll_update_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(!should_hide_decrypt_fail(&msg));
@@ -2125,7 +2160,7 @@ mod decrypt_fail {
         let msg = wa::Message {
             ephemeral_message: Some(Box::new(wa::message::FutureProofMessage {
                 message: Some(Box::new(wa::Message {
-                    reaction_message: Some(Default::default()),
+                    reaction_message: Some(Box::default()),
                     ..Default::default()
                 })),
             })),
@@ -2137,7 +2172,7 @@ mod decrypt_fail {
     #[test]
     fn conditional_reveal() {
         let msg = wa::Message {
-            conditional_reveal_message: Some(Default::default()),
+            conditional_reveal_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2147,10 +2182,10 @@ mod decrypt_fail {
     fn poll_add_option_edit() {
         use wa::message::secret_encrypted_message::SecretEncType;
         let msg = wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 secret_enc_type: Some(SecretEncType::PollAddOption as i32),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2196,7 +2231,7 @@ mod decrypt_fail_for_send {
     fn revoke_does_not_block_content_based_hide() {
         // A reaction still hides on its own merits even under a revoke edit.
         let msg = wa::Message {
-            reaction_message: Some(Default::default()),
+            reaction_message: Some(Box::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail_for_send(
@@ -2212,10 +2247,10 @@ mod stanza_type {
 
     fn secret(enc: SecretEncType) -> wa::Message {
         wa::Message {
-            secret_encrypted_message: Some(wa::message::SecretEncryptedMessage {
+            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
                 secret_enc_type: Some(enc as i32),
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         }
     }
@@ -2310,15 +2345,15 @@ mod stanza_type {
                 ..Default::default()
             },
             wa::Message {
-                decline_payment_request_message: Some(Default::default()),
+                decline_payment_request_message: Some(Box::default()),
                 ..Default::default()
             },
             wa::Message {
-                cancel_payment_request_message: Some(Default::default()),
+                cancel_payment_request_message: Some(Box::default()),
                 ..Default::default()
             },
             wa::Message {
-                payment_invite_message: Some(Default::default()),
+                payment_invite_message: Some(Box::default()),
                 ..Default::default()
             },
         ];
@@ -2380,7 +2415,7 @@ mod stanza_type {
     #[test]
     fn preserved_classifier_branches() {
         let r = wa::Message {
-            reaction_message: Some(Default::default()),
+            reaction_message: Some(Box::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&r), stanza::MSG_TYPE_REACTION);
@@ -2706,8 +2741,12 @@ mod mark_full_distribution_list {
 
     type SigResult<T> = crate::libsignal::protocol::error::Result<T>;
 
+    // Clones share state (Arc), mirroring production stores: the encrypt
+    // fan-out spawns tasks over store clones and their writes must be
+    // visible to the original ("the shared cache provides interior
+    // mutability").
     #[derive(Clone, Default)]
-    struct MemSessionStore(HashMap<ProtocolAddress, Vec<u8>>);
+    struct MemSessionStore(std::sync::Arc<std::sync::Mutex<HashMap<ProtocolAddress, Vec<u8>>>>);
     #[async_trait::async_trait]
     impl SessionStore for MemSessionStore {
         async fn load_session(
@@ -2716,18 +2755,20 @@ mod mark_full_distribution_list {
         ) -> SigResult<Option<crate::libsignal::protocol::SessionRecord>> {
             Ok(self
                 .0
+                .lock()
+                .unwrap()
                 .get(a)
                 .and_then(|b| crate::libsignal::protocol::SessionRecord::deserialize(b).ok()))
         }
         async fn has_session(&self, a: &ProtocolAddress) -> SigResult<bool> {
-            Ok(self.0.contains_key(a))
+            Ok(self.0.lock().unwrap().contains_key(a))
         }
         async fn store_session(
             &mut self,
             a: &ProtocolAddress,
             r: crate::libsignal::protocol::SessionRecord,
         ) -> SigResult<()> {
-            self.0.insert(a.clone(), r.serialize()?);
+            self.0.lock().unwrap().insert(a.clone(), r.serialize()?);
             Ok(())
         }
     }
@@ -2736,7 +2777,7 @@ mod mark_full_distribution_list {
     struct MemIdentityStore {
         pair: IdentityKeyPair,
         reg_id: u32,
-        known: HashMap<ProtocolAddress, IdentityKey>,
+        known: std::sync::Arc<std::sync::Mutex<HashMap<ProtocolAddress, IdentityKey>>>,
     }
     #[async_trait::async_trait]
     impl IdentityKeyStore for MemIdentityStore {
@@ -2751,7 +2792,7 @@ mod mark_full_distribution_list {
             a: &ProtocolAddress,
             id: &IdentityKey,
         ) -> SigResult<IdentityChange> {
-            self.known.insert(a.clone(), *id);
+            self.known.lock().unwrap().insert(a.clone(), *id);
             Ok(IdentityChange::from_changed(false))
         }
         async fn is_trusted_identity(
@@ -2763,12 +2804,19 @@ mod mark_full_distribution_list {
             Ok(true)
         }
         async fn get_identity(&self, a: &ProtocolAddress) -> SigResult<Option<IdentityKey>> {
-            Ok(self.known.get(a).copied())
+            Ok(self.known.lock().unwrap().get(a).copied())
         }
     }
 
     #[derive(Default)]
-    struct MemSenderKeyStore(HashMap<SenderKeyName, SenderKeyRecord>);
+    struct MemSenderKeyStore {
+        records: HashMap<SenderKeyName, SenderKeyRecord>,
+        // Shared per-name locks (like production stores override it), so tests
+        // can observe whether the chain lock is held during resolver calls.
+        locks: std::sync::Mutex<HashMap<SenderKeyName, std::sync::Arc<async_lock::Mutex<()>>>>,
+        setup_locks:
+            std::sync::Mutex<HashMap<SenderKeyName, std::sync::Arc<async_lock::Mutex<()>>>>,
+    }
     #[async_trait::async_trait]
     impl SenderKeyStore for MemSenderKeyStore {
         async fn store_sender_key(
@@ -2776,11 +2824,33 @@ mod mark_full_distribution_list {
             n: &SenderKeyName,
             r: SenderKeyRecord,
         ) -> SigResult<()> {
-            self.0.insert(n.clone(), r);
+            self.records.insert(n.clone(), r);
             Ok(())
         }
         async fn load_sender_key(&self, n: &SenderKeyName) -> SigResult<Option<SenderKeyRecord>> {
-            Ok(self.0.get(n).cloned())
+            Ok(self.records.get(n).cloned())
+        }
+        async fn sender_key_lock(
+            &self,
+            n: &SenderKeyName,
+        ) -> std::sync::Arc<async_lock::Mutex<()>> {
+            self.locks
+                .lock()
+                .unwrap()
+                .entry(n.clone())
+                .or_default()
+                .clone()
+        }
+        async fn session_setup_lock(
+            &self,
+            n: &SenderKeyName,
+        ) -> std::sync::Arc<async_lock::Mutex<()>> {
+            self.setup_locks
+                .lock()
+                .unwrap()
+                .entry(n.clone())
+                .or_default()
+                .clone()
         }
     }
 
@@ -2866,7 +2936,7 @@ mod mark_full_distribution_list {
         let mut is = MemIdentityStore {
             pair: sender,
             reg_id: 42,
-            known: HashMap::new(),
+            known: Default::default(),
         };
         process_prekey_bundle(
             &a.to_protocol_address(),
@@ -2962,6 +3032,231 @@ mod mark_full_distribution_list {
         assert!(
             prepared.node.attrs().optional_string("phash").is_some(),
             "a key-distributing group send must carry a phash"
+        );
+    }
+
+    /// The group send shares one message encode between the reporting token and the skmsg
+    /// plaintext (gated on no top-level `message_context_info`). The byte-equivalence of
+    /// the shared-encode helpers is locked in `messages`/`reporting_token`; pin the
+    /// group-level wiring here: a token-bearing send still mints a secret and attaches the
+    /// `<reporting>` node via that path, while an excluded type (reaction) omits both.
+    #[tokio::test]
+    async fn group_send_attaches_reporting_token_via_shared_encode() {
+        let group: Jid = "120363000000000003@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000000@lid".parse().unwrap();
+        let a: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let group_info =
+            GroupInfo::new(vec![own_jid.to_non_ad(), a.to_non_ad()], AddressingMode::Pn);
+
+        async fn prepare(
+            group: &Jid,
+            own_jid: &Jid,
+            own_lid: &Jid,
+            a: &Jid,
+            group_info: &GroupInfo,
+            msg: &wa::Message,
+            req: &str,
+        ) -> (wacore_binary::Node, bool) {
+            let (mut ss, mut is) = established_stores(a).await;
+            let mut sks = MemSenderKeyStore::default();
+            let mut pks = UnusedPreKeyStore;
+            let spks = UnusedSignedPreKeyStore;
+            let mut stores = SignalStores {
+                sender_key_store: &mut sks,
+                session_store: &mut ss,
+                identity_store: &mut is,
+                prekey_store: &mut pks,
+                signed_prekey_store: &spks,
+            };
+            let resolver = MockSendContextResolver::new();
+            let rt = TokioTestRuntime;
+            let prepared = prepare_group_stanza(
+                &rt,
+                &mut stores,
+                &resolver,
+                group_info,
+                own_jid,
+                own_lid,
+                None,
+                group.clone(),
+                msg,
+                req.into(),
+                false,
+                Some(vec![a.clone()]),
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("prepare_group_stanza should succeed");
+            (prepared.node, prepared.message_secret.is_some())
+        }
+
+        // Token-bearing message → secret minted + <reporting> node carrying a token.
+        let text = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        let (node, has_secret) = prepare(
+            &group,
+            &own_jid,
+            &own_lid,
+            &a,
+            &group_info,
+            &text,
+            "REQTEXT",
+        )
+        .await;
+        assert!(has_secret, "token-bearing send must mint a message secret");
+        let reporting = node
+            .get_optional_child("reporting")
+            .expect("token-bearing group send must carry a <reporting> node");
+        assert!(
+            reporting.get_optional_child("reporting_token").is_some(),
+            "reporting node must contain a reporting_token"
+        );
+
+        // Excluded type (reaction) → no secret, no <reporting> node.
+        let reaction = wa::Message {
+            reaction_message: Some(Box::new(wa::message::ReactionMessage {
+                text: Some("👍".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let (node, has_secret) = prepare(
+            &group,
+            &own_jid,
+            &own_lid,
+            &a,
+            &group_info,
+            &reaction,
+            "REQREACT",
+        )
+        .await;
+        assert!(!has_secret, "excluded type must not mint a secret");
+        assert!(
+            node.get_optional_child("reporting").is_none(),
+            "excluded type must not carry a reporting node"
+        );
+    }
+
+    /// Regression: the prekey fetch (network RTT) must run BEFORE the
+    /// sender-key chain lock is taken, so concurrent sends to the same group
+    /// don't serialize behind a slow fetch. The probe try_locks the actual
+    /// chain lock from inside the resolver's fetch and records a violation.
+    #[tokio::test]
+    async fn prekey_fetch_runs_outside_chain_lock() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let group: Jid = "120363000000000002@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000000@lid".parse().unwrap();
+        // B has no session but its bundle IS available — forces the prekey
+        // fetch + X3DH path on this send.
+        let b: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let chain_name =
+            crate::types::jid::make_sender_key_name(&group, &own_jid.to_protocol_address());
+        let probe = ChainLockProbe {
+            lock: sks.sender_key_lock(&chain_name).await,
+            setup_lock: sks.session_setup_lock(&chain_name).await,
+            ..Default::default()
+        };
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        // Verifiable bundle (create_mock_bundle's zeroed signature fails X3DH).
+        let receiver = IdentityKeyPair::generate(&mut rng);
+        let spk = KeyPair::generate(&mut rng);
+        let opk = KeyPair::generate(&mut rng);
+        let sig = receiver
+            .private_key()
+            .calculate_signature(&spk.public_key.serialize(), &mut rng)
+            .unwrap();
+        let bundle = PreKeyBundle::new(
+            1,
+            1u32.into(),
+            Some((1u32.into(), opk.public_key)),
+            1u32.into(),
+            spk.public_key,
+            sig.to_vec(),
+            *receiver.identity_key(),
+        )
+        .unwrap();
+
+        let resolver = MockSendContextResolver::new()
+            .with_bundle(b.clone(), bundle)
+            .with_chain_lock_probe(probe.clone());
+        let rt = TokioTestRuntime;
+
+        let group_info =
+            GroupInfo::new(vec![own_jid.to_non_ad(), b.to_non_ad()], AddressingMode::Pn);
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_group_stanza(
+            &rt,
+            &mut stores,
+            &resolver,
+            &group_info,
+            &own_jid,
+            &own_lid,
+            None,
+            group,
+            &msg,
+            "TESTREQID2".into(),
+            false,
+            Some(vec![b.clone()]),
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("prepare_group_stanza should succeed");
+
+        assert!(
+            probe.fetch_calls.load(SeqCst) >= 1,
+            "test must exercise the prekey fetch path"
+        );
+        assert!(
+            !probe.fetched_under_lock.load(SeqCst),
+            "prekey fetch must not run under the sender-key chain lock"
+        );
+        assert!(
+            !probe.fetched_without_setup_lock.load(SeqCst),
+            "prekey fetch must run under the per-group session-setup lock \
+             (serializes same-group cold sends' session writes)"
+        );
+
+        // End-to-end: the session established before the lock produced a
+        // pairwise SKDM for B under the lock.
+        let participants = prepared
+            .node
+            .get_optional_child("participants")
+            .expect("participants node with the SKDM fan-out");
+        assert_eq!(
+            participants.children().map(|c| c.len()).unwrap_or(0),
+            1,
+            "B must receive a pairwise SKDM via the pre-established session"
         );
     }
 }

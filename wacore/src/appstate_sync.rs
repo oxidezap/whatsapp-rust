@@ -23,6 +23,62 @@ use waproto::whatsapp as wa;
 // Re-export Mutation from appstate for convenience
 pub use crate::appstate::Mutation;
 
+/// Index MAC carried by a mutation's record, if present.
+fn mutation_index_mac(m: &wa::SyncdMutation) -> Option<&[u8]> {
+    m.record.as_ref()?.index.as_ref()?.blob.as_deref()
+}
+
+/// Unique index MACs of a patch's mutations, in first-seen order, feeding the
+/// batched previous-value-MAC backend lookup.
+///
+/// Small patches use a cache-friendly linear scan (a HashSet measured 6-120%
+/// slower at small N here). Patches carry up to ~1000 mutations, where the
+/// scan's O(n²) compares dominate, so above [`MAC_DEDUP_SCAN_LIMIT`] dedup runs
+/// through a sort of position indices — O(n log n) with only a `Vec<u32>` of
+/// scratch, far cheaper than a `HashSet` of 32-byte MACs — then re-emits in
+/// first-seen order.
+pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>> {
+    if mutations.len() <= MAC_DEDUP_SCAN_LIMIT {
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
+        for m in mutations {
+            if let Some(mac) = mutation_index_mac(m)
+                && !out.iter().any(|v| v.as_slice() == mac)
+            {
+                out.push(mac.to_vec());
+            }
+        }
+        return out;
+    }
+
+    // Indices in `order` always carry a MAC, so the default branch is dead; it
+    // only keeps the lookup `unwrap`-free.
+    let mac_at = |i: u32| mutation_index_mac(&mutations[i as usize]).unwrap_or_default();
+
+    // Positions of mutations carrying a MAC, in first-seen order. Pre-sized to
+    // one allocation (the only scratch this path adds over the returned Vec).
+    let mut order: Vec<u32> = Vec::with_capacity(mutations.len());
+    order.extend(
+        mutations
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| mutation_index_mac(m).map(|_| i as u32)),
+    );
+
+    // Group equal MACs (ties broken by position so each run's first occurrence
+    // leads it), drop all but each run's leader, then restore first-seen order.
+    order.sort_unstable_by(|&a, &b| mac_at(a).cmp(mac_at(b)).then(a.cmp(&b)));
+    order.dedup_by(|&mut a, &mut b| mac_at(a) == mac_at(b));
+    order.sort_unstable();
+
+    order.into_iter().map(|i| mac_at(i).to_vec()).collect()
+}
+
+/// Mutation count above which [`collect_unique_index_macs`] switches from the
+/// cache-friendly O(n²) linear scan to the O(n log n) index sort. Chosen well
+/// below the ~1000-mutation patch ceiling and above the small-N range where the
+/// scan beats sorting.
+const MAC_DEDUP_SCAN_LIMIT: usize = 64;
+
 fn lookup_app_state_key(
     keys_map: &HashMap<String, Arc<ExpandedAppStateKeys>>,
     key_id: &[u8],
@@ -272,7 +328,7 @@ impl AppStateProcessor {
         // (persisted >= incoming) is discarded ("skip applying syncd old version") so it can't
         // roll the collection backward. No-op on the benign first-sync path, where snapshots
         // are requested only at version 0.
-        let snapshot_to_apply = pl.snapshot.as_ref().filter(|snapshot| {
+        let snapshot_fresh = pl.snapshot.as_ref().is_some_and(|snapshot| {
             let snapshot_version = snapshot.version.as_ref().and_then(|v| v.version).unwrap_or(0);
             if snapshot_is_stale(state.version, snapshot_version) {
                 log::warn!(
@@ -284,27 +340,30 @@ impl AppStateProcessor {
             }
             true
         });
-        if let Some(snapshot) = snapshot_to_apply {
+        if snapshot_fresh && let Some(snapshot) = pl.snapshot.take() {
             let keys_map = self.key_cache.lock().await.clone();
-            let snapshot_clone = snapshot.clone();
             let collection_name_owned = collection_name.to_string();
 
-            // Offload CPU-intensive snapshot processing to a blocking thread
+            // Offload CPU-intensive snapshot processing to a blocking thread. The
+            // snapshot moves into the closure (its 'static bound used to force a
+            // multi-MB deep clone on bootstrap) and comes back via the return tuple
+            // because the caller still reads pl.snapshot (get_missing_key_ids).
             let result = crate::runtime::blocking(&*self.runtime, move || {
                 let mut snapshot_state = HashState::default();
                 let result = process_snapshot(
-                    &snapshot_clone,
+                    &snapshot,
                     &mut snapshot_state,
                     |key_id| lookup_app_state_key(&keys_map, key_id),
                     validate_macs,
                     &collection_name_owned,
                 )?;
-                Ok::<_, crate::appstate::AppStateError>((result, snapshot_state))
+                Ok::<_, crate::appstate::AppStateError>((result, snapshot_state, snapshot))
             })
             .await
             .map_err(|e| anyhow!("{}", e))?;
 
-            let (snapshot_result, snapshot_state) = result;
+            let (snapshot_result, snapshot_state, snapshot) = result;
+            pl.snapshot = Some(snapshot);
             state = snapshot_state;
 
             // Snapshot owns the whole collection: move its Vec into the empty
@@ -365,23 +424,19 @@ impl AppStateProcessor {
             }
         }
 
-        // Snapshot the key cache once for all patches (prefetch_keys already populated it)
-        let keys_map = self.key_cache.lock().await.clone();
+        // Snapshot the key cache once for all patches (prefetch_keys already populated
+        // it); Arc so the per-patch closure handoff is a refcount bump, not a map copy.
+        let keys_map = Arc::new(self.key_cache.lock().await.clone());
         let collection_name_owned = collection_name.to_string();
 
-        // Process patches
-        for patch in &pl.patches {
-            // Collect index MACs we need to look up (pre-allocate with upper bound)
-            let mut need_db_lookup: Vec<Vec<u8>> = Vec::with_capacity(patch.mutations.len());
-            for m in &patch.mutations {
-                if let Some(rec) = &m.record
-                    && let Some(ind) = &rec.index
-                    && let Some(index_mac) = &ind.blob
-                    && !need_db_lookup.iter().any(|v| v == index_mac)
-                {
-                    need_db_lookup.push(index_mac.clone());
-                }
-            }
+        // Each patch moves into its blocking closure and comes back via the return
+        // tuple: the 'static bound used to force a full deep clone per patch
+        // (multi-MB once external mutations are inlined), and the caller still
+        // reads pl.patches afterwards (get_missing_key_ids).
+        let patches = std::mem::take(&mut pl.patches);
+        let mut processed_patches = Vec::with_capacity(patches.len());
+        for patch in patches {
+            let need_db_lookup = collect_unique_index_macs(&patch.mutations);
 
             // Fetch previous value MACs in one backend round-trip instead of a
             // spawn_blocking + query per mutation (N+1).
@@ -390,31 +445,31 @@ impl AppStateProcessor {
                 .get_mutation_macs(collection_name, &need_db_lookup)
                 .await?;
 
-            // Clone data for blocking task
-            let patch_clone = patch.clone();
             let state_clone = state.clone();
             let keys = keys_map.clone();
             let coll = collection_name_owned.clone();
 
             // Offload CPU-intensive patch processing to a blocking thread
-            let result = crate::runtime::blocking(&*self.runtime, move || {
+            let (result, patch) = crate::runtime::blocking(&*self.runtime, move || {
                 let get_prev_value_mac = |index_mac: &[u8]| -> Result<
                     Option<Vec<u8>>,
                     crate::appstate::AppStateError,
                 > { Ok(db_prev.get(index_mac).cloned()) };
 
                 let mut state = state_clone;
-                process_patch(
-                    &patch_clone,
+                let result = process_patch(
+                    &patch,
                     &mut state,
                     |key_id| lookup_app_state_key(&keys, key_id),
                     get_prev_value_mac,
                     validate_macs,
                     &coll,
-                )
+                )?;
+                Ok::<_, crate::appstate::AppStateError>((result, patch))
             })
             .await
             .map_err(|e| anyhow!("{}", e))?;
+            processed_patches.push(patch);
 
             // Update local state with the result from the blocking task
             state = result.state;
@@ -436,6 +491,7 @@ impl AppStateProcessor {
                     .await?;
             }
         }
+        pl.patches = processed_patches;
 
         // Handle case where we only have a snapshot and no patches
         if pl.patches.is_empty() && pl.snapshot.is_some() {
@@ -479,21 +535,14 @@ impl AppStateProcessor {
         let mut state = self.backend.get_version(collection_name).await?;
         let base_version = state.version;
 
-        // Pre-fetch previous value MACs for all index MACs in the mutations
-        let mut db_prev: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-            std::collections::HashMap::new();
-        for m in &mutations {
-            if let Some(rec) = &m.record
-                && let Some(ind) = &rec.index
-                && let Some(index_mac) = &ind.blob
-                && let Some(mac) = self
-                    .backend
-                    .get_mutation_mac(collection_name, index_mac)
-                    .await?
-            {
-                db_prev.insert(index_mac.clone(), mac);
-            }
-        }
+        // Pre-fetch previous value MACs in one backend round-trip, mirroring
+        // the inbound patch path: one batched query instead of a
+        // spawn_blocking + single-row SELECT per mutation.
+        let need_db_lookup = collect_unique_index_macs(&mutations);
+        let db_prev: std::collections::HashMap<Vec<u8>, Vec<u8>> = self
+            .backend
+            .get_mutation_macs(collection_name, &need_db_lookup)
+            .await?;
 
         // Update hash state
         let (_, hash_result) = state.update_hash(&mutations, |index_mac, _| {
@@ -693,5 +742,96 @@ mod external_blob_tests {
         let mut pl = pl_with_snapshot_ref(None);
         let download = |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> { Ok(Vec::new()) };
         assert!(download_external_blobs(&mut pl, &download).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    fn mutation(index_mac: &[u8]) -> wa::SyncdMutation {
+        wa::SyncdMutation {
+            record: Some(wa::SyncdRecord {
+                index: Some(wa::SyncdIndex {
+                    blob: Some(index_mac.to_vec()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Builds `n` mutations whose index MACs repeat every `distinct` values, so
+    /// the expected output is the first `distinct` MACs in first-seen order.
+    fn build(n: usize, distinct: usize) -> Vec<wa::SyncdMutation> {
+        (0..n)
+            .map(|i| {
+                let mut mac = vec![0u8; 32];
+                mac[..8].copy_from_slice(&((i % distinct) as u64).to_le_bytes());
+                mutation(&mac)
+            })
+            .collect()
+    }
+
+    fn mac_bytes(i: usize) -> Vec<u8> {
+        let mut mac = vec![0u8; 32];
+        mac[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        mac
+    }
+
+    fn expected(distinct: usize) -> Vec<Vec<u8>> {
+        (0..distinct).map(mac_bytes).collect()
+    }
+
+    /// Both dedup paths must yield identical first-seen-order unique results;
+    /// the index-sort path (large N) and scan path (small N) cannot diverge.
+    #[test]
+    fn scan_and_sort_paths_agree() {
+        // Small N exercises the linear scan; large N (> limit) the index sort.
+        for &n in &[8usize, MAC_DEDUP_SCAN_LIMIT, MAC_DEDUP_SCAN_LIMIT + 1, 1000] {
+            let distinct = (n / 2).max(1);
+            assert_eq!(
+                collect_unique_index_macs(&build(n, distinct)),
+                expected(distinct),
+                "n = {n}"
+            );
+        }
+    }
+
+    /// The index-sort path must re-emit in first-seen order, not byte-sort order.
+    /// Force that path (> limit MACs) with first appearances running opposite to
+    /// byte order, plus trailing duplicates that must be dropped — so a bug in
+    /// the order-restoration step can't pass by coinciding with the sort order.
+    #[test]
+    fn sort_path_restores_first_seen_order() {
+        let distinct = MAC_DEDUP_SCAN_LIMIT + 20;
+        // First-seen order is descending i; byte order is ascending (i < 256).
+        let mut mutations: Vec<wa::SyncdMutation> = (0..distinct)
+            .rev()
+            .map(|i| mutation(&mac_bytes(i)))
+            .collect();
+        for i in [distinct - 1, distinct / 2, 0] {
+            mutations.push(mutation(&mac_bytes(i)));
+        }
+        let want: Vec<Vec<u8>> = (0..distinct).rev().map(mac_bytes).collect();
+        assert_eq!(collect_unique_index_macs(&mutations), want);
+    }
+
+    #[test]
+    fn skips_mutations_without_index_blob() {
+        let mutations = vec![
+            mutation(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            wa::SyncdMutation::default(),
+            mutation(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            mutation(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ];
+        let macs = collect_unique_index_macs(&mutations);
+        assert_eq!(
+            macs,
+            vec![
+                b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec(),
+                b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_vec()
+            ]
+        );
     }
 }

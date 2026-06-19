@@ -579,7 +579,7 @@ impl Client {
         if raw_key_ids.is_empty() {
             return Ok(());
         }
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let own_jid = match device_snapshot.pn.clone() {
             Some(j) => j,
             None => {
@@ -605,7 +605,7 @@ impl Client {
         self.send_message_impl(
             own_jid,
             &msg,
-            Some(self.generate_message_id().await),
+            Some(self.generate_message_id()),
             true,
             false,
             None,
@@ -721,7 +721,7 @@ impl Client {
             let new_name = new_name.clone();
             let bus = self.core.event_bus.clone();
 
-            let snapshot = self.persistence_manager.get_device_snapshot().await;
+            let snapshot = self.persistence_manager.get_device_snapshot();
             let old = snapshot.push_name.clone();
             if old != new_name {
                 debug!(target: "Client/AppState", "Persisting push name from app state mutation: '{}' (old='{}')", new_name, old);

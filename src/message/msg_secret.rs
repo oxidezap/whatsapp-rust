@@ -102,27 +102,14 @@ impl Client {
         })
     }
 
-    /// Write a batch of secret aliases in one atomic upsert, so a multi-alias
-    /// capture/re-persist never leaves only some aliases stored.
+    /// Queue a batch of secret aliases on the write-behind buffer: immediately
+    /// visible to lookups, durably written off the receive lane in one batched
+    /// upsert (a multi-alias capture still lands in a single batch).
     async fn persist_msg_secret_entries(
         &self,
         entries: Vec<wacore::store::traits::MsgSecretEntry>,
-    ) -> bool {
-        if entries.is_empty() {
-            return false;
-        }
-        match self
-            .persistence_manager
-            .backend()
-            .put_msg_secrets(entries)
-            .await
-        {
-            Ok(_) => true,
-            Err(e) => {
-                log::warn!("failed to persist messageSecrets: {e:?}");
-                false
-            }
-        }
+    ) {
+        self.msg_secret_buffer.queue(entries).await;
     }
 
     async fn own_jid_for_secret_encrypted(&self, info: &MessageInfo) -> Option<Jid> {
@@ -133,23 +120,23 @@ impl Client {
         }
 
         match info.source.addressing_mode {
-            Some(AddressingMode::Lid) => match self.get_lid().await {
+            Some(AddressingMode::Lid) => match self.get_lid() {
                 Some(jid) => Some(jid),
-                None => self.get_pn().await,
+                None => self.get_pn(),
             },
-            Some(AddressingMode::Pn) => match self.get_pn().await {
+            Some(AddressingMode::Pn) => match self.get_pn() {
                 Some(jid) => Some(jid),
-                None => self.get_lid().await,
+                None => self.get_lid(),
             },
             None if info.source.sender.is_lid() || info.source.chat.is_lid() => {
-                match self.get_lid().await {
+                match self.get_lid() {
                     Some(jid) => Some(jid),
-                    None => self.get_pn().await,
+                    None => self.get_pn(),
                 }
             }
-            None => match self.get_pn().await {
+            None => match self.get_pn() {
                 Some(jid) => Some(jid),
-                None => self.get_lid().await,
+                None => self.get_lid(),
             },
         }
     }
@@ -184,38 +171,55 @@ impl Client {
             .unwrap_or_default();
 
         // Look up the secret AND the parent's event time (for the edit window
-        // check below): primary sender, then the LID/PN alternate.
-        let store_secret = match backend
-            .get_msg_secret_with_ts(&chat_for_lookup, &original_sender_str, target_id)
-            .await
-        {
-            Ok(Some(found)) => Some(found),
-            Ok(None) => match fallback_original_sender.as_ref() {
-                Some(alt) => {
-                    let alt_str = alt.to_non_ad_string();
-                    match backend
-                        .get_msg_secret_with_ts(&chat_for_lookup, &alt_str, target_id)
-                        .await
-                    {
-                        Ok(found) => found,
-                        Err(e) => {
-                            log::warn!(
-                                "[msg:{}] secret_encrypted_message alternate secret lookup failed: {e:?}",
-                                info.id
-                            );
-                            None
+        // check below): write-behind buffer first (a not-yet-flushed capture
+        // from this very lane), then the store; primary sender, then the
+        // LID/PN alternate.
+        let buffered = self
+            .msg_secret_buffer
+            .lookup(&chat_for_lookup, &original_sender_str, target_id)
+            .or_else(|| {
+                fallback_original_sender.as_ref().and_then(|alt| {
+                    self.msg_secret_buffer.lookup(
+                        &chat_for_lookup,
+                        &alt.to_non_ad_string(),
+                        target_id,
+                    )
+                })
+            });
+        let store_secret = match buffered {
+            Some(found) => Some(found),
+            None => match backend
+                .get_msg_secret_with_ts(&chat_for_lookup, &original_sender_str, target_id)
+                .await
+            {
+                Ok(Some(found)) => Some(found),
+                Ok(None) => match fallback_original_sender.as_ref() {
+                    Some(alt) => {
+                        let alt_str = alt.to_non_ad_string();
+                        match backend
+                            .get_msg_secret_with_ts(&chat_for_lookup, &alt_str, target_id)
+                            .await
+                        {
+                            Ok(found) => found,
+                            Err(e) => {
+                                log::warn!(
+                                    "[msg:{}] secret_encrypted_message alternate secret lookup failed: {e:?}",
+                                    info.id
+                                );
+                                None
+                            }
                         }
                     }
+                    None => None,
+                },
+                Err(e) => {
+                    log::warn!(
+                        "[msg:{}] backend error reading secret_encrypted_message secret: {e:?}",
+                        info.id
+                    );
+                    None
                 }
-                None => None,
             },
-            Err(e) => {
-                log::warn!(
-                    "[msg:{}] backend error reading secret_encrypted_message secret: {e:?}",
-                    info.id
-                );
-                None
-            }
         };
         // On a total store miss, ask the app-supplied resolver (if any) for the
         // parent secret. This is what lets the Disabled policy still decrypt. The
@@ -249,7 +253,7 @@ impl Client {
                 .unwrap_or_default(),
         };
 
-        let inner = match message_edit::decrypt_secret_encrypted(
+        let mut inner = match message_edit::decrypt_secret_encrypted(
             env.enc_payload,
             env.enc_iv,
             &secret,
@@ -327,6 +331,35 @@ impl Client {
             }
         };
 
+        // The reaction plaintext carries only text + timestamp; the target key
+        // lives in the envelope, so the surfaced plaintext-shape reaction gets
+        // it from there (parity with a plaintext reaction_message).
+        if env.kind == SecretEncKind::EncReaction
+            && let Some(rm) = inner.reaction_message.as_mut()
+            && rm.key.is_none()
+        {
+            rm.key = Some(env.target_message_key.clone());
+        }
+
+        // A comment's own messageSecret rides the OUTER envelope (WA Web puts
+        // it on the comment msgData), which substitution would drop. Carry it
+        // onto the dispatched body (merging into an existing secret-less inner
+        // context) so app-managed secret storage (Disabled policy) can still
+        // learn it for add-ons targeting the comment.
+        if env.kind == SecretEncKind::EncComment
+            && let Some(outer_secret) = msg
+                .message_context_info
+                .as_ref()
+                .and_then(|m| m.message_secret.as_ref())
+        {
+            let inner_mci = inner
+                .message_context_info
+                .get_or_insert_with(Default::default);
+            if inner_mci.message_secret.is_none() {
+                inner_mci.message_secret = Some(outer_secret.clone());
+            }
+        }
+
         // Mirror WA Web `ProcessEditProtocolMsgs`: drop a MESSAGE_EDIT authored
         // outside the parent's edit-processing window (editTs >= parentTs + 20m).
         // The check is on authored time, not "now", so a validly-authored edit
@@ -350,14 +383,32 @@ impl Client {
             .as_ref()
             .and_then(|m| m.message_secret.as_deref())
         {
-            // The re-persisted secret keys the NEXT add-on on the same parent,
-            // so its retention class follows the parent kind and the parent's own
-            // event time (when known) rather than this edit's arrival time.
-            let class = match env.kind {
-                SecretEncKind::MessageEdit => wacore::msg_secret::RetentionClass::Text,
-                _ => wacore::msg_secret::RetentionClass::PollEvent,
+            // The re-persisted secret keys the NEXT add-on. For the edit/poll
+            // kinds the inner message IS the parent (same id, same author), so
+            // it re-keys the parent. A comment is a NEW message: its secret
+            // keys add-ons on the COMMENT itself, so it is stored under the
+            // envelope's own id and sender, never the parent's.
+            let (persist_id, persist_sender, persist_alt, class) = match env.kind {
+                SecretEncKind::MessageEdit => (
+                    target_id,
+                    &original_sender,
+                    fallback_original_sender.as_ref(),
+                    wacore::msg_secret::RetentionClass::Text,
+                ),
+                SecretEncKind::EncComment => (
+                    info.id.as_str(),
+                    &info.source.sender,
+                    fallback_editor.as_ref(),
+                    wacore::msg_secret::RetentionClass::Text,
+                ),
+                _ => (
+                    target_id,
+                    &original_sender,
+                    fallback_original_sender.as_ref(),
+                    wacore::msg_secret::RetentionClass::PollEvent,
+                ),
             };
-            let message_ts = if parent_ts > 0 {
+            let message_ts = if parent_ts > 0 && env.kind != SecretEncKind::EncComment {
                 u64::try_from(parent_ts).ok()
             } else {
                 u64::try_from(info.timestamp.timestamp()).ok()
@@ -366,19 +417,19 @@ impl Client {
             let mut entries = Vec::with_capacity(2);
             if let Some(entry) = self.build_msg_secret_entry(
                 &info.source.chat,
-                &original_sender,
-                target_id,
+                persist_sender,
+                persist_id,
                 secret_bytes,
                 class,
                 message_ts,
             ) {
                 entries.push(entry);
             }
-            if let Some(alternate_sender) = fallback_original_sender.as_ref()
+            if let Some(alternate_sender) = persist_alt
                 && let Some(entry) = self.build_msg_secret_entry(
                     &info.source.chat,
                     alternate_sender,
-                    target_id,
+                    persist_id,
                     secret_bytes,
                     class,
                     message_ts,
@@ -489,28 +540,40 @@ impl Client {
         // Store lookup: primary, then the LID/PN alternate. A backend error is
         // logged and treated as a miss (not a hard nack) so the resolver still
         // gets a chance — mirrors the secret-encrypted edit path.
-        let store_secret = match backend
-            .get_msg_secret(&chat_for_lookup, &target_sender_str, target_id)
-            .await
-        {
-            Ok(Some(s)) => Some(s),
-            Ok(None) => match self
-                .alternate_msg_secret_lookup(&backend, &chat_for_lookup, &target_sender, target_id)
+        let buffered = self
+            .msg_secret_buffer
+            .lookup(&chat_for_lookup, &target_sender_str, target_id)
+            .map(|(secret, _)| secret);
+        let store_secret = match buffered {
+            Some(s) => Some(s),
+            None => match backend
+                .get_msg_secret(&chat_for_lookup, &target_sender_str, target_id)
                 .await
             {
-                Ok(found) => found,
+                Ok(Some(s)) => Some(s),
+                Ok(None) => match self
+                    .alternate_msg_secret_lookup(
+                        &backend,
+                        &chat_for_lookup,
+                        &target_sender,
+                        target_id,
+                    )
+                    .await
+                {
+                    Ok(found) => found,
+                    Err(e) => {
+                        log::warn!("[msg:{}] msmsg: alternate lookup failed: {e:?}", info.id);
+                        None
+                    }
+                },
                 Err(e) => {
-                    log::warn!("[msg:{}] msmsg: alternate lookup failed: {e:?}", info.id);
+                    log::warn!(
+                        "[msg:{}] backend error reading message_secret: {e:?}",
+                        info.id
+                    );
                     None
                 }
             },
-            Err(e) => {
-                log::warn!(
-                    "[msg:{}] backend error reading message_secret: {e:?}",
-                    info.id
-                );
-                None
-            }
         };
         let secret = match store_secret {
             Some(s) => s,
@@ -626,7 +689,7 @@ impl Client {
             },
         };
 
-        let msg = match wa::Message::decode(plaintext.as_slice()) {
+        let msg = match waproto::codec::message_decode(plaintext.as_slice()) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!(
@@ -653,9 +716,9 @@ impl Client {
             return Some(ts.clone());
         }
         if info.source.sender.server == wacore_binary::Server::Bot {
-            self.get_lid().await
+            self.get_lid()
         } else {
-            self.get_pn().await
+            self.get_pn()
         }
     }
 
@@ -664,7 +727,7 @@ impl Client {
     /// `lid_pn_mapping` store and retry. Returns `Ok(None)` when no mapping
     /// is known or the alternate row is absent — the caller treats that as
     /// a terminal miss.
-    async fn alternate_msg_secret_jid(
+    pub(crate) async fn alternate_msg_secret_jid(
         &self,
         backend: &Arc<dyn crate::store::traits::Backend>,
         primary_sender: &Jid,
@@ -697,16 +760,153 @@ impl Client {
             return Ok(None);
         };
         let alternate_str = alternate.to_non_ad_string();
+        if let Some((secret, _)) =
+            self.msg_secret_buffer
+                .lookup(chat_for_lookup, &alternate_str, target_id)
+        {
+            return Ok(Some(secret));
+        }
         backend
             .get_msg_secret(chat_for_lookup, &alternate_str, target_id)
             .await
+    }
+
+    /// Resolve the parent message's author and `messageSecret` for an OUTGOING
+    /// addon (CAG reaction/comment). The author comes from the target key
+    /// (`participant`, else ourselves for `from_me`); the secret is looked up
+    /// under the author, then the LID/PN alternate, then the app resolver.
+    pub(crate) async fn resolve_outgoing_addon_parent(
+        &self,
+        chat: &Jid,
+        target_key: &wa::MessageKey,
+    ) -> Result<(Jid, Vec<u8>), crate::send::SendError> {
+        use crate::send::SendError;
+        use wacore_binary::JidExt;
+
+        let target_id = target_key
+            .id
+            .as_deref()
+            .ok_or_else(|| SendError::InvalidRequest("target message key missing id".into()))?;
+        let author: Jid = if let Some(p) = target_key.participant.as_deref() {
+            p.parse().map_err(|e| {
+                SendError::InvalidRequest(format!("invalid participant in target key: {e}"))
+            })?
+        } else if target_key.from_me == Some(true) {
+            self.addon_self_jid_for_chat(chat)
+                .await
+                .ok_or(SendError::NotLoggedIn)?
+        } else if chat.is_group() {
+            // For group parents remote_jid is the group, not the author, so it
+            // can't identify the sender whose messageSecret we need.
+            return Err(SendError::InvalidRequest(
+                "target message key missing participant for group parent".into(),
+            ));
+        } else {
+            target_key
+                .remote_jid
+                .as_deref()
+                .ok_or_else(|| {
+                    SendError::InvalidRequest(
+                        "target message key missing participant and remote_jid".into(),
+                    )
+                })?
+                .parse()
+                .map_err(|e| {
+                    SendError::InvalidRequest(format!("invalid remote_jid in target key: {e}"))
+                })?
+        };
+
+        let backend = self.persistence_manager.backend();
+        let chat_str = chat.to_non_ad_string();
+        let author_str = author.to_non_ad_string();
+        let buffered = self
+            .msg_secret_buffer
+            .lookup(&chat_str, &author_str, target_id)
+            .map(|(secret, _)| secret);
+        let secret = match buffered {
+            Some(s) => Some(s),
+            None => match backend
+                .get_msg_secret(&chat_str, &author_str, target_id)
+                .await
+            {
+                Ok(Some(s)) => Some(s),
+                Ok(None) => self
+                    .alternate_msg_secret_lookup(&backend, &chat_str, &author, target_id)
+                    .await
+                    .unwrap_or(None),
+                Err(e) => {
+                    log::warn!("backend error reading message_secret for addon send: {e:?}");
+                    None
+                }
+            },
+        };
+        let secret = match secret {
+            Some(s) => s,
+            None => {
+                let alternate = self
+                    .alternate_msg_secret_jid(&backend, &author)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|j| j.to_non_ad_string());
+                self.resolve_msg_secret_via_app(
+                    &chat_str,
+                    &author_str,
+                    alternate.as_deref(),
+                    target_id,
+                )
+                .await
+                .ok_or_else(|| {
+                    SendError::InvalidRequest(format!(
+                        "no messageSecret stored for target {target_id}; the parent \
+                         message was not captured (received before this session, or \
+                         msg_secret_policy disabled without a resolver)"
+                    ))
+                })?
+            }
+        };
+        Ok((author, secret))
+    }
+
+    /// Our own JID in the namespace the chat addresses us under: the group's
+    /// addressing mode for groups (outbound group secrets are persisted under
+    /// the group sender identity), the peer's namespace for DMs.
+    pub(crate) async fn addon_self_jid_for_chat(&self, chat: &Jid) -> Option<Jid> {
+        use wacore_binary::JidExt;
+        if chat.is_group() {
+            let lid_mode = match self.groups().query_info(chat).await {
+                Ok(info) => info.addressing_mode == wacore::types::message::AddressingMode::Lid,
+                Err(e) => {
+                    log::warn!("addon self identity: group info lookup failed: {e:?}");
+                    false
+                }
+            };
+            return if lid_mode {
+                self.get_lid().or_else(|| self.get_pn())
+            } else {
+                self.get_pn().or_else(|| self.get_lid())
+            }
+            .map(|j| j.to_non_ad());
+        }
+        self.addon_self_jid(chat)
+    }
+
+    /// Our own JID in the namespace matching `reference` (the parent author or
+    /// chat addressing): LID identities key the HKDF of LID-addressed addons.
+    pub(crate) fn addon_self_jid(&self, reference: &Jid) -> Option<Jid> {
+        if reference.is_lid() {
+            self.get_lid().or_else(|| self.get_pn())
+        } else {
+            self.get_pn().or_else(|| self.get_lid())
+        }
+        .map(|j| j.to_non_ad())
     }
 
     /// On a total store miss, consult the app-supplied resolver for the parent
     /// secret, trying the primary then the LID/PN alternate sender. Bounded by a
     /// timeout because it runs inside the per-chat receive lane, so a slow app
     /// callback degrades to a miss instead of stalling the chat.
-    async fn resolve_msg_secret_via_app(
+    pub(crate) async fn resolve_msg_secret_via_app(
         &self,
         chat: &str,
         primary_sender: &str,

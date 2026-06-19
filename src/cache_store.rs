@@ -1,9 +1,9 @@
-//! Typed cache wrapper that dispatches to either moka (in-process) or a custom
-//! [`CacheStore`] backend (e.g., Redis).
+//! Typed cache wrapper that dispatches to either the in-process
+//! [`Cache`](crate::cache::Cache) or a custom [`CacheStore`] backend (e.g., Redis).
 //!
 //! [`TypedCache`] presents the same interface regardless of the backing store.
 //! Keys are serialised via [`Display`]; values are serialised with `serde_json`
-//! only on the custom-store path — the moka path has zero extra overhead.
+//! only on the custom-store path — the in-process path has zero extra overhead.
 
 use std::borrow::Borrow;
 use std::fmt::Display;
@@ -19,7 +19,7 @@ pub use wacore::store::cache::CacheStore;
 // ── Internal storage variant ──────────────────────────────────────────────────
 
 enum Inner<K, V> {
-    Moka(Cache<K, V>),
+    Local(Cache<K, V>),
     Custom {
         store: Arc<dyn CacheStore>,
         namespace: &'static str,
@@ -30,13 +30,11 @@ enum Inner<K, V> {
 
 // ── TypedCache ─────────────────────────────────────────────────────────────────
 
-/// A cache over `K → V` backed by either moka or any [`CacheStore`].
+/// A cache over `K → V` backed by either the in-process cache or any [`CacheStore`].
 ///
-/// The moka path has **zero extra overhead** — values are stored in-process
-/// without any serialisation.  The custom-store path serialises values with
-/// `serde_json` and keys via [`Display`].
-///
-/// Methods mirror moka's API so call sites need no changes.
+/// The in-process path has **zero extra overhead** — values are stored in
+/// memory without any serialisation.  The custom-store path serialises values
+/// with `serde_json` and keys via [`Display`].
 pub struct TypedCache<K, V> {
     inner: Inner<K, V>,
 }
@@ -46,10 +44,10 @@ where
     K: std::hash::Hash + Eq + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
-    /// Wrap an existing cache (zero overhead vs. using the cache directly).
-    pub fn from_moka(cache: Cache<K, V>) -> Self {
+    /// Wrap an in-process [`Cache`] (zero overhead vs. using the cache directly).
+    pub fn from_local(cache: Cache<K, V>) -> Self {
         Self {
-            inner: Inner::Moka(cache),
+            inner: Inner::Local(cache),
         }
     }
 }
@@ -91,7 +89,7 @@ where
         Q: std::hash::Hash + Eq + Display + ?Sized,
     {
         match &self.inner {
-            Inner::Moka(cache) => cache.get(key).await,
+            Inner::Local(cache) => cache.get(key).await,
             Inner::Custom {
                 store, namespace, ..
             } => {
@@ -117,7 +115,7 @@ where
     /// Insert or update a value (takes ownership of key and value).
     pub async fn insert(&self, key: K, value: V) {
         match &self.inner {
-            Inner::Moka(cache) => cache.insert(key, value).await,
+            Inner::Local(cache) => cache.insert(key, value).await,
             Inner::Custom {
                 store,
                 namespace,
@@ -148,7 +146,7 @@ where
         Q: std::hash::Hash + Eq + Display + ?Sized,
     {
         match &self.inner {
-            Inner::Moka(cache) => cache.invalidate(key).await,
+            Inner::Local(cache) => cache.invalidate(key).await,
             Inner::Custom {
                 store, namespace, ..
             } => {
@@ -162,14 +160,14 @@ where
 
     /// Remove all entries.
     ///
-    /// For the moka backend this is synchronous (matching moka's API).
+    /// For the in-process backend this is synchronous.
     /// For the custom backend this spawns a fire-and-forget task via
     /// [`tokio::runtime::Handle::try_current`] (requires `tokio-runtime`
     /// feature) to avoid panicking if called outside a Tokio runtime.
     /// Without `tokio-runtime`, the clear is skipped with a warning.
     pub fn invalidate_all(&self) {
         match &self.inner {
-            Inner::Moka(cache) => cache.invalidate_all(),
+            Inner::Local(cache) => cache.invalidate_all(),
             Inner::Custom {
                 store, namespace, ..
             } => {
@@ -197,7 +195,7 @@ where
     /// Remove all entries, awaiting completion for custom backends.
     pub async fn clear(&self) {
         match &self.inner {
-            Inner::Moka(cache) => cache.invalidate_all(),
+            Inner::Local(cache) => cache.clear().await,
             Inner::Custom {
                 store, namespace, ..
             } => {
@@ -208,13 +206,13 @@ where
         }
     }
 
-    /// Run any pending internal housekeeping tasks (moka only).
+    /// Run any pending internal housekeeping tasks (in-process backend only).
     ///
-    /// For the moka backend this ensures all writes have been applied before
-    /// calling [`entry_count`](Self::entry_count), which can otherwise lag.
-    /// For custom backends this is a no-op.
+    /// For the in-process backend this evicts expired entries so a subsequent
+    /// [`entry_count`](Self::entry_count) reflects them. For custom backends
+    /// this is a no-op.
     pub async fn run_pending_tasks(&self) {
-        if let Inner::Moka(cache) = &self.inner {
+        if let Inner::Local(cache) = &self.inner {
             cache.run_pending_tasks().await;
         }
     }
@@ -225,7 +223,7 @@ where
     /// [`entry_count_async`](Self::entry_count_async) instead.
     pub fn entry_count(&self) -> u64 {
         match &self.inner {
-            Inner::Moka(cache) => cache.entry_count(),
+            Inner::Local(cache) => cache.entry_count(),
             Inner::Custom { .. } => 0,
         }
     }
@@ -233,7 +231,7 @@ where
     /// Approximate entry count, delegating to the custom backend if available.
     pub async fn entry_count_async(&self) -> u64 {
         match &self.inner {
-            Inner::Moka(cache) => cache.entry_count(),
+            Inner::Local(cache) => cache.entry_count(),
             Inner::Custom {
                 store, namespace, ..
             } => store.entry_count(namespace).await.unwrap_or(0),

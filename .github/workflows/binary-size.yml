@@ -1,0 +1,219 @@
+permissions:
+  contents: read
+name: Binary Size
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # head_ref alone could collide across forks; the PR number is unique.
+  group: binary-size-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PROTOC_VERSION: "3.25.3"
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+  CARGO_BLOAT_VERSION: "0.12.1"
+  CARGO_LLVM_LINES_VERSION: "0.4.46"
+
+jobs:
+  binary-size-pr:
+    if: github.event_name == 'pull_request'
+    name: Binary Size (PR)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+
+      - name: Install tools (protoc, cargo-binstall)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-binstall
+
+      - name: Install cargo-bloat and cargo-llvm-lines
+        run: >
+          cargo binstall --no-confirm
+          cargo-bloat@${{ env.CARGO_BLOAT_VERSION }}
+          cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Rust registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ runner.os }}-cargo-binary-size
+          cache-targets: "false"
+
+      - name: Measure binary size
+        run: python3 scripts/ci/measure_binary_size.py --out-dir size-out
+
+      - name: Upload size artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: size-metrics
+          path: size-out/
+          retention-days: 90
+
+      - name: Download baseline from latest main run
+        id: baseline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # --event push: a fork PR from a branch named "main" also matches
+          # --branch main, and its artifact must not become the baseline.
+          run_id=$(gh run list --workflow binary-size.yml --branch main \
+            --event push --status success --limit 1 --json databaseId \
+            --jq '.[0].databaseId' || true)
+          if [ -n "$run_id" ] && [ "$run_id" != "null" ]; then
+            if gh run download "$run_id" --name size-metrics --dir base-out; then
+              echo "dir=base-out" >> "$GITHUB_OUTPUT"
+            else
+              echo "Baseline artifact missing or expired on run $run_id"
+            fi
+          else
+            echo "No successful Binary Size run on main yet"
+          fi
+
+      # Informational (job summary); the real gate is the report script below.
+      # Tolerates the window before the first push run creates the series.
+      - name: Compare against gh-pages series
+        continue-on-error: true
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: "whatsapp-rust binary size"
+          tool: "customSmallerIsBetter"
+          output-file-path: size-out/size-metrics.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: false
+          save-data-file: false
+          benchmark-data-dir-path: dev/binary-size
+          summary-always: true
+
+      # The event payload freezes the labels at trigger time; query them
+      # live so adding size-increase-ok + re-running the job works.
+      - name: Check size-increase-ok label
+        id: override
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          allow=$(gh api \
+            "repos/${{ github.repository }}/issues/${PR_NUMBER}/labels" \
+            --jq 'map(.name) | index("size-increase-ok") != null')
+          echo "allow=$allow" >> "$GITHUB_OUTPUT"
+
+      # No GH_TOKEN here: the report script is PR-controlled code.
+      - name: Generate report and evaluate gate
+        env:
+          BASE_DIR: ${{ steps.baseline.outputs.dir }}
+          ALLOW_SIZE_INCREASE: ${{ steps.override.outputs.allow }}
+        run: |
+          python3 scripts/ci/binary_size_report.py --head size-out \
+            ${BASE_DIR:+--base "$BASE_DIR"} --out-dir size-out
+          cat size-out/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Fork PRs run with a read-only token, so they only get the job summary.
+      - name: Post sticky PR comment
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          marker='<!-- binary-size-report -->'
+          cid=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate \
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
+          if [ -n "$cid" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/${cid}" \
+              -F body=@size-out/report.md
+          else
+            gh api -X POST "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+              -F body=@size-out/report.md
+          fi
+
+      - name: Enforce size budget
+        run: |
+          status=$(head -n1 size-out/gate.txt)
+          if [ "$status" = "FAIL" ]; then
+            echo "::error::Binary size budget exceeded — see the job summary or PR comment. If the increase is expected, add the size-increase-ok label."
+            exit 1
+          fi
+          echo "Gate status: $status"
+
+  binary-size-push:
+    # Dispatch only publishes from main so stray branches can't pollute the series.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    name: Binary Size (push)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # github-action-benchmark deploys the gh-pages site after auto-push.
+      deployments: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+
+      - name: Install tools (protoc, cargo-binstall)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-binstall
+
+      - name: Install cargo-bloat and cargo-llvm-lines
+        run: >
+          cargo binstall --no-confirm
+          cargo-bloat@${{ env.CARGO_BLOAT_VERSION }}
+          cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Rust registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ runner.os }}-cargo-binary-size
+          cache-targets: "false"
+
+      - name: Measure binary size
+        run: python3 scripts/ci/measure_binary_size.py --out-dir size-out
+
+      # This artifact is the comparison baseline for PR runs.
+      - name: Upload size artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: size-metrics
+          path: size-out/
+          retention-days: 90
+
+      # Post-merge safety net: alerts on the commit when a regression landed
+      # despite (or around) the PR gate, e.g. via the size-increase-ok label.
+      - name: Store series on gh-pages
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: "whatsapp-rust binary size"
+          tool: "customSmallerIsBetter"
+          output-file-path: size-out/size-metrics.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          benchmark-data-dir-path: dev/binary-size
+          max-items-in-chart: 200
+          alert-threshold: "102%"
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true

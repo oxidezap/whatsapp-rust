@@ -157,7 +157,7 @@ async fn test_session_state_after_roundtrip() -> anyhow::Result<()> {
 
     // LID sessions: the active sessions used by encrypt_for_devices
     let mut lid_sessions = Vec::new();
-    if let Some(lid) = client_b.client.get_lid().await {
+    if let Some(lid) = client_b.client.get_lid() {
         lid_sessions = scan_sessions(&*backend, &lid.user, "lid").await?;
         for (addr, pending) in &lid_sessions {
             info!("LID session {addr}: pending_pre_key={pending}");
@@ -235,7 +235,7 @@ async fn test_session_persistence() -> anyhow::Result<()> {
     // PN→LID mapping was resolved before encryption.
     let mut post_send = scan_sessions(&*backend, &jid_b.user, "c.us").await?;
     if post_send.is_empty()
-        && let Some(lid_b) = client_b.client.get_lid().await
+        && let Some(lid_b) = client_b.client.get_lid()
     {
         post_send = scan_sessions(&*backend, &lid_b.user, "lid").await?;
     }

@@ -91,7 +91,9 @@ pub struct SignalStoreCache {
 /// Cache entry tracking whether a session is present, absent, or checked out
 /// by an encrypt/decrypt operation.
 enum SessionEntry {
-    Present(Box<SessionRecord>),
+    // `Arc` so `peek_session` (retry / LID-migration checks) bumps a refcount
+    // instead of deep-cloning the record (KBs with archived states).
+    Present(Arc<SessionRecord>),
     Absent,
     /// Taken by load_session; has_session treats as present, flush/eviction skip.
     CheckedOut,
@@ -124,7 +126,7 @@ impl SessionStoreState {
     fn put(&mut self, address: &str, record: SessionRecord) {
         let addr = self.key_for(address);
         self.cache
-            .insert(addr.clone(), SessionEntry::Present(Box::new(record)));
+            .insert(addr.clone(), SessionEntry::Present(Arc::new(record)));
         self.dirty.insert(addr.clone());
         self.deleted.remove(&addr);
     }
@@ -349,7 +351,11 @@ impl SignalStoreCache {
                     else {
                         unreachable!()
                     };
-                    return Ok(Some(*record));
+                    // Unique unless a peek's Arc is still alive (short-lived
+                    // inspection paths), so this is a move, not a clone.
+                    return Ok(Some(
+                        Arc::try_unwrap(record).unwrap_or_else(|arc| (*arc).clone()),
+                    ));
                 }
                 return Ok(None);
             }
@@ -386,13 +392,13 @@ impl SignalStoreCache {
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
-    ) -> Result<Option<SessionRecord>> {
+    ) -> Result<Option<Arc<SessionRecord>>> {
         let key = address.as_str();
         {
             let state = self.sessions.lock().await;
             if let Some(entry) = state.cache.get(key) {
                 return match entry {
-                    SessionEntry::Present(record) => Ok(Some((**record).clone())),
+                    SessionEntry::Present(record) => Ok(Some(record.clone())),
                     _ => Ok(None),
                 };
             }
@@ -402,12 +408,11 @@ impl SignalStoreCache {
         let mut state = self.sessions.lock().await;
         match backend_result {
             Some(bytes) => {
-                let record = SessionRecord::deserialize(&bytes)?;
+                let record = Arc::new(SessionRecord::deserialize(&bytes)?);
                 if !state.cache.contains_key(key) {
-                    state.cache.insert(
-                        Arc::from(key),
-                        SessionEntry::Present(Box::new(record.clone())),
-                    );
+                    state
+                        .cache
+                        .insert(Arc::from(key), SessionEntry::Present(record.clone()));
                     state.evict_if_needed(self.max_entries);
                 }
                 Ok(Some(record))
@@ -535,8 +540,23 @@ impl SignalStoreCache {
     /// Shared lock for the `name` chain. Same name returns the same lock so a
     /// concurrent encrypt can't read a chain iteration another is advancing.
     pub async fn sender_key_lock(&self, name: &SenderKeyName) -> Arc<Mutex<()>> {
+        self.shared_named_lock(name.cache_key()).await
+    }
+
+    /// Shared per-group session-setup lock (see
+    /// `SenderKeyStore::session_setup_lock`). Lives in the chain-lock map
+    /// under a suffixed key; chain cache_keys end in a numeric device id, so
+    /// the key spaces are disjoint.
+    pub async fn session_setup_lock(&self, name: &SenderKeyName) -> Arc<Mutex<()>> {
+        let mut key = String::with_capacity(name.cache_key().len() + 8);
+        key.push_str(name.cache_key());
+        key.push_str("::setup");
+        self.shared_named_lock(&key).await
+    }
+
+    async fn shared_named_lock(&self, key: &str) -> Arc<Mutex<()>> {
         let mut map = self.sender_key_locks.lock().await;
-        if let Some(lock) = map.get(name.cache_key()) {
+        if let Some(lock) = map.get(key) {
             return lock.clone();
         }
         // Drop idle locks (held only by the map) once the map grows large.
@@ -544,7 +564,7 @@ impl SignalStoreCache {
             map.retain(|_, lock| Arc::strong_count(lock) > 1);
         }
         let lock = Arc::new(Mutex::new(()));
-        map.insert(Arc::from(name.cache_key()), lock.clone());
+        map.insert(Arc::from(key), lock.clone());
         lock
     }
 
@@ -1147,6 +1167,9 @@ mod consumed_prekey_atomicity_tests {
             async fn remove_prekey(&self, id: u32) -> crate::store::error::Result<()> {
                 self.0.remove_prekey(id).await
             }
+            async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> crate::store::error::Result<()> {
+                self.0.mark_prekeys_uploaded(ids).await
+            }
             async fn get_max_prekey_id(&self) -> crate::store::error::Result<u32> {
                 self.0.get_max_prekey_id().await
             }
@@ -1266,6 +1289,9 @@ mod consumed_prekey_atomicity_tests {
                     tokio::task::yield_now().await;
                 }
                 self.inner.put_sessions_batch(sessions).await
+            }
+            async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> crate::store::error::Result<()> {
+                self.inner.mark_prekeys_uploaded(ids).await
             }
             async fn remove_prekey(&self, id: u32) -> crate::store::error::Result<()> {
                 // The fix drains prekeys under the sessions lock, so a try_lock here
