@@ -367,12 +367,13 @@ impl SenderKeyState {
     pub fn add_sender_message_key(&mut self, sender_message_key: &SenderMessageKey) {
         let keys = std::sync::Arc::make_mut(&mut self.message_keys);
         keys.push(sender_message_key.as_protobuf());
-        // AMORTIZED EVICTION: Only prune when exceeding MAX + threshold.
-        // This reduces O(n) drain() calls from every insert to once every PRUNE_THRESHOLD inserts.
+        // AMORTIZED EVICTION: only prune past MAX + threshold, so the prune runs
+        // once every PRUNE_THRESHOLD inserts (survivors may be reordered; the
+        // backlog is searched by iteration, not position).
         let len = keys.len();
         if len > consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD {
             let excess = len - consts::MAX_MESSAGE_KEYS;
-            keys.drain(..excess);
+            consts::evict_oldest_message_keys(keys, excess);
         }
     }
 
@@ -383,7 +384,9 @@ impl SenderKeyState {
             .message_keys
             .iter()
             .position(|x| x.iteration.unwrap_or_default() == iteration)?;
-        let smk = std::sync::Arc::make_mut(&mut self.message_keys).remove(index);
+        // Searched by iteration, not slot, so swap_remove (O(1)) is safe where
+        // remove would shift the backlog tail (O(n)).
+        let smk = std::sync::Arc::make_mut(&mut self.message_keys).swap_remove(index);
         Some(SenderMessageKey::from_protobuf(smk))
     }
 }

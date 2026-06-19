@@ -465,10 +465,11 @@ impl SessionState {
         }
 
         if let Some(position) = message_key_position {
-            // Only now do we mutate - remove the message key directly
+            // Lookup is by counter, not slot, so the consumed key can be
+            // swap-removed (O(1)) instead of shifted out (O(n)).
             let message_key = self.session.receiver_chains[chain_idx]
                 .message_keys
-                .remove(position);
+                .swap_remove(position);
             let keys = MessageKeyGenerator::from_pb(message_key).map_err(InvalidSessionError)?;
             return Ok(Some(keys));
         }
@@ -487,14 +488,13 @@ impl SessionState {
 
         let chain = &mut self.session.receiver_chains[chain_idx];
 
-        // AMORTIZED EVICTION: Only prune when exceeding MAX + threshold.
-        // This reduces O(n) drain() calls from every insert to once every PRUNE_THRESHOLD inserts.
-        // The lookup in get_message_keys() does a linear search by counter value, so order
-        // doesn't matter for correctness.
+        // AMORTIZED EVICTION: only prune past MAX + threshold, so the prune runs
+        // once every PRUNE_THRESHOLD inserts. get_message_keys() searches by
+        // counter, so eviction may reorder survivors (see evict_oldest_message_keys).
         let len = chain.message_keys.len();
         if len > consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD {
             let excess = len - consts::MAX_MESSAGE_KEYS;
-            chain.message_keys.drain(..excess);
+            consts::evict_oldest_message_keys(&mut chain.message_keys, excess);
         }
         chain.message_keys.push(message_keys.into_pb());
 
