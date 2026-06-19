@@ -212,7 +212,12 @@ fn group_delivery_receipts<'a>(
         recipient: Option<&'a Jid>,
     }
 
-    let mut index: std::collections::HashMap<Key, usize> = std::collections::HashMap::new();
+    // Pre-sized to the receipt count so the per-group dedup map never rehashes
+    // mid-grow on a large offline backlog; it's dropped here, so the transient
+    // over-allocation when grouping is heavy never outlives the call. `groups` is
+    // returned and grouping can shrink it sharply, so it's left to grow.
+    let mut index: std::collections::HashMap<Key, usize> =
+        std::collections::HashMap::with_capacity(infos.len());
     let mut groups: Vec<DeliveryReceiptGroup> = Vec::new();
     for info in infos {
         let is_status = info.source.chat.is_status_broadcast();
