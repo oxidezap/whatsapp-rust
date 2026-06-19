@@ -117,10 +117,17 @@ jobs:
           echo "Mock server failed to become ready"
           exit 1
 
-      # simulation and memory share the same instrumented build, so one
-      # build covers both instruments.
+      # Integration benches run only the simulation (instruction-count)
+      # instrument, NOT memory. send_and_receive drives a live async round-trip,
+      # whose in-flight pipeline buffers (TLS/websocket/noise/decrypt/dispatch)
+      # straddle divan sample boundaries, so its peakMemoryBytes tracked runner
+      # scheduling/CPU rather than code (freeCalls ~= 2x allocCalls; cross-CPU
+      # runs tripped a false memory regression on every send-path PR). Simulation
+      # counts are deterministic under Valgrind regardless of host CPU and stay a
+      # meaningful end-to-end signal; the deterministic memory signal lives in the
+      # single-threaded unit benches (other job), which keep the memory instrument.
       - name: Build the benchmark targets
-        run: cargo codspeed build -m simulation -m memory -p bench-integration
+        run: cargo codspeed build -m simulation -p bench-integration
 
       # `-p bench-integration` is required: `tests/bench-integration` is not a
       # workspace default-member, so a bare `cargo codspeed run` discovers no
@@ -131,5 +138,5 @@ jobs:
           MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
           RUST_LOG: warn
         with:
-          mode: simulation,memory
+          mode: simulation
           run: cargo codspeed run -p bench-integration
