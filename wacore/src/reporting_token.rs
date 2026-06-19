@@ -569,6 +569,41 @@ pub fn generate_reporting_token(
     remote_jid: &Jid,
     existing_secret: Option<&[u8]>,
 ) -> Option<ReportingTokenResult> {
+    // Message types that carry no reporting token (reactions, poll votes, keep-in-chat)
+    // bail before encoding the message / minting a secret / deriving the key: the field
+    // extraction below would return None and discard all of it.
+    if !should_include_reporting_token(message) {
+        return None;
+    }
+    let encoded = waproto::codec::message_to_vec(message);
+    generate_reporting_token_from_encoded(
+        message,
+        &encoded,
+        stanza_id,
+        sender_jid,
+        remote_jid,
+        existing_secret,
+    )
+}
+
+/// Like [`generate_reporting_token`] but reuses `encoded_message` (the protobuf encoding
+/// of `message`, with no reporting context spliced on) instead of encoding `message`
+/// again. The DM send path encodes the message once for the wire plaintext and threads
+/// those same bytes here, so a token-bearing DM no longer encodes its message a second
+/// time per send just to extract the token's whitelisted fields.
+pub fn generate_reporting_token_from_encoded(
+    message: &wa::Message,
+    encoded_message: &[u8],
+    stanza_id: &str,
+    sender_jid: &Jid,
+    remote_jid: &Jid,
+    existing_secret: Option<&[u8]>,
+) -> Option<ReportingTokenResult> {
+    if !should_include_reporting_token(message) {
+        return None;
+    }
+    let content = extract_reporting_token_content(encoded_message, REPORTING_FIELDS)?;
+
     let message_secret: [u8; MESSAGE_SECRET_SIZE] = if let Some(secret) = existing_secret {
         if secret.len() != MESSAGE_SECRET_SIZE {
             log::warn!("Invalid existing secret size, generating new one");
@@ -587,7 +622,6 @@ pub fn generate_reporting_token(
         derive_reporting_token_key(&message_secret, stanza_id, &sender_jid_str, &remote_jid_str)
             .ok()?;
 
-    let content = generate_reporting_token_content(message)?;
     let token = calculate_reporting_token(&key, &content).ok()?;
 
     Some(ReportingTokenResult {
@@ -935,6 +969,60 @@ mod tests {
         )
         .expect("valid message with existing secret should generate token");
         assert_eq!(result.message_secret, existing_secret);
+    }
+
+    #[test]
+    fn from_encoded_matches_generate_and_skips_excluded_types() {
+        let sender = Jid::pn("5511999887766");
+        let remote = Jid::pn("5511888776655");
+        let secret = [0x5Au8; MESSAGE_SECRET_SIZE];
+
+        // Token-bearing message: feeding the message's own encoding to the _from_encoded
+        // variant yields the same token the all-in-one path derives — the contract the DM
+        // send path relies on when it shares one encode between the token and the plaintext.
+        let message = wa::Message {
+            conversation: Some("Test message".to_string()),
+            ..Default::default()
+        };
+        let encoded = waproto::codec::message_to_vec(&message);
+        let direct = generate_reporting_token(&message, "SID", &sender, &remote, Some(&secret))
+            .expect("token-bearing message");
+        let shared = generate_reporting_token_from_encoded(
+            &message,
+            &encoded,
+            "SID",
+            &sender,
+            &remote,
+            Some(&secret),
+        )
+        .expect("token-bearing message");
+        assert_eq!(direct.reporting_token, shared.reporting_token);
+        assert_eq!(direct.message_secret, shared.message_secret);
+
+        // Excluded type (reaction): both paths bail before extraction/secret/key (the
+        // reorder makes that skip explicit) and return None.
+        let reaction = wa::Message {
+            reaction_message: Some(Box::new(wa::message::ReactionMessage {
+                text: Some("👍".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let reaction_encoded = waproto::codec::message_to_vec(&reaction);
+        assert!(
+            generate_reporting_token(&reaction, "SID", &sender, &remote, Some(&secret)).is_none()
+        );
+        assert!(
+            generate_reporting_token_from_encoded(
+                &reaction,
+                &reaction_encoded,
+                "SID",
+                &sender,
+                &remote,
+                Some(&secret)
+            )
+            .is_none()
+        );
     }
 
     #[test]
