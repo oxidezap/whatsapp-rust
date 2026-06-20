@@ -76,27 +76,21 @@ impl Client {
                     return Ok(());
                 }
                 Err(e) => {
-                    if let Some(crate::appstate_sync::AppStateSyncError::KeyNotFound(id_b64)) =
-                        e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
+                    if e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
+                        .is_some_and(|ase| {
+                            matches!(ase, crate::appstate_sync::AppStateSyncError::KeyNotFound(_))
+                        })
                         && attempt == 1
                     {
-                        // The stored key is missing (e.g. an old bincode row that no
-                        // longer decodes, or one rejected as corrupt). Patch/snapshot
-                        // processing fails on it before the normal get_missing_key_ids
-                        // path runs, so request it explicitly. Arm the listener before
-                        // sending so a fast key-share can't fire before we wait, then
-                        // wait for the primary to re-share. Every share notifies, so
-                        // repairing multiple missing keys works one share at a time.
-                        use base64::Engine as _;
-                        if let Ok(key_id) =
-                            base64::engine::general_purpose::STANDARD_NO_PAD.decode(id_b64)
-                        {
-                            let listener = self.initial_keys_synced_notifier.listen();
-                            self.request_missing_keys_with_dedup(vec![key_id]).await;
-                            debug!(target: "Client/AppState", "App state key missing for {:?}; requested it, waiting up to 10s for key share then retrying", name);
-                            if rt_timeout(&*self.runtime, Duration::from_secs(10), listener)
-                                .await
-                                .is_err()
+                        if !self.initial_app_state_keys_received.load(Ordering::Relaxed) {
+                            debug!(target: "Client/AppState", "App state key missing for {:?}; waiting up to 10s for key share then retrying", name);
+                            if rt_timeout(
+                                &*self.runtime,
+                                Duration::from_secs(10),
+                                self.initial_keys_synced_notifier.listen(),
+                            )
+                            .await
+                            .is_err()
                             {
                                 warn!(target: "Client/AppState", "Timeout waiting for key share for {:?}; retrying anyway", name);
                             }
@@ -402,6 +396,8 @@ impl Client {
         // has_more_patches=true without advancing the version (WA Web uses 500).
         const MAX_PAGINATION_ITERATIONS: u32 = 500;
         let mut iteration = 0u32;
+        // Request the batch's missing keys at most once per task (see below).
+        let mut requested_missing_keys = false;
 
         while has_more {
             if self.is_shutting_down() {
@@ -512,6 +508,24 @@ impl Client {
             };
 
             let proc = self.get_app_state_processor().await;
+
+            // Keys needed to decode this batch may be absent (e.g. an old bincode
+            // row that no longer decodes). The processor fails on a missing key
+            // before the post-process request path below runs, so request them up
+            // front (once), wait briefly for the primary to re-share, then re-fetch.
+            if !requested_missing_keys
+                && let Ok(missing) = proc.get_missing_key_ids(&pl).await
+                && !missing.is_empty()
+            {
+                requested_missing_keys = true;
+                let count = missing.len();
+                let listener = self.initial_keys_synced_notifier.listen();
+                self.request_missing_keys_with_dedup(missing).await;
+                debug!(target: "Client/AppState", "Requested {count} missing app-state key(s) for {:?}; waiting up to 10s before retrying", name);
+                let _ = rt_timeout(&*self.runtime, Duration::from_secs(10), listener).await;
+                continue;
+            }
+
             let (mutations, new_state, list) =
                 proc.process_parsed_patch_list(pl, &download, true).await?;
             let decode_elapsed = _decode_start.elapsed();
