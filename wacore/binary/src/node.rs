@@ -656,6 +656,48 @@ pub struct NodeRef<'a> {
     pub content: Option<Box<NodeContentRef<'a>>>,
 }
 
+/// Layout audit for the binary-protocol "AST". These sizes are load-bearing:
+/// `NodeRef` (and the `ValueRef`/`NodeStr` it nests) is rebuilt per attribute and
+/// per element on the zero-copy decode path — hundreds of times for one usync
+/// response — so a stray field that defeats a niche (e.g. `AttrsRef`'s `Box<[_]>`
+/// null-pointer niche collapsing `Empty` into the slice) silently regresses
+/// per-message memory and cache footprint. Pin the numbers: a deliberate layout
+/// change edits the constant, an accidental one breaks the build.
+///
+/// 64-bit only — sizes assume 8-byte pointers and `CompactString`'s 24-byte SSO buffer.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use std::mem::size_of;
+    // Borrowed decode path (hot).
+    assert!(
+        size_of::<NodeStr<'static>>() == 24,
+        "NodeStr layout changed"
+    );
+    assert!(
+        size_of::<ValueRef<'static>>() == 32,
+        "ValueRef layout changed"
+    );
+    assert!(
+        size_of::<AttrsRef<'static>>() == 16,
+        "AttrsRef grew past 16B — Box<[_]> null-niche for Empty lost?"
+    );
+    assert!(
+        size_of::<NodeContentRef<'static>>() == 32,
+        "NodeContentRef layout changed"
+    );
+    assert!(
+        size_of::<NodeRef<'static>>() == 48,
+        "NodeRef grew — rebuilt per attr/element on the decode hot path"
+    );
+    // Owned form held by message handlers; dominated by the inline `Attrs` SmallVec.
+    assert!(size_of::<NodeValue>() == 32, "NodeValue layout changed");
+    assert!(size_of::<NodeContent>() == 32, "NodeContent layout changed");
+    assert!(
+        size_of::<Node>() == 184,
+        "Node grew — check the Attrs inline SmallVec and content enum"
+    );
+};
+
 impl Node {
     pub fn new(
         tag: impl Into<Cow<'static, str>>,

@@ -418,6 +418,22 @@ pub struct JidRef<'a> {
     pub integrator: u16,
 }
 
+/// Layout audit: `Jid` is embedded throughout device state and message metadata,
+/// and `JidRef` is built per JID attribute on the decode path, so an added field
+/// surfaces here as a build break instead of silent per-message bloat. `Server`
+/// must stay a single `repr(u8)` byte — it packs into the JID's tail padding.
+/// 64-bit only (8-byte pointers, 24-byte CompactString SSO).
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use std::mem::size_of;
+    assert!(
+        size_of::<Server>() == 1,
+        "Server must stay 1 byte (repr(u8))"
+    );
+    assert!(size_of::<Jid>() == 32, "Jid layout changed");
+    assert!(size_of::<JidRef<'static>>() == 32, "JidRef layout changed");
+};
+
 impl JidExt for Jid {
     fn user(&self) -> &str {
         &self.user

@@ -242,6 +242,36 @@ fn bench_unmarshal_large(bencher: divan::Bencher) {
         });
 }
 
+// Decode all the way into the owned `Node` tree (184-byte nodes) that message
+// handlers hold, not just the borrowed `NodeRef`. This is the allocation- and
+// layout-sensitive path: a regression in owned-node size shows up here while the
+// borrowed `bench_unmarshal_*` above stays flat.
+#[divan::bench]
+fn bench_unmarshal_to_owned_small(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_small_marshaled)
+        .bench_refs(|marshaled| {
+            black_box(
+                unmarshal_ref(black_box(&marshaled[1..]))
+                    .unwrap()
+                    .to_owned(),
+            );
+        });
+}
+
+#[divan::bench]
+fn bench_unmarshal_to_owned_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_large_marshaled)
+        .bench_refs(|marshaled| {
+            black_box(
+                unmarshal_ref(black_box(&marshaled[1..]))
+                    .unwrap()
+                    .to_owned(),
+            );
+        });
+}
+
 // Unpack benchmarks: payloads are pre-built in setup so the compressed case
 // measures the inflate path, not the deflate used to build the fixture. The
 // compressed body is a realistic multi-KB frame (the marshaled usync-like
