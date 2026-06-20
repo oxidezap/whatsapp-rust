@@ -528,6 +528,9 @@ impl Client {
 
             let (mutations, new_state, list) =
                 proc.process_parsed_patch_list(pl, &download, true).await?;
+            // This page decoded, so its keys were available; allow the next page
+            // (which may reference a different rotated key) to repair again.
+            requested_missing_keys = false;
             let decode_elapsed = _decode_start.elapsed();
             if decode_elapsed.as_millis() > 500 {
                 debug!(target: "Client/AppState", "Patch decode for {:?} took {:?}", name, decode_elapsed);
