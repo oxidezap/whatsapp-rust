@@ -215,10 +215,12 @@ incremental = false
 
 # Off-hot-path crates run per connection / sync / request, not per message,
 # so size-optimizing them shrinks the binary at no measurable throughput cost.
-# The per-message crypto/protocol crates (libsignal, wacore-binary, waproto,
-# prost, aes, sha2, hkdf, flate2, curve25519) stay at opt-level 3.
+# The per-message/per-frame crypto/protocol crates (libsignal, wacore-binary,
+# waproto, prost, aes, sha2, hkdf, flate2, curve25519, wacore-noise) stay at
+# opt-level 3 — wacore-noise's NoiseCipher runs the transport AEAD per frame,
+# so despite owning the once-per-connection handshake it is not handshake-only.
 # z = persistence (Diesel/SQLite, I/O-bound), media HTTP (ureq, network-bound),
-# TLS PKI, and the once-per-connection handshake.
+# and TLS PKI.
 [profile.release.package.diesel]
 opt-level = "z"
 [profile.release.package.diesel_migrations]
@@ -238,8 +240,6 @@ opt-level = "z"
 [profile.release.package.webpki-roots]
 opt-level = "z"
 [profile.release.package.http]
-opt-level = "z"
-[profile.release.package.wacore-noise]
 opt-level = "z"
 # s = data-path framing kept a notch faster than z: low throughput for a chat
 # client, but still touched on every frame/record.
