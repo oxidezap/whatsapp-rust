@@ -213,6 +213,49 @@ panic = "abort"
 strip = true
 incremental = false
 
+# Off-hot-path crates run per connection / sync / request, not per message,
+# so size-optimizing them shrinks the binary at no measurable throughput cost.
+# The per-message/per-frame crypto/protocol crates (libsignal, wacore-binary,
+# waproto, prost, aes, sha2, hkdf, flate2, curve25519, wacore-noise) stay at
+# opt-level 3 — wacore-noise's NoiseCipher runs the transport AEAD per frame,
+# so despite owning the once-per-connection handshake it is not handshake-only.
+# z = persistence (Diesel/SQLite, I/O-bound), media HTTP (ureq, network-bound),
+# and TLS PKI.
+[profile.release.package.diesel]
+opt-level = "z"
+[profile.release.package.diesel_migrations]
+opt-level = "z"
+[profile.release.package.r2d2]
+opt-level = "z"
+[profile.release.package.whatsapp-rust-sqlite-storage]
+opt-level = "z"
+[profile.release.package.ureq]
+opt-level = "z"
+[profile.release.package.ureq-proto]
+opt-level = "z"
+[profile.release.package.whatsapp-rust-ureq-http-client]
+opt-level = "z"
+[profile.release.package.rustls-webpki]
+opt-level = "z"
+[profile.release.package.webpki-roots]
+opt-level = "z"
+[profile.release.package.http]
+opt-level = "z"
+# s = data-path framing kept a notch faster than z: low throughput for a chat
+# client, but still touched on every frame/record.
+[profile.release.package.rustls]
+opt-level = "s"
+[profile.release.package.tokio-websockets]
+opt-level = "s"
+[profile.release.package.whatsapp-rust-tokio-transport]
+opt-level = "s"
+[profile.release.package.wacore-appstate]
+opt-level = "s"
+[profile.release.package.chrono]
+opt-level = "s"
+[profile.release.package.serde_json]
+opt-level = "s"
+
 # Benchmark profile: release-grade codegen, but thin LTO keeps bench builds
 # fast (release uses fat LTO) and debug symbols stay for local profiling.
 [profile.bench]
