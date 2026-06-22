@@ -36,8 +36,8 @@ mod tests {
         fail_clear_macs: Arc<Mutex<bool>>,
         // Call counters distinguishing the batched MAC prefetch from per-item
         // lookups, so tests can pin which path the processor takes.
-        singular_mac_calls: Arc<std::sync::atomic::AtomicU64>,
-        batch_mac_calls: Arc<std::sync::atomic::AtomicU64>,
+        singular_mac_calls: Arc<portable_atomic::AtomicU64>,
+        batch_mac_calls: Arc<portable_atomic::AtomicU64>,
     }
 
     // Implement SignalStore - Signal protocol cryptographic operations

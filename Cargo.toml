@@ -43,6 +43,9 @@ default-members = [
 # Force the wacore::time abstraction so WASM/deterministic-test builds don't
 # regress. Exceptions carry `#[allow(clippy::disallowed_methods)]` inline.
 disallowed_methods = "deny"
+# Ban std 64-bit atomic types: absent on 32-bit targets (Xtensa/ESP32). Use
+# portable_atomic. Host-only test/bench counters carry an inline allow.
+disallowed_types = "deny"
 
 [workspace.dependencies]
 # Shared dependencies

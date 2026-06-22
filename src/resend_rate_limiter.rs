@@ -13,9 +13,10 @@
 //! sessions, immune to clock jumps); the rate is atomic so it retunes live.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_lock::Mutex;
+use portable_atomic::AtomicU64;
 use wacore::time::Instant;
 use wacore_binary::jid::Jid;
 

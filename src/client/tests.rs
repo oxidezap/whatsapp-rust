@@ -2828,7 +2828,9 @@ async fn terminal_disconnect_propagates_to_per_connection_signal() {
 
 // Counting allocator for the empirical allocation guard below. Process-wide
 // for the unit-test binary, but the only cost is one relaxed atomic add per
-// alloc; tests that never read the counter are unaffected.
+// alloc; tests that never read the counter are unaffected. Host-only harness:
+// std's 64-bit atomic is fine here since this never compiles for embedded.
+#[allow(clippy::disallowed_types)]
 mod counting_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::{AtomicU64, Ordering};
