@@ -42,18 +42,24 @@ const SSRC: u32 = 0x5741_0001;
 #[tokio::main]
 async fn main() -> Result<()> {
     let pid = std::process::id();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(move |buf, record| {
-            use std::io::Write;
-            writeln!(
-                buf,
-                "{} pid={pid} [{:<5}] {}",
-                wacore::time::now_utc().format("%M:%S%.3f"),
-                record.level(),
-                record.args()
-            )
-        })
-        .init();
+    // webrtc-sctp/-dtls log the DTLS Close Notify at the normal end of a call ("failed to read
+    // packets on net_conn: Alert is Fatal or Close Notify"), which is benign teardown noise: the
+    // call already ended via <terminate> and the disconnect is surfaced through CallEvent. Quiet
+    // those crates to error so the demo output stays clean; RUST_LOG still overrides this.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,webrtc_sctp=error,webrtc_dtls=error"),
+    )
+    .format(move |buf, record| {
+        use std::io::Write;
+        writeln!(
+            buf,
+            "{} pid={pid} [{:<5}] {}",
+            wacore::time::now_utc().format("%M:%S%.3f"),
+            record.level(),
+            record.args()
+        )
+    })
+    .init();
     info!("🦀 voip run pid={pid}");
 
     // Defensive Windows audio-timing hygiene: ask for a 1 ms system timer so the mic drain's sleep poll
