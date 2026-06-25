@@ -69,6 +69,8 @@ pub struct CallAudioCodec {
 /// mirrors the stanza 1:1 for downstream JS consumers.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Forward-compat: WA can add call sub-types, so an external exhaustive match must keep a wildcard.
+#[non_exhaustive]
 pub enum CallAction {
     Offer {
         call_id: String,
