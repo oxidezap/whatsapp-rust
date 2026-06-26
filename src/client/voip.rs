@@ -131,12 +131,14 @@ impl Voip<'_> {
             call_creator,
             reason: None,
         });
-        self.client.send_node(stanza).await?;
-        // Sending the stanza only tells the peer; the local media task keeps capturing/sending (and a
-        // still-dormant outgoing call could attach on a late relay ack) until torn down. Reuse the same
-        // teardown the peer's `<terminate>` triggers so the public hangup actually ends our side too.
+        let sent = self.client.send_node(stanza).await;
+        // Tear the local call down regardless of whether the stanza reached the peer: the app asked to
+        // hang up, and a failed signaling send must not leave the media task capturing/sending (or a
+        // dormant outgoing call free to attach on a late relay ack). Reuse the same teardown the peer's
+        // `<terminate>` triggers so the public hangup actually ends our side too.
         #[cfg(feature = "voip")]
         crate::voip::facade::terminate_call(self.client, call_id);
+        sent?;
         Ok(())
     }
 }
@@ -184,6 +186,31 @@ mod tests {
         );
         *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
         (client, count)
+    }
+
+    struct FailingTransport;
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl crate::transport::Transport for FailingTransport {
+        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            Err(anyhow::anyhow!("transport down"))
+        }
+        async fn disconnect(&self) {}
+    }
+
+    async fn make_client_failing() -> Arc<Client> {
+        let client = crate::test_utils::create_test_client().await;
+        let socket_transport: Arc<dyn crate::transport::Transport> = Arc::new(FailingTransport);
+        let key = [0u8; 32];
+        let noise_socket = crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            socket_transport,
+            NoiseCipher::new(&key).expect("valid key"),
+            NoiseCipher::new(&key).expect("valid key"),
+        );
+        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        client
     }
 
     fn caller() -> Jid {
@@ -252,6 +279,33 @@ mod tests {
             reg.active_count(),
             0,
             "terminate must tear the local call down, not just signal the peer"
+        );
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn terminate_tears_down_local_even_when_send_fails() {
+        use wacore::voip::CallSession;
+        let client = make_client_failing().await;
+        let reg = client.call_registry();
+        reg.insert(CallSession::new_outgoing(
+            "CALL-ID-0001",
+            caller(),
+            caller(),
+        ));
+        assert_eq!(reg.active_count(), 1);
+        let res = client
+            .voip()
+            .terminate("CALL-ID-0001", &caller(), &caller())
+            .await;
+        assert!(
+            res.is_err(),
+            "a failed signaling send must surface the error"
+        );
+        assert_eq!(
+            reg.active_count(),
+            0,
+            "a failed signaling send must still tear the local media task down"
         );
     }
 

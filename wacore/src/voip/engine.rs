@@ -199,7 +199,10 @@ impl CallConfig {
             .cloned()
             .ok_or(SetupError::NoRelayToken(ep.token_id))?;
         // The relay <key> is the STUN MESSAGE-INTEGRITY key; without it the allocate/binding-success
-        // we sign can't authenticate, so fail here rather than dial with an empty key.
+        // we sign can't authenticate, so fail here rather than dial with an empty key. Sign with the
+        // base64 TEXT of <key> (relay_key_ascii), NOT its decoded bytes (relay.relay_key): the relay
+        // HMACs against the ASCII key material, so decoding first fails the allocate (verified against
+        // the WhatsApp client; raw decoded bytes were the original bug).
         let integrity_key = relay
             .relay_key_ascii
             .clone()
