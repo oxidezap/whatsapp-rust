@@ -111,7 +111,8 @@ impl Client {
             .await;
             let client = Arc::clone(self);
             let info2 = Arc::clone(&info);
-            let skip_ack = info.source.chat.is_status_broadcast();
+            let skip_ack = info.source.chat.is_status_broadcast()
+                && self.parsed_message_pre_ack_hook.get().is_none();
             self.outbound_flush.spawn(&*self.runtime, async move {
                 // Only ack once the PDO request is out (or skipped as ancient);
                 // a transient send failure leaves it queued for redelivery.
@@ -250,7 +251,9 @@ impl Client {
                 "[msg:{}] All enc payloads unrecognized; transport-acking to drop from offline queue",
                 info.id
             );
-            if !info.source.chat.is_status_broadcast() {
+            if !info.source.chat.is_status_broadcast()
+                || self.parsed_message_pre_ack_hook.get().is_some()
+            {
                 self.spawn_node_transport_ack(nr).await;
             }
             return None;
@@ -386,7 +389,7 @@ impl Client {
                 should_process_skmsg_after_session(session_payloads.is_empty(), session_outcome);
 
             if should_process_skmsg {
-                match self
+                let group_outcome = match self
                     .clone()
                     .process_group_enc_batch(
                         &group_payloads,
@@ -396,8 +399,9 @@ impl Client {
                     )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(outcome) => {
                         // Processed successfully or handled errors (e.g. sent retry receipt)
+                        outcome
                     }
                     Err(e) => {
                         log::warn!(
@@ -406,7 +410,11 @@ impl Client {
                             info.source.sender.observe(),
                             info.source.chat.observe()
                         );
+                        GroupBatchOutcome::default()
                     }
+                };
+                if group_outcome.pre_ack_hook_failed {
+                    return;
                 }
             } else {
                 // Only show warning if session messages actually FAILED (not duplicates)
@@ -474,14 +482,19 @@ impl Client {
         } else if session_had_duplicates
             && !session_decrypted_successfully
             && !session_dispatched_undecryptable
-            && !info.source.chat.is_status_broadcast()
+            && (!info.source.chat.is_status_broadcast()
+                || self.parsed_message_pre_ack_hook.get().is_some())
         {
             // Duplicate (already-processed) with no group content: ack it so the
             // server drops it from the offline queue (whatsmeow/WA Web treat
             // old-counter like success). status is acked by the should_ack gate
             // (a status SKDM pkmsg can reach here), so skip it to avoid a
             // redundant receipt.
-            self.ack_received_message(&info);
+            match self.dispatch_pending_pre_ack_message(&info).await {
+                Some(true) => {}
+                Some(false) => return,
+                None => self.ack_received_message(&info),
+            }
         } else if should_ack_skdm_only_session_fallback(session_outcome, bot_payloads.is_empty()) {
             // SKDM-only session decrypts skip dispatch, so this stanza would
             // otherwise stay queued. WA Web and whatsmeow ack every decrypted
@@ -489,6 +502,10 @@ impl Client {
             // Status is intentionally not filtered here, so its success receipt
             // still follows the normal WA Web path.
             self.ack_received_message(&info);
+        }
+
+        if session_outcome.pre_ack_hook_failed {
+            return;
         }
 
         // Bot-secret (msmsg) payloads run inline here so they're serialised
@@ -673,6 +690,8 @@ impl Client {
                         Ok(plaintext_outcome) => {
                             outcome.decrypted = true;
                             outcome.dispatched |= plaintext_outcome.dispatched;
+                            outcome.pre_ack_hook_failed |= plaintext_outcome.pre_ack_hook_failed;
+                            outcome.had_failure |= plaintext_outcome.pre_ack_hook_failed;
                             outcome.skdm_only |= plaintext_outcome.skdm_only;
                         }
                         Err(e) => {
@@ -791,6 +810,10 @@ impl Client {
                                     Ok(plaintext_outcome) => {
                                         outcome.decrypted = true;
                                         outcome.dispatched |= plaintext_outcome.dispatched;
+                                        outcome.pre_ack_hook_failed |=
+                                            plaintext_outcome.pre_ack_hook_failed;
+                                        outcome.had_failure |=
+                                            plaintext_outcome.pre_ack_hook_failed;
                                         outcome.skdm_only |= plaintext_outcome.skdm_only;
                                     }
                                     Err(e) => {
@@ -842,6 +865,7 @@ impl Client {
                                     if migration_outcome.decrypted
                                         || migration_outcome.duplicate
                                         || migration_outcome.plaintext_failed
+                                        || migration_outcome.pre_ack_hook_failed
                                     {
                                         outcome.decrypted |= migration_outcome.decrypted;
                                         outcome.duplicate |= migration_outcome.duplicate;
@@ -850,6 +874,10 @@ impl Client {
                                         outcome.plaintext_failed |=
                                             migration_outcome.plaintext_failed;
                                         outcome.had_failure |= migration_outcome.plaintext_failed;
+                                        outcome.pre_ack_hook_failed |=
+                                            migration_outcome.pre_ack_hook_failed;
+                                        outcome.had_failure |=
+                                            migration_outcome.pre_ack_hook_failed;
                                         if migration_outcome.plaintext_failed {
                                             outcome.undecryptable |= self
                                                 .handle_plaintext_failure(info, decrypt_fail_mode)
@@ -926,6 +954,7 @@ impl Client {
                         if migration_outcome.decrypted
                             || migration_outcome.duplicate
                             || migration_outcome.plaintext_failed
+                            || migration_outcome.pre_ack_hook_failed
                         {
                             outcome.decrypted |= migration_outcome.decrypted;
                             outcome.duplicate |= migration_outcome.duplicate;
@@ -933,6 +962,8 @@ impl Client {
                             outcome.skdm_only |= migration_outcome.skdm_only;
                             outcome.plaintext_failed |= migration_outcome.plaintext_failed;
                             outcome.had_failure |= migration_outcome.plaintext_failed;
+                            outcome.pre_ack_hook_failed |= migration_outcome.pre_ack_hook_failed;
+                            outcome.had_failure |= migration_outcome.pre_ack_hook_failed;
                             if migration_outcome.plaintext_failed {
                                 outcome.undecryptable |=
                                     self.handle_plaintext_failure(info, decrypt_fail_mode).await;
@@ -974,6 +1005,7 @@ impl Client {
                         if migration_outcome.decrypted
                             || migration_outcome.duplicate
                             || migration_outcome.plaintext_failed
+                            || migration_outcome.pre_ack_hook_failed
                         {
                             outcome.decrypted |= migration_outcome.decrypted;
                             outcome.duplicate |= migration_outcome.duplicate;
@@ -981,6 +1013,8 @@ impl Client {
                             outcome.skdm_only |= migration_outcome.skdm_only;
                             outcome.plaintext_failed |= migration_outcome.plaintext_failed;
                             outcome.had_failure |= migration_outcome.plaintext_failed;
+                            outcome.pre_ack_hook_failed |= migration_outcome.pre_ack_hook_failed;
+                            outcome.had_failure |= migration_outcome.pre_ack_hook_failed;
                             if migration_outcome.plaintext_failed {
                                 outcome.undecryptable |=
                                     self.handle_plaintext_failure(info, decrypt_fail_mode).await;
@@ -1031,6 +1065,7 @@ impl Client {
                         if migration_outcome.decrypted
                             || migration_outcome.duplicate
                             || migration_outcome.plaintext_failed
+                            || migration_outcome.pre_ack_hook_failed
                         {
                             outcome.decrypted |= migration_outcome.decrypted;
                             outcome.duplicate |= migration_outcome.duplicate;
@@ -1038,6 +1073,8 @@ impl Client {
                             outcome.skdm_only |= migration_outcome.skdm_only;
                             outcome.plaintext_failed |= migration_outcome.plaintext_failed;
                             outcome.had_failure |= migration_outcome.plaintext_failed;
+                            outcome.pre_ack_hook_failed |= migration_outcome.pre_ack_hook_failed;
+                            outcome.had_failure |= migration_outcome.pre_ack_hook_failed;
                             if migration_outcome.plaintext_failed {
                                 outcome.undecryptable |=
                                     self.handle_plaintext_failure(info, decrypt_fail_mode).await;
@@ -1098,11 +1135,12 @@ impl Client {
         info: &Arc<MessageInfo>,
         _sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
-    ) -> Result<(), DecryptionError> {
+    ) -> Result<GroupBatchOutcome, DecryptionError> {
         if payloads.is_empty() {
-            return Ok(());
+            return Ok(GroupBatchOutcome::default());
         }
         let mut adapter = self.signal_adapter().await;
+        let mut outcome = GroupBatchOutcome::default();
 
         // Always use bare sender for sender key operations. Real WA delivers
         // skmsg with bare participant but pkmsg (SKDM) with device-qualified
@@ -1141,7 +1179,7 @@ impl Client {
                         self.handle_unknown_device_sync(info).await;
                     }
 
-                    if let Err(e) = self
+                    match self
                         .clone()
                         .handle_decrypted_plaintext(
                             "skmsg",
@@ -1151,7 +1189,12 @@ impl Client {
                         )
                         .await
                     {
-                        log::warn!("Failed processing group plaintext (batch): {e:?}");
+                        Ok(plaintext_outcome) => {
+                            outcome.pre_ack_hook_failed |= plaintext_outcome.pre_ack_hook_failed;
+                        }
+                        Err(e) => {
+                            log::warn!("Failed processing group plaintext (batch): {e:?}");
+                        }
                     }
                 }
                 Err(SignalProtocolError::DuplicatedMessage(iteration, counter)) => {
@@ -1165,8 +1208,15 @@ impl Client {
                     // Redelivered duplicate: ack it so the server drops it from the
                     // offline queue. status is already acked by the should_ack gate,
                     // so skip it to avoid a redundant receipt.
-                    if !info.source.chat.is_status_broadcast() {
-                        self.ack_received_message(info);
+                    match self.dispatch_pending_pre_ack_message(info).await {
+                        Some(true) => {}
+                        Some(false) => outcome.pre_ack_hook_failed = true,
+                        None if !info.source.chat.is_status_broadcast()
+                            || self.parsed_message_pre_ack_hook.get().is_some() =>
+                        {
+                            self.ack_received_message(info);
+                        }
+                        None => {}
                     }
                 }
                 Err(SignalProtocolError::NoSenderKeyState(msg)) => {
@@ -1176,6 +1226,7 @@ impl Client {
                             info.id,
                             info.source.sender.observe()
                         );
+                        self.ack_status_drop_after_pre_ack_hook(info);
                         continue;
                     }
 
@@ -1208,6 +1259,7 @@ impl Client {
                             info.source.sender.observe(),
                             e
                         );
+                        self.ack_status_drop_after_pre_ack_hook(info);
                         continue;
                     }
 
@@ -1231,11 +1283,13 @@ impl Client {
                     .await;
                     if !info.source.chat.is_status_broadcast() {
                         self.spawn_nack(info, NackReason::UnhandledError, None);
+                    } else {
+                        self.ack_status_drop_after_pre_ack_hook(info);
                     }
                 }
             }
         }
-        Ok(())
+        Ok(outcome)
     }
 
     /// WA Web: online → `syncDeviceListJob`, offline → `OfflinePendingDeviceCache`.
@@ -1406,9 +1460,10 @@ impl Client {
                 ..Default::default()
             })
         } else {
-            self.dispatch_parsed_message(msg, info).await;
+            let dispatched = self.dispatch_parsed_message(msg, info).await;
             Ok(PlaintextHandleOutcome {
-                dispatched: true,
+                dispatched,
+                pre_ack_hook_failed: !dispatched,
                 ..Default::default()
             })
         }
@@ -1506,6 +1561,7 @@ impl Client {
                     Ok(plaintext_outcome) => MigrationDecryptOutcome {
                         decrypted: true,
                         dispatched: plaintext_outcome.dispatched,
+                        pre_ack_hook_failed: plaintext_outcome.pre_ack_hook_failed,
                         skdm_only: plaintext_outcome.skdm_only,
                         ..Default::default()
                     },

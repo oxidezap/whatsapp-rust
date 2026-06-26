@@ -5339,6 +5339,301 @@ async fn capturing_client(
     (client, transport)
 }
 
+#[derive(Clone)]
+struct PreAckOrderRecorder {
+    order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl wacore::types::events::EventHandler for PreAckOrderRecorder {
+    fn handle_event(&self, event: Arc<Event>) {
+        if matches!(event.as_ref(), Event::Message(_, _)) {
+            self.order
+                .lock()
+                .expect("order recorder mutex")
+                .push("event");
+        }
+    }
+}
+
+#[tokio::test]
+async fn parsed_message_pre_ack_hook_runs_before_ack_and_event() {
+    let (client, transport) = capturing_client("pre_ack_hook_success").await;
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    client.register_handler(Arc::new(PreAckOrderRecorder {
+        order: Arc::clone(&order),
+    }));
+
+    let hook_order = Arc::clone(&order);
+    let hook_transport = Arc::clone(&transport);
+    client
+        .set_parsed_message_pre_ack_hook(move |ctx| {
+            let hook_order = Arc::clone(&hook_order);
+            let hook_transport = Arc::clone(&hook_transport);
+            async move {
+                assert_eq!(ctx.info.id, "PRE_ACK_SUCCESS");
+                assert_eq!(ctx.message.conversation.as_deref(), Some("commit me"));
+                assert!(
+                    hook_transport.sent().is_empty(),
+                    "ACK/receipt must not be sent before the pre-ACK hook completes"
+                );
+                hook_order
+                    .lock()
+                    .expect("order recorder mutex")
+                    .push("hook");
+                Ok::<(), anyhow::Error>(())
+            }
+        })
+        .expect("hook should register once");
+
+    let info = Arc::new(create_test_message_info(
+        "5511999998888@s.whatsapp.net",
+        "PRE_ACK_SUCCESS",
+        "5511777776666@s.whatsapp.net",
+    ));
+    let msg = wa::Message {
+        conversation: Some("commit me".to_string()),
+        ..Default::default()
+    };
+
+    assert!(client.dispatch_parsed_message(msg, &info).await);
+
+    assert_eq!(
+        order.lock().expect("order recorder mutex").as_slice(),
+        ["hook", "event"],
+        "message event must be dispatched only after the awaited pre-ACK hook succeeds"
+    );
+
+    for _ in 0..40 {
+        if !transport.sent().is_empty() {
+            break;
+        }
+        client
+            .runtime
+            .sleep(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        !transport.sent().is_empty(),
+        "successful hook should allow the normal ACK/receipt to be sent"
+    );
+}
+
+#[tokio::test]
+async fn parsed_message_pre_ack_hook_failure_suppresses_ack_and_event() {
+    let (client, transport) = capturing_client("pre_ack_hook_failure").await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client.register_handler(collector.clone());
+
+    client
+        .set_parsed_message_pre_ack_hook(|ctx| async move {
+            assert_eq!(ctx.info.id, "PRE_ACK_FAILURE");
+            Err::<(), anyhow::Error>(anyhow::anyhow!("durable commit failed"))
+        })
+        .expect("hook should register once");
+
+    let info = Arc::new(create_test_message_info(
+        "5511999998888@s.whatsapp.net",
+        "PRE_ACK_FAILURE",
+        "5511777776666@s.whatsapp.net",
+    ));
+    let msg = wa::Message {
+        conversation: Some("retry me".to_string()),
+        ..Default::default()
+    };
+
+    assert!(!client.dispatch_parsed_message(msg, &info).await);
+
+    client
+        .runtime
+        .sleep(std::time::Duration::from_millis(50))
+        .await;
+    assert!(
+        transport.sent().is_empty(),
+        "failing hook must suppress ACK/receipt so the server can redeliver"
+    );
+    assert!(
+        collector.events().is_empty(),
+        "failing hook must not emit Event::Message for an uncommitted delivery attempt"
+    );
+}
+
+#[tokio::test]
+async fn pending_pre_ack_message_retries_hook_on_duplicate_redelivery() {
+    let (client, transport) = capturing_client("pre_ack_hook_retry_pending").await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client.register_handler(collector.clone());
+
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_attempts = Arc::clone(&attempts);
+    client
+        .set_parsed_message_pre_ack_hook(move |_ctx| {
+            let hook_attempts = Arc::clone(&hook_attempts);
+            async move {
+                let attempt = hook_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    Err::<(), anyhow::Error>(anyhow::anyhow!("first commit attempt failed"))
+                } else {
+                    Ok::<(), anyhow::Error>(())
+                }
+            }
+        })
+        .expect("hook should register once");
+
+    let info = Arc::new(create_test_message_info(
+        "5511999998888@s.whatsapp.net",
+        "PRE_ACK_RETRY",
+        "5511777776666@s.whatsapp.net",
+    ));
+    let msg = wa::Message {
+        conversation: Some("retry pending".to_string()),
+        ..Default::default()
+    };
+
+    assert!(!client.dispatch_parsed_message(msg, &info).await);
+    assert!(
+        transport.sent().is_empty(),
+        "first hook failure must leave the message unacknowledged"
+    );
+
+    assert_eq!(
+        client.dispatch_pending_pre_ack_message(&info).await,
+        Some(true),
+        "duplicate redelivery should retry the stored parsed message hook"
+    );
+
+    let got = collect_event(
+        &client,
+        collector,
+        |e| matches!(e, Event::Message(_, info) if info.id == "PRE_ACK_RETRY"),
+        500,
+    )
+    .await;
+    assert!(
+        got.is_some(),
+        "successful retry must dispatch the message event"
+    );
+
+    for _ in 0..40 {
+        if !transport.sent().is_empty() {
+            break;
+        }
+        client
+            .runtime
+            .sleep(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        !transport.sent().is_empty(),
+        "successful retry must allow the ACK/receipt"
+    );
+    assert_eq!(
+        client.dispatch_pending_pre_ack_message(&info).await,
+        None,
+        "successful pending retry must remove the stored parsed message"
+    );
+}
+
+#[tokio::test]
+async fn parsed_message_pre_ack_hook_disables_status_deferred_ack_gate() {
+    let client = crate::test_utils::create_test_client_with_name("pre_ack_status_gate").await;
+    let status_node = NodeBuilder::new("message")
+        .attr("from", "status@broadcast")
+        .attr("id", "PRE_ACK_STATUS")
+        .build();
+
+    assert!(
+        client.should_ack(&status_node.as_node_ref()),
+        "without the pre-ACK hook, status messages keep the existing deferred ACK fallback"
+    );
+
+    client
+        .set_parsed_message_pre_ack_hook(|_ctx| async { Ok::<(), anyhow::Error>(()) })
+        .expect("hook should register once");
+
+    assert!(
+        !client.should_ack(&status_node.as_node_ref()),
+        "with the pre-ACK hook, status ACK must wait for parsed-message hook success"
+    );
+}
+
+#[tokio::test]
+async fn successful_normal_redelivery_clears_stale_pre_ack_pending_entry() {
+    let (client, _transport) = capturing_client("pre_ack_normal_redelivery").await;
+
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_attempts = Arc::clone(&attempts);
+    client
+        .set_parsed_message_pre_ack_hook(move |_ctx| {
+            let hook_attempts = Arc::clone(&hook_attempts);
+            async move {
+                let attempt = hook_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    Err::<(), anyhow::Error>(anyhow::anyhow!("first commit attempt failed"))
+                } else {
+                    Ok::<(), anyhow::Error>(())
+                }
+            }
+        })
+        .expect("hook should register once");
+
+    let info = Arc::new(create_test_message_info(
+        "5511999998888@s.whatsapp.net",
+        "PRE_ACK_NORMAL_REDELIVERY",
+        "5511777776666@s.whatsapp.net",
+    ));
+    let msg = wa::Message {
+        conversation: Some("first attempt".to_string()),
+        ..Default::default()
+    };
+    assert!(!client.dispatch_parsed_message(msg, &info).await);
+
+    let redelivery_msg = wa::Message {
+        conversation: Some("normal redelivery".to_string()),
+        ..Default::default()
+    };
+    assert!(client.dispatch_parsed_message(redelivery_msg, &info).await);
+    assert_eq!(
+        client.dispatch_pending_pre_ack_message(&info).await,
+        None,
+        "normal successful redelivery must clear the old pending parsed message"
+    );
+}
+
+#[tokio::test]
+async fn own_status_success_keeps_transport_ack_with_pre_ack_hook() {
+    let (client, transport) = capturing_client("pre_ack_own_status_ack").await;
+    client
+        .set_parsed_message_pre_ack_hook(|_ctx| async { Ok::<(), anyhow::Error>(()) })
+        .expect("hook should register once");
+
+    let mut info = create_test_message_info(
+        "status@broadcast",
+        "PRE_ACK_OWN_STATUS",
+        "5511777776666@s.whatsapp.net",
+    );
+    info.source.is_from_me = true;
+    let info = Arc::new(info);
+    let msg = wa::Message {
+        conversation: Some("own status".to_string()),
+        ..Default::default()
+    };
+
+    assert!(client.dispatch_parsed_message(msg, &info).await);
+    for _ in 0..40 {
+        if !transport.sent().is_empty() {
+            break;
+        }
+        client
+            .runtime
+            .sleep(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        !transport.sent().is_empty(),
+        "own status success still needs a transport ACK when the deferred gate is suppressed"
+    );
+}
+
 /// Regression: a malformed pkmsg used to fall through silently. Now
 /// it dispatches the consumer event AND emits a nack on the wire so
 /// the server stops retransmitting.

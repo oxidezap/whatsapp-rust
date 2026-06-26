@@ -121,6 +121,7 @@ pub mod version;
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, MessageContext};
     pub use crate::client::{Client, ClientError};
+    pub use crate::message::{ParsedMessagePreAckContext, ParsedMessagePreAckHookAlreadySet};
     pub use crate::request::IqError;
     #[cfg(feature = "tokio-runtime")]
     pub use crate::runtime_impl::TokioRuntime;

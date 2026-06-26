@@ -21,6 +21,15 @@ impl Client {
     /// a consistent (generation, Arc) pair. Must be called from a non-async
     /// context or inside a scoped block (MutexGuard is !Send).
     pub(crate) fn swap_message_semaphore(&self, permits: usize) {
+        let permits = if self.parsed_message_pre_ack_hook.get().is_some() {
+            // A pre-ACK hook can intentionally fail after Signal decrypt has
+            // advanced volatile state. Keep message processing serial while the
+            // hook is installed so pending retry/flush deferral has one inbound
+            // message to reason about at a time.
+            1
+        } else {
+            permits
+        };
         let mut guard = match self.message_processing_semaphore.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -415,9 +424,13 @@ impl Client {
         };
         match tag {
             "receipt" | "notification" | "call" => true,
-            "message" => from
-                .to_jid()
-                .is_some_and(|j| j.is_newsletter() || j.is_status_broadcast()),
+            "message" => {
+                if self.parsed_message_pre_ack_hook.get().is_some() {
+                    return false;
+                }
+                from.to_jid()
+                    .is_some_and(|j| j.is_newsletter() || j.is_status_broadcast())
+            }
             _ => false,
         }
     }

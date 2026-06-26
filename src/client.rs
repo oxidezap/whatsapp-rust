@@ -501,6 +501,16 @@ pub struct Client {
     /// in `WAWebMessageProcessPlaceholder`.
     pub(crate) undecryptable_dispatched: Cache<ChatMessageId, ()>,
 
+    /// Parsed messages whose pre-ACK hook failed after Signal state advanced.
+    /// A same-process server redelivery may then arrive as a Signal duplicate;
+    /// this cache lets that duplicate retry the durable hook with the original
+    /// normalized message instead of ACKing an uncommitted delivery.
+    pub(crate) pending_parsed_message_pre_ack:
+        Cache<ChatMessageId, crate::message::PendingParsedMessagePreAck>,
+    /// Reliable barrier for Signal flush deferral. Kept separate from the cache
+    /// because `PortableCache::entry_count()` is intentionally best-effort.
+    pub(crate) pending_parsed_message_pre_ack_count: AtomicUsize,
+
     pub enable_auto_reconnect: Arc<AtomicBool>,
     pub auto_reconnect_errors: Arc<AtomicU32>,
 
@@ -562,6 +572,11 @@ pub struct Client {
     /// immutable afterward, so the receive hot path reads it with a plain
     /// `OnceLock::get` (no lock) and no per-node guard acquisition.
     pub custom_enc_handlers: std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>,
+
+    /// Optional awaited hook for consumers that need to durably commit a parsed
+    /// inbound message before the SDK sends the delivery receipt / transport ACK.
+    pub(crate) parsed_message_pre_ack_hook:
+        std::sync::OnceLock<crate::message::ParsedMessagePreAckHook>,
 
     /// Chat state (typing indicator) handlers registered by external consumers.
     /// Each handler receives a `ChatStateEvent` describing the chat, optional participant and state.

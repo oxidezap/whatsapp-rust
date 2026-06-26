@@ -487,6 +487,7 @@ pub struct BotBuilder<
     // Optional fields
     event_handlers: Vec<RegisteredHandler>,
     raw_handlers: Vec<Arc<dyn EventHandler>>,
+    pre_ack_message_hook: Option<crate::message::ParsedMessagePreAckHook>,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     override_version: Option<(u32, u32, u32)>,
     device_props_override: Option<DevicePropsOverride>,
@@ -508,6 +509,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             runtime: default_runtime(),
             event_handlers: Vec::new(),
             raw_handlers: Vec::new(),
+            pre_ack_message_hook: None,
             custom_enc_handlers: HashMap::new(),
             override_version: None,
             device_props_override: None,
@@ -533,6 +535,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             runtime: self.runtime,
             event_handlers: self.event_handlers,
             raw_handlers: self.raw_handlers,
+            pre_ack_message_hook: self.pre_ack_message_hook,
             custom_enc_handlers: self.custom_enc_handlers,
             override_version: self.override_version,
             device_props_override: self.device_props_override,
@@ -637,6 +640,27 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
                 }
             }
         })
+    }
+
+    /// Run `hook` inline before acknowledging each parsed inbound message.
+    ///
+    /// This is the durability hook for consumers that need strict
+    /// "ACK-after-commit" semantics. The hook receives the same normalized
+    /// parsed message and [`MessageInfo`] that will be emitted as
+    /// `Event::Message` after ACK. Return `Ok(())` only after your durable write
+    /// has committed. Returning `Err` suppresses both the ACK/receipt and the
+    /// normal message event for this delivery attempt so WhatsApp can retry.
+    ///
+    /// Keep this hook narrow and fast: it runs on the receive lane before ACK.
+    pub fn on_pre_ack_message<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(crate::message::ParsedMessagePreAckContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        self.pre_ack_message_hook = Some(Arc::new(
+            move |ctx| -> crate::message::ParsedMessagePreAckHookFuture { Box::pin(hook(ctx)) },
+        ));
+        self
     }
 
     /// Run `handler` with the QR payload (and validity window) each time a
@@ -968,6 +992,10 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         // Register custom enc handlers. Immutable after build, so set the whole
         // map once; the receive hot path then reads it lock-free.
         let _ = client.custom_enc_handlers.set(self.custom_enc_handlers);
+
+        if let Some(hook) = self.pre_ack_message_hook {
+            let _ = client.set_parsed_message_pre_ack_hook_arc(hook);
+        }
 
         if self.skip_history_sync {
             client.set_skip_history_sync(true);

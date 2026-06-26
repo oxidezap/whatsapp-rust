@@ -192,6 +192,13 @@ impl Client {
             ),
 
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
+            // Intentionally unbounded/no-TTL: an entry means Signal decrypt may
+            // have advanced volatile state for a message the application has
+            // not durably committed. Expiring it would allow a later Signal
+            // flush to make that advance durable and turn server redelivery
+            // into an ACKed duplicate without rerunning the hook.
+            pending_parsed_message_pre_ack: Cache::builder().build(),
+            pending_parsed_message_pre_ack_count: AtomicUsize::new(0),
 
             offline_sync_metrics: Arc::new(OfflineSyncMetrics {
                 active: AtomicBool::new(false),
@@ -226,6 +233,7 @@ impl Client {
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
             custom_enc_handlers: std::sync::OnceLock::new(),
+            parsed_message_pre_ack_hook: std::sync::OnceLock::new(),
             chatstate_handlers: Arc::new(RwLock::new(Vec::new())),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
             pdo_requested: cache_config.pdo_requested.build_with_ttl(),

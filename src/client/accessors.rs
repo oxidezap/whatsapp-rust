@@ -23,6 +23,50 @@ impl Client {
         self.core.event_bus.add_handler(handler);
     }
 
+    /// Register an awaited hook that runs after an inbound message has been
+    /// parsed and normalized, but before the SDK sends its delivery receipt or
+    /// transport ACK.
+    ///
+    /// The hook is intended for durability-sensitive consumers: persist the
+    /// message, commit the transaction, then return `Ok(())`. If the hook
+    /// returns an error, `whatsapp-rust` suppresses the ACK and the normal
+    /// `Event::Message` dispatch for this attempt, leaving the server free to
+    /// redeliver/retry instead of marking the message delivered.
+    ///
+    /// Only one hook can be registered for a `Client`. Applications using
+    /// [`BotBuilder`](crate::bot::BotBuilder) can prefer
+    /// [`BotBuilder::on_pre_ack_message`](crate::bot::BotBuilder::on_pre_ack_message)
+    /// to wire the hook during construction.
+    ///
+    /// Registering this hook also keeps inbound message processing serial. That
+    /// preserves the durability contract when a hook fails after Signal decrypt:
+    /// the SDK can defer Signal cache flushes while the uncommitted parsed
+    /// message is pending, without allowing another inbound message to race the
+    /// pending retry path.
+    pub fn set_parsed_message_pre_ack_hook<F, Fut>(
+        &self,
+        hook: F,
+    ) -> Result<(), crate::message::ParsedMessagePreAckHookAlreadySet>
+    where
+        F: Fn(crate::message::ParsedMessagePreAckContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        self.set_parsed_message_pre_ack_hook_arc(Arc::new(
+            move |ctx| -> crate::message::ParsedMessagePreAckHookFuture { Box::pin(hook(ctx)) },
+        ))
+    }
+
+    pub(crate) fn set_parsed_message_pre_ack_hook_arc(
+        &self,
+        hook: crate::message::ParsedMessagePreAckHook,
+    ) -> Result<(), crate::message::ParsedMessagePreAckHookAlreadySet> {
+        self.parsed_message_pre_ack_hook
+            .set(hook)
+            .map_err(|_| crate::message::ParsedMessagePreAckHookAlreadySet)?;
+        self.swap_message_semaphore(1);
+        Ok(())
+    }
+
     /// Enable or disable raw node forwarding.
     /// When enabled, `Event::RawNode` is emitted for every decoded stanza before
     /// the stanza router dispatches it. Only enable when external consumers need

@@ -4,6 +4,8 @@ use crate::types::message::MessageInfo;
 use log::{debug, warn};
 use prost::Message as ProtoMessage;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use wacore::libsignal::crypto::DecryptionError;
 use wacore::libsignal::protocol::SenderKeyDistributionMessage;
@@ -27,6 +29,61 @@ use waproto::whatsapp::{self as wa};
 /// Maximum retry attempts per message (matches WhatsApp Web's MAX_RETRY = 5).
 /// After this many retries, we stop sending retry receipts and rely solely on PDO.
 const MAX_DECRYPT_RETRIES: u8 = 5;
+
+/// Future returned by a parsed-message pre-ACK hook.
+///
+/// The hook is awaited inline on the receive path after the inbound payload has
+/// been parsed and normalized, but before the SDK sends the delivery receipt or
+/// transport ACK. Returning an error intentionally suppresses the ACK so the
+/// server can redeliver the message later. This is useful for consumers that
+/// must durably commit an inbound message before WhatsApp considers it
+/// delivered.
+pub(crate) type ParsedMessagePreAckHookFuture =
+    Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'static>>;
+
+/// Callback registered with [`Client::set_parsed_message_pre_ack_hook`].
+///
+/// [`Client::set_parsed_message_pre_ack_hook`]: crate::Client::set_parsed_message_pre_ack_hook
+pub(crate) type ParsedMessagePreAckHook =
+    Arc<dyn Fn(ParsedMessagePreAckContext) -> ParsedMessagePreAckHookFuture + Send + Sync>;
+
+/// Message context passed to the awaited pre-ACK hook.
+///
+/// Both `message` and `info` are `Arc`-wrapped so the hook can cheaply share the
+/// same normalized values that the event bus will receive after ACK. The
+/// `client` handle is included for applications that need account or storage
+/// context while performing a durable commit.
+#[derive(Clone)]
+pub struct ParsedMessagePreAckContext {
+    pub message: Arc<wa::Message>,
+    pub info: Arc<MessageInfo>,
+    pub client: Arc<Client>,
+}
+
+impl ParsedMessagePreAckContext {
+    pub(crate) fn new(
+        message: Arc<wa::Message>,
+        info: Arc<MessageInfo>,
+        client: Arc<Client>,
+    ) -> Self {
+        Self {
+            message,
+            info,
+            client,
+        }
+    }
+}
+
+/// Returned when a parsed-message pre-ACK hook has already been registered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("parsed message pre-ACK hook is already registered")]
+pub struct ParsedMessagePreAckHookAlreadySet;
+
+#[derive(Clone)]
+pub(crate) struct PendingParsedMessagePreAck {
+    pub message: Arc<wa::Message>,
+    pub info: Arc<MessageInfo>,
+}
 
 /// Pre-extracted enc node payload. Holds owned copies of the fields needed for
 /// decryption so the async decrypt phase doesn't borrow the original NodeRef tree.
@@ -77,9 +134,15 @@ pub(crate) struct SessionBatchOutcome {
     duplicate: bool,
     undecryptable: bool,
     dispatched: bool,
+    pre_ack_hook_failed: bool,
     skdm_only: bool,
     plaintext_failed: bool,
     had_failure: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GroupBatchOutcome {
+    pre_ack_hook_failed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -87,6 +150,7 @@ struct MigrationDecryptOutcome {
     decrypted: bool,
     duplicate: bool,
     dispatched: bool,
+    pre_ack_hook_failed: bool,
     skdm_only: bool,
     plaintext_failed: bool,
 }
@@ -94,6 +158,7 @@ struct MigrationDecryptOutcome {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PlaintextHandleOutcome {
     dispatched: bool,
+    pre_ack_hook_failed: bool,
     skdm_only: bool,
 }
 

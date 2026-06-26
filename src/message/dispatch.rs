@@ -9,7 +9,7 @@ impl Client {
         self: &Arc<Self>,
         msg: wa::Message,
         info: &Arc<MessageInfo>,
-    ) {
+    ) -> bool {
         use wacore::proto_helpers::MessageExt;
         wacore::telemetry::recv("decrypted");
 
@@ -36,12 +36,153 @@ impl Client {
         {
             Arc::make_mut(&mut info).comment_target = Some(target);
         }
-        let dispatch_msg = decrypted.unwrap_or(msg);
-        self.ack_received_message(&info);
+        let dispatch_msg = Arc::new(decrypted.unwrap_or(msg));
+
+        if !self
+            .await_parsed_message_pre_ack(Arc::clone(&dispatch_msg), Arc::clone(&info), true)
+            .await
+        {
+            return false;
+        }
+
+        self.remove_pending_pre_ack_message(&Self::pre_ack_message_key(&info))
+            .await;
+        self.ack_parsed_message_after_pre_ack(&info);
 
         self.core
             .event_bus
-            .dispatch(Event::Message(Arc::new(dispatch_msg), info));
+            .dispatch(Event::Message(dispatch_msg, info));
+        true
+    }
+
+    async fn await_parsed_message_pre_ack(
+        self: &Arc<Self>,
+        message: Arc<wa::Message>,
+        info: Arc<MessageInfo>,
+        store_pending_on_failure: bool,
+    ) -> bool {
+        let Some(hook) = self.parsed_message_pre_ack_hook.get().cloned() else {
+            return true;
+        };
+
+        if let Err(err) = hook(crate::message::ParsedMessagePreAckContext::new(
+            Arc::clone(&message),
+            Arc::clone(&info),
+            Arc::clone(self),
+        ))
+        .await
+        {
+            warn!(
+                "Parsed-message pre-ACK hook failed for message {}; suppressing ACK for retry/redelivery: {err:#}",
+                info.id
+            );
+            if store_pending_on_failure {
+                self.store_pending_pre_ack_message(message, info).await;
+            }
+            return false;
+        }
+
+        true
+    }
+
+    pub(crate) async fn dispatch_pending_pre_ack_message(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+    ) -> Option<bool> {
+        let key = Self::pre_ack_message_key(info);
+        let pending = self.pending_parsed_message_pre_ack.get(&key).await?;
+
+        if !self
+            .await_parsed_message_pre_ack(
+                Arc::clone(&pending.message),
+                Arc::clone(&pending.info),
+                false,
+            )
+            .await
+        {
+            return Some(false);
+        }
+
+        self.remove_pending_pre_ack_message(&key).await;
+        self.ack_parsed_message_after_pre_ack(&pending.info);
+        self.core
+            .event_bus
+            .dispatch(Event::Message(pending.message, pending.info));
+        Some(true)
+    }
+
+    fn pre_ack_message_key(info: &MessageInfo) -> wacore::types::message::ChatMessageId {
+        wacore::types::message::ChatMessageId::new(info.source.chat.clone(), info.id.clone())
+    }
+
+    async fn store_pending_pre_ack_message(
+        self: &Arc<Self>,
+        message: Arc<wa::Message>,
+        info: Arc<MessageInfo>,
+    ) {
+        let key = Self::pre_ack_message_key(&info);
+        if self
+            .pending_parsed_message_pre_ack
+            .get(&key)
+            .await
+            .is_none()
+        {
+            self.pending_parsed_message_pre_ack_count
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        self.pending_parsed_message_pre_ack
+            .insert(
+                key,
+                crate::message::PendingParsedMessagePreAck { message, info },
+            )
+            .await;
+    }
+
+    async fn remove_pending_pre_ack_message(
+        self: &Arc<Self>,
+        key: &wacore::types::message::ChatMessageId,
+    ) {
+        if self
+            .pending_parsed_message_pre_ack
+            .remove(key)
+            .await
+            .is_some()
+        {
+            self.pending_parsed_message_pre_ack_count
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    fn ack_parsed_message_after_pre_ack(self: &Arc<Self>, info: &Arc<MessageInfo>) {
+        if self.parsed_message_pre_ack_hook.get().is_some()
+            && info.source.chat.is_status_broadcast()
+        {
+            self.ack_received_message(info);
+            self.spawn_message_ack(info);
+        } else if self.parsed_message_pre_ack_hook.get().is_some()
+            && info.source.chat.is_newsletter()
+        {
+            self.spawn_message_ack(info);
+        } else {
+            self.ack_received_message(info);
+        }
+    }
+
+    pub(crate) fn ack_status_drop_after_pre_ack_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) {
+        if self.parsed_message_pre_ack_hook.get().is_some()
+            && info.source.chat.is_status_broadcast()
+        {
+            self.spawn_message_ack(info);
+        }
+    }
+
+    pub(crate) fn ack_newsletter_drop_after_pre_ack_hook(
+        self: &Arc<Self>,
+        info: &Arc<MessageInfo>,
+    ) {
+        if self.parsed_message_pre_ack_hook.get().is_some() && info.source.chat.is_newsletter() {
+            self.spawn_message_ack(info);
+        }
     }
 
     /// Acknowledge a received message so the server drops it from the offline

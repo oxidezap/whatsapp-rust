@@ -19,6 +19,7 @@ impl Client {
                 info.id,
                 node.tag
             );
+            self.ack_newsletter_drop_after_pre_ack_hook(info);
             return;
         };
 
@@ -37,6 +38,7 @@ impl Client {
                         "[msg:{}] Failed to decode newsletter plaintext: {e}",
                         info.id
                     );
+                    self.ack_newsletter_drop_after_pre_ack_hook(info);
                 }
             }
         } else {
@@ -45,6 +47,7 @@ impl Client {
                 info.id,
                 info.source.chat.observe()
             );
+            self.ack_newsletter_drop_after_pre_ack_hook(info);
         }
     }
 

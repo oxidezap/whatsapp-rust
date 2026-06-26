@@ -59,6 +59,17 @@ impl Client {
     /// Flush the in-memory signal cache to the database backend.
     /// Called after each message is decrypted or after encryption operations.
     pub(crate) async fn flush_signal_cache(&self) -> Result<(), anyhow::Error> {
+        if self.parsed_message_pre_ack_hook.get().is_some()
+            && self
+                .pending_parsed_message_pre_ack_count
+                .load(Ordering::Acquire)
+                > 0
+        {
+            return Err(anyhow::anyhow!(
+                "Signal cache flush deferred while parsed-message pre-ACK commit is pending"
+            ));
+        }
+
         // Hold no device guard across the flush: this per-message batched SQLite
         // write would otherwise block every concurrent Device write for its duration.
         let backend = self
