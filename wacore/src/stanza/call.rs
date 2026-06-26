@@ -42,10 +42,14 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     let from = attrs
         .optional_jid("from")
         .ok_or_else(|| anyhow!("<call> missing 'from' attribute"))?;
+    // whatsmeow doesn't require an id on <call>, and the signaling-only actions (transport,
+    // relaylatency) can arrive without one. Only the offer-ack consumes stanza_id and real offers
+    // always carry it, so default a missing id to empty rather than rejecting the whole stanza --
+    // which would drop these actions right after we added them to KNOWN_ACTIONS to surface them.
     let stanza_id = attrs
-        .required_string("id")
-        .map_err(|e| anyhow!("<call> missing 'id': {e}"))?
-        .into_owned();
+        .optional_string("id")
+        .map(|s| s.into_owned())
+        .unwrap_or_default();
     let notify = attrs
         .optional_string("notify")
         .and_then(|s| (!s.is_empty()).then(|| s.into_owned()));
@@ -1176,6 +1180,24 @@ mod tests {
             .build();
         let call = parse_call_stanza(&as_ref(&relaylatency)).unwrap().unwrap();
         assert!(matches!(call.action, CallAction::RelayLatency { .. }));
+    }
+
+    #[test]
+    fn idless_call_stanza_parses() {
+        // whatsmeow tolerates a <call> with no 'id'; transport/relaylatency can arrive that way.
+        // Rejecting it would drop the action, so an absent id parses to an empty stanza_id instead.
+        let transport = NodeBuilder::new("call")
+            .attr("from", fake_caller_lid())
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("transport")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CID")
+                .children([NodeBuilder::new("net").attr("medium", "2").build()])
+                .build()])
+            .build();
+        let call = parse_call_stanza(&as_ref(&transport)).unwrap().unwrap();
+        assert_eq!(call.stanza_id, "");
+        assert!(matches!(call.action, CallAction::Transport { .. }));
     }
 
     #[test]
