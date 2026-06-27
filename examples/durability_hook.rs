@@ -9,7 +9,9 @@
 //! your hook durably commits the message. On success the message is acked; on
 //! failure (or a crash) it stays in the server's offline queue and is
 //! redelivered on the next connect, where the hook runs again. This is
-//! at-least-once: the hook MUST be idempotent — deduplicate by `info.id`.
+//! at-least-once: the hook MUST be idempotent — deduplicate by
+//! `(info.source.chat, info.source.sender, info.id)`, since stanza ids are only
+//! unique within a chat/sender.
 //!
 //!   cargo run --example durability_hook
 
