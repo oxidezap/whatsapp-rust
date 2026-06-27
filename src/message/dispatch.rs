@@ -36,12 +36,23 @@ impl Client {
         {
             Arc::make_mut(&mut info).comment_target = Some(target);
         }
-        let dispatch_msg = decrypted.unwrap_or(msg);
-        self.ack_received_message(&info);
+        let dispatch_msg = Arc::new(decrypted.unwrap_or(msg));
 
-        self.core
-            .event_bus
-            .dispatch(Event::Message(Arc::new(dispatch_msg), info));
+        if let Some(hook) = self.inbound_durability_hook() {
+            // At-least-once: in-process handlers still fire, but the transport
+            // ack is deferred until the hook durably commits the message.
+            self.core
+                .event_bus
+                .dispatch(Event::Message(Arc::clone(&dispatch_msg), Arc::clone(&info)));
+            self.run_inbound_durability_hook(hook, &info, &dispatch_msg)
+                .await;
+        } else {
+            // Default at-most-once path (unchanged): ack, then dispatch.
+            self.ack_received_message(&info);
+            self.core
+                .event_bus
+                .dispatch(Event::Message(dispatch_msg, info));
+        }
     }
 
     /// Acknowledge a received message so the server drops it from the offline

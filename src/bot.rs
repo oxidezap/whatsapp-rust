@@ -5,6 +5,7 @@ use crate::store::commands::DeviceCommand;
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::store::traits::Backend;
+use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
 use crate::types::events::{Event, EventHandler, EventInterest, EventKind};
 use crate::types::message::MessageInfo;
@@ -488,6 +489,7 @@ pub struct BotBuilder<
     event_handlers: Vec<RegisteredHandler>,
     raw_handlers: Vec<Arc<dyn EventHandler>>,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
+    inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
     override_version: Option<(u32, u32, u32)>,
     device_props_override: Option<DevicePropsOverride>,
     pair_code_options: Option<PairCodeOptions>,
@@ -509,6 +511,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             event_handlers: Vec::new(),
             raw_handlers: Vec::new(),
             custom_enc_handlers: HashMap::new(),
+            inbound_durability_hook: None,
             override_version: None,
             device_props_override: None,
             pair_code_options: None,
@@ -534,6 +537,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             event_handlers: self.event_handlers,
             raw_handlers: self.raw_handlers,
             custom_enc_handlers: self.custom_enc_handlers,
+            inbound_durability_hook: self.inbound_durability_hook,
             override_version: self.override_version,
             device_props_override: self.device_props_override,
             pair_code_options: self.pair_code_options,
@@ -744,6 +748,22 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     {
         self.custom_enc_handlers
             .insert(enc_type.into(), Arc::new(handler));
+        self
+    }
+
+    /// Register an inbound durability hook for at-least-once delivery.
+    ///
+    /// By default the client acks a message as soon as it is decrypted
+    /// (at-most-once): a crash or failed commit before the consumer persists it
+    /// loses the message. With a hook registered, the ack is deferred until the
+    /// hook commits the message; on failure the message is redelivered on the
+    /// next connect. The hook must be idempotent (dedupe by message id). See
+    /// [`InboundDurabilityHook`] for the full contract and caveats.
+    pub fn with_inbound_durability_hook<Dh>(mut self, hook: Dh) -> Self
+    where
+        Dh: InboundDurabilityHook + 'static,
+    {
+        self.inbound_durability_hook = Some(Arc::new(hook));
         self
     }
 
@@ -968,6 +988,12 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         // Register custom enc handlers. Immutable after build, so set the whole
         // map once; the receive hot path then reads it lock-free.
         let _ = client.custom_enc_handlers.set(self.custom_enc_handlers);
+
+        // Inbound durability hook (opt-in). Immutable after build; the receive
+        // path reads it lock-free.
+        if let Some(hook) = self.inbound_durability_hook {
+            let _ = client.inbound_durability_hook.set(hook);
+        }
 
         if self.skip_history_sync {
             client.set_skip_history_sync(true);

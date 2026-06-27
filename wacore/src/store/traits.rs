@@ -450,6 +450,35 @@ pub trait ProtocolStore: Send + Sync {
 
     /// Delete sent messages older than cutoff (unix timestamp seconds). Returns count deleted.
     async fn delete_expired_sent_messages(&self, cutoff_timestamp: i64) -> Result<u32>;
+
+    // --- Pending Inbound Buffer (inbound durability hook) ---
+    //
+    // Backs the at-least-once inbound durability hook: a decrypted message is
+    // buffered here (keyed by its stanza id) before the Signal ratchet is
+    // flushed, so a crash or failed commit before the hook acks replays the
+    // message on redelivery instead of dropping it. No-op defaults keep this
+    // non-breaking for backends that do not support the hook; such a backend
+    // still runs the hook for the live attempt but cannot replay after a crash.
+
+    /// Persist a decrypted inbound message awaiting a durability-hook commit.
+    async fn store_pending_inbound(&self, _id: &str, _message: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Read a buffered inbound message by id without removing it.
+    async fn get_pending_inbound(&self, _id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Remove a buffered inbound message once its durability hook has committed.
+    async fn delete_pending_inbound(&self, _id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete buffered inbound messages older than cutoff (unix seconds). Returns count deleted.
+    async fn delete_expired_pending_inbound(&self, _cutoff_timestamp: i64) -> Result<u32> {
+        Ok(0)
+    }
 }
 
 /// Device data persistence operations.

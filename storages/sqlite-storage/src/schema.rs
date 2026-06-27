@@ -170,6 +170,15 @@ diesel::table! {
 }
 
 diesel::table! {
+    pending_inbound_messages (id, device_id) {
+        id -> Text,
+        message -> Binary,
+        device_id -> Integer,
+        inserted_at -> BigInt,
+    }
+}
+
+diesel::table! {
     msg_secrets (chat, sender, msg_id, device_id) {
         chat -> Text,
         sender -> Text,
@@ -193,6 +202,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     identities,
     lid_pn_mapping,
     msg_secrets,
+    pending_inbound_messages,
     prekeys,
     sender_key_devices,
     sender_keys,

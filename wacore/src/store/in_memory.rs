@@ -64,6 +64,8 @@ struct InMemoryState {
     group_metadata: HashMap<String, Vec<u8>>,
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
+    /// Pending inbound durability buffer: stanza id -> (message bytes, inserted_at).
+    pending_inbound: HashMap<String, (Vec<u8>, i64)>,
 
     // --- MsgSecret ---
     /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
@@ -624,6 +626,39 @@ impl ProtocolStore for InMemoryBackend {
         s.sent_messages
             .retain(|_, entry| entry.timestamp >= cutoff_timestamp);
         Ok((before - s.sent_messages.len()) as u32)
+    }
+
+    async fn store_pending_inbound(&self, id: &str, message: &[u8]) -> Result<()> {
+        let now = crate::time::now_secs();
+        self.state
+            .lock()
+            .await
+            .pending_inbound
+            .insert(id.to_string(), (message.to_vec(), now));
+        Ok(())
+    }
+
+    async fn get_pending_inbound(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .pending_inbound
+            .get(id)
+            .map(|(bytes, _)| bytes.clone()))
+    }
+
+    async fn delete_pending_inbound(&self, id: &str) -> Result<()> {
+        self.state.lock().await.pending_inbound.remove(id);
+        Ok(())
+    }
+
+    async fn delete_expired_pending_inbound(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let mut s = self.state.lock().await;
+        let before = s.pending_inbound.len();
+        s.pending_inbound
+            .retain(|_, (_, inserted_at)| *inserted_at >= cutoff_timestamp);
+        Ok((before - s.pending_inbound.len()) as u32)
     }
 }
 

@@ -173,6 +173,7 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
 aes = { workspace = true }
+async-trait = { workspace = true }
 cbc = { workspace = true, features = ["block-padding"] }
 env_logger = { workspace = true }
 flate2 = { workspace = true }

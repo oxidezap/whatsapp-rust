@@ -136,6 +136,7 @@ fn decrypt_fail_log_level(mode: crate::types::events::DecryptFailMode) -> log::L
 pub(crate) use wacore::protocol::retry::RetryReason;
 
 mod dispatch;
+mod durability;
 mod msg_secret;
 mod receive;
 mod retry;

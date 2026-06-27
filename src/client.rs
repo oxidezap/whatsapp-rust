@@ -563,6 +563,14 @@ pub struct Client {
     /// `OnceLock::get` (no lock) and no per-node guard acquisition.
     pub custom_enc_handlers: std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>,
 
+    /// Optional inbound durability hook. When set, the transport ack for a
+    /// decrypted user message is deferred until the hook commits it, converting
+    /// the consumer to at-least-once delivery. Set once at `Bot::build` and read
+    /// lock-free on the receive path. `None` (default) keeps the current
+    /// at-most-once behavior with zero overhead.
+    pub(crate) inbound_durability_hook:
+        std::sync::OnceLock<Arc<dyn crate::types::durability_hook::InboundDurabilityHook>>,
+
     /// Chat state (typing indicator) handlers registered by external consumers.
     /// Each handler receives a `ChatStateEvent` describing the chat, optional participant and state.
     pub(crate) chatstate_handlers: Arc<RwLock<Vec<ChatStateHandler>>>,

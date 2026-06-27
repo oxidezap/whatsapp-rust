@@ -50,6 +50,7 @@ pub use client::ClientError;
 #[cfg(feature = "debug-diagnostics")]
 pub use client::MemoryDiagnostics;
 pub use client::NodeFilter;
+pub use types::durability_hook::InboundDurabilityHook;
 pub mod download;
 pub mod handlers;
 pub use handlers::chatstate::ChatStateEvent;
