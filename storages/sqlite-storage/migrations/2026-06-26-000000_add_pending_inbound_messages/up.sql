@@ -11,4 +11,5 @@ CREATE TABLE pending_inbound_messages (
     PRIMARY KEY (id, device_id)
 );
 
-CREATE INDEX idx_pending_inbound_inserted ON pending_inbound_messages (inserted_at, device_id);
+-- device_id first (equality) then inserted_at (range) for the retention sweep.
+CREATE INDEX idx_pending_inbound_inserted ON pending_inbound_messages (device_id, inserted_at);

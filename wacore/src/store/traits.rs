@@ -302,6 +302,15 @@ pub trait AppSyncStore: Send + Sync {
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>>;
 }
 
+/// Error returned by the default pending-inbound methods so a backend that does
+/// not implement the durability buffer fails closed (no silent at-most-once).
+fn unsupported_pending_inbound() -> crate::store::error::StoreError {
+    crate::store::error::StoreError::Validation(
+        "backend does not support the pending inbound buffer required by the durability hook"
+            .to_string(),
+    )
+}
+
 /// WhatsApp Web protocol alignment storage.
 ///
 /// Handles SKDM tracking, LID-PN mapping, base key collision detection,
@@ -456,18 +465,19 @@ pub trait ProtocolStore: Send + Sync {
     // Backs the at-least-once inbound durability hook: a decrypted message is
     // buffered here (keyed by its stanza id) before the Signal ratchet is
     // flushed, so a crash or failed commit before the hook acks replays the
-    // message on redelivery instead of dropping it. No-op defaults keep this
-    // non-breaking for backends that do not support the hook; such a backend
-    // still runs the hook for the live attempt but cannot replay after a crash.
+    // message on redelivery instead of dropping it. The defaults are non-breaking
+    // for backends that do not implement the hook, but fail CLOSED rather than
+    // no-op: an unsupported backend used with a hook surfaces an error (and the
+    // message stays unacked) instead of silently degrading to at-most-once.
 
     /// Persist a decrypted inbound message awaiting a durability-hook commit.
     async fn store_pending_inbound(&self, _id: &str, _message: &[u8]) -> Result<()> {
-        Ok(())
+        Err(unsupported_pending_inbound())
     }
 
     /// Read a buffered inbound message by id without removing it.
     async fn get_pending_inbound(&self, _id: &str) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+        Err(unsupported_pending_inbound())
     }
 
     /// Remove a buffered inbound message once its durability hook has committed.

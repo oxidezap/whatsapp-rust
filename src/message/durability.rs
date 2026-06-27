@@ -25,21 +25,23 @@ impl Client {
         let backend = self.persistence_manager.backend();
         // Persist before the Signal ratchet is flushed (which happens after this
         // returns) so a crash mid-commit replays the message instead of losing it.
-        let bytes = msg.encode_to_vec();
-        let buffered = match backend.store_pending_inbound(&info.id, &bytes).await {
-            Ok(()) => true,
-            Err(e) => {
-                log::error!(
-                    "[msg:{}] failed to buffer inbound message for durability hook: {e:?}",
-                    info.id
-                );
-                false
-            }
-        };
+        // `message_to_vec` is the shared non-generic encoder so this call does not
+        // monomorphize the whole `wa::Message` proto tree into this crate.
+        let bytes = waproto::codec::message_to_vec(msg);
+        // Fail closed: if we cannot durably buffer the message, do not run the
+        // hook and do not ack. The server keeps it queued and redelivers it once
+        // storage recovers, rather than us acking a message we cannot replay.
+        if let Err(e) = backend.store_pending_inbound(&info.id, &bytes).await {
+            log::error!(
+                "[msg:{}] failed to buffer inbound message; suppressing ack for redelivery: {e:?}",
+                info.id
+            );
+            return;
+        }
 
         match hook.on_message(self.clone(), info, msg).await {
             Ok(()) => {
-                if buffered && let Err(e) = backend.delete_pending_inbound(&info.id).await {
+                if let Err(e) = backend.delete_pending_inbound(&info.id).await {
                     log::debug!(
                         "[msg:{}] failed to clear buffered inbound message: {e:?}",
                         info.id
@@ -58,53 +60,59 @@ impl Client {
 
     /// Redelivery path: when the server replays an already-decrypted message
     /// (`DuplicatedMessage`), re-run the hook from the buffered copy instead of
-    /// acking. Falls back to a plain ack when no hook is set, no buffered copy
-    /// exists (a genuine duplicate), or the buffer is unreadable.
+    /// acking. A plain ack is sent only for a genuine duplicate (no buffered
+    /// copy). A read failure fails closed (no ack) so a transient storage error
+    /// cannot drop a message that still needs its hook to commit.
     pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) {
         if let Some(hook) = self.inbound_durability_hook() {
             let backend = self.persistence_manager.backend();
             match backend.get_pending_inbound(&info.id).await {
-                Ok(Some(bytes)) => match wa::Message::decode(bytes.as_slice()) {
-                    Ok(msg) => {
-                        let msg = Arc::new(msg);
-                        match hook.on_message(self.clone(), info, &msg).await {
-                            Ok(()) => {
-                                if let Err(e) = backend.delete_pending_inbound(&info.id).await {
-                                    log::debug!(
-                                        "[msg:{}] failed to clear buffered inbound message: {e:?}",
+                Ok(Some(bytes)) => {
+                    match waproto::codec::message_decode(&bytes) {
+                        Ok(msg) => {
+                            let msg = Arc::new(msg);
+                            match hook.on_message(self.clone(), info, &msg).await {
+                                Ok(()) => {
+                                    if let Err(e) = backend.delete_pending_inbound(&info.id).await {
+                                        log::debug!(
+                                            "[msg:{}] failed to clear buffered inbound message: {e:?}",
+                                            info.id
+                                        );
+                                    }
+                                    self.ack_received_message(info);
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[msg:{}] inbound durability hook still failing on redelivery; keeping for retry: {e:?}",
                                         info.id
                                     );
                                 }
-                                self.ack_received_message(info);
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "[msg:{}] inbound durability hook still failing on redelivery; keeping for retry: {e:?}",
-                                    info.id
-                                );
                             }
                         }
-                        return;
+                        Err(e) => {
+                            // Corrupt row (our own serialization): it can never be
+                            // replayed, so drop it and ack to unstick the queue.
+                            log::error!(
+                                "[msg:{}] failed to decode buffered inbound message; acking to unstick queue: {e:?}",
+                                info.id
+                            );
+                            let _ = backend.delete_pending_inbound(&info.id).await;
+                            self.ack_received_message(info);
+                        }
                     }
-                    Err(e) => {
-                        // Corrupt row: drop it and ack so the queue is not stuck forever.
-                        log::error!(
-                            "[msg:{}] failed to decode buffered inbound message; acking to unstick queue: {e:?}",
-                            info.id
-                        );
-                        let _ = backend.delete_pending_inbound(&info.id).await;
-                    }
-                },
-                Ok(None) => {}
-                Err(e) => {
-                    log::debug!(
-                        "[msg:{}] failed to read pending inbound buffer: {e:?}",
-                        info.id
-                    );
                 }
+                // Genuine duplicate (never buffered, or already committed): ack it.
+                Ok(None) => self.ack_received_message(info),
+                // Fail closed: a transient read error must not ack a message whose
+                // hook may not have committed. Leave it unacked for the next replay.
+                Err(e) => log::warn!(
+                    "[msg:{}] failed to read pending inbound buffer; suppressing ack for redelivery: {e:?}",
+                    info.id
+                ),
             }
+        } else {
+            self.ack_received_message(info);
         }
-        self.ack_received_message(info);
     }
 }
 

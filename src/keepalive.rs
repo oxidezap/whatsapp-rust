@@ -251,9 +251,11 @@ impl Client {
 
         // Pending inbound buffer retention (inbound durability hook): a row a
         // permanently-failing hook never commits would otherwise linger once the
-        // server stops redelivering it. Only sweep when a hook is configured;
-        // the table is empty otherwise.
-        if self.inbound_durability_hook().is_some() {
+        // server stops redelivering it. Run unconditionally (not gated on the hook
+        // being set now) so rows buffered by a hook in a previous run are still
+        // swept after it is disabled. Backends without the buffer return 0 from
+        // the default impl, so this is a cheap no-op there.
+        {
             const PENDING_INBOUND_TTL_SECS: u64 = 7 * 24 * 60 * 60;
             let backend = self.persistence_manager.backend();
             let cutoff = cutoff_for(PENDING_INBOUND_TTL_SECS);

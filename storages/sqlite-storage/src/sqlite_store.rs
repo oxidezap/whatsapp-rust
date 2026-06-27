@@ -2861,21 +2861,21 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn get_pending_inbound(&self, id: &str) -> Result<Option<Vec<u8>>> {
-        let pool = self.pool.clone();
-        let device_id = self.device_id;
         let id = id.to_string();
-        self.with_semaphore(move || -> Result<Option<Vec<u8>>> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let row: Option<Vec<u8>> = pending_inbound_messages::table
-                .select(pending_inbound_messages::message)
-                .filter(pending_inbound_messages::id.eq(&id))
-                .filter(pending_inbound_messages::device_id.eq(device_id))
-                .first(&mut conn)
-                .optional()
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(row)
+        let device_id = self.device_id;
+        // Retry on SQLITE_BUSY: a transient lock here must not surface as a read
+        // failure, which fails closed and forces an unnecessary redelivery.
+        self.with_retry("get_pending_inbound", || {
+            let id = id.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                let row: Option<Vec<u8>> = pending_inbound_messages::table
+                    .select(pending_inbound_messages::message)
+                    .filter(pending_inbound_messages::id.eq(&id))
+                    .filter(pending_inbound_messages::device_id.eq(device_id))
+                    .first(conn)
+                    .optional()?;
+                Ok(row)
+            })
         })
         .await
     }
