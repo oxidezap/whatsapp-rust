@@ -18,8 +18,10 @@ use waproto::whatsapp as wa;
 /// connect, where the hook runs again from the buffered copy.
 ///
 /// This is at-least-once, not exactly-once: a crash after the consumer commits
-/// but before the ack lands replays the message, so the hook MUST be
-/// idempotent — deduplicate by [`MessageInfo::id`].
+/// but before the ack lands replays the message, so the hook MUST be idempotent.
+/// Deduplicate by the message source AND id — `(info.source.chat,
+/// info.source.sender, info.id)` — not `info.id` alone: stanza ids are only
+/// unique within a `(chat, sender)`, so two chats can reuse the same id.
 ///
 /// Durable replay across process crashes requires a backend that implements the
 /// `ProtocolStore` pending-inbound methods (the bundled `SqliteStore` does).

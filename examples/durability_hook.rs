@@ -24,39 +24,60 @@ use log::{error, info};
 use whatsapp_rust::InboundDurabilityHook;
 use whatsapp_rust::prelude::*;
 
+/// Idempotency key: stanza ids are only unique within a `(chat, sender)`.
+type CommitKey = (String, String, String);
+
 /// A hook that durably appends each message to a file (with fsync) before
-/// returning `Ok`, deduplicating by message id. A real implementation would
-/// INSERT into a database or enqueue to a broker; the important property is that
-/// the commit is durable BEFORE the hook returns `Ok` (which lets the SDK ack),
-/// and that the hook returns `Err` when the commit genuinely failed.
+/// returning `Ok`, deduplicating by `(chat, sender, id)`. A real implementation
+/// would INSERT into a database or enqueue to a broker; the important property is
+/// that the commit is durable BEFORE the hook returns `Ok` (which lets the SDK
+/// ack), and that the hook returns `Err` when the commit genuinely failed.
 struct InboxArchiver {
     // `Arc` so the file can be moved into `spawn_blocking` (the write/fsync must
     // not run on the async receive thread).
     file: Arc<Mutex<File>>,
-    /// Message ids already committed, for idempotency. Seeded from the archive on
+    /// Keys already committed, for idempotency. Seeded from the archive on
     /// startup so dedupe survives a restart; a real store would dedupe with a
-    /// unique constraint on the id column instead.
-    seen: Mutex<HashSet<String>>,
+    /// unique constraint on `(chat, sender, id)` instead.
+    seen: Mutex<HashSet<CommitKey>>,
 }
 
 impl InboxArchiver {
-    fn open(path: &str) -> anyhow::Result<Self> {
-        // Rebuild the dedupe set from already-committed ids so a replay after a
-        // restart does not append the same message twice.
-        let mut seen = HashSet::new();
-        if let Ok(existing) = File::open(path) {
-            for line in BufReader::new(existing).lines() {
-                let line = line?;
-                if let Some((id, _)) = line.split_once('\t') {
-                    seen.insert(id.to_string());
+    async fn open(path: &str) -> anyhow::Result<Self> {
+        let path = path.to_string();
+        // Seed the dedupe set and open the file off the async runtime thread so a
+        // large archive does not stall boot.
+        let (file, seen) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let mut seen = HashSet::new();
+            match File::open(&path) {
+                Ok(existing) => {
+                    for line in BufReader::new(existing).lines() {
+                        let line = line?;
+                        let mut parts = line.splitn(4, '\t');
+                        if let (Some(c), Some(s), Some(i)) =
+                            (parts.next(), parts.next(), parts.next())
+                        {
+                            seen.insert((c.to_string(), s.to_string(), i.to_string()));
+                        }
+                    }
+                }
+                // A missing archive is a fresh start; any other error is real and
+                // must not silently empty the dedupe set.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow::Error::from(e).context(format!("reading archive {path}")));
                 }
             }
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("opening archive file {path}"))?;
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("opening archive file {path}"))?;
+            Ok((file, seen))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("archive open task failed: {e}"))??;
+
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
             seen: Mutex::new(seen),
@@ -72,21 +93,32 @@ impl InboundDurabilityHook for InboxArchiver {
         info: &MessageInfo,
         message: &wa::Message,
     ) -> anyhow::Result<()> {
+        let key: CommitKey = (
+            info.source.chat.to_string(),
+            info.source.sender.to_string(),
+            info.id.clone(),
+        );
+
         // Idempotency: a redelivery (or a replay after a crash between commit and
-        // ack) can hand us the same message id more than once. Check, but only
-        // record it as committed AFTER the durable write below succeeds.
+        // ack) can hand us the same key more than once. Check, but only record it
+        // as committed AFTER the durable write below succeeds.
         if self
             .seen
             .lock()
             .map_err(|_| anyhow::anyhow!("seen lock poisoned"))?
-            .contains(&info.id)
+            .contains(&key)
         {
             info!("[{}] already committed, skipping (dedup)", info.id);
             return Ok(());
         }
 
-        let preview = message.conversation.as_deref().unwrap_or("<non-text>");
-        let line = format!("{}\t{preview}\n", info.id);
+        // Sanitize so the tab-delimited archive stays parseable on restart.
+        let preview = message
+            .conversation
+            .as_deref()
+            .unwrap_or("<non-text>")
+            .replace(['\t', '\n'], " ");
+        let line = format!("{}\t{}\t{}\t{preview}\n", key.0, key.1, key.2);
 
         // Durable commit on a blocking thread: append then fsync. Returning Ok
         // only after sync_all means "safe to ack"; any error returns Err, so the
@@ -104,7 +136,7 @@ impl InboundDurabilityHook for InboxArchiver {
         self.seen
             .lock()
             .map_err(|_| anyhow::anyhow!("seen lock poisoned"))?
-            .insert(info.id.clone());
+            .insert(key);
         info!("[{}] committed durably: {preview}", info.id);
         Ok(())
     }
@@ -127,7 +159,7 @@ fn main() {
             }
         };
 
-        let archiver = match InboxArchiver::open("inbox.jsonl") {
+        let archiver = match InboxArchiver::open("inbox.jsonl").await {
             Ok(archiver) => archiver,
             Err(e) => {
                 error!("failed to open archive file: {e}");

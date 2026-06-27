@@ -86,6 +86,39 @@ pub enum BotBuilderError {
     /// Initializing the device row in the storage backend failed.
     #[error("failed to initialize the device store: {0}")]
     Store(#[from] StoreError),
+    /// An inbound durability hook was registered with a backend that does not
+    /// implement the pending-inbound buffer it requires.
+    #[error("the configured backend does not support the inbound durability hook: {0}")]
+    UnsupportedDurabilityBackend(String),
+}
+
+/// Verify the backend round-trips a pending-inbound buffer entry before we accept
+/// an inbound durability hook. A backend relying on the no-op/`Err` trait
+/// defaults fails here instead of silently looping every inbound message unacked.
+async fn probe_durability_backend(
+    backend: &std::sync::Arc<dyn Backend>,
+) -> std::result::Result<(), BotBuilderError> {
+    const PROBE_ID: &str = "__wa_durability_probe__";
+    const PROBE_PAYLOAD: &[u8] = b"probe";
+    let map_err = |e: StoreError| BotBuilderError::UnsupportedDurabilityBackend(e.to_string());
+    backend
+        .store_pending_inbound("", "", PROBE_ID, PROBE_PAYLOAD)
+        .await
+        .map_err(map_err)?;
+    let got = backend
+        .get_pending_inbound("", "", PROBE_ID)
+        .await
+        .map_err(map_err)?;
+    backend
+        .delete_pending_inbound("", "", PROBE_ID)
+        .await
+        .map_err(map_err)?;
+    if got.as_deref() != Some(PROBE_PAYLOAD) {
+        return Err(BotBuilderError::UnsupportedDurabilityBackend(
+            "pending-inbound buffer did not round-trip".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// `message` is `Arc` so cloning the context across spawned tasks only bumps a
@@ -990,8 +1023,12 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         let _ = client.custom_enc_handlers.set(self.custom_enc_handlers);
 
         // Inbound durability hook (opt-in). Immutable after build; the receive
-        // path reads it lock-free.
+        // path reads it lock-free. Probe the backend first: a backend that does
+        // not implement the pending-inbound buffer would otherwise leave every
+        // inbound message unacked and looping forever at runtime, so reject it
+        // here with a clear error instead.
         if let Some(hook) = self.inbound_durability_hook {
+            probe_durability_backend(&client.persistence_manager.backend()).await?;
             let _ = client.inbound_durability_hook.set(hook);
         }
 

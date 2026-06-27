@@ -495,10 +495,13 @@ pub trait ProtocolStore: Send + Sync {
 
     /// Remove a buffered inbound message once its durability hook has committed.
     async fn delete_pending_inbound(&self, _chat: &str, _sender: &str, _id: &str) -> Result<()> {
-        Ok(())
+        Err(unsupported_pending_inbound())
     }
 
-    /// Delete buffered inbound messages older than cutoff (unix seconds). Returns count deleted.
+    /// Delete buffered inbound messages older than cutoff (unix seconds). Returns
+    /// count deleted. Unlike the other defaults this is a benign `Ok(0)`: the
+    /// keepalive sweep calls it unconditionally for every backend, so it must not
+    /// error when the buffer is unsupported.
     async fn delete_expired_pending_inbound(&self, _cutoff_timestamp: i64) -> Result<u32> {
         Ok(0)
     }
