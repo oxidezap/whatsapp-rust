@@ -98,19 +98,22 @@ pub enum BotBuilderError {
 async fn probe_durability_backend(
     backend: &std::sync::Arc<dyn Backend>,
 ) -> std::result::Result<(), BotBuilderError> {
-    const PROBE_ID: &str = "__wa_durability_probe__";
+    // A real JID (a backend may validate the format) and a process-unique id so
+    // concurrent builders on the same store do not race on a shared probe row.
+    const PROBE_JID: &str = "0@s.whatsapp.net";
     const PROBE_PAYLOAD: &[u8] = b"probe";
+    let probe_id = format!("__wa_durability_probe_{}__", std::process::id());
     let map_err = |e: StoreError| BotBuilderError::UnsupportedDurabilityBackend(e.to_string());
     backend
-        .store_pending_inbound("", "", PROBE_ID, PROBE_PAYLOAD)
+        .store_pending_inbound(PROBE_JID, PROBE_JID, &probe_id, PROBE_PAYLOAD)
         .await
         .map_err(map_err)?;
     let got = backend
-        .get_pending_inbound("", "", PROBE_ID)
+        .get_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
         .await
         .map_err(map_err)?;
     backend
-        .delete_pending_inbound("", "", PROBE_ID)
+        .delete_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
         .await
         .map_err(map_err)?;
     if got.as_deref() != Some(PROBE_PAYLOAD) {
@@ -790,7 +793,8 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// (at-most-once): a crash or failed commit before the consumer persists it
     /// loses the message. With a hook registered, the ack is deferred until the
     /// hook commits the message; on failure the message is redelivered on the
-    /// next connect. The hook must be idempotent (dedupe by message id). See
+    /// next connect. The hook must be idempotent (dedupe by `(chat, sender, id)`,
+    /// since stanza ids are only unique within a chat/sender). See
     /// [`InboundDurabilityHook`] for the full contract and caveats.
     pub fn with_inbound_durability_hook<Dh>(mut self, hook: Dh) -> Self
     where

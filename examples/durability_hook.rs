@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -49,11 +49,17 @@ impl InboxArchiver {
         // large archive does not stall boot.
         let (file, seen) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let mut seen = HashSet::new();
-            match File::open(&path) {
-                Ok(existing) => {
-                    for line in BufReader::new(existing).lines() {
-                        let line = line?;
-                        let mut parts = line.splitn(4, '\t');
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    for line in content.split_inclusive('\n') {
+                        // Only seed from complete records: a record is durable
+                        // once its terminating newline is on disk. A torn trailing
+                        // line (crash mid-append) lacks it, so skip it — otherwise
+                        // a never-committed message would be dropped as a dup.
+                        if !line.ends_with('\n') {
+                            continue;
+                        }
+                        let mut parts = line.trim_end_matches('\n').splitn(4, '\t');
                         if let (Some(c), Some(s), Some(i)) =
                             (parts.next(), parts.next(), parts.next())
                         {
