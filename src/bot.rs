@@ -98,11 +98,18 @@ pub enum BotBuilderError {
 async fn probe_durability_backend(
     backend: &std::sync::Arc<dyn Backend>,
 ) -> std::result::Result<(), BotBuilderError> {
-    // A real JID (a backend may validate the format) and a process-unique id so
-    // concurrent builders on the same store do not race on a shared probe row.
+    // A real JID (a backend may validate the format) and an id unique per probe
+    // invocation (pid + atomic counter) so concurrent builders on the same store
+    // never race on a shared probe row and false-fail.
+    use portable_atomic::{AtomicU64, Ordering};
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     const PROBE_JID: &str = "0@s.whatsapp.net";
     const PROBE_PAYLOAD: &[u8] = b"probe";
-    let probe_id = format!("__wa_durability_probe_{}__", std::process::id());
+    let probe_id = format!(
+        "__wa_durability_probe_{}_{}__",
+        std::process::id(),
+        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     let map_err = |e: StoreError| BotBuilderError::UnsupportedDurabilityBackend(e.to_string());
     backend
         .store_pending_inbound(PROBE_JID, PROBE_JID, &probe_id, PROBE_PAYLOAD)
