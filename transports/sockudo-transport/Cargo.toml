@@ -1,0 +1,35 @@
+[package]
+name = "whatsapp-rust-sockudo-transport"
+version = "0.6.0"
+edition = "2024"
+authors = ["João Lucas <jlucaso@hotmail.com>"]
+license = "MIT"
+repository = "https://github.com/jlucaso1/whatsapp-rust"
+description = "Experimental sockudo-ws WebSocket transport for whatsapp-rust (PoC, for benchmarking against the tokio-websockets transport)"
+
+[features]
+default = []
+danger-skip-tls-verify = []
+
+[dependencies]
+anyhow = { workspace = true }
+async-channel = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "net", "io-util", "time"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+webpki-roots = "1.0.4"
+# Pinned to a release tag for reproducible benchmarks. We do TLS ourselves
+# (tokio-rustls) and feed the established stream to connect_raw, so none of
+# sockudo's own TLS connectors are enabled. permessage-deflate is left off to
+# match the tokio-websockets transport (no compression) for an apples-to-apples
+# comparison. sha1_smol is the pure-Rust SHA-1 backend the client handshake needs.
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", tag = "v1.7.5", default-features = false, features = [
+  "tokio-runtime",
+  "simd",
+  "fastrand",
+  "sha1_smol",
+] }
+wacore = { workspace = true }
