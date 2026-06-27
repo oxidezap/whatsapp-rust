@@ -64,8 +64,8 @@ struct InMemoryState {
     group_metadata: HashMap<String, Vec<u8>>,
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
-    /// Pending inbound durability buffer: stanza id -> (message bytes, inserted_at).
-    pending_inbound: HashMap<String, (Vec<u8>, i64)>,
+    /// Pending inbound durability buffer: (chat, sender, id) -> (message, inserted_at).
+    pending_inbound: HashMap<(String, String, String), (Vec<u8>, i64)>,
 
     // --- MsgSecret ---
     /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
@@ -628,28 +628,40 @@ impl ProtocolStore for InMemoryBackend {
         Ok((before - s.sent_messages.len()) as u32)
     }
 
-    async fn store_pending_inbound(&self, id: &str, message: &[u8]) -> Result<()> {
+    async fn store_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+        message: &[u8],
+    ) -> Result<()> {
         let now = crate::time::now_secs();
-        self.state
-            .lock()
-            .await
-            .pending_inbound
-            .insert(id.to_string(), (message.to_vec(), now));
+        self.state.lock().await.pending_inbound.insert(
+            (chat.to_string(), sender.to_string(), id.to_string()),
+            (message.to_vec(), now),
+        );
         Ok(())
     }
 
-    async fn get_pending_inbound(&self, id: &str) -> Result<Option<Vec<u8>>> {
+    async fn get_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let key = (chat.to_string(), sender.to_string(), id.to_string());
         Ok(self
             .state
             .lock()
             .await
             .pending_inbound
-            .get(id)
+            .get(&key)
             .map(|(bytes, _)| bytes.clone()))
     }
 
-    async fn delete_pending_inbound(&self, id: &str) -> Result<()> {
-        self.state.lock().await.pending_inbound.remove(id);
+    async fn delete_pending_inbound(&self, chat: &str, sender: &str, id: &str) -> Result<()> {
+        let key = (chat.to_string(), sender.to_string(), id.to_string());
+        self.state.lock().await.pending_inbound.remove(&key);
         Ok(())
     }
 

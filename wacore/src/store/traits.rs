@@ -471,17 +471,30 @@ pub trait ProtocolStore: Send + Sync {
     // message stays unacked) instead of silently degrading to at-most-once.
 
     /// Persist a decrypted inbound message awaiting a durability-hook commit.
-    async fn store_pending_inbound(&self, _id: &str, _message: &[u8]) -> Result<()> {
+    /// Scoped by `(chat, sender, id)` because stanza ids are only unique within
+    /// a `(chat, sender)`.
+    async fn store_pending_inbound(
+        &self,
+        _chat: &str,
+        _sender: &str,
+        _id: &str,
+        _message: &[u8],
+    ) -> Result<()> {
         Err(unsupported_pending_inbound())
     }
 
-    /// Read a buffered inbound message by id without removing it.
-    async fn get_pending_inbound(&self, _id: &str) -> Result<Option<Vec<u8>>> {
+    /// Read a buffered inbound message by `(chat, sender, id)` without removing it.
+    async fn get_pending_inbound(
+        &self,
+        _chat: &str,
+        _sender: &str,
+        _id: &str,
+    ) -> Result<Option<Vec<u8>>> {
         Err(unsupported_pending_inbound())
     }
 
     /// Remove a buffered inbound message once its durability hook has committed.
-    async fn delete_pending_inbound(&self, _id: &str) -> Result<()> {
+    async fn delete_pending_inbound(&self, _chat: &str, _sender: &str, _id: &str) -> Result<()> {
         Ok(())
     }
 

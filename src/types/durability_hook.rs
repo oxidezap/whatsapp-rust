@@ -31,6 +31,19 @@ use waproto::whatsapp as wa;
 /// not perform blocking client operations for the same sender inside it (e.g. a
 /// synchronous reply) — that can deadlock against the per-sender Signal lock held
 /// while a 1:1 message is processed; persist and return, and spawn any reply.
+///
+/// Scope and known limitations:
+/// - Covers end-to-end encrypted messages (1:1 and group). Newsletter / broadcast
+///   channel messages are not encrypted and are acked on their own path, so the
+///   hook does not gate them.
+/// - If the durable buffer write itself fails (e.g. disk full, after retries),
+///   the ack is suppressed, but if the process does not crash the Signal ratchet
+///   still advances and that one message degrades to at-most-once on its next
+///   redelivery (it can no longer be decrypted, and there is no buffered copy to
+///   replay). The guarantee holds whenever the buffer write succeeds.
+/// - On a redelivery replay the `info` is re-parsed from the stanza, so a few
+///   fields derived during the first dispatch (the ephemeral timer, encrypted
+///   comment threading) may be absent. The `message` body is always the original.
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait InboundDurabilityHook: wacore::sync_marker::MaybeSendSync {

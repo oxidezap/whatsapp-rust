@@ -23,6 +23,8 @@ impl Client {
         msg: &Arc<wa::Message>,
     ) {
         let backend = self.persistence_manager.backend();
+        let chat = info.source.chat.to_string();
+        let sender = info.source.sender.to_string();
         // Persist before the Signal ratchet is flushed (which happens after this
         // returns) so a crash mid-commit replays the message instead of losing it.
         // `message_to_vec` is the shared non-generic encoder so this call does not
@@ -31,7 +33,10 @@ impl Client {
         // Fail closed: if we cannot durably buffer the message, do not run the
         // hook and do not ack. The server keeps it queued and redelivers it once
         // storage recovers, rather than us acking a message we cannot replay.
-        if let Err(e) = backend.store_pending_inbound(&info.id, &bytes).await {
+        if let Err(e) = backend
+            .store_pending_inbound(&chat, &sender, &info.id, &bytes)
+            .await
+        {
             log::error!(
                 "[msg:{}] failed to buffer inbound message; suppressing ack for redelivery: {e:?}",
                 info.id
@@ -41,7 +46,10 @@ impl Client {
 
         match hook.on_message(self.clone(), info, msg).await {
             Ok(()) => {
-                if let Err(e) = backend.delete_pending_inbound(&info.id).await {
+                if let Err(e) = backend
+                    .delete_pending_inbound(&chat, &sender, &info.id)
+                    .await
+                {
                     log::debug!(
                         "[msg:{}] failed to clear buffered inbound message: {e:?}",
                         info.id
@@ -66,14 +74,19 @@ impl Client {
     pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) {
         if let Some(hook) = self.inbound_durability_hook() {
             let backend = self.persistence_manager.backend();
-            match backend.get_pending_inbound(&info.id).await {
+            let chat = info.source.chat.to_string();
+            let sender = info.source.sender.to_string();
+            match backend.get_pending_inbound(&chat, &sender, &info.id).await {
                 Ok(Some(bytes)) => {
                     match waproto::codec::message_decode(&bytes) {
                         Ok(msg) => {
                             let msg = Arc::new(msg);
                             match hook.on_message(self.clone(), info, &msg).await {
                                 Ok(()) => {
-                                    if let Err(e) = backend.delete_pending_inbound(&info.id).await {
+                                    if let Err(e) = backend
+                                        .delete_pending_inbound(&chat, &sender, &info.id)
+                                        .await
+                                    {
                                         log::debug!(
                                             "[msg:{}] failed to clear buffered inbound message: {e:?}",
                                             info.id
@@ -96,7 +109,9 @@ impl Client {
                                 "[msg:{}] failed to decode buffered inbound message; acking to unstick queue: {e:?}",
                                 info.id
                             );
-                            let _ = backend.delete_pending_inbound(&info.id).await;
+                            let _ = backend
+                                .delete_pending_inbound(&chat, &sender, &info.id)
+                                .await;
                             self.ack_received_message(info);
                         }
                     }
@@ -146,8 +161,14 @@ mod tests {
     }
 
     fn test_info(id: &str) -> Arc<MessageInfo> {
+        use crate::types::message::MessageSource;
         Arc::new(MessageInfo {
             id: id.to_string(),
+            source: MessageSource {
+                chat: "100@g.us".parse().unwrap(),
+                sender: "200@s.whatsapp.net".parse().unwrap(),
+                ..Default::default()
+            },
             ..Default::default()
         })
     }
@@ -182,7 +203,11 @@ mod tests {
         let backend = client.persistence_manager.backend();
         assert!(
             backend
-                .get_pending_inbound("MSG_OK")
+                .get_pending_inbound(
+                    &info.source.chat.to_string(),
+                    &info.source.sender.to_string(),
+                    "MSG_OK",
+                )
                 .await
                 .unwrap()
                 .is_none(),
@@ -214,7 +239,11 @@ mod tests {
         assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
         assert!(
             backend
-                .get_pending_inbound("MSG_ERR")
+                .get_pending_inbound(
+                    &info.source.chat.to_string(),
+                    &info.source.sender.to_string(),
+                    "MSG_ERR",
+                )
                 .await
                 .unwrap()
                 .is_some(),
@@ -230,7 +259,11 @@ mod tests {
         );
         assert!(
             backend
-                .get_pending_inbound("MSG_ERR")
+                .get_pending_inbound(
+                    &info.source.chat.to_string(),
+                    &info.source.sender.to_string(),
+                    "MSG_ERR",
+                )
                 .await
                 .unwrap()
                 .is_some(),
@@ -243,7 +276,11 @@ mod tests {
         assert_eq!(hook.calls.load(Ordering::SeqCst), 3);
         assert!(
             backend
-                .get_pending_inbound("MSG_ERR")
+                .get_pending_inbound(
+                    &info.source.chat.to_string(),
+                    &info.source.sender.to_string(),
+                    "MSG_ERR",
+                )
                 .await
                 .unwrap()
                 .is_none(),

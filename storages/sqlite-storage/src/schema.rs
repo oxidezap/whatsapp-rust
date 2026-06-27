@@ -170,7 +170,9 @@ diesel::table! {
 }
 
 diesel::table! {
-    pending_inbound_messages (id, device_id) {
+    pending_inbound_messages (chat, sender, id, device_id) {
+        chat -> Text,
+        sender -> Text,
         id -> Text,
         message -> Binary,
         device_id -> Integer,

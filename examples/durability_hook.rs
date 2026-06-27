@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -30,22 +30,36 @@ use whatsapp_rust::prelude::*;
 /// the commit is durable BEFORE the hook returns `Ok` (which lets the SDK ack),
 /// and that the hook returns `Err` when the commit genuinely failed.
 struct InboxArchiver {
-    file: Mutex<File>,
-    /// Message ids already committed, for idempotency. A real store would dedupe
-    /// with a unique constraint on the id column instead.
+    // `Arc` so the file can be moved into `spawn_blocking` (the write/fsync must
+    // not run on the async receive thread).
+    file: Arc<Mutex<File>>,
+    /// Message ids already committed, for idempotency. Seeded from the archive on
+    /// startup so dedupe survives a restart; a real store would dedupe with a
+    /// unique constraint on the id column instead.
     seen: Mutex<HashSet<String>>,
 }
 
 impl InboxArchiver {
     fn open(path: &str) -> anyhow::Result<Self> {
+        // Rebuild the dedupe set from already-committed ids so a replay after a
+        // restart does not append the same message twice.
+        let mut seen = HashSet::new();
+        if let Ok(existing) = File::open(path) {
+            for line in BufReader::new(existing).lines() {
+                let line = line?;
+                if let Some((id, _)) = line.split_once('\t') {
+                    seen.insert(id.to_string());
+                }
+            }
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .with_context(|| format!("opening archive file {path}"))?;
         Ok(Self {
-            file: Mutex::new(file),
-            seen: Mutex::new(HashSet::new()),
+            file: Arc::new(Mutex::new(file)),
+            seen: Mutex::new(seen),
         })
     }
 }
@@ -74,17 +88,18 @@ impl InboundDurabilityHook for InboxArchiver {
         let preview = message.conversation.as_deref().unwrap_or("<non-text>");
         let line = format!("{}\t{preview}\n", info.id);
 
-        // Durable commit: append then fsync. Returning Ok only after sync_all
-        // means "safe to ack"; any error here returns Err, so the ack is
-        // suppressed and the server redelivers the message later.
-        {
-            let mut file = self
-                .file
-                .lock()
-                .map_err(|_| anyhow::anyhow!("file lock poisoned"))?;
+        // Durable commit on a blocking thread: append then fsync. Returning Ok
+        // only after sync_all means "safe to ack"; any error returns Err, so the
+        // ack is suppressed and the server redelivers the message later. The hook
+        // is awaited on the receive path, so the disk I/O goes to spawn_blocking.
+        let file = Arc::clone(&self.file);
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut file = file.lock().expect("file lock poisoned");
             file.write_all(line.as_bytes())?;
-            file.sync_all()?;
-        }
+            file.sync_all()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("archive write task failed: {e}"))??;
 
         self.seen
             .lock()
