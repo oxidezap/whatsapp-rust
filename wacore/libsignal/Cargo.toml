@@ -16,9 +16,9 @@ bytes = { workspace = true }
 cbc = { workspace = true }
 chrono = { workspace = true, features = ["now"] }
 ctr = { workspace = true }
-curve25519-dalek = "5.0.0-rc.0"
-derive_more = { version = "2.1.0", features = ["from", "into", "try_from"] }
-displaydoc = "0.2.5"
+curve25519-dalek = "5.0.0-rc.1"
+derive_more = { version = "2.1.1", features = ["from", "into", "try_from"] }
+displaydoc = "0.2.6"
 ghash = "0.6.0"
 hex = { workspace = true }
 hkdf = { workspace = true }
@@ -33,7 +33,7 @@ subtle = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 waproto = { workspace = true }
-x25519-dalek = { version = "3.0.0-rc.0", features = ["static_secrets"] }
+x25519-dalek = { version = "3.0.0-rc.1", features = ["static_secrets"] }
 
 [dev-dependencies]
 divan = { workspace = true }
