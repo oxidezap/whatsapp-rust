@@ -173,10 +173,6 @@ impl Client {
         use wacore::appstate::patch_decode::CollectionSyncError;
         const MAX_ITERATIONS: usize = 5;
         let mut iteration = 0;
-        // Set once we've requested missing decode keys this cycle, so the immediate
-        // refetch doesn't re-request; reset after a page decodes so a later iteration
-        // referencing a different rotated key can repair again.
-        let mut requested_keys = false;
 
         while !pending.is_empty() && iteration < MAX_ITERATIONS {
             iteration += 1;
@@ -289,34 +285,27 @@ impl Client {
                 }
             };
 
-            // Request any missing decode keys before processing. Inline each list's
-            // external blobs first so the SNAPSHOT's key_id (which lives inside the blob,
-            // not the patch metadata) is visible -- otherwise process_patch_lists aborts
-            // with KeyNotFound on the snapshot key before the post-process request runs.
-            // Request once, wait briefly for the re-share, then refetch. Only wait when a
-            // fresh request actually went out (the dedup may suppress it).
-            if !requested_keys {
-                let mut missing_all: Vec<Vec<u8>> = Vec::new();
-                for pl in &mut patch_lists {
-                    if let Ok(m) = proc.missing_key_ids_after_inline(pl, &download).await {
-                        missing_all.extend(m);
-                    }
-                }
-                if !missing_all.is_empty() {
-                    requested_keys = true;
-                    if self.request_keys_and_wait(missing_all).await {
-                        continue;
-                    }
+            // Request any missing decode keys and wait for them BEFORE processing. Inline
+            // each list's external blobs first so the SNAPSHOT's key_id (inside the blob,
+            // not the patch metadata) is visible -- else process_patch_lists aborts with
+            // KeyNotFound on the snapshot key. If the share doesn't land in time, skip
+            // this batch instead of aborting; it re-syncs on a later cycle once the key
+            // arrives (process_patch_lists is all-or-nothing on a missing key anyway).
+            let mut missing_all: Vec<Vec<u8>> = Vec::new();
+            for pl in &mut patch_lists {
+                if let Ok(m) = proc.missing_key_ids_after_inline(pl, &download).await {
+                    missing_all.extend(m);
                 }
             }
+            if !missing_all.is_empty() && !self.request_keys_and_wait(missing_all).await {
+                warn!(target: "Client/AppState", "app-state key(s) still missing after request; skipping this batch, will retry on a later sync");
+                return Ok(());
+            }
 
-            // Process the already-parsed (and inlined) collections.
+            // Process the already-parsed (and inlined) collections; keys are present.
             let results = proc
                 .process_patch_lists(patch_lists, &download, true)
                 .await?;
-            // A page decoded, so its keys were present; let a later iteration repair a
-            // different rotated key.
-            requested_keys = false;
 
             let mut needs_refetch = Vec::new();
 
@@ -426,8 +415,6 @@ impl Client {
         // has_more_patches=true without advancing the version (WA Web uses 500).
         const MAX_PAGINATION_ITERATIONS: u32 = 500;
         let mut iteration = 0u32;
-        // Request the batch's missing keys at most once per task (see below).
-        let mut requested_missing_keys = false;
 
         while has_more {
             if self.is_shutting_down() {
@@ -538,26 +525,22 @@ impl Client {
                 }
             };
 
-            // Request any missing decode keys before processing. Inline the blobs first
-            // so the SNAPSHOT's key_id (inside its external blob, not the patch metadata)
-            // is visible -- otherwise process aborts with KeyNotFound on the snapshot key
-            // before the post-process request runs. Request once, wait briefly for the
-            // re-share, then refetch (only when a fresh request actually went out).
-            if !requested_missing_keys
-                && let Ok(missing) = proc.missing_key_ids_after_inline(&mut pl, &download).await
-                && !missing.is_empty()
-            {
-                requested_missing_keys = true;
-                if self.request_keys_and_wait(missing).await {
-                    continue;
-                }
+            // Request any missing decode keys and wait for them BEFORE processing. Inline
+            // the blobs first so the SNAPSHOT's key_id (inside its external blob, not the
+            // patch metadata) is visible -- else process aborts with KeyNotFound on the
+            // snapshot key. If the share doesn't land in time, skip this collection
+            // instead of aborting; it re-syncs on a later cycle once the key arrives.
+            let missing = proc
+                .missing_key_ids_after_inline(&mut pl, &download)
+                .await
+                .unwrap_or_default();
+            if !missing.is_empty() && !self.request_keys_and_wait(missing).await {
+                warn!(target: "Client/AppState", "app-state key(s) for {:?} still missing after request; skipping, will retry on a later sync", name);
+                break;
             }
 
             let (mutations, new_state, list) =
                 proc.process_parsed_patch_list(pl, &download, true).await?;
-            // This page decoded, so its keys were available; allow the next page
-            // (which may reference a different rotated key) to repair again.
-            requested_missing_keys = false;
             let decode_elapsed = _decode_start.elapsed();
             if decode_elapsed.as_millis() > 500 {
                 debug!(target: "Client/AppState", "Patch decode for {:?} took {:?}", name, decode_elapsed);
@@ -596,18 +579,31 @@ impl Client {
     /// wait briefly for the primary to re-share. Returns true iff the caller should
     /// refetch (a request was sent and we waited); false means nothing was requested
     /// (empty or deduped), so the caller proceeds without stalling.
+    /// Request the missing decode keys, wait briefly for the re-share, then VERIFY they
+    /// actually landed. Returns true only when every requested key is now stored (the
+    /// caller may process); false means the share didn't arrive in time and the caller
+    /// must NOT process -- doing so would abort with KeyNotFound -- and should skip the
+    /// collection so it re-syncs on a later cycle. Empty input returns true (nothing to
+    /// wait for). Waits even when the per-key dedup suppressed the send: a deduped
+    /// request means an earlier one is still in flight, so the key may yet land here,
+    /// and a re-verify that fails can't be masked by treating "request sent" as success
+    /// or by a wake from an unrelated key share.
     async fn request_keys_and_wait(&self, missing: Vec<Vec<u8>>) -> bool {
         if missing.is_empty() {
-            return false;
+            return true;
         }
         let count = missing.len();
         let listener = self.initial_keys_synced_notifier.listen();
-        if self.request_missing_keys_with_dedup(missing).await {
-            debug!(target: "Client/AppState", "Requested {count} missing app-state key(s) before processing; waiting up to 10s before refetch");
-            let _ = rt_timeout(&*self.runtime, Duration::from_secs(10), listener).await;
-            return true;
+        self.request_missing_keys_with_dedup(missing.clone()).await;
+        debug!(target: "Client/AppState", "Requested {count} missing app-state key(s); waiting up to 10s for the re-share");
+        let _ = rt_timeout(&*self.runtime, Duration::from_secs(10), listener).await;
+        let backend = self.persistence_manager.backend();
+        for id in &missing {
+            if backend.get_sync_key(id).await.ok().flatten().is_none() {
+                return false;
+            }
         }
-        false
+        true
     }
 
     /// Request missing app-state keys with dedup stamps.
