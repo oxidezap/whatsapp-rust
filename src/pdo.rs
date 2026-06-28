@@ -16,7 +16,6 @@
 
 use crate::client::Client;
 use crate::types::message::MessageInfo;
-use buffa::Message;
 use log::{debug, info, warn};
 use std::sync::Arc;
 use wacore::types::message::{
@@ -337,7 +336,8 @@ impl Client {
         // (a full Message), so an eager view would pull the entire MessageView
         // tree into the binary and parse the message once into a view only to
         // copy it again into the owned form. Owned decode reads it in one pass.
-        let mut web_msg_info = match wa::WebMessageInfo::decode_from_slice(web_message_info_bytes) {
+        let mut web_msg_info = match waproto::codec::web_message_info_decode(web_message_info_bytes)
+        {
             Ok(info) => info,
             Err(e) => {
                 warn!("Failed to decode WebMessageInfo from PDO response: {:?}", e);

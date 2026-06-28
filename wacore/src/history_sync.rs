@@ -1,4 +1,3 @@
-use buffa::Message as _;
 use bytes::Bytes;
 use compact_str::CompactString;
 use std::sync::Arc;
@@ -356,7 +355,7 @@ impl<'a> HistorySyncStream<'a> {
         loop {
             match self.next_conversation_bytes()? {
                 None => return Ok(None),
-                Some(bytes) => match wa::Conversation::decode_from_slice(bytes) {
+                Some(bytes) => match waproto::codec::conversation_decode(bytes) {
                     Ok(conversation) => return Ok(Some(conversation)),
                     Err(e) => {
                         log::debug!("Skipping undecodable history-sync conversation: {e}");
@@ -1309,7 +1308,8 @@ fn extract_conversation_fields(
                         // Rare wire shapes (repeated message-typed fields,
                         // pathological nesting): fall back to full decode.
                         FastExtract::Fallback => {
-                            if let Ok(msg) = wa::HistorySyncMsg::decode_from_slice(&data[pos..end])
+                            if let Ok(msg) =
+                                waproto::codec::history_sync_msg_decode(&data[pos..end])
                             {
                                 push_secret_record(chat_id, &mut chat_id_shared, msg, records);
                             }

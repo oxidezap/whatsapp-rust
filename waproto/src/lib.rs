@@ -77,6 +77,21 @@ pub mod codec {
         whatsapp::HistorySync::decode_from_slice(bytes)
     }
 
+    /// History-sync streaming decodes individual `HistorySyncMsg`/`Conversation`
+    /// records; pinning them here keeps their nested `WebMessageInfo`/`Message`
+    /// decode tree from being re-instantiated in the calling crate.
+    #[inline(never)]
+    pub fn history_sync_msg_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::HistorySyncMsg, buffa::DecodeError> {
+        whatsapp::HistorySyncMsg::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn conversation_decode(bytes: &[u8]) -> Result<whatsapp::Conversation, buffa::DecodeError> {
+        whatsapp::Conversation::decode_from_slice(bytes)
+    }
+
     #[inline(never)]
     pub fn message_context_info_encoded_len(mci: &whatsapp::MessageContextInfo) -> usize {
         mci.encoded_len() as usize
