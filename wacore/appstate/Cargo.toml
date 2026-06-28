@@ -20,6 +20,7 @@ buffa = { workspace = true }
 bytemuck = { workspace = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
+hmac = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 serde-big-array = { workspace = true }
@@ -31,6 +32,11 @@ wacore-libsignal = { workspace = true }
 waproto = { workspace = true }
 
 [dev-dependencies]
+divan = { workspace = true }
+
+[[bench]]
+name = "appstate_benchmark"
+harness = false
 
 [lints]
 workspace = true

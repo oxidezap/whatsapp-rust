@@ -1,7 +1,16 @@
 #[cfg(feature = "simd")]
 use core::simd::u16x8;
 use hkdf::Hkdf;
+use hmac::digest::KeyInit;
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::sync::LazyLock;
+
+/// HKDF-extract with no salt keys HMAC with a zero block, identical for every
+/// input, so the key-schedule compressions run once and each derivation
+/// clones the keyed state.
+static EXTRACT_HMAC: LazyLock<Hmac<Sha256>> =
+    LazyLock::new(|| Hmac::<Sha256>::new_from_slice(&[0u8; 32]).expect("32-byte HMAC key"));
 
 #[derive(Clone, Debug)]
 pub struct LTHash {
@@ -42,7 +51,7 @@ impl LTHash {
         let mut derived = [0u8; u8::MAX as usize + 1];
         let derived = &mut derived[..self.hkdf_size as usize];
         for item in input {
-            hkdf_sha256_into(item.as_ref(), None, self.hkdf_info, derived);
+            hkdf_sha256_into(item.as_ref(), self.hkdf_info, derived);
             perform_pointwise_with_overflow(base, derived, subtract);
         }
     }
@@ -119,8 +128,11 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
     }
 }
 
-fn hkdf_sha256_into(key: &[u8], salt: Option<&[u8]>, info: &[u8], out: &mut [u8]) {
-    let hk = Hkdf::<Sha256>::new(salt, key);
+fn hkdf_sha256_into(key: &[u8], info: &[u8], out: &mut [u8]) {
+    let mut extract = EXTRACT_HMAC.clone();
+    extract.update(key);
+    let prk = extract.finalize().into_bytes();
+    let hk = Hkdf::<Sha256>::from_prk(&prk).expect("PRK is hash-sized");
     hk.expand(info, out).expect("hkdf expand");
 }
 
@@ -129,6 +141,25 @@ mod tests {
     use super::*;
 
     const EMPTY: &[Vec<u8>] = &[];
+
+    /// The pre-keyed extract must stay byte-identical to plain
+    /// `Hkdf::new(None, key)`; any drift would corrupt every ltHash.
+    #[test]
+    fn pre_keyed_extract_matches_plain_hkdf() {
+        let mut keys: Vec<Vec<u8>> = (0..16u8).map(|i| vec![i.wrapping_mul(17); 32]).collect();
+        keys.push(Vec::new());
+        keys.push(vec![0xAB; 3]);
+
+        let mut ours = [0u8; 128];
+        let mut reference = [0u8; 128];
+        for key in &keys {
+            hkdf_sha256_into(key, WAPATCH_INTEGRITY_INFO.as_bytes(), &mut ours);
+            Hkdf::<Sha256>::new(None, key)
+                .expand(WAPATCH_INTEGRITY_INFO.as_bytes(), &mut reference)
+                .expect("hkdf expand");
+            assert_eq!(ours, reference);
+        }
+    }
 
     #[test]
     fn pointwise_add_and_subtract() {

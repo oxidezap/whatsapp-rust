@@ -1,3 +1,4 @@
+pub mod abprops;
 pub mod blocklist;
 pub mod business;
 pub mod chatstate;
@@ -8,7 +9,7 @@ pub mod groups;
 pub mod keepalive;
 pub mod mediaconn;
 pub mod mex;
-pub mod mex_ids;
+pub mod mex_operations;
 pub mod newsletter;
 pub mod node;
 pub mod passive;

@@ -1,3 +1,8 @@
+// `--all-features` feature-unifies extra deps onto `whatsapp-rust`, enlarging the
+// `send_and_expect_text()` future past the default layout-query depth. Matches the
+// `512` already used in `src/lib.rs` / `examples/demo.rs`.
+#![recursion_limit = "512"]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -8,7 +13,6 @@ use wacore::types::events::{ChannelEventHandler, Event};
 use wacore_binary::node::Node;
 use whatsapp_rust::Jid;
 use whatsapp_rust::bot::Bot;
-use whatsapp_rust::store::traits::Backend;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
@@ -50,7 +54,7 @@ fn spawn_qr_autoresponder_http(
                     url: url.clone(),
                     method: "POST".into(),
                     headers: HashMap::new(),
-                    body: Some(code.as_bytes().to_vec()),
+                    body: Some(code.as_bytes().to_vec().into()),
                 };
                 match http.execute(req).await {
                     Ok(resp) if (200..300).contains(&resp.status_code) => return,
@@ -119,12 +123,11 @@ impl TestClient {
     }
 
     async fn connect_inner(_prefix: &str, push_name: Option<String>) -> anyhow::Result<Self> {
-        let backend = Arc::new(InMemoryBackend::new()) as Arc<dyn Backend>;
         let transport_factory = TokioWebSocketTransportFactory::new().with_url(mock_server_url());
         let (event_handler, event_rx) = ChannelEventHandler::new();
 
         let mut builder = Bot::builder()
-            .with_backend(backend)
+            .with_backend(InMemoryBackend::new())
             .with_transport_factory(transport_factory)
             .with_http_client(UreqHttpClient::new())
             .with_runtime(whatsapp_rust::TokioRuntime)
@@ -135,7 +138,7 @@ impl TestClient {
             builder = builder.with_push_name(name);
         }
 
-        let mut bot = builder.build().await?;
+        let bot = builder.build().await?;
 
         let client = bot.client();
         // with_push_name pre-seeds the name so the setting_pushName mutation has old==new (skipping auto set_available), so force active to keep delivery receipts from being type="inactive".
@@ -154,7 +157,7 @@ impl TestClient {
         client.register_handler(qr_handler);
         let _qr_responder = spawn_qr_autoresponder_http(qr_rx);
 
-        let run_handle = bot.run().await?;
+        let run_handle = bot.spawn();
 
         // Wait for PairSuccess + Connected.
         //
@@ -267,7 +270,6 @@ impl TestClient {
     pub async fn jid(&self) -> Jid {
         self.client
             .get_pn()
-            .await
             .expect("Client should have a JID after connect")
             .to_non_ad()
     }
@@ -277,13 +279,12 @@ impl TestClient {
     /// Notification handling stores tcTokens under the sender's LID when it is
     /// available, otherwise it falls back to the phone-number user part.
     pub async fn tc_token_key(&self) -> anyhow::Result<String> {
-        if let Some(lid) = self.client.get_lid().await {
+        if let Some(lid) = self.client.get_lid() {
             return Ok(lid.user.to_string());
         }
 
         self.client
             .get_pn()
-            .await
             .map(|jid| jid.user.to_string())
             .ok_or_else(|| anyhow::anyhow!("Client should have a JID after connect"))
     }
@@ -329,7 +330,6 @@ impl TestClient {
         self.client
             .persistence_manager()
             .get_device_snapshot()
-            .await
             .nct_salt
             .clone()
     }
@@ -446,7 +446,7 @@ impl TestClient {
 
     /// Wait for initial app state sync to complete (keys become available).
     pub async fn wait_for_app_state_sync(&mut self) -> anyhow::Result<()> {
-        let push_name = self.client.get_push_name().await;
+        let push_name = self.client.get_push_name();
         if !push_name.is_empty() {
             return Ok(());
         }

@@ -64,6 +64,8 @@ struct InMemoryState {
     group_metadata: HashMap<String, Vec<u8>>,
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
+    /// Pending inbound durability buffer: (chat, sender, id) -> (message, inserted_at).
+    pending_inbound: HashMap<(String, String, String), (Vec<u8>, i64)>,
 
     // --- MsgSecret ---
     /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
@@ -170,6 +172,13 @@ impl SignalStore for InMemoryBackend {
                 record: Bytes::copy_from_slice(record),
             },
         );
+        Ok(())
+    }
+
+    async fn mark_prekeys_uploaded(&self, _ids: &[u32]) -> Result<()> {
+        // The in-memory store does not track the uploaded flag (see
+        // store_prekey); the contract that matters is NOT resurrecting
+        // deleted rows, which a no-op trivially satisfies.
         Ok(())
     }
 
@@ -339,6 +348,15 @@ impl AppSyncStore for InMemoryBackend {
         for im in index_macs {
             s.mutation_macs.remove(&(name.to_string(), im.clone()));
         }
+        Ok(())
+    }
+
+    async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
+        self.state
+            .lock()
+            .await
+            .mutation_macs
+            .retain(|(n, _), _| n != name);
         Ok(())
     }
 
@@ -517,6 +535,11 @@ impl ProtocolStore for InMemoryBackend {
         Ok(())
     }
 
+    async fn delete_group_metadata(&self, group_jid: &str) -> Result<()> {
+        self.state.lock().await.group_metadata.remove(group_jid);
+        Ok(())
+    }
+
     // --- TcToken Storage ---
 
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>> {
@@ -603,6 +626,51 @@ impl ProtocolStore for InMemoryBackend {
         s.sent_messages
             .retain(|_, entry| entry.timestamp >= cutoff_timestamp);
         Ok((before - s.sent_messages.len()) as u32)
+    }
+
+    async fn store_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+        message: &[u8],
+    ) -> Result<()> {
+        let now = crate::time::now_secs();
+        self.state.lock().await.pending_inbound.insert(
+            (chat.to_string(), sender.to_string(), id.to_string()),
+            (message.to_vec(), now),
+        );
+        Ok(())
+    }
+
+    async fn get_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let key = (chat.to_string(), sender.to_string(), id.to_string());
+        Ok(self
+            .state
+            .lock()
+            .await
+            .pending_inbound
+            .get(&key)
+            .map(|(bytes, _)| bytes.clone()))
+    }
+
+    async fn delete_pending_inbound(&self, chat: &str, sender: &str, id: &str) -> Result<()> {
+        let key = (chat.to_string(), sender.to_string(), id.to_string());
+        self.state.lock().await.pending_inbound.remove(&key);
+        Ok(())
+    }
+
+    async fn delete_expired_pending_inbound(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let mut s = self.state.lock().await;
+        let before = s.pending_inbound.len();
+        s.pending_inbound
+            .retain(|_, (_, inserted_at)| *inserted_at >= cutoff_timestamp);
+        Ok((before - s.pending_inbound.len()) as u32)
     }
 }
 
@@ -729,6 +797,41 @@ mod tests {
         assert_eq!(
             backend.get_group_metadata(jid).await.unwrap().as_deref(),
             Some(&b"blob-v2"[..])
+        );
+        // Delete drops the blob so the next query re-fetches in full.
+        backend.delete_group_metadata(jid).await.unwrap();
+        assert!(backend.get_group_metadata(jid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_mutation_macs_wipes_only_named_collection() {
+        use crate::store::traits::AppSyncStore;
+        let backend = InMemoryBackend::new();
+        let mac = |i: u8, v: u8| AppStateMutationMAC {
+            index_mac: vec![i],
+            value_mac: vec![v],
+        };
+        backend
+            .put_mutation_macs("regular", 1, &[mac(1, 10)])
+            .await
+            .unwrap();
+        backend
+            .put_mutation_macs("critical", 1, &[mac(2, 20)])
+            .await
+            .unwrap();
+
+        backend.clear_mutation_macs("regular").await.unwrap();
+
+        assert!(
+            backend
+                .get_mutation_mac("regular", &[1])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            backend.get_mutation_mac("critical", &[2]).await.unwrap(),
+            Some(vec![20])
         );
     }
 

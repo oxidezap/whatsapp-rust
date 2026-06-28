@@ -2,10 +2,6 @@
 
 use async_trait::async_trait;
 use buffa::Message as ProtoMessage;
-use iai_callgrind::{
-    Callgrind, FlamegraphConfig, LibraryBenchmarkConfig, library_benchmark,
-    library_benchmark_group, main,
-};
 use std::collections::HashMap;
 use std::hint::black_box;
 use wacore::client::context::{GroupInfo, SendContextResolver};
@@ -14,6 +10,7 @@ use wacore::runtime::{AbortHandle, Runtime};
 use wacore::send::{SignalStores, prepare_group_stanza, prepare_peer_stanza};
 use wacore::types::jid::{JidExt, make_sender_key_name};
 use wacore::types::message::AddressingMode;
+use wacore_binary::JidExt as _;
 use wacore_binary::jid::Jid;
 use wacore_binary::marshal::marshal;
 use wacore_binary::node::{Node, NodeContent};
@@ -31,38 +28,91 @@ use waproto::whatsapp as wa;
 
 type SigResult<T> = wacore_libsignal::protocol::error::Result<T>;
 
+fn main() {
+    divan::main();
+}
+
+/// Deterministic bench RNG (SplitMix64). A local algorithm, so fixtures are
+/// stable across rand versions and platforms and baselines never shift on a
+/// dependency bump. The `CryptoRng` marker is satisfied for API purposes
+/// only: bench key material is synthetic by design.
+struct BenchRng(u64);
+
+impl BenchRng {
+    fn step(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+// rand 0.10: `Rng`/`CryptoRng` are blanket-implemented over the infallible
+// Try* traits, so these two impls are the whole surface.
+impl rand::TryRng for BenchRng {
+    type Error = std::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok((self.step() >> 32) as u32)
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.step())
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        for chunk in dst.chunks_mut(8) {
+            let bytes = self.step().to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+        Ok(())
+    }
+}
+
+impl rand::rand_core::TryCryptoRng for BenchRng {}
+
+/// Deterministically seeded RNG: fixtures must be identical across runs and
+/// builds so CodSpeed comparisons measure code, not key material.
+fn bench_rng(seed: u64) -> BenchRng {
+    BenchRng(seed)
+}
+
+/// FNV-1a fold of a fixture label into an RNG seed.
+fn seed_of(label: &str) -> u64 {
+    label.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // In-memory Signal stores
 // ---------------------------------------------------------------------------
 
-// Bench runtime: real thread-pool executor so `Runtime::spawn` actually
-// runs the spawned future in the background, mirroring how production
-// drives the parallel encrypt fan-out. `sleep` / `spawn_blocking` are not
-// exercised by the encrypt path.
-struct BenchRuntime {
-    pool: futures::executor::ThreadPool,
-}
-
-impl Default for BenchRuntime {
-    fn default() -> Self {
-        Self {
-            pool: futures::executor::ThreadPool::new().expect("create bench thread pool"),
-        }
-    }
-}
+// Bench runtime: runs spawned futures INLINE. CodSpeed's simulation
+// serializes threads, so a real pool would measure scheduler and
+// cross-thread synchronization overhead with zero parallelism benefit;
+// inline execution measures the encrypt work itself, deterministically.
+// `sleep` / `spawn_blocking` are not exercised by the encrypt path.
+#[derive(Default)]
+struct BenchRuntime;
 
 #[async_trait]
 impl Runtime for BenchRuntime {
     fn spawn(
         &self,
-        future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+        mut future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
     ) -> AbortHandle {
-        use futures::task::SpawnExt;
-        // Silent spawn failure would skip a device's encrypt and fake the speedup.
-        self.pool
-            .spawn(future)
-            .expect("bench thread pool spawn failed");
-        AbortHandle::noop()
+        // Nested `futures::executor::block_on` panics, so drive the task with
+        // a noop-waker poll loop. Encrypt tasks are CPU-bound and complete
+        // without ever truly pending; the guard catches misuse.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        for _ in 0..1_000_000 {
+            if future.as_mut().poll(&mut cx).is_ready() {
+                return AbortHandle::noop();
+            }
+        }
+        panic!(
+            "BenchRuntime::spawn: task pended forever; inline runtime only suits CPU-bound tasks"
+        );
     }
 
     fn sleep(
@@ -233,9 +283,9 @@ struct User {
 
 impl User {
     fn new(user: &str, server: &str) -> Self {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng(seed_of(user));
         let identity_key_pair = IdentityKeyPair::generate(&mut rng);
-        let reg_id = rand::random::<u32>() & 0x3FFF;
+        let reg_id = (seed_of(user) as u32) & 0x3FFF;
 
         let pk_id: PreKeyId = 1.into();
         let pk_pair = KeyPair::generate(&mut rng);
@@ -297,7 +347,7 @@ impl User {
 
 fn establish_session(sender: &mut User, receiver: &User) {
     let bundle = receiver.prekey_bundle();
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut rng = bench_rng(0xBE_5EED + 1);
     futures::executor::block_on(async {
         process_prekey_bundle(
             &receiver.address,
@@ -325,7 +375,7 @@ fn establish_bidirectional(a: &mut User, b: &mut User) {
         let ct_msg = CiphertextMessage::PreKeySignalMessage(
             PreKeySignalMessage::try_from(ct.serialize()).unwrap(),
         );
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng(0xBE_5EED + 2);
         message_decrypt(
             &ct_msg,
             &a.address,
@@ -381,8 +431,14 @@ impl SendContextResolver for MockResolver {
     ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
         Ok(HashMap::new())
     }
-    async fn resolve_group_info(&self, _: &Jid) -> Result<GroupInfo, anyhow::Error> {
-        Ok(GroupInfo::new(self.0.clone(), AddressingMode::Pn))
+    async fn resolve_group_info(
+        &self,
+        _: &Jid,
+    ) -> Result<std::sync::Arc<GroupInfo>, anyhow::Error> {
+        Ok(std::sync::Arc::new(GroupInfo::new(
+            self.0.clone(),
+            AddressingMode::Pn,
+        )))
     }
 }
 
@@ -433,8 +489,8 @@ fn decrypt_dm(
         } else {
             CiphertextMessage::SignalMessage(SignalMessage::try_from(ciphertext).unwrap())
         };
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let plaintext = message_decrypt(
+        let mut rng = bench_rng(0xBE_5EED + 3);
+        let decrypted = message_decrypt(
             &parsed,
             sender_addr,
             &mut receiver.sessions,
@@ -447,7 +503,7 @@ fn decrypt_dm(
         .await
         .unwrap();
 
-        let unpadded = MessageUtils::unpad_message_ref(&plaintext, 2).unwrap();
+        let unpadded = MessageUtils::unpad_message_ref(&decrypted.plaintext, 2).unwrap();
         wa::Message::decode_from_slice(unpadded).unwrap()
     })
 }
@@ -538,11 +594,15 @@ struct GrpSendData {
     alice: User,
     group_jid: Jid,
     participants: Vec<Jid>,
+    /// Warm-send fixture: the resolved set with its phash memo pre-warmed in
+    /// setup, like the per-group device memo serves production repeat sends.
+    resolved_for_phash: Option<std::sync::Arc<wacore::send::ResolvedGroupDevices>>,
     force_skdm: bool,
     resolver: MockResolver,
     msg: wa::Message,
     // Built once in setup so the measured body excludes thread-pool startup
-    // (iai-callgrind would otherwise charge the syscalls to the encrypt path).
+    // (building the pool inside the bench body would charge its syscalls to
+    // the encrypt path).
     runtime: BenchRuntime,
 }
 
@@ -562,20 +622,31 @@ fn setup_group_send(n: usize) -> GrpSendData {
 
     let sk_name = make_sender_key_name(&group_jid, &alice.address);
     futures::executor::block_on(async {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng(0xBE_5EED + 4);
         create_sender_key_distribution_message(&sk_name, &mut alice.sender_keys, &mut rng)
             .await
             .unwrap();
     });
 
+    let resolved = std::sync::Arc::new(wacore::send::ResolvedGroupDevices::new(
+        participants.clone(),
+    ));
+    // Warm steady state: production warms the memo on the first send after a
+    // topology change and serves every later send from it. Assert it, so a
+    // silent failure can't leave the bench measuring the cold path.
+    resolved
+        .phash(&alice.jid)
+        .expect("phash must warm in setup");
+
     GrpSendData {
         alice,
         group_jid,
         participants,
+        resolved_for_phash: Some(resolved),
         force_skdm: false,
         resolver: MockResolver(devices),
         msg: text_msg(),
-        runtime: BenchRuntime::default(),
+        runtime: BenchRuntime,
     }
 }
 
@@ -593,16 +664,19 @@ fn setup_group_send_256() -> GrpSendData {
 fn setup_group_skdm_10() -> GrpSendData {
     let mut d = setup_group_send(10);
     d.force_skdm = true;
+    d.resolved_for_phash = None;
     d
 }
 fn setup_group_skdm_50() -> GrpSendData {
     let mut d = setup_group_send(50);
     d.force_skdm = true;
+    d.resolved_for_phash = None;
     d
 }
 fn setup_group_skdm_256() -> GrpSendData {
     let mut d = setup_group_send(256);
     d.force_skdm = true;
+    d.resolved_for_phash = None;
     d
 }
 
@@ -623,7 +697,7 @@ fn setup_group_recv() -> GrpRecvData {
     // Alice creates sender key and distributes SKDM to Bob
     let sk_name = make_sender_key_name(&group_jid, &alice.address);
     futures::executor::block_on(async {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng(0xBE_5EED + 5);
         let skdm =
             create_sender_key_distribution_message(&sk_name, &mut alice.sender_keys, &mut rng)
                 .await
@@ -638,8 +712,7 @@ fn setup_group_recv() -> GrpRecvData {
     // (server strips <participants> before forwarding to recipients)
     let resolver = MockResolver(vec![bob.jid.clone()]);
     let own_jid = alice.jid.clone();
-    let mut group_info =
-        GroupInfo::new(vec![bob.jid.clone(), alice.jid.clone()], AddressingMode::Pn);
+    let group_info = GroupInfo::new(vec![bob.jid.clone(), alice.jid.clone()], AddressingMode::Pn);
 
     let mut stores = SignalStores {
         sender_key_store: &mut alice.sender_keys,
@@ -649,12 +722,12 @@ fn setup_group_recv() -> GrpRecvData {
         signed_prekey_store: &alice.signed_prekeys,
     };
 
-    let runtime = BenchRuntime::default();
+    let runtime = BenchRuntime;
     let result = futures::executor::block_on(prepare_group_stanza(
         &runtime,
         &mut stores,
         &resolver,
-        &mut group_info,
+        &group_info,
         &own_jid,
         &own_jid,
         None,
@@ -683,32 +756,34 @@ fn setup_group_recv() -> GrpRecvData {
 // Benchmarks
 // ===========================================================================
 
-#[library_benchmark]
-#[bench::text(setup = setup_dm_send)]
-fn bench_dm_send(mut d: DmSendData) {
-    let signal_addr = d.bob_jid.to_protocol_address();
-    let node = futures::executor::block_on(prepare_peer_stanza(
-        &mut d.alice.sessions,
-        &mut d.alice.identity,
-        d.bob_jid,
-        &signal_addr,
-        &d.msg,
-        "b-001".into(),
-        None,
-    ))
-    .unwrap();
-    black_box(marshal(&node).unwrap());
+#[divan::bench]
+fn bench_dm_send(bencher: divan::Bencher) {
+    bencher.with_inputs(setup_dm_send).bench_refs(|d| {
+        let signal_addr = d.bob_jid.to_protocol_address();
+        let node = futures::executor::block_on(prepare_peer_stanza(
+            &mut d.alice.sessions,
+            &mut d.alice.identity,
+            d.bob_jid.clone(),
+            &signal_addr,
+            &d.msg,
+            "b-001".into(),
+            None,
+        ))
+        .unwrap();
+        black_box(marshal(&node).unwrap());
+    });
 }
 
-#[library_benchmark]
-#[bench::text(setup = setup_dm_recv)]
-fn bench_dm_recv(mut d: DmRecvData) {
-    black_box(decrypt_dm(
-        &d.ciphertext,
-        &d.enc_type,
-        &d.alice_addr,
-        &mut d.bob,
-    ));
+#[divan::bench]
+fn bench_dm_recv(bencher: divan::Bencher) {
+    bencher.with_inputs(setup_dm_recv).bench_refs(|d| {
+        black_box(decrypt_dm(
+            &d.ciphertext,
+            &d.enc_type,
+            &d.alice_addr,
+            &mut d.bob,
+        ));
+    });
 }
 
 fn run_group_send(d: &mut GrpSendData) {
@@ -717,8 +792,16 @@ fn run_group_send(d: &mut GrpSendData) {
     // only emits a phash if it gets the full device set. Mirror the real
     // warm-send caller by passing it; the cold/force_skdm path resolves the set
     // itself and keeps None.
-    let all_devices_for_phash = (!d.force_skdm).then(|| d.participants.clone());
+    let all_devices_for_phash = d.resolved_for_phash.clone();
     let mut group_info = GroupInfo::new(std::mem::take(&mut d.participants), AddressingMode::Pn);
+    let own_base = own_jid.to_non_ad();
+    if !group_info
+        .participants
+        .iter()
+        .any(|p| p.is_same_user_as(&own_base))
+    {
+        group_info.participants.push(own_base);
+    }
     let mut stores = SignalStores {
         sender_key_store: &mut d.alice.sender_keys,
         session_store: &mut d.alice.sessions,
@@ -731,7 +814,7 @@ fn run_group_send(d: &mut GrpSendData) {
         &d.runtime,
         &mut stores,
         &d.resolver,
-        &mut group_info,
+        &group_info,
         &own_jid,
         &own_jid,
         None,
@@ -750,42 +833,57 @@ fn run_group_send(d: &mut GrpSendData) {
 }
 
 // Steady-state group send (skmsg only, no SKDM distribution)
-#[library_benchmark]
-#[bench::group_10(setup = setup_group_send_10)]
-#[bench::group_50(setup = setup_group_send_50)]
-#[bench::group_256(setup = setup_group_send_256)]
-fn bench_group_send(mut d: GrpSendData) {
-    run_group_send(&mut d);
+#[divan::bench]
+fn bench_group_send_10(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_send_10)
+        .bench_refs(run_group_send);
+}
+
+#[divan::bench]
+fn bench_group_send_50(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_send_50)
+        .bench_refs(run_group_send);
+}
+
+#[divan::bench]
+fn bench_group_send_256(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_send_256)
+        .bench_refs(run_group_send);
 }
 
 // First-message group send: forces SKDM distribution with N pairwise encryptions
-#[library_benchmark]
-#[bench::skdm_10(setup = setup_group_skdm_10)]
-#[bench::skdm_50(setup = setup_group_skdm_50)]
-#[bench::skdm_256(setup = setup_group_skdm_256)]
-fn bench_group_send_skdm(mut d: GrpSendData) {
-    run_group_send(&mut d);
+#[divan::bench]
+fn bench_group_send_skdm_10(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_skdm_10)
+        .bench_refs(run_group_send);
 }
 
-#[library_benchmark]
-#[bench::text(setup = setup_group_recv)]
-fn bench_group_recv(mut d: GrpRecvData) {
-    black_box(decrypt_group(
-        &d.skmsg_bytes,
-        &d.alice_addr,
-        &d.group_jid,
-        &mut d.bob,
-    ));
+#[divan::bench]
+fn bench_group_send_skdm_50(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_skdm_50)
+        .bench_refs(run_group_send);
 }
 
-library_benchmark_group!(name = dm_send; benchmarks = bench_dm_send);
-library_benchmark_group!(name = dm_recv; benchmarks = bench_dm_recv);
-library_benchmark_group!(name = group_send; benchmarks = bench_group_send);
-library_benchmark_group!(name = group_send_skdm; benchmarks = bench_group_send_skdm);
-library_benchmark_group!(name = group_recv; benchmarks = bench_group_recv);
+#[divan::bench]
+fn bench_group_send_skdm_256(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_group_skdm_256)
+        .bench_refs(run_group_send);
+}
 
-main!(
-    config = LibraryBenchmarkConfig::default()
-        .tool(Callgrind::default().flamegraph(FlamegraphConfig::default()));
-    library_benchmark_groups = dm_send, dm_recv, group_send, group_send_skdm, group_recv
-);
+#[divan::bench]
+fn bench_group_recv(bencher: divan::Bencher) {
+    bencher.with_inputs(setup_group_recv).bench_refs(|d| {
+        black_box(decrypt_group(
+            &d.skmsg_bytes,
+            &d.alice_addr,
+            &d.group_jid,
+            &mut d.bob,
+        ));
+    });
+}

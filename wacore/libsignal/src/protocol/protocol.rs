@@ -503,6 +503,21 @@ impl SenderKeyMessage {
         Ok(valid)
     }
 
+    /// Like [`Self::verify_signature`], against a cached verifier: the
+    /// per-key Edwards derivations are reused across messages instead of
+    /// recomputed per signature.
+    pub fn verify_signature_prepared(
+        &self,
+        signature_key: &crate::core::curve::PreparedVerifyingKey,
+    ) -> Result<bool> {
+        let valid = signature_key.verify_signature(
+            &self.serialized[..self.serialized.len() - Self::SIGNATURE_LEN],
+            &self.serialized[self.serialized.len() - Self::SIGNATURE_LEN..],
+        );
+
+        Ok(valid)
+    }
+
     #[inline]
     pub fn message_version(&self) -> u8 {
         self.message_version
@@ -816,7 +831,7 @@ impl buffa::Message for DecryptionErrorMessageProto {
         &mut self,
         tag: buffa::encoding::Tag,
         buf: &mut impl buffa::bytes::Buf,
-        _depth: u32,
+        _ctx: buffa::DecodeContext<'_>,
     ) -> core::result::Result<(), buffa::DecodeError> {
         use buffa::encoding::WireType;
         // Validate wire type per field; a mismatch falls through to skip_field

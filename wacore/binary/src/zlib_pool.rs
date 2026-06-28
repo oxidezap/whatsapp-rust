@@ -33,6 +33,7 @@ pub struct InflateReader<'a> {
     total_out: u64,
     max: u64,
     eof: bool,
+    stream_end: bool,
 }
 
 impl<'a> InflateReader<'a> {
@@ -60,6 +61,7 @@ impl<'a> InflateReader<'a> {
             total_out: 0,
             max,
             eof: false,
+            stream_end: false,
         }
     }
 
@@ -92,6 +94,19 @@ impl<'a> InflateReader<'a> {
         self.eof && self.cursor >= self.buf.len()
     }
 
+    /// Total decompressed bytes produced so far. After the stream ends this is
+    /// the blob's exact inflated size.
+    pub fn total_out(&self) -> u64 {
+        self.total_out
+    }
+
+    /// Whether zlib reported a proper stream end (terminator + adler32
+    /// checksum). An EOF (`ensure` returning false) without this means the
+    /// input was truncated, not finished.
+    pub fn stream_ended(&self) -> bool {
+        self.stream_end
+    }
+
     fn pump(&mut self) -> io::Result<()> {
         // Drop the consumed prefix before growing, so the buffer holds roughly
         // just the record currently being accumulated.
@@ -100,19 +115,22 @@ impl<'a> InflateReader<'a> {
             self.cursor = 0;
         }
 
-        let mut chunk = [0u8; Self::CHUNK];
         // `decomp` is `Some` for the reader's whole lifetime (only `Drop` takes it),
         // so this is unreachable in practice; surface it as an error rather than panic.
         let decomp = self
             .decomp
             .as_mut()
             .ok_or_else(|| io::Error::other("InflateReader used after pool return"))?;
+        // Inflate straight into the window's spare capacity: a stack chunk +
+        // extend_from_slice would copy every decompressed byte a second time
+        // (~10% of a history-sync extraction).
+        self.buf.reserve(Self::CHUNK);
         let prev_in = decomp.total_in();
         let prev_out = decomp.total_out();
         let status = decomp
-            .decompress(
+            .decompress_vec(
                 &self.input[self.in_pos..],
-                &mut chunk,
+                &mut self.buf,
                 FlushDecompress::None,
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -126,14 +144,18 @@ impl<'a> InflateReader<'a> {
                 format!("decompressed payload exceeds {} bytes", self.max),
             ));
         }
-        self.buf.extend_from_slice(&chunk[..produced]);
 
         match status {
-            Status::StreamEnd => self.eof = true,
+            Status::StreamEnd => {
+                self.eof = true;
+                self.stream_end = true;
+            }
             // No output produced and not at stream end: distinguish a truncated
-            // tail (no input left → treat as end) from a stalled/corrupt stream
-            // (input remains but the decompressor consumed none → error, instead
-            // of spinning forever since 64 KB of output is always available).
+            // tail (no input left → treat as end, with `stream_end` left false
+            // so callers can tell it apart from a real terminator) from a
+            // stalled/corrupt stream (input remains but the decompressor
+            // consumed none → error, instead of spinning forever since 64 KB of
+            // output is always available).
             // Mirrors the no-progress guard in `decompress_zlib_pooled`.
             _ if produced == 0 => {
                 if self.in_pos >= self.input.len() {
@@ -172,6 +194,38 @@ impl Drop for InflateReader<'_> {
     }
 }
 
+/// Grow the output buffer by projecting the decompressed size from the
+/// expansion ratio observed so far, instead of blind capacity doubling. A
+/// high-ratio stream (the up-front `2x compressed` guess undershot) then
+/// converges in one or two reallocations sized near the real total, rather
+/// than a doubling chain whose copies and final overshoot dominate both the
+/// allocated-bytes count and the peak.
+fn grow_by_observed_ratio(
+    scratch: &mut Vec<u8>,
+    decompressor: &Decompress,
+    compressed_len: usize,
+    cap: usize,
+) {
+    let consumed = decompressor.total_in() as usize;
+    let produced = decompressor.total_out() as usize;
+    let remaining_in = compressed_len.saturating_sub(consumed) as u64;
+    let projected = if consumed > 0 && produced > 0 {
+        // 9/8 margin: early bytes compress worse than the warmed-up tail, so
+        // the observed ratio slightly underestimates the remainder.
+        ((produced as u64).saturating_mul(remaining_in) / consumed as u64).saturating_mul(9) / 8
+    } else {
+        0
+    };
+    // Floor at the doubling step: small payloads (protocol nodes) keep their
+    // old growth exactly; the projection only ever grows MORE, for the
+    // high-ratio multi-MB streams it exists for.
+    let min_grow = scratch.capacity().max(4096);
+    let want = (projected.min(usize::MAX as u64) as usize)
+        .max(min_grow)
+        .min(cap - scratch.len());
+    scratch.reserve(want);
+}
+
 /// Decompress zlib data using a pooled decompressor.
 ///
 /// Reuses the per-thread `flate2::Decompress` internal state (~48 KB) across
@@ -193,8 +247,12 @@ pub fn decompress_zlib_pooled(compressed: &[u8], max_size: u64) -> io::Result<Ve
         // every multi-MB history-sync chunk. 2x the compressed length is a
         // conservative first guess (zlib here compresses ~2-5x): it rarely
         // overshoots the real size, so it cuts reallocations without inflating
-        // peak memory. Bounded by `cap` so a bad guess can't exceed the limit.
-        let estimated = compressed.len().saturating_mul(2).clamp(4096, cap);
+        // peak memory. Bounded by `cap` so a bad guess can't exceed the limit;
+        // the floor also bows to `cap` because callers now pass exact (possibly
+        // tiny) decompressed sizes as the limit, where a fixed 4096 floor would
+        // invert the clamp and panic.
+        let floor = 4096.min(cap);
+        let estimated = compressed.len().saturating_mul(2).clamp(floor, cap);
         if scratch.capacity() < estimated {
             scratch.reserve(estimated - scratch.capacity());
         }
@@ -232,9 +290,7 @@ pub fn decompress_zlib_pooled(compressed: &[u8], max_size: u64) -> io::Result<Ve
             match status {
                 Status::StreamEnd => break,
                 Status::Ok => {
-                    // Grow but never past the cap
-                    let want = scratch.capacity().max(4096).min(cap - scratch.len());
-                    scratch.reserve(want);
+                    grow_by_observed_ratio(scratch, decompressor, compressed.len(), cap);
                 }
                 Status::BufError => {
                     if decompressor.total_in() == prev_in && decompressor.total_out() == prev_out {
@@ -243,8 +299,7 @@ pub fn decompress_zlib_pooled(compressed: &[u8], max_size: u64) -> io::Result<Ve
                             "zlib stream truncated (no progress)",
                         ));
                     }
-                    let want = scratch.capacity().max(4096).min(cap - scratch.len());
-                    scratch.reserve(want);
+                    grow_by_observed_ratio(scratch, decompressor, compressed.len(), cap);
                 }
             }
         }
@@ -317,6 +372,28 @@ mod tests {
         let compressed = zlib(&original);
         let mut r = InflateReader::new(&compressed, 4096);
         assert!(r.ensure(1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn pooled_high_ratio_stream_roundtrips() {
+        // ~50x expansion: the 2x up-front guess undershoots badly, so this
+        // exercises the ratio-projected growth path end to end.
+        let original: Vec<u8> = (0..4_000_000u32).map(|i| ((i / 1024) % 7) as u8).collect();
+        let compressed = zlib(&original);
+        assert!(
+            compressed.len() < original.len() / 20,
+            "fixture not high-ratio"
+        );
+        let out = decompress_zlib_pooled(&compressed, 64 * 1024 * 1024).unwrap();
+        assert_eq!(out, original);
+        // The projection should land near the real size, not at a doubling
+        // overshoot far past it.
+        assert!(
+            out.capacity() < original.len() * 2,
+            "capacity {} vs data {}",
+            out.capacity(),
+            original.len()
+        );
     }
 
     #[test]

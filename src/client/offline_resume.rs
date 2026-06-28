@@ -14,8 +14,9 @@
 //! continuation per cycle, just as WA Web's `$6` timer coalesces
 //! synchronously-arriving stanzas into one `$13` call.
 
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use log::{debug, warn};
@@ -89,6 +90,7 @@ pub(crate) fn build_offline_batch_request(count: u32) -> Node {
 }
 
 /// Called from `IbHandler` on `<ib><offline_preview count="N"/>` with N > 0.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.offline_first_batch", level = "debug", skip_all, fields(total = total)))]
 pub(crate) async fn send_first_batch(client: Arc<Client>, total: usize) {
     let generation = client.connection_generation.load(Ordering::Acquire);
     client.offline_batch.arm(generation);

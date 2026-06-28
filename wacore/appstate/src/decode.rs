@@ -79,19 +79,23 @@ pub fn decode_record(
     let action = wa::SyncActionDataView::decode_view(plaintext.as_slice())
         .map_err(|_| AppStateError::DecodeFailed)?;
 
+    // WA Web (syncdDecryptMutation) computes the index MAC unconditionally over the
+    // decoded index (empty buffer when the field is absent) and rejects on mismatch,
+    // so an absent index must still match the stored MAC rather than bypass the check.
+    if validate_macs {
+        let stored = record
+            .index
+            .as_option()
+            .and_then(|i| i.blob.as_ref())
+            .ok_or(AppStateError::MissingIndexMAC)?;
+        validate_index_mac(action.index.unwrap_or(&[]), stored, &keys.index)?;
+    }
+
     let mut index_list: Vec<String> = Vec::new();
-    if let Some(idx_bytes) = action.index {
-        if validate_macs {
-            let stored = record
-                .index
-                .blob
-                .as_ref()
-                .ok_or(AppStateError::MissingIndexMAC)?;
-            validate_index_mac(idx_bytes, stored, &keys.index)?;
-        }
-        if let Ok(parsed) = serde_json::from_slice::<Vec<String>>(idx_bytes) {
-            index_list = parsed;
-        }
+    if let Some(idx_bytes) = action.index
+        && let Ok(parsed) = serde_json::from_slice::<Vec<String>>(idx_bytes)
+    {
+        index_list = parsed;
     }
 
     // A record without an index MAC is malformed; never persist an empty MAC
@@ -103,7 +107,12 @@ pub fn decode_record(
         .ok_or(AppStateError::MissingIndexMAC)?;
     Ok((
         Mutation {
-            action_value: action.value.as_option().map(MessageView::to_owned_message),
+            action_value: action
+                .value
+                .as_option()
+                .map(MessageView::to_owned_message)
+                .transpose()
+                .map_err(|_| AppStateError::DecodeFailed)?,
             index: index_list,
             operation,
         },
@@ -166,10 +175,10 @@ pub fn collect_key_id_refs_from_patch_list<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::generate_content_mac;
+    use crate::hash::{generate_content_mac, generate_index_mac};
     use crate::keys::expand_app_state_keys;
     use buffa::Message;
-    use wacore_libsignal::crypto::{CryptographicMac, aes_256_cbc_encrypt_into};
+    use wacore_libsignal::crypto::aes_256_cbc_encrypt_into;
 
     fn create_test_record(
         op: wa::syncd_mutation::SyncdOperation,
@@ -189,20 +198,10 @@ mod tests {
         let mut value_blob = value_with_iv;
         value_blob.extend_from_slice(&value_mac);
 
-        let index_blob = action_data
-            .index
-            .as_ref()
-            .map(|index| {
-                let mut mac = CryptographicMac::new("HmacSha256", &keys.index)
-                    .expect("HmacSha256 is a valid algorithm");
-                mac.update(index);
-                mac.finalize()
-            })
-            .unwrap_or_else(|| vec![1; 32]);
-
+        let index_bytes = action_data.index.as_deref().unwrap_or(&[]);
         wa::SyncdRecord {
             index: buffa::MessageField::some(wa::SyncdIndex {
-                blob: Some(index_blob),
+                blob: Some(generate_index_mac(index_bytes, &keys.index)),
             }),
             value: buffa::MessageField::some(wa::SyncdValue {
                 blob: Some(value_blob),
@@ -249,8 +248,8 @@ mod tests {
         );
         assert_eq!(mutation.operation, wa::syncd_mutation::SyncdOperation::SET);
         // MACs are returned separately and must carry the real bytes, not empty
-        // or swapped values: the record's index blob is `vec![1; 32]`.
-        assert_eq!(macs.index_mac, vec![1u8; 32]);
+        // or swapped values: index_mac is the HMAC of the (absent here) index.
+        assert_eq!(macs.index_mac, generate_index_mac(&[], &keys.index));
         assert!(!macs.value_mac.is_empty());
         assert_ne!(macs.index_mac, macs.value_mac);
     }
@@ -276,7 +275,7 @@ mod tests {
             &action_data,
         );
 
-        // With MAC validation enabled but no index in action_data, should succeed
+        // No index field, but the stored index MAC matches the empty-index HMAC: passes.
         let result = decode_record(
             wa::syncd_mutation::SyncdOperation::SET,
             &record,
@@ -288,64 +287,39 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_record_view_preserves_index_and_value_with_mac_validation() {
+    fn index_mac_is_validated_even_when_index_field_absent() {
         let master_key = [7u8; 32];
         let keys = expand_app_state_keys(&master_key);
         let key_id = b"test_key_id".to_vec();
-        let index = serde_json::to_vec(&vec!["regular", "chat", "15550000001@s.whatsapp.net"])
-            .expect("test index should serialize");
 
         let action_data = wa::SyncActionData {
-            index: Some(index),
             value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(1234567890),
-                push_name_setting: buffa::MessageField::some(
-                    wa::sync_action_value::PushNameSetting {
-                        name: Some("Test User".to_string()),
-                    },
-                ),
                 ..Default::default()
             }),
-            padding: Some(vec![0; 4]),
-            version: Some(1),
+            ..Default::default()
         };
-
-        let record = create_test_record(
+        let mut record = create_test_record(
             wa::syncd_mutation::SyncdOperation::SET,
             &keys,
             &key_id,
             &action_data,
         );
+        // Tamper the stored index MAC: with no index field the old code skipped the
+        // check entirely and accepted this; WA Web (and now we) reject it.
+        record.index = buffa::MessageField::some(wa::SyncdIndex {
+            blob: Some(vec![0xFF; 32]),
+        });
 
-        let (mutation, macs) = decode_record(
+        let err = decode_record(
             wa::syncd_mutation::SyncdOperation::SET,
             &record,
             &keys,
             &key_id,
             true,
         )
-        .expect("view-backed decode should preserve action data");
-
-        assert_eq!(
-            mutation.index,
-            vec!["regular", "chat", "15550000001@s.whatsapp.net"]
-        );
-        assert_eq!(
-            mutation.action_value.as_ref().and_then(|v| v.timestamp),
-            Some(1234567890)
-        );
-        assert_eq!(
-            mutation
-                .action_value
-                .as_ref()
-                .and_then(|v| v.push_name_setting.as_option())
-                .and_then(|p| p.name.as_deref()),
-            Some("Test User")
-        );
-        assert_eq!(
-            macs.index_mac,
-            record.index.blob.clone().unwrap_or_default()
-        );
+        .unwrap_err();
+        assert!(matches!(err, AppStateError::MismatchingIndexMAC));
     }
 
     #[test]

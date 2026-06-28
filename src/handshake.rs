@@ -22,6 +22,7 @@ const NOISE_HANDSHAKE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 const IK_FAILURE_THRESHOLD: u32 = 1;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum HandshakeError {
     #[error("Transport error: {0}")]
     Transport(#[from] anyhow::Error),
@@ -151,6 +152,10 @@ fn should_persist_cert_chain(device: &wacore::store::Device) -> bool {
     device.is_registered()
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.conn.handshake", level = "debug", skip_all, err(Debug))
+)]
 pub async fn do_handshake(
     runtime: Arc<dyn Runtime>,
     persistence_manager: &PersistenceManager,
@@ -158,7 +163,7 @@ pub async fn do_handshake(
     transport: Arc<dyn Transport>,
     transport_events: &mut async_channel::Receiver<TransportEvent>,
 ) -> Result<Arc<NoiseSocket>> {
-    let device_snapshot = persistence_manager.get_device_snapshot().await;
+    let device_snapshot = persistence_manager.get_device_snapshot();
     let now_secs = wacore::time::now_secs();
     let pattern = select_pattern(
         &device_snapshot,
@@ -230,6 +235,10 @@ pub async fn do_handshake(
     }
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.conn.handshake.xx", level = "debug", skip_all, err(Debug))
+)]
 async fn run_xx_handshake(
     runtime: &Arc<dyn Runtime>,
     device: &wacore::store::Device,
@@ -267,6 +276,10 @@ async fn run_xx_handshake(
 
 /// `fallback_taken` is set to `true` once we pivot from IK to XXfallback,
 /// before any operation that could fail.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.conn.handshake.ik", level = "debug", skip_all, err(Debug))
+)]
 async fn run_ik_handshake(
     runtime: &Arc<dyn Runtime>,
     device: &wacore::store::Device,

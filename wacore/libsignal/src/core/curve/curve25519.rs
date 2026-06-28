@@ -46,6 +46,45 @@ pub struct PrivateKey {
     sign_bit: u8,
 }
 
+/// The XEdDSA verify equation with the per-key derivations precomputed:
+/// `minus_cap_a` is the negated Edwards form of the signer's public key for
+/// the signature's sign bit, and `cap_a_bytes` its compressed encoding. The
+/// single source of truth for verification; `PrivateKey::verify_signature`
+/// derives the inputs per call, while cached verifiers reuse them.
+pub(crate) fn verify_signature_prepared(
+    minus_cap_a: &EdwardsPoint,
+    cap_a_bytes: &[u8; 32],
+    message: &[&[u8]],
+    signature: &[u8; SIGNATURE_LENGTH],
+) -> bool {
+    let mut cap_r = [0u8; 32];
+    cap_r.copy_from_slice(&signature[..32]);
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&signature[32..]);
+    s[31] &= 0b0111_1111_u8;
+    if (s[31] & 0b1110_0000_u8) != 0 {
+        return false;
+    }
+
+    let mut hash = Sha512::new();
+    // Explicitly pass a slice to avoid generating multiple versions of update().
+    hash.update(&cap_r[..]);
+    hash.update(cap_a_bytes);
+    for message_piece in message {
+        hash.update(message_piece);
+    }
+    let h = Scalar::from_bytes_mod_order_wide(&hash.finalize().into());
+
+    let cap_r_check_point = EdwardsPoint::vartime_double_scalar_mul_basepoint(
+        &h,
+        minus_cap_a,
+        &Scalar::from_bytes_mod_order(s),
+    );
+    let cap_r_check = cap_r_check_point.compress();
+
+    bool::from(cap_r_check.as_bytes().ct_eq(&cap_r))
+}
+
 impl PrivateKey {
     /// Computes the cached scalar, Edwards public key, and sign bit from a StaticSecret.
     #[inline]
@@ -256,33 +295,7 @@ impl PrivateKey {
                 None => return false,
             };
         let cap_a = ed_pub_key_point.compress();
-        let mut cap_r = [0u8; 32];
-        cap_r.copy_from_slice(&signature[..32]);
-        let mut s = [0u8; 32];
-        s.copy_from_slice(&signature[32..]);
-        s[31] &= 0b0111_1111_u8;
-        if (s[31] & 0b1110_0000_u8) != 0 {
-            return false;
-        }
-        let minus_cap_a = -ed_pub_key_point;
-
-        let mut hash = Sha512::new();
-        // Explicitly pass a slice to avoid generating multiple versions of update().
-        hash.update(&cap_r[..]);
-        hash.update(cap_a.as_bytes());
-        for message_piece in message {
-            hash.update(message_piece);
-        }
-        let h = Scalar::from_bytes_mod_order_wide(&hash.finalize().into());
-
-        let cap_r_check_point = EdwardsPoint::vartime_double_scalar_mul_basepoint(
-            &h,
-            &minus_cap_a,
-            &Scalar::from_bytes_mod_order(s),
-        );
-        let cap_r_check = cap_r_check_point.compress();
-
-        bool::from(cap_r_check.as_bytes().ct_eq(&cap_r))
+        verify_signature_prepared(&-ed_pub_key_point, cap_a.as_bytes(), message, signature)
     }
 
     pub fn derive_public_key_bytes(&self) -> [u8; PUBLIC_KEY_LENGTH] {

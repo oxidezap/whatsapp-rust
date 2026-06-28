@@ -1,7 +1,7 @@
 use e2e_tests::TestClient;
 use log::info;
 use wacore::types::events::Event;
-use whatsapp_rust::download::{Downloadable, MediaType};
+use whatsapp_rust::download::{DownloadParams, Downloadable, MediaType};
 use whatsapp_rust::upload::UploadResponse;
 use whatsapp_rust::waproto::whatsapp as wa;
 
@@ -232,14 +232,14 @@ async fn test_upload_then_download_image() -> anyhow::Result<()> {
     // Download using download_from_params
     let downloaded = client
         .client
-        .download_from_params(
+        .download_from_params(&DownloadParams::encrypted(
             &upload.direct_path,
             &upload.media_key,
             &upload.file_sha256,
             &upload.file_enc_sha256,
             upload.file_length,
             MediaType::Image,
-        )
+        ))
         .await?;
 
     assert_eq!(
@@ -265,14 +265,14 @@ async fn test_upload_then_download_video() -> anyhow::Result<()> {
 
     let downloaded = client
         .client
-        .download_from_params(
+        .download_from_params(&DownloadParams::encrypted(
             &upload.direct_path,
             &upload.media_key,
             &upload.file_sha256,
             &upload.file_enc_sha256,
             upload.file_length,
             MediaType::Video,
-        )
+        ))
         .await?;
 
     assert_eq!(downloaded, original);
@@ -295,14 +295,14 @@ async fn test_upload_then_download_document() -> anyhow::Result<()> {
 
     let downloaded = client
         .client
-        .download_from_params(
+        .download_from_params(&DownloadParams::encrypted(
             &upload.direct_path,
             &upload.media_key,
             &upload.file_sha256,
             &upload.file_enc_sha256,
             upload.file_length,
             MediaType::Document,
-        )
+        ))
         .await?;
 
     assert_eq!(downloaded, original);
@@ -361,12 +361,14 @@ async fn test_upload_then_download_to_writer() -> anyhow::Result<()> {
     let result_cursor = client
         .client
         .download_from_params_to_writer(
-            &upload.direct_path,
-            &upload.media_key,
-            &upload.file_sha256,
-            &upload.file_enc_sha256,
-            upload.file_length,
-            MediaType::Image,
+            &DownloadParams::encrypted(
+                &upload.direct_path,
+                &upload.media_key,
+                &upload.file_sha256,
+                &upload.file_enc_sha256,
+                upload.file_length,
+                MediaType::Image,
+            ),
             cursor,
         )
         .await?;
@@ -389,7 +391,6 @@ async fn test_send_image_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -453,7 +454,6 @@ async fn test_send_video_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -500,7 +500,6 @@ async fn test_send_document_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -546,7 +545,6 @@ async fn test_send_audio_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -592,7 +590,6 @@ async fn test_send_ptt_voice_message() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -641,13 +638,11 @@ async fn test_send_image_bidirectional() -> anyhow::Result<()> {
     let jid_a = client_a
         .client
         .get_pn()
-        .await
         .expect("A should have JID")
         .to_non_ad();
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -714,7 +709,6 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 
@@ -803,14 +797,14 @@ async fn test_upload_download_large_file() -> anyhow::Result<()> {
 
     let downloaded = client
         .client
-        .download_from_params(
+        .download_from_params(&DownloadParams::encrypted(
             &upload.direct_path,
             &upload.media_key,
             &upload.file_sha256,
             &upload.file_enc_sha256,
             upload.file_length,
             MediaType::Document,
-        )
+        ))
         .await?;
 
     assert_eq!(downloaded.len(), original.len());
@@ -841,14 +835,14 @@ async fn test_multiple_uploads_reuse_media_conn() -> anyhow::Result<()> {
         // Verify round-trip
         let downloaded = client
             .client
-            .download_from_params(
+            .download_from_params(&DownloadParams::encrypted(
                 &resp.direct_path,
                 &resp.media_key,
                 &resp.file_sha256,
                 &resp.file_enc_sha256,
                 resp.file_length,
                 MediaType::Image,
-            )
+            ))
             .await?;
         assert_eq!(downloaded, data);
     }
@@ -869,7 +863,6 @@ async fn test_send_image_no_caption() -> anyhow::Result<()> {
     let jid_b = client_b
         .client
         .get_pn()
-        .await
         .expect("B should have JID")
         .to_non_ad();
 

@@ -32,7 +32,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-04-05
+          toolchain: nightly-2026-06-16
 
       - name: Cache install-action tools
         uses: actions/cache@v5
@@ -42,11 +42,6 @@ jobs:
           key: ${{ runner.os }}-install-action-${{ hashFiles('.github/workflows/copilot-setup-steps.yml') }}
           restore-keys: |
             ${{ runner.os }}-install-action-
-
-      - name: Install tools (valgrind, iai-callgrind-runner)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: valgrind,iai-callgrind-runner@0.16.1
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2

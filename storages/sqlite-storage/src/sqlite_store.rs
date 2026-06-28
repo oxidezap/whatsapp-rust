@@ -84,7 +84,11 @@ struct DeviceRow {
     server_has_prekeys: bool,
     server_cert_chain: Option<Vec<u8>>,
     login_counter: i32,
+    first_unupload_pre_key_id: i32,
 }
+
+/// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
+const ID_PARAM_CHUNK: usize = 900;
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -156,8 +160,15 @@ impl SqliteStore {
 
         let pool_size = 2;
 
+        // Local SQLite file connections don't spontaneously drop, so r2d2's
+        // default per-checkout liveness probe (a SELECT 1 via Diesel's
+        // is_valid) is pure overhead on every store op: any real failure
+        // surfaces as a StoreError on the next actual query, so the probe
+        // guards nothing here. Skipping it saves a cached SELECT 1 (reset+step)
+        // per pool.get().
         let pool = Pool::builder()
             .max_size(pool_size)
+            .test_on_check_out(false)
             .connection_customizer(Box::new(ConnectionOptions))
             .build(manager)
             .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -263,6 +274,15 @@ impl SqliteStore {
                     if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
                 {
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
+                    // Skip the first transient blip; warn from the second retry on so
+                    // sustained busy/locked contention doesn't go unobserved.
+                    if attempt >= 1 {
+                        warn!(
+                            "{op_name} busy/locked, retry {}/{} in {delay_ms}ms: {e}",
+                            attempt + 1,
+                            MAX_RETRIES + 1
+                        );
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 }
                 Ok(Err(e)) => return Err(e.into()),
@@ -327,17 +347,13 @@ impl SqliteStore {
             device_data.edge_routing_info.as_deref().map(Arc::from);
         let props_hash: Option<Arc<str>> = device_data.props_hash.as_deref().map(Arc::from);
         let next_pre_key_id = device_data.next_pre_key_id as i32;
+        let first_unupload_pre_key_id = device_data.first_unupload_pre_key_id as i32;
         let server_has_prekeys = device_data.server_has_prekeys;
         let nct_salt: Option<Arc<[u8]>> = device_data.nct_salt.as_deref().map(Arc::from);
         let server_cert_chain: Option<Arc<[u8]>> = device_data
             .server_cert_chain
             .as_ref()
-            .map(|chain| {
-                bincode::serde::encode_to_vec(chain, bincode::config::standard())
-                    .map(Arc::from)
-                    .map_err(|e| StoreError::Serialization(Box::new(e)))
-            })
-            .transpose()?;
+            .map(|chain| Arc::from(crate::wire::encode_server_cert_chain(chain)));
         let login_counter = device_data.login_counter;
         let new_lid: Arc<str> = Arc::from(
             device_data
@@ -393,6 +409,7 @@ impl SqliteStore {
                         device::edge_routing_info.eq(edge_routing_info.as_deref()),
                         device::props_hash.eq(props_hash.as_deref()),
                         device::next_pre_key_id.eq(next_pre_key_id),
+                        device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(nct_salt.as_deref()),
                         device::server_cert_chain.eq(server_cert_chain.as_deref()),
@@ -421,6 +438,8 @@ impl SqliteStore {
                         device::edge_routing_info.eq(excluded(device::edge_routing_info)),
                         device::props_hash.eq(excluded(device::props_hash)),
                         device::next_pre_key_id.eq(excluded(device::next_pre_key_id)),
+                        device::first_unupload_pre_key_id
+                            .eq(excluded(device::first_unupload_pre_key_id)),
                         device::server_has_prekeys.eq(excluded(device::server_has_prekeys)),
                         device::nct_salt.eq(excluded(device::nct_salt)),
                         device::server_cert_chain.eq(excluded(device::server_cert_chain)),
@@ -452,6 +471,7 @@ impl SqliteStore {
         let app_version_tertiary = new_device.app_version_tertiary as i64;
         let app_version_last_fetched_ms = new_device.app_version_last_fetched_ms;
         let next_pre_key_id = new_device.next_pre_key_id as i32;
+        let first_unupload_pre_key_id = new_device.first_unupload_pre_key_id as i32;
         let server_has_prekeys = new_device.server_has_prekeys;
 
         self.with_retry("create_new_device", || {
@@ -484,6 +504,7 @@ impl SqliteStore {
                         device::edge_routing_info.eq(None::<&[u8]>),
                         device::props_hash.eq(None::<&str>),
                         device::next_pre_key_id.eq(next_pre_key_id),
+                        device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(None::<&[u8]>),
                         device::server_cert_chain.eq(None::<&[u8]>),
@@ -590,6 +611,7 @@ impl SqliteStore {
                 edge_routing_info: row.edge_routing_info,
                 props_hash: row.props_hash,
                 next_pre_key_id: row.next_pre_key_id as u32,
+                first_unupload_pre_key_id: row.first_unupload_pre_key_id as u32,
                 server_has_prekeys: row.server_has_prekeys,
                 nct_salt: row.nct_salt,
                 nct_salt_sync_seen: false,
@@ -602,11 +624,8 @@ impl SqliteStore {
                         // change between versions) must NOT block startup —
                         // log it and degrade to None so the next connect
                         // simply pays one XX handshake to repopulate.
-                        match bincode::serde::decode_from_slice(
-                            bytes,
-                            bincode::config::standard(),
-                        ) {
-                            Ok((chain, _)) => Some(chain),
+                        match crate::wire::decode_server_cert_chain(bytes) {
+                            Ok(chain) => Some(chain),
                             Err(e) => {
                                 log::warn!(
                                     "device {} server_cert_chain blob ({} bytes) failed to decode: {e}; \
@@ -965,9 +984,20 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(Box::new(e)))??;
 
         if let Some(data) = res {
-            let (key, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())
-                .map_err(|e| StoreError::Serialization(Box::new(e)))?;
-            Ok(Some(key))
+            // An undecodable blob (an old bincode row or genuine corruption) is
+            // treated as absent: the app-state sync path then re-requests the key,
+            // the primary re-shares it, and the next set overwrites it as protobuf.
+            match crate::wire::decode_app_state_sync_key(&data) {
+                Ok(key) => Ok(Some(key)),
+                Err(e) => {
+                    warn!(
+                        "app_state_sync_key blob ({} bytes) failed to decode: {e}; \
+                         treating as absent, key will be re-requested",
+                        data.len()
+                    );
+                    Ok(None)
+                }
+            }
         } else {
             Ok(None)
         }
@@ -981,8 +1011,7 @@ impl SqliteStore {
     ) -> Result<()> {
         let pool = self.pool.clone();
         let key_id = key_id.to_vec();
-        let data = bincode::serde::encode_to_vec(&key, bincode::config::standard())
-            .map_err(|e| StoreError::Serialization(Box::new(e)))?;
+        let data = crate::wire::encode_app_state_sync_key(&key);
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
@@ -1015,13 +1044,22 @@ impl SqliteStore {
                 let mut conn = pool
                     .get()
                     .map_err(|e| StoreError::Connection(Box::new(e)))?;
-                let res: Option<Vec<u8>> = app_state_keys::table
-                    .select(app_state_keys::key_id)
+                // Return the latest key whose blob actually decodes. A legacy bincode
+                // row (or a corrupt one) reads as absent via get_sync_key but still
+                // sits in the table with a possibly lexicographically-higher key_id;
+                // selecting it here would make the outbound build_patch fail later in
+                // get_app_state_key with KeyNotFound. Skip undecodable rows so outbound
+                // mutations use the newest USABLE key.
+                let candidates: Vec<(Vec<u8>, Vec<u8>)> = app_state_keys::table
+                    .select((app_state_keys::key_id, app_state_keys::key_data))
                     .filter(app_state_keys::device_id.eq(device_id))
                     .order(app_state_keys::key_id.desc())
-                    .first(&mut conn)
-                    .optional()
+                    .load(&mut conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
+                let res = candidates
+                    .into_iter()
+                    .find(|(_, data)| crate::wire::decode_app_state_sync_key(data).is_ok())
+                    .map(|(key_id, _)| key_id);
                 Ok(res)
             })
             .await
@@ -1054,9 +1092,19 @@ impl SqliteStore {
             .map_err(|e| StoreError::Database(Box::new(e)))??;
 
         if let Some(data) = res {
-            let (state, _) = bincode::serde::decode_from_slice(&data, bincode::config::standard())
-                .map_err(|e| StoreError::Serialization(Box::new(e)))?;
-            Ok(state)
+            // An undecodable blob (an old bincode row or corruption) resets the
+            // collection to default, which simply re-syncs it from version 0.
+            match crate::wire::decode_hash_state(&data) {
+                Ok(state) => Ok(state),
+                Err(e) => {
+                    warn!(
+                        "app_state_version blob ({} bytes) failed to decode: {e}; \
+                         resetting to default, collection will re-sync from 0",
+                        data.len()
+                    );
+                    Ok(HashState::default())
+                }
+            }
         } else {
             Ok(HashState::default())
         }
@@ -1069,8 +1117,7 @@ impl SqliteStore {
         device_id: i32,
     ) -> Result<()> {
         let name = name.to_string();
-        let data = bincode::serde::encode_to_vec(&state, bincode::config::standard())
-            .map_err(|e| StoreError::Serialization(Box::new(e)))?;
+        let data = crate::wire::encode_hash_state(&state);
         self.with_retry("set_app_state_version", || {
             let name = name.clone();
             let data = data.clone();
@@ -1261,6 +1308,38 @@ impl SignalStore for SqliteStore {
             .await
     }
 
+    async fn put_identities_batch(&self, identities: &[(Arc<str>, [u8; 32])]) -> Result<()> {
+        if identities.is_empty() {
+            return Ok(());
+        }
+
+        let device_id = self.device_id;
+        // `Arc<Vec>` so each retry attempt bumps a refcount instead of re-cloning
+        // the whole batch.
+        let batch = Arc::new(identities.to_vec());
+        self.with_retry("put_identities_batch", || {
+            let batch = batch.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for (address, key) in batch.iter() {
+                        diesel::insert_into(identities::table)
+                            .values((
+                                identities::address.eq(address.as_ref()),
+                                identities::key.eq(&key[..]),
+                                identities::device_id.eq(device_id),
+                            ))
+                            .on_conflict((identities::address, identities::device_id))
+                            .do_update()
+                            .set(identities::key.eq(&key[..]))
+                            .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
+    }
+
     async fn load_identity(&self, address: &str) -> Result<Option<[u8; 32]>> {
         let blob = self
             .load_identity_for_device(address, self.device_id)
@@ -1353,6 +1432,36 @@ impl SignalStore for SqliteStore {
     async fn put_session(&self, address: &str, session: &[u8]) -> Result<()> {
         self.put_session_for_device(address, session, self.device_id)
             .await
+    }
+
+    async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+
+        let device_id = self.device_id;
+        let batch = Arc::new(sessions.to_vec());
+        self.with_retry("put_sessions_batch", || {
+            let batch = batch.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for (address, record) in batch.iter() {
+                        diesel::insert_into(sessions::table)
+                            .values((
+                                sessions::address.eq(address.as_ref()),
+                                sessions::record.eq(record.as_ref()),
+                                sessions::device_id.eq(device_id),
+                            ))
+                            .on_conflict((sessions::address, sessions::device_id))
+                            .do_update()
+                            .set(sessions::record.eq(record.as_ref()))
+                            .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
     }
 
     async fn delete_session(&self, address: &str) -> Result<()> {
@@ -1524,16 +1633,22 @@ impl SignalStore for SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let rows: Vec<(i32, Vec<u8>)> = prekeys::table
-                .select((prekeys::id, prekeys::key))
-                .filter(prekeys::id.eq_any(&ids))
-                .filter(prekeys::device_id.eq(device_id))
-                .load(&mut conn)
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(rows
-                .into_iter()
-                .map(|(id, key)| (id as u32, Bytes::from(key)))
-                .collect())
+            // Chunked like mark_prekeys_uploaded: the upload window can carry
+            // more ids than SQLite's host-parameter limit.
+            let mut out = Vec::with_capacity(ids.len());
+            for chunk in ids.chunks(ID_PARAM_CHUNK) {
+                let rows: Vec<(i32, Vec<u8>)> = prekeys::table
+                    .select((prekeys::id, prekeys::key))
+                    .filter(prekeys::id.eq_any(chunk))
+                    .filter(prekeys::device_id.eq(device_id))
+                    .load(&mut conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                out.extend(
+                    rows.into_iter()
+                        .map(|(id, key)| (id as u32, Bytes::from(key))),
+                );
+            }
+            Ok(out)
         })
         .await
     }
@@ -1588,6 +1703,32 @@ impl SignalStore for SqliteStore {
         Err(StoreError::RetriesExhausted {
             op: "remove_prekey".to_string(),
         })
+    }
+
+    async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let device_id = self.device_id;
+        let ids: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
+        self.with_retry("mark_prekeys_uploaded", move || {
+            let ids = ids.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                // Stay under SQLite's host-parameter limit (999 by default);
+                // the upload batch is configurable up to u16::MAX ids.
+                for chunk in ids.chunks(ID_PARAM_CHUNK) {
+                    diesel::update(
+                        prekeys::table
+                            .filter(prekeys::id.eq_any(chunk.to_vec()))
+                            .filter(prekeys::device_id.eq(device_id)),
+                    )
+                    .set(prekeys::uploaded.eq(true))
+                    .execute(conn)?;
+                }
+                Ok(())
+            })
+        })
+        .await
     }
 
     async fn get_max_prekey_id(&self) -> Result<u32> {
@@ -1771,6 +1912,36 @@ impl SignalStore for SqliteStore {
             .await
     }
 
+    async fn put_sender_keys_batch(&self, sender_keys: &[(Arc<str>, Bytes)]) -> Result<()> {
+        if sender_keys.is_empty() {
+            return Ok(());
+        }
+
+        let device_id = self.device_id;
+        let batch = Arc::new(sender_keys.to_vec());
+        self.with_retry("put_sender_keys_batch", || {
+            let batch = batch.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for (address, record) in batch.iter() {
+                        diesel::insert_into(sender_keys::table)
+                            .values((
+                                sender_keys::address.eq(address.as_ref()),
+                                sender_keys::record.eq(record.as_ref()),
+                                sender_keys::device_id.eq(device_id),
+                            ))
+                            .on_conflict((sender_keys::address, sender_keys::device_id))
+                            .do_update()
+                            .set(sender_keys::record.eq(record.as_ref()))
+                            .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
+    }
+
     async fn get_sender_key(&self, address: &str) -> Result<Option<Vec<u8>>> {
         self.get_sender_key_for_device(address, self.device_id)
             .await
@@ -1832,6 +2003,24 @@ impl AppSyncStore for SqliteStore {
     async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()> {
         self.delete_app_state_mutation_macs_for_device(name, index_macs, self.device_id)
             .await
+    }
+
+    async fn clear_mutation_macs(&self, name: &str) -> Result<()> {
+        let device_id = self.device_id;
+        let name = name.to_string();
+        self.with_retry("clear_mutation_macs", || {
+            let name = name.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::delete(
+                    app_state_mutation_macs::table
+                        .filter(app_state_mutation_macs::name.eq(&name))
+                        .filter(app_state_mutation_macs::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(())
+            })
+        })
+        .await
     }
 
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>> {
@@ -2437,6 +2626,28 @@ impl ProtocolStore for SqliteStore {
         Ok(())
     }
 
+    async fn delete_group_metadata(&self, group_jid: &str) -> Result<()> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let group_jid = group_jid.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            diesel::delete(
+                group_metadata::table
+                    .filter(group_metadata::group_jid.eq(&group_jid))
+                    .filter(group_metadata::device_id.eq(device_id)),
+            )
+            .execute(&mut conn)
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))??;
+        Ok(())
+    }
+
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
@@ -2646,6 +2857,115 @@ impl ProtocolStore for SqliteStore {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))?
     }
+
+    async fn store_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+        message: &[u8],
+    ) -> Result<()> {
+        let chat = chat.to_string();
+        let sender = sender.to_string();
+        let id = id.to_string();
+        // Arc avoids cloning the payload bytes on each retry iteration.
+        let message: Arc<Vec<u8>> = Arc::new(message.to_vec());
+        let device_id = self.device_id;
+        self.with_retry("store_pending_inbound", || {
+            let chat = chat.clone();
+            let sender = sender.clone();
+            let id = id.clone();
+            let message = Arc::clone(&message);
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::replace_into(pending_inbound_messages::table)
+                    .values((
+                        pending_inbound_messages::chat.eq(&chat),
+                        pending_inbound_messages::sender.eq(&sender),
+                        pending_inbound_messages::id.eq(&id),
+                        pending_inbound_messages::message.eq(message.as_slice()),
+                        pending_inbound_messages::device_id.eq(device_id),
+                    ))
+                    .execute(conn)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    async fn get_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let chat = chat.to_string();
+        let sender = sender.to_string();
+        let id = id.to_string();
+        let device_id = self.device_id;
+        // Retry on SQLITE_BUSY: a transient lock here must not surface as a read
+        // failure, which fails closed and forces an unnecessary redelivery.
+        self.with_retry("get_pending_inbound", || {
+            let chat = chat.clone();
+            let sender = sender.clone();
+            let id = id.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                let row: Option<Vec<u8>> = pending_inbound_messages::table
+                    .select(pending_inbound_messages::message)
+                    .filter(pending_inbound_messages::chat.eq(&chat))
+                    .filter(pending_inbound_messages::sender.eq(&sender))
+                    .filter(pending_inbound_messages::id.eq(&id))
+                    .filter(pending_inbound_messages::device_id.eq(device_id))
+                    .first(conn)
+                    .optional()?;
+                Ok(row)
+            })
+        })
+        .await
+    }
+
+    async fn delete_pending_inbound(&self, chat: &str, sender: &str, id: &str) -> Result<()> {
+        let chat = chat.to_string();
+        let sender = sender.to_string();
+        let id = id.to_string();
+        let device_id = self.device_id;
+        self.with_retry("delete_pending_inbound", || {
+            let chat = chat.clone();
+            let sender = sender.clone();
+            let id = id.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::delete(
+                    pending_inbound_messages::table
+                        .filter(pending_inbound_messages::chat.eq(&chat))
+                        .filter(pending_inbound_messages::sender.eq(&sender))
+                        .filter(pending_inbound_messages::id.eq(&id))
+                        .filter(pending_inbound_messages::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    async fn delete_expired_pending_inbound(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        tokio::task::spawn_blocking(move || -> Result<u32> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            let deleted = diesel::delete(
+                pending_inbound_messages::table
+                    .filter(pending_inbound_messages::inserted_at.lt(cutoff_timestamp))
+                    .filter(pending_inbound_messages::device_id.eq(device_id)),
+            )
+            .execute(&mut conn)
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(deleted as u32)
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -2728,12 +3048,15 @@ impl MsgSecretStore for SqliteStore {
         sender: &str,
         msg_id: &str,
     ) -> Result<Option<Vec<u8>>> {
+        // Serialized through the db semaphore for the same reason as
+        // get_msg_secret_with_ts: a read racing a write transaction must wait,
+        // not error out as a phantom miss.
         let pool = self.pool.clone();
         let device_id = self.device_id;
         let chat = chat.to_string();
         let sender = sender.to_string();
         let msg_id = msg_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+        self.with_semaphore(move || -> Result<Option<Vec<u8>>> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -2749,7 +3072,6 @@ impl MsgSecretStore for SqliteStore {
             Ok(row)
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn get_msg_secret_with_ts(
@@ -2758,12 +3080,16 @@ impl MsgSecretStore for SqliteStore {
         sender: &str,
         msg_id: &str,
     ) -> Result<Option<(Vec<u8>, i64)>> {
+        // Serialized through the db semaphore: a raw read racing a write
+        // transaction hits the shared-cache table lock on in-memory stores
+        // (SQLITE_LOCKED is not covered by busy_timeout) and callers treat the
+        // error as a missing secret.
         let pool = self.pool.clone();
         let device_id = self.device_id;
         let chat = chat.to_string();
         let sender = sender.to_string();
         let msg_id = msg_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<(Vec<u8>, i64)>> {
+        self.with_semaphore(move || -> Result<Option<(Vec<u8>, i64)>> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -2779,7 +3105,6 @@ impl MsgSecretStore for SqliteStore {
             Ok(row)
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn delete_expired_msg_secrets(&self, cutoff_timestamp: i64) -> Result<u32> {
@@ -2965,6 +3290,124 @@ mod tests {
             .await
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_mutation_macs_wipes_only_named_collection() {
+        let store = create_test_store().await;
+        let mac = |i: u8| AppStateMutationMAC {
+            index_mac: vec![i; 32],
+            value_mac: vec![i; 32],
+        };
+        store
+            .put_mutation_macs("regular", 1, &[mac(1)])
+            .await
+            .unwrap();
+        store
+            .put_mutation_macs("critical", 1, &[mac(2)])
+            .await
+            .unwrap();
+
+        store.clear_mutation_macs("regular").await.unwrap();
+
+        assert!(
+            store
+                .get_mutation_mac("regular", &[1; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_mutation_mac("critical", &[2; 32])
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_signal_batches_persist_and_upsert() {
+        use std::sync::Arc;
+        let store = create_test_store().await;
+
+        let sessions: Vec<(Arc<str>, Bytes)> = (0..5u8)
+            .map(|i| {
+                (
+                    Arc::from(format!("user{i}@s.whatsapp.net").as_str()),
+                    Bytes::from(vec![i; 8]),
+                )
+            })
+            .collect();
+        store.put_sessions_batch(&sessions).await.unwrap();
+        for (addr, bytes) in &sessions {
+            assert_eq!(
+                store.get_session(addr).await.unwrap().as_deref(),
+                Some(bytes.as_ref())
+            );
+        }
+
+        let identities: Vec<(Arc<str>, [u8; 32])> = (0..5u8)
+            .map(|i| {
+                (
+                    Arc::from(format!("user{i}@s.whatsapp.net").as_str()),
+                    [i; 32],
+                )
+            })
+            .collect();
+        store.put_identities_batch(&identities).await.unwrap();
+        for (addr, key) in &identities {
+            assert_eq!(store.load_identity(addr).await.unwrap(), Some(*key));
+        }
+
+        let sender_keys: Vec<(Arc<str>, Bytes)> = (0..5u8)
+            .map(|i| {
+                (
+                    Arc::from(format!("g@g.us::user{i}").as_str()),
+                    Bytes::from(vec![i; 16]),
+                )
+            })
+            .collect();
+        store.put_sender_keys_batch(&sender_keys).await.unwrap();
+        for (addr, bytes) in &sender_keys {
+            assert_eq!(
+                store.get_sender_key(addr).await.unwrap().as_deref(),
+                Some(bytes.as_ref())
+            );
+        }
+
+        // Re-batching the same addresses upserts (on_conflict do_update).
+        let updated: Vec<(Arc<str>, Bytes)> = sessions
+            .iter()
+            .map(|(addr, _)| (addr.clone(), Bytes::from(vec![0xAA; 8])))
+            .collect();
+        store.put_sessions_batch(&updated).await.unwrap();
+        for (addr, _) in &sessions {
+            assert_eq!(
+                store.get_session(addr).await.unwrap().as_deref(),
+                Some([0xAA; 8].as_slice())
+            );
+        }
+
+        // Duplicate address within one batch: last value wins via on_conflict
+        // do_update inside the single transaction.
+        let dup: Arc<str> = Arc::from("dup@s.whatsapp.net");
+        store
+            .put_sessions_batch(&[
+                (dup.clone(), Bytes::from(vec![1u8; 4])),
+                (dup.clone(), Bytes::from(vec![2u8; 4])),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_session(&dup).await.unwrap().as_deref(),
+            Some([2u8; 4].as_slice())
+        );
+
+        // Empty batches short-circuit without error.
+        store.put_sessions_batch(&[]).await.unwrap();
+        store.put_identities_batch(&[]).await.unwrap();
+        store.put_sender_keys_batch(&[]).await.unwrap();
     }
 
     #[test]
@@ -3347,10 +3790,90 @@ mod tests {
         );
     }
 
+    /// mark_prekeys_uploaded must be UPDATE-only: a row deleted between the
+    /// upload snapshot and the mark (consumed one-time key) stays deleted.
+    #[tokio::test]
+    async fn mark_prekeys_uploaded_never_resurrects_deleted_rows() {
+        let store = create_test_store().await;
+        store
+            .store_prekey(1, b"record-1", false)
+            .await
+            .expect("store");
+        store
+            .store_prekey(2, b"record-2", false)
+            .await
+            .expect("store");
+        store.remove_prekey(1).await.expect("consume");
+
+        store
+            .mark_prekeys_uploaded(&[1, 2])
+            .await
+            .expect("mark uploaded");
+
+        let gone = store.load_prekey(1).await.expect("load");
+        assert!(gone.is_none(), "consumed key must not be resurrected");
+        let live = store.load_prekey(2).await.expect("load");
+        assert!(live.is_some(), "live key still present");
+    }
+
+    /// Round-trips the prekey watermarks through the SQLite schema: save with
+    /// both counters set, reopen on the same db, load and compare. Exercises
+    /// the `2026-06-10-000000_add_first_unupload_pk_id` migration and the
+    /// column mapping in both upsert paths.
+    #[tokio::test]
+    async fn test_prekey_watermarks_survive_save_load_roundtrip() {
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(300);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_name = format!(
+            "file:memdb_pkwatermark_{}_{}?mode=memory&cache=shared",
+            std::process::id(),
+            id
+        );
+
+        let device_id = 9;
+        let _writer = SqliteStore::new_for_device(&db_name, device_id)
+            .await
+            .expect("create store");
+        _writer.create_new_device().await.expect("create device");
+
+        let mut device = _writer
+            .load_device_data_for_device(device_id)
+            .await
+            .expect("load")
+            .expect("device should exist after create");
+        assert_eq!(
+            device.first_unupload_pre_key_id, 0,
+            "fresh device starts with the watermark unset"
+        );
+        device.next_pre_key_id = 913;
+        device.first_unupload_pre_key_id = 101;
+        _writer
+            .save_device_data_for_device(device_id, &device)
+            .await
+            .expect("save with watermarks");
+
+        let store = SqliteStore::new_for_device(&db_name, device_id)
+            .await
+            .expect("reopen store");
+        let loaded = store
+            .load_device_data_for_device(device_id)
+            .await
+            .expect("load")
+            .expect("device should exist after reopen");
+        assert_eq!(loaded.next_pre_key_id, 913);
+        assert_eq!(
+            loaded.first_unupload_pre_key_id, 101,
+            "first_unupload_pre_key_id must survive a save/load roundtrip"
+        );
+    }
+
     /// Round-trips a `CachedServerCertChain` through the SQLite schema:
     /// save → close store → reopen on the same db_name → load. Exercises
     /// the `2026-04-26-000000_add_server_cert_chain` migration plus the
-    /// bincode encode/decode path in `save_device_data_for_device` /
+    /// protobuf encode/decode path in `save_device_data_for_device` /
     /// `load_device_data_for_device` (the part that the in-memory backend
     /// integration tests don't reach).
     #[tokio::test]
@@ -3407,7 +3930,7 @@ mod tests {
 
         // Second store on the SAME shared-cache db: this exercises the
         // exact path a fresh-process load would take — schema migration
-        // already applied, BLOB column present, and the bincode-encoded
+        // already applied, BLOB column present, and the protobuf-encoded
         // chain decoded by the load path.
         let store = SqliteStore::new_for_device(&db_name, device_id)
             .await
@@ -3443,6 +3966,238 @@ mod tests {
         );
     }
 
+    // The migration strategy is self-healing with NO migration: rows written by the
+    // old `bincode` codec can't decode as the new protobuf wire format, so the store
+    // must read them back as ABSENT (never an error) -- then the sync path re-requests
+    // the key / re-syncs the collection, and the protobuf setters overwrite the row.
+    #[tokio::test]
+    async fn legacy_bincode_blobs_self_heal_then_overwrite() {
+        use diesel::{ExpressionMethods, RunQueryDsl, sql_query};
+        use wacore::appstate::hash::HashState;
+        use wacore::store::traits::AppStateSyncKey;
+
+        // Exact bytes `bincode` 2.0.1 (config::standard, via serde) produced for these
+        // domain structs before the migration, captured with the real codec. They must
+        // not parse as the protobuf wire format.
+        // AppStateSyncKey { key_data: [0x11;32], fingerprint: [aa bb cc dd], timestamp: 1_700_000_000 }.
+        let legacy_sync_key = {
+            let mut v = vec![0x20u8]; // bincode varint len 32
+            v.extend([0x11u8; 32]);
+            v.extend([0x04, 0xaa, 0xbb, 0xcc, 0xdd, 0xfc, 0x00, 0xe2, 0xa7, 0xca]);
+            v
+        };
+        // HashState { version: 7, hash: [de ad 00..00 be], index_value_map: {} }.
+        let legacy_hash_state = {
+            let mut v = vec![0x07u8]; // version varint 7
+            v.push(0xde);
+            v.push(0xad);
+            v.extend([0u8; 125]);
+            v.push(0xbe);
+            v.push(0x00); // empty map
+            v
+        };
+
+        let store = create_test_store().await;
+        let device_id = store.device_id;
+
+        // Insert the legacy rows directly (bypassing the protobuf setters), exactly as
+        // an upgraded DB would already hold them.
+        let key_id = b"legacy-key".to_vec();
+        {
+            let kid = key_id.clone();
+            let blob = legacy_sync_key.clone();
+            store
+                .with_retry("insert_legacy_key", move || {
+                    let kid = kid.clone();
+                    let blob = blob.clone();
+                    Box::new(move |conn| {
+                        diesel::insert_into(app_state_keys::table)
+                            .values((
+                                app_state_keys::key_id.eq(kid),
+                                app_state_keys::key_data.eq(blob),
+                                app_state_keys::device_id.eq(device_id),
+                            ))
+                            .execute(conn)
+                            .map(|_| ())
+                    })
+                })
+                .await
+                .expect("insert legacy key row");
+        }
+        let name = "critical_block";
+        {
+            let blob = legacy_hash_state.clone();
+            store
+                .with_retry("insert_legacy_version", move || {
+                    let blob = blob.clone();
+                    Box::new(move |conn| {
+                        diesel::insert_into(app_state_versions::table)
+                            .values((
+                                app_state_versions::name.eq(name),
+                                app_state_versions::state_data.eq(blob),
+                                app_state_versions::device_id.eq(device_id),
+                            ))
+                            .execute(conn)
+                            .map(|_| ())
+                    })
+                })
+                .await
+                .expect("insert legacy version row");
+        }
+
+        // Self-heal: a legacy bincode row reads back as absent / default, NOT an error,
+        // and never as a partially-decoded protobuf with garbage material.
+        assert!(
+            store
+                .get_app_state_sync_key_for_device(&key_id, device_id)
+                .await
+                .expect("legacy sync-key blob must not surface a decode error")
+                .is_none(),
+            "a legacy bincode sync-key row must read back as absent"
+        );
+        assert_eq!(
+            store
+                .get_app_state_version_for_device(name, device_id)
+                .await
+                .expect("legacy version blob must not surface a decode error")
+                .version,
+            0,
+            "a legacy bincode version row must reset to default (re-sync from 0)"
+        );
+
+        // And the protobuf setters overwrite the healed rows: a re-shared key and a
+        // fresh version persist and read back correctly afterwards.
+        store
+            .set_app_state_sync_key_for_device(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: vec![7u8; 32],
+                    fingerprint: vec![1, 2, 3],
+                    timestamp: 99,
+                },
+                device_id,
+            )
+            .await
+            .expect("overwrite key");
+        let healed_key = store
+            .get_app_state_sync_key_for_device(&key_id, device_id)
+            .await
+            .expect("get key")
+            .expect("re-shared key must persist over the legacy row");
+        assert_eq!(healed_key.key_data, vec![7u8; 32]);
+        assert_eq!(healed_key.timestamp, 99);
+
+        store
+            .set_app_state_version_for_device(
+                name,
+                HashState {
+                    version: 5,
+                    ..HashState::default()
+                },
+                device_id,
+            )
+            .await
+            .expect("overwrite version");
+        assert_eq!(
+            store
+                .get_app_state_version_for_device(name, device_id)
+                .await
+                .expect("get version")
+                .version,
+            5,
+            "a re-synced version must persist over the legacy row"
+        );
+
+        // Genuine corruption (not a clean bincode blob) is handled the same way.
+        store
+            .with_retry("corrupt_key", || {
+                Box::new(|conn| {
+                    sql_query("UPDATE app_state_keys SET key_data = X'00ff00ff'")
+                        .execute(conn)
+                        .map(|_| ())
+                })
+            })
+            .await
+            .expect("corrupt key blob");
+        assert!(
+            store
+                .get_app_state_sync_key_for_device(&key_id, device_id)
+                .await
+                .expect("corrupt key blob must not error")
+                .is_none(),
+            "an arbitrarily corrupt sync-key blob must also read back as absent"
+        );
+    }
+
+    // Outbound mutations (chat actions) encrypt with the latest sync key, so the
+    // latest-key selection must skip a legacy bincode row even when it sorts higher --
+    // otherwise build_patch would later fail in get_app_state_key with KeyNotFound.
+    #[tokio::test]
+    async fn latest_sync_key_skips_undecodable_rows() {
+        use diesel::{ExpressionMethods, RunQueryDsl};
+        use wacore::store::traits::AppStateSyncKey;
+
+        // Real bincode 2.0.1 bytes for an AppStateSyncKey -- undecodable as protobuf.
+        let legacy_blob = {
+            let mut v = vec![0x20u8];
+            v.extend([0x11u8; 32]);
+            v.extend([0x04, 0xaa, 0xbb, 0xcc, 0xdd, 0xfc, 0x00, 0xe2, 0xa7, 0xca]);
+            v
+        };
+
+        let store = create_test_store().await;
+        let device_id = store.device_id;
+
+        // A valid (protobuf) key at a LOWER key_id...
+        let good_id = b"key-aaa".to_vec();
+        store
+            .set_app_state_sync_key_for_device(
+                &good_id,
+                AppStateSyncKey {
+                    key_data: vec![7u8; 32],
+                    fingerprint: vec![1],
+                    timestamp: 1,
+                },
+                device_id,
+            )
+            .await
+            .unwrap();
+
+        // ...and a stale bincode row at a lexicographically HIGHER key_id, inserted raw.
+        let bad_id = b"key-zzz".to_vec();
+        {
+            let bid = bad_id.clone();
+            let blob = legacy_blob.clone();
+            store
+                .with_retry("insert_stale_key", move || {
+                    let bid = bid.clone();
+                    let blob = blob.clone();
+                    Box::new(move |conn| {
+                        diesel::insert_into(app_state_keys::table)
+                            .values((
+                                app_state_keys::key_id.eq(bid),
+                                app_state_keys::key_data.eq(blob),
+                                app_state_keys::device_id.eq(device_id),
+                            ))
+                            .execute(conn)
+                            .map(|_| ())
+                    })
+                })
+                .await
+                .unwrap();
+        }
+
+        // The higher-but-undecodable row must be skipped for the usable key.
+        assert_eq!(
+            store
+                .get_latest_app_state_sync_key_id_for_device(device_id)
+                .await
+                .unwrap(),
+            Some(good_id),
+            "latest-key selection must skip undecodable bincode rows"
+        );
+    }
+
     #[tokio::test]
     async fn group_metadata_round_trip_sqlite() {
         use wacore::store::traits::ProtocolStore;
@@ -3463,6 +4218,10 @@ mod tests {
             store.get_group_metadata(jid).await.unwrap().as_deref(),
             Some(&b"blob-v2"[..])
         );
+
+        // Delete drops the blob so the next query re-fetches in full.
+        store.delete_group_metadata(jid).await.unwrap();
+        assert!(store.get_group_metadata(jid).await.unwrap().is_none());
     }
 
     #[tokio::test]

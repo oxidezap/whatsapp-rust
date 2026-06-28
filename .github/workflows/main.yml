@@ -11,6 +11,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  PROTOC_VERSION: '3.25.3'
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
 
@@ -22,7 +23,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-04-05
+          toolchain: nightly-2026-06-16
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -33,8 +34,15 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-04-05
+          toolchain: nightly-2026-06-16
           components: clippy
+      # The voip example (built under --all-targets) links cpal, which needs ALSA headers.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache Rust registry
@@ -51,7 +59,14 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-04-05
+          toolchain: nightly-2026-06-16
+      # The voip example (built under --all-targets) links cpal, which needs ALSA headers.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache Rust registry
@@ -61,7 +76,7 @@ jobs:
       - name: Build project
         run: cargo build --workspace --exclude e2e-tests --all-targets --verbose
       - name: Run tests
-        run: cargo test --workspace --exclude e2e-tests --verbose -- --no-capture
+        run: cargo test --workspace --exclude e2e-tests --verbose -- --nocapture
       # waproto serde tests are feature-gated and produce zero tests under the
       # default feature set, so exercise each representation explicitly.
       - name: Test waproto serde (enum repr)
@@ -69,12 +84,55 @@ jobs:
       - name: Test waproto serde (snake_case)
         run: cargo test -p waproto --features serde-snake-case --verbose
 
+  test-all-features:
+    name: Build & Lint (all features)
+    runs-on: ubuntu-latest
+    # Runs on every PR (no voip path filter): the voip-gated code is scattered across the client,
+    # handler, send and stanza layers, so enumerating its files in a path filter kept leaking. The
+    # webrtc/opus tree compiles once and is cached (sccache), so the steady-state cost is the
+    # workspace recompile with voip on, not the deps. The heavy relay e2e tests stay out of `--lib`.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      # The voip example (built under --all-features --all-targets) links cpal,
+      # which needs ALSA on Linux.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache Rust registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+      - name: Build (all features)
+        run: cargo build --workspace --exclude e2e-tests --all-features --all-targets --verbose
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --exclude e2e-tests --all-features --all-targets -- -D warnings
+      # No `cargo test --all-features`: it enables the `danger-skip-*-verify` flags, which disable
+      # security verification (the cert-chain negative test is even cfg'd out), so the suite would
+      # change behavior rather than catch rot; build + clippy cover that. The voip suite runs under
+      # the explicit `voip` feature set instead, never `--all-features`.
+      - name: Test (voip)
+        run: |
+          cargo test -p wacore --features voip --lib
+          cargo test -p whatsapp-rust --features "voip tokio-native tokio-transport" --lib
+
   test-stable:
     name: Test Stable (no-simd)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache Rust registry

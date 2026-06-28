@@ -82,6 +82,7 @@ diesel::table! {
         server_has_prekeys -> Bool,
         server_cert_chain -> Nullable<Binary>,
         login_counter -> Integer,
+        first_unupload_pre_key_id -> Integer,
     }
 }
 
@@ -169,6 +170,17 @@ diesel::table! {
 }
 
 diesel::table! {
+    pending_inbound_messages (chat, sender, id, device_id) {
+        chat -> Text,
+        sender -> Text,
+        id -> Text,
+        message -> Binary,
+        device_id -> Integer,
+        inserted_at -> BigInt,
+    }
+}
+
+diesel::table! {
     msg_secrets (chat, sender, msg_id, device_id) {
         chat -> Text,
         sender -> Text,
@@ -192,6 +204,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     identities,
     lid_pn_mapping,
     msg_secrets,
+    pending_inbound_messages,
     prekeys,
     sender_key_devices,
     sender_keys,

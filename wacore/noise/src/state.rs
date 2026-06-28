@@ -2,8 +2,7 @@ use crate::error::{NoiseError, Result};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use wacore_libsignal::crypto::{
-    GcmInPlaceBuffer, aes_256_gcm_decrypt, aes_256_gcm_decrypt_in_place, aes_256_gcm_encrypt,
-    aes_256_gcm_encrypt_in_place,
+    GcmInPlaceBuffer, TransportAead, aes_256_gcm_decrypt, aes_256_gcm_encrypt, transport_aead,
 };
 
 /// Buffer kinds accepted by [`NoiseCipher::decrypt_in_place_with_counter`].
@@ -25,13 +24,19 @@ const TAG_LEN: usize = 16;
 /// A cipher wrapper that encapsulates AES-256-GCM encryption/decryption
 /// with counter-based IV generation.
 pub struct NoiseCipher {
-    key: [u8; 32],
+    /// Connection-lifetime AEAD from the provider hook: the transport key is
+    /// fixed, so the default RustCrypto path precomputes the AES key schedule
+    /// and the GHASH subkey once instead of on every frame; custom providers
+    /// keep observing transport crypto through the trait default.
+    aead: Box<dyn TransportAead>,
 }
 
 impl NoiseCipher {
     /// Creates a new cipher from a 32-byte key.
     pub fn new(key: &[u8; 32]) -> Result<Self> {
-        Ok(Self { key: *key })
+        Ok(Self {
+            aead: transport_aead(key).map_err(NoiseError::Encrypt)?,
+        })
     }
 
     /// Encrypts plaintext using the specified counter for IV generation.
@@ -39,7 +44,9 @@ impl NoiseCipher {
     pub fn encrypt_with_counter(&self, counter: u32, plaintext: &[u8]) -> Result<Vec<u8>> {
         let iv = generate_iv(counter);
         let mut out = Vec::with_capacity(plaintext.len() + TAG_LEN);
-        aes_256_gcm_encrypt(&self.key, &iv, b"", plaintext, &mut out)
+        out.extend_from_slice(plaintext);
+        self.aead
+            .encrypt_in_place(&iv, b"", &mut out)
             .map_err(NoiseError::Encrypt)?;
         Ok(out)
     }
@@ -54,7 +61,9 @@ impl NoiseCipher {
         buffer: &mut B,
     ) -> Result<()> {
         let iv = generate_iv(counter);
-        aes_256_gcm_encrypt_in_place(&self.key, &iv, b"", buffer).map_err(NoiseError::Encrypt)
+        self.aead
+            .encrypt_in_place(&iv, b"", buffer)
+            .map_err(NoiseError::Encrypt)
     }
 
     /// Decrypts ciphertext (with 16-byte tag appended) in-place within the
@@ -67,7 +76,9 @@ impl NoiseCipher {
         buffer: &mut B,
     ) -> Result<()> {
         let iv = generate_iv(counter);
-        aes_256_gcm_decrypt_in_place(&self.key, &iv, b"", buffer).map_err(NoiseError::Decrypt)
+        self.aead
+            .decrypt_in_place(&iv, b"", buffer)
+            .map_err(NoiseError::Decrypt)
     }
 }
 

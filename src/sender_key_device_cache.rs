@@ -1,7 +1,7 @@
 //! In-memory cache for per-group sender key device tracking.
 //! Avoids DB round-trips on group sends after the first.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::Cache;
@@ -13,26 +13,20 @@ use wacore_binary::Jid;
 pub(crate) struct SenderKeyDeviceMap {
     /// user → (device_id → has_key)
     devices: HashMap<Arc<str>, HashMap<u16, bool>>,
-    /// Users with at least one `has_key=false` device.
-    forgotten_users: HashSet<Arc<str>>,
 }
 
 impl SenderKeyDeviceMap {
     pub fn from_db_rows(rows: &[(String, bool)]) -> Self {
         let mut devices: HashMap<Arc<str>, HashMap<u16, bool>> = HashMap::with_capacity(rows.len());
-        let mut forgotten_users = HashSet::with_capacity(rows.len() / 4);
 
         for (jid_str, has_key) in rows {
             match jid_str.parse::<Jid>() {
                 Ok(jid) => {
                     let user: Arc<str> = Arc::from(jid.user.as_str());
                     devices
-                        .entry(user.clone())
+                        .entry(user)
                         .or_default()
                         .insert(jid.device, *has_key);
-                    if !*has_key {
-                        forgotten_users.insert(user);
-                    }
                 }
                 Err(e) => {
                     log::warn!("Skipping malformed device JID '{}': {}", jid_str, e);
@@ -40,10 +34,7 @@ impl SenderKeyDeviceMap {
             }
         }
 
-        Self {
-            devices,
-            forgotten_users,
-        }
+        Self { devices }
     }
 
     #[cfg(test)]
@@ -51,12 +42,23 @@ impl SenderKeyDeviceMap {
         self.devices.is_empty()
     }
 
+    /// Single (user, device) lookup. Retained for tests that cross-check the
+    /// warm gate; production resolves both lookups via `device_and_primary_warm`.
+    #[cfg(test)]
     pub fn device_has_key(&self, user: &str, device: u16) -> Option<bool> {
         self.devices.get(user)?.get(&device).copied()
     }
 
-    pub fn is_user_forgotten(&self, user: &str) -> bool {
-        self.forgotten_users.contains(user)
+    /// WA Web warm gate (ParticipantStore.js): a device is warm only when it AND
+    /// its primary (device 0) hold the key. Resolves the per-user inner map once
+    /// so the two device lookups share a single outer (user-string) hash instead
+    /// of re-hashing the user per call. A missing entry counts as cold (`?? false`).
+    pub fn device_and_primary_warm(&self, user: &str, device: u16) -> bool {
+        let Some(by_device) = self.devices.get(user) else {
+            return false;
+        };
+        by_device.get(&device).copied().unwrap_or(false)
+            && by_device.get(&0).copied().unwrap_or(false)
     }
 }
 
@@ -88,9 +90,14 @@ impl SenderKeyDeviceCache {
     /// after a device is removed: a future re-add of the same device_id would
     /// otherwise hit a stale `has_key=true` entry and skip SKDM redistribution.
     pub(crate) async fn invalidate_entries_for_device(&self, user: &str, device_id: u16) {
+        // Reliable awaited snapshot, not the best-effort `iter()`: a skipped
+        // entry here would leave a stale `has_key=true` and drop a later SKDM
+        // fanout for a re-added device.
         let to_drop: Vec<String> = self
             .inner
-            .iter()
+            .snapshot_entries()
+            .await
+            .into_iter()
             .filter_map(|(group_jid, map)| {
                 map.devices
                     .get(user)

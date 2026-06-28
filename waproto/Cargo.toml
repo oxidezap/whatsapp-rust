@@ -7,12 +7,17 @@ license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
 description = "Protocol Buffers definitions for WhatsApp"
 
+# `serde` is referenced only by derives injected into the generated code by
+# `build.rs` (`#[derive(serde::Serialize)]`), so static analysers miss it.
+[package.metadata.cargo-machete]
+ignored = ["serde"]
+
 [features]
 default = []
 serde-deserialize = []
 serde-snake-case = ["serde-deserialize"]
-# Enums (de)serialize as their numeric repr (prost parity) instead of the
-# variant name — what the JS bridge / camelCase serializer expects.
+# Enums (de)serialize as their numeric repr instead of the variant name — what
+# the JS bridge / camelCase serializer expects.
 serde-enum-repr = ["dep:serde_repr"]
 
 [dependencies]
@@ -25,7 +30,14 @@ serde_repr = { version = "0.1", optional = true }
 serde_json = "1"
 
 [build-dependencies]
+# buffa-build does the codegen; buffa-descriptor decodes+re-encodes the committed
+# camelCase descriptor so build.rs can snake_case field names for the Rust API
+# (the proto file stays in upstream/whatspec camelCase form); heck does the case
+# conversion; sha2 powers the descriptor-freshness guard.
+buffa = { workspace = true }
 buffa-build = { workspace = true }
+buffa-descriptor = { workspace = true }
+heck = { workspace = true }
 sha2 = { workspace = true }
 
 [lints]

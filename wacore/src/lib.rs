@@ -20,6 +20,8 @@ pub mod handshake;
 pub mod history_sync;
 pub mod ib;
 pub use wacore_libsignal as libsignal;
+pub mod comment;
+pub mod event;
 pub mod media_retry;
 pub mod message_edit;
 pub mod message_processing;
@@ -31,6 +33,7 @@ pub mod pair_code;
 pub mod poll;
 pub mod prekeys;
 pub mod proto_helpers;
+pub mod reaction;
 pub mod reporting_token;
 pub mod request;
 pub mod runtime;
@@ -42,10 +45,13 @@ pub mod sticker_pack;
 
 pub mod store;
 pub mod sync_marker;
+pub mod telemetry;
 pub mod time;
 pub mod types;
 pub mod upload;
 pub mod usync;
+#[cfg(feature = "voip")]
+pub mod voip;
 pub mod webp;
 
 pub mod version;

@@ -5,9 +5,27 @@
 
 use anyhow::Result;
 use log::{debug, info, warn};
+use std::sync::Arc;
 use wacore_binary::Jid;
 
 use super::Client;
+
+/// Per-group device-list snapshot for `resolve_group_devices_memoized`.
+/// Valid while the producing `GroupInfo` Arc is still the cached one AND the
+/// device-topology generation is unchanged.
+pub(crate) struct GroupDevicesMemo {
+    /// Weak identity of the producing GroupInfo: pointer equality is ABA-safe
+    /// because the Weak keeps the allocation alive, while the heavy data
+    /// (participants, maps) is freed as soon as the metadata cache drops its
+    /// Arc — the memo retains a struct-sized header, not the whole GroupInfo.
+    pub(crate) group_info: std::sync::Weak<wacore::client::context::GroupInfo>,
+    pub(crate) generation: u64,
+    /// Member identifiers in BOTH namespaces (participant users, their mapped
+    /// counterparts, resolved device users): the scoped-invalidation check
+    /// tests the topology log's touched users against this set.
+    pub(crate) members: Arc<std::collections::HashSet<wacore_binary::CompactString>>,
+    pub(crate) devices: Arc<wacore::send::ResolvedGroupDevices>,
+}
 
 /// Result of resolving a user identifier to lookup keys.
 /// This makes the LID/PN relationship explicit instead of using magic indices.
@@ -60,6 +78,162 @@ impl Client {
             .to_string()
     }
 
+    /// Resolve a group's full (LID-converted) device list, memoized per group.
+    ///
+    /// The input set is a pure function of `group_info` (participants + LID
+    /// normalization), so the memo is valid exactly while BOTH hold:
+    /// the same `GroupInfo` snapshot (`Arc` identity — any metadata refresh or
+    /// membership change produces a new `Arc`) and an unchanged
+    /// `device_topology_generation` (any registry/mapping write bumps it).
+    /// On a warm repeat send this turns the per-member cache fan-out
+    /// (2 lookups per participant) into one memo hit.
+    pub(crate) async fn resolve_group_devices_memoized(
+        &self,
+        group: &Jid,
+        group_info: &Arc<wacore::client::context::GroupInfo>,
+        own_sending_jid: &Jid,
+    ) -> Result<Arc<wacore::send::ResolvedGroupDevices>, anyhow::Error> {
+        // Store-backed registry or mapping caches can be written by OTHER
+        // processes (e.g. shared Redis across pods), which this process's
+        // topology tracker cannot observe; the memo's freshness contract
+        // doesn't hold there, so it is disabled and every send resolves.
+        if !self.group_devices_memo_enabled {
+            return Ok(Arc::new(wacore::send::ResolvedGroupDevices::new(
+                self.resolve_group_devices_uncached(group_info, own_sending_jid)
+                    .await?,
+            )));
+        }
+        // Load the generation BEFORE resolving (do NOT move this after
+        // get_user_devices): a write racing the resolve bumps it afterwards,
+        // so the memo we store is already stale by its own stamp and the next
+        // read revalidates. Loading after would stamp racing writes as seen
+        // and serve their effects stale.
+        let generation = self.device_topology.current();
+
+        if let Some(memo) = self.group_devices_memo.get(group).await
+            && std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info))
+        {
+            if memo.generation == generation {
+                // Refcount bump: the snapshot is immutable, so a hit shares
+                // it instead of cloning the device Vec.
+                return Ok(Arc::clone(&memo.devices));
+            }
+            // Stale stamp: when every change since it touched only users
+            // outside this group, re-stamp instead of recomputing, so write
+            // storms on unrelated groups don't tank the hit rate. Any doubt
+            // (log overflow, member touched) falls through to the recompute.
+            if self
+                .device_topology
+                .unchanged_for(memo.generation, |user| memo.members.contains(user))
+            {
+                self.group_devices_memo
+                    .insert(
+                        group.clone(),
+                        Arc::new(GroupDevicesMemo {
+                            group_info: memo.group_info.clone(),
+                            generation,
+                            members: Arc::clone(&memo.members),
+                            devices: Arc::clone(&memo.devices),
+                        }),
+                    )
+                    .await;
+                return Ok(Arc::clone(&memo.devices));
+            }
+        }
+
+        let devices = self
+            .resolve_group_devices_uncached(group_info, own_sending_jid)
+            .await?;
+
+        // Member identifiers in both namespaces, so the scoped-invalidation
+        // check can match however a write was keyed: writes record every
+        // resolved lookup alias (see DeviceRegistryCache::insert callers), and
+        // this set carries each member's group-facing identity (participant
+        // user + mapped counterpart) plus the namespace the resolved device
+        // JIDs ended up in.
+        let mut members = std::collections::HashSet::with_capacity(
+            group_info.participants.len() * 2 + devices.len() + 2,
+        );
+        for participant in &group_info.participants {
+            members.insert(participant.user.clone());
+            if participant.is_lid()
+                && let Some(pn) = group_info.phone_jid_for_lid_user(&participant.user)
+            {
+                members.insert(pn.user.clone());
+            } else if let Some(lid) = group_info.lid_user_for_phone_user(&participant.user) {
+                members.insert(lid.clone());
+            }
+        }
+        members.insert(own_sending_jid.user.clone());
+        for device in &devices {
+            members.insert(device.user.clone());
+        }
+
+        let devices = Arc::new(wacore::send::ResolvedGroupDevices::new(devices));
+        self.group_devices_memo
+            .insert(
+                group.clone(),
+                Arc::new(GroupDevicesMemo {
+                    group_info: Arc::downgrade(group_info),
+                    generation,
+                    members: Arc::new(members),
+                    devices: Arc::clone(&devices),
+                }),
+            )
+            .await;
+        Ok(devices)
+    }
+
+    /// The memo's recompute body: derive the resolve set from `group_info`
+    /// (participants + LID normalization, appending self when the server
+    /// snapshot omitted it — mirroring `ensure_self_in_group`, so keying the
+    /// memo off the pre-ensure Arc stays equivalent) and resolve it.
+    async fn resolve_group_devices_uncached(
+        &self,
+        group_info: &Arc<wacore::client::context::GroupInfo>,
+        own_sending_jid: &Jid,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
+        let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
+        let mut jids_to_resolve: Vec<Jid> = group_info
+            .participants
+            .iter()
+            .map(|jid| {
+                if is_lid_mode
+                    && jid.is_lid()
+                    && let Some(pn) = group_info.phone_jid_for_lid_user(&jid.user)
+                {
+                    return pn.to_non_ad();
+                }
+                jid.to_non_ad()
+            })
+            .collect();
+        if !group_info
+            .participants
+            .iter()
+            .any(|participant| wacore_binary::JidExt::is_same_user_as(participant, own_sending_jid))
+        {
+            let own = if is_lid_mode
+                && own_sending_jid.is_lid()
+                && let Some(pn) = group_info.phone_jid_for_lid_user(&own_sending_jid.user)
+            {
+                pn.to_non_ad()
+            } else {
+                own_sending_jid.to_non_ad()
+            };
+            jids_to_resolve.push(own);
+        }
+
+        let mut devices = self.get_user_devices(&jids_to_resolve).await?;
+        if is_lid_mode {
+            // WA Web expects LID addressing in SKDM <to> nodes for LID groups.
+            devices = devices
+                .into_iter()
+                .map(|d| group_info.phone_device_jid_into_lid(d))
+                .collect();
+        }
+        Ok(devices)
+    }
+
     /// Resolve a user identifier to its lookup keys with type information.
     ///
     /// Returns a `UserLookupKeys` enum that explicitly represents:
@@ -89,10 +263,40 @@ impl Client {
         UserLookupKeys::Unknown { user: user.into() }
     }
 
-    /// Get all possible lookup keys for a user (for bidirectional lookup).
-    /// Returns keys in order of preference: [canonical_key, fallback_key].
-    ///
-    /// Note: Prefer `resolve_lookup_keys` when you need type information.
+    /// Server-aware variant of `resolve_lookup_keys` for callers holding a
+    /// full `Jid`: a LID user can only key the lid->pn direction and a PN
+    /// user only pn->lid, so the known namespace removes the blind second
+    /// probe (one `lid_pn_cache` lookup per member instead of two, on every
+    /// group send). Other namespaces keep the two-probe fallback.
+    async fn resolve_lookup_keys_for_jid(&self, jid: &Jid) -> UserLookupKeys {
+        if jid.server == wacore_binary::Server::Lid {
+            if let Some(pn) = self.lid_pn_cache.get_phone_number(&jid.user).await {
+                return UserLookupKeys::LidWithPn {
+                    lid: jid.user.as_str().into(),
+                    pn: pn.into(),
+                };
+            }
+            return UserLookupKeys::Unknown {
+                user: jid.user.as_str().into(),
+            };
+        }
+        if jid.server == wacore_binary::Server::Pn {
+            if let Some(lid) = self.lid_pn_cache.get_current_lid(&jid.user).await {
+                return UserLookupKeys::PnWithLid {
+                    lid,
+                    pn: jid.user.as_str().into(),
+                };
+            }
+            return UserLookupKeys::Unknown {
+                user: jid.user.as_str().into(),
+            };
+        }
+        self.resolve_lookup_keys(&jid.user).await
+    }
+
+    /// Owned-key variant of `resolve_lookup_keys`. Test-only: production callers
+    /// use the borrowed `resolve_lookup_keys(..).all_keys()` to avoid the churn.
+    #[cfg(test)]
     pub(crate) async fn get_lookup_keys(&self, user: &str) -> Vec<String> {
         self.resolve_lookup_keys(user)
             .await
@@ -115,24 +319,26 @@ impl Client {
             return true;
         }
 
-        let lookup_keys = self.get_lookup_keys(user).await;
+        // Borrowed `&str` keys (like get_devices_from_registry), bound once so both
+        // loops share one Vec<&str>: avoids the per-message get_lookup_keys churn.
+        let lookup = self.resolve_lookup_keys(user).await;
+        let keys = lookup.all_keys();
 
-        for key in &lookup_keys {
+        for &key in &keys {
             if let Some(record) = self.device_registry_cache.get(key).await {
                 return record.devices.iter().any(|d| d.device_id == device_id);
             }
         }
 
         let backend = self.persistence_manager.backend();
-        for key in &lookup_keys {
+        for &key in &keys {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
                     let has_device = record.devices.iter().any(|d| d.device_id == device_id);
-                    // Cache under the record's actual user key (the key it was stored under
-                    // in the backend), not lookup_keys[0] which is our guessed canonical key.
-                    // This ensures consistency between the in-memory cache and the backend.
+                    // Cache under the record's actual stored key, not our guessed one,
+                    // to keep the cache and backend consistent.
                     self.device_registry_cache
-                        .insert(record.user.clone(), record)
+                        .promote(record.user.clone(), Arc::new(record))
                         .await;
                     return has_device;
                 }
@@ -148,6 +354,15 @@ impl Client {
 
     /// Update the device list for a user.
     /// Stores under LID when mapping is known, otherwise under PN.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.update_device_list",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn update_device_list(
         &self,
         mut record: wacore::store::traits::DeviceListRecord,
@@ -163,8 +378,18 @@ impl Client {
         let record_for_cache = record.clone();
 
         // Use canonical_key directly as cache key (no extra clone)
+        // Record every lookup alias, not just canonical+original: a LID-keyed
+        // update must also touch the mapped PN, or a PN-addressed group's memo
+        // (whose member set only knows the PN side) would re-stamp stale.
         self.device_registry_cache
-            .insert(canonical_key.clone(), record_for_cache)
+            .insert(
+                canonical_key.clone(),
+                Arc::new(record_for_cache),
+                lookup
+                    .all_keys()
+                    .into_iter()
+                    .chain(std::iter::once(original_user.as_str())),
+            )
             .await;
 
         let backend = self.persistence_manager.backend();
@@ -197,10 +422,11 @@ impl Client {
     }
 
     /// Batched variant of [`update_device_list`]. Cache is populated
-    /// synchronously per record (cheap moka inserts); the backend write
+    /// synchronously per record (cheap in-process inserts); the backend write
     /// collapses into a single transaction. Used by usync after fetching
     /// device lists for many users at once, where the per-row commit
     /// dominated wall-clock time on large groups.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.update_device_lists", level = "debug", skip_all, fields(count = records.len()), err(Debug)))]
     pub(crate) async fn update_device_lists(
         &self,
         records: Vec<wacore::store::traits::DeviceListRecord>,
@@ -221,8 +447,16 @@ impl Client {
             record.user.clone_from(&canonical_key);
 
             let record_for_cache = record.clone();
+            // Same alias rule as update_device_list: record every lookup key.
             self.device_registry_cache
-                .insert(canonical_key.clone(), record_for_cache)
+                .insert(
+                    canonical_key.clone(),
+                    Arc::new(record_for_cache),
+                    lookup
+                        .all_keys()
+                        .into_iter()
+                        .chain(std::iter::once(original_user.as_str())),
+                )
                 .await;
 
             if canonical_key != original_user {
@@ -255,10 +489,41 @@ impl Client {
         Ok(())
     }
 
+    /// Spawn the local identity-change reaction off the current path so it runs
+    /// after any held session lock is released (the reaction acquires its own
+    /// locks and must not deadlock against an in-flight decrypt/encrypt batch).
+    ///
+    /// Triggered from both the inbound decrypt path and the outbound
+    /// session-establishment paths when `save_identity` reports
+    /// [`IdentityChange::ReplacedExisting`](wacore::libsignal::protocol::IdentityChange),
+    /// mirroring WA Web `saveIdentity` -> `handleNewIdentity`. Gating
+    /// (primary-device, skip-self) lives in [`handle_local_identity_change`].
+    ///
+    /// [`handle_local_identity_change`]: crate::handlers::notification::handle_local_identity_change
+    pub(crate) fn react_to_local_identity_change(&self, sender: &Jid) {
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let sender = sender.clone();
+        self.runtime
+            .spawn(Box::pin(async move {
+                crate::handlers::notification::handle_local_identity_change(&client, sender).await;
+            }))
+            .detach();
+    }
+
     /// Invalidate cached device data for a specific user.
     ///
     /// Removes all device registry cache entries (all LID/PN aliases) so the
     /// next lookup falls through to the database or network.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.invalidate_device_cache",
+            level = "debug",
+            skip_all
+        )
+    )]
     pub(crate) async fn invalidate_device_cache(&self, user: &str) {
         let lookup = self.resolve_lookup_keys(user).await;
 
@@ -269,6 +534,11 @@ impl Client {
             if let Err(e) = self.persistence_manager.backend().delete_devices(key).await {
                 warn!("Failed to delete device registry from DB for {key}: {e}");
             }
+            // Invalidate again after the delete: a concurrent reader that read
+            // the doomed DB row can promote() it back between the first
+            // invalidate and the delete commit (same guard as the canonical
+            // flip path in update_device_list).
+            self.device_registry_cache.invalidate(key).await;
         }
 
         debug!("Invalidated device cache for user: {} ({:?})", user, lookup);
@@ -287,6 +557,10 @@ impl Client {
     /// New devices need no explicit cache invalidation: `resolve_skdm_targets`
     /// queries the registry on each send and `device_has_key()` returns `None`
     /// for unseen device IDs, dropping them into `needs_skdm` automatically.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.session.patch_device_add", level = "debug", skip_all)
+    )]
     pub(crate) async fn patch_device_add(
         &self,
         user: &str,
@@ -342,6 +616,23 @@ impl Client {
             self.append_device_if_new(&mut record, device_id, device.key_index);
         }
 
+        // WA Web `AdvDeviceNotificationApi.handleDeviceAddNotification` re-adds the
+        // primary (device 0) to the rebuilt list unconditionally, so a raw_id
+        // mismatch (which clears the list) never drops it. `filter_devices_by_key_index`
+        // only keeps device 0 when it is already in the input, so after a clear the
+        // primary would otherwise be lost, leaving a record with no device 0 (or an
+        // empty list) that suppresses the usync re-fetch forever.
+        //
+        // The primary's key_index is never read (`filter_devices_by_key_index` keeps
+        // device 0 regardless and `is_key_index_valid` is not applied to it), so store
+        // `None` to match how device 0 is recorded everywhere else.
+        if !record.devices.iter().any(|d| d.device_id == 0) {
+            record.devices.push(wacore::store::traits::DeviceInfo {
+                device_id: 0,
+                key_index: None,
+            });
+        }
+
         // New devices are picked up automatically by `resolve_skdm_targets`:
         // unknown device → `device_has_key()` returns `None` → falls into
         // `needs_skdm`. No global cache invalidation needed.
@@ -391,6 +682,15 @@ impl Client {
     /// Matches WA Web's `clearDeviceRecord()` in `IdentityUpdateDeviceTableApi`:
     /// - Deletes Signal sessions for non-primary devices (stale identity)
     /// - Invalidates sender key device cache so SKDM will be redistributed
+    ///
+    /// The companion-device session wipe is intentionally not per-device locked
+    /// (matches WA Web's single-threaded model). A concurrent encrypt to one of
+    /// those companions can re-store a session right after the wipe, but that is
+    /// self-healing: the next send re-establishes it via `process_prekey_bundle`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.session.clear_device_record", level = "debug", skip_all)
+    )]
     pub(crate) async fn clear_device_record(
         &self,
         user: &str,
@@ -422,7 +722,16 @@ impl Client {
     /// (`UpdateDeviceTableApi`): deletes Signal sessions for the device,
     /// then invalidates the sender key device cache so SKDM will be
     /// redistributed on the next group send.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.patch_device_remove", level = "debug", skip_all, fields(device_id = device_id)))]
     pub(crate) async fn patch_device_remove(&self, user: &str, device_id: u32) {
+        // WA Web's remove path re-adds the primary unconditionally, mirroring its
+        // add path: device 0 is never dropped. Without this guard a remove for the
+        // primary would both delete its sender-key rows and persist a record with no
+        // device 0, which then suppresses the usync re-fetch forever (the symmetric
+        // failure to the add path fixed above).
+        if device_id == 0 {
+            return;
+        }
         if let Some(mut record) = self.load_device_record(user).await {
             let before = record.devices.len();
             record.devices.retain(|d| d.device_id != device_id);
@@ -477,6 +786,7 @@ impl Client {
     /// Cache eviction runs only after the DB delete succeeds; on failure the
     /// error is propagated so the caller can leave both DB and cache in their
     /// pre-call state rather than half-applying the cleanup.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.delete_sender_key_rows", level = "debug", skip_all, fields(device_id = device_id), err(Debug)))]
     async fn delete_sender_key_rows_for_device(
         &self,
         user: &str,
@@ -506,6 +816,10 @@ impl Client {
     }
 
     /// Update key_index for a device in the registry.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.session.patch_device_update", level = "debug", skip_all)
+    )]
     pub(crate) async fn patch_device_update(
         &self,
         user: &str,
@@ -532,7 +846,8 @@ impl Client {
 
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
-                return Some(record);
+                // Cold load-modify-persist path: callers mutate the owned record.
+                return Some((*record).clone());
             }
         }
 
@@ -541,7 +856,7 @@ impl Client {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
                     self.device_registry_cache
-                        .insert(record.user.clone(), record.clone())
+                        .promote(record.user.clone(), Arc::new(record.clone()))
                         .await;
                     return Some(record);
                 }
@@ -562,17 +877,26 @@ impl Client {
     ///
     /// This follows the same 2-tier pattern as [`has_device`]: registry cache first,
     /// then the backend database.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.get_devices_from_registry", level = "trace", skip_all, fields(peer = %jid.observe())))]
     pub(crate) async fn get_devices_from_registry(&self, jid: &Jid) -> Option<Vec<Jid>> {
-        // Use the borrowed `&str` keys directly: both the moka cache and the
+        // Use the borrowed `&str` keys directly: both the in-process cache and the
         // backend take `&str`, so going through `get_lookup_keys` (which re-owns
         // the already-cloned keys into a `Vec<String>`) just churns per member on
         // every group send. `lookup` owns the key Strings for the duration here.
-        let lookup = self.resolve_lookup_keys(&jid.user).await;
+        let lookup = self.resolve_lookup_keys_for_jid(jid).await;
 
-        // L1: device_registry_cache (moka, fast)
+        // L1: device_registry_cache (in-process, fast)
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
-                return Some(Self::reconstruct_device_jids(jid, &record));
+                let devices = Self::reconstruct_device_jids(jid, &record);
+                // An empty record is never a valid device set — WA Web always keeps
+                // the primary (device 0) — so read it as a miss instead of `Some([])`.
+                // The 1:1 send path reads this directly and only warms from the network
+                // on `None`; returning `Some([])` would shadow that warmup and the
+                // bare-JID fallback, leaving a corrupted empty row unhealed.
+                if !devices.is_empty() {
+                    return Some(devices);
+                }
             }
         }
 
@@ -582,8 +906,12 @@ impl Client {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
                     let devices = Self::reconstruct_device_jids(jid, &record);
+                    // Same invariant as L1: an empty row is corruption, treat as a miss.
+                    if devices.is_empty() {
+                        continue;
+                    }
                     self.device_registry_cache
-                        .insert(record.user.clone(), record)
+                        .promote(record.user.clone(), Arc::new(record))
                         .await;
                     return Some(devices);
                 }
@@ -638,6 +966,14 @@ impl Client {
     }
 
     /// Migrate device registry entries from PN key to LID key.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.migrate_device_registry",
+            level = "debug",
+            skip_all
+        )
+    )]
     pub(crate) async fn migrate_device_registry_on_lid_discovery(&self, pn: &str, lid: &str) {
         let backend = self.persistence_manager.backend();
 
@@ -653,12 +989,16 @@ impl Client {
                 record.user = lid.to_string();
 
                 if let Err(e) = backend.update_device_list(record.clone()).await {
+                    // The backend row may have changed even on error, so the
+                    // change is recorded before the early return; the success
+                    // path records once via the fused cache insert below.
+                    self.device_topology.record([pn, lid]);
                     warn!("Failed to migrate device registry to LID: {}", e);
                     return;
                 }
 
                 self.device_registry_cache
-                    .insert(lid.to_string(), record)
+                    .insert(lid.to_string(), Arc::new(record), [lid, pn])
                     .await;
 
                 // Drop the PN-keyed row in both cache and DB. Invalidate
@@ -713,8 +1053,462 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert(user.into(), record)
+            .raw_insert_for_tests(user.into(), Arc::new(record))
             .await;
+    }
+
+    /// The server-aware probe must resolve the same canonical record as the
+    /// blind two-probe for both namespaces: a LID jid via its lid->pn mapping
+    /// and a PN jid via pn->lid, plus the unmapped-PN fallback.
+    #[tokio::test]
+    async fn server_aware_probe_resolves_both_namespaces() {
+        let client = create_test_client().await;
+        let pn = "5511999990000";
+        let lid = "100000000000001";
+        client
+            .add_lid_pn_mapping(lid, pn, crate::lid_pn_cache::LearningSource::Usync)
+            .await
+            .expect("mapping should persist");
+        setup_device_record(&client, pn, &[0, 7]).await;
+
+        let via_pn = client
+            .get_devices_from_registry(&Jid::pn(pn))
+            .await
+            .expect("PN jid must resolve via pn->lid probe");
+        assert_eq!(via_pn.len(), 2);
+        let via_lid = client
+            .get_devices_from_registry(&Jid::lid(lid))
+            .await
+            .expect("LID jid must resolve via lid->pn probe");
+        assert_eq!(via_lid.len(), 2);
+
+        // Unmapped PN still resolves through its own key.
+        let bare = "5511888880000";
+        setup_device_record(&client, bare, &[0]).await;
+        assert!(
+            client
+                .get_devices_from_registry(&Jid::pn(bare))
+                .await
+                .is_some(),
+            "unmapped PN must resolve via its own record"
+        );
+    }
+
+    /// Locks the three validity gates of the group-devices memo: a repeat
+    /// resolve with the same GroupInfo Arc + generation is a memo hit (proved
+    /// by serving a raw cache change STALE), any topology bump recomputes,
+    /// and a refreshed GroupInfo (new Arc, same content) recomputes.
+    #[tokio::test]
+    async fn group_devices_memo_hits_and_invalidates() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000042@g.us".parse().expect("group jid");
+        let user_a = "5511999990001";
+        let user_b = "5511999990002";
+        setup_device_record(&client, user_a, &[0, 5]).await;
+        setup_device_record(&client, user_b, &[0]).await;
+
+        let group_info = Arc::new(GroupInfo::new(
+            vec![Jid::pn(user_a), Jid::pn(user_b)],
+            AddressingMode::Pn,
+        ));
+
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve should succeed");
+        assert_eq!(first.devices().len(), 3, "0+5 for A, 0 for B");
+
+        // Raw cache write WITHOUT a topology bump: the memo must keep serving
+        // the snapshot (this is what proves the repeat call was a hit and not
+        // a silent recompute).
+        setup_device_record(&client, user_a, &[0]).await;
+        let stale = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve should succeed");
+        assert!(
+            std::sync::Arc::ptr_eq(&stale, &first),
+            "same Arc + same generation must be a memo hit"
+        );
+
+        // A topology change touching a MEMBER invalidates and the recompute
+        // sees the new record.
+        client.device_topology.record([user_a]);
+        let fresh = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve should succeed");
+        assert_eq!(
+            fresh.devices().len(),
+            2,
+            "post-bump resolve must see the raw change"
+        );
+
+        // A refreshed GroupInfo (new Arc, identical content) must recompute
+        // even with an unchanged generation.
+        setup_device_record(&client, user_b, &[0, 9]).await;
+        let refreshed_info = Arc::new(GroupInfo::new(
+            vec![Jid::pn(user_a), Jid::pn(user_b)],
+            AddressingMode::Pn,
+        ));
+        let after_refresh = client
+            .resolve_group_devices_memoized(
+                &group,
+                &refreshed_info,
+                &refreshed_info.participants[0],
+            )
+            .await
+            .expect("resolve should succeed");
+        assert_eq!(
+            after_refresh.devices().len(),
+            3,
+            "a new GroupInfo Arc must invalidate the memo by identity"
+        );
+    }
+
+    /// Locks the scoped invalidation: changes touching only OTHER groups'
+    /// users re-stamp the memo (still a hit), a member's change recomputes,
+    /// and the doubt fallbacks (global event, log overflow) recompute.
+    #[tokio::test]
+    async fn group_devices_memo_scoped_invalidation() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000077@g.us".parse().expect("group jid");
+        let user_a = "5511999990011";
+        setup_device_record(&client, user_a, &[0, 5]).await;
+        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(user_a)], AddressingMode::Pn));
+
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(first.devices().len(), 2);
+
+        // Raw change (not recorded) + changes touching only a NON-member:
+        // the memo must re-stamp and keep serving the snapshot.
+        setup_device_record(&client, user_a, &[0]).await;
+        client.device_topology.record(["5511000000001"]);
+        client.device_topology.record(["5511000000002"]);
+        let stale = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert!(
+            std::sync::Arc::ptr_eq(&stale, &first),
+            "non-member changes must re-stamp, not recompute"
+        );
+
+        // A member's change recomputes and sees the raw change.
+        client.device_topology.record([user_a]);
+        let fresh = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(fresh.devices().len(), 1, "member change must recompute");
+
+        // Global events (mapping cache clear, warm-up) poison the fast path.
+        setup_device_record(&client, user_a, &[0, 5, 9]).await;
+        client.device_topology.record_global();
+        let after_global = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(
+            after_global.devices().len(),
+            3,
+            "global event must recompute"
+        );
+
+        // Log overflow past the memo's stamp: cannot prove cleanliness,
+        // must recompute.
+        setup_device_record(&client, user_a, &[0]).await;
+        for _ in 0..300 {
+            client.device_topology.record(["5511000000003"]);
+        }
+        let after_overflow = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(
+            after_overflow.devices().len(),
+            1,
+            "log overflow must recompute"
+        );
+    }
+
+    /// A mapping add for a member (logged under BOTH its LID and PN keys)
+    /// must invalidate even when the group only knows one namespace.
+    #[tokio::test]
+    async fn group_devices_memo_invalidated_by_member_mapping_change() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000078@g.us".parse().expect("group jid");
+        let pn = "5511999990012";
+        setup_device_record(&client, pn, &[0]).await;
+        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(pn)], AddressingMode::Pn));
+
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(first.devices().len(), 1);
+
+        // Raw change, then learn a LID mapping for the member: the add logs
+        // (lid, pn) and the memo's member set carries the PN, so it must
+        // recompute even though the group never saw the LID.
+        setup_device_record(&client, pn, &[0, 7]).await;
+        client
+            .add_lid_pn_mapping(
+                "100000000000077",
+                pn,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .expect("mapping");
+        let fresh = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(
+            fresh.devices().len(),
+            2,
+            "a member's mapping change must invalidate the memo"
+        );
+    }
+
+    /// Review fix: a server group snapshot that omits self used to be
+    /// rebuilt by ensure_self_in_group on every send (fresh Arc), making the
+    /// memo permanently miss. Keying off the pre-ensure Arc and appending
+    /// self inside the derivation keeps the identity stable.
+    #[tokio::test]
+    async fn memo_hits_when_self_missing_from_group_snapshot() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000080@g.us".parse().expect("group jid");
+        let member = "5511999990014";
+        let own = Jid::pn("5511999990015");
+        setup_device_record(&client, member, &[0]).await;
+        setup_device_record(&client, "5511999990015", &[0, 3]).await;
+
+        // Self deliberately absent from the snapshot.
+        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(member)], AddressingMode::Pn));
+
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info, &own)
+            .await
+            .expect("resolve");
+        assert_eq!(
+            first.devices().len(),
+            3,
+            "member device + own's two devices"
+        );
+
+        let second = client
+            .resolve_group_devices_memoized(&group, &group_info, &own)
+            .await
+            .expect("resolve");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a self-missing group snapshot must still produce memo hits"
+        );
+    }
+
+    /// Codex P2 regression: a PN-addressed group's memo only knows the PN
+    /// side of a member when the cached GroupInfo carries no LID map, but a
+    /// later usync update can arrive keyed by the LID (canonical == original).
+    /// The write must record every lookup alias so the memo recomputes
+    /// instead of re-stamping stale.
+    #[tokio::test]
+    async fn lid_keyed_update_invalidates_pn_group_memo() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000079@g.us".parse().expect("group jid");
+        let pn = "5511999990013";
+        let lid = "100000000000079";
+
+        // Mapping known BEFORE the memo: the canonical record lives under the
+        // LID, while the group only references the member by PN.
+        client
+            .add_lid_pn_mapping(lid, pn, crate::lid_pn_cache::LearningSource::Usync)
+            .await
+            .expect("mapping");
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: pn.into(),
+                devices: vec![wacore::store::traits::DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                }],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("seed record");
+
+        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(pn)], AddressingMode::Pn));
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(first.devices().len(), 1);
+
+        // The update arrives keyed by the LID: canonical == original == LID,
+        // so without the alias rule only the LID would be recorded and the
+        // PN-only member set would re-stamp the stale snapshot.
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: lid.into(),
+                devices: vec![
+                    wacore::store::traits::DeviceInfo {
+                        device_id: 0,
+                        key_index: None,
+                    },
+                    wacore::store::traits::DeviceInfo {
+                        device_id: 11,
+                        key_index: None,
+                    },
+                ],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("LID-keyed update");
+
+        let fresh = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(
+            fresh.devices().len(),
+            2,
+            "a LID-keyed update for a member must invalidate the PN group's memo"
+        );
+    }
+
+    /// Locks the invariant that every device-topology write path bumps the
+    /// generation. patch_device_add/patch_device_remove funnel their writes
+    /// through update_device_list, so the funnel is what is asserted.
+    #[tokio::test]
+    async fn topology_mutators_bump_the_generation() {
+        let client = create_test_client().await;
+        let current_gen = |c: &Arc<Client>| c.device_topology.current();
+
+        let before = current_gen(&client);
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: "5511999990003".into(),
+                devices: vec![wacore::store::traits::DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                }],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("update_device_list");
+        assert!(
+            current_gen(&client) > before,
+            "update_device_list must bump"
+        );
+
+        let before = current_gen(&client);
+        client
+            .update_device_lists(vec![wacore::store::traits::DeviceListRecord {
+                user: "5511999990004".into(),
+                devices: vec![wacore::store::traits::DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                }],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            }])
+            .await
+            .expect("update_device_lists");
+        assert!(
+            current_gen(&client) > before,
+            "update_device_lists must bump"
+        );
+
+        let before = current_gen(&client);
+        client.invalidate_device_cache("5511999990003").await;
+        assert!(
+            current_gen(&client) > before,
+            "invalidate_device_cache must bump"
+        );
+
+        let before = current_gen(&client);
+        client
+            .add_lid_pn_mapping(
+                "100000000000042",
+                "5511999990004",
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .expect("mapping should persist");
+        assert!(
+            current_gen(&client) > before,
+            "add_lid_pn_mapping must bump"
+        );
+
+        // Fresh pair: the record must live under its PN key (no mapping yet)
+        // for the migration to find and move it.
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: "5511999990005".into(),
+                devices: vec![wacore::store::traits::DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                }],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("seed PN-keyed record");
+        let before = current_gen(&client);
+        client
+            .migrate_device_registry_on_lid_discovery("5511999990005", "100000000000043")
+            .await;
+        assert!(
+            current_gen(&client) > before,
+            "migrate_device_registry_on_lid_discovery must bump"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_registry_hit_shares_arc_not_deep_clone() {
+        let client = create_test_client().await;
+        setup_device_record(&client, "15551112222", &[1, 2]).await;
+
+        let a = client
+            .device_registry_cache
+            .get("15551112222")
+            .await
+            .expect("warm hit");
+        let b = client
+            .device_registry_cache
+            .get("15551112222")
+            .await
+            .expect("warm hit");
+
+        // A warm registry hit returns a refcount bump of the same allocation, not a deep copy.
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.devices.len(), 2);
     }
 
     #[tokio::test]
@@ -812,6 +1606,26 @@ mod tests {
         assert!(client.has_device(lid, 1).await);
         // Non-existent device should return false
         assert!(!client.has_device(lid, 99).await);
+    }
+
+    /// has_device must iterate every lookup key: a record keyed under PN is found
+    /// when queried by LID (the fallback key), and vice versa. Guards the
+    /// borrowed-`all_keys()` iteration the churn fix preserves.
+    #[tokio::test]
+    async fn test_has_device_found_via_fallback_lookup_key() {
+        let client = create_test_client().await;
+        let lid = "100000000000009";
+        let pn = "15559998888";
+
+        setup_lid_pn(&client, lid, pn).await;
+        setup_device_record(&client, pn, &[2]).await;
+
+        assert!(
+            client.has_device(lid, 2).await,
+            "device keyed under PN must be found when queried by LID"
+        );
+        assert!(client.has_device(pn, 2).await);
+        assert!(!client.has_device(lid, 77).await);
     }
 
     /// Test that invalidate_device_cache clears registry cache entries for
@@ -915,7 +1729,7 @@ mod tests {
     async fn test_patch_device_add_deduplicates() {
         let client = create_test_client().await;
 
-        setup_device_record(&client, "15551234567", &[3]).await;
+        setup_device_record(&client, "15551234567", &[0, 3]).await;
 
         // Patch: add device 3 again — should not duplicate
         let elem = make_device_element(3, None);
@@ -926,7 +1740,12 @@ mod tests {
             .get("15551234567")
             .await
             .unwrap();
-        assert_eq!(updated.devices.len(), 1);
+        assert_eq!(
+            updated.devices.iter().filter(|d| d.device_id == 3).count(),
+            1
+        );
+        assert!(updated.devices.iter().any(|d| d.device_id == 0));
+        assert_eq!(updated.devices.len(), 2);
     }
 
     #[tokio::test]
@@ -986,7 +1805,7 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert("15551234567".to_string(), record)
+            .raw_insert_for_tests("15551234567".to_string(), Arc::new(record))
             .await;
 
         // Patch: update device 3 key_index to 5
@@ -1021,6 +1840,142 @@ mod tests {
         assert_eq!(updated.devices.len(), 2);
         let dev3 = updated.devices.iter().find(|d| d.device_id == 3).unwrap();
         assert_eq!(dev3.key_index, Some(2));
+    }
+
+    /// Encode an `ADVSignedKeyIndexList` whose decoded `raw_id`/`valid_indexes`
+    /// drive `patch_device_add` (the signature is not verified locally; the
+    /// notification arrives over the authenticated Noise channel).
+    fn make_signed_key_index_bytes(
+        raw_id: u32,
+        current_index: u32,
+        valid_indexes: Vec<u32>,
+    ) -> Vec<u8> {
+        use buffa::Message;
+        let details = waproto::whatsapp::ADVKeyIndexList {
+            raw_id: Some(raw_id),
+            timestamp: Some(100),
+            current_index: Some(current_index),
+            valid_indexes,
+            account_type: None,
+        }
+        .encode_to_vec();
+        waproto::whatsapp::ADVSignedKeyIndexList {
+            details: Some(details),
+            account_signature: None,
+            account_signature_key: None,
+        }
+        .encode_to_vec()
+    }
+
+    fn record_with_raw_id(
+        user: &str,
+        device_ids: &[u32],
+        raw_id: u32,
+    ) -> wacore::store::traits::DeviceListRecord {
+        wacore::store::traits::DeviceListRecord {
+            user: user.into(),
+            devices: device_ids
+                .iter()
+                .map(|&id| wacore::store::traits::DeviceInfo {
+                    device_id: id,
+                    key_index: if id == 0 { None } else { Some(7) },
+                })
+                .collect(),
+            timestamp: 1000,
+            phash: None,
+            raw_id: Some(raw_id),
+        }
+    }
+
+    // raw_id mismatch clears the list and rebuilds from the notification; the
+    // primary (device 0) must survive. Regression guard for a record that would
+    // otherwise persist without device 0 (and then suppress usync forever).
+    #[tokio::test]
+    async fn test_patch_device_add_raw_id_mismatch_preserves_primary() {
+        let client = create_test_client().await;
+
+        client
+            .device_registry_cache
+            .raw_insert_for_tests(
+                "15551234567".to_string(),
+                Arc::new(record_with_raw_id("15551234567", &[0, 5], 1)),
+            )
+            .await;
+
+        // New raw_id (2) != stored (1) → clear + rebuild. Notified device 19 has a
+        // valid key index, so the rebuilt list is the companion plus the primary.
+        let signed = make_signed_key_index_bytes(2, 0, vec![7]);
+        let key_index_info = wacore::stanza::devices::KeyIndexInfo {
+            timestamp: 100,
+            signed_bytes: Some(signed),
+        };
+        let elem = make_device_element(19, Some(7));
+        client
+            .patch_device_add("15551234567", &elem, Some(&key_index_info))
+            .await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        let dev0 = updated
+            .devices
+            .iter()
+            .find(|d| d.device_id == 0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "primary (device 0) must survive a raw_id mismatch clear, got {:?}",
+                    updated.devices
+                )
+            });
+        // The re-seeded primary carries no key index (it is never read for device 0).
+        assert_eq!(dev0.key_index, None);
+        assert!(updated.devices.iter().any(|d| d.device_id == 19));
+        // Stale companion from the old identity is dropped by the clear.
+        assert!(!updated.devices.iter().any(|d| d.device_id == 5));
+    }
+
+    // Same mismatch but the notified device's key index is rejected, so the
+    // rebuilt list would be empty without the primary re-seed. Guards the `[]`
+    // record that otherwise leaves the user with zero devices.
+    #[tokio::test]
+    async fn test_patch_device_add_raw_id_mismatch_rejected_device_keeps_primary() {
+        let client = create_test_client().await;
+
+        client
+            .device_registry_cache
+            .raw_insert_for_tests(
+                "15551234567".to_string(),
+                Arc::new(record_with_raw_id("15551234567", &[0, 5], 1)),
+            )
+            .await;
+
+        // current_index 10, empty valid set → notified key index 3 is invalid
+        // (not in valid set, not > current_index), so no companion is added.
+        let signed = make_signed_key_index_bytes(2, 10, vec![]);
+        let key_index_info = wacore::stanza::devices::KeyIndexInfo {
+            timestamp: 100,
+            signed_bytes: Some(signed),
+        };
+        let elem = make_device_element(19, Some(3));
+        client
+            .patch_device_add("15551234567", &elem, Some(&key_index_info))
+            .await;
+
+        let updated = client
+            .device_registry_cache
+            .get("15551234567")
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.devices.len(),
+            1,
+            "expected only the primary, got {:?}",
+            updated.devices
+        );
+        assert_eq!(updated.devices[0].device_id, 0);
+        assert_eq!(updated.devices[0].key_index, None);
     }
 
     #[tokio::test]
@@ -1121,6 +2076,25 @@ mod tests {
         assert_eq!(devices[0].user, lid, "device JID user should be the LID");
     }
 
+    // A present-but-empty record must read as a miss (None), not Some([]). The
+    // 1:1 send path reads get_devices_from_registry directly and only warms from
+    // the network on None, so an empty Some would shadow that warmup and the
+    // bare-JID fallback, leaving the corrupted row unhealed on the send path.
+    #[tokio::test]
+    async fn get_devices_from_registry_reads_empty_record_as_miss() {
+        let client = create_test_client().await;
+        let user = "15551234567";
+        setup_device_record(&client, user, &[]).await;
+
+        assert!(
+            client
+                .get_devices_from_registry(&Jid::pn(user))
+                .await
+                .is_none(),
+            "an empty record must read as a miss, not Some([])"
+        );
+    }
+
     // ── DB-fallback tests for patch helpers ──────────────────────────────
 
     #[tokio::test]
@@ -1129,7 +2103,7 @@ mod tests {
 
         let client = create_test_client().await;
 
-        // Seed backend DB directly (bypassing moka cache)
+        // Seed backend DB directly (bypassing the in-process cache)
         let record = DeviceListRecord {
             user: "15551234567".into(),
             devices: vec![DeviceInfo {
@@ -1288,7 +2262,7 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert("15551234567".into(), record)
+            .raw_insert_for_tests("15551234567".into(), Arc::new(record))
             .await;
 
         // Warm the sender key device cache
@@ -1541,7 +2515,10 @@ mod tests {
         backend.update_device_list(legacy.clone()).await.unwrap();
         // Warm cache under PN to simulate a reader that populated it before
         // the mapping was learned.
-        client.device_registry_cache.insert(pn.into(), legacy).await;
+        client
+            .device_registry_cache
+            .raw_insert_for_tests(pn.into(), Arc::new(legacy))
+            .await;
 
         setup_lid_pn(&client, lid, pn).await;
 
@@ -1628,6 +2605,27 @@ mod tests {
             .await
             .unwrap();
         assert!(rows.iter().all(|(jid, _)| jid != &device_jid));
+    }
+
+    // A remove targeting the primary (device 0) must be a no-op: WA Web never
+    // drops device 0. Regression guard for the symmetric failure to the add path
+    // — dropping the primary persists a record that suppresses usync forever.
+    #[tokio::test]
+    async fn patch_device_remove_keeps_primary() {
+        let client = create_test_client().await;
+        let user = "15551234567";
+        setup_device_record(&client, user, &[0, 5]).await;
+
+        client.patch_device_remove(user, 0).await;
+
+        let record = client.device_registry_cache.get(user).await.unwrap();
+        assert!(
+            record.devices.iter().any(|d| d.device_id == 0),
+            "remove for the primary must be ignored, got {:?}",
+            record.devices
+        );
+        // The companion is untouched too — the remove is a full no-op.
+        assert!(record.devices.iter().any(|d| d.device_id == 5));
     }
 
     #[tokio::test]
@@ -1725,11 +2723,10 @@ mod tests {
             .rotate_sender_key_on_participant_remove(group, &["271060335329480"])
             .await;
 
-        let device_arc = client.persistence_manager.get_device_arc().await;
-        let device = device_arc.read().await;
+        let device_snapshot = client.persistence_manager.get_device_snapshot();
         let key = client
             .signal_cache
-            .get_sender_key(&sk_name, &*device.backend)
+            .get_sender_key(&sk_name, &*device_snapshot.backend)
             .await
             .unwrap();
         assert!(
@@ -1780,11 +2777,10 @@ mod tests {
             .rotate_sender_key_on_participant_remove(group, &["271060335329480"])
             .await;
 
-        let device_arc = client.persistence_manager.get_device_arc().await;
-        let device = device_arc.read().await;
+        let device_snapshot = client.persistence_manager.get_device_snapshot();
         let key = client
             .signal_cache
-            .get_sender_key(&sk_name, &*device.backend)
+            .get_sender_key(&sk_name, &*device_snapshot.backend)
             .await
             .unwrap();
         assert!(

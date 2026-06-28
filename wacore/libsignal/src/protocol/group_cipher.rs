@@ -125,7 +125,7 @@ fn get_sender_key(state: &mut SenderKeyState, iteration: u32) -> Result<SenderMe
     let current_iteration = sender_chain_key.iteration();
 
     if current_iteration > iteration {
-        if let Some(smk) = state.remove_sender_message_key(iteration)? {
+        if let Some(smk) = state.remove_sender_message_key(iteration) {
             return Ok(smk);
         } else {
             log::debug!("SenderKey Duplicate message for iteration: {iteration}");
@@ -210,9 +210,9 @@ pub async fn group_decrypt(
     }
 
     let signing_key = sender_key_state
-        .signing_key_public()
+        .signing_key_verifier()
         .map_err(|_| SignalProtocolError::InvalidSenderKeySession)?;
-    if !skm.verify_signature(&signing_key)? {
+    if !skm.verify_signature_prepared(signing_key)? {
         return Err(SignalProtocolError::SignatureValidationFailed);
     }
 

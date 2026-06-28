@@ -11,6 +11,11 @@ use wacore_binary::{Jid, JidExt as _};
 
 use wacore_binary::OwnedNodeRef;
 
+/// Max message ids per read/played `<receipt>` stanza. WA Web's
+/// `sendAggregateReceipts` splices ids into chunks of 256 and emits one receipt
+/// per chunk, so a large catch-up doesn't produce one oversized stanza.
+const MAX_RECEIPT_IDS_PER_STANZA: usize = 256;
+
 /// Pure builder for the delivery `<receipt>` node. Extracted so unit tests
 /// can assert wire shape without spinning a transport. Mirrors WA Web's
 /// `Send/DeliveryReceiptJob.js` — the participant gate there is
@@ -25,10 +30,117 @@ use wacore_binary::OwnedNodeRef;
 /// The server's offline queue only drops a self-fanout on this sender receipt;
 /// a bare transport `<ack>` is ignored and the stanza is replayed until a
 /// ~50min GC closes the stream.
-fn build_delivery_receipt_node(
+/// Builds a `<receipt type="played"|"played-self">` for voice/video notes,
+/// mirroring WA Web `WAWebSendPlayedReceiptJob`: newsletters use `played-self`,
+/// everything else `played`. The `participant` attr is set only for
+/// group/broadcast chats; in DMs WA Web drops it (`r.isUser() ? null : author`).
+fn build_played_receipt_node(
+    chat: &Jid,
+    sender: Option<&Jid>,
+    message_ids: &[&str],
+    timestamp: &str,
+) -> wacore_binary::Node {
+    let receipt_type = if chat.is_newsletter() {
+        ReceiptType::PlayedSelf
+    } else {
+        ReceiptType::Played
+    };
+
+    let mut builder = NodeBuilder::new("receipt")
+        .attr("to", chat)
+        .attr("type", receipt_type.as_wire_str())
+        .attr("id", message_ids[0])
+        .attr("t", timestamp);
+
+    if (chat.is_group() || chat.is_status_broadcast() || chat.is_broadcast_list())
+        && let Some(sender) = sender
+    {
+        builder = builder.attr("participant", sender);
+    }
+
+    if message_ids.len() > 1 {
+        let items: Vec<wacore_binary::Node> = message_ids[1..]
+            .iter()
+            .map(|id| NodeBuilder::new("item").attr("id", *id).build())
+            .collect();
+        builder = builder.children(vec![NodeBuilder::new("list").children(items).build()]);
+    }
+
+    builder.build()
+}
+
+/// Pure builder for the read `<receipt>` node. Mirrors WA Web
+/// `WAWebSendReadReceiptJob` + `sendAggregateReceipts`: newsletters use
+/// `read-self`, everything else `read`; status reads carry `context="status"`
+/// and, for a LID author, `peer_participant_pn` (the resolved LID->PN). The DM
+/// `read`-vs-`read-self` read-receipts-privacy gating is not modeled here.
+fn build_read_receipt_node(
+    chat: &Jid,
+    sender: Option<&Jid>,
+    message_ids: &[&str],
+    timestamp: &str,
+    peer_participant_pn: Option<&Jid>,
+) -> wacore_binary::Node {
+    let receipt_type = if chat.is_newsletter() {
+        ReceiptType::ReadSelf
+    } else {
+        ReceiptType::Read
+    };
+
+    let mut builder = NodeBuilder::new("receipt")
+        .attr("to", chat)
+        .attr("type", receipt_type.as_wire_str())
+        .attr("id", message_ids[0])
+        .attr("t", timestamp);
+
+    if let Some(sender) = sender {
+        builder = builder.attr("participant", sender);
+    }
+
+    if chat.is_status_broadcast() {
+        builder = builder.attr("context", "status");
+        if let Some(pn) = peer_participant_pn {
+            builder = builder.attr("peer_participant_pn", pn);
+        }
+    }
+
+    if message_ids.len() > 1 {
+        let items: Vec<wacore_binary::Node> = message_ids[1..]
+            .iter()
+            .map(|id| NodeBuilder::new("item").attr("id", *id).build())
+            .collect();
+        builder = builder.children(vec![NodeBuilder::new("list").children(items).build()]);
+    }
+
+    builder.build()
+}
+
+/// The `type` attr a delivery receipt carries for `info`, as a static wire
+/// string (`None` = plain delivered, which omits the attr). Single source of
+/// truth for both the receipt builder and the aggregation grouping key, so the
+/// two can't drift apart.
+fn delivery_receipt_type(
     info: &crate::types::message::MessageInfo,
     active: bool,
-) -> wacore_binary::Node {
+) -> Option<&'static str> {
+    let is_status = info.source.chat.is_status_broadcast();
+    if info.category == MessageCategory::Peer {
+        Some("peer_msg")
+    } else if info.source.is_self_fanout() {
+        Some("sender")
+    } else if !active && !is_status {
+        Some("inactive")
+    } else {
+        None
+    }
+}
+
+/// Receipt-level attrs shared by the single and aggregate delivery builders
+/// (everything except `id`/`t`/the `<list>` child).
+fn delivery_receipt_builder(
+    info: &crate::types::message::MessageInfo,
+    active: bool,
+) -> NodeBuilder {
     let is_status = info.source.chat.is_status_broadcast();
     // A peer-synced message takes `type="peer_msg"` and carries NO recipient
     // (WA Web `!l` guard), so the sender-receipt shape applies only off the
@@ -42,16 +154,10 @@ fn build_delivery_receipt_node(
     } else {
         &info.source.sender
     };
-    let mut builder = NodeBuilder::new("receipt")
-        .attr("id", &info.id)
-        .attr("to", to);
+    let mut builder = NodeBuilder::new("receipt").attr("to", to);
 
-    if info.category == MessageCategory::Peer {
-        builder = builder.attr("type", ReceiptType::PeerMsg.as_wire_str());
-    } else if sender_receipt {
-        builder = builder.attr("type", ReceiptType::Sender.as_wire_str());
-    } else if !active && !is_status {
-        builder = builder.attr("type", ReceiptType::Inactive.as_wire_str());
+    if let Some(receipt_type) = delivery_receipt_type(info, active) {
+        builder = builder.attr("type", receipt_type);
     }
 
     // Device-stripped recipient (WA Web `USER_JID`) so the server can route it.
@@ -67,7 +173,107 @@ fn build_delivery_receipt_node(
         builder = builder.attr("context", "status");
     }
 
-    builder.build()
+    builder
+}
+
+fn build_delivery_receipt_node(
+    info: &crate::types::message::MessageInfo,
+    active: bool,
+) -> wacore_binary::Node {
+    delivery_receipt_builder(info, active)
+        .attr("id", &info.id)
+        .build()
+}
+
+/// One buffered-offline delivery group: every entry shares identical
+/// receipt-level attrs, derived from the representative `rep`.
+struct DeliveryReceiptGroup<'a> {
+    rep: &'a MessageInfo,
+    ids: Vec<&'a str>,
+}
+
+/// Group buffered offline messages so each group maps to ONE aggregate
+/// `<receipt>` (WA Web `sendAggregateOfflineReceipts` groups by chat and
+/// author). The key covers every input that varies the receipt-level attrs
+/// for a fixed `active`: the `to` JID, the participant (group/status author),
+/// the type attr, and the self-fanout recipient. Splitting more finely than
+/// WA Web (e.g. on recipient device) is always wire-safe; merging across any
+/// of these would corrupt the receipt. Keys are borrowed, no per-entry
+/// allocation beyond the ids vec.
+fn group_delivery_receipts<'a>(
+    infos: &'a [Arc<MessageInfo>],
+    active: bool,
+) -> Vec<DeliveryReceiptGroup<'a>> {
+    #[derive(PartialEq, Eq, Hash)]
+    struct Key<'a> {
+        to: &'a Jid,
+        participant: Option<&'a Jid>,
+        receipt_type: Option<&'static str>,
+        recipient: Option<&'a Jid>,
+    }
+
+    let mut index: std::collections::HashMap<Key, usize> = std::collections::HashMap::new();
+    let mut groups: Vec<DeliveryReceiptGroup> = Vec::new();
+    for info in infos {
+        let is_status = info.source.chat.is_status_broadcast();
+        let is_group_like = info.source.is_group || is_status;
+        let sender_receipt = info.source.is_self_fanout() && info.category != MessageCategory::Peer;
+        let key = Key {
+            to: if is_group_like {
+                &info.source.chat
+            } else {
+                &info.source.sender
+            },
+            participant: is_group_like.then_some(&info.source.sender),
+            receipt_type: delivery_receipt_type(info, active),
+            recipient: if sender_receipt {
+                info.source.recipient.as_ref()
+            } else {
+                None
+            },
+        };
+        match index.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                groups[*e.get()].ids.push(&info.id);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(groups.len());
+                groups.push(DeliveryReceiptGroup {
+                    rep: info,
+                    ids: vec![&info.id],
+                });
+            }
+        }
+    }
+    groups
+}
+
+/// Aggregate delivery `<receipt>` nodes for one group, chunked at
+/// [`MAX_RECEIPT_IDS_PER_STANZA`]: per chunk the first id is the `id` attr and
+/// the rest become `<list><item id=.../></list>`, the same shape WA Web's
+/// `sendAggregateReceipts` emits and `collect_simple_message_ids` parses on
+/// ingest. `t` mirrors the offline aggregate path passing `unixTime()`.
+fn build_aggregate_delivery_receipt_nodes(
+    rep: &MessageInfo,
+    ids: &[&str],
+    active: bool,
+    timestamp: &str,
+) -> Vec<wacore_binary::Node> {
+    ids.chunks(MAX_RECEIPT_IDS_PER_STANZA)
+        .map(|chunk| {
+            let mut builder = delivery_receipt_builder(rep, active)
+                .attr("id", chunk[0])
+                .attr("t", timestamp);
+            if chunk.len() > 1 {
+                let items: Vec<wacore_binary::Node> = chunk[1..]
+                    .iter()
+                    .map(|id| NodeBuilder::new("item").attr("id", *id).build())
+                    .collect();
+                builder = builder.children(vec![NodeBuilder::new("list").children(items).build()]);
+            }
+            builder.build()
+        })
+        .collect()
 }
 
 /// `<ack class="message" error=N>` builder, mirrors WA Web's
@@ -132,6 +338,10 @@ impl Client {
             || info.source.is_self_fanout()
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.receipt.handle", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_receipt(self: &Arc<Self>, node: Arc<OwnedNodeRef>) {
         let nr = node.get();
         let mut attrs = nr.attrs();
@@ -146,6 +356,10 @@ impl Client {
         let receipt_type_cow = attrs.optional_string("type");
         let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
         let participant = attrs.optional_jid("participant");
+        // participant_pn -> sender_alt so the LID-PN cache warms from receipts too.
+        let participant_pn = attrs.optional_jid("participant_pn");
+        // Present when this receipt was drained from the offline queue on reconnect.
+        let offline = attrs.optional_string("offline").is_some();
         let stanza_ts = attrs
             .optional_u64("t")
             .and_then(|t| i64::try_from(t).ok())
@@ -153,6 +367,10 @@ impl Client {
             .unwrap_or_else(wacore::time::now_utc);
 
         let receipt_type = ReceiptType::parse(receipt_type_str);
+        // WA Web downgrades a delivery ack to "sent" (not delivered) when the receipt carries
+        // <error reason="lid" type="feature-incapable"> (the LID peer can't receive it).
+        let receipt_type =
+            wacore::stanza::receipt::downgrade_for_feature_incapable(nr, receipt_type);
         let is_view = receipt_type_str == "view";
         let is_group = from.is_group();
         let default_sender = if is_group {
@@ -174,8 +392,9 @@ impl Client {
                 .or_else(|| agg_key.clone())
                 .unwrap_or_else(|| stanza_id.clone());
             debug!(
-                "Aggregated receipt from {from}: stanza={stanza_id} \
+                "Aggregated receipt from {}: stanza={stanza_id} \
                  message_id={agg_msg_id:?} key={agg_key:?} users={}",
+                from.observe(),
                 users.len()
             );
             for user in users {
@@ -189,7 +408,13 @@ impl Client {
                 // aggregated_by_message: each <user> carries its own type;
                 // aggregated_by_type: all users share the receipt-level type.
                 let effective_type = match user.r#type.as_deref() {
-                    Some(t) => ReceiptType::parse(t),
+                    // Apply the receipt-level feature-incapable downgrade to the per-user type
+                    // too, so an aggregated delivery receipt with a feature-incapable LID
+                    // participant doesn't re-emit a delivered tick for it.
+                    Some(t) => wacore::stanza::receipt::downgrade_for_feature_incapable(
+                        nr,
+                        ReceiptType::parse(t),
+                    ),
                     None => receipt_type.clone(),
                 };
                 let r = Receipt {
@@ -197,10 +422,12 @@ impl Client {
                     source: crate::types::message::MessageSource {
                         chat: from.clone(),
                         sender: user.jid,
+                        sender_alt: user.participant_pn,
                         ..Default::default()
                     },
                     timestamp: user_ts,
                     r#type: effective_type,
+                    offline,
                 };
                 self.core.event_bus.dispatch(Event::Receipt(r));
             }
@@ -213,8 +440,9 @@ impl Client {
             wacore::stanza::receipt::collect_simple_message_ids(nr, &stanza_id, is_view);
 
         debug!(
-            "Received receipt type '{receipt_type:?}' for {} message(s) from {from}",
-            message_ids.len()
+            "Received receipt type '{receipt_type:?}' for {} message(s) from {}",
+            message_ids.len(),
+            from.observe()
         );
 
         let receipt = Receipt {
@@ -222,10 +450,12 @@ impl Client {
             source: crate::types::message::MessageSource {
                 chat: from,
                 sender: default_sender,
+                sender_alt: participant_pn,
                 ..Default::default()
             },
             timestamp: stanza_ts,
             r#type: receipt_type,
+            offline,
         };
 
         if receipt.r#type == ReceiptType::Retry {
@@ -261,7 +491,7 @@ impl Client {
                         .optional_string("call-id")
                         .as_deref()
                         .unwrap_or_default(),
-                    receipt.source.chat,
+                    receipt.source.chat.observe(),
                     child_attrs
                         .optional_string("call-creator")
                         .as_deref()
@@ -291,6 +521,7 @@ impl Client {
     ///   `Send/DeliveryReceiptJob.js`); these are NOT skipped anymore.
     /// - Newsletters and messages without an ID are skipped (newsletters are
     ///   handled by the ack gate, not here).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_delivery", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn send_delivery_receipt(&self, info: &crate::types::message::MessageInfo) {
         if !Self::should_send_delivery_receipt(info) {
             return;
@@ -310,13 +541,99 @@ impl Client {
             ReceiptType::Delivered
         };
         debug!(target: "Client/Receipt", "Sending {} receipt for message {} to {}",
-            receipt_kind.as_wire_str(), info.id, info.source.sender);
+            receipt_kind.as_wire_str(), info.id, info.source.sender.observe());
 
         if let Err(e) = self.send_node(receipt_node).await
             && !matches!(e, crate::client::ClientError::NotConnected)
         {
             log::warn!(target: "Client/Receipt", "Failed to send delivery receipt for message {}: {:?}", info.id, e);
         }
+    }
+
+    /// Buffer an offline-drained message's delivery receipt for the aggregate
+    /// flush at offline-sync completion (WA Web `sendAggregateOfflineReceipts`).
+    /// Returns `false` when the sync already completed, so the caller falls
+    /// back to the live 1:1 receipt. The completed flag is re-checked under
+    /// the buffer lock: `complete_offline_sync` flips the flag before
+    /// draining, so a push that wins the lock either lands before the drain
+    /// (and is included) or observes the flag and goes 1:1 — a receipt can
+    /// never strand in the buffer.
+    pub(crate) fn try_buffer_offline_receipt(&self, info: &Arc<MessageInfo>) -> bool {
+        let mut buffer = self
+            .offline_receipt_buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
+            .offline_sync_completed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        buffer.push(Arc::clone(info));
+        true
+    }
+
+    /// Drain the offline receipt buffer and send one aggregate `<receipt>`
+    /// per (chat, author, type, recipient) group, chunked at 256 ids. The
+    /// drain `mem::take`s the buffer so no capacity is retained between
+    /// offline windows, and the send runs as an `outbound_flush` task so
+    /// `disconnect()` flushes it like any other receipt (issue #571).
+    pub(crate) fn flush_offline_receipts(&self) {
+        let infos = std::mem::take(
+            &mut *self
+                .offline_receipt_buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if infos.is_empty() {
+            return;
+        }
+        let Some(client) = self.self_weak.get().and_then(std::sync::Weak::upgrade) else {
+            // Shutdown teardown: receipts stay unsent and the server
+            // redelivers the messages on the next connect, same as a failed
+            // send today.
+            return;
+        };
+        self.outbound_flush.spawn(&*self.runtime, async move {
+            let active = client.receipts_are_active();
+            let timestamp = wacore::time::now_utc().timestamp().to_string();
+            let groups = group_delivery_receipts(&infos, active);
+            debug!(
+                target: "Client/Receipt",
+                "Flushing {} offline delivery receipts as {} aggregate stanza group(s)",
+                infos.len(),
+                groups.len()
+            );
+            for group in &groups {
+                for node in build_aggregate_delivery_receipt_nodes(
+                    group.rep, &group.ids, active, &timestamp,
+                ) {
+                    if let Err(e) = client.send_node(node).await
+                        && !matches!(e, crate::client::ClientError::NotConnected)
+                    {
+                        log::warn!(
+                            target: "Client/Receipt",
+                            "Failed to send aggregate delivery receipt for chat {}: {:?}",
+                            group.rep.source.chat.observe(),
+                            e
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// Drop receipts a teardown drain missed. Called from the connection-state
+    /// resets: a receipt buffered after `disconnect()`'s drain belongs to a
+    /// message that was never acked, so the server redelivers it on the next
+    /// connect and it gets re-acked fresh there. Carrying the stale entry over
+    /// would mix a dead connection's receipts into the next connection's
+    /// aggregate flush.
+    pub(crate) fn clear_offline_receipt_buffer(&self) {
+        *self
+            .offline_receipt_buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Vec::new();
     }
 
     /// Spawn an async nack so the caller doesn't await network I/O while
@@ -339,6 +656,7 @@ impl Client {
     /// Emits a nack so the server stops retransmitting an unrecoverable
     /// failure. Prefer [`Client::send_retry_receipt`] for recoverable
     /// errors (BadMac, NoSession, etc).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_nack", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
     pub(crate) async fn send_nack(
         &self,
         info: &MessageInfo,
@@ -348,7 +666,7 @@ impl Client {
         if info.id.is_empty() {
             return;
         }
-        let Some(own_pn) = self.get_pn().await else {
+        let Some(own_pn) = self.get_pn() else {
             log::debug!(
                 "[msg:{}] Skipping nack ({:?}): own PN not yet set",
                 info.id,
@@ -360,7 +678,7 @@ impl Client {
         let nack = build_nack_node(info, &own_pn, reason, failure_reason);
         debug!(target: "Client/Receipt",
             "Sending nack (reason={:?}, code={}) for message {} from {}",
-            reason, reason.code(), info.id, info.source.sender);
+            reason, reason.code(), info.id, info.source.sender.observe());
 
         if let Err(e) = self.send_node(nack).await
             && !matches!(e, crate::client::ClientError::NotConnected)
@@ -373,11 +691,12 @@ impl Client {
     /// Sends read receipts for one or more messages.
     ///
     /// For group messages, pass the message sender as `sender`.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.mark_as_read", level = "debug", skip_all, fields(chat = %chat.observe()), err(Debug)))]
     pub async fn mark_as_read(
         &self,
         chat: &Jid,
         sender: Option<&Jid>,
-        message_ids: Vec<String>,
+        message_ids: &[&str],
     ) -> Result<(), anyhow::Error> {
         if message_ids.is_empty() {
             return Ok(());
@@ -385,32 +704,71 @@ impl Client {
 
         let timestamp = wacore::time::now_secs_u64().to_string();
 
-        let mut builder = NodeBuilder::new("receipt")
-            .attr("to", chat)
-            .attr("type", "read")
-            .attr("id", &message_ids[0])
-            .attr("t", &timestamp);
+        // Status reads from a LID author carry peer_participant_pn (the resolved
+        // LID->PN), matching WA Web's LidMigrationUtils.toPn.
+        let peer_participant_pn = if chat.is_status_broadcast()
+            && let Some(sender) = sender
+            && sender.is_lid()
+        {
+            self.get_lid_pn_entry(sender)
+                .await
+                .ok()
+                .flatten()
+                .map(|e| Jid::new(&*e.phone_number, wacore_binary::Server::Pn))
+        } else {
+            None
+        };
 
-        if let Some(sender) = sender {
-            builder = builder.attr("participant", sender);
+        debug!(target: "Client/Receipt", "Sending read receipt for {} message(s) to {}", message_ids.len(), chat.observe());
+
+        // WA Web's sendAggregateReceipts caps each <receipt> at 256 ids (one <list>
+        // per chunk), so a large catch-up read (post-reconnect / history scroll)
+        // doesn't emit one oversized stanza the server may reject.
+        for chunk in message_ids.chunks(MAX_RECEIPT_IDS_PER_STANZA) {
+            let node = build_read_receipt_node(
+                chat,
+                sender,
+                chunk,
+                &timestamp,
+                peer_participant_pn.as_ref(),
+            );
+            self.send_node(node)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send read receipt: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Marks one or more voice/video notes as played (`<receipt type="played">`).
+    ///
+    /// Mirrors WA Web `WAWebSendPlayedReceiptJob`. For group/broadcast chats pass
+    /// the message sender as `sender` so the receipt carries `participant`; in DMs
+    /// pass `None`. Newsletters emit `played-self`. The DM `played`-vs-`played-self`
+    /// privacy gating (read-receipts off) is not applied here, matching
+    /// [`mark_as_read`](Self::mark_as_read).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.mark_as_played", level = "debug", skip_all, fields(chat = %chat.observe()), err(Debug)))]
+    pub async fn mark_as_played(
+        &self,
+        chat: &Jid,
+        sender: Option<&Jid>,
+        message_ids: &[&str],
+    ) -> Result<(), anyhow::Error> {
+        if message_ids.is_empty() {
+            return Ok(());
         }
 
-        // Additional message IDs go into <list><item id="..."/></list>
-        if message_ids.len() > 1 {
-            let items: Vec<wacore_binary::Node> = message_ids[1..]
-                .iter()
-                .map(|id| NodeBuilder::new("item").attr("id", id).build())
-                .collect();
-            builder = builder.children(vec![NodeBuilder::new("list").children(items).build()]);
+        let timestamp = wacore::time::now_secs_u64().to_string();
+
+        debug!(target: "Client/Receipt", "Sending played receipt for {} message(s) to {}", message_ids.len(), chat.observe());
+
+        // Same 256-id cap per stanza as read receipts (WA Web sendAggregateReceipts).
+        for chunk in message_ids.chunks(MAX_RECEIPT_IDS_PER_STANZA) {
+            let node = build_played_receipt_node(chat, sender, chunk, &timestamp);
+            self.send_node(node)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send played receipt: {}", e))?;
         }
-
-        let node = builder.build();
-
-        debug!(target: "Client/Receipt", "Sending read receipt for {} message(s) to {}", message_ids.len(), chat);
-
-        self.send_node(node)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send read receipt: {}", e))
+        Ok(())
     }
 }
 
@@ -1425,6 +1783,132 @@ mod tests {
         assert_eq!(receipts[2].r#type, ReceiptType::Inactive);
     }
 
+    /// participant_pn must land in the Receipt event's sender_alt on both shapes.
+    #[tokio::test]
+    async fn test_receipt_threads_participant_pn_into_sender_alt() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        // Aggregated shape: per-user participant_pn.
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "120363000000000001@g.us")
+                    .attr("id", "STANZA-PPN")
+                    .attr("t", "1700000000")
+                    .children([NodeBuilder::new("participants")
+                        .attr("message_id", "MSG-PPN")
+                        .children([NodeBuilder::new("user")
+                            .attr("jid", "99000000000001@lid")
+                            .attr("participant_pn", "15551234567@s.whatsapp.net")
+                            .attr("type", "read")
+                            .build()])
+                        .build()])
+                    .build(),
+            ))
+            .await;
+
+        // Simple shape: receipt-level participant_pn.
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "99000000000002@lid")
+                    .attr("id", "STANZA-PPN-SIMPLE")
+                    .attr("participant_pn", "15557654321@s.whatsapp.net")
+                    .attr("t", "1700000000")
+                    .build(),
+            ))
+            .await;
+
+        let events = collector.events();
+        let receipts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+
+        let agg = receipts
+            .iter()
+            .find(|r| r.message_ids.iter().any(|id| id == "MSG-PPN"))
+            .expect("aggregated receipt dispatched");
+        assert_eq!(
+            agg.source.sender_alt.as_ref().expect("sender_alt set").user,
+            "15551234567",
+            "aggregated receipt must thread per-user participant_pn into sender_alt"
+        );
+
+        let simple = receipts
+            .iter()
+            .find(|r| r.message_ids.iter().any(|id| id == "STANZA-PPN-SIMPLE"))
+            .expect("simple receipt dispatched");
+        assert_eq!(
+            simple
+                .source
+                .sender_alt
+                .as_ref()
+                .expect("sender_alt set")
+                .user,
+            "15557654321",
+            "simple receipt must thread receipt-level participant_pn into sender_alt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_receipt_offline_attr_propagated() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        // Drained from the offline queue: carries the `offline` attr.
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "15551234567@s.whatsapp.net")
+                    .attr("id", "OFFLINE-RCPT")
+                    .attr("offline", "1")
+                    .attr("t", "1700000000")
+                    .build(),
+            ))
+            .await;
+
+        // Live delivery: no `offline` attr.
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "15551234567@s.whatsapp.net")
+                    .attr("id", "LIVE-RCPT")
+                    .attr("t", "1700000000")
+                    .build(),
+            ))
+            .await;
+
+        let events = collector.events();
+        let receipts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+
+        let offline = receipts
+            .iter()
+            .find(|r| r.message_ids.iter().any(|id| id == "OFFLINE-RCPT"))
+            .expect("offline receipt dispatched");
+        assert!(
+            offline.offline,
+            "receipt with the offline attr sets offline=true"
+        );
+
+        let live = receipts
+            .iter()
+            .find(|r| r.message_ids.iter().any(|id| id == "LIVE-RCPT"))
+            .expect("live receipt dispatched");
+        assert!(
+            !live.offline,
+            "receipt without the offline attr sets offline=false"
+        );
+    }
+
     /// Missing per-user `t`: the fan-out event's timestamp falls back to
     /// the stanza-level `t` rather than collapsing to epoch zero (which
     /// was the previous behavior).
@@ -1598,5 +2082,412 @@ mod tests {
             participant_attr
         );
         assert_eq!(participant_attr.to_jid().unwrap(), sender_jid);
+    }
+
+    fn jid(s: &str) -> Jid {
+        s.parse().expect("test JID")
+    }
+
+    #[test]
+    fn played_receipt_group_is_played_with_participant() {
+        let node = build_played_receipt_node(
+            &jid("123@g.us"),
+            Some(&jid("456@s.whatsapp.net")),
+            &["M1"],
+            "100",
+        );
+        assert_eq!(node.tag, "receipt");
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played")
+        );
+        assert_eq!(
+            node.attrs
+                .get("participant")
+                .and_then(|v| v.to_jid().map(|j| j.to_string()))
+                .as_deref(),
+            Some("456@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn played_receipt_dm_is_played_without_participant() {
+        // WA Web drops `participant` in DMs (PlayedReceiptJob `r.isUser() ? null`).
+        let node = build_played_receipt_node(&jid("456@s.whatsapp.net"), None, &["M1"], "100");
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played")
+        );
+        assert!(node.attrs.get("participant").is_none());
+    }
+
+    #[test]
+    fn played_receipt_newsletter_is_played_self() {
+        let node = build_played_receipt_node(&jid("123@newsletter"), None, &["M1"], "100");
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played-self")
+        );
+        assert!(node.attrs.get("participant").is_none());
+    }
+
+    #[test]
+    fn played_receipt_extra_ids_go_into_list() {
+        let node =
+            build_played_receipt_node(&jid("456@s.whatsapp.net"), None, &["M1", "M2", "M3"], "100");
+        assert_eq!(
+            node.attrs.get("id").map(|v| v.as_str()).as_deref(),
+            Some("M1")
+        );
+        let list = node
+            .get_optional_child("list")
+            .expect("extra ids must produce a <list>");
+        assert_eq!(list.children().map(|c| c.len()).unwrap_or(0), 2);
+    }
+
+    #[test]
+    fn played_receipt_status_broadcast_carries_participant() {
+        let node = build_played_receipt_node(
+            &jid("status@broadcast"),
+            Some(&jid("456@s.whatsapp.net")),
+            &["M1"],
+            "100",
+        );
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played")
+        );
+        assert_eq!(
+            node.attrs
+                .get("participant")
+                .and_then(|v| v.to_jid().map(|j| j.to_string()))
+                .as_deref(),
+            Some("456@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn played_receipt_broadcast_list_carries_participant() {
+        let node = build_played_receipt_node(
+            &jid("120363000000000001@broadcast"),
+            Some(&jid("456@s.whatsapp.net")),
+            &["M1"],
+            "100",
+        );
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("played")
+        );
+        assert_eq!(
+            node.attrs
+                .get("participant")
+                .and_then(|v| v.to_jid().map(|j| j.to_string()))
+                .as_deref(),
+            Some("456@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn read_receipt_dm_is_read_without_context() {
+        let node = build_read_receipt_node(&jid("456@s.whatsapp.net"), None, &["M1"], "100", None);
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("read")
+        );
+        assert!(node.attrs.get("context").is_none());
+        assert!(node.attrs.get("peer_participant_pn").is_none());
+    }
+
+    #[test]
+    fn read_receipt_newsletter_is_read_self() {
+        let node = build_read_receipt_node(&jid("123@newsletter"), None, &["M1"], "100", None);
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("read-self")
+        );
+    }
+
+    #[test]
+    fn read_receipt_status_carries_context_and_peer_pn() {
+        let pn = jid("559980000001@s.whatsapp.net");
+        let node = build_read_receipt_node(
+            &jid("status@broadcast"),
+            Some(&jid("100000012345678@lid")),
+            &["M1"],
+            "100",
+            Some(&pn),
+        );
+        assert_eq!(
+            node.attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("read")
+        );
+        assert_eq!(
+            node.attrs.get("context").map(|v| v.as_str()).as_deref(),
+            Some("status")
+        );
+        assert_eq!(
+            node.attrs
+                .get("peer_participant_pn")
+                .and_then(|v| v.to_jid().map(|j| j.to_string()))
+                .as_deref(),
+            Some("559980000001@s.whatsapp.net")
+        );
+    }
+
+    fn offline_info(id: &str, chat: &str, sender: &str, is_group: bool) -> Arc<MessageInfo> {
+        let mut info = info_with(chat, sender, is_group);
+        info.id = id.to_string();
+        info.is_offline = true;
+        Arc::new(info)
+    }
+
+    #[test]
+    fn aggregate_delivery_receipts_group_by_chat_author_and_type() {
+        let group_chat = "120363000000000001@g.us";
+        let mut peer = info_with(
+            "5511999990000@s.whatsapp.net",
+            "5511999990000@s.whatsapp.net",
+            false,
+        );
+        peer.id = "M6".to_string();
+        peer.source.is_from_me = true;
+        peer.category = MessageCategory::Peer;
+
+        let infos = vec![
+            offline_info(
+                "M1",
+                "5511999990000@s.whatsapp.net",
+                "5511999990000@s.whatsapp.net",
+                false,
+            ),
+            offline_info(
+                "M2",
+                "5511999990000@s.whatsapp.net",
+                "5511999990000@s.whatsapp.net",
+                false,
+            ),
+            offline_info("M3", group_chat, "5511888880000@s.whatsapp.net", true),
+            offline_info("M4", group_chat, "5511888880000@s.whatsapp.net", true),
+            offline_info("M5", group_chat, "5511777770000@s.whatsapp.net", true),
+            Arc::new(peer),
+        ];
+
+        let groups = group_delivery_receipts(&infos, true);
+
+        // DM sender, group author A, group author B, and the peer-typed DM
+        // must each get their own stanza; same (chat, author, type) coalesce.
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0].ids, vec!["M1", "M2"]);
+        assert_eq!(groups[1].ids, vec!["M3", "M4"]);
+        assert_eq!(groups[2].ids, vec!["M5"]);
+        assert_eq!(groups[3].ids, vec!["M6"]);
+        assert_eq!(
+            delivery_receipt_type(groups[3].rep, true),
+            Some("peer_msg"),
+            "peer messages must not coalesce into the plain delivered group"
+        );
+    }
+
+    #[test]
+    fn aggregate_delivery_receipt_node_shape_and_ingest_roundtrip() {
+        let infos = vec![
+            offline_info(
+                "M1",
+                "120363000000000001@g.us",
+                "5511888880000@s.whatsapp.net",
+                true,
+            ),
+            offline_info(
+                "M2",
+                "120363000000000001@g.us",
+                "5511888880000@s.whatsapp.net",
+                true,
+            ),
+            offline_info(
+                "M3",
+                "120363000000000001@g.us",
+                "5511888880000@s.whatsapp.net",
+                true,
+            ),
+        ];
+        let groups = group_delivery_receipts(&infos, true);
+        assert_eq!(groups.len(), 1);
+
+        let nodes = build_aggregate_delivery_receipt_nodes(
+            groups[0].rep,
+            &groups[0].ids,
+            true,
+            "1760000000",
+        );
+        assert_eq!(nodes.len(), 1);
+        let node = &nodes[0];
+
+        // WA Web sendAggregateReceipts: id = first, rest in <list><item>,
+        // DELIVERY drops the type attr, t carries the flush timestamp.
+        assert_eq!(node.tag, "receipt");
+        assert_eq!(
+            node.attrs.get("id").map(|v| v.as_str()).as_deref(),
+            Some("M1")
+        );
+        assert_eq!(
+            node.attrs.get("t").map(|v| v.as_str()).as_deref(),
+            Some("1760000000")
+        );
+        assert!(node.attrs.get("type").is_none());
+        assert_eq!(
+            node.attrs.get("to").map(|v| v.as_str()).as_deref(),
+            Some("120363000000000001@g.us")
+        );
+        assert_eq!(
+            node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
+            Some("5511888880000@s.whatsapp.net")
+        );
+
+        // The shape must round-trip through our own ingest parser (the same
+        // form WA Web sends us): list items first, stanza id appended last.
+        let owned = node_to_arc(node.clone());
+        let parsed = wacore::stanza::receipt::collect_simple_message_ids(owned.get(), "M1", false);
+        assert_eq!(
+            parsed,
+            vec!["M2".to_string(), "M3".to_string(), "M1".to_string()]
+        );
+    }
+
+    #[test]
+    fn aggregate_delivery_receipt_chunks_at_256_ids() {
+        let chat = "5511999990000@s.whatsapp.net";
+        let infos: Vec<Arc<MessageInfo>> = (0..257)
+            .map(|i| offline_info(&format!("M{i:03}"), chat, chat, false))
+            .collect();
+        let groups = group_delivery_receipts(&infos, true);
+        assert_eq!(groups.len(), 1);
+
+        let nodes = build_aggregate_delivery_receipt_nodes(
+            groups[0].rep,
+            &groups[0].ids,
+            true,
+            "1760000000",
+        );
+        assert_eq!(nodes.len(), 2, "257 ids must split into 256 + 1 stanzas");
+
+        let first_list_len = nodes[0]
+            .children()
+            .and_then(|c| c.iter().find(|n| n.tag == "list"))
+            .and_then(|l| l.children())
+            .map(|items| items.len());
+        assert_eq!(first_list_len, Some(255), "id attr + 255 list items = 256");
+        assert_eq!(
+            nodes[1].attrs.get("id").map(|v| v.as_str()).as_deref(),
+            Some("M256")
+        );
+        assert!(
+            nodes[1].children().is_none(),
+            "a single-id chunk must not carry an empty <list>"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_receipt_buffer_protocol() {
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        let (client, _rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+        )
+        .await;
+
+        // Offline messages buffer instead of sending 1:1.
+        let info = offline_info(
+            "OFF1",
+            "5511999990000@s.whatsapp.net",
+            "5511999990000@s.whatsapp.net",
+            false,
+        );
+        client.ack_received_message(&info);
+        let info2 = offline_info(
+            "OFF2",
+            "5511999990000@s.whatsapp.net",
+            "5511999990000@s.whatsapp.net",
+            false,
+        );
+        client.ack_received_message(&info2);
+        assert_eq!(
+            client.offline_receipt_buffer.lock().expect("buffer").len(),
+            2
+        );
+
+        // A live (non-offline) message never touches the buffer.
+        let mut live = info_with(
+            "5511999990000@s.whatsapp.net",
+            "5511999990000@s.whatsapp.net",
+            false,
+        );
+        live.id = "LIVE1".to_string();
+        client.ack_received_message(&Arc::new(live));
+        assert_eq!(
+            client.offline_receipt_buffer.lock().expect("buffer").len(),
+            2
+        );
+
+        // Once the completion flag flips, late offline receipts fall back to
+        // 1:1 instead of stranding in the buffer (the exact race this guards).
+        client
+            .offline_sync_completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let late = offline_info(
+            "OFF3",
+            "5511999990000@s.whatsapp.net",
+            "5511999990000@s.whatsapp.net",
+            false,
+        );
+        assert!(!client.try_buffer_offline_receipt(&late));
+        assert_eq!(
+            client.offline_receipt_buffer.lock().expect("buffer").len(),
+            2
+        );
+
+        // Flush drains everything and releases the backing capacity, so no
+        // memory is held between offline windows.
+        client.flush_offline_receipts();
+        {
+            let buffer = client.offline_receipt_buffer.lock().expect("buffer");
+            assert!(buffer.is_empty());
+            assert_eq!(
+                buffer.capacity(),
+                0,
+                "drained buffer must not retain capacity"
+            );
+        }
+
+        // Teardown straggler: a receipt buffered after disconnect()'s drain
+        // (flag still false on the next connection) must be dropped by the
+        // connection-state reset instead of leaking into the next
+        // connection's aggregate flush; the server redelivers its message.
+        client
+            .offline_sync_completed
+            .store(false, std::sync::atomic::Ordering::Release);
+        let straggler = offline_info(
+            "OFF4",
+            "5511999990000@s.whatsapp.net",
+            "5511999990000@s.whatsapp.net",
+            false,
+        );
+        assert!(client.try_buffer_offline_receipt(&straggler));
+        client.clear_offline_receipt_buffer();
+        assert!(
+            client
+                .offline_receipt_buffer
+                .lock()
+                .expect("buffer")
+                .is_empty(),
+            "connection reset must drop stale buffered receipts"
+        );
     }
 }

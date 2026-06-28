@@ -1,0 +1,7 @@
+# Runtime codec tables: the committed `*.bin` (zlib+protobuf) are the build artifacts embedded via
+# include_bytes!. These JSON are the regen source for the seed/cc-blob `.bin` — kept locally to
+# regenerate them (see README.md), not committed.
+/lsf_seed.json
+/pitch_seed.json
+/smpl_cc_blob.json
+/cc_seed.json

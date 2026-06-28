@@ -5,16 +5,64 @@
 
 use crate::client::Client;
 use crate::request::IqError;
-use anyhow::Result;
 use log::debug;
 use std::collections::HashMap;
+use thiserror::Error;
 use wacore::iq::contacts::{ProfilePictureSpec, ProfilePictureType};
 use wacore::iq::usync::{IsOnWhatsAppQueryType, IsOnWhatsAppSpec, IsOnWhatsAppUser, UserInfoSpec};
 use wacore_binary::{Jid, JidExt};
 
 // Re-export types from wacore
 pub use wacore::iq::contacts::ProfilePicture;
-pub use wacore::iq::usync::{IsOnWhatsAppResult, UserInfo};
+pub use wacore::iq::usync::{IsOnWhatsAppResult, UserInfo, UsyncSubprotocolError};
+pub use wacore::stanza::business::VerifiedName;
+
+/// Error returned by contact-information operations (existence checks,
+/// profile pictures, user info).
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ContactError {
+    /// The usync/profile IQ to the server failed.
+    #[error(transparent)]
+    Iq(#[from] IqError),
+    /// An input JID is not supported for this query (only PN and LID are).
+    #[error("unsupported contact JID: {0}")]
+    InvalidJid(String),
+}
+
+fn ensure_is_on_whatsapp_jids_supported(jids: &[Jid]) -> Result<(), ContactError> {
+    if let Some(jid) = jids.iter().find(|jid| !jid.is_pn() && !jid.is_lid()) {
+        return Err(ContactError::InvalidJid(format!(
+            "is_on_whatsapp only supports PN and LID JIDs, got {jid}"
+        )));
+    }
+    Ok(())
+}
+
+/// Mapping extractors as fn items, NOT closures. A closure returning
+/// references tied to its argument is inferred at a concrete lifetime, and
+/// because its type is embedded in the public methods' future types, callers
+/// that box those futures (`#[async_trait]`, `Box<dyn Future + Send>`) hit
+/// "implementation of `FnOnce` is not general enough" (issue #825). Fn items
+/// implement `Fn` for every lifetime by construction.
+/// PN-primary result -> (PN, LID mapping).
+fn forward_lid_pair(r: &IsOnWhatsAppResult) -> (&Jid, Option<&Jid>) {
+    (&r.jid, r.lid.as_ref())
+}
+
+/// LID-primary result inverted to (PN, LID); None when not LID-primary.
+fn reverse_lid_pair(r: &IsOnWhatsAppResult) -> Option<(&Jid, Option<&Jid>)> {
+    if r.jid.is_lid() {
+        r.pn_jid.as_ref().map(|pn| (pn, Some(&r.jid)))
+    } else {
+        None
+    }
+}
+
+/// UserInfo entry -> (queried JID, LID mapping).
+fn user_info_lid_pair(entry: &UserInfo) -> (&Jid, Option<&Jid>) {
+    (&entry.jid, entry.lid.as_ref())
+}
 
 pub struct Contacts<'a> {
     client: &'a Client,
@@ -25,6 +73,10 @@ impl<'a> Contacts<'a> {
         Self { client }
     }
 
+    /// Callers must pass `fn` items (e.g. [`forward_lid_pair`]), NOT
+    /// closures: a closure returning borrowed pairs embeds a non-HRTB type in
+    /// the public caller's future and breaks `#[async_trait]` consumers
+    /// (issue #825, guarded by tests/async_trait_boxed_future_compat.rs).
     async fn persist_lid_mappings<'b, I>(&self, entries: I)
     where
         I: IntoIterator<Item = (&'b Jid, Option<&'b Jid>)>,
@@ -59,10 +111,14 @@ impl<'a> Contacts<'a> {
     /// Accepts both PN JIDs (`Jid::pn("1234567890")`) and LID JIDs (`Jid::lid("100000001")`).
     /// PN and LID queries use different protocols (matching WA Web ExistsJob), so mixed
     /// inputs are split into separate requests.
-    pub async fn is_on_whatsapp(&self, jids: &[Jid]) -> Result<Vec<IsOnWhatsAppResult>> {
+    pub async fn is_on_whatsapp(
+        &self,
+        jids: &[Jid],
+    ) -> Result<Vec<IsOnWhatsAppResult>, ContactError> {
         if jids.is_empty() {
             return Ok(Vec::new());
         }
+        ensure_is_on_whatsapp_jids_supported(jids)?;
 
         debug!("is_on_whatsapp: checking {} JIDs", jids.len());
 
@@ -81,7 +137,11 @@ impl<'a> Contacts<'a> {
                     known_lid: None,
                 });
             } else {
-                log::warn!("is_on_whatsapp: skipping unsupported JID type: {jid}");
+                #[cfg(debug_assertions)]
+                panic!("is_on_whatsapp: unexpected JID type {jid} after validation");
+
+                #[cfg(not(debug_assertions))]
+                continue;
             }
         }
 
@@ -99,16 +159,10 @@ impl<'a> Contacts<'a> {
             results.extend(self.client.execute(spec).await?);
         }
 
-        self.persist_lid_mappings(results.iter().map(|r| (&r.jid, r.lid.as_ref())))
+        self.persist_lid_mappings(results.iter().map(forward_lid_pair))
             .await;
-        self.persist_lid_mappings(results.iter().filter_map(|r| {
-            if r.jid.is_lid() {
-                r.pn_jid.as_ref().map(|pn| (pn, Some(&r.jid)))
-            } else {
-                None
-            }
-        }))
-        .await;
+        self.persist_lid_mappings(results.iter().filter_map(reverse_lid_pair))
+            .await;
 
         Ok(results)
     }
@@ -117,7 +171,7 @@ impl<'a> Contacts<'a> {
         &self,
         jid: &Jid,
         preview: bool,
-    ) -> Result<Option<ProfilePicture>> {
+    ) -> Result<Option<ProfilePicture>, ContactError> {
         debug!(
             "get_profile_picture: fetching {} picture for {}",
             if preview { "preview" } else { "full" },
@@ -133,7 +187,7 @@ impl<'a> Contacts<'a> {
 
         // Skip own JID: server never responds when tctoken is sent for self
         let is_own_jid = {
-            let snap = self.client.persistence_manager.get_device_snapshot().await;
+            let snap = self.client.persistence_manager.get_device_snapshot();
             snap.pn.as_ref().is_some_and(|pn| pn.is_same_user_as(jid))
                 || snap
                     .lid
@@ -149,10 +203,7 @@ impl<'a> Contacts<'a> {
             && self
                 .client
                 .ab_props
-                .is_enabled_or(
-                    wacore::iq::props::config_codes::PROFILE_PIC_PRIVACY_TOKEN,
-                    true,
-                )
+                .is_enabled(wacore::iq::props::stale::PROFILE_PIC_PRIVACY_TOKEN)
                 .await
             && let Some(token) = self.client.lookup_tc_token_for_jid(jid).await
         {
@@ -168,7 +219,10 @@ impl<'a> Contacts<'a> {
         }
     }
 
-    pub async fn get_user_info(&self, jids: &[Jid]) -> Result<HashMap<Jid, UserInfo>> {
+    pub async fn get_user_info(
+        &self,
+        jids: &[Jid],
+    ) -> Result<HashMap<Jid, UserInfo>, ContactError> {
         if jids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -179,7 +233,7 @@ impl<'a> Contacts<'a> {
         let spec = UserInfoSpec::new(jids.to_vec(), request_id);
 
         let info = self.client.execute(spec).await?;
-        self.persist_lid_mappings(info.values().map(|entry| (&entry.jid, entry.lid.as_ref())))
+        self.persist_lid_mappings(info.values().map(user_info_lid_pair))
             .await;
         Ok(info)
     }
@@ -207,5 +261,19 @@ mod tests {
         assert_eq!(pic.id, "123456789");
         assert_eq!(pic.url, "https://example.com/pic.jpg");
         assert!(pic.direct_path.is_some());
+    }
+
+    #[test]
+    fn is_on_whatsapp_accepts_pn_and_lid_jids() {
+        ensure_is_on_whatsapp_jids_supported(&[Jid::pn("15550000001"), Jid::lid("100000001")])
+            .unwrap();
+    }
+
+    #[test]
+    fn is_on_whatsapp_rejects_unsupported_jid_type() {
+        let err = ensure_is_on_whatsapp_jids_supported(&[Jid::group("15550000001-1234567890")])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("only supports PN and LID JIDs"));
     }
 }

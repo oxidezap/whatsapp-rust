@@ -152,6 +152,14 @@ pub struct PollVoteAddressing<'a> {
     pub voter_jid: &'a str,
 }
 
+/// The encrypted vote payload and its GCM IV, paired so the two same-typed
+/// byte slices can't be transposed at a call site.
+#[derive(Debug, Clone, Copy)]
+pub struct PollVoteCiphertext<'a> {
+    pub enc_payload: &'a [u8],
+    pub enc_iv: &'a [u8],
+}
+
 /// Decrypt a poll vote, retrying once under the alternate addressing.
 ///
 /// The creator and voter JIDs key the derivation, so a vote authored under LID
@@ -160,16 +168,14 @@ pub struct PollVoteAddressing<'a> {
 /// retries with both JIDs swapped together (never mixed), matching WA Web
 /// `WAWebAddonEncryption.decryptAddOn`.
 pub fn decrypt_poll_vote_with_fallback(
-    enc_payload: &[u8],
-    iv: &[u8],
+    ciphertext: PollVoteCiphertext<'_>,
     message_secret: &[u8],
     stanza_id: &str,
     primary: PollVoteAddressing<'_>,
     fallback: Option<PollVoteAddressing<'_>>,
 ) -> Result<Vec<Vec<u8>>> {
     match decrypt_poll_vote_with_secret(
-        enc_payload,
-        iv,
+        ciphertext,
         message_secret,
         stanza_id,
         primary.poll_creator_jid,
@@ -178,8 +184,7 @@ pub fn decrypt_poll_vote_with_fallback(
         Ok(v) => Ok(v),
         Err(primary_err) => match fallback {
             Some(fb) => decrypt_poll_vote_with_secret(
-                enc_payload,
-                iv,
+                ciphertext,
                 message_secret,
                 stanza_id,
                 fb.poll_creator_jid,
@@ -240,16 +245,15 @@ where
 /// Decrypt a poll vote given the poll's `messageSecret` directly. Preferred
 /// over the legacy two-step path that splits derive+decrypt.
 pub fn decrypt_poll_vote_with_secret(
-    enc_payload: &[u8],
-    iv: &[u8],
+    ciphertext: PollVoteCiphertext<'_>,
     message_secret: &[u8],
     stanza_id: &str,
     poll_creator_jid: &str,
     voter_jid: &str,
 ) -> Result<Vec<Vec<u8>>> {
     let plaintext = decrypt_addon(
-        enc_payload,
-        iv,
+        ciphertext.enc_payload,
+        ciphertext.enc_iv,
         message_secret,
         &poll_vote_addon_ctx(stanza_id, poll_creator_jid, voter_jid),
     )?;
@@ -347,8 +351,17 @@ mod tests {
 
         let (enc, iv) =
             encrypt_poll_vote_with_secret(&hashes, &secret, stanza_id, creator, voter).unwrap();
-        let out =
-            decrypt_poll_vote_with_secret(&enc, &iv, &secret, stanza_id, creator, voter).unwrap();
+        let out = decrypt_poll_vote_with_secret(
+            PollVoteCiphertext {
+                enc_payload: &enc,
+                enc_iv: &iv,
+            },
+            &secret,
+            stanza_id,
+            creator,
+            voter,
+        )
+        .unwrap();
         assert_eq!(out, hashes);
     }
 
@@ -397,8 +410,10 @@ mod tests {
 
         assert!(
             decrypt_poll_vote_with_secret(
-                &enc,
-                &iv,
+                PollVoteCiphertext {
+                    enc_payload: &enc,
+                    enc_iv: &iv,
+                },
                 &secret,
                 "id",
                 "c@s.whatsapp.net",
@@ -429,8 +444,10 @@ mod tests {
         let creator_lid = "111111111111111@lid";
         let voter_lid = "222222222222222@lid";
         let out = decrypt_poll_vote_with_fallback(
-            &enc,
-            &iv,
+            PollVoteCiphertext {
+                enc_payload: &enc,
+                enc_iv: &iv,
+            },
             &secret,
             stanza_id,
             PollVoteAddressing {
@@ -500,8 +517,10 @@ mod tests {
 
         // Primary matches; a deliberately-wrong fallback must never be reached.
         let out = decrypt_poll_vote_with_fallback(
-            &enc,
-            &iv,
+            PollVoteCiphertext {
+                enc_payload: &enc,
+                enc_iv: &iv,
+            },
             &secret,
             stanza_id,
             PollVoteAddressing {
@@ -531,8 +550,10 @@ mod tests {
         .unwrap();
 
         let err = decrypt_poll_vote_with_fallback(
-            &enc,
-            &iv,
+            PollVoteCiphertext {
+                enc_payload: &enc,
+                enc_iv: &iv,
+            },
             &secret,
             stanza_id,
             PollVoteAddressing {
@@ -563,8 +584,10 @@ mod tests {
         .unwrap();
         assert!(
             decrypt_poll_vote_with_fallback(
-                &enc,
-                &iv,
+                PollVoteCiphertext {
+                    enc_payload: &enc,
+                    enc_iv: &iv,
+                },
                 &secret,
                 "id",
                 PollVoteAddressing {
@@ -589,8 +612,10 @@ mod tests {
         )
         .unwrap();
         let out = decrypt_poll_vote_with_secret(
-            &enc,
-            &iv,
+            PollVoteCiphertext {
+                enc_payload: &enc,
+                enc_iv: &iv,
+            },
             &secret,
             "id",
             "c@s.whatsapp.net",

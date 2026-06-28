@@ -1,5 +1,5 @@
 use crate::stanza::BusinessSubscription;
-use crate::types::call::IncomingCall;
+use crate::types::call::{CallEndedElsewhere, IncomingCall, MissedCall};
 use crate::types::message::MessageInfo;
 use crate::types::presence::{ChatPresence, ChatPresenceMedia, ReceiptType};
 use buffa::Message;
@@ -7,7 +7,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use wacore_binary::Node;
 use wacore_binary::OwnedNodeRef;
 use wacore_binary::{Jid, MessageId};
@@ -15,23 +15,33 @@ use waproto::whatsapp as wa;
 
 /// A lazily-parsed history sync blob.
 ///
-/// Wraps the decompressed protobuf bytes and only decodes on first access.
-/// With `Arc<Event>` dispatch, all handlers share the same `LazyHistorySync`
-/// so `OnceLock` gives parse-once semantics for free.
+/// Carries the original **compressed** payload (one immutable `Bytes`,
+/// typically ~10x smaller than the inflated form), so holding or queueing the
+/// event costs O(compressed) memory. Cheap metadata (`sync_type`,
+/// `chunk_order`, `progress`) is available without touching the payload, and
+/// with `Arc<Event>` dispatch all handlers share the same instance.
 ///
-/// Cheap metadata (`sync_type`, `chunk_order`, `progress`) is available
-/// without decoding — useful for filtering events.
+/// Three ways at the payload, by increasing cost:
+/// - [`stream()`](Self::stream) — conversations one at a time with bounded
+///   memory (peak ≈ the largest single conversation), plus a decoded
+///   remainder for everything else.
+/// - [`decompress()`](Self::decompress) — the raw decompressed protobuf
+///   bytes, inflated per call, for custom partial decoding.
+/// - [`get()`](Self::get) — full decode, cached; later calls are free.
 ///
-/// Call [`get()`](Self::get) when you need the owned `wa::HistorySync` proto;
-/// the decompressed `raw_bytes` are freed on the first successful decode.
+/// A multi-MB chunk takes tens of milliseconds to inflate (plus decode for
+/// `get()`). Inside an async handler, prefer doing that work in
+/// `spawn_blocking` — clone [`compressed_bytes()`](Self::compressed_bytes)
+/// into the closure — when [`decompressed_size()`](Self::decompressed_size)
+/// is large.
 pub struct LazyHistorySync {
-    /// Decompressed protobuf bytes. Taken (freed) once [`get()`](Self::get)
-    /// materializes the owned proto, so the two halves don't coexist (~2x the
-    /// decompressed size) for the event's lifetime.
-    raw_bytes: Mutex<Option<Bytes>>,
-    /// Original decompressed size, kept after `raw_bytes` is freed so Debug and
-    /// [`raw_size()`](Self::raw_size) stay meaningful.
-    raw_size: usize,
+    /// Original zlib-compressed payload. Immutable for the event's lifetime:
+    /// clones are refcount bumps, and every accessor keeps working after
+    /// [`get()`](Self::get) (no take-dance).
+    compressed: Bytes,
+    /// Exact inflated size, counted by the producer's extraction pass; doubles
+    /// as the inflate cap (a tighter anti-bomb bound than the global ceiling).
+    decompressed_size: usize,
     sync_type: i32,
     chunk_order: Option<u32>,
     progress: Option<u32>,
@@ -43,51 +53,38 @@ pub struct LazyHistorySync {
 
 impl Clone for LazyHistorySync {
     fn clone(&self) -> Self {
-        // Common case (not yet decoded): carry the raw bytes for a cheap, lazy
-        // clone. Once `get()` has freed the raw bytes, carry the decoded proto
-        // instead (a deep copy, only when cloning an already-inspected blob) so
-        // the clone stays usable rather than decoding to `None`.
-        let raw = self.locked_raw().clone();
-        let parsed = OnceLock::new();
-        if raw.is_none()
-            && let Some(decoded) = self.parsed.get()
-        {
-            let _ = parsed.set(decoded.clone());
-        }
+        // The decode cache is intentionally not carried over: it would deep-copy
+        // a multi-MB proto. A clone re-inflates on demand from the shared
+        // compressed bytes.
         Self {
-            raw_bytes: Mutex::new(raw),
-            raw_size: self.raw_size,
+            compressed: self.compressed.clone(),
+            decompressed_size: self.decompressed_size,
             sync_type: self.sync_type,
             chunk_order: self.chunk_order,
             progress: self.progress,
             peer_data_request_session_id: self.peer_data_request_session_id.clone(),
-            parsed,
+            parsed: OnceLock::new(),
         }
     }
 }
 
 impl LazyHistorySync {
     pub fn new(
-        raw_bytes: Bytes,
+        compressed: Bytes,
+        decompressed_size: usize,
         sync_type: i32,
         chunk_order: Option<u32>,
         progress: Option<u32>,
     ) -> Self {
         Self {
-            raw_size: raw_bytes.len(),
-            raw_bytes: Mutex::new(Some(raw_bytes)),
+            compressed,
+            decompressed_size,
             sync_type,
             chunk_order,
             progress,
             peer_data_request_session_id: None,
             parsed: OnceLock::new(),
         }
-    }
-
-    /// Lock the raw-bytes slot, recovering from a poisoned mutex (a poison only
-    /// means a prior holder panicked; the `Option<Bytes>` is still valid).
-    fn locked_raw(&self) -> std::sync::MutexGuard<'_, Option<Bytes>> {
-        self.raw_bytes.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn with_peer_data_request_session_id(mut self, id: Option<String>) -> Self {
@@ -111,47 +108,59 @@ impl LazyHistorySync {
         self.progress
     }
 
-    /// `None` for server-pushed syncs (e.g. `INITIAL_BOOTSTRAP`).
+    /// `None` for server-pushed syncs (e.g. `InitialBootstrap`).
     pub fn peer_data_request_session_id(&self) -> Option<&str> {
         self.peer_data_request_session_id.as_deref()
     }
 
-    /// Full decode of the history sync proto, cached via OnceLock.
-    /// Returns `None` if decoding fails.
+    /// The original zlib-compressed payload. Zero-cost access; `Bytes` clones
+    /// share the buffer (hand one to `spawn_blocking` for off-runtime
+    /// consumption).
+    pub fn compressed_bytes(&self) -> &Bytes {
+        &self.compressed
+    }
+
+    /// Exact size of the decompressed blob in bytes, known without inflating.
+    pub fn decompressed_size(&self) -> usize {
+        self.decompressed_size
+    }
+
+    /// Inflate the payload, returning the raw decompressed protobuf bytes for
+    /// custom partial decoding. Inflates on EVERY call (no caching) — hold on
+    /// to the result if it is needed more than once. The exact
+    /// [`decompressed_size`](Self::decompressed_size) caps the inflate, so a
+    /// tampered blob fails instead of over-allocating.
+    pub fn decompress(&self) -> std::io::Result<Bytes> {
+        wacore_binary::zlib_pool::decompress_zlib_pooled(
+            &self.compressed,
+            self.decompressed_size as u64,
+        )
+        .map(Bytes::from)
+    }
+
+    /// Incremental reader over the payload: conversations one at a time, then
+    /// everything else as a decoded remainder, without materializing the whole
+    /// decompressed blob. See [`HistorySyncStream`].
     ///
-    /// On the first successful decode the decompressed `raw_bytes` are freed, so
-    /// only the owned proto is retained afterwards (not ~2x). A consumer that
-    /// needs the raw bytes for partial decoding must read [`raw_bytes()`] before
-    /// calling this; afterwards it returns `None`.
-    ///
-    /// [`raw_bytes()`]: Self::raw_bytes
+    /// [`HistorySyncStream`]: crate::history_sync::HistorySyncStream
+    pub fn stream(&self) -> crate::history_sync::HistorySyncStream<'_> {
+        crate::history_sync::HistorySyncStream::new(&self.compressed, self.decompressed_size as u64)
+    }
+
+    /// Full decode of the history sync proto, cached via OnceLock: the first
+    /// call inflates + decodes, later calls are free. Returns `None` if
+    /// inflating or decoding fails. The compressed payload is kept, so
+    /// [`decompress()`](Self::decompress) and [`stream()`](Self::stream) keep
+    /// working afterwards.
     pub fn get(&self) -> Option<&wa::HistorySync> {
-        let parsed = self.parsed.get_or_init(|| {
-            // Cheap refcount bump; the lock is released before decoding so a
-            // concurrent reader isn't blocked by the parse.
-            let raw = self.locked_raw().clone()?;
-            wa::HistorySync::decode_from_slice(&raw[..])
-                .ok()
-                .map(Box::new)
-        });
-        // Free the raw bytes only AFTER the owned proto is committed, so a
-        // concurrent clone never sees both gone (raw == None implies parsed set).
-        if parsed.is_some() {
-            *self.locked_raw() = None;
-        }
-        parsed.as_deref()
-    }
-
-    /// The raw decompressed protobuf bytes for custom/partial decoding, or
-    /// `None` once [`get()`](Self::get) has consumed them on a successful decode.
-    pub fn raw_bytes(&self) -> Option<Bytes> {
-        self.locked_raw().clone()
-    }
-
-    /// Size of the decompressed blob in bytes, available even after the raw
-    /// bytes have been freed by [`get()`](Self::get).
-    pub fn raw_size(&self) -> usize {
-        self.raw_size
+        self.parsed
+            .get_or_init(|| {
+                let raw = self.decompress().ok()?;
+                wa::HistorySync::decode_from_slice(&raw[..])
+                    .ok()
+                    .map(Box::new)
+            })
+            .as_deref()
     }
 }
 
@@ -165,8 +174,8 @@ impl fmt::Debug for LazyHistorySync {
                 "peer_data_request_session_id",
                 &self.peer_data_request_session_id,
             )
-            .field("raw_size", &self.raw_size)
-            .field("raw_freed", &self.locked_raw().is_none())
+            .field("compressed_size", &self.compressed.len())
+            .field("decompressed_size", &self.decompressed_size)
             .field(
                 "parsed",
                 &self.parsed.get().and_then(|o| o.as_ref()).is_some(),
@@ -199,6 +208,7 @@ impl Serialize for LazyHistorySync {
 /// be at most 64 kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum EventKind {
     Connected,
     Disconnected,
@@ -223,6 +233,8 @@ pub enum EventKind {
     GroupUpdate,
     ContactUpdate,
     IncomingCall,
+    MissedCall,
+    CallEndedElsewhere,
     PushNameUpdate,
     SelfPushNameUpdated,
     PinUpdate,
@@ -231,7 +243,11 @@ pub enum EventKind {
     StarUpdate,
     MarkChatAsReadUpdate,
     DeleteChatUpdate,
+    ClearChatUpdate,
+    UserStatusMuteUpdate,
     DeleteMessageForMeUpdate,
+    LabelEditUpdate,
+    LabelAssociationUpdate,
     HistorySync,
     OfflineSyncPreview,
     OfflineSyncCompleted,
@@ -246,7 +262,20 @@ pub enum EventKind {
     NewsletterLiveUpdate,
     RawNode,
     MexNotification,
+    // When adding a variant, mind the 64-kind ceiling below (EventInterest packs
+    // each discriminant as a bit in a u64) and keep the guard pointing at the
+    // last variant.
 }
+
+impl EventKind {
+    /// Bit-index ceiling: [`EventInterest`] packs each kind's discriminant into a
+    /// `u64`, so there can be at most 64 kinds.
+    pub const CAPACITY: u8 = 64;
+}
+
+// Build-time tripwire: a new variant that would overflow EventInterest's bitmask
+// fails compilation instead of silently corrupting the mask at runtime.
+const _: () = assert!((EventKind::MexNotification as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. The event bus skips
 /// materializing and dispatching events whose kind no handler wants, so a
@@ -283,6 +312,12 @@ impl EventInterest {
     #[inline]
     pub const fn wants(self, kind: EventKind) -> bool {
         self.0 & (1u64 << (kind as u8)) != 0
+    }
+
+    /// Set union, for aggregating the interests of several handlers behind one
+    /// bus registration.
+    pub const fn union(self, other: Self) -> Self {
+        EventInterest(self.0 | other.0)
     }
 }
 
@@ -324,9 +359,22 @@ impl EventHandler for ChannelEventHandler {
     }
 }
 
+/// Immutable snapshot of the registered handlers. `dispatch` clones only the
+/// outer `Arc` (one refcount bump, no `Vec` allocation), then drops the lock and
+/// iterates the snapshot. Handler interest is re-evaluated per dispatch so a
+/// handler whose `interest()` widens at runtime still receives the new kinds.
+#[derive(Default)]
+struct HandlerSnapshot {
+    handlers: Vec<Arc<dyn EventHandler>>,
+}
+
 #[derive(Default, Clone)]
 pub struct CoreEventBus {
-    handlers: Arc<RwLock<Vec<Arc<dyn EventHandler>>>>,
+    // Copy-on-write: the snapshot is only swapped (under the lock) when a
+    // handler is added, which happens at startup. `dispatch` takes a cheap
+    // outer-Arc clone and then drops the lock, so a concurrent `add_handler`
+    // can never invalidate a snapshot a dispatch is iterating.
+    handlers: Arc<RwLock<Arc<HandlerSnapshot>>>,
 }
 
 impl CoreEventBus {
@@ -334,52 +382,52 @@ impl CoreEventBus {
         Self::default()
     }
 
-    pub fn add_handler(&self, handler: Arc<dyn EventHandler>) {
+    fn snapshot(&self) -> Arc<HandlerSnapshot> {
         self.handlers
-            .write()
+            .read()
             .expect("RwLock should not be poisoned")
-            .push(handler);
+            .clone()
+    }
+
+    pub fn add_handler(&self, handler: Arc<dyn EventHandler>) {
+        let mut guard = self
+            .handlers
+            .write()
+            .expect("RwLock should not be poisoned");
+        let current = &**guard;
+        let mut handlers = Vec::with_capacity(current.handlers.len() + 1);
+        handlers.extend(current.handlers.iter().cloned());
+        handlers.push(handler);
+        *guard = Arc::new(HandlerSnapshot { handlers });
     }
 
     /// Returns true if there are any event handlers registered.
     /// Useful for skipping expensive work when no one is listening.
     pub fn has_handlers(&self) -> bool {
-        !self
-            .handlers
-            .read()
-            .expect("RwLock should not be poisoned")
-            .is_empty()
+        !self.snapshot().handlers.is_empty()
     }
 
     /// Whether any registered handler is interested in `kind`. Lets callers
     /// skip producing an event nobody would receive (e.g. retaining a large
     /// `HistorySync` blob when only message-only handlers are registered).
     pub fn has_handler_for(&self, kind: EventKind) -> bool {
-        self.handlers
-            .read()
-            .expect("RwLock should not be poisoned")
+        self.snapshot()
+            .handlers
             .iter()
             .any(|h| h.interest().wants(kind))
     }
 
     pub fn dispatch(&self, event: Event) {
-        let handlers = self
-            .handlers
-            .read()
-            .expect("RwLock should not be poisoned")
-            .clone();
-        if handlers.is_empty() {
-            return;
-        }
-        // Skip materializing the event (Arc) and invoking handlers whose
-        // declared interest excludes this kind. A handler that subscribed to a
-        // few kinds never pays for boxing the events it ignores.
+        let snapshot = self.snapshot();
+        // Skip materializing the event (Arc) when no handler wants this kind. The
+        // interest is re-evaluated here (not read from a cached aggregate) so a
+        // handler whose interest() widens at runtime is never short-circuited out.
         let kind = event.kind();
-        if !handlers.iter().any(|h| h.interest().wants(kind)) {
+        if !snapshot.handlers.iter().any(|h| h.interest().wants(kind)) {
             return;
         }
         let event = Arc::new(event);
-        for handler in &handlers {
+        for handler in &snapshot.handlers {
             if handler.interest().wants(kind) {
                 handler.handle_event(Arc::clone(&event));
             }
@@ -459,6 +507,10 @@ pub struct IdentityChange {
     /// Optional LID for the user
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lid_user: Option<Jid>,
+    /// `true` when detected locally while saving a peer's new identity during
+    /// decrypt (mirrors WA Web `saveIdentity` -> `handleNewIdentity`), `false`
+    /// when triggered by the server's `<identity/>` notification.
+    pub implicit: bool,
 }
 
 /// Type of business status update.
@@ -592,6 +644,16 @@ pub enum Event {
     /// reject, terminate). Mirror of WA Web's inbound call signaling.
     IncomingCall(IncomingCall),
 
+    /// A call that must not ring (e.g. an offer replayed from the offline queue on reconnect).
+    /// Surfaced separately from [`IncomingCall`] so a consumer cannot accidentally auto-accept a
+    /// dead call. Mirror of WA Web's `cancel_call` + `missed_call`.
+    MissedCall(MissedCall),
+
+    /// An incoming call we were ringing for was answered/declined on another of our devices, so the
+    /// caller dismissed this one. Distinct from [`MissedCall`] -- mirrors WA Web's AcceptedElsewhere /
+    /// Rejected call-log outcomes (`<terminate reason="accepted_elsewhere"|"rejected_elsewhere">`).
+    CallEndedElsewhere(CallEndedElsewhere),
+
     PushNameUpdate(PushNameUpdate),
     SelfPushNameUpdated(SelfPushNameUpdated),
     PinUpdate(PinUpdate),
@@ -600,7 +662,11 @@ pub enum Event {
     StarUpdate(StarUpdate),
     MarkChatAsReadUpdate(MarkChatAsReadUpdate),
     DeleteChatUpdate(DeleteChatUpdate),
+    ClearChatUpdate(ClearChatUpdate),
+    UserStatusMuteUpdate(UserStatusMuteUpdate),
     DeleteMessageForMeUpdate(DeleteMessageForMeUpdate),
+    LabelEditUpdate(LabelEditUpdate),
+    LabelAssociationUpdate(LabelAssociationUpdate),
 
     HistorySync(Box<LazyHistorySync>),
     OfflineSyncPreview(OfflineSyncPreview),
@@ -677,6 +743,8 @@ impl Event {
             Event::GroupUpdate(_) => EventKind::GroupUpdate,
             Event::ContactUpdate(_) => EventKind::ContactUpdate,
             Event::IncomingCall(_) => EventKind::IncomingCall,
+            Event::MissedCall(_) => EventKind::MissedCall,
+            Event::CallEndedElsewhere(_) => EventKind::CallEndedElsewhere,
             Event::PushNameUpdate(_) => EventKind::PushNameUpdate,
             Event::SelfPushNameUpdated(_) => EventKind::SelfPushNameUpdated,
             Event::PinUpdate(_) => EventKind::PinUpdate,
@@ -685,7 +753,11 @@ impl Event {
             Event::StarUpdate(_) => EventKind::StarUpdate,
             Event::MarkChatAsReadUpdate(_) => EventKind::MarkChatAsReadUpdate,
             Event::DeleteChatUpdate(_) => EventKind::DeleteChatUpdate,
+            Event::ClearChatUpdate(_) => EventKind::ClearChatUpdate,
+            Event::UserStatusMuteUpdate(_) => EventKind::UserStatusMuteUpdate,
             Event::DeleteMessageForMeUpdate(_) => EventKind::DeleteMessageForMeUpdate,
+            Event::LabelEditUpdate(_) => EventKind::LabelEditUpdate,
+            Event::LabelAssociationUpdate(_) => EventKind::LabelAssociationUpdate,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -928,6 +1000,10 @@ pub struct Receipt {
     pub message_ids: Vec<MessageId>,
     pub timestamp: DateTime<Utc>,
     pub r#type: ReceiptType,
+    /// True when the receipt carried the `offline` attribute, i.e. it was drained
+    /// from the server's offline queue on reconnect rather than delivered live.
+    /// Mirrors WA Web `incomingMsgReceiptParser` (`offline: maybeAttrString`).
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1121,6 +1197,32 @@ pub struct DeleteChatUpdate {
     pub from_full_sync: bool,
 }
 
+/// A chat's messages were cleared (kept) on a linked device.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClearChatUpdate {
+    /// The chat being cleared.
+    pub jid: Jid,
+    /// From the index, not the proto — ClearChatAction only has messageRange.
+    pub delete_starred: bool,
+    /// From the index, not the proto.
+    pub delete_media: bool,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::ClearChatAction>,
+    pub from_full_sync: bool,
+}
+
+/// A contact/group/newsletter's status updates were muted/unmuted on a linked device.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserStatusMuteUpdate {
+    /// The entity whose status was (un)muted.
+    pub jid: Jid,
+    /// `true` = status muted, `false` = unmuted.
+    pub muted: bool,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::UserStatusMuteAction>,
+    pub from_full_sync: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeleteMessageForMeUpdate {
     /// The chat containing the deleted message.
@@ -1133,29 +1235,63 @@ pub struct DeleteMessageForMeUpdate {
     pub from_full_sync: bool,
 }
 
+/// A label was created, renamed/recolored, or deleted on a linked device.
+/// `action.deleted == Some(true)` means the label was removed.
+#[derive(Debug, Clone, Serialize)]
+pub struct LabelEditUpdate {
+    /// The label identifier (the index key, not a JID).
+    pub label_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::LabelEditAction>,
+    pub from_full_sync: bool,
+}
+
+/// A label was associated with or removed from a chat on a linked device.
+/// `action.labeled == Some(true)` means the label was added to the chat.
+#[derive(Debug, Clone, Serialize)]
+pub struct LabelAssociationUpdate {
+    /// The label identifier.
+    pub label_id: String,
+    /// The chat the label was associated with or removed from.
+    pub chat_jid: Jid,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::LabelAssociationAction>,
+    pub from_full_sync: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use buffa::Message;
     use waproto::whatsapp as wa;
 
-    /// Build a HistorySync proto with conversations and encode it.
-    fn make_history_sync_bytes(conversations: Vec<wa::Conversation>) -> Vec<u8> {
+    /// Build a HistorySync proto with conversations, returning its
+    /// zlib-compressed wire form plus the exact decompressed size.
+    fn make_compressed_history_sync(conversations: Vec<wa::Conversation>) -> (Bytes, usize) {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap,
             conversations,
             ..Default::default()
         };
-        hs.encode_to_vec()
+        let raw = hs.encode_to_vec();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).unwrap();
+        (Bytes::from(encoder.finish().unwrap()), raw.len())
+    }
+
+    fn lazy_from(conversations: Vec<wa::Conversation>) -> LazyHistorySync {
+        let (compressed, raw_len) = make_compressed_history_sync(conversations);
+        LazyHistorySync::new(compressed, raw_len, 0, None, None)
     }
 
     #[test]
     fn lazy_history_sync_get_decodes() {
-        let bytes = make_history_sync_bytes(vec![wa::Conversation {
+        let lazy = lazy_from(vec![wa::Conversation {
             id: "chat@s.whatsapp.net".to_string(),
             ..Default::default()
         }]);
-        let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
 
         let hs = lazy.get().expect("should decode");
         assert_eq!(hs.conversations.len(), 1);
@@ -1164,11 +1300,10 @@ mod tests {
 
     #[test]
     fn lazy_history_sync_caches_decode() {
-        let bytes = make_history_sync_bytes(vec![wa::Conversation {
+        let lazy = lazy_from(vec![wa::Conversation {
             id: "test@g.us".to_string(),
             ..Default::default()
         }]);
-        let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
 
         let first = lazy.get().expect("first decode");
         let second = lazy.get().expect("second decode");
@@ -1178,22 +1313,24 @@ mod tests {
 
     #[test]
     fn lazy_history_sync_cheap_metadata() {
-        let bytes = make_history_sync_bytes(vec![]);
-        let lazy = LazyHistorySync::new(Bytes::from(bytes), 3, Some(2), Some(50));
+        let (compressed, raw_len) = make_compressed_history_sync(vec![]);
+        let lazy = LazyHistorySync::new(compressed.clone(), raw_len, 3, Some(2), Some(50));
 
         assert_eq!(lazy.sync_type(), 3);
         assert_eq!(lazy.chunk_order(), Some(2));
         assert_eq!(lazy.progress(), Some(50));
+        assert_eq!(lazy.decompressed_size(), raw_len);
+        assert_eq!(lazy.compressed_bytes(), &compressed);
     }
 
     #[test]
     fn lazy_history_sync_peer_data_request_session_id() {
-        let bytes = make_history_sync_bytes(vec![]);
+        let (compressed, raw_len) = make_compressed_history_sync(vec![]);
 
-        let unset = LazyHistorySync::new(Bytes::from(bytes.clone()), 0, None, None);
+        let unset = LazyHistorySync::new(compressed.clone(), raw_len, 0, None, None);
         assert_eq!(unset.peer_data_request_session_id(), None);
 
-        let set = LazyHistorySync::new(Bytes::from(bytes), 0, None, None)
+        let set = LazyHistorySync::new(compressed, raw_len, 0, None, None)
             .with_peer_data_request_session_id(Some("session-123".to_string()));
         assert_eq!(set.peer_data_request_session_id(), Some("session-123"));
 
@@ -1203,84 +1340,96 @@ mod tests {
     }
 
     #[test]
-    fn lazy_history_sync_raw_bytes() {
-        let bytes = make_history_sync_bytes(vec![wa::Conversation {
+    fn lazy_history_sync_decompress_yields_raw_proto() {
+        let lazy = lazy_from(vec![wa::Conversation {
             id: "raw@s.whatsapp.net".to_string(),
             ..Default::default()
         }]);
-        let raw = bytes.clone();
-        let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
 
-        assert_eq!(lazy.raw_bytes().as_deref(), Some(&raw[..]));
-
-        // Consumer can partial-decode from raw_bytes
-        let raw_bytes = lazy.raw_bytes().expect("raw still present before get()");
-        let decoded = wa::HistorySync::decode_from_slice(&raw_bytes[..]).expect("should decode");
+        // Consumer can partial-decode from the inflated bytes.
+        let raw = lazy.decompress().expect("inflates");
+        assert_eq!(raw.len(), lazy.decompressed_size());
+        let decoded = wa::HistorySync::decode_from_slice(&raw[..]).expect("should decode");
         assert_eq!(decoded.conversations[0].id, "raw@s.whatsapp.net");
+
+        // No caching: a second call inflates again and matches.
+        assert_eq!(lazy.decompress().expect("inflates again"), raw);
     }
 
     #[test]
-    fn lazy_history_sync_get_frees_raw_bytes() {
-        let bytes = make_history_sync_bytes(vec![wa::Conversation {
-            id: "freed@s.whatsapp.net".to_string(),
+    fn lazy_history_sync_everything_keeps_working_after_get() {
+        let lazy = lazy_from(vec![wa::Conversation {
+            id: "kept@s.whatsapp.net".to_string(),
             ..Default::default()
         }]);
-        let raw_len = bytes.len();
-        let lazy = LazyHistorySync::new(Bytes::from(bytes), 7, Some(1), Some(42));
 
-        assert!(lazy.raw_bytes().is_some(), "raw present before get()");
         assert_eq!(
             lazy.get().expect("decodes").conversations[0].id,
-            "freed@s.whatsapp.net"
+            "kept@s.whatsapp.net"
         );
 
-        // The decompressed bytes are released once the owned proto exists.
-        assert!(
-            lazy.raw_bytes().is_none(),
-            "raw freed after a successful get()"
-        );
-        // Metadata survives the free.
-        assert_eq!(lazy.raw_size(), raw_len);
-        assert_eq!(lazy.sync_type(), 7);
-        assert_eq!(lazy.chunk_order(), Some(1));
-        assert_eq!(lazy.progress(), Some(42));
-        // get() still returns the cached proto after raw is gone.
+        // The compressed payload is kept: decompress() and stream() still work
+        // after a successful get() (the old take-dance surprise is gone).
+        let raw = lazy.decompress().expect("decompress after get()");
+        assert_eq!(raw.len(), lazy.decompressed_size());
+        let mut stream = lazy.stream();
+        let conversation = stream
+            .next_conversation()
+            .expect("stream after get()")
+            .expect("one conversation");
+        assert_eq!(conversation.id, "kept@s.whatsapp.net");
+    }
+
+    #[test]
+    fn lazy_history_sync_stream_iterates_conversations() {
+        let lazy = lazy_from(vec![
+            wa::Conversation {
+                id: "first@s.whatsapp.net".to_string(),
+                ..Default::default()
+            },
+            wa::Conversation {
+                id: "second@s.whatsapp.net".to_string(),
+                ..Default::default()
+            },
+        ]);
+
+        let mut stream = lazy.stream();
         assert_eq!(
-            lazy.get().expect("cached").conversations[0].id,
-            "freed@s.whatsapp.net"
+            stream.next_conversation().unwrap().unwrap().id,
+            "first@s.whatsapp.net"
+        );
+        assert_eq!(
+            stream.next_conversation().unwrap().unwrap().id,
+            "second@s.whatsapp.net"
+        );
+        assert!(stream.next_conversation().unwrap().is_none());
+        let remainder = stream.remainder().expect("remainder decodes");
+        assert!(remainder.conversations.is_empty());
+        assert_eq!(
+            remainder.sync_type,
+            wa::history_sync::HistorySyncType::InitialBootstrap
         );
     }
 
     #[test]
-    fn lazy_history_sync_keeps_raw_when_decode_fails() {
-        // A corrupt blob fails to decode; raw is kept so partial decode / retry
-        // remains possible (only a successful decode frees it).
-        let lazy = LazyHistorySync::new(Bytes::from_static(&[0xFF, 0xFF, 0xFF]), 0, None, None);
-        assert!(lazy.get().is_none());
-        assert!(
-            lazy.raw_bytes().is_some(),
-            "raw must survive a failed decode"
-        );
-    }
-
-    #[test]
-    fn lazy_history_sync_clone_after_get_stays_decodable() {
-        let bytes = make_history_sync_bytes(vec![wa::Conversation {
+    fn lazy_history_sync_clone_is_cheap_and_redecodes() {
+        let lazy = lazy_from(vec![wa::Conversation {
             id: "cloned@s.whatsapp.net".to_string(),
             ..Default::default()
         }]);
-        let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
 
-        // Decode on the original, which frees its raw bytes.
+        // Decode on the original; the clone shares the compressed buffer (no
+        // deep copy) and re-decodes on demand (the cache isn't carried over).
         assert_eq!(
             lazy.get().expect("decodes").conversations[0].id,
             "cloned@s.whatsapp.net"
         );
-        assert!(lazy.raw_bytes().is_none());
-
-        // A clone taken AFTER the original decoded must still yield the history
-        // (the decoded proto is carried over since the raw bytes are gone).
         let cloned = lazy.clone();
+        assert_eq!(
+            cloned.compressed_bytes().as_ptr(),
+            lazy.compressed_bytes().as_ptr(),
+            "clone shares the compressed buffer"
+        );
         assert_eq!(
             cloned.get().expect("clone still decodes").conversations[0].id,
             "cloned@s.whatsapp.net"
@@ -1288,33 +1437,33 @@ mod tests {
     }
 
     #[test]
-    fn lazy_history_sync_clone_before_get_is_lazy() {
-        let bytes = make_history_sync_bytes(vec![wa::Conversation {
-            id: "lazyclone@s.whatsapp.net".to_string(),
-            ..Default::default()
-        }]);
-        let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
-
-        // Cloning before any decode carries the raw bytes (cheap, still lazy).
-        let cloned = lazy.clone();
-        assert!(cloned.raw_bytes().is_some(), "lazy clone carries raw");
-        assert_eq!(
-            cloned.get().expect("decodes").conversations[0].id,
-            "lazyclone@s.whatsapp.net"
-        );
-    }
-
-    #[test]
-    fn lazy_history_sync_empty_bytes_decodes_default() {
-        // Empty protobuf bytes are valid — decode to default HistorySync
-        let lazy = LazyHistorySync::new(Bytes::new(), 0, None, None);
-        let hs = lazy.get().expect("empty bytes decode to default");
+    fn lazy_history_sync_empty_proto_decodes_default() {
+        // A zero-conversation HistorySync still inflates and decodes.
+        let lazy = lazy_from(vec![]);
+        let hs = lazy.get().expect("decodes");
         assert!(hs.conversations.is_empty());
     }
 
     #[test]
     fn lazy_history_sync_corrupt_bytes_returns_none() {
-        let lazy = LazyHistorySync::new(Bytes::from_static(&[0xFF, 0xFF, 0xFF]), 0, None, None);
+        // Not a zlib stream: inflating fails, get() yields None, and the
+        // payload stays available for inspection.
+        let lazy = LazyHistorySync::new(Bytes::from_static(&[0xFF, 0xFF, 0xFF]), 16, 0, None, None);
+        assert!(lazy.get().is_none());
+        assert!(lazy.decompress().is_err());
+        assert_eq!(lazy.compressed_bytes().len(), 3);
+    }
+
+    #[test]
+    fn lazy_history_sync_undersized_cap_fails_loud() {
+        // A decompressed_size below the real inflated size trips the inflate
+        // cap instead of silently over-allocating past the producer's count.
+        let (compressed, raw_len) = make_compressed_history_sync(vec![wa::Conversation {
+            id: "capped@s.whatsapp.net".to_string(),
+            ..Default::default()
+        }]);
+        let lazy = LazyHistorySync::new(compressed, raw_len - 1, 0, None, None);
+        assert!(lazy.decompress().is_err());
         assert!(lazy.get().is_none());
     }
 
@@ -1336,8 +1485,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let bytes = make_history_sync_bytes(vec![conv]);
-        let lazy = LazyHistorySync::new(Bytes::from(bytes), 0, None, None);
+        let lazy = lazy_from(vec![conv]);
 
         let hs = lazy.get().expect("should decode");
         assert_eq!(hs.conversations[0].messages.len(), 1);
@@ -1436,5 +1584,155 @@ mod tests {
         bus2.add_handler(Arc::new(Counter));
         bus2.dispatch(Event::Connected(Connected));
         assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dispatch_respects_dynamically_widened_interest() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A handler whose interest() widens after registration. dispatch must
+        // re-read interest each time (never a stale cached aggregate), so the
+        // newly-wanted kind is delivered.
+        struct Dynamic {
+            interest: Mutex<EventInterest>,
+            hits: AtomicUsize,
+        }
+        impl EventHandler for Dynamic {
+            fn handle_event(&self, _: Arc<Event>) {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+            }
+            fn interest(&self) -> EventInterest {
+                *self.interest.lock().unwrap()
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let h = Arc::new(Dynamic {
+            interest: Mutex::new(EventInterest::of(&[EventKind::Message])),
+            hits: AtomicUsize::new(0),
+        });
+        bus.add_handler(h.clone());
+
+        // Not yet interested in Connected: dropped before materialization.
+        bus.dispatch(Event::Connected(Connected));
+        assert_eq!(h.hits.load(Ordering::SeqCst), 0);
+        assert!(!bus.has_handler_for(EventKind::Connected));
+
+        // Widen interest at runtime.
+        *h.interest.lock().unwrap() = EventInterest::ALL;
+        assert!(bus.has_handler_for(EventKind::Connected));
+        bus.dispatch(Event::Connected(Connected));
+        assert_eq!(
+            h.hits.load(Ordering::SeqCst),
+            1,
+            "a handler whose interest widened at runtime must receive the newly-wanted kind"
+        );
+    }
+
+    #[test]
+    fn aggregate_interest_and_has_handler_for() {
+        struct Narrow(EventInterest);
+        impl EventHandler for Narrow {
+            fn handle_event(&self, _: Arc<Event>) {}
+            fn interest(&self) -> EventInterest {
+                self.0
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        // Empty bus: nothing is wanted and there are no handlers.
+        assert!(!bus.has_handlers());
+        assert!(!bus.has_handler_for(EventKind::Message));
+        assert!(!bus.has_handler_for(EventKind::Receipt));
+
+        bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Message]))));
+        assert!(bus.has_handlers());
+        assert!(bus.has_handler_for(EventKind::Message));
+        assert!(!bus.has_handler_for(EventKind::Receipt));
+
+        // has_handler_for is true once any registered handler wants the kind.
+        bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Receipt]))));
+        assert!(bus.has_handler_for(EventKind::Message));
+        assert!(bus.has_handler_for(EventKind::Receipt));
+        assert!(!bus.has_handler_for(EventKind::Connected));
+    }
+
+    #[test]
+    fn dispatch_preserves_handler_ordering() {
+        use std::sync::Mutex;
+
+        struct Tagged {
+            id: u32,
+            log: Arc<Mutex<Vec<u32>>>,
+        }
+        impl EventHandler for Tagged {
+            fn handle_event(&self, _: Arc<Event>) {
+                self.log.lock().unwrap().push(self.id);
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        for id in 0..5u32 {
+            bus.add_handler(Arc::new(Tagged {
+                id,
+                log: log.clone(),
+            }));
+        }
+        bus.dispatch(Event::Connected(Connected));
+        // Copy-on-write rebuilds must keep registration order intact.
+        assert_eq!(*log.lock().unwrap(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn dispatch_is_reentrancy_safe_against_concurrent_add() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A handler that registers another handler while it is being dispatched.
+        // The snapshot taken by `dispatch` must outlive the swap, so the newly
+        // added handler is NOT invoked for the in-flight event and the iteration
+        // does not observe a mutated list.
+        struct AddsDuringDispatch {
+            bus: CoreEventBus,
+            invocations: Arc<AtomicUsize>,
+            added: Mutex<bool>,
+        }
+        impl EventHandler for AddsDuringDispatch {
+            fn handle_event(&self, _: Arc<Event>) {
+                self.invocations.fetch_add(1, Ordering::SeqCst);
+                let mut added = self.added.lock().unwrap();
+                if !*added {
+                    *added = true;
+                    struct Late(Arc<AtomicUsize>);
+                    impl EventHandler for Late {
+                        fn handle_event(&self, _: Arc<Event>) {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    self.bus
+                        .add_handler(Arc::new(Late(self.invocations.clone())));
+                }
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        bus.add_handler(Arc::new(AddsDuringDispatch {
+            bus: bus.clone(),
+            invocations: invocations.clone(),
+            added: Mutex::new(false),
+        }));
+
+        // First dispatch: only the original handler runs, even though it adds a
+        // second handler mid-flight.
+        bus.dispatch(Event::Connected(Connected));
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(bus.snapshot().handlers.len(), 2);
+
+        // Second dispatch sees both handlers (original adds nothing new now).
+        bus.dispatch(Event::Connected(Connected));
+        assert_eq!(invocations.load(Ordering::SeqCst), 3);
     }
 }

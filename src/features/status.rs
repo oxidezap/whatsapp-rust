@@ -3,7 +3,7 @@ use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
 use crate::client::Client;
-use crate::send::SendResult;
+use crate::send::{SendError, SendResult};
 use crate::upload::UploadResponse;
 
 /// Privacy setting sent in the `<meta>` node of the status stanza.
@@ -52,7 +52,7 @@ impl<'a> Status<'a> {
         font: wa::message::extended_text_message::FontType,
         recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         let message = wa::Message {
             extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some(text.to_string()),
@@ -79,22 +79,15 @@ impl<'a> Status<'a> {
         caption: Option<&str>,
         recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
-        let message = wa::Message {
-            image_message: buffa::MessageField::some(wa::message::ImageMessage {
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key.to_vec()),
-                file_sha256: Some(upload.file_sha256.to_vec()),
-                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
-                file_length: Some(upload.file_length),
-                mimetype: Some("image/jpeg".to_string()),
-                jpeg_thumbnail: Some(thumbnail),
+    ) -> Result<SendResult, SendError> {
+        let message = crate::media::image_message(
+            upload,
+            crate::media::ImageOptions {
                 caption: caption.map(|c| c.to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+                jpeg_thumbnail: Some(thumbnail),
+                mimetype: None,
+            },
+        );
 
         self.client
             .send_status_message(message, recipients, options)
@@ -113,23 +106,17 @@ impl<'a> Status<'a> {
         caption: Option<&str>,
         recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
-        let message = wa::Message {
-            video_message: buffa::MessageField::some(wa::message::VideoMessage {
-                url: Some(upload.url),
-                direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key.to_vec()),
-                file_sha256: Some(upload.file_sha256.to_vec()),
-                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
-                file_length: Some(upload.file_length),
-                mimetype: Some("video/mp4".to_string()),
-                jpeg_thumbnail: Some(thumbnail),
-                seconds: Some(duration_seconds),
+    ) -> Result<SendResult, SendError> {
+        let message = crate::media::video_message(
+            upload,
+            crate::media::VideoOptions {
                 caption: caption.map(|c| c.to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+                jpeg_thumbnail: Some(thumbnail),
+                duration_seconds: Some(duration_seconds),
+                mimetype: None,
+                gif_playback: None,
+            },
+        );
 
         self.client
             .send_status_message(message, recipients, options)
@@ -144,7 +131,7 @@ impl<'a> Status<'a> {
         message: wa::Message,
         recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         self.client
             .send_status_message(message, recipients, options)
             .await
@@ -159,7 +146,7 @@ impl<'a> Status<'a> {
         message_id: impl Into<String>,
         recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<SendResult, anyhow::Error> {
+    ) -> Result<SendResult, SendError> {
         let message_id = message_id.into();
         let to = Jid::status_broadcast();
 

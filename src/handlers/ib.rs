@@ -36,6 +36,10 @@ impl StanzaHandler for IbHandler {
     }
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.recv.ib", level = "debug", skip_all)
+)]
 async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) {
     for child in node.children().unwrap_or_default() {
         match child.tag.as_ref() {

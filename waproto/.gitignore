@@ -2,3 +2,5 @@
 # The tracked source of truth is whatsapp.proto + whatsapp.desc.
 whatsapp.rs
 src/whatsapp.rs
+tags.rs
+src/tags.rs

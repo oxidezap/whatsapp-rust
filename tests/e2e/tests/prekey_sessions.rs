@@ -42,7 +42,6 @@ async fn test_prekey_collision_regression() -> anyhow::Result<()> {
     let recipient_jid = recipient
         .client
         .get_pn()
-        .await
         .expect("Recipient should have a JID")
         .to_non_ad();
     info!("Recipient JID: {recipient_jid}");

@@ -642,13 +642,17 @@ impl SessionRecord {
             .iter()
             .take(limit)
             .map(|sv| sv.to_owned_message())
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(|_| InvalidSessionError("failed to decode archived session protobuf"))?;
 
         Ok(Self {
             current_session: view
                 .current_session
                 .as_option()
-                .map(|sv| sv.to_owned_message().into()),
+                .map(|sv| sv.to_owned_message())
+                .transpose()
+                .map_err(|_| InvalidSessionError("failed to decode current session protobuf"))?
+                .map(Into::into),
             previous_sessions: Arc::new(previous_sessions),
         })
     }

@@ -2,15 +2,35 @@
 //!
 //! Provides APIs for changing push name (display name) and status text (about).
 
-use crate::client::Client;
+use crate::client::{Client, ClientError};
+use crate::request::IqError;
 use crate::store::commands::DeviceCommand;
 use anyhow::Result;
 use log::{debug, warn};
+use thiserror::Error;
 use wacore::iq::contacts::SetProfilePictureSpec;
 use wacore::iq::profile::SetStatusTextSpec;
 use wacore_binary::builder::NodeBuilder;
 
 pub use wacore::iq::contacts::SetProfilePictureResponse;
+
+/// Error returned by own-profile operations (push name, status text, picture).
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ProfileError {
+    /// An IQ to the server failed (status text / profile picture).
+    #[error(transparent)]
+    Iq(#[from] IqError),
+    /// Connection/transport failure sending a stanza (push-name presence).
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    /// A provided argument is invalid (e.g. an empty push name).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    /// Catch-all for internal failures with no dedicated variant.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
 
 /// Feature handle for profile operations.
 pub struct Profile<'a> {
@@ -32,7 +52,7 @@ impl<'a> Profile<'a> {
     /// ```
     ///
     /// Note: This sets the profile "About" text, not ephemeral text status updates.
-    pub async fn set_status_text(&self, text: &str) -> Result<()> {
+    pub async fn set_status_text(&self, text: &str) -> Result<(), ProfileError> {
         debug!("Setting status text (length={})", text.len());
 
         self.client.execute(SetStatusTextSpec::new(text)).await?;
@@ -54,9 +74,11 @@ impl<'a> Profile<'a> {
     /// ```xml
     /// <presence name="New Name"/>
     /// ```
-    pub async fn set_push_name(&self, name: &str) -> Result<()> {
+    pub async fn set_push_name(&self, name: &str) -> Result<(), ProfileError> {
         if name.is_empty() {
-            return Err(anyhow::anyhow!("Push name cannot be empty"));
+            return Err(ProfileError::InvalidArgument(
+                "push name cannot be empty".into(),
+            ));
         }
 
         debug!("Setting push name (length={})", name.len());
@@ -90,6 +112,9 @@ impl<'a> Profile<'a> {
     /// Sends a JPEG image as the new profile picture. The image should already
     /// be properly sized/cropped by the caller (WhatsApp typically uses 640x640).
     ///
+    /// Passing empty `image_data` **removes** the picture (matching WhatsApp Web);
+    /// call [`Profile::remove_profile_picture`] when removal is the intent.
+    ///
     /// ## Wire Format
     /// ```xml
     /// <iq type="set" xmlns="w:profile:picture" to="s.whatsapp.net">
@@ -99,16 +124,17 @@ impl<'a> Profile<'a> {
     pub async fn set_profile_picture(
         &self,
         image_data: Vec<u8>,
-    ) -> Result<SetProfilePictureResponse> {
+    ) -> Result<SetProfilePictureResponse, ProfileError> {
+        // for_own routes empty bytes to the remove path, matching WA Web; no panic.
         debug!("Setting profile picture (size={} bytes)", image_data.len());
         Ok(self
             .client
-            .execute(SetProfilePictureSpec::set_own(image_data))
+            .execute(SetProfilePictureSpec::for_own(image_data))
             .await?)
     }
 
     /// Remove the user's own profile picture.
-    pub async fn remove_profile_picture(&self) -> Result<SetProfilePictureResponse> {
+    pub async fn remove_profile_picture(&self) -> Result<SetProfilePictureResponse, ProfileError> {
         debug!("Removing profile picture");
         Ok(self
             .client
@@ -118,11 +144,8 @@ impl<'a> Profile<'a> {
 
     /// Build and send the `setting_pushName` app state mutation.
     async fn send_push_name_mutation(&self, name: &str) -> Result<()> {
-        use rand::Rng;
-        use wacore::appstate::encode::encode_record;
+        use wacore::appstate::schemas;
         use waproto::whatsapp as wa;
-
-        let index = serde_json::to_vec(&["setting_pushName"])?;
 
         let value = wa::SyncActionValue {
             push_name_setting: buffa::MessageField::some(wa::sync_action_value::PushNameSetting {
@@ -131,36 +154,11 @@ impl<'a> Profile<'a> {
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
-
-        // Get the latest sync key for encryption
-        let proc = self.client.get_app_state_processor().await;
-        let key_id = proc
-            .backend
-            .get_latest_sync_key_id()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?
-            .ok_or_else(|| anyhow::anyhow!("No app state sync key available"))?;
-        let keys = proc.get_app_state_key(&key_id).await?;
-
-        // Generate random IV
-        let mut iv = [0u8; 16];
-        rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
-
-        let (mutation, _) = encode_record(
-            wa::syncd_mutation::SyncdOperation::SET,
-            &index,
-            &value,
-            &keys,
-            &key_id,
-            &iv,
-        );
-
+        // setting_pushName's index has no args (collection/version come from the schema).
         self.client
-            .send_app_state_patch(
-                wacore::appstate::patch_decode::WAPatchName::CriticalBlock.as_str(),
-                vec![mutation],
-            )
-            .await
+            .send_app_state_action(&schemas::SETTING_PUSH_NAME, &[], &value)
+            .await?;
+        Ok(())
     }
 }
 

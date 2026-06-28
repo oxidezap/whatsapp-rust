@@ -1,17 +1,7 @@
-//! Unified cache type that dispatches to moka or the portable implementation
-//! depending on the `moka-cache` feature flag.
+//! The client's in-process cache type.
 //!
-//! When `moka-cache` is enabled (default), [`Cache`] is `moka::future::Cache`.
-//! When disabled, [`Cache`] is [`PortableCache`](crate::portable_cache::PortableCache).
+//! Backed by [`PortableCache`](crate::portable_cache::PortableCache): a
+//! runtime-agnostic cache (capacity + TTL/TTI eviction, single-flight
+//! `get_with`) that builds on every target, including wasm32.
 
-#[cfg(feature = "moka-cache")]
-mod inner {
-    pub type Cache<K, V> = moka::future::Cache<K, V>;
-}
-
-#[cfg(not(feature = "moka-cache"))]
-mod inner {
-    pub type Cache<K, V> = crate::portable_cache::PortableCache<K, V>;
-}
-
-pub use inner::Cache;
+pub use crate::portable_cache::PortableCache as Cache;

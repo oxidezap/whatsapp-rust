@@ -48,14 +48,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Generate hashify PTHash lookup (FNV-1a, compile-time perfect hash)
+    // Length-bucketed lookup (match key.len() + byte discriminator, no full-key
+    // hash). On the miss-heavy encode path (every stanza string is probed, most
+    // miss) this beats the PTHash map, which folds every key byte before probing.
     writeln!(
         file,
-        "fn hashify_lookup(key: &[u8]) -> Option<&'static TokenKind> {{"
+        "fn hashify_lookup(key: &[u8]) -> Option<TokenKind> {{"
     )?;
-    writeln!(file, "    hashify::map! {{")?;
+    writeln!(file, "    hashify::tiny_map! {{")?;
     writeln!(file, "        key,")?;
-    writeln!(file, "        TokenKind,")?;
     for (token, kind) in &values {
         writeln!(file, "        {:?} => {},", token.as_bytes(), kind)?;
     }

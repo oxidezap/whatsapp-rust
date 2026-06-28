@@ -29,8 +29,8 @@ impl Default for HashState {
 pub struct HashUpdateResult {
     /// Whether a REMOVE mutation was missing its previous value.
     /// This happens when the server has an entry we don't have locally.
-    /// WhatsApp Web tracks this as `hasMissingRemove` and uses it to
-    /// determine if MAC validation failures should be fatal.
+    /// WhatsApp Web tracks this as telemetry for MAC-failure diagnostics;
+    /// it must not make MAC validation failures non-fatal.
     pub has_missing_remove: bool,
 }
 
@@ -43,6 +43,39 @@ impl HashState {
     where
         F: FnMut(&[u8], usize) -> anyhow::Result<Option<Vec<u8>>>,
     {
+        // WA Web index-mode (WAWebSyncdAntiTampering, gate `d`): when every mutation
+        // carries an index, a SET whose index is also REMOVEd in the same patch must
+        // NOT subtract its previous value; the REMOVE owns that subtraction. Without
+        // the guard the previous value is subtracted twice and the SET's value is
+        // orphaned in the MAC store, leaving the ltHash and the store in permanent
+        // disagreement. The legacy non-index path keeps the old math, like WA Web.
+        // fn item, not a closure: the borrowed return needs HRTB (issue #825 class).
+        fn index_mac_of(mutation: &wa::SyncdMutation) -> Option<&[u8]> {
+            mutation
+                .record
+                .as_option()
+                .and_then(|r| r.index.as_option())
+                .and_then(|idx| idx.blob.as_deref())
+        }
+        let index_mode = mutations.iter().all(|m| index_mac_of(m).is_some());
+        // Membership set over REMOVE index_macs, which are HMAC outputs (uniformly
+        // random). A linear-scan Vec beats a SipHash HashSet at the patch sizes seen
+        // in practice — the same trade-off as detect_duplicate_index_in_patch and
+        // collect_unique_index_macs (#856). Only `.contains()` is queried below, so an
+        // unconditional push is membership-equivalent to the set (a malformed duplicate
+        // REMOVE is rejected by the duplicate-index guard regardless).
+        let mut removed_in_patch: Vec<&[u8]> = Vec::new();
+        if index_mode {
+            for mutation in mutations {
+                if mutation.operation.unwrap_or_default()
+                    == wa::syncd_mutation::SyncdOperation::REMOVE
+                    && let Some(index_mac) = index_mac_of(mutation)
+                {
+                    removed_in_patch.push(index_mac);
+                }
+            }
+        }
+
         // Borrow the MAC tails instead of copying; mirrors `update_hash_from_records`.
         let mut added: Vec<&[u8]> = Vec::with_capacity(mutations.len());
         let mut removed: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
@@ -50,15 +83,18 @@ impl HashState {
 
         for (i, mutation) in mutations.iter().enumerate() {
             let op = mutation.operation.unwrap_or_default();
-            if op == wa::syncd_mutation::SyncdOperation::SET
+            let is_set = op == wa::syncd_mutation::SyncdOperation::SET;
+            if is_set
                 && mutation.record.is_set()
                 && let Some(blob) = &mutation.record.value.blob
                 && blob.len() >= 32
             {
                 added.push(&blob[blob.len() - 32..]);
             }
-            let index_mac_opt = mutation.record.index.blob.as_ref();
-            if let Some(index_mac) = index_mac_opt {
+            if let Some(index_mac) = index_mac_of(mutation) {
+                if is_set && removed_in_patch.contains(&index_mac) {
+                    continue;
+                }
                 match get_prev_set_value_mac(index_mac, i) {
                     Ok(Some(prev)) => removed.push(prev),
                     Ok(None) => {
@@ -165,18 +201,19 @@ pub fn generate_content_mac(
     result
 }
 
+pub fn generate_index_mac(index_json_bytes: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    let mut mac =
+        CryptographicMac::new("HmacSha256", key).expect("HmacSha256 is a valid algorithm");
+    mac.update(index_json_bytes);
+    mac.finalize()
+}
+
 pub fn validate_index_mac(
     index_json_bytes: &[u8],
     expected_mac: &[u8],
     key: &[u8; 32],
 ) -> Result<(), AppStateError> {
-    let computed = {
-        let mut mac =
-            CryptographicMac::new("HmacSha256", key).expect("HmacSha256 is a valid algorithm");
-        mac.update(index_json_bytes);
-        mac.finalize()
-    };
-    if computed.as_slice() != expected_mac {
+    if generate_index_mac(index_json_bytes, key).as_slice() != expected_mac {
         Err(AppStateError::MismatchingIndexMAC)
     } else {
         Ok(())
@@ -291,6 +328,120 @@ mod tests {
             expected_final_hash.as_slice(),
             "The final hash state after overwrite and remove is incorrect."
         );
+    }
+
+    /// WA Web index-mode: a SET whose index is also REMOVEd in the same patch must
+    /// not subtract its previous value; only the REMOVE subtracts (the store value).
+    #[test]
+    fn test_update_hash_set_plus_remove_same_index_subtracts_once() {
+        const INDEX_MAC: &[u8] = &[1; 32];
+        const PREV_VALUE: &[u8] = &[10; 32];
+        const NEW_VALUE: &[u8] = &[20; 32];
+
+        let mutations = vec![
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::SET,
+                INDEX_MAC.to_vec(),
+                Some(NEW_VALUE.to_vec()),
+            ),
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::REMOVE,
+                INDEX_MAC.to_vec(),
+                Some(PREV_VALUE.to_vec()),
+            ),
+        ];
+
+        let mut state = HashState::default();
+        let mut lookups = 0usize;
+        let (hash_result, result) = state.update_hash(&mutations, |_, _| {
+            lookups += 1;
+            Ok(Some(PREV_VALUE.to_vec()))
+        });
+        assert!(result.is_ok());
+        assert!(!hash_result.has_missing_remove);
+        assert_eq!(lookups, 1, "the suppressed SET must not query the store");
+
+        let expected = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0; 128],
+            &[PREV_VALUE.to_vec()],
+            &[NEW_VALUE.to_vec()],
+        );
+        assert_eq!(state.hash.as_slice(), expected.as_slice());
+    }
+
+    /// Index-mode is gated on every mutation carrying an index (WA Web's `d`):
+    /// with one index-less mutation in the patch, the SET subtracts as before.
+    #[test]
+    fn test_update_hash_suppression_disabled_without_full_index_coverage() {
+        const INDEX_MAC: &[u8] = &[1; 32];
+        const PREV_VALUE: &[u8] = &[10; 32];
+        const NEW_VALUE: &[u8] = &[20; 32];
+
+        let mut index_less = create_mutation(
+            wa::syncd_mutation::SyncdOperation::SET,
+            vec![],
+            Some(vec![30; 32]),
+        );
+        if let Some(rec) = index_less.record.as_option_mut() {
+            rec.index = Default::default();
+        }
+
+        let mutations = vec![
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::SET,
+                INDEX_MAC.to_vec(),
+                Some(NEW_VALUE.to_vec()),
+            ),
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::REMOVE,
+                INDEX_MAC.to_vec(),
+                Some(PREV_VALUE.to_vec()),
+            ),
+            index_less,
+        ];
+
+        let mut state = HashState::default();
+        let (_, result) = state.update_hash(&mutations, |_, _| Ok(Some(PREV_VALUE.to_vec())));
+        assert!(result.is_ok());
+
+        // Legacy math: SET and REMOVE each subtract the previous value.
+        let expected = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0; 128],
+            &[PREV_VALUE.to_vec(), PREV_VALUE.to_vec()],
+            &[NEW_VALUE.to_vec(), vec![30; 32]],
+        );
+        assert_eq!(state.hash.as_slice(), expected.as_slice());
+    }
+
+    /// SET+REMOVE same index against an empty store: the SET still adds, the REMOVE
+    /// finds nothing and flags has_missing_remove, matching WA Web index-mode which
+    /// has no fallback query.
+    #[test]
+    fn test_update_hash_set_plus_remove_same_index_empty_store() {
+        const INDEX_MAC: &[u8] = &[1; 32];
+        const NEW_VALUE: &[u8] = &[20; 32];
+
+        let mutations = vec![
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::SET,
+                INDEX_MAC.to_vec(),
+                Some(NEW_VALUE.to_vec()),
+            ),
+            create_mutation(
+                wa::syncd_mutation::SyncdOperation::REMOVE,
+                INDEX_MAC.to_vec(),
+                Some(NEW_VALUE.to_vec()),
+            ),
+        ];
+
+        let mut state = HashState::default();
+        let (hash_result, result) = state.update_hash(&mutations, |_, _| Ok(None));
+        assert!(result.is_ok());
+        assert!(hash_result.has_missing_remove);
+
+        const EMPTY: &[Vec<u8>] = &[];
+        let expected = WAPATCH_INTEGRITY.subtract_then_add(&[0; 128], EMPTY, &[NEW_VALUE.to_vec()]);
+        assert_eq!(state.hash.as_slice(), expected.as_slice());
     }
 
     /// Known-answer test for generate_patch_mac to guard byte ordering and input

@@ -4,10 +4,11 @@
 //
 
 use std::fmt;
+use std::sync::LazyLock;
 
 use arrayref::array_ref;
 
-use hmac::{HmacReset, KeyInit, Mac};
+use hmac::{Hmac, HmacReset, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::protocol::{PrivateKey, PublicKey, Result, crypto, stores::session_structure};
@@ -125,6 +126,12 @@ pub struct MessageKeys {
     counter: u32,
 }
 
+/// Message-key derivation runs HKDF with no salt, so its extract step is always
+/// HMAC keyed by a constant zero block. Caching that keyed state lets each
+/// derivation clone past the ipad/opad key schedule instead of recomputing it.
+static MESSAGE_KEY_EXTRACT_HMAC: LazyLock<Hmac<Sha256>> =
+    LazyLock::new(|| Hmac::<Sha256>::new_from_slice(&[0u8; 32]).expect("32-byte HMAC key"));
+
 impl MessageKeys {
     pub fn derive_keys(
         input_key_material: &[u8],
@@ -132,9 +139,22 @@ impl MessageKeys {
         counter: u32,
     ) -> Self {
         let mut okm = [0; 80];
-        hkdf::Hkdf::<sha2::Sha256>::new(optional_salt, input_key_material)
-            .expand(b"WhisperMessageKeys", &mut okm)
-            .expect("valid output length");
+        match optional_salt {
+            None => {
+                let mut extract = MESSAGE_KEY_EXTRACT_HMAC.clone();
+                extract.update(input_key_material);
+                let prk = extract.finalize().into_bytes();
+                hkdf::Hkdf::<Sha256>::from_prk(&prk)
+                    .expect("PRK is hash-sized")
+                    .expand(b"WhisperMessageKeys", &mut okm)
+                    .expect("valid output length");
+            }
+            Some(salt) => {
+                hkdf::Hkdf::<sha2::Sha256>::new(Some(salt), input_key_material)
+                    .expand(b"WhisperMessageKeys", &mut okm)
+                    .expect("valid output length");
+            }
+        }
 
         MessageKeys {
             cipher_key: *array_ref![okm, 0, 32],
@@ -285,6 +305,33 @@ impl fmt::Display for RootKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The no-salt fast path keys HKDF-extract with a cached zero block; it must
+    /// stay byte-identical to `Hkdf::new(None, ikm)`, or every derived Signal
+    /// message key would desync from the peer.
+    #[test]
+    fn derive_keys_no_salt_matches_plain_hkdf() {
+        let mut ikms: Vec<Vec<u8>> = (0..16u8)
+            .map(|i| vec![i.wrapping_mul(31).wrapping_add(7); 32])
+            .collect();
+        ikms.push(Vec::new());
+        ikms.push(vec![0xAB; 3]);
+        ikms.push(vec![0x5Au8; 64]);
+
+        for (i, ikm) in ikms.iter().enumerate() {
+            let keys = MessageKeys::derive_keys(ikm, None, i as u32);
+
+            let mut okm = [0u8; 80];
+            hkdf::Hkdf::<sha2::Sha256>::new(None, ikm)
+                .expand(b"WhisperMessageKeys", &mut okm)
+                .expect("valid output length");
+
+            assert_eq!(keys.cipher_key(), array_ref![okm, 0, 32]);
+            assert_eq!(keys.mac_key(), array_ref![okm, 32, 32]);
+            assert_eq!(keys.iv(), array_ref![okm, 64, 16]);
+            assert_eq!(keys.counter(), i as u32);
+        }
+    }
 
     /// Test that ChainKey properly derives the next chain key
     /// The chain key advances by HMAC-SHA256 with a constant seed

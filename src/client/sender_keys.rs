@@ -8,6 +8,7 @@ use waproto::whatsapp as wa;
 use super::Client;
 
 impl Client {
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.set_sender_key_status", level = "debug", skip_all, fields(count = device_jids.len(), has_key = has_key), err(Debug)))]
     pub(crate) async fn set_sender_key_status_for_devices(
         &self,
         group_jid: &str,
@@ -16,7 +17,7 @@ impl Client {
         exclude_own_devices: bool,
     ) -> Result<()> {
         let snapshot = if exclude_own_devices {
-            Some(self.persistence_manager.get_device_snapshot().await)
+            Some(self.persistence_manager.get_device_snapshot())
         } else {
             None
         };
@@ -57,6 +58,7 @@ impl Client {
     /// Mark device JIDs as needing fresh SKDM (has_key = false).
     /// Filters out our own devices (WA Web: `!isMeDevice(e)` check).
     /// Called from handle_retry_receipt for group/status messages.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.mark_forget_sender_key", level = "debug", skip_all, fields(count = device_jids.len()), err(Debug)))]
     pub(crate) async fn mark_forget_sender_key(
         &self,
         group_jid: &str,
@@ -73,6 +75,7 @@ impl Client {
     /// the group and wipe `sender_key_devices` so the next send takes the
     /// `force_skdm=true` path (`!key_exists`) and redistributes to all
     /// remaining participants.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.rotate_sender_key_on_remove", level = "debug", skip_all, fields(removed = removed_user_ids.len())))]
     pub(crate) async fn rotate_sender_key_on_participant_remove(
         &self,
         group_jid: &str,
@@ -112,7 +115,7 @@ impl Client {
 
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
         use wacore::types::jid::JidExt;
-        let snapshot = self.persistence_manager.get_device_snapshot().await;
+        let snapshot = self.persistence_manager.get_device_snapshot();
         for own_jid in snapshot.lid.iter().chain(snapshot.pn.iter()) {
             let sk_name =
                 SenderKeyName::from_parts(group_jid, own_jid.to_protocol_address().as_str());
@@ -141,6 +144,7 @@ impl Client {
     /// alternate PN/LID key, `alternate_chat` contains the namespace that
     /// matched -- the caller should use it for session operations instead of
     /// `resolve_encryption_jid` (which would map back to the primary).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.take_recent_message", level = "debug", skip_all, fields(peer = %to.observe())))]
     pub(crate) async fn take_recent_message(
         &self,
         to: &Jid,
@@ -164,9 +168,9 @@ impl Client {
         if let Some(alt_chat) = alt_chat {
             log::debug!(
                 "Primary key miss for {}:{}, trying alternate {}",
-                primary_key.chat,
+                primary_key.chat.observe(),
                 id,
-                alt_chat
+                alt_chat.observe()
             );
             let alt_key = ChatMessageId {
                 chat: alt_chat,
@@ -182,13 +186,12 @@ impl Client {
 
     /// Look up and consume a message by exact `ChatMessageId` (L1 cache then DB).
     async fn try_take_by_key(&self, key: &ChatMessageId) -> Option<wa::Message> {
-        use buffa::Message;
         let chat_str = key.chat.to_string();
         let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
 
         // L1 cache check (if capacity > 0)
         if has_l1_cache && let Some(bytes) = self.recent_messages.remove(key).await {
-            if let Ok(msg) = wa::Message::decode_from_slice(bytes.as_slice()) {
+            if let Ok(msg) = waproto::codec::message_decode(bytes.as_slice()) {
                 // Cache hit — consume the DB row in the background to avoid orphans.
                 let backend = self.persistence_manager.backend();
                 let mid = key.id.clone();
@@ -203,7 +206,7 @@ impl Client {
             }
             log::warn!(
                 "Failed to decode cached message for {}:{}, trying DB",
-                key.chat,
+                key.chat.observe(),
                 key.id
             );
         }
@@ -215,12 +218,12 @@ impl Client {
             .take_sent_message(&chat_str, &key.id)
             .await
         {
-            Ok(Some(bytes)) => match wa::Message::decode_from_slice(bytes.as_slice()) {
+            Ok(Some(bytes)) => match waproto::codec::message_decode(bytes.as_slice()) {
                 Ok(msg) => Some(msg),
                 Err(e) => {
                     log::warn!(
                         "Failed to decode DB message for {}:{}: {}",
-                        key.chat,
+                        key.chat.observe(),
                         key.id,
                         e
                     );
@@ -231,9 +234,65 @@ impl Client {
             Err(e) => {
                 log::warn!(
                     "Failed to read sent message from DB for {}:{}: {}",
-                    key.chat,
+                    key.chat.observe(),
                     key.id,
                     e
+                );
+                None
+            }
+        }
+    }
+
+    /// Non-consuming variant of [`Self::take_recent_message`]: returns the cached
+    /// message (and the alternate-namespace chat it matched, if any) WITHOUT
+    /// removing it from L1 or touching the DB. The retry handler uses this so a
+    /// resend doesn't decode-then-re-encode the message and churn the DB (delete +
+    /// re-store) on every retry. Returns `None` on an L1 miss (including DB-only
+    /// mode, capacity 0); the caller falls back to take + re-add there.
+    pub(crate) async fn peek_recent_message(
+        &self,
+        to: &Jid,
+        id: &str,
+    ) -> Option<(wa::Message, Option<Jid>)> {
+        let primary_key = self.make_chat_message_id(to, id).await;
+        if let Some(msg) = self.peek_by_key(&primary_key).await {
+            return Some((msg, None));
+        }
+
+        let alt_chat = if primary_key.chat.server != to.server {
+            Some(to.clone())
+        } else {
+            self.swap_pn_lid_namespace(&primary_key.chat).await
+        };
+
+        if let Some(alt_chat) = alt_chat {
+            let alt_key = ChatMessageId {
+                chat: alt_chat,
+                id: primary_key.id,
+            };
+            if let Some(msg) = self.peek_by_key(&alt_key).await {
+                return Some((msg, Some(alt_key.chat)));
+            }
+        }
+
+        None
+    }
+
+    /// L1-only, non-consuming lookup. Returns `None` when L1 is disabled
+    /// (capacity 0) or misses; the DB is intentionally not read here so the caller
+    /// can fall back to the consuming take + re-add path.
+    async fn peek_by_key(&self, key: &ChatMessageId) -> Option<wa::Message> {
+        if self.cache_config.recent_messages.capacity == 0 {
+            return None;
+        }
+        let bytes = self.recent_messages.get(key).await?;
+        match waproto::codec::message_decode(bytes.as_slice()) {
+            Ok(msg) => Some(msg),
+            Err(e) => {
+                log::warn!(
+                    "Failed to decode cached message for {}:{}: {e}",
+                    key.chat.observe(),
+                    key.id
                 );
                 None
             }
@@ -244,10 +303,10 @@ impl Client {
     /// is enabled (capacity > 0) also stores in-memory for fast retrieval.
     /// In DB-only mode (capacity = 0), the DB write is awaited to guarantee persistence.
     /// With L1 cache, the DB write is backgrounded since the cache serves reads immediately.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.add_recent_message", level = "debug", skip_all, fields(peer = %to.observe())))]
     pub(crate) async fn add_recent_message(&self, to: &Jid, id: &str, msg: &wa::Message) {
-        use buffa::Message;
         let key = self.make_chat_message_id(to, id).await;
-        let bytes = msg.encode_to_vec();
+        let bytes = waproto::codec::message_to_vec(msg);
         let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
 
         if has_l1_cache {

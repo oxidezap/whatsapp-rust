@@ -32,7 +32,7 @@ mod state;
 mod storage;
 mod stores;
 mod timestamp;
-pub use crate::core::curve::{CurveError, KeyPair, PrivateKey, PublicKey};
+pub use crate::core::curve::{CurveError, KeyPair, PreparedVerifyingKey, PrivateKey, PublicKey};
 pub use crate::core::{
     Aci, DeviceId, Pni, ProtocolAddress, ServiceId, ServiceIdFixedWidthBinaryBytes, ServiceIdKind,
 };
@@ -58,7 +58,8 @@ pub use ratchet::{
 pub use sender_keys::{SenderKeyRecord, SenderKeyState};
 pub use session::{process_prekey, process_prekey_bundle};
 pub use session_cipher::{
-    message_decrypt, message_decrypt_prekey, message_decrypt_signal, message_encrypt,
+    DecryptionResult, message_decrypt, message_decrypt_prekey, message_decrypt_signal,
+    message_encrypt,
 };
 pub use state::{
     GenericSignedPreKey, PreKeyBundle, PreKeyBundleContent, PreKeyId, PreKeyRecord, SessionRecord,

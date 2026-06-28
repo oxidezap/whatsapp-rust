@@ -108,6 +108,20 @@ pub trait SignalStore: Send + Sync {
     /// Store an identity key for a remote address.
     async fn put_identity(&self, address: &str, key: [u8; 32]) -> Result<()>;
 
+    /// Store multiple identity keys in a single batch operation.
+    /// Default implementation falls back to individual `put_identity` calls.
+    /// Addresses are `Arc<str>` so callers (the flush path) pass shared keys
+    /// without allocating a `String` per entry.
+    async fn put_identities_batch(
+        &self,
+        identities: &[(std::sync::Arc<str>, [u8; 32])],
+    ) -> Result<()> {
+        for (address, key) in identities {
+            self.put_identity(address, *key).await?;
+        }
+        Ok(())
+    }
+
     /// Load an identity key for a remote address (always 32 bytes).
     async fn load_identity(&self, address: &str) -> Result<Option<[u8; 32]>>;
 
@@ -121,6 +135,15 @@ pub trait SignalStore: Send + Sync {
 
     /// Store an encrypted session.
     async fn put_session(&self, address: &str, session: &[u8]) -> Result<()>;
+
+    /// Store multiple encrypted sessions in a single batch operation.
+    /// Default implementation falls back to individual `put_session` calls.
+    async fn put_sessions_batch(&self, sessions: &[(std::sync::Arc<str>, Bytes)]) -> Result<()> {
+        for (address, session) in sessions {
+            self.put_session(address, session).await?;
+        }
+        Ok(())
+    }
 
     /// Delete a session.
     async fn delete_session(&self, address: &str) -> Result<()>;
@@ -169,6 +192,12 @@ pub trait SignalStore: Send + Sync {
         Ok(result)
     }
 
+    /// Mark already-stored pre-keys as uploaded WITHOUT inserting. UPDATE
+    /// semantics on purpose: a key consumed (deleted) between the upload
+    /// snapshot and this call must stay deleted, never be resurrected by an
+    /// upsert.
+    async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> Result<()>;
+
     /// Remove a pre-key.
     async fn remove_prekey(&self, id: u32) -> Result<()>;
 
@@ -194,6 +223,18 @@ pub trait SignalStore: Send + Sync {
 
     /// Store a sender key for group messaging.
     async fn put_sender_key(&self, address: &str, record: &[u8]) -> Result<()>;
+
+    /// Store multiple sender keys in a single batch operation.
+    /// Default implementation falls back to individual `put_sender_key` calls.
+    async fn put_sender_keys_batch(
+        &self,
+        sender_keys: &[(std::sync::Arc<str>, Bytes)],
+    ) -> Result<()> {
+        for (address, record) in sender_keys {
+            self.put_sender_key(address, record).await?;
+        }
+        Ok(())
+    }
 
     /// Get a sender key.
     async fn get_sender_key(&self, address: &str) -> Result<Option<Vec<u8>>>;
@@ -252,8 +293,22 @@ pub trait AppSyncStore: Send + Sync {
     /// Delete mutation MACs by their index MACs.
     async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()>;
 
+    /// Delete every mutation MAC for a collection. Called on snapshot re-sync so the
+    /// MAC store is rebuilt from the snapshot, matching the ltHash baseline; leftover
+    /// entries would corrupt the next patch's ltHash.
+    async fn clear_mutation_macs(&self, name: &str) -> Result<()>;
+
     /// Get the most recently stored app state sync key ID.
     async fn get_latest_sync_key_id(&self) -> Result<Option<Vec<u8>>>;
+}
+
+/// Error returned by the default pending-inbound methods so a backend that does
+/// not implement the durability buffer fails closed (no silent at-most-once).
+fn unsupported_pending_inbound() -> crate::store::error::StoreError {
+    crate::store::error::StoreError::Validation(
+        "backend does not support the pending inbound buffer required by the durability hook"
+            .to_string(),
+    )
 }
 
 /// WhatsApp Web protocol alignment storage.
@@ -363,6 +418,13 @@ pub trait ProtocolStore: Send + Sync {
         Ok(())
     }
 
+    /// Remove the persisted group metadata blob for `group_jid` (e.g. on leave),
+    /// so the next query re-fetches in full instead of comparing a stale phash.
+    /// No-op by default.
+    async fn delete_group_metadata(&self, _group_jid: &str) -> Result<()> {
+        Ok(())
+    }
+
     // --- TcToken Storage ---
 
     /// Get a trusted contact token for a JID (stored under LID).
@@ -397,6 +459,52 @@ pub trait ProtocolStore: Send + Sync {
 
     /// Delete sent messages older than cutoff (unix timestamp seconds). Returns count deleted.
     async fn delete_expired_sent_messages(&self, cutoff_timestamp: i64) -> Result<u32>;
+
+    // --- Pending Inbound Buffer (inbound durability hook) ---
+    //
+    // Backs the at-least-once inbound durability hook: a decrypted message is
+    // buffered here (keyed by its stanza id) before the Signal ratchet is
+    // flushed, so a crash or failed commit before the hook acks replays the
+    // message on redelivery instead of dropping it. The defaults are non-breaking
+    // for backends that do not implement the hook, but fail CLOSED rather than
+    // no-op: an unsupported backend used with a hook surfaces an error (and the
+    // message stays unacked) instead of silently degrading to at-most-once.
+
+    /// Persist a decrypted inbound message awaiting a durability-hook commit.
+    /// Scoped by `(chat, sender, id)` because stanza ids are only unique within
+    /// a `(chat, sender)`.
+    async fn store_pending_inbound(
+        &self,
+        _chat: &str,
+        _sender: &str,
+        _id: &str,
+        _message: &[u8],
+    ) -> Result<()> {
+        Err(unsupported_pending_inbound())
+    }
+
+    /// Read a buffered inbound message by `(chat, sender, id)` without removing it.
+    async fn get_pending_inbound(
+        &self,
+        _chat: &str,
+        _sender: &str,
+        _id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Err(unsupported_pending_inbound())
+    }
+
+    /// Remove a buffered inbound message once its durability hook has committed.
+    async fn delete_pending_inbound(&self, _chat: &str, _sender: &str, _id: &str) -> Result<()> {
+        Err(unsupported_pending_inbound())
+    }
+
+    /// Delete buffered inbound messages older than cutoff (unix seconds). Returns
+    /// count deleted. Unlike the other defaults this is a benign `Ok(0)`: the
+    /// keepalive sweep calls it unconditionally for every backend, so it must not
+    /// error when the buffer is unsupported.
+    async fn delete_expired_pending_inbound(&self, _cutoff_timestamp: i64) -> Result<u32> {
+        Ok(0)
+    }
 }
 
 /// Device data persistence operations.

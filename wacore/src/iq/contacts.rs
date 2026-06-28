@@ -234,6 +234,16 @@ impl SetProfilePictureSpec {
         }
     }
 
+    /// Set or remove the own picture from caller-supplied bytes. Empty bytes mean
+    /// remove, matching WAWebSendProfilePictureJob (`a ? wap("picture",..) : null`).
+    pub fn for_own(image_data: Vec<u8>) -> Self {
+        if image_data.is_empty() {
+            Self::remove_own()
+        } else {
+            Self::set_own(image_data)
+        }
+    }
+
     /// Set a group's profile picture. Panics if `image_data` is empty (use `remove_group` instead).
     pub fn set_group(group_jid: &Jid, image_data: Vec<u8>) -> Self {
         assert!(
@@ -251,6 +261,16 @@ impl SetProfilePictureSpec {
         Self {
             target: Some(group_jid.clone()),
             image_data: None,
+        }
+    }
+
+    /// Set or remove a group's picture from caller-supplied bytes. Empty bytes
+    /// mean remove, mirroring [`Self::for_own`].
+    pub fn for_group(group_jid: &Jid, image_data: Vec<u8>) -> Self {
+        if image_data.is_empty() {
+            Self::remove_group(group_jid)
+        } else {
+            Self::set_group(group_jid, image_data)
         }
     }
 }
@@ -305,6 +325,32 @@ impl IqSpec for SetProfilePictureSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn for_own_routes_empty_to_remove() {
+        // WA Web treats empty bytes as a removal.
+        assert!(
+            SetProfilePictureSpec::for_own(Vec::new())
+                .image_data
+                .is_none()
+        );
+        assert_eq!(
+            SetProfilePictureSpec::for_own(vec![1, 2, 3]).image_data,
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn for_group_routes_empty_to_remove() {
+        let group_jid: Jid = "123456789@g.us".parse().unwrap();
+        let removed = SetProfilePictureSpec::for_group(&group_jid, Vec::new());
+        assert!(removed.image_data.is_none());
+        assert_eq!(removed.target.as_ref(), Some(&group_jid));
+
+        let set = SetProfilePictureSpec::for_group(&group_jid, vec![1, 2, 3]);
+        assert_eq!(set.image_data, Some(vec![1, 2, 3]));
+        assert_eq!(set.target.as_ref(), Some(&group_jid));
+    }
 
     #[test]
     fn test_profile_picture_spec_preview() {

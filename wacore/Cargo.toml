@@ -6,21 +6,43 @@ authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
 description = "Core WhatsApp protocol implementation without runtime dependencies"
+# Only the explicit [[bench]] targets below are built; never auto-discover benches/*.rs, so a stray
+# untracked file on a reused CI runner can't get compiled as a phantom bench.
+autobenches = false
+
+# `getrandom` is pulled only to forward the `js` feature (wasm getrandom backend);
+# there is no direct `use`, so static analysers flag it as unused.
+[package.metadata.cargo-machete]
+ignored = ["getrandom"]
 
 [features]
 default = ["simd"]
 simd = ["wacore-appstate/simd"]
 debug-diagnostics = []
 debug-snapshots = []
+# Optional observability: emit tracing spans/events. Off by default (no dep).
+tracing = ["dep:tracing"]
+# Optional metrics via the `metrics` facade. Off by default (no dep).
+metrics = ["dep:metrics"]
+# Render raw phone numbers in tracing fields instead of redacted tokens (debug only).
+tracing-pii = ["wacore-binary/tracing-pii"]
 # Disables XEdDSA verification of the server's Noise cert chain. Required
 # for the e2e mock server (self-signed certs). NEVER enable in prod.
 danger-skip-cert-chain-verify = ["wacore-noise/danger-skip-cert-chain-verify"]
 # Enable JS-based random number generation for wasm32 targets.
 # Activates getrandom's wasm_js backend so rand works in the browser.
 js = ["getrandom/wasm_js"]
+# VoIP/calls media crypto (SRTP, SFrame, WAHKDF). Pure, no-Tokio. Off by default:
+# the media plane is opt-in and pulls aes-gcm into the non-dev build. The MLow codec's
+# runtime constant tables are zlib-compressed protobuf (buffa, see tables.proto).
+voip = ["dep:aes-gcm"]
+# Heap profiling of the codec hot paths via the `voip_profile` example (dhat as global allocator).
+# Dev/profiling only; off by default and not pulled into normal builds.
+dhat-heap = ["dep:dhat"]
 
 [dependencies]
 aes = { workspace = true }
+aes-gcm = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
 async-lock = { workspace = true }
@@ -29,7 +51,9 @@ base64 = { workspace = true }
 buffa = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true, features = ["now", "serde"] }
+compact_str = { workspace = true }
 ctr = { workspace = true }
+dhat = { version = "0.3", optional = true }
 event-listener = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true, features = ["std"] }
@@ -40,6 +64,7 @@ hmac = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
 md5 = "0.8.0"
+metrics = { workspace = true, optional = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
@@ -49,6 +74,7 @@ sha1 = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true, optional = true }
 typed-builder = "0.23"
 wacore-appstate = { workspace = true }
 wacore-binary = { workspace = true, features = ["serde"] }
@@ -57,10 +83,12 @@ wacore-libsignal = { workspace = true }
 wacore-noise = { workspace = true }
 waproto = { workspace = true }
 
+[build-dependencies]
+buffa-build = { workspace = true }
+
 [dev-dependencies]
-aes-gcm = { workspace = true }
+divan = { workspace = true }
 futures = { workspace = true, features = ["executor", "thread-pool"] }
-iai-callgrind = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [[bench]]
@@ -70,6 +98,32 @@ harness = false
 [[bench]]
 name = "send_receive_benchmark"
 harness = false
+
+[[bench]]
+name = "history_sync_benchmark"
+harness = false
+
+[[bench]]
+name = "sframe_varint_benchmark"
+harness = false
+required-features = ["voip"]
+
+[[bench]]
+name = "message_utils_benchmark"
+harness = false
+
+[[bench]]
+name = "appstate_sync_benchmark"
+harness = false
+
+[[bench]]
+name = "voip_benchmark"
+harness = false
+required-features = ["voip"]
+
+[[example]]
+name = "voip_profile"
+required-features = ["voip"]
 
 [lints]
 workspace = true

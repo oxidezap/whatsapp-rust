@@ -4,6 +4,7 @@
 //! Orchestration and dispatch remain in `whatsapp-rust/src/receipt.rs`.
 
 use crate::types::message::{MessageCategory, MessageInfo};
+use crate::types::presence::ReceiptType;
 use wacore_binary::NodeRef;
 use wacore_binary::{Jid, JidExt as _, STATUS_BROADCAST_USER};
 
@@ -130,10 +131,78 @@ pub fn should_send_delivery_receipt(info: &MessageInfo) -> bool {
         || info.source.is_self_fanout()
 }
 
+/// WA Web's receipt parser downgrades a delivery ack to "sent" (not delivered) when the
+/// `<receipt>` carries `<error reason="lid" type="feature-incapable">`: the LID peer is
+/// feature-incapable and never received the message. Returns the effective receipt type.
+///
+/// Scoped to `Delivered` (the only type that carries this error in practice), which also
+/// keeps the downgrade from rerouting retry / enc-rekey receipts.
+pub fn downgrade_for_feature_incapable(
+    node: &NodeRef<'_>,
+    parsed_type: ReceiptType,
+) -> ReceiptType {
+    if parsed_type != ReceiptType::Delivered {
+        return parsed_type;
+    }
+    let Some(err) = node.get_optional_child("error") else {
+        return parsed_type;
+    };
+    let mut a = err.attrs();
+    let reason = a.optional_string("reason");
+    let err_type = a.optional_string("type");
+    if reason.as_deref() == Some("lid") && err_type.as_deref() == Some("feature-incapable") {
+        ReceiptType::Sent
+    } else {
+        parsed_type
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::message::{MessageCategory, MessageInfo, MessageSource};
+
+    #[test]
+    fn feature_incapable_error_downgrades_delivery_to_sent() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let with_error = NodeBuilder::new("receipt")
+            .children([NodeBuilder::new("error")
+                .attr("reason", "lid")
+                .attr("type", "feature-incapable")
+                .build()])
+            .build();
+        assert_eq!(
+            downgrade_for_feature_incapable(&with_error.as_node_ref(), ReceiptType::Delivered),
+            ReceiptType::Sent,
+            "lid/feature-incapable error downgrades delivery to sent"
+        );
+
+        // No <error> child: unchanged.
+        let plain = NodeBuilder::new("receipt").build();
+        assert_eq!(
+            downgrade_for_feature_incapable(&plain.as_node_ref(), ReceiptType::Delivered),
+            ReceiptType::Delivered
+        );
+
+        // Different error type: unchanged.
+        let other = NodeBuilder::new("receipt")
+            .children([NodeBuilder::new("error")
+                .attr("reason", "lid")
+                .attr("type", "other")
+                .build()])
+            .build();
+        assert_eq!(
+            downgrade_for_feature_incapable(&other.as_node_ref(), ReceiptType::Delivered),
+            ReceiptType::Delivered
+        );
+
+        // Non-delivery type with the same error: not downgraded (scoped to Delivered).
+        assert_eq!(
+            downgrade_for_feature_incapable(&with_error.as_node_ref(), ReceiptType::Read),
+            ReceiptType::Read
+        );
+    }
 
     #[test]
     fn skip_empty_id() {

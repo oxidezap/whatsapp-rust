@@ -263,6 +263,7 @@ where
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct UploadResponse {
     pub url: String,
     pub direct_path: String,
@@ -287,19 +288,6 @@ impl From<UploadResponse> for wacore::sticker_pack::MediaUploadInfo {
             r.file_length,
             r.media_key_timestamp,
         )
-    }
-}
-
-impl UploadResponse {
-    /// Convert crypto fields to `Vec<u8>` for protobuf message construction.
-    pub fn media_key_vec(&self) -> Vec<u8> {
-        self.media_key.to_vec()
-    }
-    pub fn file_sha256_vec(&self) -> Vec<u8> {
-        self.file_sha256.to_vec()
-    }
-    pub fn file_enc_sha256_vec(&self) -> Vec<u8> {
-        self.file_enc_sha256.to_vec()
     }
 }
 
@@ -349,6 +337,7 @@ impl Client {
     ///
     /// Only needed for new or modified media. To forward existing media unchanged,
     /// reuse the original message's CDN fields directly, no round-trip required.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.upload", level = "debug", skip_all, fields(kind = ?media_type, len = data.len()), err(Debug)))]
     pub async fn upload(
         &self,
         data: Vec<u8>,
@@ -375,7 +364,9 @@ impl Client {
             file_enc_sha256: enc.file_enc_sha256,
             streaming_sidecar: enc.streaming_sidecar,
         };
-        let ciphertext = enc.data_to_upload;
+        // Bytes so each retry/resume attempt slices with a refcount bump instead of
+        // copying the whole (multi-MB) ciphertext per attempt.
+        let ciphertext = bytes::Bytes::from(enc.data_to_upload);
 
         upload_media_with_retry(
             crypto,
@@ -387,7 +378,7 @@ impl Client {
             || async { self.invalidate_media_conn().await },
             |request| async move { self.http_client.execute(request).await },
             |request, offset, _remaining| {
-                let body = ciphertext[offset as usize..].to_vec();
+                let body = ciphertext.slice(offset as usize..);
                 async move { self.http_client.execute(request.with_body(body)).await }
             },
         )
@@ -400,6 +391,7 @@ impl Client {
     /// storage of your choice, then pass that storage as `source` plus the
     /// returned [`wacore::upload::EncryptedMediaInfo`]. The caller owns where the
     /// ciphertext lives (temp file, memory, …); this method never touches disk.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.upload_stream", level = "debug", skip_all, fields(kind = ?media_type), err(Debug)))]
     pub async fn upload_stream<S>(
         &self,
         source: S,

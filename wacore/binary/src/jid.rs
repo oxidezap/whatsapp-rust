@@ -177,6 +177,8 @@ pub enum Server {
     Interop = 8,
     Bot = 9,
     Legacy = 10,
+    /// `@call` call-signaling JID; not an AD server, so it round-trips via JID_PAIR.
+    Call = 11,
 }
 
 #[cfg(feature = "serde")]
@@ -209,6 +211,7 @@ impl Server {
             Self::Interop => "interop",
             Self::Bot => "bot",
             Self::Legacy => "c.us",
+            Self::Call => "call",
         }
     }
 
@@ -223,6 +226,26 @@ impl Server {
     #[inline]
     pub fn is_lid_family(self) -> bool {
         matches!(self, Self::Lid | Self::HostedLid)
+    }
+
+    /// Whether the `agent` byte is part of the rendered JID for this server.
+    /// AD-capable servers (Pn/Lid/Hosted/HostedLid) carry it as a hidden domain
+    /// byte and suppress it in display; others (e.g. `@bot`/`@interop`) render it.
+    /// Single source of truth shared by the formatter and `Jid::is_same_chat_as`.
+    #[inline]
+    pub fn renders_agent(self) -> bool {
+        !matches!(self, Self::Pn | Self::Lid | Self::Hosted | Self::HostedLid)
+    }
+
+    /// Whether the `user` part is (or can be) a real phone number, i.e. PII that
+    /// must be redacted in tracing fields. LID-family/group/broadcast/newsletter/
+    /// bot/call users are pseudonymous or non-personal and are safe to render raw.
+    #[inline]
+    pub fn carries_phone_number(self) -> bool {
+        matches!(
+            self,
+            Self::Pn | Self::Hosted | Self::Legacy | Self::Messenger | Self::Interop
+        )
     }
 }
 
@@ -259,6 +282,7 @@ impl TryFrom<&str> for Server {
             "interop" => Ok(Self::Interop),
             "bot" => Ok(Self::Bot),
             "c.us" => Ok(Self::Legacy),
+            "call" => Ok(Self::Call),
             other => Err(JidError::InvalidFormat(format!("unknown server: {other}"))),
         }
     }
@@ -539,6 +563,20 @@ impl Jid {
         }
     }
 
+    /// Device-insensitive "same chat" check: two JIDs address the same chat when
+    /// they render to the same string ignoring the multi-device `device`. Compares
+    /// `user`, `server`, `integrator`, and `agent` only where the server renders
+    /// the agent (`@bot`/`@interop`); Pn/Lid/Hosted suppress it in display, so a
+    /// stray decoded agent byte there must not split the chat. Allocates nothing.
+    /// Stricter than `is_same_user_as`, which ignores `server`.
+    #[inline]
+    pub fn is_same_chat_as(&self, other: &Jid) -> bool {
+        self.user == other.user
+            && self.server == other.server
+            && self.integrator == other.integrator
+            && (!self.server.renders_agent() || self.agent == other.agent)
+    }
+
     /// Canonical non-AD string form (`user@server`, device + agent stripped)
     /// in a single allocation. Equivalent to `to_non_ad().to_string()` but
     /// skips the throwaway intermediate `Jid` and its `CompactString` clone.
@@ -569,18 +607,27 @@ impl Jid {
     }
 
     pub fn to_ad_string(&self) -> String {
-        if self.user.is_empty() {
-            return self.server.as_str().to_string();
-        }
         let mut s = String::with_capacity(self.user.len() + 20);
-        s.push_str(&self.user);
-        s.push('.');
-        s.push_str(itoa::Buffer::new().format(self.agent));
-        s.push(':');
-        s.push_str(itoa::Buffer::new().format(self.device));
-        s.push('@');
-        s.push_str(self.server.as_str());
+        self.push_ad_to(&mut s);
         s
+    }
+
+    /// Append the AD-string form (`user.agent:device@server`) to `buf`, for
+    /// callers that batch many JIDs into one shared buffer instead of paying
+    /// a heap `String` per JID (see `participant_list_hash`).
+    #[inline]
+    pub fn push_ad_to(&self, buf: &mut String) {
+        if self.user.is_empty() {
+            buf.push_str(self.server.as_str());
+            return;
+        }
+        buf.push_str(&self.user);
+        buf.push('.');
+        buf.push_str(itoa::Buffer::new().format(self.agent));
+        buf.push(':');
+        buf.push_str(itoa::Buffer::new().format(self.device));
+        buf.push('@');
+        buf.push_str(self.server.as_str());
     }
 
     /// Append the Display representation to `buf` using direct push operations,
@@ -749,12 +796,7 @@ macro_rules! write_jid {
             return;
         }
         $buf.push_str(user);
-        if agent > 0
-            && !matches!(
-                server,
-                Server::Pn | Server::Lid | Server::Hosted | Server::HostedLid
-            )
-        {
+        if agent > 0 && server.renders_agent() {
             $buf.push('.');
             $buf.push_str(itoa::Buffer::new().format(agent));
         }
@@ -772,12 +814,7 @@ macro_rules! write_jid {
             return $f.write_str(server.as_str());
         }
         $f.write_str(user)?;
-        if agent > 0
-            && !matches!(
-                server,
-                Server::Pn | Server::Lid | Server::Hosted | Server::HostedLid
-            )
-        {
+        if agent > 0 && server.renders_agent() {
             $f.write_str(".")?;
             $f.write_str(itoa::Buffer::new().format(agent))?;
         }
@@ -810,21 +847,186 @@ pub fn push_jid_to_compact(
     write_jid!(infallible buf, user, server, agent, device);
 }
 
+/// Stack writer sized for any realistic JID, so `Display` can emit a single
+/// `write_str`: a `ToString`-backed `String` then reserves once at the exact
+/// length instead of reallocating per fragment. Overflow errors out and the
+/// caller falls back to direct fragment writes.
+struct JidStackWriter {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl JidStackWriter {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0; 64],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        // Whole `&str` fragments are appended, never split, so the bytes
+        // stay valid UTF-8.
+        std::str::from_utf8(&self.buf[..self.len]).expect("concatenated str fragments")
+    }
+}
+
+impl fmt::Write for JidStackWriter {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        if end > self.buf.len() {
+            return Err(fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+#[inline]
+fn write_jid_fallible<W: fmt::Write>(
+    w: &mut W,
+    user: &str,
+    server: Server,
+    agent: u8,
+    device: u16,
+) -> fmt::Result {
+    write_jid!(fallible w, user, server, agent, device)
+}
+
 impl fmt::Display for Jid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_jid!(fallible f, &*self.user, self.server, self.agent, self.device)
+        let mut w = JidStackWriter::new();
+        if write_jid_fallible(&mut w, &self.user, self.server, self.agent, self.device).is_ok() {
+            return f.write_str(w.as_str());
+        }
+        write_jid_fallible(f, &self.user, self.server, self.agent, self.device)
+    }
+}
+
+/// Privacy-aware [`Display`] wrapper for a [`Jid`], for use in tracing fields.
+///
+/// Pseudonymous (LID) and non-personal (newsletter/bot/call, modern group ids)
+/// JIDs render in full, so the same peer/chat correlates across spans. JIDs whose
+/// `user` is a phone number ([`Server::carries_phone_number`]) render the user as
+/// a `pn#<token>` instead — preserving correlation without leaking the number.
+/// Legacy group/broadcast ids of the form `<creator-phone>-<timestamp>` get only
+/// the numeric prefix redacted (`pn#<token>-<timestamp>`), keeping the timestamp.
+///
+/// The token is a keyed hash (SipHash via a process-lifetime random key), not a
+/// plain digest of the number: the phone-number search space is small, so an
+/// unkeyed hash would be reversible by precomputation. The random key lives only
+/// in process memory, so exported traces cannot be brute-forced back to numbers.
+/// It is stable within a process run (correlation works) but not across restarts
+/// (a fresh key each start). Enable the `tracing-pii` feature to render raw
+/// numbers (local debugging only). The token is computed only while formatting an
+/// already-enabled span, so it costs nothing on disabled call sites.
+pub struct ObservedJid<'a>(&'a Jid);
+
+impl Jid {
+    /// Privacy-aware display for tracing spans/fields. See [`ObservedJid`].
+    #[inline]
+    pub fn observe(&self) -> ObservedJid<'_> {
+        ObservedJid(self)
+    }
+}
+
+/// Per-process keyed token for a sensitive string: a SipHash with a random key
+/// created once per process. Stable within a run (so the same value correlates
+/// across spans) but not precomputable from the input, so exported traces cannot
+/// be brute-forced back to the original (e.g. an E.164 phone number). Public so
+/// other layers can redact non-`Jid` identifiers (e.g. a Signal `ProtocolAddress`
+/// name, which embeds a phone number) with the same keyed scheme.
+pub fn observe_token(s: &str) -> u64 {
+    use std::hash::BuildHasher;
+    static KEY: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    KEY.get_or_init(std::collections::hash_map::RandomState::new)
+        .hash_one(s)
+}
+
+/// Privacy-aware redaction of a JID supplied as a string (e.g. a group jid `&str`
+/// in a span field). Parses it and applies [`Jid::observe`]; if it does not parse,
+/// falls back to a keyed token so a raw number can never leak. Honors `tracing-pii`.
+pub fn observe_str(s: &str) -> String {
+    if cfg!(feature = "tracing-pii") {
+        return s.to_string();
+    }
+    match s.parse::<Jid>() {
+        Ok(jid) => jid.observe().to_string(),
+        Err(_) => format!("?#{:016x}", observe_token(s)),
+    }
+}
+
+impl fmt::Display for ObservedJid<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let jid = self.0;
+        if jid.user.is_empty() || cfg!(feature = "tracing-pii") {
+            return fmt::Display::fmt(jid, f);
+        }
+        // Decide the privacy-safe `user` rendering.
+        let redacted: Option<String> = if jid.server.carries_phone_number() {
+            // The whole user is a phone number.
+            Some(format!("pn#{:016x}", observe_token(jid.user.as_str())))
+        } else if matches!(jid.server, Server::Group | Server::Broadcast) {
+            // Legacy group/broadcast ids embed the creator phone as
+            // "<phone>-<timestamp>". Redact the numeric prefix and keep the
+            // timestamp (not PII) so the group still correlates across spans.
+            match jid.user.find('-') {
+                Some(i) if i > 0 && jid.user.as_bytes()[..i].iter().all(|b| b.is_ascii_digit()) => {
+                    Some(format!(
+                        "pn#{:016x}{}",
+                        observe_token(&jid.user[..i]),
+                        &jid.user[i..]
+                    ))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let Some(user) = redacted else {
+            // Pseudonymous (LID) or non-personal: safe to render in full.
+            return fmt::Display::fmt(jid, f);
+        };
+        f.write_str(&user)?;
+        // Preserve agent where it is part of the identity (e.g. Interop/Messenger),
+        // mirroring the normal JID display so distinct IDs stay distinct.
+        if jid.agent > 0 && jid.server.renders_agent() {
+            write!(f, ".{}", jid.agent)?;
+        }
+        if jid.device > 0 {
+            write!(f, ":{}", jid.device)?;
+        }
+        write!(f, "@{}", jid.server.as_str())
     }
 }
 
 impl<'a> fmt::Display for JidRef<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_jid!(fallible f, &*self.user, self.server, self.agent, self.device)
+        let mut w = JidStackWriter::new();
+        if write_jid_fallible(&mut w, &self.user, self.server, self.agent, self.device).is_ok() {
+            return f.write_str(w.as_str());
+        }
+        write_jid_fallible(f, &self.user, self.server, self.agent, self.device)
     }
 }
 
 impl From<Jid> for String {
     fn from(jid: Jid) -> Self {
         jid.to_string()
+    }
+}
+
+/// Lets `impl Into<Jid>` APIs accept `&Jid` transparently: borrow-callers pay
+/// one cheap clone (the user part is inline for typical numeric ids), owned
+/// callers move for free.
+impl From<&Jid> for Jid {
+    fn from(jid: &Jid) -> Self {
+        jid.clone()
     }
 }
 
@@ -845,6 +1047,47 @@ impl TryFrom<String> for Jid {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// `observe()` must never leak a raw phone number, must keep pseudonymous /
+    /// non-personal JIDs intact for correlation, and must preserve device.
+    #[test]
+    #[cfg(not(feature = "tracing-pii"))]
+    fn observe_redacts_phone_but_not_lid_or_group() {
+        let pn = Jid::from_str("5511999998888:7@s.whatsapp.net").unwrap();
+        let shown = pn.observe().to_string();
+        assert!(shown.starts_with("pn#"), "{shown}");
+        assert!(
+            !shown.contains("5511999998888"),
+            "raw number leaked: {shown}"
+        );
+        assert!(shown.ends_with(":7@s.whatsapp.net"), "device lost: {shown}");
+        // Stable within the process so the same peer correlates across spans.
+        assert_eq!(shown, pn.observe().to_string());
+
+        // LID is pseudonymous and modern group ids are non-personal: rendered in full.
+        let lid = Jid::from_str("123456789@lid").unwrap();
+        assert_eq!(lid.observe().to_string(), lid.to_string());
+        let group = Jid::from_str("120363012345678901@g.us").unwrap();
+        assert_eq!(group.observe().to_string(), group.to_string());
+
+        // Legacy group id embeds the creator phone ("<phone>-<ts>"): redact the
+        // numeric prefix, keep the timestamp.
+        let legacy = Jid::from_str("123456789-1620000000@g.us").unwrap();
+        let ls = legacy.observe().to_string();
+        assert!(
+            ls.starts_with("pn#") && ls.ends_with("-1620000000@g.us"),
+            "{ls}"
+        );
+        // Exact no-leak invariant: the creator phone must not appear anywhere.
+        assert!(!ls.contains("123456789"), "creator phone leaked: {ls}");
+        // The redacted prefix is the fixed-width keyed token, not the raw number.
+        let mid = &ls["pn#".len()..ls.find('-').unwrap()];
+        assert_eq!(mid.len(), 16, "token width: {ls}");
+        assert!(
+            mid.bytes().all(|b| b.is_ascii_hexdigit()),
+            "token hex: {ls}"
+        );
+    }
 
     /// Helper function to test a full parsing and display round-trip.
     fn assert_jid_roundtrip(
@@ -932,6 +1175,9 @@ mod tests {
         // LID JID cases (critical for the bug)
         assert_jid_roundtrip("12345.6789@lid", "12345.6789", "lid", 0, 0);
         assert_jid_roundtrip("12345.6789:25@lid", "12345.6789", "lid", 25, 0);
+
+        // @call (call-signaling server) must parse and render, not be rejected.
+        assert_jid_roundtrip("12345@call", "12345", "call", 0, 0);
     }
 
     #[test]
@@ -1145,6 +1391,55 @@ mod tests {
             !bot_jid.is_hosted(),
             "Bot JID should NOT be detected as hosted (different mechanism)"
         );
+    }
+
+    #[test]
+    fn is_same_chat_as_matches_rendered_chat_identity() {
+        let base: Jid = "5511999887766@s.whatsapp.net".parse().unwrap();
+
+        // Device is ignored.
+        assert!(base.is_same_chat_as(&base.with_device(33)));
+        assert!(base.with_device(5).is_same_chat_as(&base.with_device(0)));
+
+        // Different user or server -> different chat (server guards the
+        // is_same_user_as looseness that ignores server).
+        let other_user: Jid = "5521988776655@s.whatsapp.net".parse().unwrap();
+        assert!(!base.is_same_chat_as(&other_user));
+        let as_lid: Jid = "5511999887766@lid".parse().unwrap();
+        assert!(!base.is_same_chat_as(&as_lid));
+
+        // integrator participates in identity.
+        let other_integrator = Jid {
+            integrator: 1,
+            ..base.clone()
+        };
+        assert!(!base.is_same_chat_as(&other_integrator));
+
+        // Pn suppresses the agent in display, so a stray decoded agent byte must
+        // not split the chat: same rendered string -> same chat.
+        let pn_agent1 = Jid {
+            agent: 1,
+            ..base.clone()
+        };
+        assert_eq!(base.to_string(), pn_agent1.to_string());
+        assert!(base.is_same_chat_as(&pn_agent1));
+
+        // @bot renders the agent, so distinct agents are distinct chats; device
+        // is still ignored.
+        let bot_a = Jid {
+            user: "13136555001".into(),
+            server: Server::Bot,
+            agent: 1,
+            device: 0,
+            integrator: 0,
+        };
+        let bot_b = Jid {
+            agent: 2,
+            ..bot_a.clone()
+        };
+        assert_ne!(bot_a.to_string(), bot_b.to_string());
+        assert!(!bot_a.is_same_chat_as(&bot_b));
+        assert!(bot_a.is_same_chat_as(&bot_a.with_device(7)));
     }
 
     /// Tests that document the filtering behavior for group messages.

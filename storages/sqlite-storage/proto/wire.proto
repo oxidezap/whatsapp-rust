@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+// On-disk encoding for the BLOB columns this backend persists (server cert
+// chain, app-state sync keys, app-state hash state). Field-tagged so adding or
+// reordering a field never corrupts existing rows. Wire-compatible with the
+// rows previously written by the prost-derived equivalents (same field numbers
+// and proto3 semantics), so old blobs keep decoding.
+//
+// Regenerate the descriptor after editing: scripts/regenerate-wire-desc.sh
+package wire;
+
+message NoiseCert {
+  bytes key = 1;
+  int64 not_before = 2;
+  int64 not_after = 3;
+}
+
+message ServerCertChain {
+  NoiseCert intermediate = 1;
+  NoiseCert leaf = 2;
+}
+
+message AppStateSyncKeyWire {
+  bytes key_data = 1;
+  bytes fingerprint = 2;
+  int64 timestamp = 3;
+}
+
+message HashStateWire {
+  uint64 version = 1;
+  bytes hash = 2;
+  map<string, bytes> index_value_map = 3;
+}

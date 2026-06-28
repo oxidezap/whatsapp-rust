@@ -322,7 +322,7 @@ async fn cold_start_xx_then_cached_ik_reconnect() {
     );
 
     // The cert chain must now be cached on the device.
-    let device = pm.get_device_snapshot().await;
+    let device = pm.get_device_snapshot();
     let chain = device
         .server_cert_chain
         .as_ref()
@@ -364,7 +364,7 @@ async fn cold_start_xx_then_cached_ik_reconnect() {
 
     // After IK Continue, the on-disk cache stays as-is (the orchestrator
     // does NOT issue SetServerCertChain on the IK path).
-    let device = pm.get_device_snapshot().await;
+    let device = pm.get_device_snapshot();
     assert_eq!(
         device.server_cert_chain.as_ref().unwrap().leaf.key,
         server_static_pub_expected
@@ -467,7 +467,7 @@ async fn post_xxfallback_failure_does_not_invalidate_ik_cache() {
     // Cache must be untouched: the failure happened post-pivot, so the
     // orchestrator's invalidation gate must have skipped both the clear
     // and the counter increment.
-    let device = pm.get_device_snapshot().await;
+    let device = pm.get_device_snapshot();
     let chain = device
         .server_cert_chain
         .as_ref()
@@ -529,7 +529,7 @@ async fn ik_continue_does_not_overwrite_cached_chain() {
         result.err()
     );
 
-    let device = pm.get_device_snapshot().await;
+    let device = pm.get_device_snapshot();
     let chain = device
         .server_cert_chain
         .as_ref()
@@ -571,7 +571,7 @@ async fn xx_after_pair_success_persists_cert_chain() {
     .expect("unpaired XX must succeed");
     task1.await.unwrap();
 
-    let device = pm.get_device_snapshot().await;
+    let device = pm.get_device_snapshot();
     assert!(!device.is_registered(), "still unpaired after first XX");
     assert!(
         device.server_cert_chain.is_none(),
@@ -600,7 +600,7 @@ async fn xx_after_pair_success_persists_cert_chain() {
     .expect("paired XX must succeed");
     task2.await.unwrap();
 
-    let device = pm.get_device_snapshot().await;
+    let device = pm.get_device_snapshot();
     assert!(device.is_registered(), "paired after SetId");
     let chain = device
         .server_cert_chain
@@ -647,7 +647,7 @@ async fn unpaired_xx_does_not_persist_cert_chain() {
         result.err()
     );
 
-    let device = pm.get_device_snapshot().await;
+    let device = pm.get_device_snapshot();
     assert!(
         !device.is_registered(),
         "precondition: device must still be unpaired"
@@ -782,7 +782,7 @@ async fn ik_rejected_recovers_via_xxfallback_and_repopulates_cache() {
     // the fresh chain (same key here, but the orchestration MUST emit
     // SetServerCertChain regardless).
     assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 0);
-    let device = pm.get_device_snapshot().await;
+    let device = pm.get_device_snapshot();
     let chain = device.server_cert_chain.as_ref().expect("cert chain");
     assert_eq!(chain.leaf.key, server_static_pub_expected);
 }
@@ -879,7 +879,7 @@ async fn ik_with_stale_cache_invalidates_and_increments_counter() {
         1,
         "ik_handshake_failures must be 1 after one crypto-fatal failure"
     );
-    let device = pm.get_device_snapshot().await;
+    let device = pm.get_device_snapshot();
     assert!(
         device.server_cert_chain.is_none(),
         "stale cert chain must be cleared after crypto-fatal IK failure"

@@ -5,6 +5,18 @@ use crate::error::{BinaryError, Result};
 use crate::jid::Jid;
 use crate::node::{Attrs, Node, NodeRef, NodeStr, NodeValue, ValueRef};
 
+/// Coerces a wire boolean. WhatsApp/XMPP serialize flags as `"1"`/`"0"` as well
+/// as `"true"`/`"false"`; `str::parse::<bool>()` only accepts the latter and
+/// would silently reject `"1"`. Mirrors whatsmeow's `strconv.ParseBool` and WA
+/// Web's gating coercion. Returns `None` for any other value.
+fn coerce_protocol_bool(s: &str) -> Option<bool> {
+    match s {
+        "1" | "true" | "True" | "t" | "T" | "TRUE" => Some(true),
+        "0" | "false" | "False" | "f" | "F" | "FALSE" => Some(false),
+        _ => None,
+    }
+}
+
 pub struct AttrParser<'a> {
     pub attrs: &'a Attrs,
     pub errors: Vec<BinaryError>,
@@ -95,11 +107,11 @@ impl<'a> AttrParserRef<'a> {
 
     fn get_bool(&mut self, key: &str, require: bool) -> Option<bool> {
         self.get_string_value(key, require)
-            .and_then(|s| match s.parse::<bool>() {
-                Ok(val) => Some(val),
-                Err(e) => {
+            .and_then(|s| match coerce_protocol_bool(&s) {
+                Some(val) => Some(val),
+                None => {
                     self.errors.push(BinaryError::AttrParse(format!(
-                        "Failed to parse bool from '{s}' for key '{key}': {e}"
+                        "Failed to parse bool from '{s}' for key '{key}'"
                     )));
                     None
                 }
@@ -243,11 +255,11 @@ impl<'a> AttrParser<'a> {
     // --- Boolean ---
     fn get_bool(&mut self, key: &str, require: bool) -> Option<bool> {
         self.get_string_value(key, require)
-            .and_then(|s| match s.parse::<bool>() {
-                Ok(val) => Some(val),
-                Err(e) => {
+            .and_then(|s| match coerce_protocol_bool(&s) {
+                Some(val) => Some(val),
+                None => {
                     self.errors.push(BinaryError::AttrParse(format!(
-                        "Failed to parse bool from '{s}' for key '{key}': {e}"
+                        "Failed to parse bool from '{s}' for key '{key}'"
                     )));
                     None
                 }
@@ -305,5 +317,25 @@ impl<'a> AttrParser<'a> {
                     None
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod bool_coercion_tests {
+    use super::coerce_protocol_bool;
+
+    #[test]
+    fn coerce_protocol_bool_accepts_wire_forms() {
+        // "1"/"0" are the WhatsApp wire forms str::parse::<bool> used to reject.
+        for t in ["1", "true", "True", "t", "T", "TRUE"] {
+            assert_eq!(coerce_protocol_bool(t), Some(true), "{t}");
+        }
+        for f in ["0", "false", "False", "f", "F", "FALSE"] {
+            assert_eq!(coerce_protocol_bool(f), Some(false), "{f}");
+        }
+        // Matches whatsmeow strconv.ParseBool: on/off and junk are not booleans.
+        for bad in ["", "yes", "no", "2", "on", "off"] {
+            assert_eq!(coerce_protocol_bool(bad), None, "{bad}");
+        }
     }
 }

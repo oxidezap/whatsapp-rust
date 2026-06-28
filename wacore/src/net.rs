@@ -39,6 +39,30 @@ impl std::fmt::Display for DisconnectReason {
     }
 }
 
+impl DisconnectReason {
+    /// Whether this is a benign, server-initiated stream recycle (the normal
+    /// WhatsApp reconnect path) rather than a transport-level error.
+    ///
+    /// Used only to pick a log level: a clean shutdown is logged quietly (the
+    /// reconnect is routine), while everything else stays loud so a genuine
+    /// transport failure is never hidden behind reconnect noise. Deliberately
+    /// conservative — anything ambiguous returns `false` (stays loud): a read/IO
+    /// error, an abnormal close code, or an unreported reason.
+    pub fn is_clean_shutdown(&self) -> bool {
+        match self {
+            // EOF with no Close frame is how the WA server recycles a connection.
+            Self::StreamEnded => true,
+            // A Close frame with a normal / going-away / no code is graceful; any
+            // other code (protocol/server error, restart, etc.) stays loud.
+            Self::ServerClose { code, .. } => matches!(code, None | Some(1000) | Some(1001)),
+            // A transport read/IO error is a real failure — never quiet.
+            Self::ReadError(_) => false,
+            // Unknown reason: stay loud, don't assume it was benign.
+            Self::Unknown => false,
+        }
+    }
+}
+
 /// An event produced by the transport layer.
 #[derive(Debug, Clone)]
 pub enum TransportEvent {
@@ -54,7 +78,7 @@ pub enum TransportEvent {
 /// The transport is a dumb pipe for bytes with no knowledge of WhatsApp framing.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait Transport: Send + Sync {
+pub trait Transport: crate::sync_marker::MaybeSendSync {
     /// Sends raw data to the server.
     async fn send(&self, data: Bytes) -> Result<(), anyhow::Error>;
 
@@ -65,7 +89,7 @@ pub trait Transport: Send + Sync {
 /// A factory responsible for creating new transport instances.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait TransportFactory: Send + Sync {
+pub trait TransportFactory: crate::sync_marker::MaybeSendSync {
     /// Creates a new transport and returns it, along with a stream of events.
     async fn create_transport(
         &self,
@@ -78,7 +102,7 @@ pub struct HttpRequest {
     pub url: String,
     pub method: String, // "GET" or "POST"
     pub headers: HashMap<String, String>,
-    pub body: Option<Vec<u8>>,
+    pub body: Option<Bytes>,
 }
 
 impl HttpRequest {
@@ -105,8 +129,8 @@ impl HttpRequest {
         self
     }
 
-    pub fn with_body(mut self, body: Vec<u8>) -> Self {
-        self.body = Some(body);
+    pub fn with_body(mut self, body: impl Into<Bytes>) -> Self {
+        self.body = Some(body.into());
         self
     }
 }
@@ -139,7 +163,7 @@ pub type UploadBody = Box<dyn std::io::Read + Send>;
 /// Trait for executing HTTP requests in a runtime-agnostic way
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait HttpClient: Send + Sync {
+pub trait HttpClient: crate::sync_marker::MaybeSendSync {
     /// Executes a given HTTP request and returns the response.
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse>;
 
@@ -174,5 +198,57 @@ pub trait HttpClient: Send + Sync {
         Err(anyhow::anyhow!(
             "Upload streaming not supported by this HTTP client"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DisconnectReason;
+
+    // Happy paths: benign server-initiated recycles must classify as clean so
+    // their reconnect is logged quietly.
+    #[test]
+    fn clean_shutdowns_are_classified_clean() {
+        assert!(DisconnectReason::StreamEnded.is_clean_shutdown());
+        assert!(
+            DisconnectReason::ServerClose {
+                code: Some(1000),
+                reason: String::new()
+            }
+            .is_clean_shutdown()
+        );
+        assert!(
+            DisconnectReason::ServerClose {
+                code: Some(1001),
+                reason: "going away".to_string()
+            }
+            .is_clean_shutdown()
+        );
+        assert!(
+            DisconnectReason::ServerClose {
+                code: None,
+                reason: String::new()
+            }
+            .is_clean_shutdown()
+        );
+    }
+
+    // Bad paths: a real transport error, an abnormal close code, or an unreported
+    // reason must NOT be classified clean — they have to stay loud so genuine
+    // failures are never hidden behind reconnect noise.
+    #[test]
+    fn real_errors_are_never_classified_clean() {
+        assert!(!DisconnectReason::ReadError("connection reset".to_string()).is_clean_shutdown());
+        assert!(!DisconnectReason::Unknown.is_clean_shutdown());
+        for code in [1002u16, 1006, 1011, 1012, 1013, 3000, 4000] {
+            assert!(
+                !DisconnectReason::ServerClose {
+                    code: Some(code),
+                    reason: String::new()
+                }
+                .is_clean_shutdown(),
+                "close code {code} must not be treated as a clean shutdown"
+            );
+        }
     }
 }

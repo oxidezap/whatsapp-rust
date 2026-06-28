@@ -1,6 +1,7 @@
 use crate::client::Client;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 use wacore::client::context::{GroupInfo, SendContextResolver};
 use wacore::iq::prekeys::PreKeyFetchReason;
 use wacore::libsignal::protocol::PreKeyBundle;
@@ -29,23 +30,33 @@ impl SendContextResolver for Client {
             .map_err(|e| {
                 // Re-wrap server errors as wacore::ServerErrorCode so
                 // encrypt_for_devices can downcast across crate boundaries
-                if let Some(crate::request::IqError::ServerError { code, text }) =
-                    e.downcast_ref::<crate::request::IqError>()
+                if let Some(crate::request::IqError::ServerError {
+                    code,
+                    text,
+                    error_type,
+                    backoff,
+                }) = e.downcast_ref::<crate::request::IqError>()
                 {
                     return anyhow::Error::new(wacore::request::ServerErrorCode {
                         code: *code,
                         text: text.clone(),
+                        error_type: error_type.clone(),
+                        backoff: *backoff,
                     });
                 }
                 e
             })
     }
 
-    async fn resolve_group_info(&self, jid: &Jid) -> Result<GroupInfo, anyhow::Error> {
-        self.groups().query_info(jid).await
+    async fn resolve_group_info(&self, jid: &Jid) -> Result<Arc<GroupInfo>, anyhow::Error> {
+        Ok(self.groups().query_info(jid).await?)
     }
 
     async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {
         self.lid_pn_cache.get_current_lid(phone_user).await
+    }
+
+    fn on_local_identity_change(&self, jid: &Jid) {
+        self.react_to_local_identity_change(jid);
     }
 }

@@ -3,6 +3,7 @@ use wacore::handshake::NoiseError;
 use wacore_binary::error::BinaryError;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SocketError {
     #[error("socket is closed")]
     SocketClosed,
@@ -17,6 +18,7 @@ pub enum SocketError {
 pub type Result<T> = std::result::Result<T, SocketError>;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum EncryptSendErrorKind {
     #[error("cryptography error")]
     Crypto,

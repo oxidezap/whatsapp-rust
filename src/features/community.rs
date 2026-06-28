@@ -4,17 +4,37 @@
 //! Uses the `w:g2` IQ namespace for mutations and MEX (GraphQL) for metadata queries.
 
 use crate::client::Client;
+use crate::features::groups::GroupError;
 use crate::features::groups::GroupMetadata;
 use crate::features::groups::GroupParticipant;
-use crate::features::mex::{MexError, MexRequest};
+use crate::features::mex::{MexError, mex_request};
+use crate::request::IqError;
 use log::warn;
-use serde_json::json;
+use thiserror::Error;
 use wacore::iq::groups::{
     DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateIq, GroupCreateOptions,
     JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
-use wacore::iq::mex_ids::community as community_docs;
+use wacore::iq::mex_operations::{fetch_all_subgroups, query_subgroup_participant_count};
 use wacore_binary::Jid;
+
+/// Error returned by community operations.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum CommunityError {
+    /// A `w:g2` IQ to the server failed.
+    #[error(transparent)]
+    Iq(#[from] IqError),
+    /// A MEX (GraphQL) metadata query/mutation failed or returned bad data.
+    #[error(transparent)]
+    Mex(#[from] MexError),
+    /// A delegated group operation failed (e.g. setting the community description).
+    #[error(transparent)]
+    Group(#[from] GroupError),
+    /// The request was malformed or the server response was missing required data.
+    #[error("invalid community request: {0}")]
+    InvalidRequest(String),
+}
 
 // Types
 
@@ -61,12 +81,14 @@ impl CreateCommunityOptions {
 
 /// Result of creating a community.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CreateCommunityResult {
     pub metadata: GroupMetadata,
 }
 
 /// A subgroup within a community.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CommunitySubgroup {
     pub id: Jid,
     pub subject: String,
@@ -77,6 +99,7 @@ pub struct CommunitySubgroup {
 
 /// Result of linking subgroups to a community.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LinkSubgroupsResult {
     pub linked_jids: Vec<Jid>,
     pub failed_groups: Vec<(Jid, u32)>,
@@ -84,6 +107,7 @@ pub struct LinkSubgroupsResult {
 
 /// Result of unlinking subgroups from a community.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct UnlinkSubgroupsResult {
     pub unlinked_jids: Vec<Jid>,
     pub failed_groups: Vec<(Jid, u32)>,
@@ -122,7 +146,7 @@ impl<'a> Community<'a> {
     pub async fn create(
         &self,
         options: CreateCommunityOptions,
-    ) -> Result<CreateCommunityResult, anyhow::Error> {
+    ) -> Result<CreateCommunityResult, CommunityError> {
         let description = options.description.clone();
 
         let create_options = GroupCreateOptions {
@@ -154,7 +178,8 @@ impl<'a> Community<'a> {
     }
 
     /// Deactivate (delete) a community. Subgroups are unlinked but not deleted.
-    pub async fn deactivate(&self, community_jid: &Jid) -> Result<(), anyhow::Error> {
+    pub async fn deactivate(&self, community_jid: impl Into<Jid>) -> Result<(), CommunityError> {
+        let community_jid = &community_jid.into();
         self.client
             .execute(DeleteCommunityIq::new(community_jid))
             .await?;
@@ -164,9 +189,10 @@ impl<'a> Community<'a> {
     /// Link existing groups as subgroups of a community.
     pub async fn link_subgroups(
         &self,
-        community_jid: &Jid,
+        community_jid: impl Into<Jid>,
         subgroup_jids: &[Jid],
-    ) -> Result<LinkSubgroupsResult, anyhow::Error> {
+    ) -> Result<LinkSubgroupsResult, CommunityError> {
+        let community_jid = &community_jid.into();
         let response = self
             .client
             .execute(LinkSubgroupsIq::new(community_jid, subgroup_jids))
@@ -192,10 +218,11 @@ impl<'a> Community<'a> {
     /// Unlink subgroups from a community.
     pub async fn unlink_subgroups(
         &self,
-        community_jid: &Jid,
+        community_jid: impl Into<Jid>,
         subgroup_jids: &[Jid],
         remove_orphan_members: bool,
-    ) -> Result<UnlinkSubgroupsResult, anyhow::Error> {
+    ) -> Result<UnlinkSubgroupsResult, CommunityError> {
+        let community_jid = &community_jid.into();
         let response = self
             .client
             .execute(UnlinkSubgroupsIq::new(
@@ -226,21 +253,19 @@ impl<'a> Community<'a> {
     pub async fn get_subgroups(
         &self,
         community_jid: &Jid,
-    ) -> Result<Vec<CommunitySubgroup>, MexError> {
+    ) -> Result<Vec<CommunitySubgroup>, CommunityError> {
         let response = self
             .client
             .mex()
-            .query(MexRequest {
-                doc: community_docs::FETCH_ALL_SUBGROUPS,
-                variables: json!({
-                    "group_id": community_jid.to_string()
-                }),
-            })
+            .query(mex_request!(fetch_all_subgroups {
+                group_id: Some(community_jid.to_string()),
+                ..Default::default()
+            }))
             .await?;
 
-        let data = response
-            .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data field".into()))?;
+        let data = response.data.ok_or_else(|| {
+            CommunityError::InvalidRequest("MEX response missing data field".into())
+        })?;
 
         let group_query = &data["xwa2_group_query_by_id"];
         let mut subgroups = Vec::new();
@@ -273,23 +298,21 @@ impl<'a> Community<'a> {
     pub async fn get_subgroup_participant_counts(
         &self,
         community_jid: &Jid,
-    ) -> Result<Vec<(Jid, u32)>, MexError> {
+    ) -> Result<Vec<(Jid, u32)>, CommunityError> {
         let response = self
             .client
             .mex()
-            .query(MexRequest {
-                doc: community_docs::FETCH_SUBGROUP_PARTICIPANT_COUNT,
-                variables: json!({
-                    "input": {
-                        "group_jid": community_jid.to_string()
-                    }
+            .query(mex_request!(query_subgroup_participant_count {
+                input: Some(query_subgroup_participant_count::Input {
+                    group_jid: Some(community_jid.to_string()),
+                    ..Default::default()
                 }),
-            })
+            }))
             .await?;
 
-        let data = response
-            .data
-            .ok_or_else(|| MexError::PayloadParsing("missing data field".into()))?;
+        let data = response.data.ok_or_else(|| {
+            CommunityError::InvalidRequest("MEX response missing data field".into())
+        })?;
 
         let group_query = &data["xwa2_group_query_by_id"];
         let edges_ref = group_query
@@ -324,9 +347,11 @@ impl<'a> Community<'a> {
     /// Query a linked subgroup's metadata from the parent community.
     pub async fn query_linked_group(
         &self,
-        community_jid: &Jid,
-        subgroup_jid: &Jid,
-    ) -> Result<GroupMetadata, anyhow::Error> {
+        community_jid: impl Into<Jid>,
+        subgroup_jid: impl Into<Jid>,
+    ) -> Result<GroupMetadata, CommunityError> {
+        let community_jid = &community_jid.into();
+        let subgroup_jid = &subgroup_jid.into();
         let response = self
             .client
             .execute(QueryLinkedGroupIq::new(community_jid, subgroup_jid))
@@ -337,9 +362,11 @@ impl<'a> Community<'a> {
     /// Join a linked subgroup via the parent community.
     pub async fn join_subgroup(
         &self,
-        community_jid: &Jid,
-        subgroup_jid: &Jid,
-    ) -> Result<GroupMetadata, anyhow::Error> {
+        community_jid: impl Into<Jid>,
+        subgroup_jid: impl Into<Jid>,
+    ) -> Result<GroupMetadata, CommunityError> {
+        let community_jid = &community_jid.into();
+        let subgroup_jid = &subgroup_jid.into();
         let response = self
             .client
             .execute(JoinLinkedGroupIq::new(community_jid, subgroup_jid))
@@ -350,8 +377,9 @@ impl<'a> Community<'a> {
     /// Get all participants across all linked groups of a community.
     pub async fn get_linked_groups_participants(
         &self,
-        community_jid: &Jid,
-    ) -> Result<Vec<GroupParticipant>, anyhow::Error> {
+        community_jid: impl Into<Jid>,
+    ) -> Result<Vec<GroupParticipant>, CommunityError> {
+        let community_jid = &community_jid.into();
         let response = self
             .client
             .execute(GetLinkedGroupsParticipantsIq::new(community_jid))

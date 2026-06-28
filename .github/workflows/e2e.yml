@@ -38,7 +38,15 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
+<<<<<<< HEAD
           toolchain: nightly-2026-04-05
+=======
+          toolchain: nightly-2026-06-16
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
+>>>>>>> oxidezap/main
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Cache Rust registry
@@ -60,4 +68,4 @@ jobs:
         env:
           MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
           RUST_LOG: info
-        run: cargo test -p e2e-tests -- --no-capture
+        run: cargo test -p e2e-tests -- --nocapture

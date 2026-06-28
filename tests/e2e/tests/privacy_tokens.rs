@@ -40,11 +40,13 @@ async fn send_message_and_expect_463_with_id(
     text: &str,
     msg_id: String,
 ) -> anyhow::Result<Arc<OwnedNodeRef>> {
+    // Match by the unique message id, not by `from`: once the peer resolves to a
+    // LID the nack comes back addressed by LID (the send is LID-addressed), so a
+    // PN `from` filter would never match. The id alone identifies this nack.
     let waiter = sender.client.wait_for_node(
         NodeFilter::tag("ack")
             .attr("id", msg_id.clone())
             .attr("class", "message")
-            .attr("from", recipient_jid.to_string())
             .attr("error", "463"),
     );
 
@@ -122,7 +124,6 @@ async fn test_issue_tokens_api_delivers_notification_and_updates_index() -> anyh
     let jid_b_lid = client_b
         .client
         .get_lid()
-        .await
         .expect("B should have LID after connect");
     let issued = client_a
         .client
@@ -235,8 +236,8 @@ async fn test_tc_token_notification_reaches_all_connected_devices() -> anyhow::R
     let mut client_b1 = TestClient::connect_as("e2e_tctok_multi_b1", &shared_b_name).await?;
     let client_b2 = TestClient::connect_as("e2e_tctok_multi_b2", &shared_b_name).await?;
 
-    let phone_b1 = client_b1.client.get_pn().await.expect("B1 should have JID");
-    let phone_b2 = client_b2.client.get_pn().await.expect("B2 should have JID");
+    let phone_b1 = client_b1.client.get_pn().expect("B1 should have JID");
+    let phone_b2 = client_b2.client.get_pn().expect("B2 should have JID");
     assert_eq!(
         phone_b1.user, phone_b2.user,
         "B devices should share a phone"
@@ -395,7 +396,6 @@ async fn test_only_nct_send_ab_without_salt_still_receives_463() -> anyhow::Resu
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let msg_id = format!("E2ECSNEG1{}", uuid::Uuid::new_v4().simple());
     let sent_msg_id = msg_id.clone();
@@ -455,7 +455,6 @@ async fn test_send_and_syncd_ab_without_delivery_still_receives_463() -> anyhow:
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let msg_id = format!("E2ECSNEG2{}", uuid::Uuid::new_v4().simple());
     let sent_msg_id = msg_id.clone();
@@ -516,7 +515,6 @@ async fn test_history_sync_nct_salt_enables_cstoken_first_contact() -> anyhow::R
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
@@ -583,7 +581,6 @@ async fn test_cstoken_only_first_contact_succeeds_when_tctoken_disabled() -> any
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
@@ -644,7 +641,6 @@ async fn test_syncd_nct_salt_enables_cstoken_first_contact() -> anyhow::Result<(
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
@@ -702,7 +698,6 @@ async fn test_clearing_nct_salt_locally_makes_first_contact_fail_again() -> anyh
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     client_b
         .client
@@ -732,7 +727,6 @@ async fn test_clearing_nct_salt_locally_makes_first_contact_fail_again() -> anyh
     let jid_c_lid = client_c
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     send_first_message_and_expect_463(
         &client_b,
@@ -842,7 +836,6 @@ async fn test_nct_salt_survives_reconnect_and_still_allows_first_contact() -> an
     let jid_a_lid = client_a
         .client
         .get_lid()
-        .await
         .expect("restricted recipient should have a LID");
     let sent_waiter = client_b.next_sent_message_waiter();
     client_b
@@ -934,9 +927,21 @@ async fn test_pn_target_first_contact_uses_cstoken_after_lid_resolution() -> any
         .await
         .map_err(|_| anyhow::anyhow!("Timed out waiting for PN-target sent message node"))?
         .map_err(|_| anyhow::anyhow!("PN-target sent message waiter was canceled"))?;
-    assert_eq!(
-        sent.attrs.get("to").map(|v| v.to_string()),
-        Some(jid_a_pn.to_string())
+    // After LID resolution the DM is addressed by LID, matching the LID
+    // participants (WAWebSendMsgCreateFanoutStanza builds the stanza from one
+    // CHAT_JID). Pre-fix the outer `to` stayed the PN, producing the mixed
+    // PN-over-LID stanza the real server rejects with ack error 400 (issue #730).
+    let sent_to = sent
+        .attrs()
+        .optional_jid("to")
+        .expect("sent message must carry a to JID");
+    assert!(
+        sent_to.is_lid(),
+        "DM to a LID-mapped peer must be LID-addressed, got {sent_to}"
+    );
+    assert_ne!(
+        sent_to.user, jid_a_pn.user,
+        "outer to must not stay the PN once the peer resolves to a LID"
     );
     assert!(has_child(&sent, "cstoken"));
     assert!(!has_child(&sent, "tctoken"));

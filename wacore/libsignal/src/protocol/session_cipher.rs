@@ -52,16 +52,40 @@ impl EncryptionBuffer {
         &mut self.buffer
     }
 }
+
+/// Current capacity of this thread's encrypt buffer. Test-only: lets the
+/// oversized-buffer-release regression test observe the thread-local.
+#[cfg(test)]
+fn encryption_buffer_capacity() -> usize {
+    ENCRYPTION_BUFFER.with(|b| b.borrow().buffer.capacity())
+}
 use crate::protocol::consts::MAX_FORWARD_JUMPS;
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, UsePQRatchet};
 use crate::protocol::state::PreKeyId;
 use crate::protocol::state::SessionState;
 use crate::protocol::{
-    CiphertextMessage, CiphertextMessageType, Direction, IdentityKeyStore, KeyPair,
+    CiphertextMessage, CiphertextMessageType, Direction, IdentityChange, IdentityKeyStore, KeyPair,
     PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, Result, SessionRecord,
     SessionStore, SignalMessage, SignalProtocolError, SignedPreKeyStore, session,
 };
+
+/// Plaintext plus whether decrypting this message replaced a previously-stored
+/// identity key for the sender. A [`IdentityChange::ReplacedExisting`] is the
+/// local signal that the peer's identity changed (e.g. reinstall), letting the
+/// caller react without waiting for the server's `<identity/>` push.
+#[derive(Debug)]
+pub struct DecryptionResult {
+    pub plaintext: Vec<u8>,
+    pub identity_change: IdentityChange,
+    /// The one-time pre-key a pkmsg consumed, if any. The decrypt does NOT delete
+    /// it: removing the prekey is the caller's responsibility, and only once the
+    /// promoted session is itself durable. A crash with the prekey already gone
+    /// but the session still volatile makes a redelivered pkmsg undecryptable, so
+    /// the caller buffers this id and deletes it alongside the session flush.
+    /// `None` for a SignalMessage decrypt or a pkmsg that reused an existing session.
+    pub consumed_prekey_id: Option<PreKeyId>,
+}
 
 pub async fn message_encrypt(
     ptext: &[u8],
@@ -131,63 +155,75 @@ async fn message_encrypt_inner(
         ));
     }
 
-    let ctext = ENCRYPTION_BUFFER.with(|buffer| {
+    // Encrypt into the thread-local buffer and build the message while still
+    // borrowing it: SignalMessage::new copies the ciphertext into its protobuf
+    // body, so no owned intermediate Vec is needed. The buffer is reused across
+    // calls (cleared, capacity kept) instead of being taken out and reallocated.
+    // aes_256_cbc_encrypt appends from buf.len(), so clear it first; this also
+    // drops any ciphertext left by a prior call that errored.
+    let message = ENCRYPTION_BUFFER.with(|buffer| {
         let mut buf_wrapper = buffer.borrow_mut();
         let buf = buf_wrapper.get_buffer();
+        buf.clear();
         aes_256_cbc_encrypt_into(ptext, message_keys.cipher_key(), message_keys.iv(), buf)
             .map_err(|_| {
                 log::error!("session state corrupt for {remote_address}");
                 SignalProtocolError::InvalidSessionStructure("invalid sender chain message keys")
             })?;
-        let result = std::mem::take(buf);
-        // Restore buffer capacity for next use (take() leaves empty Vec with 0 capacity)
-        buf.reserve(EncryptionBuffer::INITIAL_CAPACITY);
-        Ok::<Vec<u8>, SignalProtocolError>(result)
+        let ctext = buf.as_slice();
+
+        let message = if let Some(items) = session_state.unacknowledged_pre_key_message_items()? {
+            let local_registration_id = session_state.local_registration_id();
+
+            log::debug!(
+                "Building PreKeyWhisperMessage for: {} with preKeyId: {}",
+                remote_address,
+                items
+                    .pre_key_id()
+                    .map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+            );
+
+            let message = SignalMessage::new(
+                session_version,
+                message_keys.mac_key(),
+                sender_ephemeral,
+                chain_key.index(),
+                previous_counter,
+                ctext,
+                &local_identity_key,
+                &their_identity_key,
+            )?;
+
+            CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::new(
+                session_version,
+                local_registration_id,
+                items.pre_key_id(),
+                items.signed_pre_key_id(),
+                *items.base_key(),
+                local_identity_key,
+                message,
+            )?)
+        } else {
+            CiphertextMessage::SignalMessage(SignalMessage::new(
+                session_version,
+                message_keys.mac_key(),
+                sender_ephemeral,
+                chain_key.index(),
+                previous_counter,
+                ctext,
+                &local_identity_key,
+                &their_identity_key,
+            )?)
+        };
+        // A plaintext whose ciphertext exceeds MAX_CAPACITY leaves an oversized
+        // buffer in thread-local storage; release it now (the old take+realloc
+        // path did this implicitly) so a single large send doesn't pin memory
+        // per worker thread until get_buffer's periodic shrink fires.
+        if buf.capacity() > EncryptionBuffer::MAX_CAPACITY {
+            *buf = Vec::with_capacity(EncryptionBuffer::INITIAL_CAPACITY);
+        }
+        Ok::<CiphertextMessage, SignalProtocolError>(message)
     })?;
-
-    let message = if let Some(items) = session_state.unacknowledged_pre_key_message_items()? {
-        let local_registration_id = session_state.local_registration_id();
-
-        log::debug!(
-            "Building PreKeyWhisperMessage for: {} with preKeyId: {}",
-            remote_address,
-            items
-                .pre_key_id()
-                .map_or_else(|| "<none>".to_string(), |id| id.to_string()),
-        );
-
-        let message = SignalMessage::new(
-            session_version,
-            message_keys.mac_key(),
-            sender_ephemeral,
-            chain_key.index(),
-            previous_counter,
-            &ctext,
-            &local_identity_key,
-            &their_identity_key,
-        )?;
-
-        CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::new(
-            session_version,
-            local_registration_id,
-            items.pre_key_id(),
-            items.signed_pre_key_id(),
-            *items.base_key(),
-            local_identity_key,
-            message,
-        )?)
-    } else {
-        CiphertextMessage::SignalMessage(SignalMessage::new(
-            session_version,
-            message_keys.mac_key(),
-            sender_ephemeral,
-            chain_key.index(),
-            previous_counter,
-            &ctext,
-            &local_identity_key,
-            &their_identity_key,
-        )?)
-    };
 
     identity_store
         .save_identity(remote_address, &their_identity_key)
@@ -208,7 +244,7 @@ pub async fn message_decrypt<R: Rng + CryptoRng>(
     signed_pre_key_store: &dyn SignedPreKeyStore,
     csprng: &mut R,
     use_pq_ratchet: UsePQRatchet,
-) -> Result<Vec<u8>> {
+) -> Result<DecryptionResult> {
     match ciphertext {
         CiphertextMessage::SignalMessage(m) => {
             message_decrypt_signal(m, remote_address, session_store, identity_store, csprng).await
@@ -243,7 +279,7 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     signed_pre_key_store: &dyn SignedPreKeyStore,
     csprng: &mut R,
     use_pq_ratchet: UsePQRatchet,
-) -> Result<Vec<u8>> {
+) -> Result<DecryptionResult> {
     let existing = session_store.load_session(remote_address).await?;
     let had_session = existing.is_some();
     // Snapshot before process_prekey so a BadMac/InvalidMessage at the
@@ -283,13 +319,16 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
         session_store.store_session(remote_address, record).await?;
     }
 
-    let (plaintext, pre_key_used) = result?;
+    let (plaintext, pre_key_used, identity_change) = result?;
 
-    if let Some(pre_key_id) = pre_key_used {
-        pre_key_store.remove_pre_key(pre_key_id).await?;
-    }
-
-    Ok(plaintext)
+    // The consumed prekey is reported up, not deleted here: the promoted session
+    // is still volatile in the caller's cache, so the prekey must only be removed
+    // once that session is durable (see DecryptionResult::consumed_prekey_id).
+    Ok(DecryptionResult {
+        plaintext,
+        identity_change,
+        consumed_prekey_id: pre_key_used,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -302,7 +341,7 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
     signed_pre_key_store: &dyn SignedPreKeyStore,
     csprng: &mut R,
     use_pq_ratchet: UsePQRatchet,
-) -> Result<(Vec<u8>, Option<PreKeyId>)> {
+) -> Result<(Vec<u8>, Option<PreKeyId>, IdentityChange)> {
     let process_prekey_result = session::process_prekey(
         ciphertext,
         remote_address,
@@ -314,7 +353,7 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
     )
     .await;
 
-    let (pre_key_used, identity_to_save) = match process_prekey_result {
+    let (pre_key_used, identity_to_save, reused_existing_session) = match process_prekey_result {
         Ok(result) => result,
         Err(e) => {
             let errs = [e];
@@ -340,14 +379,28 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
         csprng,
     )?;
 
-    identity_store
+    let saved = identity_store
         .save_identity(
             identity_to_save.remote_address,
             identity_to_save.their_identity_key,
         )
         .await?;
 
-    Ok((decrypt_result.plaintext, pre_key_used.pre_key_id))
+    // A duplicate/out-of-order pkmsg that matched an existing session carries the
+    // identity from when that session was built, not a fresh rotation. Reporting
+    // it as a change would fire a spurious local identity-change reaction (mirrors
+    // the previous-session SignalMessage path).
+    let identity_change = if reused_existing_session {
+        IdentityChange::NewOrUnchanged
+    } else {
+        saved
+    };
+
+    Ok((
+        decrypt_result.plaintext,
+        pre_key_used.pre_key_id,
+        identity_change,
+    ))
 }
 
 pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
@@ -356,7 +409,7 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
     session_store: &mut dyn SessionStore,
     identity_store: &mut dyn IdentityKeyStore,
     csprng: &mut R,
-) -> Result<Vec<u8>> {
+) -> Result<DecryptionResult> {
     let mut session_record = session_store
         .load_session(remote_address)
         .await?
@@ -375,7 +428,12 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
         .store_session(remote_address, session_record)
         .await?;
 
-    result
+    let (plaintext, identity_change) = result?;
+    Ok(DecryptionResult {
+        plaintext,
+        identity_change,
+        consumed_prekey_id: None,
+    })
 }
 
 async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
@@ -384,7 +442,7 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
     session_record: &mut SessionRecord,
     identity_store: &mut dyn IdentityKeyStore,
     csprng: &mut R,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, IdentityChange)> {
     // A record with no current state and no previous states is degenerate — treat
     // it as missing so the caller gets SessionNotFound and sends a proper retry
     // receipt (with error code 1) instead of attempting decryption that will always
@@ -424,14 +482,19 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
     // The previous session gets promoted to current via `promote_old_session`, so we need
     // to save its identity to avoid UntrustedIdentity errors on subsequent messages.
     // This handles out-of-order message delivery after an identity change gracefully.
-    if decrypt_result.used_previous_session {
+    let identity_change = if decrypt_result.used_previous_session {
         log::debug!(
             "Saving identity for {} from previous session (skipping trust check)",
             remote_address,
         );
+        // Re-saving an archived session's (older) identity for out-of-order
+        // delivery is not the peer's current identity changing, so never report
+        // it as a change. Doing so would fire a spurious local identity-change
+        // reaction and clobber the current identity.
         identity_store
             .save_identity(remote_address, &their_identity_key)
             .await?;
+        IdentityChange::NewOrUnchanged
     } else {
         if !identity_store
             .is_trusted_identity(remote_address, &their_identity_key, Direction::Receiving)
@@ -449,10 +512,10 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
 
         identity_store
             .save_identity(remote_address, &their_identity_key)
-            .await?;
-    }
+            .await?
+    };
 
-    Ok(decrypt_result.plaintext)
+    Ok((decrypt_result.plaintext, identity_change))
 }
 
 fn create_decryption_failure_log(
@@ -546,8 +609,9 @@ fn create_decryption_failure_log(
     Ok(lines.join("\n"))
 }
 
-/// Result of decrypting a message, including whether a previous session was used.
-struct DecryptionResult {
+/// Result of decrypting a message against a session record, including whether a
+/// previous session was used.
+struct RecordDecryptResult {
     plaintext: Vec<u8>,
     /// True if the message was decrypted using a previous (archived) session state
     /// rather than the current session. When true, the identity check should be
@@ -561,7 +625,7 @@ fn decrypt_message_with_record<R: Rng + CryptoRng>(
     ciphertext: &SignalMessage,
     original_message_type: CiphertextMessageType,
     csprng: &mut R,
-) -> Result<DecryptionResult> {
+) -> Result<RecordDecryptResult> {
     debug_assert!(matches!(
         original_message_type,
         CiphertextMessageType::Whisper | CiphertextMessageType::PreKey
@@ -607,7 +671,7 @@ fn decrypt_message_with_record<R: Rng + CryptoRng>(
                         .expect("successful decrypt always has a valid base key"),
                 );
                 record.set_session_state(current_state); // update the state
-                return Ok(DecryptionResult {
+                return Ok(RecordDecryptResult {
                     plaintext: ptext,
                     used_previous_session: false,
                 });
@@ -696,7 +760,7 @@ fn decrypt_message_with_record<R: Rng + CryptoRng>(
                 );
                 // Promote this session (it's already been removed by take_previous_session)
                 record.promote_state(previous);
-                return Ok(DecryptionResult {
+                return Ok(RecordDecryptResult {
                     plaintext: ptext,
                     used_previous_session: true,
                 });
@@ -798,10 +862,25 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     let their_ephemeral = ciphertext.sender_ratchet_key();
     let counter = ciphertext.counter();
 
-    // Transactional decrypt — roll back chain advance / new-chain DH
-    // step on any failure so the next msg derives from an
-    // uncorrupted ratchet. See `SessionState::decrypt_snapshot`.
-    let snapshot = state.decrypt_snapshot();
+    // Transactional decrypt — roll back chain advance / new-chain DH step on any
+    // failure so the next msg derives from an uncorrupted ratchet.
+    //
+    // Fast path for the common in-order message on an existing receiver chain
+    // (counter == the chain's current index): the only mutation is a single
+    // `set_receiver_chain_key` advance — no DH ratchet, no skipped-key caching,
+    // no chain eviction — so saving the old `ChainKey` (a `Copy`) is a complete
+    // rollback and avoids cloning the whole receiver-chain set. Every other case
+    // (new chain, skip-ahead, out-of-order key removal) and any lookup error
+    // falls through to the full `decrypt_snapshot`, unchanged.
+    let fast_rollback: Option<ChainKey> = match state.get_receiver_chain_key(their_ephemeral) {
+        Ok(Some(chain_key)) if chain_key.index() == counter => Some(chain_key),
+        _ => None,
+    };
+    let full_snapshot = match fast_rollback {
+        Some(_) => None,
+        None => Some(state.decrypt_snapshot()),
+    };
+
     let result = decrypt_with_pending_state(
         current_or_previous,
         state,
@@ -814,12 +893,18 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     );
     match result {
         Ok(ptext) => {
-            drop(snapshot);
+            drop(full_snapshot);
             state.clear_unacknowledged_pre_key_message();
             Ok(ptext)
         }
         Err(e) => {
-            state.restore_decrypt_snapshot(snapshot);
+            if let Some(chain_key) = fast_rollback {
+                // The chain still exists (in-order decrypt never removes it), so
+                // restoring its key cannot fail; keep the original decrypt error.
+                let _ = state.set_receiver_chain_key(their_ephemeral, &chain_key);
+            } else if let Some(snapshot) = full_snapshot {
+                state.restore_decrypt_snapshot(snapshot);
+            }
             Err(e)
         }
     }
@@ -1255,6 +1340,249 @@ mod tests {
         }
     }
 
+    /// Builds Bob's prekey stores plus a self-signed `PreKeyBundle`, without
+    /// establishing any session. Each call uses a fresh identity, so two bundles
+    /// for the same address model a peer reinstall.
+    #[allow(clippy::type_complexity)]
+    fn fresh_bob(
+        rng: &mut rand::rngs::StdRng,
+    ) -> (
+        ProtocolAddress,
+        MemSessionStore,
+        MemIdentityStore,
+        MemPreKeyStore,
+        MemSignedPreKeyStore,
+        PreKeyBundle,
+    ) {
+        let bob_addr = ProtocolAddress::new("bob".to_string(), 1.into());
+        let bob_id = IdentityKeyPair::generate(rng);
+        let bob_identity_key = *bob_id.identity_key();
+
+        let prekey_id: PreKeyId = 1.into();
+        let prekey_pair = KeyPair::generate(rng);
+        let signed_id: SignedPreKeyId = 1.into();
+        let signed_pair = KeyPair::generate(rng);
+        let signed_sig = bob_id
+            .private_key()
+            .calculate_signature(&signed_pair.public_key.serialize(), rng)
+            .expect("signature");
+
+        let mut bob_prekeys = MemPreKeyStore::new();
+        let mut bob_signed = MemSignedPreKeyStore::new();
+        futures::executor::block_on(async {
+            bob_prekeys
+                .save_pre_key(prekey_id, &PreKeyRecord::new(prekey_id, &prekey_pair))
+                .await
+                .expect("save prekey");
+            bob_signed
+                .save_signed_pre_key(
+                    signed_id,
+                    &SignedPreKeyRecord::new(
+                        signed_id,
+                        Timestamp::from_epoch_millis(0),
+                        &signed_pair,
+                        &signed_sig,
+                    ),
+                )
+                .await
+                .expect("save signed prekey");
+        });
+
+        let bundle = PreKeyBundle::new(
+            2,
+            1.into(),
+            Some((prekey_id, prekey_pair.public_key)),
+            signed_id,
+            signed_pair.public_key,
+            signed_sig.to_vec(),
+            bob_identity_key,
+        )
+        .expect("valid bundle");
+
+        (
+            bob_addr,
+            MemSessionStore::new(),
+            MemIdentityStore::new(bob_id, 2),
+            bob_prekeys,
+            bob_signed,
+            bundle,
+        )
+    }
+
+    /// `process_prekey_bundle` must report `NewOrUnchanged` on first contact and
+    /// `ReplacedExisting` when a later bundle carries a different identity for the
+    /// same address (peer reinstall). This is the signal the high-level client
+    /// threads up to mirror WA Web `saveIdentity` -> `handleNewIdentity`.
+    #[test]
+    fn process_prekey_bundle_reports_identity_change() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let (bob_addr, _bs, _bi, _bp, _bsp, bundle1) = fresh_bob(&mut rng);
+        let (_bob_addr2, _bs2, _bi2, _bp2, _bsp2, bundle2) = fresh_bob(&mut rng);
+
+        let alice_id = IdentityKeyPair::generate(&mut rng);
+        let mut alice_sessions = MemSessionStore::new();
+        let mut alice_identity = MemIdentityStore::new(alice_id, 1);
+
+        futures::executor::block_on(async {
+            let first = process_prekey_bundle(
+                &bob_addr,
+                &mut alice_sessions,
+                &mut alice_identity,
+                &bundle1,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("first bundle");
+            assert_eq!(first, IdentityChange::NewOrUnchanged, "first contact");
+
+            let second = process_prekey_bundle(
+                &bob_addr,
+                &mut alice_sessions,
+                &mut alice_identity,
+                &bundle2,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("second bundle");
+            assert_eq!(
+                second,
+                IdentityChange::ReplacedExisting,
+                "different identity for same address"
+            );
+        });
+    }
+
+    /// `message_decrypt` of a pkmsg reports `NewOrUnchanged` on first contact and
+    /// `ReplacedExisting` when the sender's stored identity differs (reinstall),
+    /// while still returning the correct plaintext.
+    #[test]
+    fn decrypt_prekey_reports_identity_change() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+        for (preseed_stale, expected) in [
+            (false, IdentityChange::NewOrUnchanged),
+            (true, IdentityChange::ReplacedExisting),
+        ] {
+            let alice_addr = ProtocolAddress::new("alice".to_string(), 1.into());
+            let alice_id = IdentityKeyPair::generate(&mut rng);
+            let mut alice_sessions = MemSessionStore::new();
+            let mut alice_identity = MemIdentityStore::new(alice_id, 1);
+
+            let (bob_addr, mut bob_sessions, mut bob_identity, mut bob_prekeys, bob_signed, bundle) =
+                fresh_bob(&mut rng);
+
+            futures::executor::block_on(async {
+                if preseed_stale {
+                    // Bob already knows a different identity for Alice → reinstall.
+                    let stale = *IdentityKeyPair::generate(&mut rng).identity_key();
+                    bob_identity
+                        .save_identity(&alice_addr, &stale)
+                        .await
+                        .expect("seed stale identity");
+                }
+
+                process_prekey_bundle(
+                    &bob_addr,
+                    &mut alice_sessions,
+                    &mut alice_identity,
+                    &bundle,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("process bundle");
+
+                let ct =
+                    message_encrypt(b"hi", &bob_addr, &mut alice_sessions, &mut alice_identity)
+                        .await
+                        .expect("encrypt");
+                let pkmsg = CiphertextMessage::PreKeySignalMessage(
+                    PreKeySignalMessage::try_from(ct.serialize()).expect("parse pkmsg"),
+                );
+
+                let res = message_decrypt(
+                    &pkmsg,
+                    &alice_addr,
+                    &mut bob_sessions,
+                    &mut bob_identity,
+                    &mut bob_prekeys,
+                    &bob_signed,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("decrypt pkmsg");
+
+                assert_eq!(res.plaintext, b"hi".to_vec());
+                assert_eq!(res.identity_change, expected);
+            });
+        }
+    }
+
+    /// `process_prekey` must signal session reuse when a pkmsg matches an
+    /// already-established session. The caller relies on this to avoid treating
+    /// a duplicate/out-of-order pkmsg's (possibly stale) identity as a fresh
+    /// rotation and firing a spurious local identity-change reaction.
+    #[test]
+    fn process_prekey_signals_reuse_for_established_session() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let alice_addr = ProtocolAddress::new("alice".to_string(), 1.into());
+        let alice_id = IdentityKeyPair::generate(&mut rng);
+        let mut alice_sessions = MemSessionStore::new();
+        let mut alice_identity = MemIdentityStore::new(alice_id, 1);
+
+        let (bob_addr, _bs, bob_identity, bob_prekeys, bob_signed, bundle) = fresh_bob(&mut rng);
+
+        futures::executor::block_on(async {
+            process_prekey_bundle(
+                &bob_addr,
+                &mut alice_sessions,
+                &mut alice_identity,
+                &bundle,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("process bundle");
+            let ct = message_encrypt(b"hi", &bob_addr, &mut alice_sessions, &mut alice_identity)
+                .await
+                .expect("encrypt");
+            let pkmsg = PreKeySignalMessage::try_from(ct.serialize()).expect("parse pkmsg");
+
+            let mut record = SessionRecord::new_fresh();
+            let (_used, _save, reused_first) = process_prekey(
+                &pkmsg,
+                &alice_addr,
+                &mut record,
+                &bob_identity,
+                &bob_prekeys,
+                &bob_signed,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("first process_prekey");
+            assert!(!reused_first, "first pkmsg establishes a new session");
+
+            let (_used2, _save2, reused_again) = process_prekey(
+                &pkmsg,
+                &alice_addr,
+                &mut record,
+                &bob_identity,
+                &bob_prekeys,
+                &bob_signed,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("second process_prekey");
+            assert!(
+                reused_again,
+                "re-processing the same pkmsg must signal session reuse"
+            );
+        });
+    }
+
     /// P0: MAC verification failure must return `BadMac`, not `InvalidMessage`.
     ///
     /// Establishes a full Alice↔Bob session with a complete round-trip, then
@@ -1332,6 +1660,142 @@ mod tests {
             assert!(
                 matches!(err, SignalProtocolError::BadMac(_)),
                 "expected BadMac, got: {err}"
+            );
+        });
+    }
+
+    /// Fast-path rollback: a MAC failure on an in-order message (the path that
+    /// now rolls back via the single saved chain key instead of the full
+    /// `decrypt_snapshot` clone) must leave the receiver chain untouched, so the
+    /// next legitimate message on the same chain still decrypts. A regressed
+    /// rollback would leave the chain advanced and surface `DuplicatedMessage`.
+    #[test]
+    fn inorder_macfail_rolls_back_chain_and_recovers() {
+        let mut tp = setup_established_session();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+        futures::executor::block_on(async {
+            // Bob replies so Alice clears her pending prekey and sends plain
+            // SignalMessages from here on.
+            let bob_reply = message_encrypt(
+                b"ack",
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+            )
+            .await
+            .expect("Bob encrypt reply");
+            let bob_msg =
+                SignalMessage::try_from(bob_reply.serialize()).expect("reply is a SignalMessage");
+            message_decrypt_signal(
+                &bob_msg,
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+                &mut rng,
+            )
+            .await
+            .expect("Alice decrypts reply");
+
+            // Alice sends two consecutive messages on the same sending chain.
+            let m1 = message_encrypt(
+                b"first",
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+            )
+            .await
+            .expect("encrypt m1");
+            let m2 = message_encrypt(
+                b"second",
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+            )
+            .await
+            .expect("encrypt m2");
+            assert!(
+                matches!(m2, CiphertextMessage::SignalMessage(_)),
+                "m2 should be a SignalMessage"
+            );
+
+            // Bob decrypts m1 → advances the receiver chain, so m2 is an in-order
+            // message on an existing chain (the fast path).
+            let m1_sig = SignalMessage::try_from(m1.serialize()).expect("m1 SignalMessage");
+            let p1 = message_decrypt_signal(
+                &m1_sig,
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+                &mut rng,
+            )
+            .await
+            .expect("Bob decrypts m1");
+            assert_eq!(p1.plaintext, b"first");
+
+            // Corrupt m2's MAC and decrypt → BadMac, exercising the fast-path rollback.
+            let raw = m2.serialize();
+            let mut corrupted = raw.to_vec();
+            let off = corrupted.len() - 4;
+            corrupted[off] ^= 0xFF;
+            let corrupted_msg =
+                SignalMessage::try_from(corrupted.as_slice()).expect("protobuf intact");
+            let err = message_decrypt_signal(
+                &corrupted_msg,
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+                &mut rng,
+            )
+            .await
+            .expect_err("corrupted m2 must fail");
+            assert!(
+                matches!(err, SignalProtocolError::BadMac(_)),
+                "expected BadMac, got: {err}"
+            );
+
+            // The legit m2 must still decrypt — proving the chain key was rolled back.
+            let m2_sig = SignalMessage::try_from(m2.serialize()).expect("m2 SignalMessage");
+            let p2 = message_decrypt_signal(
+                &m2_sig,
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+                &mut rng,
+            )
+            .await
+            .expect("Bob decrypts legit m2 after rollback");
+            assert_eq!(p2.plaintext, b"second");
+        });
+    }
+
+    /// Reusing the encrypt buffer must not pin an oversized allocation: a
+    /// plaintext larger than MAX_CAPACITY grows the thread-local buffer, which
+    /// has to be released after the message is built (the old take+realloc path
+    /// did this implicitly).
+    #[test]
+    fn encrypt_releases_oversized_buffer() {
+        let mut tp = setup_established_session();
+        futures::executor::block_on(async {
+            let big = vec![7u8; 32 * 1024]; // ciphertext far exceeds MAX_CAPACITY (16 KiB)
+            message_encrypt(
+                &big,
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+            )
+            .await
+            .expect("encrypt large message");
+
+            // The fix's contract is "buffer must not exceed MAX_CAPACITY after a
+            // send". Asserting against MAX (not INITIAL) keeps the test robust:
+            // Vec::with_capacity only guarantees a lower bound, so an allocator
+            // that rounds up must not flake this. A 32 KiB plaintext without the
+            // release leaves the buffer well above MAX (~32 KiB).
+            let cap = encryption_buffer_capacity();
+            assert!(
+                cap <= EncryptionBuffer::MAX_CAPACITY,
+                "encrypt buffer should be released after an oversized send, got capacity {cap}"
             );
         });
     }

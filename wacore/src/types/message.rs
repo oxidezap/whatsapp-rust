@@ -337,6 +337,11 @@ pub struct MessageInfo {
     /// goes to the right routing target).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_recipient_pn: Option<Jid>,
+    /// Parent post key when the dispatched message is a decrypted CAG channel
+    /// comment (`enc_comment_message`). The inner `Message` proto has no slot
+    /// for the threading link, so it surfaces here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_target: Option<wa::MessageKey>,
     /// Broadcast-contact-list recipients from `<participants><to jid>` on an
     /// incoming broadcast/status stanza. Populated only for broadcasts; used to
     /// validate a `deviceSentMessage.phash` (WA Web `validateBclHash`). Empty
@@ -406,6 +411,43 @@ mod tests {
         let mut newsletter = bot.clone();
         newsletter.chat = "120363298765432100@newsletter".parse().unwrap();
         assert!(!newsletter.is_self_fanout(), "newsletter excluded");
+    }
+
+    #[test]
+    fn is_bot_authored_non_bot_chat_matches_wa_web() {
+        // WA Web aborts the retry receipt only when `!to.isBot() && participant.isBot()`,
+        // with participant == null for DMs. A bot DM (chat == sender == bot) must therefore
+        // NOT be suppressed; only a bot reply inside a non-bot group is.
+        let bot_dm = MessageSource {
+            chat: "200000000000002@bot".parse().unwrap(),
+            sender: "200000000000002@bot".parse().unwrap(),
+            ..Default::default()
+        };
+        assert!(
+            !bot_dm.is_bot_authored_non_bot_chat(),
+            "bot DM must not be suppressed (WA Web sends the retry)"
+        );
+
+        let group_bot = MessageSource {
+            chat: "120363021033254949@g.us".parse().unwrap(),
+            sender: "200000000000002@bot".parse().unwrap(),
+            is_group: true,
+            ..Default::default()
+        };
+        assert!(
+            group_bot.is_bot_authored_non_bot_chat(),
+            "bot reply in a non-bot group is suppressed"
+        );
+
+        let user_dm = MessageSource {
+            chat: "300000000000003@lid".parse().unwrap(),
+            sender: "300000000000003@lid".parse().unwrap(),
+            ..Default::default()
+        };
+        assert!(
+            !user_dm.is_bot_authored_non_bot_chat(),
+            "normal user DM is never suppressed"
+        );
     }
 
     #[test]

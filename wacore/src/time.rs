@@ -27,9 +27,16 @@ pub trait TimeProvider: Send + Sync + 'static {
     fn now_millis(&self) -> i64;
 }
 
-/// Default wall-clock provider using `chrono`.
+/// Default wall-clock provider using `chrono` (native targets only).
+///
+/// cfg-gated off `wasm32` for the same reason the monotonic clock is: there is
+/// no backend for `chrono::Utc::now()` on `wasm32-unknown-unknown` (we don't pull
+/// `wasmbind`), so it falls through to `SystemTime::now()`, which panics. The
+/// wasm default is [`UnsetWasmTimeProvider`].
+#[cfg(not(target_arch = "wasm32"))]
 struct ChronoTimeProvider;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl TimeProvider for ChronoTimeProvider {
     // The single legitimate call to `chrono::Utc::now()`: this IS the default
     // provider backing `wacore::time::now_utc()`. Everywhere else must go
@@ -37,6 +44,29 @@ impl TimeProvider for ChronoTimeProvider {
     #[allow(clippy::disallowed_methods)]
     fn now_millis(&self) -> i64 {
         chrono::Utc::now().timestamp_millis()
+    }
+}
+
+/// WASM default when no wall-clock provider is registered. Unlike the monotonic
+/// clock, the wall clock has no internal source on `wasm32` (and we won't panic
+/// like `chrono::Utc::now()` would), so this returns epoch (0) and warns once.
+/// Embedders MUST call [`set_time_provider`] with a real provider (e.g. backed
+/// by `Date.now()`) before the first timestamp.
+#[cfg(target_arch = "wasm32")]
+struct UnsetWasmTimeProvider;
+
+#[cfg(target_arch = "wasm32")]
+impl TimeProvider for UnsetWasmTimeProvider {
+    fn now_millis(&self) -> i64 {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "wacore::time: no wall-clock provider set on wasm32; returning epoch. \
+                 Call set_time_provider() before the first timestamp."
+            );
+        }
+        0
     }
 }
 
@@ -51,11 +81,29 @@ pub fn set_time_provider(provider: impl TimeProvider) -> Result<(), &'static str
 }
 
 /// Current time in milliseconds since Unix epoch.
+#[cfg(not(target_arch = "wasm32"))]
 #[inline]
 pub fn now_millis() -> i64 {
     TIME_PROVIDER
-        .get_or_init(|| Box::new(ChronoTimeProvider))
+        .get_or_init(default_time_provider)
         .now_millis()
+}
+
+/// On wasm32 the epoch fallback is used transiently and never stored in the
+/// `OnceLock`, so a later `set_time_provider()` always wins even if an early
+/// timestamp already ran during initialization.
+#[cfg(target_arch = "wasm32")]
+#[inline]
+pub fn now_millis() -> i64 {
+    match TIME_PROVIDER.get() {
+        Some(provider) => provider.now_millis(),
+        None => UnsetWasmTimeProvider.now_millis(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_time_provider() -> Box<dyn TimeProvider> {
+    Box::new(ChronoTimeProvider)
 }
 
 /// Current time in seconds since Unix epoch.
@@ -160,14 +208,14 @@ impl MonotonicProvider for StdMonotonicProvider {
 /// a real provider via [`set_monotonic_provider`] for sub-ms precision.
 #[cfg(target_arch = "wasm32")]
 struct WallDerivedMonotonicProvider {
-    last: std::sync::atomic::AtomicU64,
+    last: portable_atomic::AtomicU64,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl WallDerivedMonotonicProvider {
     const fn new() -> Self {
         Self {
-            last: std::sync::atomic::AtomicU64::new(0),
+            last: portable_atomic::AtomicU64::new(0),
         }
     }
 }
@@ -271,5 +319,22 @@ impl std::ops::Sub<Instant> for Instant {
     type Output = std::time::Duration;
     fn sub(self, rhs: Instant) -> std::time::Duration {
         self.saturating_duration_since(rhs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The native default must yield a real wall-clock time, not the wasm fallback's
+    // epoch. Guards the cfg-split refactor that keeps wasm32 from panicking.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_default_time_provider_returns_real_time() {
+        let ms = default_time_provider().now_millis();
+        assert!(
+            ms > 1_600_000_000_000,
+            "expected a post-2020 timestamp, got {ms}"
+        );
     }
 }

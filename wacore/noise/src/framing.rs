@@ -1,4 +1,4 @@
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use log::trace;
 
 pub const FRAME_LENGTH_SIZE: usize = 3;
@@ -105,23 +105,40 @@ impl FrameDecoder {
         self.buffer.extend_from_slice(data);
     }
 
+    /// Feed an owned payload, adopting its allocation when possible.
+    ///
+    /// In steady state each transport message starts on a frame boundary
+    /// (`buffer` is empty) and the payload has no other references, so
+    /// `try_into_mut` succeeds and the bytes are adopted wholesale — the one
+    /// remaining full copy of inbound traffic on the receive path is skipped.
+    /// A pending partial frame or a shared payload falls back to [`feed`].
+    ///
+    /// [`feed`]: Self::feed
+    pub fn feed_bytes(&mut self, data: Bytes) {
+        if self.buffer.is_empty() {
+            match data.try_into_mut() {
+                Ok(owned) => self.buffer = owned,
+                Err(shared) => self.buffer.extend_from_slice(&shared),
+            }
+        } else {
+            self.buffer.extend_from_slice(&data);
+        }
+    }
+
     pub fn decode_frame(&mut self) -> Option<BytesMut> {
         if self.buffer.len() < FRAME_LENGTH_SIZE {
             return None;
         }
 
+        // The 3-byte length caps frame_len at 0xFFFFFF (= FRAME_MAX_SIZE - 1), so an
+        // oversize read is structurally impossible; the size limit is enforced on
+        // send (encode_frame_into) and WA Web's convertBufferedToFrames likewise
+        // trusts the decoded length. A previous `frame_len > FRAME_MAX_SIZE` branch
+        // here was dead, and its handling (advancing only the 3 length bytes, leaving
+        // the payload to be misread as the next length) would have desynced the stream.
         let frame_len = ((self.buffer[0] as usize) << 16)
             | ((self.buffer[1] as usize) << 8)
             | (self.buffer[2] as usize);
-
-        if frame_len > FRAME_MAX_SIZE {
-            trace!(
-                "Frame length {} exceeds maximum size {}, dropping invalid frame",
-                frame_len, FRAME_MAX_SIZE
-            );
-            self.buffer.advance(FRAME_LENGTH_SIZE);
-            return None;
-        }
 
         if self.buffer.len() >= FRAME_LENGTH_SIZE + frame_len {
             self.buffer.advance(FRAME_LENGTH_SIZE);
@@ -211,6 +228,72 @@ mod tests {
             .expect("frame operation should succeed");
         assert_eq!(&frame2[..], &[0xCC, 0xDD, 0xEE]);
 
+        assert!(decoder.decode_frame().is_none());
+    }
+
+    #[test]
+    fn test_feed_bytes_adopts_unique_payload_without_copy() {
+        let mut data = vec![0, 0, 5];
+        data.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let payload_addr = data.as_ptr() as usize;
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed_bytes(Bytes::from(data));
+
+        let frame = decoder.decode_frame().expect("complete frame");
+        assert_eq!(&frame[..], &[1, 2, 3, 4, 5]);
+        // Zero-copy: the frame points into the original allocation, offset by
+        // the 3-byte length prefix.
+        assert_eq!(frame.as_ptr() as usize, payload_addr + FRAME_LENGTH_SIZE);
+    }
+
+    #[test]
+    fn test_feed_bytes_shared_payload_falls_back_to_copy() {
+        let mut data = vec![0, 0, 2];
+        data.extend_from_slice(&[0xAA, 0xBB]);
+        let shared = Bytes::from(data);
+        let keep_alive = shared.clone(); // refcount > 1 → try_into_mut fails
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed_bytes(shared);
+
+        let frame = decoder.decode_frame().expect("complete frame");
+        assert_eq!(&frame[..], &[0xAA, 0xBB]);
+        assert_eq!(&keep_alive[3..], &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn test_feed_bytes_partial_frame_accumulates() {
+        let mut decoder = FrameDecoder::new();
+
+        decoder.feed_bytes(Bytes::from(vec![0, 0, 4, 1, 2]));
+        assert!(decoder.decode_frame().is_none());
+
+        // Buffer non-empty → append path; the frame completes across feeds.
+        decoder.feed_bytes(Bytes::from(vec![3, 4]));
+        let frame = decoder.decode_frame().expect("complete frame");
+        assert_eq!(&frame[..], &[1, 2, 3, 4]);
+
+        // Drained again → the next unique payload is adopted zero-copy.
+        let mut data = vec![0, 0, 1];
+        data.push(0xCC);
+        let payload_addr = data.as_ptr() as usize;
+        decoder.feed_bytes(Bytes::from(data));
+        let frame = decoder.decode_frame().expect("complete frame");
+        assert_eq!(frame.as_ptr() as usize, payload_addr + FRAME_LENGTH_SIZE);
+    }
+
+    #[test]
+    fn test_feed_bytes_multiple_frames_single_payload() {
+        let mut decoder = FrameDecoder::new();
+        decoder.feed_bytes(Bytes::from(vec![
+            0, 0, 2, 0xAA, 0xBB, 0, 0, 3, 0xCC, 0xDD, 0xEE,
+        ]));
+
+        let frame1 = decoder.decode_frame().expect("first frame");
+        assert_eq!(&frame1[..], &[0xAA, 0xBB]);
+        let frame2 = decoder.decode_frame().expect("second frame");
+        assert_eq!(&frame2[..], &[0xCC, 0xDD, 0xEE]);
         assert!(decoder.decode_frame().is_none());
     }
 

@@ -5,7 +5,7 @@ use bytes::BytesMut;
 use futures::channel::oneshot;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use wacore::handshake::NoiseCipher;
+use wacore::handshake::{NoiseCipher, NoiseError};
 use wacore::runtime::{AbortHandle, Runtime};
 
 const INLINE_ENCRYPT_THRESHOLD: usize = 16 * 1024;
@@ -108,6 +108,13 @@ impl NoiseSocket {
         out_buf: &mut BytesMut,
     ) -> SendResult {
         let counter = *write_counter;
+        // Refuse to wrap the per-direction frame counter: reusing an AES-GCM nonce
+        // under the same key is catastrophic. Mirrors NoiseState::post_increment_counter
+        // (which errors on exhaustion). 2^32 frames per connection is unreachable in
+        // practice, so erroring here forces a reconnect rather than a silent nonce reuse.
+        if counter == u32::MAX {
+            return Err(EncryptSendError::crypto(NoiseError::CounterExhausted));
+        }
 
         if plaintext.len() <= INLINE_ENCRYPT_THRESHOLD {
             enc_buf.clear();
@@ -177,7 +184,13 @@ impl NoiseSocket {
     }
 
     pub fn decrypt_frame(&self, mut ciphertext: BytesMut) -> Result<BytesMut> {
-        let counter = self.read_counter.fetch_add(1, Ordering::SeqCst);
+        // Checked increment: error instead of wrapping the read counter (AES-GCM
+        // nonce reuse). fetch_update returns the pre-increment counter to use, or
+        // Err when it would overflow u32. Mirrors the write side.
+        let counter = self
+            .read_counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| c.checked_add(1))
+            .map_err(|_| SocketError::Cipher(NoiseError::CounterExhausted))?;
         self.read_key
             .decrypt_in_place_with_counter(counter, &mut ciphertext)
             .map_err(SocketError::Cipher)?;
@@ -209,6 +222,27 @@ mod tests {
 
         let result = socket.encrypt_and_send(bytes::Bytes::new()).await;
         assert!(result.is_ok(), "encrypt_and_send should succeed");
+    }
+
+    #[tokio::test]
+    async fn decrypt_frame_errors_on_counter_exhaustion() {
+        let key = [0u8; 32];
+        let socket = NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(crate::transport::mock::MockTransport),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        );
+        // At u32::MAX the next read would wrap the counter to 0 and reuse a nonce;
+        // the counter check fires before decryption, so the bytes don't matter.
+        socket.read_counter.store(u32::MAX, Ordering::SeqCst);
+        let err = socket
+            .decrypt_frame(BytesMut::from(&b"ignored"[..]))
+            .expect_err("exhausted read counter must error, not wrap");
+        assert!(matches!(
+            err,
+            SocketError::Cipher(NoiseError::CounterExhausted)
+        ));
     }
 
     /// Frames above INLINE_ENCRYPT_THRESHOLD take the blocking path that now moves

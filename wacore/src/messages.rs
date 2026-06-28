@@ -37,15 +37,268 @@ impl MessageUtils {
         buf
     }
 
-    pub fn participant_list_hash(devices: &[wacore_binary::Jid]) -> Result<String> {
-        // Hash sorted ad_strings incrementally (avoids join() allocation).
-        let mut jids: Vec<String> = devices.iter().map(|j| j.to_ad_string()).collect();
-        jids.sort_unstable();
+    /// Encode + pad with an extra `message_context_info` spliced on, in a single
+    /// pre-sized allocation. `extra_context` carries the reporting-token fields
+    /// (message_secret + reporting_token_version) the send path used to inject by
+    /// deep-cloning the whole message via `prepare_message_with_context`.
+    ///
+    /// The extra context is appended as a second `message_context_info` field after the
+    /// message's own fields. When the message already carries one, the wire decoder
+    /// merges the two occurrences (later set fields win), reproducing
+    /// `prepare_message_with_context` (existing fields preserved, message_secret +
+    /// reporting_token_version overwritten) without the clone. `extra_context = None`
+    /// is exactly `encode_and_pad`. Locked by `group_encode_with_context_*` tests.
+    pub fn encode_and_pad_with_context(
+        msg: &wa::Message,
+        extra_context: Option<&wa::MessageContextInfo>,
+    ) -> Vec<u8> {
+        let pad = Self::random_pad_len();
+        let extra_len = extra_context.map_or(0, |c| {
+            let mut c_cache = buffa::SizeCache::new();
+            len_delimited_len(
+                TAG_MESSAGE_CONTEXT_INFO,
+                c.compute_size(&mut c_cache) as usize,
+            )
+        });
+        let mut msg_cache = buffa::SizeCache::new();
+        let msg_size = msg.compute_size(&mut msg_cache) as usize;
+        let mut buf = Vec::with_capacity(msg_size + extra_len + pad as usize);
+        msg.write_to(&mut msg_cache, &mut buf);
+        if let Some(c) = extra_context {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, c, &mut buf);
+        }
+        buf.resize(buf.len() + pad as usize, pad);
+        buf
+    }
+
+    /// Same wire output as [`encode_and_pad_with_context`](Self::encode_and_pad_with_context)
+    /// but the message is already encoded into `content`. The DM send path shares one
+    /// encode between the reporting token (field extraction) and the wire plaintext, so
+    /// the shared bytes are spliced + padded here instead of re-encoding the message.
+    /// `content` must be the message's encoding with no reporting context spliced on (the
+    /// caller only takes this path when the message has no top-level message_context_info).
+    pub fn pad_with_context_from_encoded(
+        content: &[u8],
+        extra_context: Option<&wa::MessageContextInfo>,
+    ) -> Vec<u8> {
+        let pad = Self::random_pad_len();
+        let extra_len = extra_context.map_or(0, |c| {
+            let mut c_cache = buffa::SizeCache::new();
+            len_delimited_len(
+                TAG_MESSAGE_CONTEXT_INFO,
+                c.compute_size(&mut c_cache) as usize,
+            )
+        });
+        let mut buf = Vec::with_capacity(content.len() + extra_len + pad as usize);
+        buf.extend_from_slice(content);
+        if let Some(c) = extra_context {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, c, &mut buf);
+        }
+        buf.resize(buf.len() + pad as usize, pad);
+        buf
+    }
+
+    /// Build both DM plaintexts (recipient and own-device DeviceSentMessage) from a
+    /// single encode of the shared message content, splicing in the reporting-token
+    /// `extra_context` (message_secret + reporting_token_version) without cloning the
+    /// message.
+    ///
+    /// The recipient plaintext and the DSM inner carry the same message, so the previous
+    /// path encoded it twice (once for the recipient, once inside `wrap_device_sent` +
+    /// `encode_and_pad`) and boxed a whole `Message` per send, on top of the deep clone
+    /// `prepare_message_with_context` made to attach the reporting secret. Here the
+    /// content is encoded once from `&message` and spliced into both: the recipient
+    /// appends `extra_context` out of tag order (protobuf decoders accept any field
+    /// order), and the DSM frames the content as `device_sent_message.message` with the
+    /// `extra_context` hoisted onto the outer message. Equivalent, after decode, to
+    /// `prepare_message_with_context(message, secret)` then `encode_and_pad(..)` /
+    /// `encode_and_pad(wrap_device_sent(..))` (locked by the `splice_*` differential
+    /// tests).
+    ///
+    /// The hot send path has no top-level `message_context_info` on `message`, so the
+    /// common branch below borrows it and never clones. The rare case (the message
+    /// already carries one, e.g. a forwarded message or a poll with a caller-set secret)
+    /// hoisting onto the DSM wrapper needs an owned message, so it clones once and folds
+    /// `extra_context` in before splicing.
+    pub fn encode_dm_plaintexts(
+        message: &wa::Message,
+        extra_context: Option<&wa::MessageContextInfo>,
+        destination_jid: &str,
+    ) -> DmPlaintexts {
+        if message.message_context_info.is_set() {
+            let mut owned = message.clone();
+            if let Some(extra) = extra_context {
+                // Fold the reporting context into the existing mci via the same merge the
+                // wire decoder performs (later set fields win), matching
+                // prepare_message_with_context without enumerating its fields here.
+                let ctx = owned
+                    .message_context_info
+                    .as_option_mut()
+                    .expect("mci is set");
+                ctx.merge_from_slice(&extra.encode_to_vec())
+                    .expect("merge MessageContextInfo");
+            }
+            return Self::encode_dm_plaintexts_owned(owned, destination_jid);
+        }
+
+        // Common path: `message` has no top-level message_context_info, so its encoding
+        // is the shared content and `extra_context` is the only mci to splice on.
+        // Padding is uniform 1..=16, so reserving 16 lets both buffers hold their
+        // worst-case pad without reallocating.
+        const MAX_PAD: usize = 16;
+
+        let mci_field_len = extra_context.map_or(0, |m| {
+            let mut c = buffa::SizeCache::new();
+            len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, m.compute_size(&mut c) as usize)
+        });
+        let mut msg_cache = buffa::SizeCache::new();
+        let content_len = message.compute_size(&mut msg_cache) as usize;
+        let dest = destination_jid.as_bytes();
+
+        // recipient = content (encoded once) + the extra message_context_info field.
+        // Pre-size for content + the appended mci field + padding so it never
+        // reallocates; the content bytes are then spliced into the own-device buffer.
+        let mut recipient = Vec::with_capacity(content_len + mci_field_len + MAX_PAD);
+        message.write_to(&mut msg_cache, &mut recipient);
+
+        // own-device plaintext = Message { device_sent_message { destination_jid,
+        // message }, [message_context_info] }. The DeviceSentMessage length is
+        // pre-computed so the spliced content goes straight in, and the buffer is sized
+        // exactly (device_sent_message field + mci field + padding): one allocation, no
+        // reallocation regardless of whether extra_context is present.
+        let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest.len())
+            + len_delimited_len(TAG_DSM_MESSAGE, content_len);
+        let own_cap = len_delimited_len(TAG_DEVICE_SENT_MESSAGE, dsm_len) + mci_field_len + MAX_PAD;
+        let mut own_devices = Vec::with_capacity(own_cap);
+        push_varint((TAG_DEVICE_SENT_MESSAGE << 3) | 2, &mut own_devices); // field 31 key
+        push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
+        push_len_delimited(TAG_DSM_DESTINATION_JID, dest, &mut own_devices);
+        push_len_delimited(TAG_DSM_MESSAGE, &recipient[..content_len], &mut own_devices);
+        if let Some(extra) = extra_context {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, extra, &mut own_devices);
+        }
+
+        // Finish the recipient now that its content has been spliced into own_devices.
+        if let Some(extra) = extra_context {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, extra, &mut recipient);
+        }
+
+        DmPlaintexts {
+            recipient: Self::pad_message_v2(recipient),
+            own_devices: Self::pad_message_v2(own_devices),
+        }
+    }
+
+    /// Same wire output as [`encode_dm_plaintexts`](Self::encode_dm_plaintexts)'s common
+    /// (no top-level message_context_info) path, but the shared content is already encoded
+    /// into `content`. The DM send path reuses the single message encode it also feeds to
+    /// the reporting token, so the message is no longer encoded twice per send. `content`
+    /// must be the message's encoding with no reporting context spliced on.
+    pub fn dm_plaintexts_from_encoded(
+        content: &[u8],
+        extra_context: Option<&wa::MessageContextInfo>,
+        destination_jid: &str,
+    ) -> DmPlaintexts {
+        const MAX_PAD: usize = 16;
+
+        let mci_field_len = extra_context.map_or(0, |m| {
+            let mut c = buffa::SizeCache::new();
+            len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, m.compute_size(&mut c) as usize)
+        });
+        let content_len = content.len();
+        let dest = destination_jid.as_bytes();
+
+        let mut recipient = Vec::with_capacity(content_len + mci_field_len + MAX_PAD);
+        recipient.extend_from_slice(content);
+
+        let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest.len())
+            + len_delimited_len(TAG_DSM_MESSAGE, content_len);
+        let own_cap = len_delimited_len(TAG_DEVICE_SENT_MESSAGE, dsm_len) + mci_field_len + MAX_PAD;
+        let mut own_devices = Vec::with_capacity(own_cap);
+        push_varint((TAG_DEVICE_SENT_MESSAGE << 3) | 2, &mut own_devices); // field 31 key
+        push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
+        push_len_delimited(TAG_DSM_DESTINATION_JID, dest, &mut own_devices);
+        push_len_delimited(TAG_DSM_MESSAGE, content, &mut own_devices);
+        if let Some(extra) = extra_context {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, extra, &mut own_devices);
+        }
+
+        if let Some(extra) = extra_context {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, extra, &mut recipient);
+        }
+
+        DmPlaintexts {
+            recipient: Self::pad_message_v2(recipient),
+            own_devices: Self::pad_message_v2(own_devices),
+        }
+    }
+
+    /// Owned-message DM splice for the rare case where `message` already carries a
+    /// top-level `message_context_info` that must be hoisted onto the DSM wrapper
+    /// (`wrap_device_sent` semantics). Hoisting requires ownership; the common path in
+    /// [`encode_dm_plaintexts`] borrows instead and never reaches this.
+    fn encode_dm_plaintexts_owned(mut message: wa::Message, destination_jid: &str) -> DmPlaintexts {
+        const MAX_PAD: usize = 16;
+
+        // Hoist message_context_info onto the wrapper (as wrap_device_sent does) so the
+        // remaining content is identical for both plaintexts and encoded once. Keep the
+        // mci struct (not a temp Vec): it is small and encoded straight into each buffer.
+        let mci = message.message_context_info.take();
+        let mci_field_len = mci.as_ref().map_or(0, |m| {
+            let mut c = buffa::SizeCache::new();
+            len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, m.compute_size(&mut c) as usize)
+        });
+        let mut msg_cache = buffa::SizeCache::new();
+        let content_len = message.compute_size(&mut msg_cache) as usize;
+        let dest = destination_jid.as_bytes();
+
+        let mut recipient = Vec::with_capacity(content_len + mci_field_len + MAX_PAD);
+        message.write_to(&mut msg_cache, &mut recipient);
+
+        let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest.len())
+            + len_delimited_len(TAG_DSM_MESSAGE, content_len);
+        let own_cap = len_delimited_len(TAG_DEVICE_SENT_MESSAGE, dsm_len) + mci_field_len + MAX_PAD;
+        let mut own_devices = Vec::with_capacity(own_cap);
+        push_varint((TAG_DEVICE_SENT_MESSAGE << 3) | 2, &mut own_devices); // field 31 key
+        push_varint(dsm_len as u64, &mut own_devices); // DeviceSentMessage length
+        push_len_delimited(TAG_DSM_DESTINATION_JID, dest, &mut own_devices);
+        push_len_delimited(TAG_DSM_MESSAGE, &recipient[..content_len], &mut own_devices);
+        if let Some(mci) = &mci {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, mci, &mut own_devices);
+        }
+
+        if let Some(mci) = &mci {
+            push_message_field(TAG_MESSAGE_CONTEXT_INFO, mci, &mut recipient);
+        }
+
+        DmPlaintexts {
+            recipient: Self::pad_message_v2(recipient),
+            own_devices: Self::pad_message_v2(own_devices),
+        }
+    }
+
+    pub fn participant_list_hash<'a>(
+        devices: impl IntoIterator<Item = &'a wacore_binary::Jid>,
+    ) -> Result<String> {
+        // Format every device into one shared arena and sort range views over
+        // it: two allocations total instead of a heap String per device (this
+        // runs over the full device set on every group send). Sorting the
+        // slices is the same lexicographic order as sorting the individual
+        // ad_strings, so the hashed concatenation is byte-identical.
+        let devices = devices.into_iter();
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(devices.size_hint().0);
+        let mut arena = String::with_capacity(ranges.capacity() * 36);
+        for jid in devices {
+            let start = arena.len();
+            jid.push_ad_to(&mut arena);
+            ranges.push((start, arena.len()));
+        }
+        ranges.sort_unstable_by(|a, b| arena[a.0..a.1].cmp(&arena[b.0..b.1]));
 
         let mut h = CryptographicHash::new("SHA-256")
             .map_err(|e| anyhow!("failed to initialize SHA-256 hasher: {:?}", e))?;
-        for jid in &jids {
-            h.update(jid.as_bytes());
+        for &(start, end) in &ranges {
+            h.update(&arena.as_bytes()[start..end]);
         }
 
         let full_hash = h
@@ -55,10 +308,10 @@ impl MessageUtils {
         // Standard base64 ('+'/'/'), matching whatsmeow (`base64.RawStdEncoding`)
         // and WA Web (`WABase64.encodeB64`). URL-safe ('-'/'_') diverges from the
         // server on ~22% of phashes (any output hitting base64 index 62/63).
-        Ok(format!(
-            "2:{hash}",
-            hash = base64::prelude::BASE64_STANDARD_NO_PAD.encode(&full_hash[..6])
-        ))
+        let mut out = String::with_capacity(10);
+        out.push_str("2:");
+        base64::prelude::BASE64_STANDARD_NO_PAD.encode_string(&full_hash[..6], &mut out);
+        Ok(out)
     }
 
     /// Validate a broadcast-contact-list hash from an incoming `deviceSentMessage`
@@ -174,6 +427,93 @@ pub fn has_only_sender_key_distribution_top_level_fields(
     Ok(has_sender_key_distribution)
 }
 
+/// The two padded plaintexts a DM send needs, built from a single encode of the
+/// shared message content. See [`MessageUtils::encode_dm_plaintexts`].
+pub struct DmPlaintexts {
+    /// Plaintext encrypted to the recipient's devices (the message itself).
+    pub recipient: Vec<u8>,
+    /// Plaintext encrypted to our own other devices (the message wrapped in a
+    /// DeviceSentMessage), equivalent to `encode_and_pad(wrap_device_sent(..))`.
+    pub own_devices: Vec<u8>,
+}
+
+// Protobuf field numbers spliced by `encode_dm_plaintexts`, sourced from the
+// generated schema tags so a .proto renumber breaks here at compile time
+// instead of silently changing the wire payload.
+const TAG_DEVICE_SENT_MESSAGE: u64 = waproto::tags::message::DEVICE_SENT_MESSAGE as u64;
+const TAG_MESSAGE_CONTEXT_INFO: u64 = waproto::tags::message::MESSAGE_CONTEXT_INFO as u64;
+const TAG_DSM_DESTINATION_JID: u64 =
+    waproto::tags::message::device_sent_message::DESTINATION_JID as u64;
+const TAG_DSM_MESSAGE: u64 = waproto::tags::message::device_sent_message::MESSAGE as u64;
+
+/// Append a base-128 varint (protobuf wire format).
+#[inline]
+fn push_varint(mut v: u64, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// Append a length-delimited protobuf field (wire type 2): a string field, or a
+/// nested message field carrying already-encoded `bytes`. The latter is the splice
+/// point that lets the shared content be reused without re-encoding it.
+#[inline]
+fn push_len_delimited(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
+    push_varint((field << 3) | 2, out); // wire type 2 = length-delimited
+    push_varint(bytes.len() as u64, out);
+    out.extend_from_slice(bytes);
+}
+
+/// Bytes a base-128 varint occupies.
+#[inline]
+fn varint_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+/// Encoded size of the length-delimited field `field` carrying `payload_len`
+/// bytes (key + length varint + payload). Mirrors what `push_len_delimited`
+/// writes, so a nested field's length can be pre-computed without a temp buffer.
+#[inline]
+fn len_delimited_len(field: u64, payload_len: usize) -> usize {
+    varint_len((field << 3) | 2) + varint_len(payload_len as u64) + payload_len
+}
+
+/// Append a message_context_info as a nested length-delimited field, encoding it
+/// straight into `out` (no intermediate `Vec`). Used for the small
+/// `message_context_info` field on both plaintexts.
+#[inline]
+fn push_message_field(field: u64, msg: &wa::MessageContextInfo, out: &mut Vec<u8>) {
+    let mut cache = buffa::SizeCache::new();
+    let size = msg.compute_size(&mut cache) as usize;
+    push_varint((field << 3) | 2, out);
+    push_varint(size as u64, out);
+    msg.write_to(&mut cache, out);
+}
+
+/// Wrap a message into a DeviceSentMessage for own-device sync, hoisting
+/// `message_context_info` onto the outer message (matching WA Web). Inverse of
+/// [`unwrap_device_sent`].
+pub fn wrap_device_sent(mut message: wa::Message, destination_jid: String) -> wa::Message {
+    let context = std::mem::take(&mut message.message_context_info);
+    wa::Message {
+        message_context_info: context,
+        device_sent_message: wa::message::DeviceSentMessage {
+            destination_jid: Some(destination_jid),
+            message: message.into(),
+            ..Default::default()
+        }
+        .into(),
+        ..Default::default()
+    }
+}
+
 /// Unwrap a DeviceSentMessage wrapper, returning the inner message.
 ///
 /// When a message is sent from our own device, the actual content is nested
@@ -185,10 +525,11 @@ pub fn unwrap_device_sent(mut msg: wa::Message) -> wa::Message {
     if let Some(mut dsm) = msg.device_sent_message.take() {
         if let Some(mut inner) = dsm.message.take() {
             inner.message_context_info = crate::proto_helpers::merge_dsm_context(
-                inner.message_context_info.take(),
+                inner.message_context_info.take().map(Box::new),
                 msg.message_context_info.as_option(),
             )
-            .into();
+            .map(|b| buffa::MessageField::some(*b))
+            .unwrap_or_default();
             return inner;
         }
         msg.device_sent_message = buffa::MessageField::some(dsm);
@@ -202,7 +543,7 @@ pub fn unwrap_device_sent(mut msg: wa::Message) -> wa::Message {
 /// When sending a group message, WhatsApp includes the SKDM in a separate
 /// `pkmsg` enc node.  We must process it (store the sender key) but should
 /// not surface it as a user event.
-pub fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
+pub fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
     if msg.sender_key_distribution_message.is_unset()
         && msg
             .fast_ratchet_key_sender_key_distribution_message
@@ -211,7 +552,7 @@ pub fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
         return false;
     }
 
-    // Fast path: most common user-visible fields (avoids clone for the typical case).
+    // Fast path: most common user-visible fields (avoids the slow path for the typical case).
     if msg.conversation.is_some()
         || msg.extended_text_message.is_set()
         || msg.image_message.is_set()
@@ -228,15 +569,24 @@ pub fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
         return false;
     }
 
-    // Slow path: encode-and-compare to catch all current and future fields.
-    // buffa's MessageField PartialEq treats set-to-default as equal to unset,
-    // but protobuf wire format distinguishes them, so byte comparison is correct.
-    use buffa::Message;
-    let mut stripped = msg.clone();
-    stripped.sender_key_distribution_message = Default::default();
-    stripped.fast_ratchet_key_sender_key_distribution_message = Default::default();
-    stripped.message_context_info = Default::default();
-    stripped.encode_to_vec() == wa::Message::default().encode_to_vec()
+    // Slow path: temporarily take out the carrier fields and compare the rest to
+    // default to catch all current and future fields, then restore them. This
+    // avoids deep-cloning the whole Message just to clear three fields.
+    let skdm = msg.sender_key_distribution_message.take();
+    let fast = msg.fast_ratchet_key_sender_key_distribution_message.take();
+    let ctx = msg.message_context_info.take();
+
+    // proto fields only encode when non-default, so encoded length 0 means all
+    // remaining fields are at default — i.e. the message has no user content.
+    let mut cache = buffa::SizeCache::new();
+    let only = msg.compute_size(&mut cache) == 0;
+
+    msg.sender_key_distribution_message = skdm.map(buffa::MessageField::some).unwrap_or_default();
+    msg.fast_ratchet_key_sender_key_distribution_message =
+        fast.map(buffa::MessageField::some).unwrap_or_default();
+    msg.message_context_info = ctx.map(buffa::MessageField::some).unwrap_or_default();
+
+    only
 }
 
 /// Parse a message stanza into a `MessageInfo` struct.
@@ -858,6 +1208,53 @@ mod parse_message_info_tests {
         assert_eq!(h_multi, "2:AAv/hwhn");
     }
 
+    /// Locks the arena-sorted phash against the straightforward reference
+    /// (one String per device, sorted, concatenated) over a mixed device set:
+    /// unsorted input, duplicate JIDs, agents, multiple servers, and the
+    /// prefix-ordering edge ("111" vs "1110" users) where a slice comparator
+    /// bug would diverge from String ordering.
+    #[test]
+    fn phash_arena_matches_per_string_reference() {
+        use sha2::{Digest, Sha256};
+
+        fn dev(user: &str, agent: u8, device: u16, server: wacore_binary::Server) -> Jid {
+            Jid {
+                user: user.into(),
+                server,
+                agent,
+                device,
+                integrator: 0,
+            }
+        }
+
+        let devices = vec![
+            dev("5511999990000", 0, 14, wacore_binary::Server::Pn),
+            dev("111", 0, 0, wacore_binary::Server::Pn),
+            dev("1110", 0, 0, wacore_binary::Server::Pn),
+            dev("100000000000001", 2, 3, wacore_binary::Server::Lid),
+            dev("5511999990000", 0, 14, wacore_binary::Server::Pn),
+            dev("5511888880000", 1, 0, wacore_binary::Server::Hosted),
+            dev("999", 0, 65535, wacore_binary::Server::Bot),
+        ];
+
+        let mut reference: Vec<String> = devices.iter().map(|j| j.to_ad_string()).collect();
+        reference.sort_unstable();
+        let mut hasher = Sha256::new();
+        for jid in &reference {
+            hasher.update(jid.as_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut expected = String::with_capacity(10);
+        expected.push_str("2:");
+        use base64::Engine as _;
+        base64::prelude::BASE64_STANDARD_NO_PAD.encode_string(&digest[..6], &mut expected);
+
+        assert_eq!(
+            MessageUtils::participant_list_hash(&devices).unwrap(),
+            expected
+        );
+    }
+
     // #6 — validate_bcl_hash accepts the matching phashV2 and rejects a tampered
     // one (the WA Web validateBclHash check on device-sent broadcasts).
     #[test]
@@ -918,6 +1315,489 @@ mod parse_message_info_tests {
         assert!(
             info.bcl_participants.is_empty(),
             "group fanout participants are not a bcl"
+        );
+    }
+}
+
+#[cfg(test)]
+mod device_sent_tests {
+    use super::*;
+
+    fn msg_with_secret(secret: &[u8]) -> wa::Message {
+        wa::Message {
+            conversation: Some("hi".into()),
+            message_context_info: wa::MessageContextInfo {
+                message_secret: Some(secret.to_vec()),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wrap_hoists_context_to_outer_on_wire() {
+        let secret = [7u8; 32];
+        let wrapped = wrap_device_sent(msg_with_secret(&secret), "1@s.whatsapp.net".into());
+
+        let bytes = wrapped.encode_to_vec();
+        let decoded = wa::Message::decode_from_slice(bytes.as_slice()).unwrap();
+
+        assert_eq!(
+            decoded
+                .message_context_info
+                .as_option()
+                .and_then(|c| c.message_secret.as_deref()),
+            Some(secret.as_slice())
+        );
+        let inner = decoded
+            .device_sent_message
+            .as_option()
+            .unwrap()
+            .message
+            .as_option()
+            .unwrap();
+        assert!(inner.message_context_info.is_unset());
+        assert_eq!(inner.conversation.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn wrap_without_context_leaves_outer_empty() {
+        let inner = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        let wrapped = wrap_device_sent(inner, "1@s.whatsapp.net".into());
+
+        assert!(wrapped.message_context_info.is_unset());
+        let dsm = wrapped.device_sent_message.as_option().unwrap();
+        assert_eq!(dsm.destination_jid.as_deref(), Some("1@s.whatsapp.net"));
+        assert!(
+            dsm.message
+                .as_option()
+                .unwrap()
+                .message_context_info
+                .is_unset()
+        );
+    }
+
+    #[test]
+    fn wrap_then_unwrap_preserves_non_secret_context_fields() {
+        let inner = wa::Message {
+            message_context_info: wa::MessageContextInfo {
+                message_add_on_duration_in_secs: Some(604800),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        };
+        let unwrapped = unwrap_device_sent(wrap_device_sent(inner, "1@s.whatsapp.net".into()));
+        assert_eq!(
+            unwrapped
+                .message_context_info
+                .as_option()
+                .and_then(|c| c.message_add_on_duration_in_secs),
+            Some(604800)
+        );
+    }
+
+    #[test]
+    fn wrap_then_unwrap_round_trips_secret() {
+        let secret = [9u8; 32];
+        let wrapped = wrap_device_sent(msg_with_secret(&secret), "1@s.whatsapp.net".into());
+        let unwrapped = unwrap_device_sent(wrapped);
+
+        assert_eq!(unwrapped.conversation.as_deref(), Some("hi"));
+        assert_eq!(
+            unwrapped
+                .message_context_info
+                .as_option()
+                .and_then(|c| c.message_secret.as_deref()),
+            Some(secret.as_slice())
+        );
+    }
+
+    // Unpad (v2) + buffa-decode a padded plaintext.
+    fn decode_padded(b: &[u8]) -> wa::Message {
+        wa::Message::decode_from_slice(MessageUtils::unpad_message_ref(b, 2).unwrap()).unwrap()
+    }
+
+    /// The spliced plaintexts must decode to exactly what the prost-based path
+    /// produces: recipient == encode(message), own_devices == encode(wrap_device_sent).
+    /// `extra` is `None` here (no reporting context); the with-context cases are
+    /// covered by `splice_with_reporting_context_matches_prepare`.
+    fn assert_splice_matches(message: wa::Message, dest: &str) {
+        let recipient_old = decode_padded(&MessageUtils::encode_and_pad(&message));
+        let dsm_old = decode_padded(&MessageUtils::encode_and_pad(&wrap_device_sent(
+            message.clone(),
+            dest.to_string(),
+        )));
+
+        let DmPlaintexts {
+            recipient,
+            own_devices,
+        } = MessageUtils::encode_dm_plaintexts(&message, None, dest);
+
+        assert_eq!(
+            decode_padded(&recipient),
+            recipient_old,
+            "recipient mismatch"
+        );
+        assert_eq!(
+            decode_padded(&own_devices),
+            dsm_old,
+            "own-device DSM mismatch"
+        );
+    }
+
+    #[test]
+    fn splice_matches_prost_across_message_shapes() {
+        let dest = "5511999998888:3@s.whatsapp.net";
+
+        // plain conversation text
+        assert_splice_matches(
+            wa::Message {
+                conversation: Some("ping".into()),
+                ..Default::default()
+            },
+            dest,
+        );
+        // unicode + long text (multi-byte content, larger than one varint length)
+        assert_splice_matches(
+            wa::Message {
+                conversation: Some("héllo 🚀 ".repeat(500)),
+                ..Default::default()
+            },
+            dest,
+        );
+        // with message_context_info (reporting-token path: secret hoisted to wrapper)
+        assert_splice_matches(msg_with_secret(&[42u8; 32]), dest);
+        // extended text + nested context_info (forwarded) AND top-level mci
+        assert_splice_matches(
+            wa::Message {
+                extended_text_message: wa::message::ExtendedTextMessage {
+                    text: Some("quoted".into()),
+                    context_info: wa::ContextInfo {
+                        is_forwarded: Some(true),
+                        ..Default::default()
+                    }
+                    .into(),
+                    ..Default::default()
+                }
+                .into(),
+                message_context_info: wa::MessageContextInfo {
+                    message_secret: Some(vec![1, 2, 3, 4]),
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            dest,
+        );
+        // media message (refs/keys), no mci
+        assert_splice_matches(
+            wa::Message {
+                image_message: wa::message::ImageMessage {
+                    url: Some("https://mmg.example/abc".into()),
+                    media_key: Some(vec![9u8; 32]),
+                    file_sha256: Some(vec![8u8; 32]),
+                    mimetype: Some("image/jpeg".into()),
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            dest,
+        );
+        // empty message (no content, no mci)
+        assert_splice_matches(wa::Message::default(), dest);
+        // mci-only (no content body)
+        assert_splice_matches(
+            wa::Message {
+                message_context_info: wa::MessageContextInfo {
+                    message_secret: Some(vec![7u8; 32]),
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            dest,
+        );
+        // empty destination_jid (degenerate but must still match)
+        assert_splice_matches(
+            wa::Message {
+                conversation: Some("x".into()),
+                ..Default::default()
+            },
+            "",
+        );
+    }
+
+    /// Pin the spliced field numbers to the prost-generated schema: encode a probe
+    /// with only the relevant field set and read the first protobuf key. If the
+    /// .proto ever renumbers one of these fields, prost regenerates and this fails
+    /// with a precise message, so the hand-written framing cannot silently drift.
+    #[test]
+    fn splice_tags_match_prost_schema() {
+        fn first_field_number(bytes: &[u8]) -> u64 {
+            let (mut key, mut shift) = (0u64, 0u32);
+            for &b in bytes {
+                key |= u64::from(b & 0x7f) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            key >> 3
+        }
+
+        let outer_dsm = wa::Message {
+            device_sent_message: wa::message::DeviceSentMessage::default().into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&outer_dsm.encode_to_vec()),
+            TAG_DEVICE_SENT_MESSAGE,
+            "Message.device_sent_message tag drifted from the .proto"
+        );
+
+        let outer_mci = wa::Message {
+            message_context_info: wa::MessageContextInfo::default().into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&outer_mci.encode_to_vec()),
+            TAG_MESSAGE_CONTEXT_INFO,
+            "Message.message_context_info tag drifted from the .proto"
+        );
+
+        let dsm_dest = wa::message::DeviceSentMessage {
+            destination_jid: Some("x".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&dsm_dest.encode_to_vec()),
+            TAG_DSM_DESTINATION_JID,
+            "DeviceSentMessage.destination_jid tag drifted from the .proto"
+        );
+
+        let dsm_msg = wa::message::DeviceSentMessage {
+            message: wa::Message::default().into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&dsm_msg.encode_to_vec()),
+            TAG_DSM_MESSAGE,
+            "DeviceSentMessage.message tag drifted from the .proto"
+        );
+    }
+
+    /// Message shapes exercising both encode-with-context paths: no embedded mci
+    /// (common, no clone) and an embedded mci carrying a non-reporting field that
+    /// must survive the merge while message_secret is overwritten (rare, clone).
+    fn context_test_shapes() -> Vec<wa::Message> {
+        vec![
+            wa::Message {
+                conversation: Some("ping".into()),
+                ..Default::default()
+            },
+            wa::Message {
+                conversation: Some("poll".into()),
+                message_context_info: wa::MessageContextInfo {
+                    // preserved by the merge
+                    message_add_on_duration_in_secs: Some(604800),
+                    // overwritten by the reporting context
+                    message_secret: Some(vec![1u8; 32]),
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// The reporting context the send path injects (message_secret +
+    /// reporting_token_version), matching `prepare_message_with_context`.
+    fn reporting_context(secret: &[u8; 32]) -> wa::MessageContextInfo {
+        wa::MessageContextInfo {
+            message_secret: Some(secret.to_vec()),
+            reporting_token_version: Some(crate::reporting_token::REPORTING_TOKEN_VERSION),
+            ..Default::default()
+        }
+    }
+
+    /// `encode_dm_plaintexts(&msg, Some(reporting_ctx), dest)` must decode to exactly
+    /// what the old clone-based path produced: `prepare_message_with_context(msg, secret)`
+    /// then prost `encode_and_pad` (recipient) / `encode_and_pad(wrap_device_sent(..))`
+    /// (own devices). The real `prepare_message_with_context` is the oracle, so the merge
+    /// semantics (existing fields kept, message_secret + version overwritten) are pinned.
+    #[test]
+    fn splice_with_reporting_context_matches_prepare() {
+        let dest = "5511999998888:3@s.whatsapp.net";
+        let secret = [0x5Au8; 32];
+        let extra = reporting_context(&secret);
+
+        for message in context_test_shapes() {
+            let reference = crate::reporting_token::prepare_message_with_context(&message, &secret);
+            let recipient_ref = decode_padded(&MessageUtils::encode_and_pad(&reference));
+            let dsm_ref = decode_padded(&MessageUtils::encode_and_pad(&wrap_device_sent(
+                reference.clone(),
+                dest.to_string(),
+            )));
+
+            let DmPlaintexts {
+                recipient,
+                own_devices,
+            } = MessageUtils::encode_dm_plaintexts(&message, Some(&extra), dest);
+
+            assert_eq!(
+                decode_padded(&recipient),
+                recipient_ref,
+                "recipient mismatch for {message:?}"
+            );
+            assert_eq!(
+                decode_padded(&own_devices),
+                dsm_ref,
+                "own-device DSM mismatch for {message:?}"
+            );
+        }
+    }
+
+    /// `prepare_dm_stanza` skips the DeviceSentMessage buffer (and its destination-jid
+    /// stringify) when there are no own companion devices, encoding the recipient via
+    /// `encode_and_pad_with_context` instead of `encode_dm_plaintexts`. That swap is only
+    /// sound while both agree on the recipient bytes for messages without a top-level
+    /// `message_context_info` — exactly the gate `prepare_dm_stanza` uses. Pin that
+    /// agreement (with and without a reporting context) so a change to either encoder
+    /// can't silently corrupt the no-own-device send path.
+    #[test]
+    fn recipient_only_encode_matches_dm_recipient_without_top_level_mci() {
+        let dest = "5511999998888:3@s.whatsapp.net";
+        let reporting_ctx = reporting_context(&[0x5Au8; 32]);
+
+        let shapes = [
+            wa::Message {
+                conversation: Some("ping".into()),
+                ..Default::default()
+            },
+            wa::Message {
+                image_message: wa::message::ImageMessage {
+                    url: Some("https://mmg.example/abc".into()),
+                    media_key: Some(vec![9u8; 32]),
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+        ];
+
+        for message in shapes {
+            assert!(
+                message.message_context_info.is_unset(),
+                "fast path only applies to messages without a top-level mci"
+            );
+            for extra in [None, Some(&reporting_ctx)] {
+                let recipient_only = MessageUtils::encode_and_pad_with_context(&message, extra);
+                let dm_recipient =
+                    MessageUtils::encode_dm_plaintexts(&message, extra, dest).recipient;
+                assert_eq!(
+                    decode_padded(&recipient_only),
+                    decode_padded(&dm_recipient),
+                    "recipient-only encode diverged from encode_dm_plaintexts ({message:?}, extra={extra:?})"
+                );
+            }
+        }
+    }
+
+    /// The `_from_encoded` encoders let the DM send path reuse the single message encode
+    /// it also feeds to the reporting token. They must produce byte-identical wire output
+    /// (modulo random padding) to re-encoding the message via `encode_and_pad_with_context`
+    /// / `encode_dm_plaintexts`, or the shared-encode send path would corrupt the payload.
+    /// Their precondition is a message with no top-level mci, so only those shapes apply.
+    #[test]
+    fn from_encoded_encoders_match_reencoding_without_top_level_mci() {
+        let dest = "5511999998888:3@s.whatsapp.net";
+        let reporting_ctx = reporting_context(&[0x5Au8; 32]);
+
+        let unpad = |b: &[u8]| MessageUtils::unpad_message_ref(b, 2).unwrap().to_vec();
+
+        let shapes = [
+            wa::Message {
+                conversation: Some("ping".into()),
+                ..Default::default()
+            },
+            wa::Message {
+                conversation: Some("héllo 🚀 ".repeat(500)),
+                ..Default::default()
+            },
+            wa::Message {
+                image_message: wa::message::ImageMessage {
+                    url: Some("https://mmg.example/abc".into()),
+                    media_key: Some(vec![9u8; 32]),
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+        ];
+
+        for message in shapes {
+            assert!(
+                message.message_context_info.is_unset(),
+                "the _from_encoded path only applies to messages without a top-level mci"
+            );
+            let content = message.encode_to_vec();
+            for extra in [None, Some(&reporting_ctx)] {
+                assert_eq!(
+                    unpad(&MessageUtils::pad_with_context_from_encoded(
+                        &content, extra
+                    )),
+                    unpad(&MessageUtils::encode_and_pad_with_context(&message, extra)),
+                    "pad_with_context_from_encoded diverged ({message:?}, extra={extra:?})"
+                );
+
+                let from_encoded = MessageUtils::dm_plaintexts_from_encoded(&content, extra, dest);
+                let reencoded = MessageUtils::encode_dm_plaintexts(&message, extra, dest);
+                assert_eq!(
+                    unpad(&from_encoded.recipient),
+                    unpad(&reencoded.recipient),
+                    "dm_plaintexts_from_encoded recipient diverged ({message:?}, extra={extra:?})"
+                );
+                assert_eq!(
+                    unpad(&from_encoded.own_devices),
+                    unpad(&reencoded.own_devices),
+                    "dm_plaintexts_from_encoded own_devices diverged ({message:?}, extra={extra:?})"
+                );
+            }
+        }
+    }
+
+    /// `encode_and_pad_with_context` (the group path) with a reporting context must
+    /// decode to `prepare_message_with_context(msg, secret)` encoded by prost; with
+    /// `None` it must equal plain `encode_and_pad`.
+    #[test]
+    fn group_encode_with_context_matches_prepare() {
+        let secret = [0x33u8; 32];
+        let extra = reporting_context(&secret);
+
+        for message in context_test_shapes() {
+            let reference = crate::reporting_token::prepare_message_with_context(&message, &secret);
+            let ref_decoded = decode_padded(&MessageUtils::encode_and_pad(&reference));
+            let got = decode_padded(&MessageUtils::encode_and_pad_with_context(
+                &message,
+                Some(&extra),
+            ));
+            assert_eq!(got, ref_decoded, "group encode-with-context mismatch");
+        }
+
+        let plain = wa::Message {
+            conversation: Some("x".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            decode_padded(&MessageUtils::encode_and_pad_with_context(&plain, None)),
+            decode_padded(&MessageUtils::encode_and_pad(&plain)),
+            "encode_and_pad_with_context(None) must equal encode_and_pad"
         );
     }
 }

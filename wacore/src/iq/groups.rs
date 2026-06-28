@@ -496,6 +496,7 @@ pub struct GroupQueryRequest {
 
 /// A participant in a group response.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GroupParticipantResponse {
     pub jid: Jid,
     pub phone_number: Option<Jid>,
@@ -542,6 +543,7 @@ impl ProtocolNode for GroupParticipantResponse {
 
 /// Response from a group info query.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GroupInfoResponse {
     pub id: Jid,
     pub subject: GroupSubject,
@@ -986,6 +988,7 @@ impl ProtocolNode for GroupParticipatingRequest {
 
 /// Response containing all groups the user is participating in.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct GroupParticipatingResponse {
     pub groups: Vec<GroupInfoResponse>,
 }
@@ -1166,6 +1169,7 @@ pub struct AddRequestInfo {
 /// `type` is often omitted by the server. On `error == "403"` the
 /// `<add_request>` child (`add_request` field) carries the V4 invite token.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ParticipantChangeResponse {
     pub jid: Jid,
     pub status: Option<String>,
@@ -1328,17 +1332,14 @@ pub struct SetGroupDescriptionIq {
 }
 
 impl SetGroupDescriptionIq {
-    pub fn new(
-        group_jid: &Jid,
-        description: Option<GroupDescription>,
-        prev: Option<String>,
-    ) -> Self {
+    pub fn new(group_jid: &Jid, description: Option<GroupDescription>, prev: Option<&str>) -> Self {
         let id = generate_description_id();
         Self {
             group_jid: group_jid.clone(),
             description,
             id,
-            prev,
+            // Owned because build_iq runs after the spec is moved into execute().
+            prev: prev.map(str::to_string),
         }
     }
 }
@@ -3129,7 +3130,7 @@ mod tests {
     fn test_set_group_description_with_id_and_prev() {
         let jid: Jid = "120363000000000001@g.us".parse().unwrap();
         let desc = GroupDescription::new("New description").unwrap();
-        let spec = SetGroupDescriptionIq::new(&jid, Some(desc), Some("AABBCCDD".to_string()));
+        let spec = SetGroupDescriptionIq::new(&jid, Some(desc), Some("AABBCCDD"));
         let iq = spec.build_iq();
 
         if let Some(NodeContent::Nodes(nodes)) = &iq.content {
@@ -3152,7 +3153,7 @@ mod tests {
     #[test]
     fn test_set_group_description_delete() {
         let jid: Jid = "120363000000000001@g.us".parse().unwrap();
-        let spec = SetGroupDescriptionIq::new(&jid, None, Some("PREV1234".to_string()));
+        let spec = SetGroupDescriptionIq::new(&jid, None, Some("PREV1234"));
         let iq = spec.build_iq();
 
         if let Some(NodeContent::Nodes(nodes)) = &iq.content {

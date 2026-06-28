@@ -1,9 +1,12 @@
 mod blocking;
 pub(crate) mod chat_actions;
 mod chatstate;
+mod comments;
 mod community;
 mod contacts;
+mod events;
 mod groups;
+pub(crate) mod labels;
 mod media_reupload;
 pub mod message_edit;
 mod mex;
@@ -11,51 +14,65 @@ pub(crate) mod newsletter;
 mod polls;
 mod presence;
 mod profile;
+mod reaction;
 mod signal;
 pub(crate) mod status;
 mod tctoken;
 
-pub use blocking::{Blocking, BlocklistEntry};
+pub use blocking::{Blocking, BlockingError, BlocklistEntry};
 
-pub use chat_actions::{ChatActions, SyncActionMessageRange, message_key, message_range};
+pub use chat_actions::{
+    AppStateError, ChatActions, SyncActionMessageRange, message_key, message_range,
+};
 
 pub use community::{
-    Community, CommunitySubgroup, CreateCommunityOptions, CreateCommunityResult, GroupType,
-    LinkSubgroupsResult, UnlinkSubgroupsResult, group_type,
+    Community, CommunityError, CommunitySubgroup, CreateCommunityOptions, CreateCommunityResult,
+    GroupType, LinkSubgroupsResult, UnlinkSubgroupsResult, group_type,
 };
 
-pub use chatstate::{ChatStateType, Chatstate};
+pub use chatstate::{ChatStateError, ChatStateType, Chatstate};
 
-pub use contacts::{Contacts, IsOnWhatsAppResult, ProfilePicture, UserInfo};
+pub use comments::Comments;
+
+pub use contacts::{
+    ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, UserInfo, UsyncSubprotocolError,
+    VerifiedName,
+};
+
+pub use events::{EventCreationParams, EventResponseType, Events};
 
 pub use groups::{
-    BatchGroupResult, CreateGroupResult, GroupCreateOptions, GroupDescription, GroupJoinError,
-    GroupMetadata, GroupParticipant, GroupParticipantOptions, GroupProfilePicture, GroupSubject,
-    Groups, GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
-    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
-    ParticipantType, PictureType,
+    BatchGroupResult, CreateGroupResult, GroupCreateOptions, GroupDescription, GroupError,
+    GroupJoinError, GroupMetadata, GroupParticipant, GroupParticipantOptions, GroupProfilePicture,
+    GroupSubject, Groups, GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode,
+    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
+    ParticipantChangeResponse, ParticipantType, PictureType,
 };
 
-pub use media_reupload::{MediaRetryResult, MediaReupload, MediaReuploadRequest};
+pub use labels::Labels;
+
+pub use media_reupload::{
+    MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest,
+};
 
 pub use message_edit::{EncryptedEdit, SecretEncKind, SecretEncrypted};
 
 pub use mex::{Mex, MexError, MexErrorExtensions, MexGraphQLError, MexRequest, MexResponse};
 
 pub use newsletter::{
-    Newsletter, NewsletterMessage, NewsletterMessageType, NewsletterMetadata,
+    Newsletter, NewsletterError, NewsletterMessage, NewsletterMessageType, NewsletterMetadata,
     NewsletterReactionCount, NewsletterRole, NewsletterState, NewsletterVerification,
 };
 
-pub use polls::{PollOptionResult, Polls};
+pub use polls::{PollError, PollOptionResult, PollVoteCiphertext, Polls};
 
 pub use presence::{Presence, PresenceError, PresenceStatus};
 
-pub use profile::{Profile, SetProfilePictureResponse};
+pub use profile::{Profile, ProfileError, SetProfilePictureResponse};
 
 pub use status::{Status, StatusPrivacySetting, StatusSendOptions};
 
-pub use signal::Signal;
+pub use signal::{Signal, SignalError};
 pub use wacore::message_processing::EncType;
 
-pub use tctoken::TcToken;
+pub use tctoken::{TcToken, TcTokenError};

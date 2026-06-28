@@ -42,6 +42,11 @@ impl Client {
             // Old workers holding the previous semaphore Arc will finish normally.
             self.swap_message_semaphore(64);
 
+            // The flag flip above happens-before this drain takes the buffer
+            // lock, so late offline receipts either land in this flush or
+            // observe the flag and send 1:1 (see try_buffer_offline_receipt).
+            self.flush_offline_receipts();
+
             self.offline_sync_notifier.notify(usize::MAX);
 
             self.core
@@ -146,6 +151,7 @@ impl Client {
 
     /// Ensure E2E sessions exist for the given device JIDs.
     /// Waits for offline delivery, resolves LID mappings, then batches prekey fetches.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure", level = "debug", skip_all, fields(count = device_jids.len()), err(Debug)))]
     pub(crate) async fn ensure_e2e_sessions(&self, device_jids: &[Jid]) -> Result<()> {
         if device_jids.is_empty() {
             return Ok(());
@@ -158,6 +164,7 @@ impl Client {
     /// Like `ensure_e2e_sessions` but skips `resolve_lid_mappings`. Use when the
     /// caller already resolved JIDs to the correct namespace (e.g., after
     /// alternate PN/LID key normalization in retry handling).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_resolved", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     pub(crate) async fn ensure_e2e_sessions_resolved(&self, jids: &[Jid]) -> Result<()> {
         if jids.is_empty() {
             return Ok(());
@@ -167,26 +174,24 @@ impl Client {
     }
 
     /// Core session-check + prekey-fetch logic shared by both entry points.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_inner", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     async fn ensure_sessions_inner(&self, jids: Vec<Jid>) -> Result<()> {
         use wacore::types::jid::JidExt;
 
-        let device_store = self.persistence_manager.get_device_arc().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let mut jids_needing_sessions = Vec::with_capacity(jids.len());
 
-        {
-            let device_guard = device_store.read().await;
-            for jid in jids {
-                let signal_addr = jid.to_protocol_address();
-                // Check cache first (includes unflushed sessions), fall back to backend
-                match self
-                    .signal_cache
-                    .has_session(&signal_addr, &*device_guard.backend)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => jids_needing_sessions.push(jid),
-                    Err(e) => log::warn!("Failed to check session for {}: {}", jid, e),
-                }
+        for jid in jids {
+            let signal_addr = jid.to_protocol_address();
+            // Check cache first (includes unflushed sessions), fall back to backend
+            match self
+                .signal_cache
+                .has_session(&signal_addr, &*device_snapshot.backend)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => jids_needing_sessions.push(jid),
+                Err(e) => log::warn!("Failed to check session for {}: {}", jid.observe(), e),
             }
         }
 
@@ -203,6 +208,7 @@ impl Client {
 
     /// Fetch prekeys and establish sessions for a batch of JIDs.
     /// Returns the number of sessions successfully established.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.fetch_establish", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     async fn fetch_and_establish_sessions(&self, jids: &[Jid]) -> Result<usize, anyhow::Error> {
         use wacore::libsignal::protocol::{UsePQRatchet, process_prekey_bundle};
         use wacore::types::jid::JidExt;
@@ -239,21 +245,29 @@ impl Client {
                 )
                 .await
                 {
-                    Ok(_) => {
+                    Ok(identity_change) => {
                         success_count += 1;
-                        log::debug!("Successfully established session with {}", jid);
+                        log::debug!("Successfully established session with {}", jid.observe());
+                        if identity_change
+                            == wacore::libsignal::protocol::IdentityChange::ReplacedExisting
+                        {
+                            self.react_to_local_identity_change(jid);
+                        }
                     }
                     Err(e) => {
                         failed_count += 1;
-                        log::warn!("Failed to establish session with {}: {}", jid, e);
+                        log::warn!("Failed to establish session with {}: {}", jid.observe(), e);
                     }
                 }
             } else {
                 missing_count += 1;
                 if jid.device == 0 {
-                    log::warn!("Server did not return prekeys for primary phone {}", jid);
+                    log::warn!(
+                        "Server did not return prekeys for primary phone {}",
+                        jid.observe()
+                    );
                 } else {
-                    log::debug!("Server did not return prekeys for {}", jid);
+                    log::debug!("Server did not return prekeys for {}", jid.observe());
                 }
             }
         }
@@ -278,8 +292,17 @@ impl Client {
 
     /// Log primary phone (device 0) session state at login.
     /// Migration is lazy via try_pn_to_lid_migration_decrypt on first message.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.primary_phone_check",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub(crate) async fn establish_primary_phone_session_immediate(&self) -> Result<()> {
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         let own_pn = device_snapshot
             .pn
@@ -304,7 +327,7 @@ impl Client {
             .unwrap_or(false);
 
         match (lid_exists, pn_exists) {
-            (true, _) => log::debug!("LID session with {} exists", primary_phone_lid),
+            (true, _) => log::debug!("LID session with {} exists", primary_phone_lid.observe()),
             (false, true) => {
                 log::debug!("PN-only session for own device 0 — will migrate on first message")
             }
@@ -316,16 +339,27 @@ impl Client {
         Ok(())
     }
 
-    /// Check if a session exists for the given JID.
-    async fn check_session_exists(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
+    /// Whether `message_encrypt` for `jid` would emit a pkmsg (no session, or a
+    /// session with an un-acked pre-key still pending). Reuses the send path's
+    /// pre-flight so the voip offer treats a session-present-but-unacked device as
+    /// pkmsg too, not as plain msg.
+    #[cfg(feature = "voip")]
+    pub(crate) async fn would_emit_pkmsg(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
         let device_store = self.persistence_manager.get_device_arc().await;
-        let device_guard = device_store.read().await;
+        let mut adapter = self.signal_adapter_from(device_store);
+        let signal_addr = jid.to_protocol_address();
+        wacore::send::pkmsg_would_be_emitted(&mut adapter.session_store, &signal_addr).await
+    }
+
+    /// Check if a session exists for the given JID.
+    pub(crate) async fn check_session_exists(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let signal_addr = jid.to_protocol_address();
 
-        device_guard
+        device_snapshot
             .contains_session(&signal_addr)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to check session for {}: {}", jid, e))
+            .map_err(|e| anyhow::anyhow!("Failed to check session for {}: {}", jid.observe(), e))
     }
 }
 

@@ -15,6 +15,10 @@ impl StanzaHandler for SuccessHandler {
         "success"
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.success", level = "debug", skip_all)
+    )]
     async fn handle(
         &self,
         client: Arc<Client>,
@@ -37,6 +41,10 @@ impl StanzaHandler for FailureHandler {
         "failure"
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.failure", level = "debug", skip_all)
+    )]
     async fn handle(
         &self,
         client: Arc<Client>,
@@ -59,6 +67,10 @@ impl StanzaHandler for StreamErrorHandler {
         "stream:error"
     }
 
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.stream_error", level = "debug", skip_all)
+    )]
     async fn handle(
         &self,
         client: Arc<Client>,

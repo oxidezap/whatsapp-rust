@@ -137,17 +137,19 @@ impl<'a> Decoder<'a> {
             .read_value_as_string()?
             .ok_or(BinaryError::InvalidNode)?;
 
-        // Domain type mapping — must mirror encoder's server_to_domain_type().
+        // Domain type mapping must mirror WA Web decodeJidU.
         // WA Web: 0=WHATSAPP, 1=LID, even+bit7=HOSTED, 129=HOSTED_LID, else throw.
-        // server_to_domain_type encodes Pn/unknown as the agent value directly,
-        // so unmapped agents round-trip as Pn with the original agent preserved.
         let server = match agent {
             0 => crate::jid::Server::Pn,
             1 => crate::jid::Server::Lid,
             128 => crate::jid::Server::Hosted,
             129 => crate::jid::Server::HostedLid,
             n if (n & 128) != 0 && (n & 1) == 0 => crate::jid::Server::Hosted,
-            _ => crate::jid::Server::Pn,
+            _ => {
+                return Err(BinaryError::AttrParse(format!(
+                    "read_ad_jid - Invalid domain type encoding {agent}"
+                )));
+            }
         };
 
         Ok(JidRef {
@@ -683,6 +685,23 @@ mod tests {
         let mut decoder = Decoder::new(&data);
         let result = decoder.read_value_as_string();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ad_jid_rejects_invalid_domain_type() {
+        let data = vec![token::AD_JID, 2, 1, token::BINARY_8, 3, b'1', b'2', b'3'];
+        let mut decoder = Decoder::new(&data);
+        let result = decoder.read_value_as_string();
+
+        match result {
+            Err(BinaryError::AttrParse(msg)) => {
+                assert!(
+                    msg.contains("Invalid domain type encoding 2"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected AttrParse for invalid AD_JID domain type, got {other:?}"),
+        }
     }
 
     /// Test read_bytes with exact length

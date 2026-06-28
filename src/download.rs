@@ -22,14 +22,36 @@ impl From<&MediaConn> for wacore::download::MediaConnection {
     }
 }
 
-/// Implements `Downloadable` from raw media parameters.
-struct DownloadParams {
-    direct_path: String,
-    media_key: Option<Vec<u8>>,
-    file_sha256: Vec<u8>,
-    file_enc_sha256: Option<Vec<u8>>,
-    file_length: u64,
-    media_type: MediaType,
+/// `Downloadable` built from raw CDN fields, for re-downloading media without
+/// the original message in hand.
+pub struct DownloadParams {
+    pub direct_path: String,
+    pub media_key: Option<Vec<u8>>,
+    pub file_sha256: Vec<u8>,
+    pub file_enc_sha256: Option<Vec<u8>>,
+    pub file_length: u64,
+    pub media_type: MediaType,
+}
+
+impl DownloadParams {
+    /// Params for encrypted media. Slices are copied into the owned struct.
+    pub fn encrypted(
+        direct_path: impl Into<String>,
+        media_key: &[u8],
+        file_sha256: &[u8],
+        file_enc_sha256: &[u8],
+        file_length: u64,
+        media_type: MediaType,
+    ) -> Self {
+        Self {
+            direct_path: direct_path.into(),
+            media_key: Some(media_key.to_vec()),
+            file_sha256: file_sha256.to_vec(),
+            file_enc_sha256: Some(file_enc_sha256.to_vec()),
+            file_length,
+            media_type,
+        }
+    }
 }
 
 impl Downloadable for DownloadParams {
@@ -232,6 +254,10 @@ impl Client {
     /// Only needed when you need the plaintext bytes (processing, transcoding,
     /// re-upload). To forward existing media unchanged, reuse the original
     /// message's CDN fields directly, no round-trip required.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.media.download", level = "debug", skip_all, err(Debug))
+    )]
     pub async fn download(&self, downloadable: &dyn Downloadable) -> Result<Vec<u8>> {
         download_media_with_retry(
             |force| self.prepare_requests(downloadable, force),
@@ -241,22 +267,20 @@ impl Client {
         .await
     }
 
-    pub async fn download_to_file<W: Write + Seek + Send + Unpin>(
-        &self,
-        downloadable: &dyn Downloadable,
-        mut writer: W,
-    ) -> Result<()> {
-        let data = self.download(downloadable).await?;
-        writer.seek(SeekFrom::Start(0))?;
-        writer.write_all(&data)?;
-        Ok(())
-    }
-
     /// Fetch a first-party sticker pack's metadata and sticker list from the CDN.
     ///
     /// Each returned [`wacore::sticker_pack::StickerPackItem`] is [`Downloadable`],
     /// so individual stickers can be fetched with [`Self::download`]. The locale
     /// only affects localized pack names; `"en"` mirrors whatsmeow's default.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.media.fetch_sticker_pack",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub async fn fetch_sticker_pack(
         &self,
         pack_id: &str,
@@ -278,24 +302,9 @@ impl Client {
     }
 
     /// Downloads and decrypts media from raw parameters without needing the original message.
-    pub async fn download_from_params(
-        &self,
-        direct_path: &str,
-        media_key: &[u8],
-        file_sha256: &[u8],
-        file_enc_sha256: &[u8],
-        file_length: u64,
-        media_type: MediaType,
-    ) -> Result<Vec<u8>> {
-        let params = Self::build_download_params(
-            direct_path,
-            media_key,
-            file_sha256,
-            file_enc_sha256,
-            file_length,
-            media_type,
-        );
-        self.download(&params).await
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.download_from_params", level = "debug", skip_all, fields(kind = ?params.media_type), err(Debug)))]
+    pub async fn download_from_params(&self, params: &DownloadParams) -> Result<Vec<u8>> {
+        self.download(params).await
     }
 
     async fn prepare_requests(
@@ -361,6 +370,15 @@ impl Client {
     /// blocking thread. The writer is seeked back to position 0 before returning.
     ///
     /// Memory usage: ~40KB regardless of file size (8KB read buffer + decrypt state).
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.media.download_to_writer",
+            level = "debug",
+            skip_all,
+            err(Debug)
+        )
+    )]
     pub async fn download_to_writer<W: Write + Seek + Send + 'static>(
         &self,
         downloadable: &dyn Downloadable,
@@ -377,44 +395,13 @@ impl Client {
 
     /// Streaming variant of `download_from_params` that writes to a writer
     /// instead of buffering in memory.
-    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.media.download_from_params_to_writer", level = "debug", skip_all, fields(kind = ?params.media_type), err(Debug)))]
     pub async fn download_from_params_to_writer<W: Write + Seek + Send + 'static>(
         &self,
-        direct_path: &str,
-        media_key: &[u8],
-        file_sha256: &[u8],
-        file_enc_sha256: &[u8],
-        file_length: u64,
-        media_type: MediaType,
+        params: &DownloadParams,
         writer: W,
     ) -> Result<W> {
-        let params = Self::build_download_params(
-            direct_path,
-            media_key,
-            file_sha256,
-            file_enc_sha256,
-            file_length,
-            media_type,
-        );
-        self.download_to_writer(&params, writer).await
-    }
-
-    fn build_download_params(
-        direct_path: &str,
-        media_key: &[u8],
-        file_sha256: &[u8],
-        file_enc_sha256: &[u8],
-        file_length: u64,
-        media_type: MediaType,
-    ) -> DownloadParams {
-        DownloadParams {
-            direct_path: direct_path.to_string(),
-            media_key: Some(media_key.to_vec()),
-            file_sha256: file_sha256.to_vec(),
-            file_enc_sha256: Some(file_enc_sha256.to_vec()),
-            file_length,
-            media_type,
-        }
+        self.download_to_writer(params, writer).await
     }
 
     /// Download + decrypt to a writer. Uses streaming when available,

@@ -35,6 +35,10 @@ pub fn make_qr_data_with_client_type(
     PairUtils::make_qr_data(&device_state, ref_str, client_type)
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.pair.handle_iq", level = "debug", skip_all)
+)]
 pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
     // Server JID is "s.whatsapp.net" (no @ prefix for server-only JIDs)
     if node
@@ -56,7 +60,7 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
 
                     let mut codes = Vec::new();
 
-                    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+                    let device_snapshot = client.persistence_manager.get_device_snapshot();
                     let device_state = DeviceState {
                         identity_key: device_snapshot.identity_key.clone(),
                         noise_key: device_snapshot.noise_key.clone(),
@@ -147,6 +151,10 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
     false
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.pair.success", level = "debug", skip_all)
+)]
 async fn handle_pair_success<'a>(
     client: &Arc<Client>,
     request_node: &NodeRef<'a>,
@@ -214,7 +222,7 @@ async fn handle_pair_success<'a>(
         (Jid::default(), Jid::default())
     };
 
-    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+    let device_snapshot = client.persistence_manager.get_device_snapshot();
     let device_state = DeviceState {
         identity_key: device_snapshot.identity_key.clone(),
         noise_key: device_snapshot.noise_key.clone(),
@@ -293,7 +301,7 @@ async fn handle_pair_success<'a>(
             }
 
             if !business_name.is_empty() {
-                info!("✅ Setting push_name during pairing: '{}'", &business_name);
+                info!("✅ Setting push_name during pairing: '{}'", business_name);
                 client
                     .persistence_manager
                     .process_command(crate::store::commands::DeviceCommand::SetPushName(
@@ -334,7 +342,7 @@ async fn handle_pair_success<'a>(
 
             client.expected_disconnect.store(true, Ordering::Relaxed);
 
-            info!("Successfully paired {jid}");
+            info!("Successfully paired {}", jid.observe());
 
             let success_event = PairSuccess {
                 id: jid,
@@ -369,6 +377,10 @@ async fn handle_pair_success<'a>(
     }
 }
 
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.pair.qr", level = "debug", skip_all, err(Debug))
+)]
 pub async fn pair_with_qr_code(client: &Arc<Client>, qr_code: &str) -> Result<(), anyhow::Error> {
     info!(target: "Client/PairTest", "Master client attempting to pair with QR code.");
 
@@ -376,7 +388,7 @@ pub async fn pair_with_qr_code(client: &Arc<Client>, qr_code: &str) -> Result<()
 
     let master_ephemeral = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
 
-    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+    let device_snapshot = client.persistence_manager.get_device_snapshot();
     let device_state = DeviceState {
         identity_key: device_snapshot.identity_key.clone(),
         noise_key: device_snapshot.noise_key.clone(),

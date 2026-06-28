@@ -15,6 +15,7 @@ use waproto::whatsapp::ExternalBlobReference;
 use waproto::whatsapp::message::HistorySyncNotification;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MediaDecryptionError {
     #[error("downloaded file is too short to contain MAC")]
     PayloadTooShort,

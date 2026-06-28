@@ -1,0 +1,93 @@
+{
+  "inputs": {
+    "callKey": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "hbhKey": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d",
+    "selfLid": "111111111111111:0@lid",
+    "peerLid": "222222222222222:0@lid",
+    "ssrc": 305419896,
+    "seq": 7,
+    "roc": 0,
+    "payload": "102132435465768798a9bacb",
+    "callId": "00112233445566778899AABBCCDDEEFF",
+    "sframeCounter": 5,
+    "samplePacket": "90780007000003c012345678deadbeef"
+  },
+  "sframe": {
+    "participantPeerId": "222222222222222:0@lid",
+    "infoLabelPeer": "e2e sframe key222222222222222:0@lid",
+    "peerKey32": "e77cc4666a53d2264ba278b3e2b9ba1cc41ac0e3b587b09db3dd3fa646d51ae9",
+    "selfKey32": "07e656b474ef306e7e5353f94057a8904821c0f2247b867c102e7ef4cc0dd95c",
+    "counterToIv_5": "00000000000000000500000000000000",
+    "header_5_0": "050003",
+    "encrypt_out": "e5ef789f9fa501842a9ff5f54cc12a630d12008f1bb39060c951724f050003"
+  },
+  "e2e_srtp": {
+    "peer_cipherKey": "747055a9d18be0fcdc0e29d871309081",
+    "peer_salt": "10fb8133eff7639cc0d06788f49c",
+    "peer_authKey": "8eff4bb04971d92512b034ce0ebc466059bfc6ea",
+    "self_cipherKey": "261bde5b556020e3e6da0f5e3132db57",
+    "self_salt": "44224a8c019b379c4bbf7dda284a",
+    "self_authKey": "56b2655b60a1c17c03dfe94950d5df233481ad41",
+    "rtpIv": "10fb8133fdc335e4c0d06788f49b0000",
+    "cipher_out": "17b30591a2650ed7bbae9c5a",
+    "warp_mi_tag4": "53fada83"
+  },
+  "wahkdf": {
+    "okm46": "3f5423fb6f67e4c588bf5741a3a4e92c749ee99101a47c82bb5dacec40cfc7b95d387fe9ff466f78db6cc4fdaa30",
+    "masterKey": "3f5423fb6f67e4c588bf5741a3a4e92c",
+    "masterSalt": "749ee99101a47c82bb5dacec40cf"
+  },
+  "hbh_srtp": {
+    "uplinkKey30": "d7c293861dccfc246ce7c66b498e7d50e92424ae12c54f79c9131eac0a94",
+    "masterKey": "d7c293861dccfc246ce7c66b498e7d50",
+    "masterSalt": "e92424ae12c54f79c9131eac0a94",
+    "sessionKey": "8586b2992b154e6531606e8b7ceeb782",
+    "sessionSalt": "e14ea5189ca6f303f3697237cf04",
+    "authKey": "1caf9c0b1f0c08fad93a41f7d6897ba12eaf100f",
+    "icmKey30": "8586b2992b154e6531606e8b7ceeb782e14ea5189ca6f303f3697237cf04",
+    "rtpIcmNonce": "00000000123456780000000000070000",
+    "cipher_out": "eacd64249a77b5270140c634"
+  },
+  "voip_crypto": {
+    "ssrc_slot0": 1805509457,
+    "ssrc_slot1": 2479325408
+  },
+  "rtp": {
+    "speechHeader16": "90f800010000000012345678debe0000",
+    "dtxHeader20": "907800020000014012345678debe000130010000",
+    "estimateSpeech12": 32,
+    "estimateDtx1": 25,
+    "estimatePriming2": 25
+  },
+  "rtcp": {
+    "nowMs": 1718000000000,
+    "remoteSsrc": 2596069104,
+    "stats": {
+      "packetsSent": 5,
+      "octetsSent": 600,
+      "rtpTimestamp": 1600
+    },
+    "compact208": "81d00002123456789abcdef0",
+    "compact209": "81d1000112345678",
+    "senderReport": "80c8000612345678ea11180000000000000006400000000500000258"
+  },
+  "stun": {
+    "tx": "a0a1a2a3a4a5a6a7a8a9aaab",
+    "relayToken": "1020304050607080",
+    "miKey": "30313233343536373839616263646566",
+    "crc32_abc": 891568578,
+    "attr_token": "400000081020304050607080",
+    "xorEndpoint": "2c84bce246c7",
+    "nativeSenderSub": "0112345678",
+    "minimalMi": "000300242112a442a0a1a2a3a4a5a6a7a8a9aaab4000000810203040506070800008001450c96f7efef837bbde7e1f534dae139816d3e015",
+    "withFp": "0003002c2112a442a0a1a2a3a4a5a6a7a8a9aaab4000000810203040506070800008001450c96f7efef837bbde7e1f534dae139816d3e01580280004ade1f63c",
+    "wasmAllocate": "000300942112a442a0a1a2a3a4a5a6a7a8a9aaab400000081020304050607080402400600a0618cabc85ae040a08100118a5acafae0a0a08100218d6a4e6f90f0a08080118f7dd9eb60a0a0a0801100118abccb1f30d0a0a0801100218dadaef8a050a08080218c5e9ec8e0b0a0a0802100118fdc2b1b60f0a0a0802100218b097f7b2090016000800012c84bce246c700080014816c90841f948115ce794ef87726c00ff74220c7",
+    "ping": "080100002112a442a0a1a2a3a4a5a6a7a8a9aaab"
+  },
+  "stun_proto": {
+    "voip_sender_subscriptions": "0a0a18f8acd1910128003000",
+    "apk_sender_subscriptions_nopid": "0a080a0608f0d9a2a302",
+    "apk_sender_subscriptions_pid": "0a130a1108f0d9a2a3021209080e1205617564696f",
+    "apk_stream_descriptors": "0a150a05617564696f12044f50555318f0d9a2a3022000"
+  }
+}

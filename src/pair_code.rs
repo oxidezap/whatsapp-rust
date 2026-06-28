@@ -64,6 +64,7 @@ pub use wacore::pair_code::{PairCodeError, PairCodeOptions};
 /// Wraps `wacore::pair_code::PairCodeError` (validation, key derivation, bundle
 /// building) and adds the IQ transport layer via `RequestFailed`.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PairError {
     #[error(transparent)]
     PairCode(#[from] PairCodeError),
@@ -108,6 +109,10 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.pair.code", level = "debug", skip_all, err(Debug))
+    )]
     pub async fn pair_with_code(
         self: &Arc<Self>,
         options: PairCodeOptions,
@@ -151,7 +156,7 @@ impl Client {
         let ephemeral_keypair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
 
         // Get device state for noise key
-        let device_snapshot = self.persistence_manager.get_device_snapshot().await;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
         let noise_static_pub: [u8; 32] = device_snapshot
             .noise_key
             .public_key
@@ -237,6 +242,10 @@ impl Client {
 ///
 /// This is called when the user enters the code on their phone. The notification
 /// contains the primary device's encrypted ephemeral public key and identity public key.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.pair.code_notification", level = "debug", skip_all)
+)]
 pub(crate) async fn handle_pair_code_notification(
     client: &Arc<Client>,
     node: &NodeRef<'_>,
@@ -325,7 +334,7 @@ pub(crate) async fn handle_pair_code_notification(
     };
 
     // Get device keys
-    let device_snapshot = client.persistence_manager.get_device_snapshot().await;
+    let device_snapshot = client.persistence_manager.get_device_snapshot();
 
     // Prepare encrypted key bundle (includes rotated adv_secret_key)
     let (wrapped_bundle, new_adv_secret) = match PairCodeUtils::prepare_key_bundle(
@@ -391,6 +400,8 @@ mod tests {
         let iq = IqError::ServerError {
             code: 400,
             text: "bad-request".into(),
+            error_type: None,
+            backoff: None,
         };
         let pe: PairError = iq.into();
         let src = std::error::Error::source(&pe).expect("source preserved");

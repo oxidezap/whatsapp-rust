@@ -26,18 +26,24 @@ struct GcmGhash {
 
 impl GcmGhash {
     fn new(h: &[u8; TAG_SIZE], ghash_pad: [u8; TAG_SIZE], associated_data: &[u8]) -> Result<Self> {
-        let mut ghash = GHash::new(h.into());
+        Ok(Self::from_keyed(
+            GHash::new(h.into()),
+            ghash_pad,
+            associated_data,
+        ))
+    }
 
+    fn from_keyed(mut ghash: GHash, ghash_pad: [u8; TAG_SIZE], associated_data: &[u8]) -> Self {
         ghash.update_padded(associated_data);
 
-        Ok(Self {
+        Self {
             ghash,
             ghash_pad,
             msg_buf: [0u8; TAG_SIZE],
             msg_buf_offset: 0,
             ad_len: associated_data.len(),
             msg_len: 0,
-        })
+        }
     }
 
     fn update(&mut self, msg: &[u8]) {
@@ -122,6 +128,43 @@ fn setup_gcm(key: &[u8], nonce: &[u8], associated_data: &[u8]) -> Result<(Aes256
     Ok((ctr, ghash))
 }
 
+/// Key-dependent AES-256-GCM state computed once: the AES key schedule and
+/// the keyed GHASH outlive individual seals when the key never changes (the
+/// Noise transport key lives for a whole connection), leaving only the
+/// nonce-dependent setup per call.
+#[derive(Clone)]
+pub struct Aes256GcmKey {
+    cipher: Aes256,
+    keyed_ghash: GHash,
+}
+
+impl Aes256GcmKey {
+    pub fn new(key: &[u8]) -> Result<Self> {
+        let cipher = Aes256::new_from_slice(key).map_err(|_| Error::InvalidKeySize)?;
+        let mut h: Block<Aes256> = [0u8; TAG_SIZE].into();
+        cipher.encrypt_block(&mut h);
+        let h: [u8; TAG_SIZE] = h.into();
+        Ok(Self {
+            cipher,
+            keyed_ghash: GHash::new((&h).into()),
+        })
+    }
+
+    fn setup(&self, nonce: &[u8], associated_data: &[u8]) -> Result<(Aes256Ctr32, GcmGhash)> {
+        if nonce.len() != NONCE_SIZE {
+            return Err(Error::InvalidNonceSize);
+        }
+
+        let mut ctr = Aes256Ctr32::new(self.cipher.clone(), nonce, 1)?;
+
+        let mut ghash_pad = [0u8; 16];
+        ctr.process(&mut ghash_pad);
+
+        let ghash = GcmGhash::from_keyed(self.keyed_ghash.clone(), ghash_pad, associated_data);
+        Ok((ctr, ghash))
+    }
+}
+
 pub struct Aes256GcmEncryption {
     ctr: Aes256Ctr32,
     ghash: GcmGhash,
@@ -133,6 +176,11 @@ impl Aes256GcmEncryption {
 
     pub fn new(key: &[u8], nonce: &[u8], associated_data: &[u8]) -> Result<Self> {
         let (ctr, ghash) = setup_gcm(key, nonce, associated_data)?;
+        Ok(Self { ctr, ghash })
+    }
+
+    pub fn new_with_key(key: &Aes256GcmKey, nonce: &[u8], associated_data: &[u8]) -> Result<Self> {
+        let (ctr, ghash) = key.setup(nonce, associated_data)?;
         Ok(Self { ctr, ghash })
     }
 
@@ -157,6 +205,11 @@ impl Aes256GcmDecryption {
 
     pub fn new(key: &[u8], nonce: &[u8], associated_data: &[u8]) -> Result<Self> {
         let (ctr, ghash) = setup_gcm(key, nonce, associated_data)?;
+        Ok(Self { ctr, ghash })
+    }
+
+    pub fn new_with_key(key: &Aes256GcmKey, nonce: &[u8], associated_data: &[u8]) -> Result<Self> {
+        let (ctr, ghash) = key.setup(nonce, associated_data)?;
         Ok(Self { ctr, ghash })
     }
 
@@ -507,5 +560,45 @@ mod tests {
         dec.decrypt(&mut decrypted);
         dec.verify_tag(&expected_tag).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    /// The pre-keyed path must stay byte-identical to the per-call setup;
+    /// any drift would corrupt every Noise frame.
+    #[test]
+    fn pre_keyed_matches_per_call_setup() {
+        let key = [0x42u8; 32];
+        let pre_keyed = Aes256GcmKey::new(&key).unwrap();
+
+        for (i, len) in [0usize, 1, 15, 16, 17, 1500, 4096].iter().enumerate() {
+            let mut nonce = [0u8; NONCE_SIZE];
+            nonce[11] = i as u8;
+            let aad: &[u8] = if i % 2 == 0 { b"" } else { b"associated" };
+            let plaintext: Vec<u8> = (0..*len).map(|b| b as u8).collect();
+
+            let mut plain_ct = plaintext.clone();
+            let mut enc = Aes256GcmEncryption::new(&key, &nonce, aad).unwrap();
+            enc.encrypt(&mut plain_ct);
+            let plain_tag = enc.compute_tag();
+
+            let mut pk_ct = plaintext.clone();
+            let mut enc = Aes256GcmEncryption::new_with_key(&pre_keyed, &nonce, aad).unwrap();
+            enc.encrypt(&mut pk_ct);
+            let pk_tag = enc.compute_tag();
+
+            assert_eq!(plain_ct, pk_ct);
+            assert_eq!(plain_tag, pk_tag);
+
+            let mut dec = Aes256GcmDecryption::new_with_key(&pre_keyed, &nonce, aad).unwrap();
+            dec.decrypt(&mut pk_ct);
+            dec.verify_tag(&pk_tag).unwrap();
+            assert_eq!(pk_ct, plaintext);
+
+            let mut bad_tag = pk_tag;
+            bad_tag[0] ^= 1;
+            let mut ct_again = plain_ct.clone();
+            let mut dec = Aes256GcmDecryption::new_with_key(&pre_keyed, &nonce, aad).unwrap();
+            dec.decrypt(&mut ct_again);
+            assert!(dec.verify_tag(&bad_tag).is_err());
+        }
     }
 }

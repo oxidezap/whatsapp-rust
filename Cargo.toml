@@ -43,41 +43,47 @@ default-members = [
 # Force the wacore::time abstraction so WASM/deterministic-test builds don't
 # regress. Exceptions carry `#[allow(clippy::disallowed_methods)]` inline.
 disallowed_methods = "deny"
+# Ban std 64-bit atomic types: absent on 32-bit targets (Xtensa/ESP32). Use
+# portable_atomic. Host-only test/bench counters carry an inline allow.
+disallowed_types = "deny"
 
 [workspace.dependencies]
 # Shared dependencies
-aes = "0.9.0"
-aes-gcm = { version = "0.11.0-rc.3", default-features = false, features = ["aes", "alloc", "bytes"] }
+aes = "0.9.1"
+aes-gcm = { version = "0.11.0-rc.4", default-features = false, features = ["aes", "alloc", "bytes"] }
 anyhow = { version = "1.0", default-features = false }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
 async-lock = { version = "3", default-features = false }
 async-trait = "0.1.89"
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-# Fork branch carrying oneof_attribute (#167): lets us split serde derives so
-# enums use serde_repr (numeric, JS-bridge parity) while messages/oneofs keep
-# serde::Serialize. Pinned by `rev` (not the moving `branch`) so a force-push
-# upstream can't silently change the generated crypto serialization under us;
-# the lockfile alone doesn't protect `cargo update` or downstream consumers.
-# Revert to a tagged buffa release once #167 lands upstream.
-buffa = { git = "https://github.com/jlucaso1/buffa", rev = "fa1c33b58d4944cde94776695d642e8cf13f23bd", default-features = false, features = ["json"] }
-buffa-build = { git = "https://github.com/jlucaso1/buffa", rev = "fa1c33b58d4944cde94776695d642e8cf13f23bd", default-features = false }
-bytemuck = { version = "1.22", default-features = false }
-bytes = { version = "1.5", default-features = false }
+# oneof_attribute (#167) is upstream as of v0.8.0, so we track the tagged
+# upstream release instead of the fork. Pinned by `tag` for reproducibility;
+# the generated crypto serialization can't shift under us without a deliberate
+# version bump here.
+buffa = { git = "https://github.com/anthropics/buffa", tag = "v0.8.0", default-features = false, features = ["json"] }
+buffa-build = { git = "https://github.com/anthropics/buffa", tag = "v0.8.0", default-features = false }
+buffa-descriptor = { git = "https://github.com/anthropics/buffa", tag = "v0.8.0", default-features = false }
+bytemuck = { version = "1.25", default-features = false }
+bytes = { version = "1.12", default-features = false }
+cbc = { version = "0.2", features = ["alloc"] }
 chrono = { version = "0.4", default-features = false }
 compact_str = { version = "0.9", default-features = false }
 ctr = { version = "0.10", default-features = false }
+divan = { package = "codspeed-divan-compat", version = "4.7.0" }
 env_logger = { version = "0.11", default-features = false }
 event-listener = { version = "5", default-features = false }
-flate2 = { version = "1.1.5", default-features = false, features = ["zlib-rs"] }
+flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 getrandom = { version = "0.4", default-features = false }
+heck = "0.5"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 hkdf = { version = "0.13.0", default-features = false }
 hmac = { version = "0.13.0", default-features = false }
-iai-callgrind = "0.16"
 itoa = "1"
 log = "0.4"
+metrics = "0.24"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 rand = "0.10"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
@@ -85,8 +91,9 @@ serde_json = { version = "1.0", default-features = false }
 sha1 = { version = "0.11.0", default-features = false }
 sha2 = { version = "0.11.0", default-features = false }
 subtle = { version = "2.6", default-features = false }
-thiserror = "2.0.17"
-tokio = { version = "1.48.0", default-features = false }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 uuid = { version = "1", default-features = false }
 
 # Internal workspace crates
@@ -102,10 +109,20 @@ yoke = { version = "0.8", features = ["derive"] }
 [features]
 debug-diagnostics = ["wacore/debug-diagnostics"]
 debug-snapshots = ["wacore/debug-snapshots"]
+# Optional observability. Off by default: no `tracing` dep, zero overhead.
+# Emits tracing spans/events only; the application installs the subscriber
+# (and any OpenTelemetry bridge). See examples/observability.rs.
+tracing = ["dep:tracing", "wacore/tracing"]
+# Optional metrics (counters/histograms/gauges via the `metrics` facade). Off by
+# default: no dependency, zero overhead. Emits only; the application installs a
+# recorder (e.g. metrics-exporter-prometheus). See examples/metrics.rs.
+metrics = ["wacore/metrics"]
+# Render raw phone numbers in tracing fields instead of the redacted `pn#<hash>`.
+# Local debugging only; never enable in production.
+tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
 danger-skip-cert-chain-verify = ["wacore/danger-skip-cert-chain-verify"]
 default = [
-    "moka-cache",
     "simd",
     "sqlite-storage",
     "tokio-transport",
@@ -114,7 +131,6 @@ default = [
     "tokio-native",
     "signal",
 ]
-moka-cache = ["dep:moka"]
 simd = ["wacore/simd"]
 ureq-client = ["dep:whatsapp-rust-ureq-http-client"]
 tokio-transport = ["dep:whatsapp-rust-tokio-transport"]
@@ -122,6 +138,21 @@ tokio-runtime = ["dep:tokio"]
 signal = ["tokio-runtime", "tokio/signal"]
 sqlite-storage = ["whatsapp-rust-sqlite-storage"]
 tokio-native = ["tokio-runtime", "tokio/rt-multi-thread"]
+# VoIP calls media plane (opt-in, NOT default): pulls wacore's voip crypto plus the
+# DTLS/SCTP/DataChannel transport (webrtc-rs) and libopus FFI. Not buildable on wasm32/esp32
+# (a compile_error in src/voip/mod.rs enforces this); use wacore's `voip` feature there.
+voip = [
+    "wacore/voip",
+    "tokio-runtime",
+    "tokio/net",
+    "dep:webrtc-dtls",
+    "dep:webrtc-sctp",
+    "dep:webrtc-data",
+    "dep:webrtc-util",
+    "dep:webrtc-util-011",
+    "dep:opus",
+    "dep:rustls",
+]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -132,23 +163,32 @@ base64 = { workspace = true }
 buffa = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
-env_logger = { workspace = true }
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }
 hex = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
-moka = { version = "0.12.12", features = ["future"], optional = true }
+opus = { version = "0.3", optional = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }
+# Only with `voip`: lets us install the `ring` rustls CryptoProvider before the DTLS handshake.
+# webrtc-dtls picks rustls' process-default provider, and the tree carries both ring and aws-lc-rs,
+# so without an explicit default the first real handshake panics.
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 scopeguard = "1.2"
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"], optional = true }
+tracing = { workspace = true, optional = true }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
 waproto = { workspace = true }
+webrtc-data = { version = "0.17", optional = true }
+webrtc-dtls = { version = "0.12", optional = true }
+webrtc-sctp = { version = "0.17", optional = true }
+webrtc-util = { version = "0.17", optional = true }
+webrtc-util-011 = { package = "webrtc-util", version = "0.11", optional = true }
 whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.6.0", optional = true }
 whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.6.0", optional = true }
 whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.6.0", optional = true }
@@ -164,11 +204,24 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
 aes = { workspace = true }
-cbc = { version = "0.2", features = ["alloc", "block-padding"] }
+async-trait = { workspace = true }
+cbc = { workspace = true, features = ["block-padding"] }
+# Cross-platform audio I/O for the `voip` example only. A dev-dependency, so it
+# never reaches consumers of the published lib (and only compiles when an example
+# that uses it is built). Needs libasound2-dev (ALSA) on Linux.
+cpal = "0.18"
+env_logger = { workspace = true }
 flate2 = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
+metrics-exporter-prometheus = "0.18"
+# Lock-free SPSC ring to hand samples from the async drain task to cpal's
+# realtime output callback without locking or per-callback allocation. voip
+# example only (dev-dependency).
+ringbuf = "0.5"
 sha2 = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }
 wacore-noise = { path = "./wacore/noise", features = [
     "test-util",
@@ -178,9 +231,26 @@ wacore-noise = { path = "./wacore/noise", features = [
 [lints]
 workspace = true
 
+# The demo client. Needs only the package default features, so a plain
+# `cargo build --example demo` works without `required-features`.
+[[example]]
+name = "demo"
+
 [[example]]
 name = "benchmark"
 required-features = ["danger-skip-tls-verify"]
+
+[[example]]
+name = "observability"
+required-features = ["tracing"]
+
+[[example]]
+name = "metrics"
+required-features = ["metrics"]
+
+[[example]]
+name = "voip"
+required-features = ["voip", "sqlite-storage", "tokio-transport", "ureq-client", "tokio-native"]
 
 [profile.release]
 opt-level = 3
@@ -191,7 +261,51 @@ panic = "abort"
 strip = true
 incremental = false
 
-# Benchmark profile: optimized but without aggressive LTO that breaks iai-callgrind
+# Off-hot-path crates run per connection / sync / request, not per message,
+# so size-optimizing them shrinks the binary at no measurable throughput cost.
+# The per-message/per-frame crypto/protocol crates (libsignal, wacore-binary,
+# waproto, buffa, aes, sha2, hkdf, flate2, curve25519, wacore-noise) stay at
+# opt-level 3 — wacore-noise's NoiseCipher runs the transport AEAD per frame,
+# so despite owning the once-per-connection handshake it is not handshake-only.
+# z = persistence (Diesel/SQLite, I/O-bound), media HTTP (ureq, network-bound),
+# and TLS PKI.
+[profile.release.package.diesel]
+opt-level = "z"
+[profile.release.package.diesel_migrations]
+opt-level = "z"
+[profile.release.package.r2d2]
+opt-level = "z"
+[profile.release.package.whatsapp-rust-sqlite-storage]
+opt-level = "z"
+[profile.release.package.ureq]
+opt-level = "z"
+[profile.release.package.ureq-proto]
+opt-level = "z"
+[profile.release.package.whatsapp-rust-ureq-http-client]
+opt-level = "z"
+[profile.release.package.rustls-webpki]
+opt-level = "z"
+[profile.release.package.webpki-roots]
+opt-level = "z"
+[profile.release.package.http]
+opt-level = "z"
+# s = data-path framing kept a notch faster than z: low throughput for a chat
+# client, but still touched on every frame/record.
+[profile.release.package.rustls]
+opt-level = "s"
+[profile.release.package.tokio-websockets]
+opt-level = "s"
+[profile.release.package.whatsapp-rust-tokio-transport]
+opt-level = "s"
+[profile.release.package.wacore-appstate]
+opt-level = "s"
+[profile.release.package.chrono]
+opt-level = "s"
+[profile.release.package.serde_json]
+opt-level = "s"
+
+# Benchmark profile: release-grade codegen, but thin LTO keeps bench builds
+# fast (release uses fat LTO) and debug symbols stay for local profiling.
 [profile.bench]
 inherits = "release"
 lto = "thin"
