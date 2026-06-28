@@ -298,8 +298,15 @@ impl Client {
                 }
             }
             if !missing_all.is_empty() && !self.request_keys_and_wait(missing_all).await {
-                warn!(target: "Client/AppState", "app-state key(s) still missing after request; skipping this batch, will retry on a later sync");
-                return Ok(());
+                // The re-shared key didn't land in time. Report failure rather than a
+                // false success: the initial critical-sync path treats Ok as permission
+                // to cancel its retry watchdog and dispatch Connected, which would leave
+                // CriticalBlock/CriticalUnblockLow unsynced with no scheduled retry. The
+                // collections re-sync on the retry (or a later server_sync) once the
+                // share arrives; the keys we DID repair are already persisted.
+                return Err(anyhow::anyhow!(
+                    "app-state decode key(s) still missing after re-request; deferring batched sync"
+                ));
             }
 
             // Process the already-parsed (and inlined) collections; keys are present.
@@ -535,8 +542,12 @@ impl Client {
                 .await
                 .unwrap_or_default();
             if !missing.is_empty() && !self.request_keys_and_wait(missing).await {
-                warn!(target: "Client/AppState", "app-state key(s) for {:?} still missing after request; skipping, will retry on a later sync", name);
-                break;
+                // Report failure (not a partial success) so the caller retries instead of
+                // treating the collection as synced; it re-syncs once the share lands.
+                // Pages already decoded this run have their version persisted.
+                return Err(anyhow::anyhow!(
+                    "app-state decode key(s) for {name:?} still missing after re-request; deferring sync"
+                ));
             }
 
             let (mutations, new_state, list) =
