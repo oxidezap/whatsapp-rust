@@ -1,0 +1,34 @@
+# Standalone crate for the VoIP audio demo. Lives outside the root package so its
+# audio stack (cpal -> alsa-sys, needs ALSA/pkg-config on Linux) never enters the
+# dependency closure of `cargo build --example demo`, which the Docker image runs.
+# A workspace member but not a default-member: plain `cargo build` skips it; build
+# it explicitly with `cargo run -p whatsapp-rust-voip-cli`.
+[package]
+name = "whatsapp-rust-voip-cli"
+version = "0.6.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-channel = { workspace = true }
+cpal = "0.18"
+env_logger = { workspace = true }
+hex = { workspace = true }
+log = { workspace = true }
+portable-atomic = { workspace = true }
+rand = { workspace = true }
+ringbuf = "0.5"
+tokio = { workspace = true, features = ["full"] }
+wacore = { path = "../../wacore", features = ["voip"] }
+whatsapp-rust = { path = "../..", features = [
+    "voip",
+    "sqlite-storage",
+    "tokio-transport",
+    "ureq-client",
+    "tokio-native",
+] }
+
+[lints]
+workspace = true
