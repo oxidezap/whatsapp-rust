@@ -84,7 +84,6 @@ itoa = "1"
 log = "0.4"
 metrics = "0.24"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
-postcard = { version = "1", default-features = false, features = ["use-std"] }
 rand = "0.10"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
