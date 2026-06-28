@@ -23,5 +23,19 @@ protoc \
   -I"$proto_dir" \
   "$proto_dir/wire.proto"
 
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+{
+  printf 'proto %s\n' "$(hash_file "$proto_dir/wire.proto")"
+  printf 'desc %s\n' "$(hash_file "$proto_dir/wire.desc")"
+} > "$proto_dir/wire.desc.sha256"
+
 echo "regenerated: $proto_dir/wire.desc"
-echo "commit storages/sqlite-storage/proto/wire.proto and storages/sqlite-storage/proto/wire.desc"
+echo "regenerated: $proto_dir/wire.desc.sha256"
+echo "commit storages/sqlite-storage/proto/wire.proto, wire.desc, and wire.desc.sha256"
