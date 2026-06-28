@@ -28,15 +28,17 @@ fn mutation_index_mac(m: &wa::SyncdMutation) -> Option<&[u8]> {
     m.record.as_option()?.index.as_option()?.blob.as_deref()
 }
 
-/// Unique index MACs of a patch's mutations, in first-seen order, feeding the
-/// batched previous-value-MAC backend lookup.
+/// Distinct index MACs of a patch's mutations, feeding the batched
+/// previous-value-MAC backend lookup. Both callers pass the result straight to a
+/// `get_mutation_macs` HashMap fetch, so the order is unspecified.
 ///
-/// Small patches use a cache-friendly linear scan (a HashSet measured 6-120%
-/// slower at small N here). Patches carry up to ~1000 mutations, where the
-/// scan's O(n²) compares dominate, so above [`MAC_DEDUP_SCAN_LIMIT`] dedup runs
-/// through a sort of position indices — O(n log n) with only a `Vec<u32>` of
-/// scratch, far cheaper than a `HashSet` of 32-byte MACs — then re-emits in
-/// first-seen order.
+/// Small patches dedup with a linear scan that allocates only the keepers,
+/// cheaper than a sort at small N. Larger patches decode each MAC once into the
+/// returned `Vec` and sort + dedup in place: the comparator works on the owned
+/// bytes, never re-walking the boxed record/index/blob `MessageField` chain (the
+/// part buffa makes pricier than prost's `Option` derefs), with no scratch
+/// beyond the returned `Vec`. Distinct indices are the realistic patch shape, so
+/// the pre-dedup `Vec` is essentially already unique.
 pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>> {
     if mutations.len() <= MAC_DEDUP_SCAN_LIMIT {
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
@@ -50,33 +52,18 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>
         return out;
     }
 
-    // Indices in `order` always carry a MAC, so the default branch is dead; it
-    // only keeps the lookup `unwrap`-free.
-    let mac_at = |i: u32| mutation_index_mac(&mutations[i as usize]).unwrap_or_default();
-
-    // Positions of mutations carrying a MAC, in first-seen order. Pre-sized to
-    // one allocation (the only scratch this path adds over the returned Vec).
-    let mut order: Vec<u32> = Vec::with_capacity(mutations.len());
-    order.extend(
-        mutations
-            .iter()
-            .enumerate()
-            .filter_map(|(i, m)| mutation_index_mac(m).map(|_| i as u32)),
-    );
-
-    // Group equal MACs (ties broken by position so each run's first occurrence
-    // leads it), drop all but each run's leader, then restore first-seen order.
-    order.sort_unstable_by(|&a, &b| mac_at(a).cmp(mac_at(b)).then(a.cmp(&b)));
-    order.dedup_by(|&mut a, &mut b| mac_at(a) == mac_at(b));
-    order.sort_unstable();
-
-    order.into_iter().map(|i| mac_at(i).to_vec()).collect()
+    let mut out: Vec<Vec<u8>> = mutations
+        .iter()
+        .filter_map(|m| mutation_index_mac(m).map(<[u8]>::to_vec))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
-/// Mutation count above which [`collect_unique_index_macs`] switches from the
-/// cache-friendly O(n²) linear scan to the O(n log n) index sort. Chosen well
-/// below the ~1000-mutation patch ceiling and above the small-N range where the
-/// scan beats sorting.
+/// Mutation count at or below which [`collect_unique_index_macs`] dedups with a
+/// linear scan instead of a sort; above it the sort wins despite allocating
+/// every MAC before deduping.
 const MAC_DEDUP_SCAN_LIMIT: usize = 64;
 
 fn lookup_app_state_key(
@@ -794,7 +781,7 @@ mod dedup_tests {
     }
 
     /// Builds `n` mutations whose index MACs repeat every `distinct` values, so
-    /// the expected output is the first `distinct` MACs in first-seen order.
+    /// the distinct set is the first `distinct` MACs.
     fn build(n: usize, distinct: usize) -> Vec<wa::SyncdMutation> {
         (0..n)
             .map(|i| {
@@ -815,38 +802,19 @@ mod dedup_tests {
         (0..distinct).map(mac_bytes).collect()
     }
 
-    /// Both dedup paths must yield identical first-seen-order unique results;
-    /// the index-sort path (large N) and scan path (small N) cannot diverge.
+    /// Dedups to the distinct index MACs across small and large N, dropping
+    /// repeats. Order is unspecified (callers feed a HashMap lookup), so compare
+    /// as sorted sets.
     #[test]
-    fn scan_and_sort_paths_agree() {
-        // Small N exercises the linear scan; large N (> limit) the index sort.
-        for &n in &[8usize, MAC_DEDUP_SCAN_LIMIT, MAC_DEDUP_SCAN_LIMIT + 1, 1000] {
+    fn dedups_to_distinct_macs() {
+        for &n in &[8usize, 64, 65, 1000] {
             let distinct = (n / 2).max(1);
-            assert_eq!(
-                collect_unique_index_macs(&build(n, distinct)),
-                expected(distinct),
-                "n = {n}"
-            );
+            let mut got = collect_unique_index_macs(&build(n, distinct));
+            got.sort_unstable();
+            let mut want = expected(distinct);
+            want.sort_unstable();
+            assert_eq!(got, want, "n = {n}");
         }
-    }
-
-    /// The index-sort path must re-emit in first-seen order, not byte-sort order.
-    /// Force that path (> limit MACs) with first appearances running opposite to
-    /// byte order, plus trailing duplicates that must be dropped — so a bug in
-    /// the order-restoration step can't pass by coinciding with the sort order.
-    #[test]
-    fn sort_path_restores_first_seen_order() {
-        let distinct = MAC_DEDUP_SCAN_LIMIT + 20;
-        // First-seen order is descending i; byte order is ascending (i < 256).
-        let mut mutations: Vec<wa::SyncdMutation> = (0..distinct)
-            .rev()
-            .map(|i| mutation(&mac_bytes(i)))
-            .collect();
-        for i in [distinct - 1, distinct / 2, 0] {
-            mutations.push(mutation(&mac_bytes(i)));
-        }
-        let want: Vec<Vec<u8>> = (0..distinct).rev().map(mac_bytes).collect();
-        assert_eq!(collect_unique_index_macs(&mutations), want);
     }
 
     #[test]
@@ -857,7 +825,8 @@ mod dedup_tests {
             mutation(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             mutation(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
         ];
-        let macs = collect_unique_index_macs(&mutations);
+        let mut macs = collect_unique_index_macs(&mutations);
+        macs.sort_unstable();
         assert_eq!(
             macs,
             vec![
