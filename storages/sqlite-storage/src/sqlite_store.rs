@@ -3957,6 +3957,92 @@ mod tests {
         );
     }
 
+    // The migration strategy is self-healing: a row that no longer decodes (an old
+    // bincode blob or genuine corruption) must read back as ABSENT, never an error,
+    // so the sync path re-requests the key / re-syncs the collection from scratch.
+    #[tokio::test]
+    async fn undecodable_blobs_self_heal_to_absent() {
+        use diesel::sql_query;
+        use wacore::appstate::hash::HashState;
+        use wacore::store::traits::AppStateSyncKey;
+
+        let store = create_test_store().await;
+        let device_id = store.device_id;
+
+        // A valid sync key reads back normally.
+        let key_id = b"key-id-1".to_vec();
+        store
+            .set_app_state_sync_key_for_device(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: vec![7u8; 32],
+                    fingerprint: vec![1, 2, 3],
+                    timestamp: 42,
+                },
+                device_id,
+            )
+            .await
+            .expect("set key");
+        assert!(
+            store
+                .get_app_state_sync_key_for_device(&key_id, device_id)
+                .await
+                .expect("get key")
+                .is_some()
+        );
+
+        // Garbage in the blob column -> treated as absent (so it gets re-requested),
+        // not a decode error bubbling up.
+        store
+            .with_retry("corrupt_key", || {
+                Box::new(|conn| {
+                    sql_query("UPDATE app_state_keys SET key_data = X'00ff00ff'")
+                        .execute(conn)
+                        .map(|_| ())
+                })
+            })
+            .await
+            .expect("corrupt key blob");
+        assert!(
+            store
+                .get_app_state_sync_key_for_device(&key_id, device_id)
+                .await
+                .expect("get corrupted key must not error")
+                .is_none(),
+            "an undecodable sync-key blob must read back as absent"
+        );
+
+        // A garbage app-state version blob resets to default (version 0) so the
+        // collection re-syncs from scratch instead of erroring.
+        let name = "critical_block";
+        let state = HashState {
+            version: 9,
+            ..HashState::default()
+        };
+        store
+            .set_app_state_version_for_device(name, state, device_id)
+            .await
+            .expect("set version");
+        store
+            .with_retry("corrupt_version", || {
+                Box::new(|conn| {
+                    sql_query("UPDATE app_state_versions SET state_data = X'00ff00ff'")
+                        .execute(conn)
+                        .map(|_| ())
+                })
+            })
+            .await
+            .expect("corrupt version blob");
+        let healed = store
+            .get_app_state_version_for_device(name, device_id)
+            .await
+            .expect("get corrupted version must not error");
+        assert_eq!(
+            healed.version, 0,
+            "an undecodable version blob must reset to default"
+        );
+    }
+
     #[tokio::test]
     async fn group_metadata_round_trip_sqlite() {
         use wacore::store::traits::ProtocolStore;
