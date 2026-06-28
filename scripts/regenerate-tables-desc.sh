@@ -32,9 +32,13 @@ hash_file() {
   fi
 }
 
+# Compute into vars first so `set -e` aborts on a hashing failure rather than
+# writing a bogus (empty-hash) .sha256 from a command-substitution in printf.
+proto_sha="$(hash_file "$proto_dir/tables.proto")"
+desc_sha="$(hash_file "$proto_dir/tables.desc")"
 {
-  printf 'proto %s\n' "$(hash_file "$proto_dir/tables.proto")"
-  printf 'desc %s\n' "$(hash_file "$proto_dir/tables.desc")"
+  printf 'proto %s\n' "$proto_sha"
+  printf 'desc %s\n' "$desc_sha"
 } > "$proto_dir/tables.desc.sha256"
 
 echo "regenerated: $proto_dir/tables.desc"

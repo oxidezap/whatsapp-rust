@@ -1,0 +1,7 @@
+# Proto sources are sha256-hashed by the build.rs descriptor-freshness guards
+# (waproto, sqlite-storage wire, wacore voip tables). Force LF so a CRLF checkout
+# (Windows core.autocrlf=true) can't change the hash and trip a false "stale
+# descriptor" build error. The committed descriptors are binary.
+*.proto text eol=lf
+*.desc binary
+*.desc.sha256 text eol=lf
