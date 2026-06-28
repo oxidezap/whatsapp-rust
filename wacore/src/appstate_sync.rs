@@ -422,6 +422,15 @@ impl AppStateProcessor {
                 });
                 return Ok((new_mutations, state, pl));
             }
+            // Reached here with an empty baseline and no snapshot applied (a snapshot
+            // would have advanced the version off 0): a genesis patch (v1), or no
+            // patches. Any mutation MACs still on disk are from a prior, now-reset
+            // state -- e.g. a version blob that no longer decoded and reset to 0 -- so
+            // wipe them before the genesis patch runs, or its ltHash would be anchored
+            // to stale index->value entries (REMOVE/overwrite lookups would subtract
+            // MACs that aren't part of this fresh baseline). The snapshot branch above
+            // already clears for the snapshot path.
+            self.backend.clear_mutation_macs(collection_name).await?;
         }
 
         // Snapshot the key cache once for all patches (prefetch_keys already populated
@@ -584,6 +593,25 @@ impl AppStateProcessor {
             }
         }
         Ok(missing)
+    }
+
+    /// Inline the patch list's external blobs, then report which referenced decode keys
+    /// are absent. Inlining first is load-bearing: the SNAPSHOT's `key_id` lives inside
+    /// its external blob, so [`get_missing_key_ids`] alone (called before download)
+    /// can't see it and would miss the snapshot's key — letting processing later abort
+    /// with `KeyNotFound`. Used by the sync paths to request missing keys up front.
+    /// Idempotent: `download_external_blobs` no-ops once the blobs are inlined, and the
+    /// supplied `download` closure should read from the already-prefetched cache.
+    pub async fn missing_key_ids_after_inline<FDownload>(
+        &self,
+        pl: &mut PatchList,
+        download: &FDownload,
+    ) -> Result<Vec<Vec<u8>>>
+    where
+        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>>,
+    {
+        download_external_blobs(pl, download)?;
+        self.get_missing_key_ids(pl).await
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_collection", level = "debug", skip_all, fields(name = ?name), err(Debug)))]

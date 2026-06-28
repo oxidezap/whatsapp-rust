@@ -865,4 +865,118 @@ mod tests {
         );
         assert!(matches!(pl.error, Some(CollectionSyncError::Retry { .. })));
     }
+
+    // Companion to snapshot_resync_drops_stale_mutation_macs: a collection whose
+    // version blob reset to 0 (e.g. an old bincode row that no longer decodes) keeps
+    // its pre-reset mutation MACs on disk. When the v0 resync arrives as a genesis
+    // patch (v1) WITHOUT a snapshot, those stale MACs must be wiped before the patch
+    // runs, or its ltHash anchors to index->value entries that aren't part of the
+    // fresh baseline.
+    #[tokio::test]
+    async fn genesis_patch_on_reset_collection_drops_stale_mutation_macs() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let name = WAPatchName::Regular;
+
+        // Reset collection: version 0 / empty hash, but stale MACs still present.
+        backend
+            .set_version(name.as_str(), HashState::default())
+            .await
+            .unwrap();
+        let stale_index_mac = vec![0xAB; 32];
+        backend
+            .put_mutation_macs(
+                name.as_str(),
+                7,
+                &[AppStateMutationMAC {
+                    index_mac: stale_index_mac.clone(),
+                    value_mac: vec![0xCD; 32],
+                }],
+            )
+            .await
+            .unwrap();
+
+        // A genesis patch (v1) served without a snapshot.
+        let patch_list = PatchList {
+            name,
+            has_more_patches: false,
+            patches: vec![wa::SyncdPatch {
+                version: Some(wa::SyncdVersion { version: Some(1) }),
+                ..Default::default()
+            }],
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+
+        processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("genesis patch onto a reset collection should process");
+
+        assert_eq!(
+            backend
+                .get_mutation_mac(name.as_str(), &stale_index_mac)
+                .await
+                .unwrap(),
+            None,
+            "a genesis-patch resync onto a reset collection must clear the stale pre-reset MACs"
+        );
+    }
+
+    // The SNAPSHOT's key_id lives INSIDE its external blob, so get_missing_key_ids on
+    // the un-inlined list can't see it. missing_key_ids_after_inline must download and
+    // inline the blob first, so an absent snapshot key is requested up front instead of
+    // aborting mid-process with KeyNotFound (the regression a paired companion hit when
+    // its snapshot key was absent after the bincode->prost reset).
+    #[tokio::test]
+    async fn missing_key_ids_after_inline_sees_external_snapshot_key() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+
+        let snapshot_key_id = b"snapshot-key-xyz".to_vec();
+        let snapshot_bytes = wa::SyncdSnapshot {
+            key_id: Some(wa::KeyId {
+                id: Some(snapshot_key_id.clone()),
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let direct_path = "/snapshot/blob".to_string();
+
+        let mut pl = PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches: vec![],
+            snapshot: None,
+            snapshot_ref: Some(wa::ExternalBlobReference {
+                direct_path: Some(direct_path),
+                ..Default::default()
+            }),
+            error: None,
+        };
+
+        let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<Vec<u8>> {
+            Ok(snapshot_bytes.clone())
+        };
+
+        // Before inlining, the external snapshot's key is invisible.
+        assert!(
+            processor.get_missing_key_ids(&pl).await.unwrap().is_empty(),
+            "the snapshot key is inside the un-downloaded blob, so it can't be seen yet"
+        );
+
+        // After inlining, the absent snapshot key is reported so it gets requested.
+        let missing = processor
+            .missing_key_ids_after_inline(&mut pl, &download)
+            .await
+            .unwrap();
+        assert_eq!(
+            missing,
+            vec![snapshot_key_id],
+            "the snapshot's key must be requestable after inlining the blob"
+        );
+    }
 }

@@ -173,6 +173,10 @@ impl Client {
         use wacore::appstate::patch_decode::CollectionSyncError;
         const MAX_ITERATIONS: usize = 5;
         let mut iteration = 0;
+        // Set once we've requested missing decode keys this cycle, so the immediate
+        // refetch doesn't re-request; reset after a page decodes so a later iteration
+        // referencing a different rotated key can repair again.
+        let mut requested_keys = false;
 
         while !pending.is_empty() && iteration < MAX_ITERATIONS {
             iteration += 1;
@@ -224,7 +228,10 @@ impl Client {
 
             // Parse the response once here for pre-download; the same parsed
             // lists are handed to the processor below (no second parse).
-            let patch_lists = wacore::appstate::patch_decode::parse_patch_lists_ref(resp.get())?;
+            let mut patch_lists =
+                wacore::appstate::patch_decode::parse_patch_lists_ref(resp.get())?;
+
+            let proc = self.get_app_state_processor().await;
             {
                 for pl in &patch_lists {
                     // Download external snapshot
@@ -282,11 +289,34 @@ impl Client {
                 }
             };
 
-            // Process the already-parsed collections (no re-parse of the response).
-            let proc = self.get_app_state_processor().await;
+            // Request any missing decode keys before processing. Inline each list's
+            // external blobs first so the SNAPSHOT's key_id (which lives inside the blob,
+            // not the patch metadata) is visible -- otherwise process_patch_lists aborts
+            // with KeyNotFound on the snapshot key before the post-process request runs.
+            // Request once, wait briefly for the re-share, then refetch. Only wait when a
+            // fresh request actually went out (the dedup may suppress it).
+            if !requested_keys {
+                let mut missing_all: Vec<Vec<u8>> = Vec::new();
+                for pl in &mut patch_lists {
+                    if let Ok(m) = proc.missing_key_ids_after_inline(pl, &download).await {
+                        missing_all.extend(m);
+                    }
+                }
+                if !missing_all.is_empty() {
+                    requested_keys = true;
+                    if self.request_keys_and_wait(missing_all).await {
+                        continue;
+                    }
+                }
+            }
+
+            // Process the already-parsed (and inlined) collections.
             let results = proc
                 .process_patch_lists(patch_lists, &download, true)
                 .await?;
+            // A page decoded, so its keys were present; let a later iteration repair a
+            // different rotated key.
+            requested_keys = false;
 
             let mut needs_refetch = Vec::new();
 
@@ -442,18 +472,19 @@ impl Client {
 
             let _decode_start = wacore::time::Instant::now();
 
-            // Pre-download all external blobs (snapshot and patch mutations)
-            // We use directPath as the key to identify each blob
+            // Parse the response once here; the same parsed list is handed to the
+            // processor below (no second parse).
+            let mut pl = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get())?;
+            debug!(target: "Client/AppState", "Parsed patch list for {:?}: has_snapshot_ref={} has_more_patches={} patches_count={}",
+                name, pl.snapshot_ref.is_some(), pl.has_more_patches, pl.patches.len());
+
+            let proc = self.get_app_state_processor().await;
+
+            // Pre-download all external blobs (snapshot and patch mutations); keyed by
+            // directPath.
             let mut pre_downloaded: std::collections::HashMap<String, Vec<u8>> =
                 std::collections::HashMap::new();
-
-            // Parse the response once here for pre-download; the same parsed list
-            // is handed to the processor below (no second parse).
-            let pl = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get())?;
             {
-                debug!(target: "Client/AppState", "Parsed patch list for {:?}: has_snapshot_ref={} has_more_patches={} patches_count={}",
-                    name, pl.snapshot_ref.is_some(), pl.has_more_patches, pl.patches.len());
-
                 // Download external snapshot if present
                 if let Some(ext) = &pl.snapshot_ref
                     && let Some(path) = &ext.direct_path
@@ -507,27 +538,17 @@ impl Client {
                 }
             };
 
-            let proc = self.get_app_state_processor().await;
-
-            // Keys needed to decode this batch may be absent (e.g. an old bincode
-            // row that no longer decodes). The processor fails on a missing key
-            // before the post-process request path below runs, so request them up
-            // front (once), wait briefly for the primary to re-share, then re-fetch.
-            // Only wait when we actually sent a fresh request: if the per-key dedup
-            // suppressed it (already asked within its window), no new re-share is
-            // coming from us, so stalling the batch 10s would be pointless -- fall
-            // through and let the missing key fail this page; the collection
-            // re-syncs on a later attempt once the earlier request's share lands.
+            // Request any missing decode keys before processing. Inline the blobs first
+            // so the SNAPSHOT's key_id (inside its external blob, not the patch metadata)
+            // is visible -- otherwise process aborts with KeyNotFound on the snapshot key
+            // before the post-process request runs. Request once, wait briefly for the
+            // re-share, then refetch (only when a fresh request actually went out).
             if !requested_missing_keys
-                && let Ok(missing) = proc.get_missing_key_ids(&pl).await
+                && let Ok(missing) = proc.missing_key_ids_after_inline(&mut pl, &download).await
                 && !missing.is_empty()
             {
                 requested_missing_keys = true;
-                let count = missing.len();
-                let listener = self.initial_keys_synced_notifier.listen();
-                if self.request_missing_keys_with_dedup(missing).await {
-                    debug!(target: "Client/AppState", "Requested {count} missing app-state key(s) for {:?}; waiting up to 10s before retrying", name);
-                    let _ = rt_timeout(&*self.runtime, Duration::from_secs(10), listener).await;
+                if self.request_keys_and_wait(missing).await {
                     continue;
                 }
             }
@@ -568,6 +589,25 @@ impl Client {
 
         debug!(target: "Client/AppState", "Completed and saved app state sync for {:?} (final version={})", name, state.version);
         Ok(())
+    }
+
+    /// Shared missing-key repair step for both sync paths: request the given keys and,
+    /// only if a fresh request actually went out (the per-key dedup didn't suppress it),
+    /// wait briefly for the primary to re-share. Returns true iff the caller should
+    /// refetch (a request was sent and we waited); false means nothing was requested
+    /// (empty or deduped), so the caller proceeds without stalling.
+    async fn request_keys_and_wait(&self, missing: Vec<Vec<u8>>) -> bool {
+        if missing.is_empty() {
+            return false;
+        }
+        let count = missing.len();
+        let listener = self.initial_keys_synced_notifier.listen();
+        if self.request_missing_keys_with_dedup(missing).await {
+            debug!(target: "Client/AppState", "Requested {count} missing app-state key(s) before processing; waiting up to 10s before refetch");
+            let _ = rt_timeout(&*self.runtime, Duration::from_secs(10), listener).await;
+            return true;
+        }
+        false
     }
 
     /// Request missing app-state keys with dedup stamps.
@@ -615,8 +655,13 @@ impl Client {
             return Ok(());
         }
         let device_snapshot = self.persistence_manager.get_device_snapshot();
+        // Address the request to the PRIMARY (device 0), not our own device JID: this is
+        // a peer message and `device_snapshot.pn` carries OUR device number, so sending
+        // it as-is encrypts to ourselves (no self-session exists) and fails with
+        // "session ... not found". The primary is the app-state key source and we hold a
+        // session with it from pairing. Mirrors whatsmeow's `ownID.ToNonAD()`.
         let own_jid = match device_snapshot.pn.clone() {
-            Some(j) => j,
+            Some(j) => j.to_non_ad(),
             None => {
                 return Err(anyhow::anyhow!(
                     "no own JID available for app-state key request"
