@@ -513,6 +513,11 @@ impl Client {
             // row that no longer decodes). The processor fails on a missing key
             // before the post-process request path below runs, so request them up
             // front (once), wait briefly for the primary to re-share, then re-fetch.
+            // Only wait when we actually sent a fresh request: if the per-key dedup
+            // suppressed it (already asked within its window), no new re-share is
+            // coming from us, so stalling the batch 10s would be pointless -- fall
+            // through and let the missing key fail this page; the collection
+            // re-syncs on a later attempt once the earlier request's share lands.
             if !requested_missing_keys
                 && let Ok(missing) = proc.get_missing_key_ids(&pl).await
                 && !missing.is_empty()
@@ -520,10 +525,11 @@ impl Client {
                 requested_missing_keys = true;
                 let count = missing.len();
                 let listener = self.initial_keys_synced_notifier.listen();
-                self.request_missing_keys_with_dedup(missing).await;
-                debug!(target: "Client/AppState", "Requested {count} missing app-state key(s) for {:?}; waiting up to 10s before retrying", name);
-                let _ = rt_timeout(&*self.runtime, Duration::from_secs(10), listener).await;
-                continue;
+                if self.request_missing_keys_with_dedup(missing).await {
+                    debug!(target: "Client/AppState", "Requested {count} missing app-state key(s) for {:?}; waiting up to 10s before retrying", name);
+                    let _ = rt_timeout(&*self.runtime, Duration::from_secs(10), listener).await;
+                    continue;
+                }
             }
 
             let (mutations, new_state, list) =
@@ -566,9 +572,12 @@ impl Client {
 
     /// Request missing app-state keys with dedup stamps.
     /// On send failure, removes stamps so keys can be retried next sync.
-    async fn request_missing_keys_with_dedup(&self, missing: Vec<Vec<u8>>) {
+    /// Returns true iff a fresh key request was actually sent (some ids passed the
+    /// per-key dedup and the send succeeded), so the caller knows whether a re-share
+    /// is plausibly inbound and worth waiting for.
+    async fn request_missing_keys_with_dedup(&self, missing: Vec<Vec<u8>>) -> bool {
         if missing.is_empty() {
-            return;
+            return false;
         }
         let mut to_request: Vec<Vec<u8>> = Vec::with_capacity(missing.len());
         let mut guard = self.app_state_key_requests.lock().await;
@@ -586,15 +595,18 @@ impl Client {
         }
         guard.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(24 * 3600));
         drop(guard);
-        if !to_request.is_empty()
-            && let Err(e) = self.request_app_state_keys(&to_request).await
-        {
+        if to_request.is_empty() {
+            return false;
+        }
+        if let Err(e) = self.request_app_state_keys(&to_request).await {
             warn!("Failed to send app state key request: {e}");
             let mut guard = self.app_state_key_requests.lock().await;
             for key_id in &to_request {
                 guard.remove(&hex::encode(key_id));
             }
+            return false;
         }
+        true
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.request_keys", level = "debug", skip_all, fields(count = raw_key_ids.len()), err(Debug)))]
