@@ -16,7 +16,7 @@
 
 use crate::client::Client;
 use crate::types::message::MessageInfo;
-use buffa::MessageView;
+use buffa::Message;
 use log::{debug, info, warn};
 use std::sync::Arc;
 use wacore::types::message::{
@@ -333,7 +333,11 @@ impl Client {
             return;
         };
 
-        let web_msg_info = match wa::WebMessageInfoView::decode_view(web_message_info_bytes) {
+        // Owned decode (not a view): WebMessageInfo carries a nested `message`
+        // (a full Message), so an eager view would pull the entire MessageView
+        // tree into the binary and parse the message once into a view only to
+        // copy it again into the owned form. Owned decode reads it in one pass.
+        let mut web_msg_info = match wa::WebMessageInfo::decode_from_slice(web_message_info_bytes) {
             Ok(info) => info,
             Err(e) => {
                 warn!("Failed to decode WebMessageInfo from PDO response: {:?}", e);
@@ -345,8 +349,8 @@ impl Client {
             warn!("PDO response WebMessageInfo missing key");
             return;
         };
-        let remote_jid_str = key.remote_jid.unwrap_or("");
-        let msg_id = key.id.unwrap_or("");
+        let remote_jid_str = key.remote_jid.as_deref().unwrap_or("");
+        let msg_id = key.id.as_deref().unwrap_or("");
 
         let cache_key = match remote_jid_str.parse::<Jid>() {
             Ok(jid) => ChatMessageId::new(jid, msg_id.to_owned()),
@@ -374,10 +378,7 @@ impl Client {
         let mut message_info = if let Some(pending) = pending {
             pending.message_info
         } else {
-            match self
-                .message_info_from_web_message_info_view(&web_msg_info)
-                .await
-            {
+            match self.message_info_from_web_message_info(&web_msg_info).await {
                 Ok(info) => Arc::new(info),
                 Err(e) => {
                     warn!(
@@ -389,14 +390,10 @@ impl Client {
             }
         };
 
-        let Some(message_view) = web_msg_info.message.as_option() else {
+        let Some(message) = web_msg_info.message.take() else {
             // Expected when the phone could not decrypt the message either;
             // WA Web only counts this outcome in telemetry, with no warning.
             info!("PDO response WebMessageInfo missing message content");
-            return;
-        };
-        let Ok(message) = message_view.to_owned_message() else {
-            info!("PDO response WebMessageInfo message failed to decode");
             return;
         };
 
@@ -430,7 +427,6 @@ impl Client {
 
     /// Reconstructs a MessageInfo from a WebMessageInfo.
     /// This is used when we receive a PDO response but don't have the original pending request cached.
-    #[cfg(test)]
     async fn message_info_from_web_message_info(
         &self,
         web_msg: &wa::WebMessageInfo,
@@ -446,25 +442,6 @@ impl Client {
             key.participant.as_deref(),
             web_msg.message_timestamp,
             web_msg.push_name.as_deref(),
-        )
-        .await
-    }
-
-    async fn message_info_from_web_message_info_view(
-        &self,
-        web_msg: &wa::WebMessageInfoView<'_>,
-    ) -> Result<MessageInfo, anyhow::Error> {
-        let Some(key) = web_msg.key.as_option() else {
-            anyhow::bail!("WebMessageInfo missing key");
-        };
-
-        self.message_info_from_web_message_parts(
-            key.remote_jid,
-            key.from_me,
-            key.id,
-            key.participant,
-            web_msg.message_timestamp,
-            web_msg.push_name,
         )
         .await
     }
@@ -724,7 +701,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconstruct_from_web_message_info_view() {
-        use buffa::{Message as _, MessageView as _};
+        use buffa::Message as _;
         use waproto::whatsapp as wa;
 
         let client = setup_reconstruct_client().await;
@@ -738,10 +715,10 @@ mod tests {
         web_msg.push_name = Some("Recovered Sender".to_string());
         web_msg.message_timestamp = Some(1_700_000_000);
         let encoded = web_msg.encode_to_vec();
-        let view = wa::WebMessageInfoView::decode_view(&encoded).expect("view should decode");
+        let decoded = wa::WebMessageInfo::decode_from_slice(&encoded).expect("should decode");
 
         let info = client
-            .message_info_from_web_message_info_view(&view)
+            .message_info_from_web_message_info(&decoded)
             .await
             .unwrap();
 

@@ -1,7 +1,7 @@
 use crate::AppStateError;
 use crate::hash::{generate_content_mac, validate_index_mac};
 use crate::keys::ExpandedAppStateKeys;
-use buffa::MessageView;
+use buffa::Message;
 use wacore_libsignal::crypto::aes_256_cbc_decrypt_into;
 use waproto::whatsapp as wa;
 
@@ -76,7 +76,10 @@ pub fn decode_record(
     aes_256_cbc_decrypt_into(ciphertext, &keys.value_encryption, iv, &mut plaintext)
         .map_err(|_| AppStateError::DecryptionFailed)?;
 
-    let action = wa::SyncActionDataView::decode_view(plaintext.as_slice())
+    // Owned decode (not a view): the `value` sub-message is needed owned, so a
+    // view would parse it once into a view and copy it again into the owned
+    // form — two passes over the largest field. Owned decode does it in one.
+    let action = wa::SyncActionData::decode_from_slice(plaintext.as_slice())
         .map_err(|_| AppStateError::DecodeFailed)?;
 
     // WA Web (syncdDecryptMutation) computes the index MAC unconditionally over the
@@ -88,11 +91,11 @@ pub fn decode_record(
             .as_option()
             .and_then(|i| i.blob.as_ref())
             .ok_or(AppStateError::MissingIndexMAC)?;
-        validate_index_mac(action.index.unwrap_or(&[]), stored, &keys.index)?;
+        validate_index_mac(action.index.as_deref().unwrap_or(&[]), stored, &keys.index)?;
     }
 
     let mut index_list: Vec<String> = Vec::new();
-    if let Some(idx_bytes) = action.index
+    if let Some(idx_bytes) = action.index.as_deref()
         && let Ok(parsed) = serde_json::from_slice::<Vec<String>>(idx_bytes)
     {
         index_list = parsed;
@@ -107,12 +110,7 @@ pub fn decode_record(
         .ok_or(AppStateError::MissingIndexMAC)?;
     Ok((
         Mutation {
-            action_value: action
-                .value
-                .as_option()
-                .map(MessageView::to_owned_message)
-                .transpose()
-                .map_err(|_| AppStateError::DecodeFailed)?,
+            action_value: action.value.into_option(),
             index: index_list,
             operation,
         },
