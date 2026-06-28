@@ -544,10 +544,10 @@ pub fn unwrap_device_sent(mut msg: wa::Message) -> wa::Message {
     if let Some(mut dsm) = msg.device_sent_message.take() {
         if let Some(mut inner) = dsm.message.take() {
             inner.message_context_info = crate::proto_helpers::merge_dsm_context(
-                inner.message_context_info.take().map(Box::new),
+                inner.message_context_info.take(),
                 msg.message_context_info.as_option(),
             )
-            .map(|b| buffa::MessageField::some(*b))
+            .map(buffa::MessageField::some)
             .unwrap_or_default();
             return inner;
         }
