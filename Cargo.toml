@@ -12,6 +12,7 @@ description = "Rust client for WhatsApp Web"
 [workspace]
 members = [
     ".",
+    "examples/voip-cli",
     "http_clients/ureq-client",
     "storages/sqlite-storage",
     "tests/bench-integration",
@@ -76,7 +77,6 @@ itoa = "1"
 log = "0.4"
 metrics = "0.24"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
-postcard = { version = "1", default-features = false, features = ["use-std"] }
 prost = { version = "0.14.4", default-features = false, features = ["std"] }
 prost-build = { version = "0.14.4", default-features = false }
 prost-types = { version = "0.14.4", default-features = false, features = ["std"] }
@@ -202,19 +202,11 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 aes = { workspace = true }
 async-trait = { workspace = true }
 cbc = { workspace = true, features = ["block-padding"] }
-# Cross-platform audio I/O for the `voip` example only. A dev-dependency, so it
-# never reaches consumers of the published lib (and only compiles when an example
-# that uses it is built). Needs libasound2-dev (ALSA) on Linux.
-cpal = "0.18"
 env_logger = { workspace = true }
 flate2 = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
 metrics-exporter-prometheus = "0.18"
-# Lock-free SPSC ring to hand samples from the async drain task to cpal's
-# realtime output callback without locking or per-callback allocation. voip
-# example only (dev-dependency).
-ringbuf = "0.5"
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -243,10 +235,6 @@ required-features = ["tracing"]
 [[example]]
 name = "metrics"
 required-features = ["metrics"]
-
-[[example]]
-name = "voip"
-required-features = ["voip", "sqlite-storage", "tokio-transport", "ureq-client", "tokio-native"]
 
 [profile.release]
 opt-level = 3

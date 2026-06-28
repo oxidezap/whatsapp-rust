@@ -1163,7 +1163,6 @@ dependencies = [
  "futures",
  "hex",
  "log",
- "prost",
  "tokio",
  "uuid",
  "wacore",
@@ -4243,7 +4242,6 @@ dependencies = [
  "bytes",
  "cbc 0.2.1",
  "chrono",
- "cpal",
  "env_logger",
  "event-listener",
  "flate2",
@@ -4259,7 +4257,6 @@ dependencies = [
  "portable-atomic",
  "prost",
  "rand 0.10.1",
- "ringbuf",
  "rustls",
  "scopeguard",
  "serde",
@@ -4329,6 +4326,24 @@ dependencies = [
  "tokio",
  "ureq",
  "wacore",
+]
+
+[[package]]
+name = "whatsapp-rust-voip-cli"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "cpal",
+ "env_logger",
+ "hex",
+ "log",
+ "portable-atomic",
+ "rand 0.10.1",
+ "ringbuf",
+ "tokio",
+ "wacore",
+ "whatsapp-rust",
 ]
 
 [[package]]

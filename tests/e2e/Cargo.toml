@@ -39,7 +39,6 @@ whatsapp-rust-ureq-http-client = { path = "../../http_clients/ureq-client", feat
 env_logger = { workspace = true }
 hex = { workspace = true }
 log = { workspace = true }
-prost = { workspace = true }
 
 [lints]
 workspace = true
