@@ -410,7 +410,8 @@ dependencies = [
 [[package]]
 name = "buffa"
 version = "0.8.0"
-source = "git+https://github.com/anthropics/buffa?tag=v0.8.0#3e72fbb1ef8a7b0f84e6ea0409038c7996a92450"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f5f4b9af6f6e0cd7ce5d0bc30fd28e64e3582c76e25c374a3d37d21501702a2"
 dependencies = [
  "base64",
  "bytes",
@@ -427,7 +428,8 @@ dependencies = [
 [[package]]
 name = "buffa-build"
 version = "0.8.0"
-source = "git+https://github.com/anthropics/buffa?tag=v0.8.0#3e72fbb1ef8a7b0f84e6ea0409038c7996a92450"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd40e2a8f692db728974e24de6e536c0529dc537b2130fc63002b91d17df9331"
 dependencies = [
  "buffa",
  "buffa-codegen",
@@ -437,7 +439,8 @@ dependencies = [
 [[package]]
 name = "buffa-codegen"
 version = "0.8.0"
-source = "git+https://github.com/anthropics/buffa?tag=v0.8.0#3e72fbb1ef8a7b0f84e6ea0409038c7996a92450"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89936eae12df4511c9201033c262ed9cae902d4f7cddbbb329348346603474d8"
 dependencies = [
  "buffa",
  "buffa-descriptor",
@@ -451,7 +454,8 @@ dependencies = [
 [[package]]
 name = "buffa-descriptor"
 version = "0.8.0"
-source = "git+https://github.com/anthropics/buffa?tag=v0.8.0#3e72fbb1ef8a7b0f84e6ea0409038c7996a92450"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25ece5cac7e437c6084948d3fd63e9b911b3d864e3de82725d2790095a95a393"
 dependencies = [
  "buffa",
  "rustversion",
@@ -4312,6 +4316,7 @@ dependencies = [
  "log",
  "portable-atomic",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "wacore",
 ]

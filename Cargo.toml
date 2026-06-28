@@ -61,9 +61,9 @@ base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 # upstream release instead of the fork. Pinned by `tag` for reproducibility;
 # the generated crypto serialization can't shift under us without a deliberate
 # version bump here.
-buffa = { git = "https://github.com/anthropics/buffa", tag = "v0.8.0", default-features = false, features = ["json"] }
-buffa-build = { git = "https://github.com/anthropics/buffa", tag = "v0.8.0", default-features = false }
-buffa-descriptor = { git = "https://github.com/anthropics/buffa", tag = "v0.8.0", default-features = false }
+buffa = { version = "0.8.0", default-features = false, features = ["json"] }
+buffa-build = { version = "0.8.0", default-features = false }
+buffa-descriptor = { version = "0.8.0", default-features = false }
 bytemuck = { version = "1.25", default-features = false }
 bytes = { version = "1.12", default-features = false }
 cbc = { version = "0.2", features = ["alloc"] }
