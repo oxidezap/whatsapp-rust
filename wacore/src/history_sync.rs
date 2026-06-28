@@ -1653,11 +1653,11 @@ mod tests {
         }
     }
 
-    /// Differential corpus: every structurally interesting shape, prost-built
+    /// Differential corpus: every structurally interesting shape, buffa-built
     /// and hand-crafted, must extract identically through the fast path and
-    /// the prost oracle.
+    /// the full-decode oracle.
     #[test]
-    fn differential_fast_path_matches_prost_oracle() {
+    fn differential_fast_path_matches_full_decode_oracle() {
         let emit = emit_len_field;
         let secret = vec![0x5Au8; 32];
         let mut corpus: Vec<(String, Vec<u8>)> = Vec::new();
@@ -2867,9 +2867,9 @@ mod tests {
     }
 
     /// Collecting `next_conversation()` + `remainder()` and stitching them back
-    /// together must equal one full prost decode of the decompressed blob.
+    /// together must equal one full decode of the decompressed blob.
     #[test]
-    fn stream_parity_with_full_prost_decode() {
+    fn stream_parity_with_full_decode() {
         let own = "5511000000000";
         let hs = parity_fixture(own);
         let compressed = encode_and_compress(&hs);

@@ -57,10 +57,10 @@ async-channel = { version = "2.5.0", default-features = false, features = ["std"
 async-lock = { version = "3", default-features = false }
 async-trait = "0.1.89"
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-# oneof_attribute (#167) is upstream as of v0.8.0, so we track the tagged
-# upstream release instead of the fork. Pinned by `tag` for reproducibility;
-# the generated crypto serialization can't shift under us without a deliberate
-# version bump here.
+# oneof_attribute (#167) is upstream as of v0.8.0, so we use the crates.io
+# release instead of the git fork. The caret `0.8.0` accepts any 0.8.x patch;
+# in-repo builds stay reproducible via the committed Cargo.lock (the persisted
+# wire format keys on proto field numbers, not the codegen patch version).
 buffa = { version = "0.8.0", default-features = false, features = ["json"] }
 buffa-build = { version = "0.8.0", default-features = false }
 buffa-descriptor = { version = "0.8.0", default-features = false }
