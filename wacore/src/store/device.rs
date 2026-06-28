@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
-/// Protobuf-bytes serde for `ADVSignedDeviceIdentity` (prost types lack `Deserialize`).
+/// Protobuf-bytes serde for `ADVSignedDeviceIdentity` (the generated types lack `Deserialize`).
 pub mod account_serde {
     use buffa::Message;
     use waproto::whatsapp as wa;
