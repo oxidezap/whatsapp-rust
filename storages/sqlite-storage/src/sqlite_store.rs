@@ -3957,42 +3957,149 @@ mod tests {
         );
     }
 
-    // The migration strategy is self-healing: a row that no longer decodes (an old
-    // bincode blob or genuine corruption) must read back as ABSENT, never an error,
-    // so the sync path re-requests the key / re-syncs the collection from scratch.
+    // The migration strategy is self-healing with NO migration: rows written by the
+    // old `bincode` codec can't decode as the new protobuf wire format, so the store
+    // must read them back as ABSENT (never an error) -- then the sync path re-requests
+    // the key / re-syncs the collection, and the protobuf setters overwrite the row.
     #[tokio::test]
-    async fn undecodable_blobs_self_heal_to_absent() {
-        use diesel::sql_query;
+    async fn legacy_bincode_blobs_self_heal_then_overwrite() {
+        use diesel::{ExpressionMethods, RunQueryDsl, sql_query};
         use wacore::appstate::hash::HashState;
         use wacore::store::traits::AppStateSyncKey;
+
+        // Exact bytes `bincode` 2.0.1 (config::standard, via serde) produced for these
+        // domain structs before the migration, captured with the real codec. They must
+        // not parse as the protobuf wire format.
+        // AppStateSyncKey { key_data: [0x11;32], fingerprint: [aa bb cc dd], timestamp: 1_700_000_000 }.
+        let legacy_sync_key = {
+            let mut v = vec![0x20u8]; // bincode varint len 32
+            v.extend([0x11u8; 32]);
+            v.extend([0x04, 0xaa, 0xbb, 0xcc, 0xdd, 0xfc, 0x00, 0xe2, 0xa7, 0xca]);
+            v
+        };
+        // HashState { version: 7, hash: [de ad 00..00 be], index_value_map: {} }.
+        let legacy_hash_state = {
+            let mut v = vec![0x07u8]; // version varint 7
+            v.push(0xde);
+            v.push(0xad);
+            v.extend([0u8; 125]);
+            v.push(0xbe);
+            v.push(0x00); // empty map
+            v
+        };
 
         let store = create_test_store().await;
         let device_id = store.device_id;
 
-        // A valid sync key reads back normally.
-        let key_id = b"key-id-1".to_vec();
+        // Insert the legacy rows directly (bypassing the protobuf setters), exactly as
+        // an upgraded DB would already hold them.
+        let key_id = b"legacy-key".to_vec();
+        {
+            let kid = key_id.clone();
+            let blob = legacy_sync_key.clone();
+            store
+                .with_retry("insert_legacy_key", move || {
+                    let kid = kid.clone();
+                    let blob = blob.clone();
+                    Box::new(move |conn| {
+                        diesel::insert_into(app_state_keys::table)
+                            .values((
+                                app_state_keys::key_id.eq(kid),
+                                app_state_keys::key_data.eq(blob),
+                                app_state_keys::device_id.eq(device_id),
+                            ))
+                            .execute(conn)
+                            .map(|_| ())
+                    })
+                })
+                .await
+                .expect("insert legacy key row");
+        }
+        let name = "critical_block";
+        {
+            let blob = legacy_hash_state.clone();
+            store
+                .with_retry("insert_legacy_version", move || {
+                    let blob = blob.clone();
+                    Box::new(move |conn| {
+                        diesel::insert_into(app_state_versions::table)
+                            .values((
+                                app_state_versions::name.eq(name),
+                                app_state_versions::state_data.eq(blob),
+                                app_state_versions::device_id.eq(device_id),
+                            ))
+                            .execute(conn)
+                            .map(|_| ())
+                    })
+                })
+                .await
+                .expect("insert legacy version row");
+        }
+
+        // Self-heal: a legacy bincode row reads back as absent / default, NOT an error,
+        // and never as a partially-decoded protobuf with garbage material.
+        assert!(
+            store
+                .get_app_state_sync_key_for_device(&key_id, device_id)
+                .await
+                .expect("legacy sync-key blob must not surface a decode error")
+                .is_none(),
+            "a legacy bincode sync-key row must read back as absent"
+        );
+        assert_eq!(
+            store
+                .get_app_state_version_for_device(name, device_id)
+                .await
+                .expect("legacy version blob must not surface a decode error")
+                .version,
+            0,
+            "a legacy bincode version row must reset to default (re-sync from 0)"
+        );
+
+        // And the protobuf setters overwrite the healed rows: a re-shared key and a
+        // fresh version persist and read back correctly afterwards.
         store
             .set_app_state_sync_key_for_device(
                 &key_id,
                 AppStateSyncKey {
                     key_data: vec![7u8; 32],
                     fingerprint: vec![1, 2, 3],
-                    timestamp: 42,
+                    timestamp: 99,
                 },
                 device_id,
             )
             .await
-            .expect("set key");
-        assert!(
+            .expect("overwrite key");
+        let healed_key = store
+            .get_app_state_sync_key_for_device(&key_id, device_id)
+            .await
+            .expect("get key")
+            .expect("re-shared key must persist over the legacy row");
+        assert_eq!(healed_key.key_data, vec![7u8; 32]);
+        assert_eq!(healed_key.timestamp, 99);
+
+        store
+            .set_app_state_version_for_device(
+                name,
+                HashState {
+                    version: 5,
+                    ..HashState::default()
+                },
+                device_id,
+            )
+            .await
+            .expect("overwrite version");
+        assert_eq!(
             store
-                .get_app_state_sync_key_for_device(&key_id, device_id)
+                .get_app_state_version_for_device(name, device_id)
                 .await
-                .expect("get key")
-                .is_some()
+                .expect("get version")
+                .version,
+            5,
+            "a re-synced version must persist over the legacy row"
         );
 
-        // Garbage in the blob column -> treated as absent (so it gets re-requested),
-        // not a decode error bubbling up.
+        // Genuine corruption (not a clean bincode blob) is handled the same way.
         store
             .with_retry("corrupt_key", || {
                 Box::new(|conn| {
@@ -4007,39 +4114,9 @@ mod tests {
             store
                 .get_app_state_sync_key_for_device(&key_id, device_id)
                 .await
-                .expect("get corrupted key must not error")
+                .expect("corrupt key blob must not error")
                 .is_none(),
-            "an undecodable sync-key blob must read back as absent"
-        );
-
-        // A garbage app-state version blob resets to default (version 0) so the
-        // collection re-syncs from scratch instead of erroring.
-        let name = "critical_block";
-        let state = HashState {
-            version: 9,
-            ..HashState::default()
-        };
-        store
-            .set_app_state_version_for_device(name, state, device_id)
-            .await
-            .expect("set version");
-        store
-            .with_retry("corrupt_version", || {
-                Box::new(|conn| {
-                    sql_query("UPDATE app_state_versions SET state_data = X'00ff00ff'")
-                        .execute(conn)
-                        .map(|_| ())
-                })
-            })
-            .await
-            .expect("corrupt version blob");
-        let healed = store
-            .get_app_state_version_for_device(name, device_id)
-            .await
-            .expect("get corrupted version must not error");
-        assert_eq!(
-            healed.version, 0,
-            "an undecodable version blob must reset to default"
+            "an arbitrarily corrupt sync-key blob must also read back as absent"
         );
     }
 
