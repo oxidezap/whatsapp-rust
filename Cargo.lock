@@ -1215,7 +1215,6 @@ dependencies = [
  "anyhow",
  "async-channel",
  "buffa",
- "chrono",
  "dhat",
  "env_logger",
  "futures",
