@@ -9,7 +9,6 @@ use wacore::WireEnum;
 use crate::client::{Client, ClientError};
 use crate::features::mex::{MexError, mex_request};
 use crate::request::IqError;
-use buffa::Message as _;
 use thiserror::Error;
 use wacore::iq::mex_operations::{
     create_newsletter, fetch_all_newsletters_metadata, fetch_newsletter, join_newsletter,
@@ -716,7 +715,7 @@ fn parse_newsletter_messages_response(
                 .get_optional_child("plaintext")
                 .and_then(|pt| match pt.content.as_deref() {
                     Some(NodeContentRef::Bytes(bytes)) => {
-                        wa::Message::decode_from_slice(bytes.as_ref()).ok()
+                        waproto::codec::message_decode(bytes.as_ref()).ok()
                     }
                     _ => None,
                 });

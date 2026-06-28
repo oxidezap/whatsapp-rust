@@ -358,7 +358,10 @@ impl MessageUtils {
 /// runtime-independent portion of `handle_decrypted_plaintext`.
 pub fn decode_plaintext(padded_plaintext: &[u8], padding_version: u8) -> Result<wa::Message> {
     let plaintext_slice = MessageUtils::unpad_message_ref(padded_plaintext, padding_version)?;
-    wa::Message::decode_from_slice(plaintext_slice)
+    // Route through the pinned codec entry point so the Message decode tree
+    // (BotMetadata/ProtocolMessage/ContextInfo merge_field, etc.) is
+    // instantiated once in waproto instead of copied into every calling crate.
+    waproto::codec::message_decode(plaintext_slice)
         .map_err(|e| anyhow::anyhow!("Failed to decode decrypted plaintext: {e}"))
 }
 

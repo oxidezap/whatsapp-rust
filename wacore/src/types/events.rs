@@ -2,7 +2,6 @@ use crate::stanza::BusinessSubscription;
 use crate::types::call::{CallEndedElsewhere, IncomingCall, MissedCall};
 use crate::types::message::MessageInfo;
 use crate::types::presence::{ChatPresence, ChatPresenceMedia, ReceiptType};
-use buffa::Message;
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -156,7 +155,7 @@ impl LazyHistorySync {
         self.parsed
             .get_or_init(|| {
                 let raw = self.decompress().ok()?;
-                wa::HistorySync::decode_from_slice(&raw[..])
+                waproto::codec::history_sync_decode(&raw[..])
                     .ok()
                     .map(Box::new)
             })

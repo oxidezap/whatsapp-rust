@@ -22,7 +22,6 @@
 //! that already handle `protocolMessage.editedMessage` can reuse their code.
 
 use anyhow::{Result, anyhow};
-use buffa::Message;
 
 use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
 
@@ -65,7 +64,7 @@ pub fn encrypt_message_edit(
     message_secret: &[u8],
     ctx: &MessageEditContext<'_>,
 ) -> Result<(Vec<u8>, [u8; IV_SIZE])> {
-    let plaintext = inner_message.encode_to_vec();
+    let plaintext = waproto::codec::message_to_vec(inner_message);
     encrypt_addon(&plaintext, message_secret, &ctx.as_addon_ctx())
 }
 
@@ -99,7 +98,7 @@ pub fn decrypt_secret_encrypted(
         modification_type,
     };
     let plaintext = decrypt_addon(enc_payload, iv, message_secret, &addon)?;
-    waproto::whatsapp::Message::decode_from_slice(&plaintext[..])
+    waproto::codec::message_decode(&plaintext[..])
         .map_err(|e| anyhow!("Failed to decode inner secret-encrypted Message: {e}"))
 }
 

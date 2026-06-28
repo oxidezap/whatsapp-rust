@@ -678,7 +678,6 @@ pub fn extract_message_secret(message: &wa::Message) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buffa::Message as _;
 
     #[test]
     fn test_generate_message_secret() {
@@ -877,7 +876,7 @@ mod tests {
             ..Default::default()
         };
 
-        let message_bytes = message.encode_to_vec();
+        let message_bytes = waproto::codec::message_to_vec(&message);
         let extracted = extract_reporting_token_content(&message_bytes, REPORTING_FIELDS);
 
         assert!(extracted.is_some());

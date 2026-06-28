@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use buffa::Message as _;
 use log::warn;
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
@@ -145,7 +144,7 @@ impl<'a> AcceptCall<'a> {
             .map_err(|e| CallError::Decrypt(e.to_string()))?;
         let unpadded = MessageUtils::unpad_message_ref(&plaintext, enc.version)
             .map_err(|e| CallError::Decrypt(e.to_string()))?;
-        let msg = wa::Message::decode_from_slice(unpadded)
+        let msg = waproto::codec::message_decode(unpadded)
             .map_err(|e| CallError::Decrypt(format!("decode call message: {e}")))?;
         let call_key = msg
             .call
