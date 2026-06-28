@@ -1044,13 +1044,22 @@ impl SqliteStore {
                 let mut conn = pool
                     .get()
                     .map_err(|e| StoreError::Connection(Box::new(e)))?;
-                let res: Option<Vec<u8>> = app_state_keys::table
-                    .select(app_state_keys::key_id)
+                // Return the latest key whose blob actually decodes. A legacy bincode
+                // row (or a corrupt one) reads as absent via get_sync_key but still
+                // sits in the table with a possibly lexicographically-higher key_id;
+                // selecting it here would make the outbound build_patch fail later in
+                // get_app_state_key with KeyNotFound. Skip undecodable rows so outbound
+                // mutations use the newest USABLE key.
+                let candidates: Vec<(Vec<u8>, Vec<u8>)> = app_state_keys::table
+                    .select((app_state_keys::key_id, app_state_keys::key_data))
                     .filter(app_state_keys::device_id.eq(device_id))
                     .order(app_state_keys::key_id.desc())
-                    .first(&mut conn)
-                    .optional()
+                    .load(&mut conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
+                let res = candidates
+                    .into_iter()
+                    .find(|(_, data)| crate::wire::decode_app_state_sync_key(data).is_ok())
+                    .map(|(key_id, _)| key_id);
                 Ok(res)
             })
             .await
@@ -4117,6 +4126,75 @@ mod tests {
                 .expect("corrupt key blob must not error")
                 .is_none(),
             "an arbitrarily corrupt sync-key blob must also read back as absent"
+        );
+    }
+
+    // Outbound mutations (chat actions) encrypt with the latest sync key, so the
+    // latest-key selection must skip a legacy bincode row even when it sorts higher --
+    // otherwise build_patch would later fail in get_app_state_key with KeyNotFound.
+    #[tokio::test]
+    async fn latest_sync_key_skips_undecodable_rows() {
+        use diesel::{ExpressionMethods, RunQueryDsl};
+        use wacore::store::traits::AppStateSyncKey;
+
+        // Real bincode 2.0.1 bytes for an AppStateSyncKey -- undecodable as protobuf.
+        let legacy_blob = {
+            let mut v = vec![0x20u8];
+            v.extend([0x11u8; 32]);
+            v.extend([0x04, 0xaa, 0xbb, 0xcc, 0xdd, 0xfc, 0x00, 0xe2, 0xa7, 0xca]);
+            v
+        };
+
+        let store = create_test_store().await;
+        let device_id = store.device_id;
+
+        // A valid (protobuf) key at a LOWER key_id...
+        let good_id = b"key-aaa".to_vec();
+        store
+            .set_app_state_sync_key_for_device(
+                &good_id,
+                AppStateSyncKey {
+                    key_data: vec![7u8; 32],
+                    fingerprint: vec![1],
+                    timestamp: 1,
+                },
+                device_id,
+            )
+            .await
+            .unwrap();
+
+        // ...and a stale bincode row at a lexicographically HIGHER key_id, inserted raw.
+        let bad_id = b"key-zzz".to_vec();
+        {
+            let bid = bad_id.clone();
+            let blob = legacy_blob.clone();
+            store
+                .with_retry("insert_stale_key", move || {
+                    let bid = bid.clone();
+                    let blob = blob.clone();
+                    Box::new(move |conn| {
+                        diesel::insert_into(app_state_keys::table)
+                            .values((
+                                app_state_keys::key_id.eq(bid),
+                                app_state_keys::key_data.eq(blob),
+                                app_state_keys::device_id.eq(device_id),
+                            ))
+                            .execute(conn)
+                            .map(|_| ())
+                    })
+                })
+                .await
+                .unwrap();
+        }
+
+        // The higher-but-undecodable row must be skipped for the usable key.
+        assert_eq!(
+            store
+                .get_latest_app_state_sync_key_id_for_device(device_id)
+                .await
+                .unwrap(),
+            Some(good_id),
+            "latest-key selection must skip undecodable bincode rows"
         );
     }
 
