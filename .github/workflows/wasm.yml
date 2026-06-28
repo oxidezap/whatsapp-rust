@@ -42,3 +42,14 @@ jobs:
           cargo build -p whatsapp-rust --lib --release
           --target wasm32-unknown-unknown
           --no-default-features --features debug-diagnostics
+      # The sans-IO VoIP core (wacore::voip: the CallEngine, the portable run_call driver,
+      # the RelayTransport seam, the MLow codec, SRTP/SFrame crypto) must stay wasm-buildable
+      # so the WASM bridge can drive 1:1 calls. whatsapp-rust's `voip` feature compile-errors on
+      # wasm (it pulls webrtc-rs + libopus FFI), so the guard is on the pure core here.
+      - name: Build wacore VoIP core for wasm32 (release)
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        run: >
+          cargo build -p wacore --lib --release
+          --target wasm32-unknown-unknown
+          --no-default-features --features "voip,js"

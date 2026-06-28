@@ -226,6 +226,7 @@ impl Client {
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
             custom_enc_handlers: std::sync::OnceLock::new(),
+            inbound_durability_hook: std::sync::OnceLock::new(),
             chatstate_handlers: Arc::new(RwLock::new(Vec::new())),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
             pdo_requested: cache_config.pdo_requested.build_with_ttl(),
@@ -252,6 +253,12 @@ impl Client {
             self_weak: std::sync::OnceLock::new(),
             saver_handle: std::sync::OnceLock::new(),
             raw_node_forwarding: AtomicBool::new(false),
+            #[cfg(feature = "voip")]
+            call_registry: std::sync::Arc::new(wacore::voip::CallRegistry::new()),
+            #[cfg(feature = "voip")]
+            pending_outgoing_calls: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
 
         let arc = Arc::new(this);
@@ -647,6 +654,20 @@ impl Client {
         self.clear_sent_node_waiters();
         self.is_logged_in.store(false, Ordering::Relaxed);
         self.is_ready.store(false, Ordering::Relaxed);
+        // Publish the disconnected state BEFORE draining VoIP calls (it used to be cleared only after
+        // the socket teardown below): a concurrent accept()/call() setup that finishes its async work
+        // in this window must see `!is_connected()` and bail instead of registering/connecting a call
+        // after this sweep.
+        self.is_connected.store(false, Ordering::Release);
+        // Tear down every in-flight VoIP call: the relay socket and signaling are connection-scoped,
+        // so a call can't survive a disconnect/reconnect. Aborts each media task and clears the map.
+        #[cfg(feature = "voip")]
+        {
+            self.call_registry.abort_all();
+            // Dormant outgoing calls (relay never arrived) live in pending_outgoing_calls, not the
+            // registry, so abort_all misses them. Drain them and notify `ended` so any waiter wakes.
+            crate::voip::facade::drain_pending_outgoing_on_disconnect(self);
+        }
         // Signal the keepalive loop (and any other per-connection tasks) to
         // exit promptly. Without this, a stale keepalive loop can overlap
         // with the next one after reconnect. Uses the PER-CONNECTION signal
@@ -662,13 +683,10 @@ impl Client {
         }
         *self.transport_events.lock().await = None;
         *self.noise_socket.lock().await = None;
-        // Clear is_connected AFTER noise_socket is None, so no task can see
-        // is_connected==true with a cleared socket. send_node() independently
-        // checks the socket, but this ordering avoids a confusing state window.
-        self.is_connected.store(false, Ordering::Release);
         // Authoritative point for the gauge: every disconnect (intentional or a
         // run-loop drop/reconnect) funnels through here, so disconnect()'s early
-        // set is just a prompt redundant signal.
+        // set is just a prompt redundant signal. (`is_connected` was already cleared above, before
+        // the VoIP drain, so no task can observe is_connected==true with a cleared socket.)
         wacore::telemetry::set_connected(false);
         // Presence doesn't survive reconnects: demote presence-driven active
         // receipts (1 -> 0), leaving a forced value (2) untouched.
@@ -807,6 +825,13 @@ impl Client {
 
     pub fn is_connected(&self) -> bool {
         self.is_connected.load(Ordering::Acquire)
+    }
+
+    /// Force the connected flag (tests only): the facade's connect path now gates on `is_connected`,
+    /// so a unit test driving `spawn_call`/`place_call` must mark the client connected first.
+    #[cfg(all(test, feature = "voip"))]
+    pub(crate) fn set_connected_for_test(&self, connected: bool) {
+        self.is_connected.store(connected, Ordering::Release);
     }
 
     pub fn is_logged_in(&self) -> bool {

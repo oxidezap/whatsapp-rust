@@ -50,6 +50,8 @@ pub use client::ClientError;
 #[cfg(feature = "debug-diagnostics")]
 pub use client::MemoryDiagnostics;
 pub use client::NodeFilter;
+pub use client::{CallError, Voip};
+pub use types::durability_hook::InboundDurabilityHook;
 pub mod download;
 pub mod handlers;
 pub use handlers::chatstate::ChatStateEvent;
@@ -77,6 +79,8 @@ pub mod socket;
 pub mod store;
 pub mod transport;
 pub mod upload;
+#[cfg(feature = "voip")]
+pub mod voip;
 pub use upload::UploadOptions;
 
 pub mod pdo;

@@ -151,29 +151,6 @@ impl Client {
         self.execute(BusinessProfileSpec::new(jid)).await
     }
 
-    /// Reject an incoming call. Fire-and-forget — no server response is expected.
-    pub async fn reject_call(
-        &self,
-        call_id: &str,
-        call_from: &wacore_binary::Jid,
-    ) -> Result<(), anyhow::Error> {
-        anyhow::ensure!(!call_id.is_empty(), "call_id cannot be empty");
-        let id = self.generate_request_id();
-
-        let stanza = wacore_binary::builder::NodeBuilder::new("call")
-            .attr("to", call_from)
-            .attr("id", id)
-            .children([wacore_binary::builder::NodeBuilder::new("reject")
-                .attr("call-id", call_id)
-                .attr("call-creator", call_from)
-                .attr("count", "0")
-                .build()])
-            .build();
-
-        self.send_node(stanza).await?;
-        Ok(())
-    }
-
     pub async fn send_digest_key_bundle(&self) -> Result<(), crate::request::IqError> {
         use wacore::iq::prekeys::DigestKeyBundleSpec;
 

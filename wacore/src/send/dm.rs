@@ -187,8 +187,12 @@ pub async fn prepare_dm_stanza(
             .build(),
     ];
 
-    if includes_prekey_message && let Some(acc) = account {
-        let device_identity_bytes = acc.encode_to_vec();
+    // DM stays lenient when pkmsg lacks an account (no pre-flight here): map the
+    // helper's error back to omission so the wire shape is unchanged.
+    if let Some(device_identity_bytes) = needs_device_identity(includes_prekey_message, account)
+        .ok()
+        .flatten()
+    {
         message_content_nodes.push(
             NodeBuilder::new("device-identity")
                 .bytes(device_identity_bytes)
@@ -236,7 +240,7 @@ pub async fn prepare_dm_stanza(
 /// (`SessionAdapter` → `SignalStoreCache::get_session` marks the slot
 /// `CheckedOut`); the loaded record is put back via `store_session`
 /// so the subsequent `message_encrypt` finds the slot Present.
-pub(crate) async fn pkmsg_would_be_emitted<S>(
+pub async fn pkmsg_would_be_emitted<S>(
     session_store: &mut S,
     signal_address: &ProtocolAddress,
 ) -> Result<bool>
@@ -322,15 +326,12 @@ where
     let enc_node = enc_builder.bytes(serialized).build();
 
     let mut children = vec![enc_node];
-    if is_prekey {
-        // Defense in depth: pre-flight should have caught this, but a corrupt
-        // session that triggers a fresh pkmsg mid-call would slip past.
-        let acc = account.ok_or_else(|| {
-            anyhow!("DM retry pkmsg without <device-identity> (unreachable via pre-flight)")
-        })?;
+    // Defense in depth: pre-flight should have caught a no-account pkmsg, but a
+    // corrupt session that triggers a fresh pkmsg mid-call would slip past.
+    if let Some(device_identity_bytes) = needs_device_identity(is_prekey, account)? {
         children.push(
             NodeBuilder::new("device-identity")
-                .bytes(acc.encode_to_vec())
+                .bytes(device_identity_bytes)
                 .build(),
         );
     }

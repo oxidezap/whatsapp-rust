@@ -136,6 +136,44 @@ pub struct EncryptResult {
     pub had_unregistered_device: bool,
 }
 
+/// One device's encrypted ciphertext, node-agnostic. The DM/peer paths map this
+/// into a `<to><enc>` node; the voip offer maps it into an `<enc>` per device.
+pub struct EncryptedDevice {
+    pub device_jid: Jid,
+    /// `pkmsg` or `msg`.
+    pub enc_type: &'static str,
+    pub is_prekey: bool,
+    pub ciphertext: Vec<u8>,
+}
+
+/// Node-agnostic encrypt fan-out result: the per-device ciphertexts plus the
+/// two batch flags the message path threads into its stanza.
+pub struct EncryptForDevicesRaw {
+    pub devices: Vec<EncryptedDevice>,
+    pub includes_prekey_message: bool,
+    /// True if any device returned 406 (unregistered) during prekey fetch.
+    pub had_unregistered_device: bool,
+}
+
+/// Resolve the `<device-identity>` blob a stanza must carry. A pkmsg recipient
+/// validates our identity from it; without it a pkmsg advances the sender chain
+/// while the peer can't consume the pre-key message (the linked-device deadlock).
+///
+/// - `includes_prekey && account.is_some()` -> `Ok(Some(encoded))`
+/// - `includes_prekey && account.is_none()` -> `Err` (refuse before send)
+/// - `!includes_prekey` -> `Ok(None)`
+pub fn needs_device_identity(
+    includes_prekey: bool,
+    account: Option<&wa::AdvSignedDeviceIdentity>,
+) -> Result<Option<Vec<u8>>> {
+    if !includes_prekey {
+        return Ok(None);
+    }
+    let acc = account
+        .ok_or_else(|| anyhow!("pkmsg requires <device-identity> but no ADV account is present"))?;
+    Ok(Some(acc.encode_to_vec()))
+}
+
 /// Maximum number of concurrent per-device crypto tasks during group send
 /// fan-out. Picked from the `perf-audit` benchmark: speedup plateaus around
 /// 16 on Oracle ARM64; 32 gives only ~10% more for double the task overhead.
@@ -146,7 +184,6 @@ struct EncryptOneResult {
     enc_type: &'static str,
     is_prekey: bool,
     ciphertext: Vec<u8>,
-    hide_decrypt_fail: bool,
 }
 
 /// Surfaces a spawned task that didn't deliver its result — either the task
@@ -256,7 +293,6 @@ async fn encrypt_one_device(
     session_store: &mut dyn crate::libsignal::protocol::SessionStore,
     identity_store: &mut dyn crate::libsignal::protocol::IdentityKeyStore,
     device_jid: Jid,
-    hide_decrypt_fail: bool,
 ) -> (Jid, Result<Option<EncryptOneResult>, String>) {
     match message_encrypt(plaintext, addr, session_store, identity_store).await {
         Ok(encrypted_payload) => {
@@ -272,7 +308,6 @@ async fn encrypt_one_device(
                     is_prekey,
                     // Box<[u8]> -> Vec<u8> reuses the allocation (no copy).
                     ciphertext: serialized_bytes.into(),
-                    hide_decrypt_fail,
                 })),
             )
         }
@@ -280,41 +315,53 @@ async fn encrypt_one_device(
     }
 }
 
-/// Append one encrypt result to the fan-out output: a `<to>` participant node on
-/// success, a logged skip on failure.
-fn push_encrypt_result(
+/// Append one encrypt result to the raw fan-out output: an [`EncryptedDevice`]
+/// on success, a logged skip on failure. Node-agnostic so both the message
+/// `<to>` map and the voip offer share it.
+fn push_raw_result(
     (device_jid, res): (Jid, Result<Option<EncryptOneResult>, String>),
-    mediatype: Option<&str>,
-    participant_nodes: &mut Vec<Node>,
-    encrypted_devices: &mut Vec<Jid>,
+    devices: &mut Vec<EncryptedDevice>,
     includes_prekey_message: &mut bool,
 ) {
     match res {
         Ok(Some(one)) => {
             *includes_prekey_message |= one.is_prekey;
-            let mut enc_builder = NodeBuilder::new("enc")
-                .attr("v", stanza::ENC_VERSION)
-                .attr("type", one.enc_type);
-            // `mediatype` is batch-level (same for every device) and originates as
-            // a `&'static str`, so it's threaded here instead of cloned per result.
-            if let Some(mt) = mediatype {
-                enc_builder = enc_builder.attr("mediatype", mt);
-            }
-            if one.hide_decrypt_fail {
-                enc_builder = enc_builder.attr("decrypt-fail", "hide");
-            }
-            let enc_node = enc_builder.bytes(one.ciphertext).build();
-            participant_nodes.push(
-                NodeBuilder::new("to")
-                    .attr("jid", device_jid.clone())
-                    .children([enc_node])
-                    .build(),
-            );
-            encrypted_devices.push(device_jid);
+            devices.push(EncryptedDevice {
+                device_jid,
+                enc_type: one.enc_type,
+                is_prekey: one.is_prekey,
+                ciphertext: one.ciphertext,
+            });
         }
         Ok(None) => {}
         Err(msg) => log::warn!("Failed to encrypt for device: {msg}. Skipping."),
     }
+}
+
+/// Map one [`EncryptedDevice`] to the message path's `<to><enc>` participant
+/// node, applying the batch-level `mediatype` and `decrypt-fail` attrs. This is
+/// exactly the wire shape the DM/peer fan-out produced before the raw split.
+fn encrypted_device_to_participant_node(
+    one: EncryptedDevice,
+    mediatype: Option<&str>,
+    hide_decrypt_fail: bool,
+) -> Node {
+    let mut enc_builder = NodeBuilder::new("enc")
+        .attr("v", stanza::ENC_VERSION)
+        .attr("type", one.enc_type);
+    // `mediatype` is batch-level (same for every device) and originates as
+    // a `&'static str`, so it's threaded here instead of cloned per result.
+    if let Some(mt) = mediatype {
+        enc_builder = enc_builder.attr("mediatype", mt);
+    }
+    if hide_decrypt_fail {
+        enc_builder = enc_builder.attr("decrypt-fail", "hide");
+    }
+    let enc_node = enc_builder.bytes(one.ciphertext).build();
+    NodeBuilder::new("to")
+        .attr("jid", one.device_jid)
+        .children([enc_node])
+        .build()
 }
 
 /// Per-device Signal sessions are independent (different ratchet state per
@@ -360,6 +407,19 @@ pub async fn encrypt_for_devices(
 pub struct SessionPlan {
     encryption_overrides: Vec<Option<Jid>>,
     pub had_unregistered_device: bool,
+}
+
+impl SessionPlan {
+    /// A plan that performs no LID override and no prekey fetch: each device is
+    /// encrypted against its own address as-is. For callers that already ensured
+    /// sessions out-of-band (the voip offer asserts sessions before encrypting)
+    /// and must not touch the network during the encrypt fan-out.
+    pub fn assume_ready(device_count: usize) -> Self {
+        Self {
+            encryption_overrides: vec![None; device_count],
+            had_unregistered_device: false,
+        }
+    }
 }
 
 /// Resolve LID overrides and establish missing Signal sessions (prekey
@@ -580,6 +640,47 @@ pub async fn encrypt_for_devices_with_sessions(
     mediatype: Option<&str>,
     plan: SessionPlan,
 ) -> Result<EncryptResult> {
+    let raw =
+        encrypt_for_devices_with_sessions_raw(runtime, stores, devices, plaintext_to_encrypt, plan)
+            .await?;
+
+    // Map each ciphertext to the message path's `<to><enc>` node, preserving the
+    // raw fan-out order so the wire output is identical to the pre-split path.
+    // `encrypted_devices` mirrors `participant_nodes` index-for-index, as before.
+    let mut participant_nodes = Vec::with_capacity(raw.devices.len());
+    let mut encrypted_devices = Vec::with_capacity(raw.devices.len());
+    for one in raw.devices {
+        encrypted_devices.push(one.device_jid.clone());
+        participant_nodes.push(encrypted_device_to_participant_node(
+            one,
+            mediatype,
+            hide_decrypt_fail,
+        ));
+    }
+
+    Ok(EncryptResult {
+        participant_nodes,
+        includes_prekey_message: raw.includes_prekey_message,
+        encrypted_devices,
+        had_unregistered_device: raw.had_unregistered_device,
+    })
+}
+
+/// Node-agnostic core of the encrypt fan-out: pairwise-encrypt
+/// `plaintext_to_encrypt` for each device using sessions prepared by
+/// [`ensure_sessions_for_devices`] over the same `devices` slice, returning the
+/// per-device ciphertexts. No resolver, no network, no node-building — safe to
+/// run under locks that must not span I/O. A device whose session is still
+/// missing (e.g. its bundle was absent) fails its encrypt and is skipped.
+/// Same parallel fan-out + skip-on-fail contract as the message path.
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.encrypt_fanout", level = "debug", skip_all, fields(count = devices.len()), err(Debug)))]
+pub async fn encrypt_for_devices_with_sessions_raw(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'_>,
+    devices: &[Jid],
+    plaintext_to_encrypt: &[u8],
+    plan: SessionPlan,
+) -> Result<EncryptForDevicesRaw> {
     debug_assert_eq!(
         plan.encryption_overrides.len(),
         devices.len(),
@@ -590,9 +691,8 @@ pub async fn encrypt_for_devices_with_sessions(
         had_unregistered_device,
     } = plan;
 
-    let mut participant_nodes = Vec::with_capacity(devices.len());
+    let mut encrypted = Vec::with_capacity(devices.len());
     let mut includes_prekey_message = false;
-    let mut encrypted_devices = Vec::with_capacity(devices.len());
 
     // The wire-order of `<to>` participants does not need to match the input
     // device order: WA Web's `phash` (computed both client and server side)
@@ -614,16 +714,9 @@ pub async fn encrypt_for_devices_with_sessions(
             &mut *stores.session_store,
             &mut *stores.identity_store,
             device_jid,
-            hide_decrypt_fail,
         )
         .await;
-        push_encrypt_result(
-            res,
-            mediatype,
-            &mut participant_nodes,
-            &mut encrypted_devices,
-            &mut includes_prekey_message,
-        );
+        push_raw_result(res, &mut encrypted, &mut includes_prekey_message);
     } else {
         // Parallel encrypt fan-out across tokio tasks bounded by
         // ENCRYPT_FANOUT_CONCURRENCY; collected in completion order so the
@@ -654,7 +747,6 @@ pub async fn encrypt_for_devices_with_sessions(
                     &mut *session_store,
                     &mut *identity_store,
                     device_jid,
-                    hide_decrypt_fail,
                 )
                 .await
             })
@@ -667,13 +759,7 @@ pub async fn encrypt_for_devices_with_sessions(
         }
         while let Some(spawn_result) = in_flight.next().await {
             match spawn_result {
-                Ok(res) => push_encrypt_result(
-                    res,
-                    mediatype,
-                    &mut participant_nodes,
-                    &mut encrypted_devices,
-                    &mut includes_prekey_message,
-                ),
+                Ok(res) => push_raw_result(res, &mut encrypted, &mut includes_prekey_message),
                 Err(SpawnCanceled) => {
                     log::warn!("Encrypt task did not deliver a result; skipping device.");
                 }
@@ -686,10 +772,9 @@ pub async fn encrypt_for_devices_with_sessions(
         }
     }
 
-    Ok(EncryptResult {
-        participant_nodes,
+    Ok(EncryptForDevicesRaw {
+        devices: encrypted,
         includes_prekey_message,
-        encrypted_devices,
         had_unregistered_device,
     })
 }

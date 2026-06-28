@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package mlow.tables;
+
+// The embedded MLow heap window: heap byte regions at their absolute addresses
+// plus the table-base pointers. Carries the residual pitch-contour window (the
+// only reads still served from the heap). Stored zlib-compressed.
+message HeapWindow {
+  repeated Region regions = 1;
+  uint32 g_cc = 2;
+  uint32 g_nrg = 3;
+  uint32 g_pitch = 4;
+  uint32 g_clk = 5;
+}
+
+// One contiguous heap region: its absolute base address and bytes.
+message Region {
+  uint32 base = 1;
+  bytes data = 2;
+}
+
+// Irreducible LSF seed ROM. The expanded LSF runtime tables are derived from
+// this at load. Flat row-major; the shape of each field is fixed by the codec.
+// u8/i8 arrays are bytes; f32 are packed repeated float; u16 are repeated uint32.
+message LsfSeed {
+  bytes rot_8 = 1;               // [2][16][16][16]
+  bytes rot_cond_8 = 2;          // [2][2][16][16]
+  bytes st2_all_qlvls_8 = 3;     // [9593]
+  bytes st2_all_qlvl_dcmfs = 4;  // [9593]
+  bytes st2_min_qi = 5;          // [2][2][17][16] i8
+  bytes st2_max_qi = 6;          // [2][2][17][16] i8
+  repeated uint32 cb_16 = 7;     // [2][16][16] u16
+  repeated uint32 cinv_16 = 8;   // [2][136]    u16
+  repeated uint32 cmf = 9;       // [2][17]     u16
+  repeated uint32 cmf_cond = 10; // [2][18]     u16
+  repeated uint32 lsf_sel = 11;  // [3][3]      u16
+  repeated uint32 lsf_extra = 12; // [3]        u16
+  repeated float mean = 13;            // [2][16]
+  repeated float min_dist = 14;        // [2][17]
+  repeated float reg_cond = 15;        // [2]
+  repeated float qstep = 16;           // [2][2]
+  // grid16 tables (17..21) dropped: derived at load from mean/reg_cond/rot_cond_8.
+}
+
+// Irreducible pitch seed ROM. The expanded pitch runtime tables are derived
+// from this at load.
+message PitchSeed {
+  bytes blocksegs_bitstream = 1; // [676]
+  bytes blocksegs2idx = 2;       // [217]
+  bytes blocksegs_ix = 3;        // [187][2]
+  bytes firstblock_range = 4;    // [9][2]
+  bytes blockseg_idx_dcmf = 5;   // [217]
+  bytes delta_lag_dcmfs = 6;     // [3][319]
+  bytes block_transition_dcmf = 7; // [9][9]
+}
+
+// Irreducible nrgres/gains + LTP gain seed ROM. The runtime CDFs are derived
+// from the DCMFs at load (integer dcmf_to_cmf). gain_recon carries the static
+// gain-reconstruction int16 rodata verbatim, addressed from gain_recon_base.
+message CcSeed {
+  bytes nrgres_gain4_dcmf = 1;       // [84]
+  bytes nrgres_shape4_dcmf = 2;      // [98]
+  bytes fcbg_offset_dcmf = 3;        // [3][4][176]
+  bytes acbgains_hr_dcmf = 4;        // [17][16]
+  bytes fcbgains_v_dcmf = 5;         // [34]
+  bytes fcbgains_v_delta_dcmf = 6;   // [67]
+  repeated sint32 acbgains_cb_hr_q14 = 7; // [16][2] i16
+  uint32 gain_recon_base = 8;        // 0xf35e0
+  bytes gain_recon = 9;              // gain-reconstruction int16 rodata
+  bytes n_pulses_dcmf_bgn = 10;      // [17] pulse-count CDF seed (background noise)
+  bytes n_pulses_dcmf_uv = 11;       // [33] pulse-count CDF seed (unvoiced)
+  bytes n_pulses_dcmf_v = 12;        // [33] pulse-count CDF seed (voiced)
+}

@@ -52,15 +52,12 @@ where
 
     let mut children = vec![enc_node];
 
-    if is_prekey {
-        // Defense in depth: pre-flight should have caught this, but a corrupt
-        // session that triggers a fresh pkmsg mid-call would slip past.
-        let acc = account.ok_or_else(|| {
-            anyhow!("group retry pkmsg without <device-identity> (unreachable via pre-flight)")
-        })?;
+    // Defense in depth: pre-flight should have caught a no-account pkmsg, but a
+    // corrupt session that triggers a fresh pkmsg mid-call would slip past.
+    if let Some(device_identity_bytes) = needs_device_identity(is_prekey, account)? {
         children.push(
             NodeBuilder::new("device-identity")
-                .bytes(acc.encode_to_vec())
+                .bytes(device_identity_bytes)
                 .build(),
         );
     }
@@ -435,10 +432,16 @@ pub async fn prepare_group_stanza(
                                 .children(result.participant_nodes)
                                 .build(),
                         );
-                        if includes_prekey_message && let Some(acc) = account {
+                        // Lenient (matches the DM fan-out): a no-account pkmsg
+                        // omits the node rather than failing the whole send.
+                        if let Some(device_identity_bytes) =
+                            needs_device_identity(includes_prekey_message, account)
+                                .ok()
+                                .flatten()
+                        {
                             message_children.push(
                                 NodeBuilder::new("device-identity")
-                                    .bytes(acc.encode_to_vec())
+                                    .bytes(device_identity_bytes)
                                     .build(),
                             );
                         }

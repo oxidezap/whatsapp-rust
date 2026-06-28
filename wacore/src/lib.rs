@@ -50,6 +50,8 @@ pub mod time;
 pub mod types;
 pub mod upload;
 pub mod usync;
+#[cfg(feature = "voip")]
+pub mod voip;
 pub mod webp;
 
 pub mod version;

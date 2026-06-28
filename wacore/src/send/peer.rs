@@ -69,15 +69,12 @@ where
     let meta_node = NodeBuilder::new("meta").attr("appdata", "default").build();
 
     let mut children = vec![meta_node, enc_node];
-    if is_prekey {
-        // Defense in depth: pre-flight should have caught this, but a corrupt
-        // session that triggers a fresh pkmsg mid-call would slip past.
-        let account = account.ok_or_else(|| {
-            anyhow!("peer pkmsg without <device-identity> (unreachable via pre-flight)")
-        })?;
+    // Defense in depth: pre-flight should have caught a no-account pkmsg, but a
+    // corrupt session that triggers a fresh pkmsg mid-call would slip past.
+    if let Some(device_identity_bytes) = needs_device_identity(is_prekey, account)? {
         children.push(
             NodeBuilder::new("device-identity")
-                .bytes(account.encode_to_vec())
+                .bytes(device_identity_bytes)
                 .build(),
         );
     }

@@ -58,6 +58,9 @@ jobs:
           prefix-key: ${{ runner.os }}-cargo-binary-size
           cache-targets: "false"
 
+      # measure_binary_size builds an example, which pulls the cpal dev-dependency (alsa-sys).
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Measure binary size
         run: python3 scripts/ci/measure_binary_size.py --out-dir size-out
 
@@ -190,6 +193,9 @@ jobs:
           prefix-key: ${{ runner.os }}-cargo-binary-size
           cache-targets: "false"
 
+      # measure_binary_size builds an example, which pulls the cpal dev-dependency (alsa-sys).
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Measure binary size
         run: python3 scripts/ci/measure_binary_size.py --out-dir size-out
 

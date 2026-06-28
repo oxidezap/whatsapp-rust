@@ -29,3 +29,9 @@ Do NOT switch any metric to rlib size: rlibs carry un-monomorphized generics plu
 - `cargo bloat` exits 0 even on analysis errors; the measure script validates its JSON instead of trusting the exit code.
 - Fork PRs run with a read-only token: they get the job summary and the gate, but no PR comment.
 - Local run: `python3 scripts/ci/measure_binary_size.py --out-dir size-out` (add `--skip-build` to reuse an existing release build).
+
+## Per-crate opt-level
+
+`[profile.release.package.*]` in the root `Cargo.toml` builds the off-hot-path crates at `opt-level = "s"`/`"z"` instead of 3. Crates that run per connection / per sync / per request rather than per message — persistence (Diesel/SQLite), media HTTP (ureq), TLS PKI — trade a little runtime speed for size; the per-message/per-frame crypto/protocol crates (libsignal, wacore-binary, waproto, prost, aes, sha2, hkdf, flate2, curve25519, and wacore-noise — whose `NoiseCipher` runs the transport AEAD on every frame) stay at 3. The overrides take effect under fat LTO and cut ~530 KiB off the stripped `demo` (~5%).
+
+Pitfall: `cargo bloat`'s per-crate `.text` is attribution guesswork, and `opt-level` changes shift where LTO accounts for inlined/monomorphized code. After this change a few `.text <crate>` series move the "wrong" way (e.g. `whatsapp_rust_sqlite_storage` and `wacore_appstate` rise) even though the total falls. Trust `bin .text` and `bin size (stripped)` from `size`/`strip` — those are exact; the gate keys off them.

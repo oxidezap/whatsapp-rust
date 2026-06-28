@@ -480,8 +480,9 @@ impl Client {
             // server drops it from the offline queue (whatsmeow/WA Web treat
             // old-counter like success). status is acked by the should_ack gate
             // (a status SKDM pkmsg can reach here), so skip it to avoid a
-            // redundant receipt.
-            self.ack_received_message(&info);
+            // redundant receipt. With a durability hook, a buffered copy here
+            // means the original commit never acked, so replay it instead.
+            self.ack_or_replay_to_hook(&info).await;
         } else if should_ack_skdm_only_session_fallback(session_outcome, bot_payloads.is_empty()) {
             // SKDM-only session decrypts skip dispatch, so this stanza would
             // otherwise stay queued. WA Web and whatsmeow ack every decrypted
@@ -1164,9 +1165,10 @@ impl Client {
                     );
                     // Redelivered duplicate: ack it so the server drops it from the
                     // offline queue. status is already acked by the should_ack gate,
-                    // so skip it to avoid a redundant receipt.
+                    // so skip it to avoid a redundant receipt. With a durability hook,
+                    // a buffered copy means the original commit never acked: replay it.
                     if !info.source.chat.is_status_broadcast() {
-                        self.ack_received_message(info);
+                        self.ack_or_replay_to_hook(info).await;
                     }
                 }
                 Err(SignalProtocolError::NoSenderKeyState(msg)) => {

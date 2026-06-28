@@ -7,6 +7,10 @@
 //! concurrently running sibling test would bleed its allocations into the
 //! measurement (seen once in CI).
 
+// Host-only allocation-count harness; std's 64-bit atomic is fine (never built
+// for embedded targets).
+#![allow(clippy::disallowed_types)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use wacore_binary::builder::NodeBuilder;

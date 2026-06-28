@@ -9,6 +9,9 @@
 // Large `--all-features` async fns (tracing + tracing-pii) need a deeper
 // recursion limit; matches `src/lib.rs` and the e2e crate.
 #![recursion_limit = "512"]
+// Host-only bench harness (counting allocator + unique-body counter); std's
+// 64-bit atomic is fine since this never builds for embedded targets.
+#![allow(clippy::disallowed_types)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::OnceLock;

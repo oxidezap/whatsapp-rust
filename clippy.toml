@@ -4,3 +4,11 @@ disallowed-methods = [
     { path = "std::time::SystemTime::now", reason = "use wacore::time::now_millis() / now_utc()" },
     { path = "std::time::Instant::now", reason = "use wacore::time::Instant::now()" },
 ]
+
+# 64-bit atomic *types*: 32-bit targets (Xtensa/ESP32) have no native AtomicU64/
+# AtomicI64, so they are absent from std/core there. portable_atomic provides a
+# transparent fallback. Host-only test/bench counters carry an inline allow.
+disallowed-types = [
+    { path = "std::sync::atomic::AtomicU64", reason = "use portable_atomic::AtomicU64 (no native 64-bit atomics on 32-bit targets like Xtensa/ESP32)" },
+    { path = "std::sync::atomic::AtomicI64", reason = "use portable_atomic::AtomicI64 (no native 64-bit atomics on 32-bit targets like Xtensa/ESP32)" },
+]

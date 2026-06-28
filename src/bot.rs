@@ -5,6 +5,7 @@ use crate::store::commands::DeviceCommand;
 use crate::store::error::StoreError;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::store::traits::Backend;
+use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
 use crate::types::events::{Event, EventHandler, EventInterest, EventKind};
 use crate::types::message::MessageInfo;
@@ -85,6 +86,49 @@ pub enum BotBuilderError {
     /// Initializing the device row in the storage backend failed.
     #[error("failed to initialize the device store: {0}")]
     Store(#[from] StoreError),
+    /// An inbound durability hook was registered with a backend that does not
+    /// implement the pending-inbound buffer it requires.
+    #[error("the configured backend does not support the inbound durability hook: {0}")]
+    UnsupportedDurabilityBackend(String),
+}
+
+/// Verify the backend round-trips a pending-inbound buffer entry before we accept
+/// an inbound durability hook. A backend relying on the no-op/`Err` trait
+/// defaults fails here instead of silently looping every inbound message unacked.
+async fn probe_durability_backend(
+    backend: &std::sync::Arc<dyn Backend>,
+) -> std::result::Result<(), BotBuilderError> {
+    // A real JID (a backend may validate the format) and an id unique per probe
+    // invocation (pid + atomic counter) so concurrent builders on the same store
+    // never race on a shared probe row and false-fail.
+    use portable_atomic::{AtomicU64, Ordering};
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    const PROBE_JID: &str = "0@s.whatsapp.net";
+    const PROBE_PAYLOAD: &[u8] = b"probe";
+    let probe_id = format!(
+        "__wa_durability_probe_{}_{}__",
+        std::process::id(),
+        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let map_err = |e: StoreError| BotBuilderError::UnsupportedDurabilityBackend(e.to_string());
+    backend
+        .store_pending_inbound(PROBE_JID, PROBE_JID, &probe_id, PROBE_PAYLOAD)
+        .await
+        .map_err(map_err)?;
+    let got = backend
+        .get_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
+        .await
+        .map_err(map_err)?;
+    backend
+        .delete_pending_inbound(PROBE_JID, PROBE_JID, &probe_id)
+        .await
+        .map_err(map_err)?;
+    if got.as_deref() != Some(PROBE_PAYLOAD) {
+        return Err(BotBuilderError::UnsupportedDurabilityBackend(
+            "pending-inbound buffer did not round-trip".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// `message` is `Arc` so cloning the context across spawned tasks only bumps a
@@ -488,6 +532,7 @@ pub struct BotBuilder<
     event_handlers: Vec<RegisteredHandler>,
     raw_handlers: Vec<Arc<dyn EventHandler>>,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
+    inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
     override_version: Option<(u32, u32, u32)>,
     device_props_override: Option<DevicePropsOverride>,
     pair_code_options: Option<PairCodeOptions>,
@@ -509,6 +554,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             event_handlers: Vec::new(),
             raw_handlers: Vec::new(),
             custom_enc_handlers: HashMap::new(),
+            inbound_durability_hook: None,
             override_version: None,
             device_props_override: None,
             pair_code_options: None,
@@ -534,6 +580,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             event_handlers: self.event_handlers,
             raw_handlers: self.raw_handlers,
             custom_enc_handlers: self.custom_enc_handlers,
+            inbound_durability_hook: self.inbound_durability_hook,
             override_version: self.override_version,
             device_props_override: self.device_props_override,
             pair_code_options: self.pair_code_options,
@@ -744,6 +791,23 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     {
         self.custom_enc_handlers
             .insert(enc_type.into(), Arc::new(handler));
+        self
+    }
+
+    /// Register an inbound durability hook for at-least-once delivery.
+    ///
+    /// By default the client acks a message as soon as it is decrypted
+    /// (at-most-once): a crash or failed commit before the consumer persists it
+    /// loses the message. With a hook registered, the ack is deferred until the
+    /// hook commits the message; on failure the message is redelivered on the
+    /// next connect. The hook must be idempotent (dedupe by `(chat, sender, id)`,
+    /// since stanza ids are only unique within a chat/sender). See
+    /// [`InboundDurabilityHook`] for the full contract and caveats.
+    pub fn with_inbound_durability_hook<Dh>(mut self, hook: Dh) -> Self
+    where
+        Dh: InboundDurabilityHook + 'static,
+    {
+        self.inbound_durability_hook = Some(Arc::new(hook));
         self
     }
 
@@ -968,6 +1032,16 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         // Register custom enc handlers. Immutable after build, so set the whole
         // map once; the receive hot path then reads it lock-free.
         let _ = client.custom_enc_handlers.set(self.custom_enc_handlers);
+
+        // Inbound durability hook (opt-in). Immutable after build; the receive
+        // path reads it lock-free. Probe the backend first: a backend that does
+        // not implement the pending-inbound buffer would otherwise leave every
+        // inbound message unacked and looping forever at runtime, so reject it
+        // here with a clear error instead.
+        if let Some(hook) = self.inbound_durability_hook {
+            probe_durability_backend(&client.persistence_manager.backend()).await?;
+            let _ = client.inbound_durability_hook.set(hook);
+        }
 
         if self.skip_history_sync {
             client.set_skip_history_sync(true);

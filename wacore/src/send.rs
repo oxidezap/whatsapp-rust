@@ -75,7 +75,6 @@ mod status;
 pub use classify::*;
 #[cfg(test)]
 pub(crate) use dm::partition_dm_devices;
-pub(crate) use dm::pkmsg_would_be_emitted;
 pub use dm::*;
 pub use encrypt::*;
 pub use group::*;

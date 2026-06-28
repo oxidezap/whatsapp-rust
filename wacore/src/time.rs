@@ -208,14 +208,14 @@ impl MonotonicProvider for StdMonotonicProvider {
 /// a real provider via [`set_monotonic_provider`] for sub-ms precision.
 #[cfg(target_arch = "wasm32")]
 struct WallDerivedMonotonicProvider {
-    last: std::sync::atomic::AtomicU64,
+    last: portable_atomic::AtomicU64,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl WallDerivedMonotonicProvider {
     const fn new() -> Self {
         Self {
-            last: std::sync::atomic::AtomicU64::new(0),
+            last: portable_atomic::AtomicU64::new(0),
         }
     }
 }

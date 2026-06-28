@@ -11,6 +11,7 @@ A high-performance, async Rust library for the WhatsApp Web API. Inspired by [wh
 - **Authentication** — QR code pairing, pair code linking, persistent sessions
 - **Messaging** — E2E encrypted (Signal Protocol), 1-on-1 and group chats, editing, reactions, quoting, receipts
 - **Media** — Upload/download images, videos, documents, GIFs, audio with automatic encryption
+- **Voice calls** — 1:1 VoIP audio calls (incoming and outgoing) behind the optional `voip` feature
 - **Groups & Communities** — Create, manage, invite, membership approval, subgroup linking
 - **Newsletters** — Create, join, send messages, reactions
 - **Status** — Text, image, and video status posts with privacy controls

@@ -339,8 +339,20 @@ impl Client {
         Ok(())
     }
 
+    /// Whether `message_encrypt` for `jid` would emit a pkmsg (no session, or a
+    /// session with an un-acked pre-key still pending). Reuses the send path's
+    /// pre-flight so the voip offer treats a session-present-but-unacked device as
+    /// pkmsg too, not as plain msg.
+    #[cfg(feature = "voip")]
+    pub(crate) async fn would_emit_pkmsg(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
+        let device_store = self.persistence_manager.get_device_arc().await;
+        let mut adapter = self.signal_adapter_from(device_store);
+        let signal_addr = jid.to_protocol_address();
+        wacore::send::pkmsg_would_be_emitted(&mut adapter.session_store, &signal_addr).await
+    }
+
     /// Check if a session exists for the given JID.
-    async fn check_session_exists(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
+    pub(crate) async fn check_session_exists(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let signal_addr = jid.to_protocol_address();
 

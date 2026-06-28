@@ -2848,6 +2848,115 @@ impl ProtocolStore for SqliteStore {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))?
     }
+
+    async fn store_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+        message: &[u8],
+    ) -> Result<()> {
+        let chat = chat.to_string();
+        let sender = sender.to_string();
+        let id = id.to_string();
+        // Arc avoids cloning the payload bytes on each retry iteration.
+        let message: Arc<Vec<u8>> = Arc::new(message.to_vec());
+        let device_id = self.device_id;
+        self.with_retry("store_pending_inbound", || {
+            let chat = chat.clone();
+            let sender = sender.clone();
+            let id = id.clone();
+            let message = Arc::clone(&message);
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::replace_into(pending_inbound_messages::table)
+                    .values((
+                        pending_inbound_messages::chat.eq(&chat),
+                        pending_inbound_messages::sender.eq(&sender),
+                        pending_inbound_messages::id.eq(&id),
+                        pending_inbound_messages::message.eq(message.as_slice()),
+                        pending_inbound_messages::device_id.eq(device_id),
+                    ))
+                    .execute(conn)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    async fn get_pending_inbound(
+        &self,
+        chat: &str,
+        sender: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let chat = chat.to_string();
+        let sender = sender.to_string();
+        let id = id.to_string();
+        let device_id = self.device_id;
+        // Retry on SQLITE_BUSY: a transient lock here must not surface as a read
+        // failure, which fails closed and forces an unnecessary redelivery.
+        self.with_retry("get_pending_inbound", || {
+            let chat = chat.clone();
+            let sender = sender.clone();
+            let id = id.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                let row: Option<Vec<u8>> = pending_inbound_messages::table
+                    .select(pending_inbound_messages::message)
+                    .filter(pending_inbound_messages::chat.eq(&chat))
+                    .filter(pending_inbound_messages::sender.eq(&sender))
+                    .filter(pending_inbound_messages::id.eq(&id))
+                    .filter(pending_inbound_messages::device_id.eq(device_id))
+                    .first(conn)
+                    .optional()?;
+                Ok(row)
+            })
+        })
+        .await
+    }
+
+    async fn delete_pending_inbound(&self, chat: &str, sender: &str, id: &str) -> Result<()> {
+        let chat = chat.to_string();
+        let sender = sender.to_string();
+        let id = id.to_string();
+        let device_id = self.device_id;
+        self.with_retry("delete_pending_inbound", || {
+            let chat = chat.clone();
+            let sender = sender.clone();
+            let id = id.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::delete(
+                    pending_inbound_messages::table
+                        .filter(pending_inbound_messages::chat.eq(&chat))
+                        .filter(pending_inbound_messages::sender.eq(&sender))
+                        .filter(pending_inbound_messages::id.eq(&id))
+                        .filter(pending_inbound_messages::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    async fn delete_expired_pending_inbound(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        tokio::task::spawn_blocking(move || -> Result<u32> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            let deleted = diesel::delete(
+                pending_inbound_messages::table
+                    .filter(pending_inbound_messages::inserted_at.lt(cutoff_timestamp))
+                    .filter(pending_inbound_messages::device_id.eq(device_id)),
+            )
+            .execute(&mut conn)
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(deleted as u32)
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))?
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]

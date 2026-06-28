@@ -348,18 +348,67 @@ impl<'a> Groups<'a> {
         Ok(info)
     }
 
+    /// Backfills each LID participant's `phone_number` from the client's LID-PN
+    /// cache (`get_lid_pn_entry`, same warm-cache + backend path `create_group`
+    /// uses). The server often omits the attribute on `<participant>` nodes of
+    /// LID-addressed groups, so consumers keying data by PN would treat current
+    /// members as absent. No-op outside LID-addressed groups or when the PN is
+    /// already present; unknown mappings leave the participant untouched.
+    async fn fill_participant_pns(&self, meta: &mut GroupMetadata) {
+        if meta.addressing_mode != AddressingMode::Lid {
+            return;
+        }
+        // Participants the server left PN-less, kept with their index.
+        let pending: Vec<(usize, Jid)> = meta
+            .participants
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.phone_number.is_none() && p.jid.is_lid())
+            .map(|(i, p)| (i, p.jid.clone()))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+
+        // Cache hits are in-memory, but a cold cache falls back to the DB and a
+        // large group would otherwise serialize those lookups — bounded fan-out.
+        use futures::StreamExt;
+        let resolved: Vec<(usize, Jid)> = futures::stream::iter(pending)
+            .map(|(i, jid)| async move {
+                let pn = self
+                    .client
+                    .get_lid_pn_entry(&jid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|e| Jid::pn(&*e.phone_number));
+                (i, pn)
+            })
+            .buffer_unordered(16)
+            .filter_map(|(i, pn)| async move { pn.map(|pn| (i, pn)) })
+            .collect()
+            .await;
+
+        for (i, pn) in resolved {
+            meta.participants[i].phone_number = Some(pn);
+        }
+    }
+
     pub async fn get_participating(&self) -> Result<HashMap<Jid, GroupMetadata>, GroupError> {
         let response = self.client.execute(GroupParticipatingIq::new()).await?;
 
-        let result = response
+        let mut result: HashMap<Jid, GroupMetadata> = response
             .groups
             .into_iter()
             .map(|group| {
                 let key = group.id.clone();
-                let metadata = GroupMetadata::from(group);
-                (key, metadata)
+                (key, GroupMetadata::from(group))
             })
             .collect();
+
+        for meta in result.values_mut() {
+            self.fill_participant_pns(meta).await;
+        }
 
         Ok(result)
     }
@@ -367,7 +416,11 @@ impl<'a> Groups<'a> {
     pub async fn get_metadata(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
         // No phash is sent, so the server always returns the full group.
         match self.client.execute(GroupQueryIq::new(jid)).await? {
-            GroupInfoOutcome::Full(group) => Ok(GroupMetadata::from(*group)),
+            GroupInfoOutcome::Full(group) => {
+                let mut meta = GroupMetadata::from(*group);
+                self.fill_participant_pns(&mut meta).await;
+                Ok(meta)
+            }
             GroupInfoOutcome::NotModified => Err(GroupError::InvalidRequest(
                 "group query returned not-modified without a phash".into(),
             )),
@@ -1209,6 +1262,59 @@ mod tests {
         assert_eq!(metadata.participants.len(), 1);
         assert!(metadata.participants[0].is_admin());
         assert!(!metadata.participants[0].is_super_admin());
+    }
+
+    #[tokio::test]
+    async fn fill_participant_pns_backfills_from_cache() {
+        use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+        use wacore_binary::jid::{Jid, Server};
+
+        let client = crate::test_utils::create_test_client().await;
+        // Warm the LID-PN cache with a mapping the server didn't echo on the
+        // participant stanza.
+        let entry = LidPnEntry::new(
+            "26263000000099".to_string(),
+            "5521900000099".to_string(),
+            LearningSource::Usync,
+        );
+        client.lid_pn_cache.add(&entry).await;
+
+        let mut meta = GroupMetadata {
+            id: "120399@g.us".parse().unwrap(),
+            participants: vec![GroupParticipant {
+                jid: Jid::new("26263000000099", Server::Lid),
+                phone_number: None,
+                participant_type: ParticipantType::Member,
+            }],
+            addressing_mode: AddressingMode::Lid,
+            ..Default::default()
+        };
+        client.groups().fill_participant_pns(&mut meta).await;
+        assert_eq!(
+            meta.participants[0].phone_number,
+            Some(Jid::pn("5521900000099")),
+            "LID participant should receive its PN from the warm cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_participant_pns_noop_in_pn_group() {
+        use wacore_binary::jid::{Jid, Server};
+
+        let client = crate::test_utils::create_test_client().await;
+        // PN-addressed group: untouched (jid already is the PN).
+        let mut meta = GroupMetadata {
+            id: "120398@g.us".parse().unwrap(),
+            participants: vec![GroupParticipant {
+                jid: Jid::new("5521900000098", Server::Pn),
+                phone_number: None,
+                participant_type: ParticipantType::Member,
+            }],
+            addressing_mode: AddressingMode::Pn,
+            ..Default::default()
+        };
+        client.groups().fill_participant_pns(&mut meta).await;
+        assert_eq!(meta.participants[0].phone_number, None);
     }
 
     #[test]

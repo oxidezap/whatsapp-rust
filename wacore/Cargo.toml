@@ -6,6 +6,9 @@ authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
 description = "Core WhatsApp protocol implementation without runtime dependencies"
+# Only the explicit [[bench]] targets below are built; never auto-discover benches/*.rs, so a stray
+# untracked file on a reused CI runner can't get compiled as a phantom bench.
+autobenches = false
 
 # `getrandom` is pulled only to forward the `js` feature (wasm getrandom backend);
 # there is no direct `use`, so static analysers flag it as unused.
@@ -29,9 +32,17 @@ danger-skip-cert-chain-verify = ["wacore-noise/danger-skip-cert-chain-verify"]
 # Enable JS-based random number generation for wasm32 targets.
 # Activates getrandom's wasm_js backend so rand works in the browser.
 js = ["getrandom/wasm_js"]
+# VoIP/calls media crypto (SRTP, SFrame, WAHKDF). Pure, no-Tokio. Off by default:
+# the media plane is opt-in and pulls aes-gcm into the non-dev build. The MLow codec's
+# runtime constant tables are zlib-compressed protobuf (prost, see tables.proto).
+voip = ["dep:aes-gcm"]
+# Heap profiling of the codec hot paths via the `voip_profile` example (dhat as global allocator).
+# Dev/profiling only; off by default and not pulled into normal builds.
+dhat-heap = ["dep:dhat"]
 
 [dependencies]
 aes = { workspace = true }
+aes-gcm = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
 async-lock = { workspace = true }
@@ -41,6 +52,7 @@ bytes = { workspace = true }
 chrono = { workspace = true, features = ["now", "serde"] }
 compact_str = { workspace = true }
 ctr = { workspace = true }
+dhat = { version = "0.3", optional = true }
 event-listener = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true, features = ["std"] }
@@ -89,12 +101,26 @@ name = "history_sync_benchmark"
 harness = false
 
 [[bench]]
+name = "sframe_varint_benchmark"
+harness = false
+required-features = ["voip"]
+
+[[bench]]
 name = "message_utils_benchmark"
 harness = false
 
 [[bench]]
 name = "appstate_sync_benchmark"
 harness = false
+
+[[bench]]
+name = "voip_benchmark"
+harness = false
+required-features = ["voip"]
+
+[[example]]
+name = "voip_profile"
+required-features = ["voip"]
 
 [lints]
 workspace = true

@@ -249,6 +249,25 @@ impl Client {
                 .detach();
         }
 
+        // Pending inbound buffer retention (inbound durability hook): a row a
+        // permanently-failing hook never commits would otherwise linger once the
+        // server stops redelivering it. Run unconditionally (not gated on the hook
+        // being set now) so rows buffered by a hook in a previous run are still
+        // swept after it is disabled. Backends without the buffer return 0 from
+        // the default impl, so this is a cheap no-op there.
+        {
+            const PENDING_INBOUND_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+            let backend = self.persistence_manager.backend();
+            let cutoff = cutoff_for(PENDING_INBOUND_TTL_SECS);
+            self.runtime
+                .spawn(Box::pin(async move {
+                    if let Err(e) = backend.delete_expired_pending_inbound(cutoff).await {
+                        log::debug!(target: "Client/Keepalive", "Pending inbound cleanup error: {e}");
+                    }
+                }))
+                .detach();
+        }
+
         // msg_secrets retention: prune rows whose per-row deadline has passed.
         // expires_at is absolute, so the cutoff is simply "now"; per-kind
         // horizons and never-expire (0) rows are baked in at write time.
