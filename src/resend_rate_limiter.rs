@@ -32,14 +32,16 @@ pub(crate) const DEFAULT_RESEND_BURST: u32 = 20;
 /// yet above any healthy chat's steady resend need.
 pub(crate) const DEFAULT_RESEND_REFILL_PER_MIN: u32 = 10;
 
-struct TokenBucket {
+/// Lazy-refill token bucket. Shared with [`crate::retry_receipt_limiter`], which
+/// applies the same arithmetic per sender instead of per chat.
+pub(crate) struct TokenBucket {
     tokens: f64,
     last_refill: Instant,
 }
 
 impl TokenBucket {
     #[inline]
-    fn new(initial: f64, now: Instant) -> Self {
+    pub(crate) fn new(initial: f64, now: Instant) -> Self {
         Self {
             tokens: initial,
             last_refill: now,
@@ -52,7 +54,7 @@ impl TokenBucket {
     /// cannot accumulate an unbounded reserve and a lowered `burst` takes effect
     /// on the next access.
     #[inline]
-    fn try_take(&mut self, now: Instant, burst: f64, refill_per_sec: f64) -> bool {
+    pub(crate) fn try_take(&mut self, now: Instant, burst: f64, refill_per_sec: f64) -> bool {
         let elapsed = now
             .saturating_duration_since(self.last_refill)
             .as_secs_f64();

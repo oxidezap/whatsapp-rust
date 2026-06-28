@@ -80,6 +80,24 @@ impl Client {
         self.resend_rate_limiter.throttled_total()
     }
 
+    /// Retune the per-sender inbound retry-receipt rate limit. Bounds the
+    /// aggregate retry-receipt rate to a sender so a chronically undecryptable
+    /// peer cannot storm us into AccountLocked; a throttled receipt is
+    /// acked-and-dropped instead. A `burst` of 0 disables the limiter.
+    ///
+    /// Takes effect on each sender's next decrypt failure; a lowered `burst`
+    /// clamps a live bucket on its next access.
+    pub fn set_retry_receipt_rate_limit(&self, burst: u32, refill_per_min: u32) {
+        self.retry_receipt_limiter.set_rate(burst, refill_per_min);
+    }
+
+    /// Total inbound retry receipts dropped by the per-sender rate limiter since
+    /// start. Surfaces chronically broken senders without the
+    /// `debug-diagnostics` feature.
+    pub fn retry_receipts_throttled_total(&self) -> u64 {
+        self.retry_receipt_limiter.throttled_total()
+    }
+
     /// Returns a snapshot of all internal collection sizes for memory leak detection.
     ///
     /// Moka caches report approximate counts (pending evictions may not be reflected).
@@ -117,6 +135,8 @@ impl Client {
             chat_lanes: self.chat_lanes.entry_count(),
             resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
             resends_throttled_total: self.resend_rate_limiter.throttled_total(),
+            retry_receipt_limiter_senders: self.retry_receipt_limiter.entry_count(),
+            retry_receipts_throttled_total: self.retry_receipt_limiter.throttled_total(),
             response_waiters: self.response_waiters.lock().await.len(),
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,

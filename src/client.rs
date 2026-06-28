@@ -199,6 +199,9 @@ pub struct MemoryDiagnostics {
     pub resend_rate_limiter_chats: u64,
     /// Total outbound resends dropped by the per-chat rate limiter since start.
     pub resends_throttled_total: u64,
+    pub retry_receipt_limiter_senders: u64,
+    /// Total inbound retry receipts dropped by the per-sender rate limiter since start.
+    pub retry_receipts_throttled_total: u64,
     // -- Unbounded collections --
     pub response_waiters: usize,
     pub node_waiters: usize,
@@ -253,6 +256,16 @@ impl std::fmt::Display for MemoryDiagnostics {
             f,
             "  resends_throttled:      {}",
             self.resends_throttled_total
+        )?;
+        writeln!(
+            f,
+            "  retry_receipt_rl_senders: {}",
+            self.retry_receipt_limiter_senders
+        )?;
+        writeln!(
+            f,
+            "  retry_receipts_throttled: {}",
+            self.retry_receipts_throttled_total
         )?;
         writeln!(f, "--- Unbounded collections ---")?;
         writeln!(f, "  response_waiters:       {}", self.response_waiters)?;
@@ -496,6 +509,11 @@ pub struct Client {
     /// to a chat (the anti-abuse signal) so a PN to LID fan-out cannot storm into
     /// AccountLocked. Throttled devices still recover via the fresh-SKDM mark.
     pub(crate) resend_rate_limiter: crate::resend_rate_limiter::ResendRateLimiter,
+
+    /// Per-sender inbound retry-receipt rate limiter: bounds the aggregate
+    /// retry-receipt rate to a sender so a chronically undecryptable peer cannot
+    /// storm us into AccountLocked. Throttled receipts are acked-and-dropped.
+    pub(crate) retry_receipt_limiter: crate::retry_receipt_limiter::RetryReceiptLimiter,
 
     /// Dispatch-once gate for `UndecryptableMessage`: a server resend of a
     /// failed id re-enters the failure path and would otherwise fire a

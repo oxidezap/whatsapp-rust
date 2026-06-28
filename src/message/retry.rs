@@ -62,6 +62,13 @@ impl Client {
     /// gate, which can be dropped mid-flush on disconnect; the server dedups the
     /// resulting duplicate ack.
     ///
+    /// Exception: when the per-sender [`retry_receipt_limiter`] is exhausted
+    /// (a sender whose session is chronically broken), the message is
+    /// deliberately ack-and-dropped — the ack goes out *without* a retry so the
+    /// server stops redelivering, rather than asking for a resend forever.
+    ///
+    /// [`retry_receipt_limiter`]: crate::retry_receipt_limiter
+    ///
     /// Returns `true` to be assigned to `dispatched_undecryptable` flag.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.decrypt_failure", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, reason = ?reason)))]
     pub(crate) async fn handle_decrypt_failure(
@@ -92,6 +99,25 @@ impl Client {
                 && Self::should_send_delivery_receipt(&info)
             {
                 client.send_delivery_receipt(&info).await;
+                return;
+            }
+            // Bound the aggregate retry-receipt rate per sender. A chronically
+            // broken session fails every message, so the per-id retry cap
+            // (MAX_DECRYPT_RETRIES) never bounds the per-sender total and we'd
+            // ask for a resend forever — an AccountLocked-class outbound storm.
+            // When throttled, ack-and-drop: clear the stanza from the offline
+            // queue (stops redelivery) rather than ask again. The session still
+            // self-heals as the bucket refills and a fresh handshake recovers it.
+            if !client
+                .retry_receipt_limiter
+                .try_acquire(&info.source.sender)
+                .await
+            {
+                log::debug!(
+                    "Throttling retry receipt to {}: per-sender retry-receipt rate cap reached",
+                    info.source.sender.observe()
+                );
+                client.send_transport_ack(&info).await;
                 return;
             }
             // Only ack once the resend request is actually out; otherwise leave
