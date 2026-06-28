@@ -60,6 +60,25 @@ pub mod codec {
         msg.encode_to_vec()
     }
 
+    /// Two-pass encode with a caller-owned `SizeCache`: `compute_size` fills the
+    /// cache, `write_to` reuses it. The send path needs the size before writing
+    /// (to pre-size buffers and splice nested fields by hand), so it drives the
+    /// two passes itself instead of calling `encode`. Pinning both keeps the
+    /// `Message` encode tree out of the calling crate.
+    #[inline(never)]
+    pub fn message_compute_size(msg: &whatsapp::Message, cache: &mut buffa::SizeCache) -> usize {
+        msg.compute_size(cache) as usize
+    }
+
+    #[inline(never)]
+    pub fn message_write_to(
+        msg: &whatsapp::Message,
+        cache: &mut buffa::SizeCache,
+        out: &mut Vec<u8>,
+    ) {
+        msg.write_to(cache, out);
+    }
+
     #[inline(never)]
     pub fn message_decode(bytes: &[u8]) -> Result<whatsapp::Message, buffa::DecodeError> {
         whatsapp::Message::decode_from_slice(bytes)
@@ -106,6 +125,27 @@ pub mod codec {
     #[inline(never)]
     pub fn message_context_info_to_vec(mci: &whatsapp::MessageContextInfo) -> Vec<u8> {
         mci.encode_to_vec()
+    }
+
+    /// `SizeCache`-driven two-pass encode for `MessageContextInfo`, mirroring
+    /// [`message_compute_size`]/[`message_write_to`]; the send path splices the
+    /// mci as a nested length-delimited field, so it needs the size before the
+    /// write.
+    #[inline(never)]
+    pub fn message_context_info_compute_size(
+        mci: &whatsapp::MessageContextInfo,
+        cache: &mut buffa::SizeCache,
+    ) -> usize {
+        mci.compute_size(cache) as usize
+    }
+
+    #[inline(never)]
+    pub fn message_context_info_write_to(
+        mci: &whatsapp::MessageContextInfo,
+        cache: &mut buffa::SizeCache,
+        out: &mut Vec<u8>,
+    ) {
+        mci.write_to(cache, out);
     }
 
     /// Merge wire bytes into an existing `MessageContextInfo` (proto merge

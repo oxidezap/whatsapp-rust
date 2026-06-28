@@ -1,7 +1,11 @@
 use crate::libsignal::crypto::CryptographicHash;
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
-use buffa::{Message as ProtoMessage, MessageView};
+use buffa::MessageView;
+// Encode/decode of proto trees is routed through `waproto::codec` so the tree is
+// instantiated once in waproto; tests still call the trait methods directly.
+#[cfg(test)]
+use buffa::Message as _;
 use waproto::whatsapp as wa;
 
 pub struct MessageUtils;
@@ -30,9 +34,9 @@ impl MessageUtils {
     pub fn encode_and_pad(msg: &wa::Message) -> Vec<u8> {
         let pad = Self::random_pad_len();
         let mut cache = buffa::SizeCache::new();
-        let size = msg.compute_size(&mut cache) as usize;
+        let size = waproto::codec::message_compute_size(msg, &mut cache);
         let mut buf = Vec::with_capacity(size + pad as usize);
-        msg.write_to(&mut cache, &mut buf);
+        waproto::codec::message_write_to(msg, &mut cache, &mut buf);
         buf.resize(buf.len() + pad as usize, pad);
         buf
     }
@@ -57,13 +61,13 @@ impl MessageUtils {
             let mut c_cache = buffa::SizeCache::new();
             len_delimited_len(
                 TAG_MESSAGE_CONTEXT_INFO,
-                c.compute_size(&mut c_cache) as usize,
+                waproto::codec::message_context_info_compute_size(c, &mut c_cache),
             )
         });
         let mut msg_cache = buffa::SizeCache::new();
-        let msg_size = msg.compute_size(&mut msg_cache) as usize;
+        let msg_size = waproto::codec::message_compute_size(msg, &mut msg_cache);
         let mut buf = Vec::with_capacity(msg_size + extra_len + pad as usize);
-        msg.write_to(&mut msg_cache, &mut buf);
+        waproto::codec::message_write_to(msg, &mut msg_cache, &mut buf);
         if let Some(c) = extra_context {
             push_message_field(TAG_MESSAGE_CONTEXT_INFO, c, &mut buf);
         }
@@ -86,7 +90,7 @@ impl MessageUtils {
             let mut c_cache = buffa::SizeCache::new();
             len_delimited_len(
                 TAG_MESSAGE_CONTEXT_INFO,
-                c.compute_size(&mut c_cache) as usize,
+                waproto::codec::message_context_info_compute_size(c, &mut c_cache),
             )
         });
         let mut buf = Vec::with_capacity(content.len() + extra_len + pad as usize);
@@ -135,8 +139,11 @@ impl MessageUtils {
                     .message_context_info
                     .as_option_mut()
                     .expect("mci is set");
-                ctx.merge_from_slice(&extra.encode_to_vec())
-                    .expect("merge MessageContextInfo");
+                waproto::codec::message_context_info_merge(
+                    ctx,
+                    &waproto::codec::message_context_info_to_vec(extra),
+                )
+                .expect("merge MessageContextInfo");
             }
             return Self::encode_dm_plaintexts_owned(owned, destination_jid);
         }
@@ -149,17 +156,20 @@ impl MessageUtils {
 
         let mci_field_len = extra_context.map_or(0, |m| {
             let mut c = buffa::SizeCache::new();
-            len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, m.compute_size(&mut c) as usize)
+            len_delimited_len(
+                TAG_MESSAGE_CONTEXT_INFO,
+                waproto::codec::message_context_info_compute_size(m, &mut c),
+            )
         });
         let mut msg_cache = buffa::SizeCache::new();
-        let content_len = message.compute_size(&mut msg_cache) as usize;
+        let content_len = waproto::codec::message_compute_size(message, &mut msg_cache);
         let dest = destination_jid.as_bytes();
 
         // recipient = content (encoded once) + the extra message_context_info field.
         // Pre-size for content + the appended mci field + padding so it never
         // reallocates; the content bytes are then spliced into the own-device buffer.
         let mut recipient = Vec::with_capacity(content_len + mci_field_len + MAX_PAD);
-        message.write_to(&mut msg_cache, &mut recipient);
+        waproto::codec::message_write_to(message, &mut msg_cache, &mut recipient);
 
         // own-device plaintext = Message { device_sent_message { destination_jid,
         // message }, [message_context_info] }. The DeviceSentMessage length is
@@ -203,7 +213,10 @@ impl MessageUtils {
 
         let mci_field_len = extra_context.map_or(0, |m| {
             let mut c = buffa::SizeCache::new();
-            len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, m.compute_size(&mut c) as usize)
+            len_delimited_len(
+                TAG_MESSAGE_CONTEXT_INFO,
+                waproto::codec::message_context_info_compute_size(m, &mut c),
+            )
         });
         let content_len = content.len();
         let dest = destination_jid.as_bytes();
@@ -246,14 +259,17 @@ impl MessageUtils {
         let mci = message.message_context_info.take();
         let mci_field_len = mci.as_ref().map_or(0, |m| {
             let mut c = buffa::SizeCache::new();
-            len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, m.compute_size(&mut c) as usize)
+            len_delimited_len(
+                TAG_MESSAGE_CONTEXT_INFO,
+                waproto::codec::message_context_info_compute_size(m, &mut c),
+            )
         });
         let mut msg_cache = buffa::SizeCache::new();
-        let content_len = message.compute_size(&mut msg_cache) as usize;
+        let content_len = waproto::codec::message_compute_size(&message, &mut msg_cache);
         let dest = destination_jid.as_bytes();
 
         let mut recipient = Vec::with_capacity(content_len + mci_field_len + MAX_PAD);
-        message.write_to(&mut msg_cache, &mut recipient);
+        waproto::codec::message_write_to(&message, &mut msg_cache, &mut recipient);
 
         let dsm_len = len_delimited_len(TAG_DSM_DESTINATION_JID, dest.len())
             + len_delimited_len(TAG_DSM_MESSAGE, content_len);
@@ -494,10 +510,10 @@ fn len_delimited_len(field: u64, payload_len: usize) -> usize {
 #[inline]
 fn push_message_field(field: u64, msg: &wa::MessageContextInfo, out: &mut Vec<u8>) {
     let mut cache = buffa::SizeCache::new();
-    let size = msg.compute_size(&mut cache) as usize;
+    let size = waproto::codec::message_context_info_compute_size(msg, &mut cache);
     push_varint((field << 3) | 2, out);
     push_varint(size as u64, out);
-    msg.write_to(&mut cache, out);
+    waproto::codec::message_context_info_write_to(msg, &mut cache, out);
 }
 
 /// Wrap a message into a DeviceSentMessage for own-device sync, hoisting
@@ -582,7 +598,7 @@ pub fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
     // proto fields only encode when non-default, so encoded length 0 means all
     // remaining fields are at default — i.e. the message has no user content.
     let mut cache = buffa::SizeCache::new();
-    let only = msg.compute_size(&mut cache) == 0;
+    let only = waproto::codec::message_compute_size(msg, &mut cache) == 0;
 
     msg.sender_key_distribution_message = skdm.map(buffa::MessageField::some).unwrap_or_default();
     msg.fast_ratchet_key_sender_key_distribution_message =
