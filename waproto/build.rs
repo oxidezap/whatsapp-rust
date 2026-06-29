@@ -53,6 +53,12 @@ fn main() -> std::io::Result<()> {
     buffa_build::Config::new()
         .descriptor_set(&snake_desc)
         .files(&["whatsapp.proto"])
+        // Box every singular message field. buffa defaults them to inline; for
+        // WhatsApp's deep, many-optional-field messages (every message variant
+        // is its own inline slot) that makes size_of explode recursively,
+        // turning decode and Vec growth into large struct memcpys. Box keeps
+        // the structs pointer-sized.
+        .box_type(buffa_build::PointerRepr::Box)
         // Messages + oneofs: serde over the struct/oneof shape. Serialize always;
         // Deserialize only for the WASM bridge (halves serde codegen).
         .message_attribute(".", "#[derive(serde::Serialize)]")
