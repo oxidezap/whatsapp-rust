@@ -4293,6 +4293,7 @@ dependencies = [
  "log",
  "portable-atomic",
  "prost",
+ "scheduled-thread-pool",
  "serde_json",
  "tokio",
  "wacore",

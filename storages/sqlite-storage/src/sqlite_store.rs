@@ -114,7 +114,10 @@ impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
         diesel::sql_query("PRAGMA synchronous = NORMAL;")
             .execute(conn)
             .map_err(diesel::r2d2::Error::QueryError)?;
-        diesel::sql_query("PRAGMA cache_size = 512;")
+        // Negative = KiB. 512 KiB per connection (was 512 pages = ~2 MiB): a per-device
+        // session DB has a small hot working set, and with one store per WhatsApp session
+        // the page cache is a per-session cost that multiplies across a busy worker.
+        diesel::sql_query("PRAGMA cache_size = -512;")
             .execute(conn)
             .map_err(diesel::r2d2::Error::QueryError)?;
         diesel::sql_query("PRAGMA temp_store = memory;")
@@ -154,21 +157,45 @@ fn parse_database_path(database_url: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
+/// One `ScheduledThreadPool` shared by EVERY store's r2d2 pool. By default r2d2 spawns its
+/// own pool of management threads (connection reaping/creation) per `Pool` — and with one
+/// `SqliteStore` per WhatsApp session that is ~3 idle threads PER SESSION (hundreds of
+/// threads on a busy worker, plus their stacks). Those threads only do infrequent
+/// connection housekeeping, so a single small shared pool serves all stores.
+fn shared_r2d2_thread_pool() -> Arc<scheduled_thread_pool::ScheduledThreadPool> {
+    static POOL: std::sync::OnceLock<Arc<scheduled_thread_pool::ScheduledThreadPool>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        Arc::new(
+            scheduled_thread_pool::ScheduledThreadPool::builder()
+                .num_threads(2)
+                .thread_name_pattern("r2d2-shared-{}")
+                .build(),
+        )
+    })
+    .clone()
+}
+
 impl SqliteStore {
     pub async fn new(database_url: &str) -> std::result::Result<Self, StoreError> {
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
 
-        let pool_size = 2;
+        // One connection suffices: every store op is already serialized through
+        // `db_semaphore` (Semaphore::new(1)) below, so a second pooled connection was only
+        // ever idle overhead (its own SQLite page cache + per-connection structures).
+        let pool_size = 1;
 
         // Local SQLite file connections don't spontaneously drop, so r2d2's
         // default per-checkout liveness probe (a SELECT 1 via Diesel's
         // is_valid) is pure overhead on every store op: any real failure
         // surfaces as a StoreError on the next actual query, so the probe
         // guards nothing here. Skipping it saves a cached SELECT 1 (reset+step)
-        // per pool.get().
+        // per pool.get(). The shared thread pool avoids r2d2's per-pool management
+        // threads (see shared_r2d2_thread_pool).
         let pool = Pool::builder()
             .max_size(pool_size)
             .test_on_check_out(false)
+            .thread_pool(shared_r2d2_thread_pool())
             .connection_customizer(Box::new(ConnectionOptions))
             .build(manager)
             .map_err(|e| StoreError::Connection(Box::new(e)))?;
