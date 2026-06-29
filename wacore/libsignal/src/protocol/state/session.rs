@@ -83,7 +83,9 @@ pub struct DecryptSnapshot {
     receiver_chains: Vec<session_structure::Chain>,
     root_key: Option<Vec<u8>>,
     previous_counter: Option<u32>,
-    sender_chain: MessageField<session_structure::Chain>,
+    // Stored as `Option` rather than `MessageField` so the snapshot doesn't
+    // bind to buffa's sub-message representation (Box vs inline).
+    sender_chain: Option<session_structure::Chain>,
 }
 
 impl SessionState {
@@ -100,7 +102,7 @@ impl SessionState {
             receiver_chains: self.session.receiver_chains.clone(),
             root_key: self.session.root_key.clone(),
             previous_counter: self.session.previous_counter,
-            sender_chain: self.session.sender_chain.clone(),
+            sender_chain: self.session.sender_chain.as_option().cloned(),
         }
     }
 
@@ -112,7 +114,7 @@ impl SessionState {
         self.session.receiver_chains = snap.receiver_chains;
         self.session.root_key = snap.root_key;
         self.session.previous_counter = snap.previous_counter;
-        self.session.sender_chain = snap.sender_chain;
+        self.session.sender_chain = snap.sender_chain.into();
     }
 
     pub fn new(

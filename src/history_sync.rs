@@ -981,15 +981,13 @@ mod tests {
         ts_secs: u64,
         bot_prompt: bool,
     ) -> wa::HistorySyncMsg {
-        let message_context_info: buffa::MessageField<wa::MessageContextInfo> = bot_prompt
-            .then(|| wa::MessageContextInfo {
-                bot_metadata: buffa::MessageField::some(wa::BotMetadata {
-                    persona_id: Some("867051314767696".into()),
-                    ..Default::default()
-                }),
+        let message_context_info = bot_prompt.then(|| wa::MessageContextInfo {
+            bot_metadata: buffa::MessageField::some(wa::BotMetadata {
+                persona_id: Some("867051314767696".into()),
                 ..Default::default()
-            })
-            .into();
+            }),
+            ..Default::default()
+        });
         wa::HistorySyncMsg {
             message: buffa::MessageField::some(wa::WebMessageInfo {
                 key: buffa::MessageField::some(wa::MessageKey {
@@ -1005,7 +1003,7 @@ mod tests {
                             ..Default::default()
                         },
                     ),
-                    message_context_info,
+                    message_context_info: message_context_info.into(),
                     ..Default::default()
                 }),
                 message_secret: Some(secret.to_vec()),
