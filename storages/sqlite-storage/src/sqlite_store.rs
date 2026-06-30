@@ -272,39 +272,49 @@ impl SqliteStore {
         let pool_size = config.pool_size.max(1);
         let thread_pool = config.thread_pool.unwrap_or_else(shared_r2d2_thread_pool);
 
-        // test_on_check_out(false): a local SQLite file connection doesn't spontaneously
-        // drop, so r2d2's per-checkout SELECT 1 liveness probe guards nothing — a real
-        // failure surfaces on the next query. The shared thread pool avoids r2d2's
-        // per-pool management threads (see shared_r2d2_thread_pool).
-        let pool = Pool::builder()
-            .max_size(pool_size)
-            .test_on_check_out(false)
-            .thread_pool(thread_pool)
-            .connection_customizer(Box::new(ConnectionOptions {
-                cache_size_kib: config.cache_size_kib,
-                busy_timeout_ms: config.busy_timeout.as_millis() as u64,
-                synchronous: config.synchronous,
-            }))
-            .build(manager)
-            .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        let options = ConnectionOptions {
+            cache_size_kib: config.cache_size_kib,
+            // Clamp a non-zero timeout up to >=1ms (and to SQLite's signed-int ms range):
+            // as_millis() would truncate a sub-millisecond Duration to 0, which disables the
+            // busy handler instead of keeping a short timeout.
+            busy_timeout_ms: if config.busy_timeout.is_zero() {
+                0
+            } else {
+                config.busy_timeout.as_millis().clamp(1, i32::MAX as u128) as u64
+            },
+            synchronous: config.synchronous,
+        };
 
-        let pool_clone = pool.clone();
-        tokio::task::spawn_blocking(move || -> std::result::Result<(), StoreError> {
-            let mut conn = pool_clone
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+        // r2d2's build() synchronously opens the pool's initial connection, so build the
+        // pool AND run migrations inside one blocking task to keep the async runtime
+        // unblocked (matters when many stores open at once).
+        let pool =
+            tokio::task::spawn_blocking(move || -> std::result::Result<SqlitePool, StoreError> {
+                // test_on_check_out(false): a local SQLite file connection doesn't
+                // spontaneously drop, so r2d2's per-checkout SELECT 1 liveness probe guards
+                // nothing — a real failure surfaces on the next query. The shared thread pool
+                // avoids r2d2's per-pool management threads (see shared_r2d2_thread_pool).
+                let pool = Pool::builder()
+                    .max_size(pool_size)
+                    .test_on_check_out(false)
+                    .thread_pool(thread_pool)
+                    .connection_customizer(Box::new(options))
+                    .build(manager)
+                    .map_err(|e| StoreError::Connection(Box::new(e)))?;
 
-            diesel::sql_query("PRAGMA journal_mode = WAL;")
-                .execute(&mut conn)
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
+                let mut conn = pool
+                    .get()
+                    .map_err(|e| StoreError::Connection(Box::new(e)))?;
+                diesel::sql_query("PRAGMA journal_mode = WAL;")
+                    .execute(&mut conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                conn.run_pending_migrations(MIGRATIONS)
+                    .map_err(StoreError::Migration)?;
 
-            conn.run_pending_migrations(MIGRATIONS)
-                .map_err(StoreError::Migration)?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
+                Ok(pool)
+            })
+            .await
+            .map_err(|e| StoreError::Database(Box::new(e)))??;
 
         let database_path = parse_database_path(database_url)?;
 
@@ -3370,13 +3380,13 @@ mod tests {
         let config = SqliteStoreConfig {
             pool_size: 2,
             cache_size_kib: 4096,
+            busy_timeout: Duration::from_secs(7),
             synchronous: Synchronous::Full,
             thread_pool: Some(Arc::new(
                 scheduled_thread_pool::ScheduledThreadPool::builder()
                     .num_threads(1)
                     .build(),
             )),
-            ..Default::default()
         };
         let store = SqliteStore::with_config(&db_name, config)
             .await
@@ -3395,6 +3405,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, Some(mac.value_mac));
+
+        // The custom PRAGMAs actually reached SQLite, so the config wiring can't silently
+        // regress.
+        #[derive(diesel::QueryableByName)]
+        struct CacheSync {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cache: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            sync: i64,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct Busy {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            timeout: i64,
+        }
+        let mut conn = store.pool.get().unwrap();
+        let cs: CacheSync = diesel::sql_query(
+            "SELECT cs.cache_size AS cache, sy.synchronous AS sync \
+             FROM pragma_cache_size cs, pragma_synchronous sy",
+        )
+        .get_result(&mut conn)
+        .unwrap();
+        let busy: Busy = diesel::sql_query("PRAGMA busy_timeout")
+            .get_result(&mut conn)
+            .unwrap();
+        assert_eq!(cs.cache, -4096, "cache_size_kib applied as negative KiB");
+        assert_eq!(cs.sync, 2, "synchronous = FULL");
+        assert_eq!(busy.timeout, 7000, "busy_timeout = 7s");
     }
 
     #[tokio::test]
