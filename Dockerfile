@@ -60,9 +60,11 @@ RUN rustc -vV > /rustc-version \
     && sed -n 's/^host: //p' /rustc-version > /rust-target \
     && test -s /rust-target \
     && rm /rustc-version
-# Cook with the same --example as the final build so the example's dev-deps
-# (env_logger, …) are cached here instead of recompiling after the source COPY.
-RUN cargo chef cook --release --recipe-path recipe.json --target "$(cat /rust-target)" --example demo
+# Cook examples so the demo's dev-deps (env_logger, …) are cached, not rebuilt
+# after the source COPY. cargo-chef exposes only the plural --examples (no
+# --example <name>); under default features that builds just demo, since the
+# other examples gate on extra features.
+RUN cargo chef cook --release --recipe-path recipe.json --target "$(cat /rust-target)" --examples
 COPY . .
 # The client lives in examples/demo.rs (the package no longer ships a bin); the
 # example artifact lands under release/examples/. Default features cover it.
