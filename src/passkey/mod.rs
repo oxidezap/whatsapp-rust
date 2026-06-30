@@ -46,11 +46,16 @@ pub enum UserVerification {
 }
 
 impl UserVerification {
-    fn parse(s: &str) -> Self {
+    /// Fail closed: a present-but-unrecognized value is rejected rather than
+    /// silently downgraded to `Preferred` (absence is handled by the caller).
+    fn parse(s: &str) -> Result<Self, PasskeyError> {
         match s {
-            "required" => Self::Required,
-            "discouraged" => Self::Discouraged,
-            _ => Self::Preferred,
+            "required" => Ok(Self::Required),
+            "preferred" => Ok(Self::Preferred),
+            "discouraged" => Ok(Self::Discouraged),
+            other => Err(PasskeyError::InvalidOptions(format!(
+                "unsupported userVerification: {other}"
+            ))),
         }
     }
 }
@@ -103,7 +108,13 @@ pub trait PasskeyAuthenticator: Send + Sync {
     async fn get_assertion(&self, request: &AssertionRequest) -> Result<Assertion, PasskeyError>;
 }
 
+// Mirror the trait's `async_trait(?Send)` on wasm: a browser authenticator's
+// future (e.g. awaiting `navigator.credentials.get`) is `!Send`. `cb`/`new`
+// reference this alias, so they pick up the right bound per-target automatically.
+#[cfg(not(target_arch = "wasm32"))]
 type AssertionFuture = Pin<Box<dyn Future<Output = Result<Assertion, PasskeyError>> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type AssertionFuture = Pin<Box<dyn Future<Output = Result<Assertion, PasskeyError>>>>;
 
 /// Generic [`PasskeyAuthenticator`] that defers to a host-provided async closure.
 ///
@@ -151,25 +162,31 @@ pub fn parse_request_options(json: &str) -> Result<AssertionRequest, PasskeyErro
         .and_then(|r| r.as_str())
         .map(|s| s.to_string());
 
+    // Reject malformed descriptors instead of dropping them: silently skipping
+    // entries can collapse a populated allowCredentials into an empty list, which
+    // this API treats as "discoverable" — a confusing, weaker outcome than failing.
     let mut allow_credentials = Vec::new();
-    if let Some(arr) = v.get("allowCredentials").and_then(|a| a.as_array()) {
+    if let Some(allow_credentials_value) = v.get("allowCredentials") {
+        let arr = allow_credentials_value.as_array().ok_or_else(|| {
+            PasskeyError::InvalidOptions("allowCredentials must be an array".into())
+        })?;
         for cred in arr {
-            if let Some(id) = cred.get("id").and_then(|i| i.as_str()) {
-                let bytes = BASE64_URL_SAFE_NO_PAD
-                    .decode(id.trim_end_matches('='))
-                    .map_err(|e| {
-                        PasskeyError::InvalidOptions(format!("credential id b64url: {e}"))
-                    })?;
-                allow_credentials.push(bytes);
-            }
+            let id = cred.get("id").and_then(|i| i.as_str()).ok_or_else(|| {
+                PasskeyError::InvalidOptions("allowCredentials[].id must be a string".into())
+            })?;
+            let bytes = BASE64_URL_SAFE_NO_PAD
+                .decode(id.trim_end_matches('='))
+                .map_err(|e| PasskeyError::InvalidOptions(format!("credential id b64url: {e}")))?;
+            allow_credentials.push(bytes);
         }
     }
 
-    let user_verification = v
-        .get("userVerification")
-        .and_then(|u| u.as_str())
-        .map(UserVerification::parse)
-        .unwrap_or(UserVerification::Preferred);
+    let user_verification = match v.get("userVerification") {
+        None => UserVerification::Preferred,
+        Some(u) => UserVerification::parse(u.as_str().ok_or_else(|| {
+            PasskeyError::InvalidOptions("userVerification must be a string".into())
+        })?)?,
+    };
 
     let timeout_ms = v.get("timeout").and_then(|t| t.as_u64());
 
@@ -240,6 +257,46 @@ mod tests {
     #[test]
     fn missing_challenge_is_error() {
         assert!(parse_request_options("{\"rpId\":\"x\"}").is_err());
+    }
+
+    #[test]
+    fn unknown_user_verification_fails_closed() {
+        let json = serde_json::json!({
+            "challenge": BASE64_URL_SAFE_NO_PAD.encode(b"c"),
+            "userVerification": "sometimes",
+        })
+        .to_string();
+        assert!(matches!(
+            parse_request_options(&json),
+            Err(PasskeyError::InvalidOptions(_))
+        ));
+    }
+
+    #[test]
+    fn absent_user_verification_defaults_to_preferred() {
+        let json =
+            serde_json::json!({ "challenge": BASE64_URL_SAFE_NO_PAD.encode(b"c") }).to_string();
+        let req = parse_request_options(&json).unwrap();
+        assert_eq!(req.user_verification, UserVerification::Preferred);
+    }
+
+    #[test]
+    fn malformed_allow_credentials_is_rejected() {
+        // non-array
+        let json = serde_json::json!({
+            "challenge": BASE64_URL_SAFE_NO_PAD.encode(b"c"),
+            "allowCredentials": "nope",
+        })
+        .to_string();
+        assert!(parse_request_options(&json).is_err());
+
+        // entry without a string id must error, not be silently dropped
+        let json = serde_json::json!({
+            "challenge": BASE64_URL_SAFE_NO_PAD.encode(b"c"),
+            "allowCredentials": [{"type": "public-key"}],
+        })
+        .to_string();
+        assert!(parse_request_options(&json).is_err());
     }
 
     #[test]

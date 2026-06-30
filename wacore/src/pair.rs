@@ -118,6 +118,23 @@ impl PairUtils {
             .build()
     }
 
+    /// Extract the `<device-identity>` bytes from a `pair-success` node, ignoring
+    /// any extra children. SHORTCAKE_PASSKEY (QR-less) pair-success adds
+    /// `<encryption-metadata>`, `<jurisdiction>`, `<client-props>` siblings; the
+    /// companion completes linking purely via this `<device-identity>` (HMAC vs
+    /// the ADV secret), never decrypting the metadata. Returns `None` when the
+    /// child is absent or carries no byte content (caller maps that to a 500).
+    ///
+    /// This is the single production parse point shared by the live handler and
+    /// the passkey regression test, so a child-parsing regression breaks both.
+    pub fn extract_device_identity_bytes<'n, 'a>(
+        success_node: &'n NodeRef<'a>,
+    ) -> Option<&'n [u8]> {
+        success_node
+            .get_optional_child_by_tag(&["device-identity"])
+            .and_then(|n| n.content_bytes())
+    }
+
     /// Performs the cryptographic operations for pairing
     pub fn do_pair_crypto(
         device_state: &DeviceState,
@@ -698,8 +715,6 @@ mod tests {
     // verifies, i.e. NO encryption-metadata decryption is needed.
     #[test]
     fn pair_success_with_passkey_encryption_metadata_completes_via_device_identity() {
-        use wacore_binary::node::NodeContent;
-
         let state = dummy_device_state();
         let payload = build_pair_success_payload(&state, &state.adv_secret_key, false);
 
@@ -731,27 +746,25 @@ mod tests {
                     .bytes(payload.clone())
                     .build(),
                 NodeBuilder::new("device")
-                    .attr("jid", "559984726662:57@s.whatsapp.net")
+                    .attr("jid", "5511999999999:57@s.whatsapp.net")
                     .build(),
             ])
             .build();
 
+        let success_ref = pair_success.as_node_ref();
+
         // The new passkey block is present in the stanza...
         assert!(
-            pair_success
+            success_ref
                 .get_optional_child_by_tag(&["encryption-metadata"])
                 .is_some(),
             "test fixture should include the new encryption-metadata block"
         );
 
-        // ...but the handler extracts <device-identity> by tag, ignoring all extras.
-        let di = pair_success
-            .get_optional_child_by_tag(&["device-identity"])
-            .expect("device-identity must be found among the new passkey children");
-        let di_bytes = match &di.content {
-            Some(NodeContent::Bytes(b)) => b.as_slice(),
-            _ => panic!("device-identity must carry bytes"),
-        };
+        // ...but the PRODUCTION extraction (the same helper the live pair-success
+        // handler calls) pulls <device-identity> by tag, ignoring all extras.
+        let di_bytes = PairUtils::extract_device_identity_bytes(&success_ref)
+            .expect("production extraction must find device-identity among passkey children");
         assert_eq!(di_bytes, payload.as_slice());
 
         // Classic crypto completes the passkey link (HMAC vs ADV secret) — no

@@ -79,7 +79,7 @@ impl ShortcakeUtils {
     /// `public_key` is the RAW 32-byte X25519 pubkey (no 0x05 prefix).
     /// `device_type` is the numeric `DeviceProps.PlatformType` (CHROME = 1).
     pub fn build_companion_ephemeral_identity(
-        public_key: &[u8],
+        public_key: &[u8; 32],
         device_type: i32,
         ref_str: &str,
     ) -> Vec<u8> {
@@ -92,9 +92,10 @@ impl ShortcakeUtils {
     }
 
     /// commitment = SHA256(companionEphemeralIdentityBytes ‖ companionNonce).
+    /// The identity is a variable-length protobuf blob; the nonce is fixed 32 B.
     pub fn commitment_hash(
         companion_ephemeral_identity: &[u8],
-        companion_nonce: &[u8],
+        companion_nonce: &[u8; 32],
     ) -> [u8; 32] {
         let mut h = Sha256::new();
         h.update(companion_ephemeral_identity);
@@ -105,7 +106,7 @@ impl ShortcakeUtils {
     /// Encode the prologue payload protobuf (companion identity + commitment{hash}).
     pub fn build_prologue_payload(
         companion_ephemeral_identity: &[u8],
-        commitment_hash: &[u8],
+        commitment_hash: &[u8; 32],
     ) -> Vec<u8> {
         wa::ProloguePayload {
             companion_ephemeral_identity: Some(companion_ephemeral_identity.to_vec()),
@@ -120,17 +121,10 @@ impl ShortcakeUtils {
     /// `h = SHA256(companionNonce ‖ primaryPublicKey)`; `out[i] = primaryNonce[i] ^ h[i]`
     /// for the first 5 bytes; Crockford base32 → 8 chars.
     pub fn derive_verification_code(
-        companion_nonce: &[u8],
-        primary_public_key: &[u8],
-        primary_nonce: &[u8],
-    ) -> Result<String, ShortcakeError> {
-        if primary_nonce.len() < VERIFICATION_CODE_BYTES {
-            return Err(ShortcakeError::Length {
-                what: "primary_nonce",
-                expected: VERIFICATION_CODE_BYTES,
-                got: primary_nonce.len(),
-            });
-        }
+        companion_nonce: &[u8; 32],
+        primary_public_key: &[u8; 32],
+        primary_nonce: &[u8; 32],
+    ) -> String {
         let mut h = Sha256::new();
         h.update(companion_nonce);
         h.update(primary_public_key);
@@ -139,13 +133,13 @@ impl ShortcakeUtils {
         for (i, slot) in out.iter_mut().enumerate() {
             *slot = primary_nonce[i] ^ digest[i];
         }
-        Ok(PairCodeUtils::encode_crockford(&out))
+        PairCodeUtils::encode_crockford(&out)
     }
 
     /// Derive the AES-256 pairing-request encryption key from the shared secret
     /// (deterministic core, unit-testable). `device_type` is the numeric enum value.
     pub fn derive_encryption_key_from_shared_secret(
-        shared_secret: &[u8],
+        shared_secret: &[u8; 32],
         device_type: i32,
         ref_str: &str,
     ) -> Result<[u8; 32], ShortcakeError> {
@@ -176,9 +170,9 @@ impl ShortcakeUtils {
     /// Encode the inner `PairingRequest` plaintext (companion static + identity
     /// pubkeys + the NEWLY-ROTATED ADV secret) — this is what gets encrypted.
     pub fn build_pairing_request(
-        companion_public_key: &[u8],
-        companion_identity_key: &[u8],
-        adv_secret: &[u8],
+        companion_public_key: &[u8; 32],
+        companion_identity_key: &[u8; 32],
+        adv_secret: &[u8; 32],
     ) -> Vec<u8> {
         wa::PairingRequest {
             companion_public_key: Some(companion_public_key.to_vec()),
@@ -217,7 +211,7 @@ impl ShortcakeUtils {
     /// Derive the pairing-handoff HMAC key from a PRIOR session's 32-byte ADV
     /// secret: HKDF-SHA256(IKM = priorAdvSecret, salt = none, info = handoff label).
     pub fn derive_pairing_handoff_hmac_key(
-        prior_adv_secret: &[u8],
+        prior_adv_secret: &[u8; 32],
     ) -> Result<[u8; 32], ShortcakeError> {
         let hk = Hkdf::<Sha256>::new(None, prior_adv_secret);
         let mut key = [0u8; 32];
@@ -286,8 +280,7 @@ mod tests {
             &companion_nonce,
             &primary_pub,
             &primary_nonce,
-        )
-        .unwrap();
+        );
         // exactly 8 Crockford chars
         assert_eq!(code.len(), 8);
         const CROCKFORD: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTVWXYZ";
@@ -310,16 +303,13 @@ mod tests {
                 &primary_pub,
                 &primary_nonce
             )
-            .unwrap()
         );
     }
 
-    #[test]
-    fn verification_code_rejects_short_primary_nonce() {
-        assert!(
-            ShortcakeUtils::derive_verification_code(&[0u8; 32], &[0u8; 32], &[0u8; 4]).is_err()
-        );
-    }
+    // Note: non-32-byte inputs are now unrepresentable — every fixed-size crypto
+    // field is a `&[u8; 32]` parameter, so a wrong length is a compile error
+    // rather than a runtime `ShortcakeError::Length`. This is strictly stronger
+    // than the previous `verification_code_rejects_short_primary_nonce` test.
 
     #[test]
     fn encryption_key_uses_string_as_salt_not_info() {

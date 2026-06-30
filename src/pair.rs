@@ -180,8 +180,7 @@ async fn handle_pair_success<'a>(
         }
     };
 
-    let device_identity_node = success_node.get_optional_child_by_tag(&["device-identity"]);
-    let device_identity_bytes = match device_identity_node.and_then(|n| n.content_bytes()) {
+    let device_identity_bytes = match PairUtils::extract_device_identity_bytes(success_node) {
         Some(b) => b,
         None => {
             let error_node = PairUtils::build_pair_error_node(&req_id, 500, "internal-error");
