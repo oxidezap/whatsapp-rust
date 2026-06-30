@@ -10,6 +10,12 @@
 # The /data volume persists the SQLite database across restarts. The image runs
 # unprivileged (uid 65532); use a named volume (as below) so it inherits that
 # ownership and stays writable — a host bind mount would need matching ownership.
+#
+# Upgrading from the old root-running image? An existing volume keeps its
+# root-owned files, which uid 65532 can't write. Chown it once with any image
+# that ships chown (scratch doesn't):
+#   docker run --rm -v whatsapp-data:/data alpine chown -R 65532:65532 /data
+#
 # Pass --phone <number> for pair code auth:
 #   docker run -v whatsapp-data:/data whatsapp-rust --phone 15551234567
 
