@@ -55,7 +55,11 @@ COPY rust-toolchain.toml .
 COPY --from=planner /app/recipe.json recipe.json
 # build-std demands an explicit --target; derive the image's own host triple so
 # buildx per-arch builds (linux/amd64, linux/arm64) each target their own arch.
-RUN rustc -vV | sed -n 's/^host: //p' > /rust-target && test -s /rust-target
+# No pipe, so a rustc failure isn't masked by sed's exit status (Hadolint DL4006).
+RUN rustc -vV > /rustc-version \
+    && sed -n 's/^host: //p' /rustc-version > /rust-target \
+    && test -s /rust-target \
+    && rm /rustc-version
 # Cook with the same --example as the final build so the example's dev-deps
 # (env_logger, …) are cached here instead of recompiling after the source COPY.
 RUN cargo chef cook --release --recipe-path recipe.json --target "$(cat /rust-target)" --example demo
