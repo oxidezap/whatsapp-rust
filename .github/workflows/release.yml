@@ -105,6 +105,7 @@ jobs:
   publish-docker:
     name: Publish Docker image
     needs: github-release
+    # docker.yml logs into GHCR and pushes the multi-arch image manifest.
     permissions:
       contents: read
       packages: write
