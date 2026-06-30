@@ -7,4 +7,4 @@ mod schema;
 mod sqlite_store;
 mod wire;
 
-pub use sqlite_store::SqliteStore;
+pub use sqlite_store::{SqliteStore, SqliteStoreConfig, Synchronous};
