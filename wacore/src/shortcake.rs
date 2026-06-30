@@ -1,0 +1,407 @@
+//! SHORTCAKE_PASSKEY companion-linking — platform-independent crypto + protobuf.
+//!
+//! WhatsApp's 2026 passkey/WebAuthn linking gate adds a third `PairingType`
+//! (`QR_CODE`, `ALT_DEVICE_LINKING`, `SHORTCAKE_PASSKEY`). When the account has
+//! the server flag `shortcake_companion_prologue__passkeys__enabled`, linking a
+//! companion requires a WebAuthn assertion (the SOLE unforgeable step) followed
+//! by an ephemeral-identity handshake that ends in an AES-256-GCM-encrypted
+//! `PairingRequest` carrying the newly-rotated ADV secret.
+//!
+//! This module is the deterministic, offline-testable foundation: every function
+//! here is pure crypto / protobuf encoding. The single non-reproducible step —
+//! the WebAuthn assertion — is abstracted behind the host's `PasskeyAuthenticator`
+//! (see the main crate's `passkey` module); it is NOT in this file.
+//!
+//! All constants/labels are reverse-engineered verbatim from WhatsApp Web
+//! (waVersion 2.3000.1042386815, modules `WAWebShortcakeLinking*`). Key facts the
+//! RE pinned down (and which are easy to get wrong):
+//! - companion ephemeral pubkey is RAW 32 bytes (no 0x05 Signal prefix).
+//! - commitment = SHA256(companionEphemeralIdentityBytes ‖ companionNonce).
+//! - verification code = SHA256(companionNonce ‖ primaryPublicKey); then
+//!   `out[i] = primaryNonce[i] ^ digest[i]` for i in 0..5; Crockford-base32 → 8 chars.
+//! - encryption key = HKDF-SHA256(IKM = X25519(companionPriv, primaryPub),
+//!   **salt = "Companion Pairing {deviceTypeNumeric} with ref {ref}"**,
+//!   **info = "Pairing Information Encryption Key"**, len 32). The human-readable
+//!   string is the SALT, not the info; deviceType is the numeric enum (CHROME=1).
+//! - handoff key = HKDF-SHA256(IKM = priorAdvSecret, salt = none, info =
+//!   "shortcake-passkey-handoff-v1", len 32); proof = HMAC-SHA256(key, prologuePayload).
+//!   The handoff only proves ADV-secret continuity for a re-link (suppresses the
+//!   verification-code UX); it does NOT replace the WebAuthn assertion.
+
+use crate::libsignal::crypto::aes_256_gcm_encrypt;
+use crate::libsignal::protocol::{CurveError, KeyPair, PublicKey};
+use crate::pair_code::PairCodeUtils;
+use hkdf::Hkdf;
+use hmac::{Hmac, KeyInit as _, Mac};
+use prost::Message;
+use rand::RngExt;
+use sha2::{Digest, Sha256};
+use waproto::whatsapp as wa;
+
+/// HKDF `info` for the pairing-handoff HMAC key (RE: "shortcake-passkey-handoff-v1").
+const HANDOFF_INFO: &[u8] = b"shortcake-passkey-handoff-v1";
+/// HKDF `info` for the pairing-request encryption key (RE: "Pairing Information Encryption Key").
+const ENC_KEY_INFO: &[u8] = b"Pairing Information Encryption Key";
+/// First N bytes of the verification-code reveal (RE: const s=5 → 8 Crockford chars).
+const VERIFICATION_CODE_BYTES: usize = 5;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShortcakeError {
+    #[error("invalid primary public key: {0}")]
+    InvalidPrimaryKey(CurveError),
+    #[error("X25519 agreement failed: {0}")]
+    KeyAgreement(CurveError),
+    #[error("HKDF expand failed for {0}")]
+    Hkdf(&'static str),
+    #[error("AES-256-GCM encryption failed")]
+    Aead,
+    #[error("unexpected length: {what} expected {expected} got {got}")]
+    Length {
+        what: &'static str,
+        expected: usize,
+        got: usize,
+    },
+}
+
+/// Output of [`ShortcakeUtils::encrypt_pairing_request`].
+pub struct EncryptedPairing {
+    /// AES-256-GCM ciphertext ‖ 16-byte tag (matches WebCrypto's single buffer).
+    pub encrypted_payload: Vec<u8>,
+    /// 12-byte random GCM IV.
+    pub iv: [u8; 12],
+}
+
+/// Platform-independent SHORTCAKE_PASSKEY crypto + protobuf builders.
+pub struct ShortcakeUtils;
+
+impl ShortcakeUtils {
+    /// Encode the companion ephemeral identity protobuf.
+    /// `public_key` is the RAW 32-byte X25519 pubkey (no 0x05 prefix).
+    /// `device_type` is the numeric `DeviceProps.PlatformType` (CHROME = 1).
+    pub fn build_companion_ephemeral_identity(
+        public_key: &[u8],
+        device_type: i32,
+        ref_str: &str,
+    ) -> Vec<u8> {
+        wa::CompanionEphemeralIdentity {
+            public_key: Some(public_key.to_vec()),
+            device_type: Some(device_type),
+            r#ref: Some(ref_str.to_string()),
+        }
+        .encode_to_vec()
+    }
+
+    /// commitment = SHA256(companionEphemeralIdentityBytes ‖ companionNonce).
+    pub fn commitment_hash(
+        companion_ephemeral_identity: &[u8],
+        companion_nonce: &[u8],
+    ) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(companion_ephemeral_identity);
+        h.update(companion_nonce);
+        h.finalize().into()
+    }
+
+    /// Encode the prologue payload protobuf (companion identity + commitment{hash}).
+    pub fn build_prologue_payload(
+        companion_ephemeral_identity: &[u8],
+        commitment_hash: &[u8],
+    ) -> Vec<u8> {
+        wa::ProloguePayload {
+            companion_ephemeral_identity: Some(companion_ephemeral_identity.to_vec()),
+            commitment: Some(wa::CompanionCommitment {
+                hash: Some(commitment_hash.to_vec()),
+            }),
+        }
+        .encode_to_vec()
+    }
+
+    /// Derive the 8-char verification code shown to the user (and the phone).
+    /// `h = SHA256(companionNonce ‖ primaryPublicKey)`; `out[i] = primaryNonce[i] ^ h[i]`
+    /// for the first 5 bytes; Crockford base32 → 8 chars.
+    pub fn derive_verification_code(
+        companion_nonce: &[u8],
+        primary_public_key: &[u8],
+        primary_nonce: &[u8],
+    ) -> Result<String, ShortcakeError> {
+        if primary_nonce.len() < VERIFICATION_CODE_BYTES {
+            return Err(ShortcakeError::Length {
+                what: "primary_nonce",
+                expected: VERIFICATION_CODE_BYTES,
+                got: primary_nonce.len(),
+            });
+        }
+        let mut h = Sha256::new();
+        h.update(companion_nonce);
+        h.update(primary_public_key);
+        let digest = h.finalize();
+        let mut out = [0u8; VERIFICATION_CODE_BYTES];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = primary_nonce[i] ^ digest[i];
+        }
+        Ok(PairCodeUtils::encode_crockford(&out))
+    }
+
+    /// Derive the AES-256 pairing-request encryption key from the shared secret
+    /// (deterministic core, unit-testable). `device_type` is the numeric enum value.
+    pub fn derive_encryption_key_from_shared_secret(
+        shared_secret: &[u8],
+        device_type: i32,
+        ref_str: &str,
+    ) -> Result<[u8; 32], ShortcakeError> {
+        let salt = format!("Companion Pairing {device_type} with ref {ref_str}");
+        let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), shared_secret);
+        let mut key = [0u8; 32];
+        hk.expand(ENC_KEY_INFO, &mut key)
+            .map_err(|_| ShortcakeError::Hkdf("encryption_key"))?;
+        Ok(key)
+    }
+
+    /// Full encryption-key derivation: X25519(companionPriv, primaryPub) → HKDF.
+    pub fn derive_encryption_key(
+        companion_keypair: &KeyPair,
+        primary_public_key: &[u8; 32],
+        device_type: i32,
+        ref_str: &str,
+    ) -> Result<[u8; 32], ShortcakeError> {
+        let primary = PublicKey::from_djb_public_key_bytes(primary_public_key)
+            .map_err(ShortcakeError::InvalidPrimaryKey)?;
+        let shared = companion_keypair
+            .private_key
+            .calculate_agreement(&primary)
+            .map_err(ShortcakeError::KeyAgreement)?;
+        Self::derive_encryption_key_from_shared_secret(&shared, device_type, ref_str)
+    }
+
+    /// Encode the inner `PairingRequest` plaintext (companion static + identity
+    /// pubkeys + the NEWLY-ROTATED ADV secret) — this is what gets encrypted.
+    pub fn build_pairing_request(
+        companion_public_key: &[u8],
+        companion_identity_key: &[u8],
+        adv_secret: &[u8],
+    ) -> Vec<u8> {
+        wa::PairingRequest {
+            companion_public_key: Some(companion_public_key.to_vec()),
+            companion_identity_key: Some(companion_identity_key.to_vec()),
+            adv_secret: Some(adv_secret.to_vec()),
+        }
+        .encode_to_vec()
+    }
+
+    /// AES-256-GCM encrypt the pairing-request plaintext with a fresh 12-byte IV,
+    /// no AAD. Output is ciphertext‖tag in one buffer (matches WebCrypto).
+    pub fn encrypt_pairing_request(
+        plaintext: &[u8],
+        key: &[u8; 32],
+    ) -> Result<EncryptedPairing, ShortcakeError> {
+        let mut iv = [0u8; 12];
+        rand::make_rng::<rand::rngs::StdRng>().fill(&mut iv);
+        let mut encrypted_payload = Vec::with_capacity(plaintext.len() + 16);
+        aes_256_gcm_encrypt(key, &iv, b"", plaintext, &mut encrypted_payload)
+            .map_err(|_| ShortcakeError::Aead)?;
+        Ok(EncryptedPairing {
+            encrypted_payload,
+            iv,
+        })
+    }
+
+    /// Encode the `EncryptedPairingRequest` protobuf sent in the final IQ.
+    pub fn build_encrypted_pairing_request(enc: &EncryptedPairing) -> Vec<u8> {
+        wa::EncryptedPairingRequest {
+            encrypted_payload: Some(enc.encrypted_payload.clone()),
+            iv: Some(enc.iv.to_vec()),
+        }
+        .encode_to_vec()
+    }
+
+    /// Derive the pairing-handoff HMAC key from a PRIOR session's 32-byte ADV
+    /// secret: HKDF-SHA256(IKM = priorAdvSecret, salt = none, info = handoff label).
+    pub fn derive_pairing_handoff_hmac_key(
+        prior_adv_secret: &[u8],
+    ) -> Result<[u8; 32], ShortcakeError> {
+        let hk = Hkdf::<Sha256>::new(None, prior_adv_secret);
+        let mut key = [0u8; 32];
+        hk.expand(HANDOFF_INFO, &mut key)
+            .map_err(|_| ShortcakeError::Hkdf("handoff_key"))?;
+        Ok(key)
+    }
+
+    /// Compute the pairing-handoff proof = HMAC-SHA256(handoffKey, prologuePayload).
+    /// Proves continuity from a prior linked session (re-link UX skip); OPTIONAL.
+    pub fn compute_pairing_handoff_proof(
+        handoff_key: &[u8; 32],
+        prologue_payload: &[u8],
+    ) -> [u8; 32] {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(handoff_key).expect("HMAC accepts any key length");
+        mac.update(prologue_payload);
+        mac.finalize().into_bytes().into()
+    }
+
+    /// Generate the companion ephemeral X25519 keypair for a new SHORTCAKE attempt.
+    pub fn generate_companion_ephemeral_keypair() -> KeyPair {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        KeyPair::generate(&mut rng)
+    }
+
+    /// Generate a fresh 32-byte companion nonce.
+    pub fn generate_companion_nonce() -> [u8; 32] {
+        let mut nonce = [0u8; 32];
+        rand::make_rng::<rand::rngs::StdRng>().fill(&mut nonce);
+        nonce
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Deterministic vectors guard the bug-prone concat/XOR/label details the RE flagged.
+
+    #[test]
+    fn commitment_is_sha256_of_identity_then_nonce() {
+        let identity = b"identity-bytes";
+        let nonce = [7u8; 32];
+        let got = ShortcakeUtils::commitment_hash(identity, &nonce);
+        // independent re-derivation, asserting the exact concat ORDER
+        let mut h = Sha256::new();
+        h.update(identity);
+        h.update(nonce);
+        let want: [u8; 32] = h.finalize().into();
+        assert_eq!(got, want);
+        // order matters: nonce-then-identity must differ
+        let mut h2 = Sha256::new();
+        h2.update(nonce);
+        h2.update(identity);
+        let wrong: [u8; 32] = h2.finalize().into();
+        assert_ne!(got, wrong);
+    }
+
+    #[test]
+    fn verification_code_format_and_xor_order() {
+        let companion_nonce = [1u8; 32];
+        let primary_pub = [2u8; 32];
+        let primary_nonce = [3u8; 32];
+        let code = ShortcakeUtils::derive_verification_code(
+            &companion_nonce,
+            &primary_pub,
+            &primary_nonce,
+        )
+        .unwrap();
+        // exactly 8 Crockford chars
+        assert_eq!(code.len(), 8);
+        const CROCKFORD: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTVWXYZ";
+        assert!(code.bytes().all(|b| CROCKFORD.contains(&b)));
+        // re-derive independently: SHA256(companionNonce ‖ primaryPub), XOR first 5 of primaryNonce
+        let mut h = Sha256::new();
+        h.update(companion_nonce);
+        h.update(primary_pub);
+        let d = h.finalize();
+        let mut out = [0u8; 5];
+        for i in 0..5 {
+            out[i] = primary_nonce[i] ^ d[i];
+        }
+        assert_eq!(code, PairCodeUtils::encode_crockford(&out));
+        // deterministic
+        assert_eq!(
+            code,
+            ShortcakeUtils::derive_verification_code(
+                &companion_nonce,
+                &primary_pub,
+                &primary_nonce
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn verification_code_rejects_short_primary_nonce() {
+        assert!(
+            ShortcakeUtils::derive_verification_code(&[0u8; 32], &[0u8; 32], &[0u8; 4]).is_err()
+        );
+    }
+
+    #[test]
+    fn encryption_key_uses_string_as_salt_not_info() {
+        let ikm = [9u8; 32];
+        let key =
+            ShortcakeUtils::derive_encryption_key_from_shared_secret(&ikm, 1, "REF123").unwrap();
+        // independent re-derivation with the documented salt/info placement
+        let salt = "Companion Pairing 1 with ref REF123";
+        let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), &ikm);
+        let mut want = [0u8; 32];
+        hk.expand(b"Pairing Information Encryption Key", &mut want)
+            .unwrap();
+        assert_eq!(key, want);
+        // swapping salt<->info (a plausible bug) must produce a different key
+        let hk2 = Hkdf::<Sha256>::new(Some(b"Pairing Information Encryption Key"), &ikm);
+        let mut wrong = [0u8; 32];
+        hk2.expand(salt.as_bytes(), &mut wrong).unwrap();
+        assert_ne!(key, wrong);
+        // device_type and ref are bound into the key
+        assert_ne!(
+            key,
+            ShortcakeUtils::derive_encryption_key_from_shared_secret(&ikm, 2, "REF123").unwrap()
+        );
+        assert_ne!(
+            key,
+            ShortcakeUtils::derive_encryption_key_from_shared_secret(&ikm, 1, "OTHER").unwrap()
+        );
+    }
+
+    #[test]
+    fn handoff_key_and_proof() {
+        let prior = [5u8; 32];
+        let k = ShortcakeUtils::derive_pairing_handoff_hmac_key(&prior).unwrap();
+        // independent HKDF (salt none, info label)
+        let hk = Hkdf::<Sha256>::new(None, &prior);
+        let mut want = [0u8; 32];
+        hk.expand(b"shortcake-passkey-handoff-v1", &mut want)
+            .unwrap();
+        assert_eq!(k, want);
+        let proof = ShortcakeUtils::compute_pairing_handoff_proof(&k, b"prologue");
+        let mut mac = Hmac::<Sha256>::new_from_slice(&k).unwrap();
+        mac.update(b"prologue");
+        let want_proof: [u8; 32] = mac.finalize().into_bytes().into();
+        assert_eq!(proof, want_proof);
+    }
+
+    #[test]
+    fn protobufs_roundtrip_with_expected_fields() {
+        let id = ShortcakeUtils::build_companion_ephemeral_identity(&[0xAA; 32], 1, "theref");
+        let decoded = wa::CompanionEphemeralIdentity::decode(id.as_slice()).unwrap();
+        assert_eq!(decoded.public_key.as_deref(), Some(&[0xAA; 32][..]));
+        assert_eq!(decoded.device_type, Some(1));
+        assert_eq!(decoded.r#ref.as_deref(), Some("theref"));
+
+        let prologue = ShortcakeUtils::build_prologue_payload(&id, &[0xBB; 32]);
+        let dp = wa::ProloguePayload::decode(prologue.as_slice()).unwrap();
+        assert_eq!(
+            dp.companion_ephemeral_identity.as_deref(),
+            Some(id.as_slice())
+        );
+        assert_eq!(
+            dp.commitment.and_then(|c| c.hash).as_deref(),
+            Some(&[0xBB; 32][..])
+        );
+
+        let pr = ShortcakeUtils::build_pairing_request(&[1; 32], &[2; 32], &[3; 32]);
+        let dpr = wa::PairingRequest::decode(pr.as_slice()).unwrap();
+        assert_eq!(dpr.companion_public_key.as_deref(), Some(&[1u8; 32][..]));
+        assert_eq!(dpr.companion_identity_key.as_deref(), Some(&[2u8; 32][..]));
+        assert_eq!(dpr.adv_secret.as_deref(), Some(&[3u8; 32][..]));
+    }
+
+    #[test]
+    fn encrypt_pairing_request_shape() {
+        let key = [4u8; 32];
+        let enc = ShortcakeUtils::encrypt_pairing_request(b"hello pairing", &key).unwrap();
+        assert_eq!(enc.iv.len(), 12);
+        // ciphertext + 16-byte GCM tag
+        assert_eq!(enc.encrypted_payload.len(), b"hello pairing".len() + 16);
+        let wire = ShortcakeUtils::build_encrypted_pairing_request(&enc);
+        let d = wa::EncryptedPairingRequest::decode(wire.as_slice()).unwrap();
+        assert_eq!(d.iv.as_deref(), Some(&enc.iv[..]));
+        assert_eq!(d.encrypted_payload, Some(enc.encrypted_payload));
+    }
+}

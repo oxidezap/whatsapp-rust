@@ -688,6 +688,78 @@ mod tests {
         assert_eq!(err.text, "hmac-mismatch");
     }
 
+    // A SHORTCAKE_PASSKEY (QR-less) login converges to the SAME pair-success as the
+    // classic QR flow, but the node carries extra children: <jurisdiction>, a new
+    // <encryption-metadata algorithm="aes-256-gcm"> block, <client-props>, <platform>.
+    // RE of WAWebHandlePairSuccess (waVersion 2.3000.1042386815) confirmed the
+    // companion PARSES but never DECRYPTS <encryption-metadata> — linking completes
+    // purely via the classic <device-identity> HMAC vs the ADV secret. This guards
+    // that our handler still extracts device-identity (ignoring the new children) and
+    // verifies, i.e. NO encryption-metadata decryption is needed.
+    #[test]
+    fn pair_success_with_passkey_encryption_metadata_completes_via_device_identity() {
+        use wacore_binary::node::NodeContent;
+
+        let state = dummy_device_state();
+        let payload = build_pair_success_payload(&state, &state.adv_secret_key, false);
+
+        let pair_success = NodeBuilder::new("pair-success")
+            .children([
+                NodeBuilder::new("jurisdiction")
+                    .attr("iso", "BR")
+                    .attr("cc", "55")
+                    .build(),
+                NodeBuilder::new("encryption-metadata")
+                    .attr("version", "1")
+                    .attr("algorithm", "aes-256-gcm")
+                    .children([
+                        NodeBuilder::new("encrypted_key")
+                            .bytes(vec![0xAAu8; 48])
+                            .build(),
+                        NodeBuilder::new("nonce").bytes(vec![0xBBu8; 12]).build(),
+                        NodeBuilder::new("encrypted_data")
+                            .bytes(vec![0xCCu8; 280])
+                            .build(),
+                        NodeBuilder::new("auth_tag").bytes(vec![0xDDu8; 16]).build(),
+                    ])
+                    .build(),
+                NodeBuilder::new("client-props")
+                    .bytes(vec![0x08u8, 0x01])
+                    .build(),
+                NodeBuilder::new("platform").attr("name", "android").build(),
+                NodeBuilder::new("device-identity")
+                    .bytes(payload.clone())
+                    .build(),
+                NodeBuilder::new("device")
+                    .attr("jid", "559984726662:57@s.whatsapp.net")
+                    .build(),
+            ])
+            .build();
+
+        // The new passkey block is present in the stanza...
+        assert!(
+            pair_success
+                .get_optional_child_by_tag(&["encryption-metadata"])
+                .is_some(),
+            "test fixture should include the new encryption-metadata block"
+        );
+
+        // ...but the handler extracts <device-identity> by tag, ignoring all extras.
+        let di = pair_success
+            .get_optional_child_by_tag(&["device-identity"])
+            .expect("device-identity must be found among the new passkey children");
+        let di_bytes = match &di.content {
+            Some(NodeContent::Bytes(b)) => b.as_slice(),
+            _ => panic!("device-identity must carry bytes"),
+        };
+        assert_eq!(di_bytes, payload.as_slice());
+
+        // Classic crypto completes the passkey link (HMAC vs ADV secret) — no
+        // decryption of <encryption-metadata> required.
+        PairUtils::do_pair_crypto(&state, di_bytes)
+            .expect("device-identity HMAC must verify for the passkey pair-success");
+    }
+
     #[test]
     fn do_pair_crypto_accepts_matching_hmac_for_hosted_account() {
         let state = dummy_device_state();

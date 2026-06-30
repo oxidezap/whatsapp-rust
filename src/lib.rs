@@ -63,6 +63,7 @@ pub mod message;
 pub(crate) mod msg_secret_buffer;
 pub mod pair;
 pub mod pair_code;
+pub mod passkey;
 pub mod request;
 pub use request::IqError;
 #[cfg(feature = "tokio-runtime")]
