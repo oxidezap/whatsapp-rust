@@ -3944,6 +3944,7 @@ dependencies = [
  "smoothutf8",
  "stable_deref_trait",
  "yoke",
+ "zlib-rs",
 ]
 
 [[package]]

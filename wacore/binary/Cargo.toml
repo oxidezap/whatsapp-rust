@@ -28,7 +28,6 @@ tracing-pii = []
 [dependencies]
 bytes = { workspace = true }
 compact_str = { workspace = true }
-flate2 = { workspace = true }
 hashify = { version = "0.2.9", default-features = false }
 itoa = { workspace = true }
 serde = { workspace = true, optional = true }
@@ -36,6 +35,7 @@ smallvec = "1.15"
 smoothutf8 = { workspace = true }
 stable_deref_trait = "1.2.1"
 yoke = { workspace = true }
+zlib-rs = { workspace = true }
 
 [build-dependencies]
 serde = { workspace = true, features = ["alloc"] }
@@ -43,6 +43,7 @@ serde_json = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 divan = { workspace = true }
+flate2 = { workspace = true }
 proptest = "1.11.0"
 serde_json = { workspace = true, features = ["std"] }
 

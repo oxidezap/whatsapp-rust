@@ -102,6 +102,7 @@ wacore-libsignal = { path = "./wacore/libsignal", version = "0.6.0" }
 wacore-noise = { path = "./wacore/noise", version = "0.6.0" }
 waproto = { path = "./waproto", version = "0.6.0" }
 yoke = { version = "0.8", features = ["derive"] }
+zlib-rs = { version = "0.6.4", default-features = false, features = ["std", "rust-allocator"] }
 
 [features]
 debug-diagnostics = ["wacore/debug-diagnostics"]
