@@ -245,6 +245,13 @@ impl Client {
             group_devices_memo: Cache::builder()
                 .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
                 .build(),
+            // Evicting a lock whose guard is still held only lets one extra
+            // send re-run that group's fan-out (the pre-single-flight
+            // behavior); the sender-key chain lock still guarantees ratchet
+            // correctness.
+            group_distribution_locks: Cache::builder()
+                .max_capacity(cache_config.group_distribution_locks_capacity.max(1))
+                .build(),
             skdm_warm_memo: Cache::builder()
                 .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
                 .build(),

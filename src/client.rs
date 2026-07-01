@@ -619,6 +619,12 @@ pub struct Client {
     pub(crate) group_devices_memo:
         Cache<Jid, Arc<crate::client::device_registry::GroupDevicesMemo>>,
 
+    /// Single-flight for cold SKDM distribution, keyed per group. Concurrent
+    /// cold sends each re-ran the full per-member fan-out before any of them
+    /// marked the devices warm; the loser now waits here and re-resolves,
+    /// finding everything warm. Warm sends never touch it.
+    pub(crate) group_distribution_locks: Cache<Jid, Arc<async_lock::Mutex<()>>>,
+
     /// Last `(devices, sender-key-device map)` Arc pair with an empty `needs_skdm`,
     /// so a warm repeat send skips `filter_skdm_targets`. `Weak` keeps the pointer
     /// comparison ABA-safe, matching `GroupDevicesMemo`.
