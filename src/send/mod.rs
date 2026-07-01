@@ -628,7 +628,12 @@ impl Client {
 
         let extra_nodes =
             build_extra_stanza_nodes(&to, inferred_meta, biz, options.extra_stanza_nodes);
-        self.send_message_impl(
+        // send_message_impl's state machine is ~13 KB (the whole send path in
+        // one async fn). Boxing keeps `send_message`'s future pointer-sized, so
+        // callers embedding it in their own futures (event handlers, spawned
+        // tasks) don't inherit those 13 KB per instance; the box is allocated
+        // only when a send actually runs.
+        Box::pin(self.send_message_impl(
             to,
             &message,
             Some(request_id),
@@ -637,7 +642,7 @@ impl Client {
             edit,
             extra_nodes,
             stanza_type_override,
-        )
+        ))
         .await
         .map_err(SendError::from_anyhow)?;
         Ok(result)
