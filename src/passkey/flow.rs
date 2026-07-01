@@ -6,17 +6,23 @@
 //! identity prologue, both sides exchange nonces to derive a shared key, and the
 //! companion finally sends its rotated ADV secret encrypted under that key. Linking
 //! then completes through the ordinary `pair-success` path.
+//!
+//! The handshake state machine ([`ShortcakeSession`]) drives against a
+//! [`ShortcakeIo`] seam rather than the concrete [`Client`], so the full IQ
+//! sequence is unit-testable with a scripted stand-in.
 
 use crate::client::Client;
 use crate::passkey::{Assertion, PasskeyAuthenticator, PasskeyError, parse_request_options};
 use crate::request::InfoQuery;
 use crate::store::commands::DeviceCommand;
 use crate::types::events::{Event, PairPasskeyConfirmation, PairPasskeyError, PairPasskeyRequest};
+use async_trait::async_trait;
 use log::warn;
 use rand::RngExt;
 use std::sync::Arc;
 use wacore::libsignal::protocol::KeyPair;
 use wacore::shortcake::ShortcakeUtils;
+use wacore::sync_marker::MaybeSendSync;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeContent, NodeRef, OwnedNodeRef, SERVER_JID, Server};
 
@@ -39,31 +45,222 @@ const TAG_ENCRYPTED_PAIRING_REQUEST: &str = "encrypted_pairing_request";
 /// Length of each half of the "XXXX-XXXX" verification code grouping.
 const CODE_GROUP_LEN: usize = 4;
 
-struct LinkingCache {
+/// The device material the handshake reads: the companion's static public keys
+/// and the reported platform.
+#[derive(Clone)]
+struct DeviceMaterial {
+    noise_public: [u8; 32],
+    identity_public: [u8; 32],
+    device_type: i32,
+}
+
+/// The effects the handshake needs from its environment. Abstracted so the full
+/// IQ sequence can be driven by a scripted stand-in in tests.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+trait ShortcakeIo: MaybeSendSync {
+    async fn query(&self, query: InfoQuery<'static>) -> Result<Arc<OwnedNodeRef>, PasskeyError>;
+    fn device_material(&self) -> Result<DeviceMaterial, PasskeyError>;
+    async fn commit_adv_secret(&self, secret: [u8; 32]);
+    fn emit(&self, event: Event);
+}
+
+#[derive(PartialEq, Eq)]
+enum Stage {
+    AwaitingPrimaryIdentity,
+    AwaitingConfirmation,
+    Done,
+}
+
+/// The in-flight handshake, created by [`ShortcakeSession::open`] and advanced by
+/// the continuation + confirmation steps. Its rotated ADV secret is held here (not
+/// in the device store) until [`confirm`](Self::confirm) commits it, so an
+/// abandoned attempt never rotates to a secret the primary never received.
+struct ShortcakeSession {
     keypair: KeyPair,
     companion_nonce: [u8; 32],
     pairing_ref: String,
     device_type: i32,
-    skip_handoff_ux: bool,
-    encryption_key: Option<[u8; 32]>,
-    /// This attempt's freshly-rotated ADV secret, held here (not in the device
-    /// store) until the flow commits it, so an abandoned attempt never rotates to a
-    /// secret the primary never received. Per-attempt, so concurrent attempts can't
-    /// cross-contaminate the committed secret.
     new_adv_secret: [u8; 32],
+    skip_handoff_ux: bool,
+    stage: Stage,
+    encryption_key: Option<[u8; 32]>,
 }
 
+impl ShortcakeSession {
+    /// Fetch a fresh ref, build the ephemeral identity + commitment, attach the
+    /// handoff proof on a re-link, and send the `passkey_prologue` IQ.
+    async fn open(
+        io: &dyn ShortcakeIo,
+        assertion: Assertion,
+        handoff_key: Option<[u8; 32]>,
+    ) -> Result<Self, PasskeyError> {
+        let device_type = io.device_material()?.device_type;
+        let pairing_ref = fetch_ref(io).await?;
+
+        let keypair = ShortcakeUtils::generate_companion_ephemeral_keypair();
+        let companion_nonce = ShortcakeUtils::generate_companion_nonce();
+        let mut new_adv_secret = [0u8; 32];
+        rand::make_rng::<rand::rngs::StdRng>().fill(&mut new_adv_secret);
+
+        let companion_pub: [u8; 32] = keypair
+            .public_key
+            .public_key_bytes()
+            .try_into()
+            .map_err(|_| PasskeyError::Flow("ephemeral public key is not 32 bytes".into()))?;
+        let identity = ShortcakeUtils::build_companion_ephemeral_identity(
+            &companion_pub,
+            device_type,
+            &pairing_ref,
+        );
+        let commitment = ShortcakeUtils::commitment_hash(&identity, &companion_nonce);
+        let prologue_payload = ShortcakeUtils::build_prologue_payload(&identity, &commitment);
+
+        let handoff_proof = handoff_key
+            .map(|key| ShortcakeUtils::compute_pairing_handoff_proof(&key, &prologue_payload));
+        let skip_handoff_ux = handoff_proof.is_some();
+
+        let prologue = build_prologue_node(
+            assertion.credential_id,
+            assertion.assertion_json,
+            prologue_payload,
+            handoff_proof,
+        );
+        io.query(InfoQuery::set(
+            MD_NAMESPACE,
+            server_jid(),
+            Some(NodeContent::Nodes(vec![prologue])),
+        ))
+        .await
+        .map_err(|e| PasskeyError::Flow(format!("passkey_prologue iq failed: {e}")))?;
+
+        Ok(Self {
+            keypair,
+            companion_nonce,
+            pairing_ref,
+            device_type,
+            new_adv_secret,
+            skip_handoff_ux,
+            stage: Stage::AwaitingPrimaryIdentity,
+            encryption_key: None,
+        })
+    }
+
+    /// Agree on the shared secret, reveal the companion nonce, derive the code +
+    /// encryption key, and emit [`Event::PairPasskeyConfirmation`]. Returns whether
+    /// the handoff proof lets the code UX be skipped.
+    async fn on_primary_identity(
+        &mut self,
+        io: &dyn ShortcakeIo,
+        primary_bytes: &[u8],
+    ) -> Result<bool, PasskeyError> {
+        if self.stage != Stage::AwaitingPrimaryIdentity {
+            return Err(PasskeyError::Flow(
+                "unexpected continuation for this stage".into(),
+            ));
+        }
+        let primary = ShortcakeUtils::parse_primary_ephemeral_identity(primary_bytes)
+            .map_err(|e| PasskeyError::Flow(format!("primary ephemeral identity: {e}")))?;
+
+        let nonce_node = NodeBuilder::new(TAG_COMPANION_NONCE)
+            .bytes(self.companion_nonce.to_vec())
+            .build();
+        io.query(InfoQuery::set(
+            MD_NAMESPACE,
+            server_jid(),
+            Some(NodeContent::Nodes(vec![nonce_node])),
+        ))
+        .await
+        .map_err(|e| PasskeyError::Flow(format!("companion_nonce iq failed: {e}")))?;
+
+        let encryption_key = ShortcakeUtils::derive_encryption_key(
+            &self.keypair,
+            &primary.public_key,
+            self.device_type,
+            &self.pairing_ref,
+        )
+        .map_err(|e| PasskeyError::Flow(format!("encryption key: {e}")))?;
+        let bare = ShortcakeUtils::derive_verification_code(
+            &self.companion_nonce,
+            &primary.public_key,
+            &primary.nonce,
+        );
+        // Grouped "XXXX-XXXX" for display (the code is ASCII).
+        let code = format!("{}-{}", &bare[..CODE_GROUP_LEN], &bare[CODE_GROUP_LEN..]);
+
+        self.encryption_key = Some(encryption_key);
+        self.stage = Stage::AwaitingConfirmation;
+        io.emit(Event::PairPasskeyConfirmation(PairPasskeyConfirmation {
+            code,
+            skip_handoff_ux: self.skip_handoff_ux,
+        }));
+        Ok(self.skip_handoff_ux)
+    }
+
+    /// Encrypt the `PairingRequest` (companion static keys + rotated ADV secret)
+    /// and send `<encrypted_pairing_request>`, then commit the rotation.
+    async fn confirm(&mut self, io: &dyn ShortcakeIo) -> Result<(), PasskeyError> {
+        if self.stage != Stage::AwaitingConfirmation {
+            return Err(PasskeyError::Flow(
+                "confirmation before the verification stage".into(),
+            ));
+        }
+        let encryption_key = self.encryption_key.ok_or_else(|| {
+            PasskeyError::Flow("confirmation before encryption key derived".into())
+        })?;
+        let material = io.device_material()?;
+
+        let plaintext = ShortcakeUtils::build_pairing_request(
+            &material.noise_public,
+            &material.identity_public,
+            &self.new_adv_secret,
+        );
+        let encrypted = ShortcakeUtils::encrypt_pairing_request(&plaintext, &encryption_key)
+            .map_err(|e| PasskeyError::Flow(format!("encrypt pairing request: {e}")))?;
+        let wrapped = ShortcakeUtils::build_encrypted_pairing_request(&encrypted);
+
+        let node = NodeBuilder::new(TAG_ENCRYPTED_PAIRING_REQUEST)
+            .bytes(wrapped)
+            .build();
+        io.query(InfoQuery::set(
+            MD_NAMESPACE,
+            server_jid(),
+            Some(NodeContent::Nodes(vec![node])),
+        ))
+        .await
+        .map_err(|e| PasskeyError::Flow(format!("encrypted_pairing_request iq failed: {e}")))?;
+
+        // Primary has the secret now: commit the rotation (before pair-success
+        // validates against it).
+        io.commit_adv_secret(self.new_adv_secret).await;
+        self.stage = Stage::Done;
+        Ok(())
+    }
+}
+
+/// SHORTCAKE_PASSKEY flow state held on the [`Client`].
 #[derive(Default)]
 pub(crate) struct PasskeyFlowState {
     /// HMAC key from the pre-rotation ADV secret; presence marks the re-link path
     /// that lets the server skip the verification-code UX. Consumed once.
     handoff_key: Option<[u8; 32]>,
-    linking: Option<LinkingCache>,
+    session: Option<ShortcakeSession>,
     authenticator: Option<Arc<dyn PasskeyAuthenticator>>,
 }
 
 fn server_jid() -> Jid {
     Jid::new("", Server::Pn)
+}
+
+/// Pull a child node's payload as bytes, accepting either binary or string content
+/// (the server sends the options JSON as a text node).
+fn child_payload(nr: &NodeRef<'_>, tag: &str) -> Option<Vec<u8>> {
+    let child = nr.get_optional_child(tag)?;
+    if let Some(b) = child.content_bytes() {
+        Some(b.to_vec())
+    } else {
+        child.content_str().map(|s| s.as_bytes().to_vec())
+    }
 }
 
 /// Pure so the wire shape (child tags + conditional proof) is unit-testable.
@@ -96,14 +293,74 @@ fn build_prologue_node(
         .build()
 }
 
-/// Pull a child node's payload as bytes, accepting either binary or string content
-/// (the server sends the options JSON as a text node).
-fn child_payload(nr: &NodeRef<'_>, tag: &str) -> Option<Vec<u8>> {
-    let child = nr.get_optional_child(tag)?;
-    if let Some(b) = child.content_bytes() {
-        Some(b.to_vec())
-    } else {
-        child.content_str().map(|s| s.as_bytes().to_vec())
+async fn fetch_ref(io: &dyn ShortcakeIo) -> Result<String, PasskeyError> {
+    let resp = io
+        .query(InfoQuery::get(
+            MD_NAMESPACE,
+            server_jid(),
+            Some(NodeContent::Nodes(vec![NodeBuilder::new(TAG_REF).build()])),
+        ))
+        .await
+        .map_err(|e| PasskeyError::Flow(format!("ref iq failed: {e}")))?;
+    child_payload(resp.get(), TAG_REF)
+        .and_then(|b| String::from_utf8(b).ok())
+        .ok_or_else(|| PasskeyError::Flow("missing ref in server response".into()))
+}
+
+async fn fetch_request_options(io: &dyn ShortcakeIo) -> Result<String, PasskeyError> {
+    let resp = io
+        .query(InfoQuery::get(
+            MD_NAMESPACE,
+            server_jid(),
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new(TAG_PASSKEY_REQUEST_OPTIONS).build(),
+            ])),
+        ))
+        .await
+        .map_err(|e| PasskeyError::Flow(format!("passkey_request_options iq failed: {e}")))?;
+    child_payload(resp.get(), TAG_PASSKEY_REQUEST_OPTIONS)
+        .and_then(|b| String::from_utf8(b).ok())
+        .ok_or_else(|| PasskeyError::Flow("missing passkey_request_options in response".into()))
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl ShortcakeIo for Client {
+    async fn query(&self, query: InfoQuery<'static>) -> Result<Arc<OwnedNodeRef>, PasskeyError> {
+        self.send_iq(query)
+            .await
+            .map_err(|e| PasskeyError::Flow(e.to_string()))
+    }
+
+    fn device_material(&self) -> Result<DeviceMaterial, PasskeyError> {
+        let snapshot = self.persistence_manager.get_device_snapshot();
+        let noise_public: [u8; 32] = snapshot
+            .noise_key
+            .public_key
+            .public_key_bytes()
+            .try_into()
+            .map_err(|_| PasskeyError::Flow("noise public key is not 32 bytes".into()))?;
+        let identity_public: [u8; 32] = snapshot
+            .identity_key
+            .public_key
+            .public_key_bytes()
+            .try_into()
+            .map_err(|_| PasskeyError::Flow("identity public key is not 32 bytes".into()))?;
+        Ok(DeviceMaterial {
+            noise_public,
+            identity_public,
+            device_type: snapshot.device_props.platform_type.unwrap_or(0),
+        })
+    }
+
+    async fn commit_adv_secret(&self, secret: [u8; 32]) {
+        self.persistence_manager
+            .process_command(DeviceCommand::SetAdvSecretKey(secret))
+            .await;
+    }
+
+    fn emit(&self, event: Event) {
+        self.core.event_bus.dispatch(event);
     }
 }
 
@@ -120,246 +377,47 @@ impl Client {
         self.passkey_state.lock().await.authenticator.clone()
     }
 
-    /// Send the WebAuthn assertion to the server as `<passkey_prologue>`. Fetches a
-    /// fresh pairing ref, builds the companion ephemeral identity + commitment, and
-    /// attaches the pairing-handoff proof when this is a re-link. Call this after an
-    /// [`Event::PairPasskeyRequest`].
+    /// Send the WebAuthn assertion as `<passkey_prologue>` and open the handshake.
+    /// Call after an [`Event::PairPasskeyRequest`].
     pub async fn send_passkey_response(&self, assertion: Assertion) -> Result<(), PasskeyError> {
-        let server = server_jid();
-
-        let ref_query = InfoQuery::get(
-            MD_NAMESPACE,
-            server.clone(),
-            Some(NodeContent::Nodes(vec![NodeBuilder::new(TAG_REF).build()])),
-        );
-        let resp = self
-            .send_iq(ref_query)
-            .await
-            .map_err(|e| PasskeyError::Flow(format!("ref iq failed: {e}")))?;
-        let pairing_ref = child_payload(resp.get(), TAG_REF)
-            .and_then(|b| String::from_utf8(b).ok())
-            .ok_or_else(|| PasskeyError::Flow("missing ref in server response".into()))?;
-
-        let keypair = ShortcakeUtils::generate_companion_ephemeral_keypair();
-        let companion_nonce = ShortcakeUtils::generate_companion_nonce();
-        let mut new_adv_secret = [0u8; 32];
-        rand::make_rng::<rand::rngs::StdRng>().fill(&mut new_adv_secret);
-        let snapshot = self.persistence_manager.get_device_snapshot();
-        let device_type = snapshot.device_props.platform_type.unwrap_or(0);
-        let companion_pub: [u8; 32] = keypair
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .map_err(|_| PasskeyError::Flow("ephemeral public key is not 32 bytes".into()))?;
-
-        let identity = ShortcakeUtils::build_companion_ephemeral_identity(
-            &companion_pub,
-            device_type,
-            &pairing_ref,
-        );
-        let commitment = ShortcakeUtils::commitment_hash(&identity, &companion_nonce);
-        let prologue_payload = ShortcakeUtils::build_prologue_payload(&identity, &commitment);
-
-        let handoff_proof = {
-            let mut state = self.passkey_state.lock().await;
-            let proof = state
-                .handoff_key
-                .take()
-                .map(|key| ShortcakeUtils::compute_pairing_handoff_proof(&key, &prologue_payload));
-            state.linking = Some(LinkingCache {
-                keypair,
-                companion_nonce,
-                pairing_ref,
-                device_type,
-                skip_handoff_ux: proof.is_some(),
-                encryption_key: None,
-                new_adv_secret,
-            });
-            proof
-        };
-
-        let prologue = build_prologue_node(
-            assertion.credential_id,
-            assertion.assertion_json,
-            prologue_payload,
-            handoff_proof,
-        );
-        if let Err(e) = self
-            .send_iq(InfoQuery::set(
-                MD_NAMESPACE,
-                server,
-                Some(NodeContent::Nodes(vec![prologue])),
-            ))
-            .await
-        {
-            // Server never accepted this prologue: drop the half-armed attempt.
-            self.passkey_state.lock().await.linking = None;
-            return Err(PasskeyError::Flow(format!(
-                "passkey_prologue iq failed: {e}"
-            )));
-        }
+        let handoff_key = self.passkey_state.lock().await.handoff_key.take();
+        let session = ShortcakeSession::open(self, assertion, handoff_key).await?;
+        self.passkey_state.lock().await.session = Some(session);
         Ok(())
     }
 
-    /// Process the continuation notification: agree on the shared secret, send the
-    /// companion nonce, derive the verification code + encryption key, and emit
-    /// [`Event::PairPasskeyConfirmation`]. Spawned off the receive loop because it
-    /// awaits a `<companion_nonce>` IQ round-trip.
-    async fn process_passkey_continuation(
-        &self,
-        primary_bytes: Vec<u8>,
-    ) -> Result<(), PasskeyError> {
-        let primary = ShortcakeUtils::parse_primary_ephemeral_identity(&primary_bytes)
-            .map_err(|e| PasskeyError::Flow(format!("primary ephemeral identity: {e}")))?;
+    /// Finish the link. For a fresh link, call this only after the user confirms the
+    /// [`Event::PairPasskeyConfirmation`] code.
+    pub async fn send_passkey_confirmation(&self) -> Result<(), PasskeyError> {
+        // Taken out for the duration: on failure the attempt is dropped, not left
+        // half-committed.
+        let mut session = self
+            .passkey_state
+            .lock()
+            .await
+            .session
+            .take()
+            .ok_or_else(|| PasskeyError::Flow("confirmation without an active session".into()))?;
+        session.confirm(self).await
+    }
 
-        let (keypair, companion_nonce, pairing_ref, device_type, skip_handoff_ux) = {
-            let state = self.passkey_state.lock().await;
-            let cache = state
-                .linking
-                .as_ref()
-                .ok_or_else(|| PasskeyError::Flow("continuation without a linking cache".into()))?;
-            (
-                cache.keypair.clone(),
-                cache.companion_nonce,
-                cache.pairing_ref.clone(),
-                cache.device_type,
-                cache.skip_handoff_ux,
-            )
-        };
+    async fn drive_continuation(&self, primary_bytes: Vec<u8>) -> Result<(), PasskeyError> {
+        let mut session = self
+            .passkey_state
+            .lock()
+            .await
+            .session
+            .take()
+            .ok_or_else(|| PasskeyError::Flow("continuation without an active session".into()))?;
+        let skip = session.on_primary_identity(self, &primary_bytes).await?;
+        self.passkey_state.lock().await.session = Some(session);
 
-        let nonce_node = NodeBuilder::new(TAG_COMPANION_NONCE)
-            .bytes(companion_nonce.to_vec())
-            .build();
-        self.send_iq(InfoQuery::set(
-            MD_NAMESPACE,
-            server_jid(),
-            Some(NodeContent::Nodes(vec![nonce_node])),
-        ))
-        .await
-        .map_err(|e| PasskeyError::Flow(format!("companion_nonce iq failed: {e}")))?;
-
-        let encryption_key = ShortcakeUtils::derive_encryption_key(
-            &keypair,
-            &primary.public_key,
-            device_type,
-            &pairing_ref,
-        )
-        .map_err(|e| PasskeyError::Flow(format!("encryption key: {e}")))?;
-        let bare = ShortcakeUtils::derive_verification_code(
-            &companion_nonce,
-            &primary.public_key,
-            &primary.nonce,
-        );
-        // Grouped "XXXX-XXXX" for display (the code is ASCII).
-        let code = format!("{}-{}", &bare[..CODE_GROUP_LEN], &bare[CODE_GROUP_LEN..]);
-
-        {
-            let mut state = self.passkey_state.lock().await;
-            // A fresh attempt could have replaced the cache during the round-trip;
-            // arming an unrelated attempt with this key would break it.
-            let cache = state.linking.as_mut().ok_or_else(|| {
-                PasskeyError::Flow("linking cache cleared mid-continuation".into())
-            })?;
-            if cache.pairing_ref != pairing_ref || cache.companion_nonce != companion_nonce {
-                return Err(PasskeyError::Flow(
-                    "linking cache replaced by a newer attempt mid-continuation".into(),
-                ));
-            }
-            cache.encryption_key = Some(encryption_key);
-        }
-
-        self.core
-            .event_bus
-            .dispatch(Event::PairPasskeyConfirmation(PairPasskeyConfirmation {
-                code,
-                skip_handoff_ux,
-            }));
-
-        // Re-link: the handoff proof already established continuity, so no user code
-        // confirmation is needed. Auto-finish when an authenticator is driving.
-        if skip_handoff_ux && self.passkey_authenticator().await.is_some() {
+        // Re-link: continuity is already proven, so finish without a user code when
+        // an authenticator is driving.
+        if skip && self.passkey_authenticator().await.is_some() {
             self.send_passkey_confirmation().await?;
         }
         Ok(())
-    }
-
-    /// Finish the link: encrypt the `PairingRequest` (companion static keys + the
-    /// newly-rotated ADV secret) under the derived key and send
-    /// `<encrypted_pairing_request>`. For a fresh link, call this only after the
-    /// user has confirmed the [`Event::PairPasskeyConfirmation`] code.
-    pub async fn send_passkey_confirmation(&self) -> Result<(), PasskeyError> {
-        let (encryption_key, adv_secret) = {
-            let state = self.passkey_state.lock().await;
-            let cache = state
-                .linking
-                .as_ref()
-                .ok_or_else(|| PasskeyError::Flow("confirmation without a linking cache".into()))?;
-            let key = cache.encryption_key.ok_or_else(|| {
-                PasskeyError::Flow("confirmation before encryption key derived".into())
-            })?;
-            (key, cache.new_adv_secret)
-        };
-
-        let snapshot = self.persistence_manager.get_device_snapshot();
-        let companion_public: [u8; 32] = snapshot
-            .noise_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .map_err(|_| PasskeyError::Flow("noise public key is not 32 bytes".into()))?;
-        let companion_identity: [u8; 32] = snapshot
-            .identity_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .map_err(|_| PasskeyError::Flow("identity public key is not 32 bytes".into()))?;
-
-        let plaintext = ShortcakeUtils::build_pairing_request(
-            &companion_public,
-            &companion_identity,
-            &adv_secret,
-        );
-        let encrypted = ShortcakeUtils::encrypt_pairing_request(&plaintext, &encryption_key)
-            .map_err(|e| PasskeyError::Flow(format!("encrypt pairing request: {e}")))?;
-        let wrapped = ShortcakeUtils::build_encrypted_pairing_request(&encrypted);
-
-        let node = NodeBuilder::new(TAG_ENCRYPTED_PAIRING_REQUEST)
-            .bytes(wrapped)
-            .build();
-        self.send_iq(InfoQuery::set(
-            MD_NAMESPACE,
-            server_jid(),
-            Some(NodeContent::Nodes(vec![node])),
-        ))
-        .await
-        .map_err(|e| PasskeyError::Flow(format!("encrypted_pairing_request iq failed: {e}")))?;
-
-        // Primary has the new secret now: commit the rotation (before pair-success
-        // validates against it) and clear the attempt.
-        self.persistence_manager
-            .process_command(DeviceCommand::SetAdvSecretKey(adv_secret))
-            .await;
-        self.passkey_state.lock().await.linking = None;
-        Ok(())
-    }
-
-    /// Fetch the WebAuthn options from the server, for when a prologue-request
-    /// notification arrives without them inline.
-    async fn get_passkey_request_options(&self) -> Result<String, PasskeyError> {
-        let query = InfoQuery::get(
-            MD_NAMESPACE,
-            server_jid(),
-            Some(NodeContent::Nodes(vec![
-                NodeBuilder::new(TAG_PASSKEY_REQUEST_OPTIONS).build(),
-            ])),
-        );
-        let resp = self
-            .send_iq(query)
-            .await
-            .map_err(|e| PasskeyError::Flow(format!("passkey_request_options iq failed: {e}")))?;
-        child_payload(resp.get(), TAG_PASSKEY_REQUEST_OPTIONS)
-            .and_then(|b| String::from_utf8(b).ok())
-            .ok_or_else(|| PasskeyError::Flow("missing passkey_request_options in response".into()))
     }
 }
 
@@ -387,7 +445,7 @@ pub(crate) async fn handle_passkey_notification(client: &Arc<Client>, node: Arc<
                 .clone()
                 .runtime
                 .spawn(Box::pin(async move {
-                    match client.get_passkey_request_options().await {
+                    match fetch_request_options(client.as_ref()).await {
                         Ok(json) => drive_passkey_request(&client, json).await,
                         Err(e) => {
                             warn!("failed to fetch passkey request options: {e}");
@@ -408,9 +466,12 @@ pub(crate) async fn handle_passkey_notification(client: &Arc<Client>, node: Arc<
 async fn drive_passkey_request(client: &Arc<Client>, options_json: String) {
     // Handoff key from the current secret proves continuity to the server; presence
     // of a key marks this as a re-link. The rotated secret itself is generated
-    // per-attempt in send_passkey_response.
-    let snapshot = client.persistence_manager.get_device_snapshot();
-    let handoff_key = ShortcakeUtils::derive_pairing_handoff_hmac_key(&snapshot.adv_secret_key)
+    // per-attempt in the session.
+    let adv_secret = client
+        .persistence_manager
+        .get_device_snapshot()
+        .adv_secret_key;
+    let handoff_key = ShortcakeUtils::derive_pairing_handoff_hmac_key(&adv_secret)
         .inspect_err(|e| warn!("failed to derive pairing-handoff key: {e}"))
         .ok();
     client.passkey_state.lock().await.handoff_key = handoff_key;
@@ -468,7 +529,7 @@ pub(crate) async fn handle_passkey_continuation(client: &Arc<Client>, node: Arc<
     let primary_bytes = match child_payload(node.get(), TAG_PRIMARY_EPHEMERAL_IDENTITY) {
         Some(bytes) => bytes,
         None => {
-            warn!("passkey continuation missing <primary_ephemeral_identity>");
+            warn!("passkey continuation missing primary_ephemeral_identity");
             client
                 .core
                 .event_bus
@@ -485,7 +546,7 @@ pub(crate) async fn handle_passkey_continuation(client: &Arc<Client>, node: Arc<
         .clone()
         .runtime
         .spawn(Box::pin(async move {
-            if let Err(e) = client.process_passkey_continuation(primary_bytes).await {
+            if let Err(e) = client.drive_continuation(primary_bytes).await {
                 warn!("passkey continuation failed: {e}");
                 client
                     .core
@@ -504,12 +565,13 @@ mod tests {
     use super::*;
     use crate::test_utils::{TestEventCollector, create_test_client, node_to_owned_ref};
     use crate::types::events::EventHandler;
+    use prost::Message as _;
+    use std::sync::Mutex;
     use std::time::Duration;
+    use wacore::libsignal::protocol::PublicKey;
+    use waproto::whatsapp as wa;
 
-    fn server_notification(
-        notif_type: &'static str,
-        child: Option<wacore_binary::Node>,
-    ) -> Arc<OwnedNodeRef> {
+    fn server_notification(notif_type: &'static str, child: Option<Node>) -> Arc<OwnedNodeRef> {
         let mut builder = NodeBuilder::new("notification")
             .attr("type", notif_type)
             .attr("from", SERVER_JID);
@@ -529,45 +591,202 @@ mod tests {
         panic!("expected event was not observed within the timeout");
     }
 
-    #[test]
-    fn prologue_node_wire_shape() {
-        // re-link: the handoff proof child is present
-        let node = build_prologue_node(
-            b"cred-id".to_vec(),
-            b"{\"type\":\"public-key\"}".to_vec(),
-            b"prologue-proto".to_vec(),
-            Some([0x42; 32]),
-        );
-        let nr = node.as_node_ref();
-        assert_eq!(nr.tag.as_ref(), "passkey_prologue");
-        assert_eq!(
-            nr.get_optional_child("credential_id")
-                .and_then(|n| n.content_bytes()),
-            Some(&b"cred-id"[..])
-        );
-        assert_eq!(
-            nr.get_optional_child("webauthn_assertion")
-                .and_then(|n| n.content_bytes()),
-            Some(&b"{\"type\":\"public-key\"}"[..])
-        );
-        assert_eq!(
-            nr.get_optional_child("prologue_payload")
-                .and_then(|n| n.content_bytes()),
-            Some(&b"prologue-proto"[..])
-        );
-        assert_eq!(
-            nr.get_optional_child("pairing_handoff_proof")
-                .and_then(|n| n.content_bytes()),
-            Some(&[0x42u8; 32][..])
+    // Scripted IQ stand-in: answers each `md` IQ by its child tag and records the
+    // child that was sent, plus committed secret and emitted events.
+    struct MockIo {
+        device: DeviceMaterial,
+        pairing_ref: String,
+        options_json: String,
+        sent: Mutex<Vec<Node>>,
+        committed: Mutex<Option<[u8; 32]>>,
+        events: Mutex<Vec<Event>>,
+    }
+
+    impl MockIo {
+        fn sent_tags(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|n| n.tag.to_string())
+                .collect()
+        }
+
+        fn sent_node(&self, tag: &str) -> Node {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|n| n.tag == tag)
+                .cloned()
+                .unwrap_or_else(|| panic!("expected a {tag} IQ to have been sent"))
+        }
+    }
+
+    #[async_trait]
+    impl ShortcakeIo for MockIo {
+        async fn query(
+            &self,
+            query: InfoQuery<'static>,
+        ) -> Result<Arc<OwnedNodeRef>, PasskeyError> {
+            let child = match &query.content {
+                Some(NodeContent::Nodes(nodes)) => nodes.first().cloned(),
+                _ => None,
+            };
+            let child = child.expect("md IQ must carry a child node");
+            let tag = child.tag.to_string();
+            self.sent.lock().unwrap().push(child);
+
+            let response = if tag == TAG_REF {
+                NodeBuilder::new("iq")
+                    .children([NodeBuilder::new(TAG_REF)
+                        .bytes(self.pairing_ref.as_bytes().to_vec())
+                        .build()])
+                    .build()
+            } else if tag == TAG_PASSKEY_REQUEST_OPTIONS {
+                NodeBuilder::new("iq")
+                    .children([NodeBuilder::new(TAG_PASSKEY_REQUEST_OPTIONS)
+                        .bytes(self.options_json.as_bytes().to_vec())
+                        .build()])
+                    .build()
+            } else {
+                NodeBuilder::new("iq").build()
+            };
+            Ok(node_to_owned_ref(&response))
+        }
+
+        fn device_material(&self) -> Result<DeviceMaterial, PasskeyError> {
+            Ok(self.device.clone())
+        }
+
+        async fn commit_adv_secret(&self, secret: [u8; 32]) {
+            *self.committed.lock().unwrap() = Some(secret);
+        }
+
+        fn emit(&self, event: Event) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn child_bytes(node: &Node, tag: &str) -> Vec<u8> {
+        child_payload(&node.as_node_ref(), tag).unwrap_or_else(|| panic!("missing {tag} child"))
+    }
+
+    #[tokio::test]
+    async fn full_handshake_drives_the_iq_sequence_and_delivers_the_committed_secret() {
+        // Companion static keys (arbitrary but distinct) + a primary playing the peer.
+        let device = DeviceMaterial {
+            noise_public: [0x11; 32],
+            identity_public: [0x12; 32],
+            device_type: 1,
+        };
+        let io = MockIo {
+            device: device.clone(),
+            pairing_ref: "REF-XYZ".to_string(),
+            options_json: "{}".to_string(),
+            sent: Mutex::new(Vec::new()),
+            committed: Mutex::new(None),
+            events: Mutex::new(Vec::new()),
+        };
+
+        // A re-link: pass a handoff key so the prologue carries the proof.
+        let handoff_key = [0x55u8; 32];
+        let assertion = Assertion {
+            assertion_json: br#"{"type":"public-key"}"#.to_vec(),
+            credential_id: b"cred-id".to_vec(),
+        };
+
+        let mut session = ShortcakeSession::open(&io, assertion, Some(handoff_key))
+            .await
+            .unwrap();
+
+        // step 1-2: ref fetched, then a prologue with the handoff proof.
+        assert_eq!(io.sent_tags(), vec![TAG_REF, TAG_PASSKEY_PROLOGUE]);
+        let prologue = io.sent_node(TAG_PASSKEY_PROLOGUE);
+        assert_eq!(child_bytes(&prologue, TAG_CREDENTIAL_ID), b"cred-id");
+        assert!(
+            prologue
+                .as_node_ref()
+                .get_optional_child(TAG_PAIRING_HANDOFF_PROOF)
+                .is_some()
         );
 
-        // fresh link: no handoff proof child
-        let fresh = build_prologue_node(b"c".to_vec(), b"a".to_vec(), b"p".to_vec(), None);
-        assert!(
-            fresh
-                .as_node_ref()
-                .get_optional_child("pairing_handoff_proof")
-                .is_none()
+        // primary's ephemeral identity
+        let primary_kp = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let primary_pub: [u8; 32] = primary_kp.public_key.public_key_bytes().try_into().unwrap();
+        let primary_nonce = [0x77u8; 32];
+        let primary_bytes = wa::PrimaryEphemeralIdentity {
+            public_key: Some(primary_pub.to_vec()),
+            nonce: Some(primary_nonce.to_vec()),
+        }
+        .encode_to_vec();
+
+        // step 3: continuation sends the companion nonce and emits the code.
+        let skip = session
+            .on_primary_identity(&io, &primary_bytes)
+            .await
+            .unwrap();
+        assert!(skip, "re-link with a handoff proof skips the code UX");
+        assert_eq!(
+            io.sent_tags().last().map(String::as_str),
+            Some(TAG_COMPANION_NONCE)
+        );
+        assert!(matches!(
+            io.events.lock().unwrap().first(),
+            Some(Event::PairPasskeyConfirmation(c)) if c.skip_handoff_ux && c.code.len() == 9
+        ));
+
+        // step 4: confirm seals + sends the pairing request and commits the secret.
+        session.confirm(&io).await.unwrap();
+        assert_eq!(
+            io.sent_tags().last().map(String::as_str),
+            Some(TAG_ENCRYPTED_PAIRING_REQUEST)
+        );
+        let committed = io
+            .committed
+            .lock()
+            .unwrap()
+            .expect("secret must be committed");
+
+        // The primary decrypts the pairing request and reads the SAME secret that
+        // was committed — proving the deferred rotation delivers what it persists.
+        let prologue_payload = child_bytes(&prologue, TAG_PROLOGUE_PAYLOAD);
+        let companion_eph_pub = wa::CompanionEphemeralIdentity::decode(
+            wa::ProloguePayload::decode(prologue_payload.as_slice())
+                .unwrap()
+                .companion_ephemeral_identity
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap()
+        .public_key
+        .unwrap();
+        let shared = primary_kp
+            .private_key
+            .calculate_agreement(&PublicKey::from_djb_public_key_bytes(&companion_eph_pub).unwrap())
+            .unwrap();
+        let key = ShortcakeUtils::derive_encryption_key_from_shared_secret(&shared, 1, "REF-XYZ")
+            .unwrap();
+        let wrapped = match io.sent_node(TAG_ENCRYPTED_PAIRING_REQUEST).content {
+            Some(NodeContent::Bytes(bytes)) => bytes,
+            _ => panic!("encrypted_pairing_request must carry bytes"),
+        };
+        let epr = wa::EncryptedPairingRequest::decode(wrapped.as_slice()).unwrap();
+        let iv: [u8; 12] = epr.iv.unwrap().as_slice().try_into().unwrap();
+        let mut plaintext = Vec::new();
+        wacore::libsignal::crypto::aes_256_gcm_decrypt(
+            &key,
+            &iv,
+            b"",
+            &epr.encrypted_payload.unwrap(),
+            &mut plaintext,
+        )
+        .unwrap();
+        let pr = wa::PairingRequest::decode(plaintext.as_slice()).unwrap();
+        assert_eq!(pr.adv_secret.as_deref(), Some(&committed[..]));
+        assert_eq!(
+            pr.companion_public_key.as_deref(),
+            Some(&device.noise_public[..])
         );
     }
 
@@ -582,17 +801,15 @@ mod tests {
             .get_device_snapshot()
             .adv_secret_key;
 
-        // verbatim options JSON; the handler forwards it untouched in the event
         let options = r#"{"challenge":"YWJjZGVm","rpId":"web.whatsapp.com"}"#;
-        let child = NodeBuilder::new("passkey_request_options")
+        let child = NodeBuilder::new(TAG_PASSKEY_REQUEST_OPTIONS)
             .bytes(options.as_bytes().to_vec())
             .build();
         client
-            .process_node(server_notification("passkey_prologue_request", Some(child)))
+            .process_node(server_notification(NOTIF_PASSKEY_REQUEST, Some(child)))
             .await;
 
-        // The rotation is staged pending, not committed to the store until the flow
-        // confirms, so the device secret is unchanged at this point.
+        // The rotation is deferred to confirmation, so the stored secret is unchanged.
         let after = client
             .persistence_manager
             .get_device_snapshot()
@@ -616,29 +833,16 @@ mod tests {
         let collector = Arc::new(TestEventCollector::default());
         client.register_handler(collector.clone() as Arc<dyn EventHandler>);
 
-        let before = client
-            .persistence_manager
-            .get_device_snapshot()
-            .adv_secret_key;
-        let child = NodeBuilder::new("passkey_request_options")
+        let child = NodeBuilder::new(TAG_PASSKEY_REQUEST_OPTIONS)
             .bytes(b"{}".to_vec())
             .build();
-        // forge a notification from a non-server JID
         let node = NodeBuilder::new("notification")
-            .attr("type", "passkey_prologue_request")
+            .attr("type", NOTIF_PASSKEY_REQUEST)
             .attr("from", "12345@s.whatsapp.net")
             .children([child])
             .build();
         client.process_node(node_to_owned_ref(&node)).await;
 
-        let after = client
-            .persistence_manager
-            .get_device_snapshot()
-            .adv_secret_key;
-        assert_eq!(
-            before, after,
-            "a forged request must NOT rotate the ADV secret"
-        );
         assert!(
             !collector
                 .events()
@@ -654,15 +858,12 @@ mod tests {
         let collector = Arc::new(TestEventCollector::default());
         client.register_handler(collector.clone() as Arc<dyn EventHandler>);
 
-        // No inline <passkey_request_options>: the handler falls back to an IQ fetch.
-        // The test client isn't connected, so the fetch fails fast and surfaces a
-        // non-continuation error (proving the fallback path runs).
+        // No inline options: the handler falls back to an IQ fetch. The test client
+        // isn't connected, so the fetch fails and surfaces a non-continuation error.
         client
-            .process_node(server_notification("passkey_prologue_request", None))
+            .process_node(server_notification(NOTIF_PASSKEY_REQUEST, None))
             .await;
 
-        // Assert it's specifically the fetch that failed, so the test proves the IQ
-        // fallback ran (not some earlier immediate error).
         wait_for(&collector, |e| {
             matches!(
                 e,
@@ -674,29 +875,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passkey_continuation_without_linking_cache_emits_error() {
+    async fn passkey_continuation_without_session_emits_error() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
         client.register_handler(collector.clone() as Arc<dyn EventHandler>);
 
-        // a well-formed primary identity, but no prior send_passkey_response ran, so
-        // there is no linking cache and the continuation must surface a continuation error.
-        let primary = waproto::whatsapp::PrimaryEphemeralIdentity {
+        let primary = wa::PrimaryEphemeralIdentity {
             public_key: Some(vec![0xAB; 32]),
             nonce: Some(vec![0xCD; 32]),
         };
-        let child = NodeBuilder::new("primary_ephemeral_identity")
+        let child = NodeBuilder::new(TAG_PRIMARY_EPHEMERAL_IDENTITY)
             .bytes(prost::Message::encode_to_vec(&primary))
             .build();
         client
-            .process_node(server_notification("crsc_continuation", Some(child)))
+            .process_node(server_notification(NOTIF_PASSKEY_CONTINUATION, Some(child)))
             .await;
 
-        // the continuation runs in a spawned task, so poll for the event
         wait_for(
             &collector,
             |e| matches!(e, Event::PairPasskeyError(err) if err.continuation),
         )
         .await;
+    }
+
+    #[test]
+    fn prologue_node_wire_shape() {
+        let node = build_prologue_node(
+            b"cred-id".to_vec(),
+            b"{\"type\":\"public-key\"}".to_vec(),
+            b"prologue-proto".to_vec(),
+            Some([0x42; 32]),
+        );
+        let nr = node.as_node_ref();
+        assert_eq!(nr.tag.as_ref(), TAG_PASSKEY_PROLOGUE);
+        assert_eq!(
+            nr.get_optional_child(TAG_CREDENTIAL_ID)
+                .and_then(|n| n.content_bytes()),
+            Some(&b"cred-id"[..])
+        );
+        assert_eq!(
+            nr.get_optional_child(TAG_PAIRING_HANDOFF_PROOF)
+                .and_then(|n| n.content_bytes()),
+            Some(&[0x42u8; 32][..])
+        );
+
+        let fresh = build_prologue_node(b"c".to_vec(), b"a".to_vec(), b"p".to_vec(), None);
+        assert!(
+            fresh
+                .as_node_ref()
+                .get_optional_child(TAG_PAIRING_HANDOFF_PROOF)
+                .is_none()
+        );
     }
 }
