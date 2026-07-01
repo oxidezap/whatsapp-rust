@@ -23,6 +23,7 @@ pub struct ImageOptions {
     /// Defaults to `image/jpeg`.
     pub mimetype: Option<String>,
     pub jpeg_thumbnail: Option<Vec<u8>>,
+    pub context_info: Option<Box<wa::ContextInfo>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -34,6 +35,7 @@ pub struct VideoOptions {
     pub duration_seconds: Option<u32>,
     /// Send as a looping GIF-style clip.
     pub gif_playback: Option<bool>,
+    pub context_info: Option<Box<wa::ContextInfo>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -46,6 +48,7 @@ pub struct DocumentOptions {
     pub caption: Option<String>,
     pub page_count: Option<u32>,
     pub jpeg_thumbnail: Option<Vec<u8>>,
+    pub context_info: Option<Box<wa::ContextInfo>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -57,6 +60,7 @@ pub struct AudioOptions {
     pub ptt: Option<bool>,
     /// PCM waveform preview bytes (voice notes).
     pub waveform: Option<Vec<u8>>,
+    pub context_info: Option<Box<wa::ContextInfo>>,
 }
 
 /// Build an image message from an upload result.
@@ -73,6 +77,7 @@ pub fn image_message(upload: UploadResponse, opts: ImageOptions) -> wa::Message 
             mimetype: Some(opts.mimetype.unwrap_or_else(|| "image/jpeg".to_string())),
             caption: opts.caption,
             jpeg_thumbnail: opts.jpeg_thumbnail,
+            context_info: opts.context_info,
             ..Default::default()
         })),
         ..Default::default()
@@ -97,6 +102,7 @@ pub fn video_message(upload: UploadResponse, opts: VideoOptions) -> wa::Message 
             jpeg_thumbnail: opts.jpeg_thumbnail,
             seconds: opts.duration_seconds,
             gif_playback: opts.gif_playback,
+            context_info: opts.context_info,
             ..Default::default()
         })),
         ..Default::default()
@@ -123,6 +129,7 @@ pub fn document_message(upload: UploadResponse, opts: DocumentOptions) -> wa::Me
             caption: opts.caption,
             page_count: opts.page_count,
             jpeg_thumbnail: opts.jpeg_thumbnail,
+            context_info: opts.context_info,
             ..Default::default()
         })),
         ..Default::default()
@@ -149,6 +156,7 @@ pub fn audio_message(upload: UploadResponse, opts: AudioOptions) -> wa::Message 
             seconds: opts.duration_seconds,
             ptt: opts.ptt,
             waveform: opts.waveform,
+            context_info: opts.context_info,
             ..Default::default()
         })),
         ..Default::default()
@@ -234,5 +242,39 @@ mod tests {
         assert_eq!(audio.ptt, Some(true));
         assert_eq!(audio.seconds, Some(5));
         assert_eq!(audio.streaming_sidecar.as_deref(), Some(&[9, 9, 9][..]));
+    }
+
+    #[test]
+    fn image_maps_context_info() {
+        let context = Box::new(wa::ContextInfo::default());
+
+        let image_msg = image_message(
+            sample_upload(),
+            ImageOptions {
+                context_info: Some(context),
+                ..Default::default()
+            },
+        );
+
+        let image = image_msg.image_message.unwrap();
+
+        assert!(image.context_info.is_some());
+    }
+
+    #[test]
+    fn video_maps_context_info() {
+        let context = Box::new(wa::ContextInfo::default());
+
+        let video_msg = video_message(
+            sample_upload(),
+            VideoOptions {
+                context_info: Some(context),
+                ..Default::default()
+            },
+        );
+
+        let video = video_msg.video_message.unwrap();
+
+        assert!(video.context_info.is_some());
     }
 }

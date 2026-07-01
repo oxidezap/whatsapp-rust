@@ -84,7 +84,7 @@ impl<'a> Status<'a> {
             crate::media::ImageOptions {
                 caption: caption.map(|c| c.to_string()),
                 jpeg_thumbnail: Some(thumbnail),
-                mimetype: None,
+                ..Default::default()
             },
         );
 
@@ -112,8 +112,7 @@ impl<'a> Status<'a> {
                 caption: caption.map(|c| c.to_string()),
                 jpeg_thumbnail: Some(thumbnail),
                 duration_seconds: Some(duration_seconds),
-                mimetype: None,
-                gif_playback: None,
+                ..Default::default()
             },
         );
 
