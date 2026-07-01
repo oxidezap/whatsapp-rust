@@ -46,6 +46,11 @@ struct LinkingCache {
     device_type: i32,
     skip_handoff_ux: bool,
     encryption_key: Option<[u8; 32]>,
+    /// This attempt's freshly-rotated ADV secret, held here (not in the device
+    /// store) until the flow commits it, so an abandoned attempt never rotates to a
+    /// secret the primary never received. Per-attempt, so concurrent attempts can't
+    /// cross-contaminate the committed secret.
+    new_adv_secret: [u8; 32],
 }
 
 #[derive(Default)]
@@ -53,9 +58,6 @@ pub(crate) struct PasskeyFlowState {
     /// HMAC key from the pre-rotation ADV secret; presence marks the re-link path
     /// that lets the server skip the verification-code UX. Consumed once.
     handoff_key: Option<[u8; 32]>,
-    /// Rotated ADV secret, held out of the device store until the flow commits it,
-    /// so an abandoned attempt never rotates to a secret the primary never received.
-    pending_adv_secret: Option<[u8; 32]>,
     linking: Option<LinkingCache>,
     authenticator: Option<Arc<dyn PasskeyAuthenticator>>,
 }
@@ -140,6 +142,8 @@ impl Client {
 
         let keypair = ShortcakeUtils::generate_companion_ephemeral_keypair();
         let companion_nonce = ShortcakeUtils::generate_companion_nonce();
+        let mut new_adv_secret = [0u8; 32];
+        rand::make_rng::<rand::rngs::StdRng>().fill(&mut new_adv_secret);
         let snapshot = self.persistence_manager.get_device_snapshot();
         let device_type = snapshot.device_props.platform_type.unwrap_or(0);
         let companion_pub: [u8; 32] = keypair
@@ -169,6 +173,7 @@ impl Client {
                 device_type,
                 skip_handoff_ux: proof.is_some(),
                 encryption_key: None,
+                new_adv_secret,
             });
             proof
         };
@@ -292,11 +297,7 @@ impl Client {
             let key = cache.encryption_key.ok_or_else(|| {
                 PasskeyError::Flow("confirmation before encryption key derived".into())
             })?;
-            // The pending (not-yet-committed) rotated ADV secret staged at request time.
-            let adv = state.pending_adv_secret.ok_or_else(|| {
-                PasskeyError::Flow("confirmation without a pending ADV secret".into())
-            })?;
-            (key, adv)
+            (key, cache.new_adv_secret)
         };
 
         let snapshot = self.persistence_manager.get_device_snapshot();
@@ -338,11 +339,7 @@ impl Client {
         self.persistence_manager
             .process_command(DeviceCommand::SetAdvSecretKey(adv_secret))
             .await;
-        {
-            let mut state = self.passkey_state.lock().await;
-            state.linking = None;
-            state.pending_adv_secret = None;
-        }
+        self.passkey_state.lock().await.linking = None;
         Ok(())
     }
 
@@ -409,19 +406,14 @@ pub(crate) async fn handle_passkey_notification(client: &Arc<Client>, node: Arc<
 }
 
 async fn drive_passkey_request(client: &Arc<Client>, options_json: String) {
-    // Handoff key from the current secret (proves continuity); stage a fresh secret
-    // that only commits at confirmation, so a failed attempt doesn't diverge.
+    // Handoff key from the current secret proves continuity to the server; presence
+    // of a key marks this as a re-link. The rotated secret itself is generated
+    // per-attempt in send_passkey_response.
     let snapshot = client.persistence_manager.get_device_snapshot();
     let handoff_key = ShortcakeUtils::derive_pairing_handoff_hmac_key(&snapshot.adv_secret_key)
         .inspect_err(|e| warn!("failed to derive pairing-handoff key: {e}"))
         .ok();
-    let mut new_adv = [0u8; 32];
-    rand::make_rng::<rand::rngs::StdRng>().fill(&mut new_adv);
-    {
-        let mut state = client.passkey_state.lock().await;
-        state.handoff_key = handoff_key;
-        state.pending_adv_secret = Some(new_adv);
-    }
+    client.passkey_state.lock().await.handoff_key = handoff_key;
 
     client
         .core
