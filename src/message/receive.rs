@@ -98,13 +98,11 @@ impl Client {
             // attr) and skip the PDO for them, still dispatching the event and
             // acking. A plain fanout (Unknown) stays recoverable via PDO.
             let is_bot = nr.get_optional_child("bot").is_some();
-            let is_hosted = unavailable
-                .get_attr("hosted")
-                .map(|v| v.as_str())
-                .as_deref()
-                == Some("true");
-            let is_view_once =
-                unavailable.get_attr("type").map(|v| v.as_str()).as_deref() == Some("view_once");
+            // `hosted` is a wire boolean (server sends "true"/"1"), so coerce it
+            // instead of matching one spelling and misclassifying the rest.
+            let is_hosted = unavailable.attrs().optional_bool("hosted");
+            let is_view_once = unavailable.get_attr("type").map(|v| v.as_str()).as_deref()
+                == Some(crate::types::events::UnavailableType::ViewOnce.as_str());
             let unavailable_type = crate::types::events::UnavailableType::from_fanout_flags(
                 is_bot,
                 is_hosted,

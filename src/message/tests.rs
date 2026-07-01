@@ -5291,19 +5291,23 @@ async fn view_once_stub_acks_without_pdo() {
 
     // The stanza is acked so the offline queue drains, without gating on a PDO.
     assert!(
-        poll_for_message_ack(&transport).await,
+        poll_for_message_ack(&transport, "VIEW_ONCE_ACK_1").await,
         "view-once stub must emit an <ack class=\"message\"> to drain the offline queue",
     );
 }
 
-/// Polls the captured transport for an `<ack class="message">`, the signal the
-/// stub was cleared from the offline queue. In this harness a PDO can never
-/// complete (no self-session), so the ack appears only when the PDO was
-/// skipped: a regression routing one of these fanouts back through PDO would
-/// leave `should_ack` false and fail the assertion.
-async fn poll_for_message_ack(transport: &crate::transport::mock::CapturingMockTransport) -> bool {
+/// Polls the captured transport for the `<ack class="message">` of `id`, the
+/// signal that stub was cleared from the offline queue. Keyed to the id so an
+/// unrelated ack can't green the test. In this harness a PDO can never complete
+/// (no self-session), so the ack appears only when the PDO was skipped: a
+/// regression routing one of these fanouts back through PDO would leave
+/// `should_ack` false and fail the assertion.
+async fn poll_for_message_ack(
+    transport: &crate::transport::mock::CapturingMockTransport,
+    id: &str,
+) -> bool {
     for _ in 0..80 {
-        if find_message_ack(&transport.sent()).is_some() {
+        if find_message_ack_for(&transport.sent(), id).is_some() {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -5335,7 +5339,7 @@ async fn bot_unavailable_stub_acks_without_pdo() {
         "bot <unavailable> stub must dispatch a Bot UndecryptableMessage",
     );
     assert!(
-        poll_for_message_ack(&transport).await,
+        poll_for_message_ack(&transport, "BOT_UNAVAIL_1").await,
         "bot stub must ack directly without a PDO round-trip",
     );
 }
@@ -5363,8 +5367,42 @@ async fn hosted_unavailable_stub_acks_without_pdo() {
         "hosted <unavailable> stub must dispatch a Hosted UndecryptableMessage",
     );
     assert!(
-        poll_for_message_ack(&transport).await,
+        poll_for_message_ack(&transport, "HOSTED_UNAVAIL_1").await,
         "hosted stub must ack directly without a PDO round-trip",
+    );
+}
+
+/// `hosted` is a wire boolean, so the numeric spelling `hosted="1"` must
+/// classify as Hosted just like `hosted="true"` and skip the futile PDO.
+#[tokio::test]
+async fn hosted_numeric_bool_unavailable_stub_acks_without_pdo() {
+    use crate::types::events::UnavailableType;
+    let (client, transport) = capturing_client("hosted_num_ack").await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.register_handler(recorder.clone());
+
+    let t = wacore::time::now_secs().to_string();
+    let node = node_to_arc(
+        NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "HOSTED_NUM_1")
+            .attr("t", &t)
+            .attr("type", "media")
+            .children(vec![
+                NodeBuilder::new("unavailable").attr("hosted", "1").build(),
+            ])
+            .build(),
+    );
+    client.clone().handle_incoming_message(node).await;
+
+    assert_eq!(
+        recorder.unavailable_count(UnavailableType::Hosted),
+        1,
+        "hosted=\"1\" must classify as Hosted via wire-boolean coercion",
+    );
+    assert!(
+        poll_for_message_ack(&transport, "HOSTED_NUM_1").await,
+        "numeric hosted stub must ack directly without a PDO round-trip",
     );
 }
 
