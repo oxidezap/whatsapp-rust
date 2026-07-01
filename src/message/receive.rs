@@ -93,11 +93,31 @@ impl Client {
                 Some("view_once") => crate::types::events::UnavailableType::ViewOnce,
                 _ => crate::types::events::UnavailableType::Unknown,
             };
-            log::info!(
-                "[msg:{}] Message has <unavailable> child (type: {:?}), requesting from phone via PDO",
-                info.id,
-                unavailable_type
+            // View-once media is never fanned out to companion/linked devices,
+            // so a PDO placeholder-resend to our own phone always comes back
+            // empty — the content is unrecoverable by design. Worse, that peer
+            // round-trip is surfaced by the phone as a spurious "Finished
+            // syncing with WhatsApp on <device>" notification for every
+            // view-once message received. Skip the PDO for view-once; still
+            // dispatch the event (so consumers see the failure) and still ack
+            // so the offline queue is cleared and the stanza is not redelivered.
+            let is_view_once = matches!(
+                unavailable_type,
+                crate::types::events::UnavailableType::ViewOnce
             );
+            if is_view_once {
+                log::info!(
+                    "[msg:{}] Message has <unavailable> child (type: ViewOnce); \
+                     unrecoverable via PDO — skipping request and acking",
+                    info.id,
+                );
+            } else {
+                log::info!(
+                    "[msg:{}] Message has <unavailable> child (type: {:?}), requesting from phone via PDO",
+                    info.id,
+                    unavailable_type
+                );
+            }
             // PDO is the only recovery here (no retry receipt), so run it before
             // the transport ack in one flush task: the ack must not clear the
             // offline queue before the PDO request goes out. status is acked by
@@ -113,10 +133,16 @@ impl Client {
             let info2 = Arc::clone(&info);
             let skip_ack = info.source.chat.is_status_broadcast();
             self.outbound_flush.spawn(&*self.runtime, async move {
-                // Only ack once the PDO request is out (or skipped as ancient);
-                // a transient send failure leaves it queued for redelivery.
-                let pdo_sent = client.run_pdo_request(&info2).await;
-                if !skip_ack && pdo_sent {
+                // View-once has no recoverable content, so skip the PDO entirely
+                // and ack directly. Otherwise PDO is the only recovery: ack only
+                // once the request is out (or skipped as ancient); a transient
+                // send failure leaves it queued for redelivery.
+                let should_ack = if is_view_once {
+                    true
+                } else {
+                    client.run_pdo_request(&info2).await
+                };
+                if !skip_ack && should_ack {
                     client.send_transport_ack(&info2).await;
                 }
             });

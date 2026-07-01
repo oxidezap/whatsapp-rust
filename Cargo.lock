@@ -76,9 +76,9 @@ dependencies = [
 
 [[package]]
 name = "aes-gcm"
-version = "0.11.0-rc.4"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da8c919c118108f144adecad74b425b804ad075580d605d9b33c2d6d1c62a2f8"
+checksum = "fdf011db2e21ce0d575593d749db5554b47fed37aff429e4dc50bc91ac93a028"
 dependencies = [
  "aead 0.6.1",
  "aes 0.9.1",
@@ -3332,6 +3332,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "smoothutf8"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b4ec95892483d6d94284caccfddb9b77111a4dcac33ed25d624248def0fa5f1"
+
+[[package]]
 name = "socket2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3854,7 +3860,7 @@ name = "wacore"
 version = "0.6.0"
 dependencies = [
  "aes 0.9.1",
- "aes-gcm 0.11.0-rc.4",
+ "aes-gcm 0.11.0",
  "anyhow",
  "async-channel",
  "async-lock",
@@ -3885,6 +3891,7 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "smoothutf8",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
@@ -3934,8 +3941,10 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "smoothutf8",
  "stable_deref_trait",
  "yoke",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -4293,6 +4302,7 @@ dependencies = [
  "log",
  "portable-atomic",
  "prost",
+ "scheduled-thread-pool",
  "serde_json",
  "tokio",
  "wacore",
@@ -4734,9 +4744,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "977347db8caa080403f6b6b7c1cda9479a8e869316f7e13a59b19076a40f94e3"
+checksum = "5431d5661c32445236631278f27946e444ddafe4684cac70b185272d4f9c52d5"
 
 [[package]]
 name = "zmij"

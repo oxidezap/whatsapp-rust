@@ -63,6 +63,8 @@ jobs:
     name: Create GitHub Release
     needs: publish
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -97,3 +99,16 @@ jobs:
               --generate-notes \
               --latest
           fi
+
+  # The tag pushed above with GITHUB_TOKEN can't trigger docker.yml's tag event,
+  # so invoke it directly and pass the version for the :X.Y.Z image tag.
+  publish-docker:
+    name: Publish Docker image
+    needs: github-release
+    # docker.yml logs into GHCR and pushes the multi-arch image manifest.
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+    with:
+      version: ${{ needs.github-release.outputs.version }}

@@ -1,18 +1,42 @@
-use flate2::{Decompress, FlushDecompress, Status};
 use std::cell::RefCell;
 use std::io;
+use zlib_rs::{Inflate, InflateError, InflateFlush, Status};
+
+/// zlib inflate wants a zlib header and the 32 KB LZ77 window.
+const ZLIB_HEADER: bool = true;
+const WINDOW_BITS: u8 = 15;
 
 thread_local! {
-    static DECOMPRESSOR: RefCell<(Decompress, Vec<u8>)> = RefCell::new((
-        Decompress::new(true),
+    static DECOMPRESSOR: RefCell<(Inflate, Vec<u8>)> = RefCell::new((
+        Inflate::new(ZLIB_HEADER, WINDOW_BITS),
         Vec::with_capacity(4096),
     ));
 
-    // Free-list of streaming-reader state (Decompress ~48 KB + 64 KB buf). A
+    // Free-list of streaming-reader state (inflate state ~48 KB + 64 KB buf). A
     // connection's bootstrap history sync decompresses several blobs sequentially,
     // each via a fresh `InflateReader`; reusing the state avoids re-initializing
     // zlib and re-allocating the buffer per blob.
-    static INFLATE_POOL: RefCell<Vec<(Decompress, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+    static INFLATE_POOL: RefCell<Vec<(Inflate, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Inflate straight into the vector's spare capacity, then extend its length by
+/// the produced count. Unlike `flate2::Decompress::decompress_vec`, this never
+/// zero-initializes the spare region first: flate2's zlib-rs backend doesn't
+/// override `decompress_uninit`, so it memsets the whole output window before
+/// every call — pure waste, since inflate overwrites exactly those bytes.
+fn inflate_into_spare(
+    inflate: &mut Inflate,
+    input: &[u8],
+    out: &mut Vec<u8>,
+    flush: InflateFlush,
+) -> Result<Status, InflateError> {
+    let before = inflate.total_out();
+    let status = inflate.decompress_uninit(input, out.spare_capacity_mut(), flush)?;
+    let produced = (inflate.total_out() - before) as usize;
+    // SAFETY: `decompress_uninit` wrote exactly `produced` bytes (per total_out)
+    // into the spare capacity, so that prefix is now initialized and in-bounds.
+    unsafe { out.set_len(out.len() + produced) };
+    Ok(status)
 }
 
 /// Streaming zlib reader: decompresses `input` incrementally into a small
@@ -25,9 +49,9 @@ thread_local! {
 pub struct InflateReader<'a> {
     input: &'a [u8],
     in_pos: usize,
-    // `Option` so `Drop` can move the state back into the pool (Decompress has no
+    // `Option` so `Drop` can move the state back into the pool (Inflate has no
     // cheap throwaway value to swap in). Always `Some` until dropped.
-    decomp: Option<Decompress>,
+    decomp: Option<Inflate>,
     buf: Vec<u8>,
     cursor: usize,
     total_out: u64,
@@ -45,9 +69,14 @@ impl<'a> InflateReader<'a> {
 
     pub fn new(input: &'a [u8], max: u64) -> Self {
         let (decomp, buf) = INFLATE_POOL.with(|p| p.borrow_mut().pop()).map_or_else(
-            || (Decompress::new(true), Vec::with_capacity(Self::CHUNK)),
+            || {
+                (
+                    Inflate::new(ZLIB_HEADER, WINDOW_BITS),
+                    Vec::with_capacity(Self::CHUNK),
+                )
+            },
             |(mut decomp, mut buf)| {
-                decomp.reset(true);
+                decomp.reset(ZLIB_HEADER);
                 buf.clear();
                 (decomp, buf)
             },
@@ -127,13 +156,13 @@ impl<'a> InflateReader<'a> {
         self.buf.reserve(Self::CHUNK);
         let prev_in = decomp.total_in();
         let prev_out = decomp.total_out();
-        let status = decomp
-            .decompress_vec(
-                &self.input[self.in_pos..],
-                &mut self.buf,
-                FlushDecompress::None,
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let status = inflate_into_spare(
+            decomp,
+            &self.input[self.in_pos..],
+            &mut self.buf,
+            InflateFlush::NoFlush,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.as_str()))?;
         let new_in = decomp.total_in();
         let produced = (decomp.total_out() - prev_out) as usize;
         self.in_pos += (new_in - prev_in) as usize;
@@ -202,7 +231,7 @@ impl Drop for InflateReader<'_> {
 /// allocated-bytes count and the peak.
 fn grow_by_observed_ratio(
     scratch: &mut Vec<u8>,
-    decompressor: &Decompress,
+    decompressor: &Inflate,
     compressed_len: usize,
     cap: usize,
 ) {
@@ -228,14 +257,14 @@ fn grow_by_observed_ratio(
 
 /// Decompress zlib data using a pooled decompressor.
 ///
-/// Reuses the per-thread `flate2::Decompress` internal state (~48 KB) across
+/// Reuses the per-thread `zlib_rs::Inflate` internal state (~48 KB) across
 /// calls. The output buffer is taken by the caller (zero-copy), so it is sized
 /// up-front from the compressed length to avoid repeated doubling reallocations
 /// while it grows to the decompressed size.
 pub fn decompress_zlib_pooled(compressed: &[u8], max_size: u64) -> io::Result<Vec<u8>> {
     DECOMPRESSOR.with(|cell| {
         let (decompressor, scratch) = &mut *cell.borrow_mut();
-        decompressor.reset(true);
+        decompressor.reset(ZLIB_HEADER);
         scratch.clear();
 
         // Cap output growth to max_size + 1 so we detect oversized payloads
@@ -259,7 +288,7 @@ pub fn decompress_zlib_pooled(compressed: &[u8], max_size: u64) -> io::Result<Ve
 
         let mut input_offset = 0;
         loop {
-            // Enforce cap before decompress_vec can grow the buffer
+            // Enforce cap before we grow the buffer for the next inflate call
             if scratch.len() >= cap {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -270,13 +299,13 @@ pub fn decompress_zlib_pooled(compressed: &[u8], max_size: u64) -> io::Result<Ve
             let prev_in = decompressor.total_in();
             let prev_out = decompressor.total_out();
 
-            let status = decompressor
-                .decompress_vec(
-                    &compressed[input_offset..],
-                    scratch,
-                    FlushDecompress::Finish,
-                )
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let status = inflate_into_spare(
+                decompressor,
+                &compressed[input_offset..],
+                scratch,
+                InflateFlush::Finish,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.as_str()))?;
 
             input_offset = decompressor.total_in() as usize;
 

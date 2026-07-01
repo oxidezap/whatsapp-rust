@@ -494,13 +494,18 @@ pub async fn prepare_group_stanza(
     let content_node = enc_builder.build();
 
     let stanza_type = stanza_type_from_message(message);
+    // status@broadcast is sent as a bare <message> (not <status>) with no addressing_mode,
+    // matching WA Web; the server NACKs a <status> tag (400) or an addressing_mode (479).
+    let is_status_broadcast = to_jid.is_status_broadcast();
     let mut stanza_builder = NodeBuilder::new("message")
         .attr("to", to_jid)
         .attr("id", request_id)
         .attr("type", stanza_type);
 
-    // WA Web always sets addressing_mode for groups (MsgCreateDeviceStanza.js:131-135)
-    stanza_builder = stanza_builder.attr("addressing_mode", group_info.addressing_mode.as_str());
+    if !is_status_broadcast {
+        stanza_builder =
+            stanza_builder.attr("addressing_mode", group_info.addressing_mode.as_str());
+    }
 
     if let Some(edit_attr) = &edit
         && *edit_attr != crate::types::message::EditAttribute::Empty

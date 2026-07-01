@@ -5218,8 +5218,9 @@ async fn test_unavailable_with_enc_skips_unavailable_shortcut() {
 
 /// Untrusted companions (web-class `PlatformType`) get the bare stub —
 /// `<unavailable>` without `<enc>`. That path must still emit a
-/// `ViewOnce` `UndecryptableMessage` so consumers surface the failure
-/// while the phone relays via PDO.
+/// `ViewOnce` `UndecryptableMessage` so consumers surface the failure.
+/// (The PDO resend is deliberately skipped for view-once — see
+/// `view_once_stub_acks_without_pdo`.)
 #[tokio::test]
 async fn test_unavailable_without_enc_dispatches_view_once_event() {
     let client = create_test_client_for_retry_with_id("unavailable_stub").await;
@@ -5233,6 +5234,44 @@ async fn test_unavailable_without_enc_dispatches_view_once_event() {
         recorder.view_once_unavailable_count(),
         1,
         "bare <unavailable> stub must dispatch exactly one ViewOnce UndecryptableMessage",
+    );
+}
+
+/// View-once media is never shared with companion/linked devices, so a PDO
+/// placeholder-resend to our own phone comes back empty — and that peer
+/// round-trip surfaces as a spurious "Finished syncing with WhatsApp on
+/// <device>" notification on the user's phone for every view-once received.
+/// The bare view-once stub must therefore ack the stanza directly (so the
+/// server stops redelivering it) instead of gating the ack on a futile PDO
+/// request, while still surfacing the failure to consumers.
+#[tokio::test]
+async fn view_once_stub_acks_without_pdo() {
+    let (client, transport) = capturing_client("view_once_ack").await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.register_handler(recorder.clone());
+
+    let node = build_unavailable_stanza("5511777776666@s.whatsapp.net", "VIEW_ONCE_ACK_1", false);
+    client.clone().handle_incoming_message(node).await;
+
+    // The (unrecoverable) failure still surfaces to consumers.
+    assert_eq!(
+        recorder.view_once_unavailable_count(),
+        1,
+        "bare view-once stub must still dispatch a ViewOnce UndecryptableMessage",
+    );
+
+    // The stanza is acked so the offline queue drains, without gating on a PDO.
+    let mut acked = false;
+    for _ in 0..80 {
+        if find_message_ack(&transport.sent()).is_some() {
+            acked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        acked,
+        "view-once stub must emit an <ack class=\"message\"> to drain the offline queue",
     );
 }
 
