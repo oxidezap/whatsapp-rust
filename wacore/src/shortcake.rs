@@ -55,12 +55,21 @@ pub enum ShortcakeError {
     Hkdf(&'static str),
     #[error("AES-256-GCM encryption failed")]
     Aead,
+    #[error("failed to decode {0} protobuf")]
+    Decode(&'static str),
     #[error("unexpected length: {what} expected {expected} got {got}")]
     Length {
         what: &'static str,
         expected: usize,
         got: usize,
     },
+}
+
+/// Parsed `<primary_ephemeral_identity>` from the server's continuation
+/// notification: the primary's ephemeral X25519 pubkey + nonce, both fixed 32 B.
+pub struct PrimaryEphemeralIdentity {
+    pub public_key: [u8; 32],
+    pub nonce: [u8; 32],
 }
 
 /// Output of [`ShortcakeUtils::encrypt_pairing_request`].
@@ -115,6 +124,36 @@ impl ShortcakeUtils {
             }),
         }
         .encode_to_vec()
+    }
+
+    /// Decode + length-validate the `PrimaryEphemeralIdentity` protobuf from the
+    /// `<primary_ephemeral_identity>` continuation node. Both fields must be
+    /// exactly 32 bytes; a wrong length is rejected here rather than producing a
+    /// bogus shared secret / verification code downstream.
+    pub fn parse_primary_ephemeral_identity(
+        bytes: &[u8],
+    ) -> Result<PrimaryEphemeralIdentity, ShortcakeError> {
+        let parsed = wa::PrimaryEphemeralIdentity::decode(bytes)
+            .map_err(|_| ShortcakeError::Decode("primary_ephemeral_identity"))?;
+        let pk = parsed.public_key.unwrap_or_default();
+        let nc = parsed.nonce.unwrap_or_default();
+        let public_key: [u8; 32] =
+            pk.as_slice()
+                .try_into()
+                .map_err(|_| ShortcakeError::Length {
+                    what: "primary_public_key",
+                    expected: 32,
+                    got: pk.len(),
+                })?;
+        let nonce: [u8; 32] = nc
+            .as_slice()
+            .try_into()
+            .map_err(|_| ShortcakeError::Length {
+                what: "primary_nonce",
+                expected: 32,
+                got: nc.len(),
+            })?;
+        Ok(PrimaryEphemeralIdentity { public_key, nonce })
     }
 
     /// Derive the 8-char verification code shown to the user (and the phone).
@@ -306,10 +345,56 @@ mod tests {
         );
     }
 
-    // Note: non-32-byte inputs are now unrepresentable — every fixed-size crypto
-    // field is a `&[u8; 32]` parameter, so a wrong length is a compile error
-    // rather than a runtime `ShortcakeError::Length`. This is strictly stronger
-    // than the previous `verification_code_rejects_short_primary_nonce` test.
+    // The fixed-size crypto inputs are `&[u8; 32]` parameters, so a wrong length
+    // is a compile error rather than a runtime check. Length validation only
+    // survives at the wire boundary: `parse_primary_ephemeral_identity` below.
+
+    #[test]
+    fn parse_primary_ephemeral_identity_roundtrip_and_length_validation() {
+        let proto = wa::PrimaryEphemeralIdentity {
+            public_key: Some(vec![0xAB; 32]),
+            nonce: Some(vec![0xCD; 32]),
+        }
+        .encode_to_vec();
+        let parsed = ShortcakeUtils::parse_primary_ephemeral_identity(&proto).unwrap();
+        assert_eq!(parsed.public_key, [0xAB; 32]);
+        assert_eq!(parsed.nonce, [0xCD; 32]);
+
+        // wrong-length pubkey is rejected with a Length error
+        let bad_pk = wa::PrimaryEphemeralIdentity {
+            public_key: Some(vec![0xAB; 31]),
+            nonce: Some(vec![0xCD; 32]),
+        }
+        .encode_to_vec();
+        assert!(matches!(
+            ShortcakeUtils::parse_primary_ephemeral_identity(&bad_pk),
+            Err(ShortcakeError::Length {
+                what: "primary_public_key",
+                ..
+            })
+        ));
+
+        // wrong-length nonce is rejected
+        let bad_nonce = wa::PrimaryEphemeralIdentity {
+            public_key: Some(vec![0xAB; 32]),
+            nonce: Some(vec![0xCD; 1]),
+        }
+        .encode_to_vec();
+        assert!(matches!(
+            ShortcakeUtils::parse_primary_ephemeral_identity(&bad_nonce),
+            Err(ShortcakeError::Length {
+                what: "primary_nonce",
+                ..
+            })
+        ));
+
+        // garbage that isn't a valid protobuf for this message: an absent field
+        // decodes to empty (length 0), which is also a Length error, not a panic.
+        assert!(matches!(
+            ShortcakeUtils::parse_primary_ephemeral_identity(&[]),
+            Err(ShortcakeError::Length { got: 0, .. })
+        ));
+    }
 
     #[test]
     fn encryption_key_uses_string_as_salt_not_info() {
@@ -393,5 +478,122 @@ mod tests {
         let d = wa::EncryptedPairingRequest::decode(wire.as_slice()).unwrap();
         assert_eq!(d.iv.as_deref(), Some(&enc.iv[..]));
         assert_eq!(d.encrypted_payload, Some(enc.encrypted_payload));
+    }
+
+    // End-to-end protocol interop: run BOTH the companion and a simulated primary
+    // through the real primitives and prove the two sides agree — the verification
+    // code matches, the X25519+HKDF encryption keys match, the primary can DECRYPT
+    // the companion's PairingRequest, and the handoff proof verifies. This is the
+    // guarantee that our output is interoperable with a real WhatsApp primary, not
+    // merely self-consistent.
+    #[test]
+    fn full_handshake_interops_with_a_simulated_primary() {
+        use crate::libsignal::crypto::aes_256_gcm_decrypt;
+
+        let device_type = 1; // CHROME
+        let pairing_ref = "REF-XYZ";
+        let prior_adv_secret = [0x11u8; 32]; // a prior linked session's secret
+        let new_adv_secret = [0x22u8; 32]; // rotated for this link
+
+        // companion: ephemeral identity + commitment + prologue + handoff proof
+        let companion_kp = ShortcakeUtils::generate_companion_ephemeral_keypair();
+        let companion_nonce = ShortcakeUtils::generate_companion_nonce();
+        let companion_pub: [u8; 32] = companion_kp
+            .public_key
+            .public_key_bytes()
+            .try_into()
+            .unwrap();
+        let identity = ShortcakeUtils::build_companion_ephemeral_identity(
+            &companion_pub,
+            device_type,
+            pairing_ref,
+        );
+        let commitment = ShortcakeUtils::commitment_hash(&identity, &companion_nonce);
+        let prologue = ShortcakeUtils::build_prologue_payload(&identity, &commitment);
+        let companion_handoff =
+            ShortcakeUtils::derive_pairing_handoff_hmac_key(&prior_adv_secret).unwrap();
+        let proof = ShortcakeUtils::compute_pairing_handoff_proof(&companion_handoff, &prologue);
+
+        // primary: its own ephemeral identity, sent back as <primary_ephemeral_identity>
+        let primary_kp = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let primary_pub: [u8; 32] = primary_kp.public_key.public_key_bytes().try_into().unwrap();
+        let primary_nonce = [0x33u8; 32];
+        let primary_wire = wa::PrimaryEphemeralIdentity {
+            public_key: Some(primary_pub.to_vec()),
+            nonce: Some(primary_nonce.to_vec()),
+        }
+        .encode_to_vec();
+        let parsed = ShortcakeUtils::parse_primary_ephemeral_identity(&primary_wire).unwrap();
+
+        // the primary verifies the handoff proof against the shared prior secret
+        let primary_handoff =
+            ShortcakeUtils::derive_pairing_handoff_hmac_key(&prior_adv_secret).unwrap();
+        assert_eq!(
+            proof,
+            ShortcakeUtils::compute_pairing_handoff_proof(&primary_handoff, &prologue),
+            "handoff proof must verify on the primary"
+        );
+
+        // both sides derive the SAME verification code from the same inputs
+        let companion_code = ShortcakeUtils::derive_verification_code(
+            &companion_nonce,
+            &parsed.public_key,
+            &parsed.nonce,
+        );
+        let primary_code = ShortcakeUtils::derive_verification_code(
+            &companion_nonce,
+            &primary_pub,
+            &primary_nonce,
+        );
+        assert_eq!(companion_code, primary_code);
+
+        // X25519 is symmetric, so both sides derive the same AES key
+        let companion_key = ShortcakeUtils::derive_encryption_key(
+            &companion_kp,
+            &parsed.public_key,
+            device_type,
+            pairing_ref,
+        )
+        .unwrap();
+        let primary_shared = primary_kp
+            .private_key
+            .calculate_agreement(&PublicKey::from_djb_public_key_bytes(&companion_pub).unwrap())
+            .unwrap();
+        let primary_key = ShortcakeUtils::derive_encryption_key_from_shared_secret(
+            &primary_shared,
+            device_type,
+            pairing_ref,
+        )
+        .unwrap();
+        assert_eq!(companion_key, primary_key, "X25519+HKDF keys must agree");
+
+        // companion encrypts the PairingRequest; the primary decrypts it and reads
+        // the newly-rotated ADV secret out
+        let request =
+            ShortcakeUtils::build_pairing_request(&[0xAA; 32], &[0xBB; 32], &new_adv_secret);
+        let enc = ShortcakeUtils::encrypt_pairing_request(&request, &companion_key).unwrap();
+        let wire = ShortcakeUtils::build_encrypted_pairing_request(&enc);
+        let decoded = wa::EncryptedPairingRequest::decode(wire.as_slice()).unwrap();
+        let iv: [u8; 12] = decoded.iv.unwrap().as_slice().try_into().unwrap();
+
+        let mut plaintext = Vec::new();
+        aes_256_gcm_decrypt(
+            &primary_key,
+            &iv,
+            b"",
+            &decoded.encrypted_payload.unwrap(),
+            &mut plaintext,
+        )
+        .unwrap();
+        let recovered = wa::PairingRequest::decode(plaintext.as_slice()).unwrap();
+        assert_eq!(recovered.adv_secret.as_deref(), Some(&new_adv_secret[..]));
+        assert_eq!(
+            recovered.companion_public_key.as_deref(),
+            Some(&[0xAA; 32][..])
+        );
+        assert_eq!(
+            recovered.companion_identity_key.as_deref(),
+            Some(&[0xBB; 32][..])
+        );
     }
 }

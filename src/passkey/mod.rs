@@ -31,6 +31,8 @@
 //! generic [`CallbackAuthenticator`] (host provides the assertion) so no platform
 //! dependency leaks into headless/library builds.
 
+pub mod flow;
+
 use async_trait::async_trait;
 use base64::prelude::*;
 use std::future::Future;
@@ -98,13 +100,20 @@ pub enum PasskeyError {
     InvalidOptions(String),
     #[error("authenticator backend error: {0}")]
     Backend(String),
+    #[error("passkey linking flow error: {0}")]
+    Flow(String),
 }
 
 /// Produces a WebAuthn assertion for a SHORTCAKE_PASSKEY link. Implemented by a
 /// real authenticator (Android Credential Manager / hybrid / software vault).
+///
+/// The `MaybeSendSync` supertrait keeps this `Send + Sync` on native (the client
+/// stores it as `Arc<dyn PasskeyAuthenticator>` and drives it across threads) but
+/// drops the bound on wasm32, where a browser authenticator may hold `!Send` JS
+/// handles — matching the sibling extension points (`Transport`, `EventHandler`).
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait PasskeyAuthenticator: Send + Sync {
+pub trait PasskeyAuthenticator: wacore::sync_marker::MaybeSendSync {
     async fn get_assertion(&self, request: &AssertionRequest) -> Result<Assertion, PasskeyError>;
 }
 
@@ -116,6 +125,13 @@ type AssertionFuture = Pin<Box<dyn Future<Output = Result<Assertion, PasskeyErro
 #[cfg(target_arch = "wasm32")]
 type AssertionFuture = Pin<Box<dyn Future<Output = Result<Assertion, PasskeyError>>>>;
 
+// The stored closure: `Send + Sync` on native, relaxed on wasm to mirror
+// `AssertionFuture` (a browser closure may capture `!Send` JS handles).
+#[cfg(not(target_arch = "wasm32"))]
+type AssertionCallback = dyn Fn(AssertionRequest) -> AssertionFuture + Send + Sync;
+#[cfg(target_arch = "wasm32")]
+type AssertionCallback = dyn Fn(AssertionRequest) -> AssertionFuture;
+
 /// Generic [`PasskeyAuthenticator`] that defers to a host-provided async closure.
 ///
 /// This is the integration seam for the Android Credential Manager strategy: the
@@ -123,13 +139,13 @@ type AssertionFuture = Pin<Box<dyn Future<Output = Result<Assertion, PasskeyErro
 /// the future with the mapped [`Assertion`]. Keeps all platform code out of the lib.
 #[derive(Clone)]
 pub struct CallbackAuthenticator {
-    cb: Arc<dyn Fn(AssertionRequest) -> AssertionFuture + Send + Sync>,
+    cb: Arc<AssertionCallback>,
 }
 
 impl CallbackAuthenticator {
     pub fn new<F>(f: F) -> Self
     where
-        F: Fn(AssertionRequest) -> AssertionFuture + Send + Sync + 'static,
+        F: Fn(AssertionRequest) -> AssertionFuture + wacore::sync_marker::MaybeSendSync + 'static,
     {
         Self { cb: Arc::new(f) }
     }
@@ -156,6 +172,9 @@ pub fn parse_request_options(json: &str) -> Result<AssertionRequest, PasskeyErro
     let challenge = BASE64_URL_SAFE_NO_PAD
         .decode(challenge_b64.trim_end_matches('='))
         .map_err(|e| PasskeyError::InvalidOptions(format!("challenge b64url: {e}")))?;
+    if challenge.is_empty() {
+        return Err(PasskeyError::InvalidOptions("empty challenge".into()));
+    }
 
     let rp_id = v
         .get("rpId")
@@ -177,6 +196,11 @@ pub fn parse_request_options(json: &str) -> Result<AssertionRequest, PasskeyErro
             let bytes = BASE64_URL_SAFE_NO_PAD
                 .decode(id.trim_end_matches('='))
                 .map_err(|e| PasskeyError::InvalidOptions(format!("credential id b64url: {e}")))?;
+            if bytes.is_empty() {
+                return Err(PasskeyError::InvalidOptions(
+                    "allowCredentials[].id is empty".into(),
+                ));
+            }
             allow_credentials.push(bytes);
         }
     }
@@ -297,6 +321,26 @@ mod tests {
         })
         .to_string();
         assert!(parse_request_options(&json).is_err());
+
+        // present-but-empty id (all padding / empty string) decodes to zero bytes,
+        // which is never a real credential id — must error, not push an empty entry.
+        let json = serde_json::json!({
+            "challenge": BASE64_URL_SAFE_NO_PAD.encode(b"c"),
+            "allowCredentials": [{"type": "public-key", "id": ""}],
+        })
+        .to_string();
+        assert!(parse_request_options(&json).is_err());
+    }
+
+    #[test]
+    fn empty_challenge_is_rejected() {
+        // a present-but-empty challenge provides zero replay protection; reject it
+        // rather than handing a degenerate request to the authenticator.
+        let json = serde_json::json!({ "challenge": "" }).to_string();
+        assert!(matches!(
+            parse_request_options(&json),
+            Err(PasskeyError::InvalidOptions(_))
+        ));
     }
 
     #[test]

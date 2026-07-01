@@ -261,6 +261,9 @@ pub enum EventKind {
     NewsletterLiveUpdate,
     RawNode,
     MexNotification,
+    PairPasskeyRequest,
+    PairPasskeyConfirmation,
+    PairPasskeyError,
     // When adding a variant, mind the 64-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u64) and keep the guard pointing at the
     // last variant.
@@ -274,7 +277,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::MexNotification as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::PairPasskeyError as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. The event bus skips
 /// materializing and dispatching events whose kind no handler wants, so a
@@ -700,6 +703,46 @@ pub enum Event {
     /// Server-pushed MEX (GraphQL) update. Routed by the textual `op_name`,
     /// which is stable across WA Web bundle releases.
     MexNotification(MexNotification),
+
+    /// SHORTCAKE_PASSKEY: the server asked for a WebAuthn assertion to gate this
+    /// companion link. Carries the verbatim `PublicKeyCredentialRequestOptions`
+    /// JSON; the host obtains an assertion (via [`crate::sync_marker`]-agnostic
+    /// authenticator) and the client sends it back. If a passkey authenticator is
+    /// registered the client drives this automatically; this event is for hosts
+    /// that drive the assertion manually.
+    PairPasskeyRequest(PairPasskeyRequest),
+
+    /// SHORTCAKE_PASSKEY: the link reached the verification stage. `code` is the
+    /// 8-char (dashed) pairing code; when `skip_handoff_ux` is set, continuity was
+    /// proven via the handoff proof and the code need not be shown to the user.
+    PairPasskeyConfirmation(PairPasskeyConfirmation),
+
+    /// SHORTCAKE_PASSKEY: the passkey link failed. `continuation` distinguishes a
+    /// failure during the continuation/verification stage from the initial request.
+    PairPasskeyError(PairPasskeyError),
+}
+
+/// Payload for [`Event::PairPasskeyRequest`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PairPasskeyRequest {
+    /// Verbatim `PublicKeyCredentialRequestOptions` JSON from the server. Pass it
+    /// straight to a WebAuthn `get` (e.g. Android Credential Manager) — or parse it
+    /// with `whatsapp_rust::passkey::parse_request_options`.
+    pub request_options_json: String,
+}
+
+/// Payload for [`Event::PairPasskeyConfirmation`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PairPasskeyConfirmation {
+    pub code: String,
+    pub skip_handoff_ux: bool,
+}
+
+/// Payload for [`Event::PairPasskeyError`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PairPasskeyError {
+    pub error: String,
+    pub continuation: bool,
 }
 
 /// `payload` shape depends on `op_name`. `offline` mirrors the raw string
@@ -771,6 +814,9 @@ impl Event {
             Event::NewsletterLiveUpdate(_) => EventKind::NewsletterLiveUpdate,
             Event::RawNode(_) => EventKind::RawNode,
             Event::MexNotification(_) => EventKind::MexNotification,
+            Event::PairPasskeyRequest(_) => EventKind::PairPasskeyRequest,
+            Event::PairPasskeyConfirmation(_) => EventKind::PairPasskeyConfirmation,
+            Event::PairPasskeyError(_) => EventKind::PairPasskeyError,
         }
     }
 
