@@ -501,7 +501,7 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
                 pos += vlen;
                 let len = usize::try_from(len).ok()?;
                 let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
-                let id = std::str::from_utf8(data.get(pos..end)?).ok()?;
+                let id = smoothutf8::from_utf8(data.get(pos..end)?)?;
                 id_match = id == own_user;
                 if !id_match {
                     return None; // wrong user, skip entirely
@@ -514,7 +514,7 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
                 pos += vlen;
                 let len = usize::try_from(len).ok()?;
                 let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
-                let name = std::str::from_utf8(data.get(pos..end)?).ok()?;
+                let name = smoothutf8::from_utf8(data.get(pos..end)?)?;
                 pushname = Some(name.to_string());
                 pos = end;
             }
@@ -1239,13 +1239,13 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
                                     from_me = f.varint != 0;
                                 }
                                 tags::message_key::ID => {
-                                    let Some(Ok(s)) = f.value.map(std::str::from_utf8) else {
+                                    let Some(s) = f.value.and_then(smoothutf8::from_utf8) else {
                                         return FastExtract::NoRecord;
                                     };
                                     msg_id = Some(s);
                                 }
                                 tags::message_key::PARTICIPANT => {
-                                    let Some(Ok(s)) = f.value.map(std::str::from_utf8) else {
+                                    let Some(s) = f.value.and_then(smoothutf8::from_utf8) else {
                                         return FastExtract::NoRecord;
                                     };
                                     key_participant = Some(s);
@@ -1272,7 +1272,7 @@ fn fast_extract(history_msg: &[u8]) -> FastExtract<'_> {
                         timestamp = Some(f.varint);
                     }
                     tags::web_message_info::PARTICIPANT => {
-                        let Some(Ok(s)) = f.value.map(std::str::from_utf8) else {
+                        let Some(s) = f.value.and_then(smoothutf8::from_utf8) else {
                             return FastExtract::NoRecord;
                         };
                         web_msg_participant = Some(s);
@@ -1546,7 +1546,7 @@ fn extract_conversation_fields(
                 let Ok(end) = checked_end(pos, len, data.len(), "conv-id") else {
                     break;
                 };
-                let Ok(id) = std::str::from_utf8(&data[pos..end]) else {
+                let Some(id) = smoothutf8::from_utf8(&data[pos..end]) else {
                     // A real conversation id is a JID (always UTF-8). If it
                     // isn't, the conversation is malformed; skip it rather than
                     // pushing its secrets under an empty chat id. The id
