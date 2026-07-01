@@ -62,7 +62,6 @@ trait ShortcakeIo: MaybeSendSync {
     async fn query(&self, query: InfoQuery<'static>) -> Result<Arc<OwnedNodeRef>, PasskeyError>;
     fn device_material(&self) -> Result<DeviceMaterial, PasskeyError>;
     async fn commit_adv_secret(&self, secret: [u8; 32]);
-    fn emit(&self, event: Event);
 }
 
 #[derive(PartialEq, Eq)]
@@ -146,14 +145,15 @@ impl ShortcakeSession {
         })
     }
 
-    /// Agree on the shared secret, reveal the companion nonce, derive the code +
-    /// encryption key, and emit [`Event::PairPasskeyConfirmation`]. Returns whether
-    /// the handoff proof lets the code UX be skipped.
+    /// Agree on the shared secret, reveal the companion nonce, and derive the code
+    /// and encryption key. Returns the confirmation payload for the caller to
+    /// publish, so the caller can restore the session before a synchronous listener
+    /// that confirms observes it.
     async fn on_primary_identity(
         &mut self,
         io: &dyn ShortcakeIo,
         primary_bytes: &[u8],
-    ) -> Result<bool, PasskeyError> {
+    ) -> Result<PairPasskeyConfirmation, PasskeyError> {
         if self.stage != Stage::AwaitingPrimaryIdentity {
             return Err(PasskeyError::Flow(
                 "unexpected continuation for this stage".into(),
@@ -190,11 +190,10 @@ impl ShortcakeSession {
 
         self.encryption_key = Some(encryption_key);
         self.stage = Stage::AwaitingConfirmation;
-        io.emit(Event::PairPasskeyConfirmation(PairPasskeyConfirmation {
+        Ok(PairPasskeyConfirmation {
             code,
             skip_handoff_ux: self.skip_handoff_ux,
-        }));
-        Ok(self.skip_handoff_ux)
+        })
     }
 
     /// Encrypt the `PairingRequest` (companion static keys + rotated ADV secret)
@@ -244,6 +243,9 @@ pub(crate) struct PasskeyFlowState {
     /// HMAC key from the pre-rotation ADV secret; presence marks the re-link path
     /// that lets the server skip the verification-code UX. Consumed once.
     handoff_key: Option<[u8; 32]>,
+    /// Set while a `send_passkey_response` is mid-open (before its session exists),
+    /// so a concurrent open is rejected rather than clobbering the attempt.
+    opening: bool,
     session: Option<ShortcakeSession>,
     authenticator: Option<Arc<dyn PasskeyAuthenticator>>,
 }
@@ -358,10 +360,6 @@ impl ShortcakeIo for Client {
             .process_command(DeviceCommand::SetAdvSecretKey(secret))
             .await;
     }
-
-    fn emit(&self, event: Event) {
-        self.core.event_bus.dispatch(event);
-    }
 }
 
 impl Client {
@@ -380,24 +378,48 @@ impl Client {
     /// Send the WebAuthn assertion as `<passkey_prologue>` and open the handshake.
     /// Call after an [`Event::PairPasskeyRequest`].
     pub async fn send_passkey_response(&self, assertion: Assertion) -> Result<(), PasskeyError> {
-        let handoff_key = self.passkey_state.lock().await.handoff_key.take();
-        let session = ShortcakeSession::open(self, assertion, handoff_key).await?;
-        self.passkey_state.lock().await.session = Some(session);
+        // Reserve the single attempt slot BEFORE the opening awaits, so a concurrent
+        // response can't open a second overlapping handshake and clobber this one's
+        // nonce/ref (which would then commit the wrong ADV rotation).
+        let handoff_key = {
+            let mut state = self.passkey_state.lock().await;
+            if state.opening || state.session.is_some() {
+                return Err(PasskeyError::Flow(
+                    "a passkey link is already in progress".into(),
+                ));
+            }
+            state.opening = true;
+            state.handoff_key.take()
+        };
+
+        let opened = ShortcakeSession::open(self, assertion, handoff_key).await;
+        let mut state = self.passkey_state.lock().await;
+        state.opening = false;
+        state.session = Some(opened?);
         Ok(())
     }
 
     /// Finish the link. For a fresh link, call this only after the user confirms the
     /// [`Event::PairPasskeyConfirmation`] code.
     pub async fn send_passkey_confirmation(&self) -> Result<(), PasskeyError> {
-        // Taken out for the duration: on failure the attempt is dropped, not left
-        // half-committed.
-        let mut session = self
-            .passkey_state
-            .lock()
-            .await
-            .session
-            .take()
-            .ok_or_else(|| PasskeyError::Flow("confirmation without an active session".into()))?;
+        // Only consume the session once it's actually at the confirmation stage — a
+        // premature call must NOT drop the in-flight attempt.
+        let mut session = {
+            let mut state = self.passkey_state.lock().await;
+            match &state.session {
+                Some(s) if s.stage == Stage::AwaitingConfirmation => state.session.take().unwrap(),
+                Some(_) => {
+                    return Err(PasskeyError::Flow(
+                        "confirmation before the verification stage".into(),
+                    ));
+                }
+                None => {
+                    return Err(PasskeyError::Flow(
+                        "confirmation without an active session".into(),
+                    ));
+                }
+            }
+        };
         session.confirm(self).await
     }
 
@@ -409,8 +431,15 @@ impl Client {
             .session
             .take()
             .ok_or_else(|| PasskeyError::Flow("continuation without an active session".into()))?;
-        let skip = session.on_primary_identity(self, &primary_bytes).await?;
+        let confirmation = session.on_primary_identity(self, &primary_bytes).await?;
+        let skip = confirmation.skip_handoff_ux;
+
+        // Restore the session BEFORE publishing the event, so a synchronous listener
+        // that confirms from it sees an active session.
         self.passkey_state.lock().await.session = Some(session);
+        self.core
+            .event_bus
+            .dispatch(Event::PairPasskeyConfirmation(confirmation));
 
         // Re-link: continuity is already proven, so finish without a user code when
         // an authenticator is driving.
@@ -592,14 +621,13 @@ mod tests {
     }
 
     // Scripted IQ stand-in: answers each `md` IQ by its child tag and records the
-    // child that was sent, plus committed secret and emitted events.
+    // child that was sent, plus the committed secret.
     struct MockIo {
         device: DeviceMaterial,
         pairing_ref: String,
         options_json: String,
         sent: Mutex<Vec<Node>>,
         committed: Mutex<Option<[u8; 32]>>,
-        events: Mutex<Vec<Event>>,
     }
 
     impl MockIo {
@@ -662,10 +690,6 @@ mod tests {
         async fn commit_adv_secret(&self, secret: [u8; 32]) {
             *self.committed.lock().unwrap() = Some(secret);
         }
-
-        fn emit(&self, event: Event) {
-            self.events.lock().unwrap().push(event);
-        }
     }
 
     fn child_bytes(node: &Node, tag: &str) -> Vec<u8> {
@@ -686,7 +710,6 @@ mod tests {
             options_json: "{}".to_string(),
             sent: Mutex::new(Vec::new()),
             committed: Mutex::new(None),
-            events: Mutex::new(Vec::new()),
         };
 
         // A re-link: pass a handoff key so the prologue carries the proof.
@@ -721,20 +744,20 @@ mod tests {
         }
         .encode_to_vec();
 
-        // step 3: continuation sends the companion nonce and emits the code.
-        let skip = session
+        // step 3: continuation sends the companion nonce and yields the code.
+        let confirmation = session
             .on_primary_identity(&io, &primary_bytes)
             .await
             .unwrap();
-        assert!(skip, "re-link with a handoff proof skips the code UX");
+        assert!(
+            confirmation.skip_handoff_ux,
+            "re-link with a handoff proof skips the code UX"
+        );
+        assert_eq!(confirmation.code.len(), 9, "code is grouped XXXX-XXXX");
         assert_eq!(
             io.sent_tags().last().map(String::as_str),
             Some(TAG_COMPANION_NONCE)
         );
-        assert!(matches!(
-            io.events.lock().unwrap().first(),
-            Some(Event::PairPasskeyConfirmation(c)) if c.skip_handoff_ux && c.code.len() == 9
-        ));
 
         // step 4: confirm seals + sends the pairing request and commits the secret.
         session.confirm(&io).await.unwrap();
@@ -787,6 +810,31 @@ mod tests {
         assert_eq!(
             pr.companion_public_key.as_deref(),
             Some(&device.noise_public[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn premature_confirmation_keeps_the_session() {
+        let client = create_test_client().await;
+        // A session that hasn't reached the confirmation stage yet.
+        client.passkey_state.lock().await.session = Some(ShortcakeSession {
+            keypair: KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()),
+            companion_nonce: [0; 32],
+            pairing_ref: "r".into(),
+            device_type: 1,
+            new_adv_secret: [1; 32],
+            skip_handoff_ux: false,
+            stage: Stage::AwaitingPrimaryIdentity,
+            encryption_key: None,
+        });
+
+        assert!(
+            client.send_passkey_confirmation().await.is_err(),
+            "confirming before the verification stage errors"
+        );
+        assert!(
+            client.passkey_state.lock().await.session.is_some(),
+            "a premature confirmation must not drop the in-flight attempt"
         );
     }
 

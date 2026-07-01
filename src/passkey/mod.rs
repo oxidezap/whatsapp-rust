@@ -176,10 +176,16 @@ pub fn parse_request_options(json: &str) -> Result<AssertionRequest, PasskeyErro
         return Err(PasskeyError::InvalidOptions("empty challenge".into()));
     }
 
-    let rp_id = v
-        .get("rpId")
-        .and_then(|r| r.as_str())
-        .map(|s| s.to_string());
+    // Absent rpId is fine (the authenticator defaults it); a present-but-non-string
+    // value is malformed and must fail closed, not silently drop the RP binding.
+    let rp_id = match v.get("rpId") {
+        None => None,
+        Some(r) => Some(
+            r.as_str()
+                .ok_or_else(|| PasskeyError::InvalidOptions("rpId must be a string".into()))?
+                .to_string(),
+        ),
+    };
 
     // Reject malformed descriptors instead of dropping them: silently skipping
     // entries can collapse a populated allowCredentials into an empty list, which
@@ -337,6 +343,20 @@ mod tests {
         // a present-but-empty challenge provides zero replay protection; reject it
         // rather than handing a degenerate request to the authenticator.
         let json = serde_json::json!({ "challenge": "" }).to_string();
+        assert!(matches!(
+            parse_request_options(&json),
+            Err(PasskeyError::InvalidOptions(_))
+        ));
+    }
+
+    #[test]
+    fn non_string_rp_id_is_rejected() {
+        // present-but-malformed rpId must fail closed, not silently drop the RP.
+        let json = serde_json::json!({
+            "challenge": BASE64_URL_SAFE_NO_PAD.encode(b"c"),
+            "rpId": 123,
+        })
+        .to_string();
         assert!(matches!(
             parse_request_options(&json),
             Err(PasskeyError::InvalidOptions(_))
