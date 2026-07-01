@@ -3479,6 +3479,176 @@ mod local_identity_change_on_send {
         }
     }
 
+    /// Prekey bundle with a valid signed-prekey signature (create_mock_bundle's
+    /// zeroed signature fails X3DH, so it can't establish a real session).
+    fn verifiable_bundle(rng: &mut rand::rngs::StdRng) -> PreKeyBundle {
+        let identity = IdentityKeyPair::generate(rng);
+        let spk = KeyPair::generate(rng);
+        let opk = KeyPair::generate(rng);
+        let sig = identity
+            .private_key()
+            .calculate_signature(&spk.public_key.serialize(), rng)
+            .unwrap();
+        PreKeyBundle::new(
+            1,
+            1u32.into(),
+            Some((1u32.into(), opk.public_key)),
+            1u32.into(),
+            spk.public_key,
+            sig.to_vec(),
+            *identity.identity_key(),
+        )
+        .unwrap()
+    }
+
+    fn raw_fanout_stores<'a>(
+        sender_key_store: &'a mut MemSenderKeyStore,
+        session_store: &'a mut MemSessionStore,
+        identity_store: &'a mut MemIdentityStore,
+        prekey_store: &'a mut UnusedPreKeyStore,
+        signed_prekey_store: &'a UnusedSignedPreKeyStore,
+    ) -> SignalStores<'a> {
+        SignalStores {
+            sender_key_store,
+            session_store,
+            identity_store,
+            prekey_store,
+            signed_prekey_store,
+        }
+    }
+
+    /// Establish a real Signal session for each device directly on the stores
+    /// (the module's per-value MemSessionStore would lose sessions written
+    /// through the fan-out's clone_box, so setup must not go through spawns).
+    async fn stores_with_sessions(devices: &[Jid]) -> (MemSessionStore, MemIdentityStore) {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut session_store = MemSessionStore::default();
+        let mut identity_store = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            known: HashMap::new(),
+        };
+        for d in devices {
+            process_prekey_bundle(
+                &d.to_protocol_address(),
+                &mut session_store,
+                &mut identity_store,
+                &verifiable_bundle(&mut rng),
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("session established");
+        }
+        (session_store, identity_store)
+    }
+
+    /// Happy path: the chunked fan-out returns a ciphertext for every device,
+    /// spanning more than one ENCRYPT_FANOUT_CONCURRENCY chunk.
+    #[tokio::test]
+    async fn encrypt_for_devices_with_sessions_raw_encrypts_every_device() {
+        let devices: Vec<Jid> = (0..20u16)
+            .map(|i| Jid::pn_device(format!("1555000{i:04}"), 0))
+            .collect();
+
+        let (mut session_store, mut identity_store) = stores_with_sessions(&devices).await;
+        let mut prekey_store = UnusedPreKeyStore;
+        let signed_prekey_store = UnusedSignedPreKeyStore;
+        let mut sender_key_store = MemSenderKeyStore::default();
+        let mut stores = raw_fanout_stores(
+            &mut sender_key_store,
+            &mut session_store,
+            &mut identity_store,
+            &mut prekey_store,
+            &signed_prekey_store,
+        );
+        let rt = TokioTestRuntime;
+
+        let raw = encrypt_for_devices_with_sessions_raw(
+            &rt,
+            &mut stores,
+            &devices,
+            b"payload",
+            SessionPlan::assume_ready(devices.len()),
+        )
+        .await
+        .expect("fan-out succeeds");
+
+        assert_eq!(raw.devices.len(), devices.len());
+        assert!(raw.includes_prekey_message, "fresh sessions emit pkmsg");
+    }
+
+    /// Bad path: a device without a session is skipped while the rest still
+    /// encrypt.
+    #[tokio::test]
+    async fn encrypt_for_devices_with_sessions_raw_skips_sessionless_device() {
+        let device_ok = Jid::pn_device("15550000000", 0);
+        let device_bad = Jid::pn_device("15550000001", 0);
+
+        let (mut session_store, mut identity_store) =
+            stores_with_sessions(std::slice::from_ref(&device_ok)).await;
+        let mut prekey_store = UnusedPreKeyStore;
+        let signed_prekey_store = UnusedSignedPreKeyStore;
+        let mut sender_key_store = MemSenderKeyStore::default();
+        let mut stores = raw_fanout_stores(
+            &mut sender_key_store,
+            &mut session_store,
+            &mut identity_store,
+            &mut prekey_store,
+            &signed_prekey_store,
+        );
+        let rt = TokioTestRuntime;
+
+        let devices = vec![device_ok.clone(), device_bad];
+        let raw = encrypt_for_devices_with_sessions_raw(
+            &rt,
+            &mut stores,
+            &devices,
+            b"payload",
+            SessionPlan::assume_ready(devices.len()),
+        )
+        .await
+        .expect("fan-out succeeds despite the sessionless device");
+
+        assert_eq!(raw.devices.len(), 1);
+        assert_eq!(raw.devices[0].device_jid, device_ok);
+    }
+
+    /// Regression: the chunked fan-out must return empty, not divide by zero, for
+    /// an empty device set (reachable on the cold force-SKDM path).
+    #[tokio::test]
+    async fn encrypt_for_devices_with_sessions_raw_handles_empty_device_set() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut session_store = MemSessionStore::default();
+        let mut identity_store = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            known: HashMap::new(),
+        };
+        let mut prekey_store = UnusedPreKeyStore;
+        let signed_prekey_store = UnusedSignedPreKeyStore;
+        let mut sender_key_store = MemSenderKeyStore::default();
+        let mut stores = SignalStores {
+            sender_key_store: &mut sender_key_store,
+            session_store: &mut session_store,
+            identity_store: &mut identity_store,
+            prekey_store: &mut prekey_store,
+            signed_prekey_store: &signed_prekey_store,
+        };
+        let rt = TokioTestRuntime;
+
+        let raw = encrypt_for_devices_with_sessions_raw(
+            &rt,
+            &mut stores,
+            &[],
+            b"x",
+            SessionPlan::assume_ready(0),
+        )
+        .await
+        .expect("empty fan-out must succeed, not panic");
+
+        assert!(raw.devices.is_empty());
+        assert!(!raw.includes_prekey_message);
+    }
+
     /// The send path must report a replaced identity via the resolver when
     /// establishing a session whose bundle carries a new identity key for an
     /// address we already knew (peer reinstall). Mirrors WA Web saveIdentity

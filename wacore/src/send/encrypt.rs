@@ -718,56 +718,70 @@ pub async fn encrypt_for_devices_with_sessions_raw(
         .await;
         push_raw_result(res, &mut encrypted, &mut includes_prekey_message);
     } else {
-        // Parallel encrypt fan-out across tokio tasks bounded by
-        // ENCRYPT_FANOUT_CONCURRENCY; collected in completion order so the
-        // fastest encrypts ship first.
+        // One task per chunk, not per device: the per-device fan-out allocated a
+        // task + oneshot + two store clones for every recipient. Same parallelism,
+        // spawns bounded by ENCRYPT_FANOUT_CONCURRENCY. Wire order is irrelevant
+        // (phash sorts before hashing on both ends).
         let plaintext_arc: std::sync::Arc<[u8]> = std::sync::Arc::from(plaintext_to_encrypt);
 
         let total = devices.len();
-        let mut next_spawn = 0usize;
+        let num_chunks = ENCRYPT_FANOUT_CONCURRENCY.min(total);
 
-        let make_encrypt_task = |idx: usize| {
-            let device_jid = devices[idx].clone();
-            // The encryption JID is only needed to build the Signal address, so
-            // derive it here from a borrow rather than cloning the whole Jid into
-            // the task (device_jid is still cloned because it's returned).
-            let addr = encryption_overrides
-                .get(idx)
-                .and_then(|o| o.as_ref())
-                .unwrap_or(&devices[idx])
-                .to_protocol_address();
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        // Index partitioning gives exactly num_chunks slices (keeps the configured
+        // parallelism) and no-ops on an empty device set instead of dividing by zero.
+        for chunk_idx in 0..num_chunks {
+            let chunk_start = chunk_idx * total / num_chunks;
+            let chunk_end = (chunk_idx + 1) * total / num_chunks;
+            // The 'static task can't borrow devices/encryption_overrides.
+            let jobs: Vec<(ProtocolAddress, Jid)> = (chunk_start..chunk_end)
+                .map(|idx| {
+                    let addr = encryption_overrides
+                        .get(idx)
+                        .and_then(|o| o.as_ref())
+                        .unwrap_or(&devices[idx])
+                        .to_protocol_address();
+                    (addr, devices[idx].clone())
+                })
+                .collect();
             let plaintext = plaintext_arc.clone();
+            // clone_box shares the Arc-backed backend, so the sequential ratchet
+            // advances persist despite one clone serving the whole chunk.
             let mut session_store = stores.session_store.clone_box();
             let mut identity_store = stores.identity_store.clone_box();
 
-            spawn_oneshot(runtime, async move {
-                encrypt_one_device(
-                    &plaintext,
-                    &addr,
-                    &mut *session_store,
-                    &mut *identity_store,
-                    device_jid,
-                )
-                .await
-            })
-        };
-
-        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-        while next_spawn < total && in_flight.len() < ENCRYPT_FANOUT_CONCURRENCY {
-            in_flight.push(make_encrypt_task(next_spawn));
-            next_spawn += 1;
+            in_flight.push(spawn_oneshot(runtime, async move {
+                let mut out = Vec::with_capacity(jobs.len());
+                for (addr, device_jid) in jobs {
+                    out.push(
+                        encrypt_one_device(
+                            &plaintext,
+                            &addr,
+                            &mut *session_store,
+                            &mut *identity_store,
+                            device_jid,
+                        )
+                        .await,
+                    );
+                }
+                out
+            }));
         }
         while let Some(spawn_result) = in_flight.next().await {
             match spawn_result {
-                Ok(res) => push_raw_result(res, &mut encrypted, &mut includes_prekey_message),
-                Err(SpawnCanceled) => {
-                    log::warn!("Encrypt task did not deliver a result; skipping device.");
+                Ok(results) => {
+                    for res in results {
+                        push_raw_result(res, &mut encrypted, &mut includes_prekey_message);
+                    }
                 }
-            }
-
-            if next_spawn < total {
-                in_flight.push(make_encrypt_task(next_spawn));
-                next_spawn += 1;
+                Err(SpawnCanceled) => {
+                    // A whole chunk drops (not one device); its members stay
+                    // un-warm and are re-targeted next send.
+                    log::warn!(
+                        "Encrypt chunk did not deliver a result; up to ~{} device(s) skipped this send.",
+                        total.div_ceil(num_chunks)
+                    );
+                }
             }
         }
     }
