@@ -110,7 +110,7 @@ pub enum PasskeyError {
 /// The `MaybeSendSync` supertrait keeps this `Send + Sync` on native (the client
 /// stores it as `Arc<dyn PasskeyAuthenticator>` and drives it across threads) but
 /// drops the bound on wasm32, where a browser authenticator may hold `!Send` JS
-/// handles — matching the sibling extension points (`Transport`, `EventHandler`).
+/// handles, matching the sibling extension points (`Transport`, `EventHandler`).
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait PasskeyAuthenticator: wacore::sync_marker::MaybeSendSync {
@@ -323,7 +323,7 @@ mod tests {
         assert!(parse_request_options(&json).is_err());
 
         // present-but-empty id (all padding / empty string) decodes to zero bytes,
-        // which is never a real credential id — must error, not push an empty entry.
+        // which is never a real credential id, so it must error, not push an empty entry.
         let json = serde_json::json!({
             "challenge": BASE64_URL_SAFE_NO_PAD.encode(b"c"),
             "allowCredentials": [{"type": "public-key", "id": ""}],

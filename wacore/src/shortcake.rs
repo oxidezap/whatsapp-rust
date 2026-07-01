@@ -480,12 +480,9 @@ mod tests {
         assert_eq!(d.encrypted_payload, Some(enc.encrypted_payload));
     }
 
-    // End-to-end protocol interop: run BOTH the companion and a simulated primary
-    // through the real primitives and prove the two sides agree — the verification
-    // code matches, the X25519+HKDF encryption keys match, the primary can DECRYPT
-    // the companion's PairingRequest, and the handoff proof verifies. This is the
-    // guarantee that our output is interoperable with a real WhatsApp primary, not
-    // merely self-consistent.
+    // Runs both the companion and a simulated primary through the primitives: the
+    // verification codes match, the X25519+HKDF keys agree, the primary decrypts the
+    // companion's PairingRequest, and the handoff proof verifies.
     #[test]
     fn full_handshake_interops_with_a_simulated_primary() {
         use crate::libsignal::crypto::aes_256_gcm_decrypt;

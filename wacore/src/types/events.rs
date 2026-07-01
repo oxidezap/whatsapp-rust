@@ -726,7 +726,7 @@ pub enum Event {
 #[derive(Debug, Clone, Serialize)]
 pub struct PairPasskeyRequest {
     /// Verbatim `PublicKeyCredentialRequestOptions` JSON from the server. Pass it
-    /// straight to a WebAuthn `get` (e.g. Android Credential Manager) — or parse it
+    /// straight to a WebAuthn `get` (e.g. Android Credential Manager), or parse it
     /// with `whatsapp_rust::passkey::parse_request_options`.
     pub request_options_json: String,
 }
