@@ -226,6 +226,7 @@ impl Client {
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
             passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
+            passkey_opening: AtomicBool::new(false),
             custom_enc_handlers: std::sync::OnceLock::new(),
             inbound_durability_hook: std::sync::OnceLock::new(),
             chatstate_handlers: Arc::new(RwLock::new(Vec::new())),

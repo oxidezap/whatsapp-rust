@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use log::warn;
 use rand::RngExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wacore::libsignal::protocol::KeyPair;
 use wacore::shortcake::ShortcakeUtils;
 use wacore::sync_marker::MaybeSendSync;
@@ -243,41 +244,21 @@ pub(crate) struct PasskeyFlowState {
     /// HMAC key from the pre-rotation ADV secret; presence marks the re-link path
     /// that lets the server skip the verification-code UX. Consumed once.
     handoff_key: Option<[u8; 32]>,
-    /// Set while a `send_passkey_response` is mid-open (before its session exists),
-    /// so a concurrent open is rejected rather than clobbering the attempt.
-    opening: bool,
     session: Option<ShortcakeSession>,
     authenticator: Option<Arc<dyn PasskeyAuthenticator>>,
 }
 
-/// Releases the `opening` reservation on drop, so a `send_passkey_response` that is
-/// cancelled mid-open can't leave the flow permanently blocked. On the success path
-/// [`finish`](Self::finish) clears it under the already-held lock and disarms this.
+/// Holds the wait-free open reservation and releases it on drop. Because it clears
+/// a plain [`AtomicBool`] (not a flag behind the async lock), the release is a sync,
+/// always-succeeding store, so a `send_passkey_response` cancelled at any await
+/// can't leave the reservation stuck.
 struct OpeningGuard<'a> {
-    state: &'a async_lock::Mutex<PasskeyFlowState>,
-    armed: bool,
-}
-
-impl<'a> OpeningGuard<'a> {
-    fn new(state: &'a async_lock::Mutex<PasskeyFlowState>) -> Self {
-        Self { state, armed: true }
-    }
-
-    fn finish(mut self, state: &mut PasskeyFlowState) {
-        state.opening = false;
-        self.armed = false;
-    }
+    flag: &'a AtomicBool,
 }
 
 impl Drop for OpeningGuard<'_> {
     fn drop(&mut self) {
-        // The lock is free at any await point where cancellation can occur, so a
-        // best-effort try_lock reliably clears the reservation there.
-        if self.armed
-            && let Some(mut state) = self.state.try_lock()
-        {
-            state.opening = false;
-        }
+        self.flag.store(false, Ordering::Release);
     }
 }
 
@@ -409,27 +390,35 @@ impl Client {
     /// Send the WebAuthn assertion as `<passkey_prologue>` and open the handshake.
     /// Call after an [`Event::PairPasskeyRequest`].
     pub async fn send_passkey_response(&self, assertion: Assertion) -> Result<(), PasskeyError> {
-        // Reserve the single attempt slot BEFORE the opening awaits, so a concurrent
-        // response can't open a second overlapping handshake and clobber this one's
-        // nonce/ref (which would then commit the wrong ADV rotation).
+        // Reserve the single open slot BEFORE the awaits, so a concurrent response
+        // can't open a second overlapping handshake and clobber this one's nonce/ref
+        // (which would then commit the wrong ADV rotation). The guard releases the
+        // reservation on every exit, including cancellation mid-open.
+        if self
+            .passkey_opening
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(PasskeyError::Flow(
+                "a passkey open is already in progress".into(),
+            ));
+        }
+        let _guard = OpeningGuard {
+            flag: &self.passkey_opening,
+        };
+
         let handoff_key = {
             let mut state = self.passkey_state.lock().await;
-            if state.opening || state.session.is_some() {
+            if state.session.is_some() {
                 return Err(PasskeyError::Flow(
                     "a passkey link is already in progress".into(),
                 ));
             }
-            state.opening = true;
             state.handoff_key.take()
         };
-        // Releases the reservation on every exit, including if this future is
-        // cancelled mid-open, so a dropped attempt can't block the flow forever.
-        let guard = OpeningGuard::new(&self.passkey_state);
 
         let session = ShortcakeSession::open(self, assertion, handoff_key).await?;
-        let mut state = self.passkey_state.lock().await;
-        guard.finish(&mut state);
-        state.session = Some(session);
+        self.passkey_state.lock().await.session = Some(session);
         Ok(())
     }
 
@@ -876,12 +865,14 @@ mod tests {
     #[tokio::test]
     async fn cancelled_open_releases_the_reservation() {
         let client = create_test_client().await;
-        client.passkey_state.lock().await.opening = true;
-        // A guard dropped without `finish` stands in for a send_passkey_response
-        // future cancelled mid-open; it must release the reservation.
-        drop(OpeningGuard::new(&client.passkey_state));
+        client.passkey_opening.store(true, Ordering::Release);
+        // A dropped guard stands in for a send_passkey_response cancelled mid-open;
+        // the release is a sync store, so it holds even under lock contention.
+        drop(OpeningGuard {
+            flag: &client.passkey_opening,
+        });
         assert!(
-            !client.passkey_state.lock().await.opening,
+            !client.passkey_opening.load(Ordering::Acquire),
             "a cancelled open must release the reservation"
         );
     }
