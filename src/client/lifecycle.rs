@@ -243,6 +243,9 @@ impl Client {
             group_devices_memo: Cache::builder()
                 .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
                 .build(),
+            skdm_warm_memo: Cache::builder()
+                .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
+                .build(),
             stanza_router: Self::create_stanza_router(),
             synchronous_ack: false,
             http_client,

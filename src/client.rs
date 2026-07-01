@@ -610,6 +610,17 @@ pub struct Client {
     pub(crate) group_devices_memo:
         Cache<Jid, Arc<crate::client::device_registry::GroupDevicesMemo>>,
 
+    /// Last `(devices, sender-key-device map)` Arc pair with an empty `needs_skdm`,
+    /// so a warm repeat send skips `filter_skdm_targets`. `Weak` keeps the pointer
+    /// comparison ABA-safe, matching `GroupDevicesMemo`.
+    pub(crate) skdm_warm_memo: Cache<
+        Jid,
+        (
+            std::sync::Weak<wacore::send::ResolvedGroupDevices>,
+            std::sync::Weak<crate::sender_key_device_cache::SenderKeyDeviceMap>,
+        ),
+    >,
+
     /// Router for dispatching stanzas to their appropriate handlers
     pub(crate) stanza_router: crate::handlers::router::StanzaRouter,
 

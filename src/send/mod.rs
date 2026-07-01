@@ -1048,12 +1048,34 @@ impl Client {
             .await
         {
             Ok(all_devices) => {
+                // Skip the O(devices) filter_skdm_targets scan when the same
+                // (devices, sender-key-map) Arc pair was already fully warm. Both
+                // Arcs swap on any warm-state or membership change, so a stale skip
+                // is impossible. Needs the device memo for a stable devices Arc.
+                if self.group_devices_memo_enabled
+                    && let Some((dw, cw)) = self.skdm_warm_memo.get(group).await
+                    && std::ptr::eq(dw.as_ptr(), std::sync::Arc::as_ptr(&all_devices))
+                    && std::ptr::eq(cw.as_ptr(), std::sync::Arc::as_ptr(&cached_map))
+                {
+                    return Some((all_devices, Vec::new()));
+                }
                 let needs_skdm = self.filter_skdm_targets(
                     group_jid,
                     all_devices.devices(),
                     &cached_map,
                     own_sending_jid,
                 );
+                if needs_skdm.is_empty() && self.group_devices_memo_enabled {
+                    self.skdm_warm_memo
+                        .insert(
+                            group.clone(),
+                            (
+                                std::sync::Arc::downgrade(&all_devices),
+                                std::sync::Arc::downgrade(&cached_map),
+                            ),
+                        )
+                        .await;
+                }
                 Some((all_devices, needs_skdm))
             }
             Err(e) => {
