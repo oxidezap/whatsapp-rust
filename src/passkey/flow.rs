@@ -319,6 +319,26 @@ impl Client {
         self.passkey_state.lock().await.linking = None;
         Ok(())
     }
+
+    /// Fetch the WebAuthn `<passkey_request_options>` JSON from the server. Used as
+    /// a fallback when a `passkey_prologue_request` notification arrives without the
+    /// options inline (mirrors whatsmeow's `getPasskeyRequestOptions`).
+    async fn get_passkey_request_options(&self) -> Result<String, PasskeyError> {
+        let query = InfoQuery::get(
+            "md",
+            server_jid(),
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("passkey_request_options").build(),
+            ])),
+        );
+        let resp = self
+            .send_iq(query)
+            .await
+            .map_err(|e| PasskeyError::Flow(format!("passkey_request_options iq failed: {e}")))?;
+        child_payload(resp.get(), "passkey_request_options")
+            .and_then(|b| String::from_utf8(b).ok())
+            .ok_or_else(|| PasskeyError::Flow("missing passkey_request_options in response".into()))
+    }
 }
 
 /// `<notification type="passkey_prologue_request">`: derive the handoff key, rotate
@@ -336,23 +356,41 @@ pub(crate) async fn handle_passkey_notification(client: &Arc<Client>, node: Arc<
         return;
     }
 
-    let options_json = match child_payload(node.get(), "passkey_request_options")
+    match child_payload(node.get(), "passkey_request_options")
         .and_then(|b| String::from_utf8(b).ok())
     {
-        Some(json) => json,
+        // Options inline (the common case): proceed immediately.
+        Some(json) => drive_passkey_request(client, json).await,
+        // No inline options: fall back to fetching them via IQ (whatsmeow does the
+        // same). Spawned because it awaits a round-trip.
         None => {
-            warn!("passkey notification missing a valid <passkey_request_options>");
+            let client = client.clone();
             client
-                .core
-                .event_bus
-                .dispatch(Event::PairPasskeyError(PairPasskeyError {
-                    error: "missing passkey_request_options".into(),
-                    continuation: false,
-                }));
-            return;
+                .clone()
+                .runtime
+                .spawn(Box::pin(async move {
+                    match client.get_passkey_request_options().await {
+                        Ok(json) => drive_passkey_request(&client, json).await,
+                        Err(e) => {
+                            warn!("failed to fetch passkey request options: {e}");
+                            client.core.event_bus.dispatch(Event::PairPasskeyError(
+                                PairPasskeyError {
+                                    error: e.to_string(),
+                                    continuation: false,
+                                },
+                            ));
+                        }
+                    }
+                }))
+                .detach();
         }
-    };
+    }
+}
 
+/// Rotate the ADV secret (keeping the prior one's handoff key), emit
+/// [`Event::PairPasskeyRequest`], and — if an authenticator is registered —
+/// auto-drive the assertion + response.
+async fn drive_passkey_request(client: &Arc<Client>, options_json: String) {
     // Derive the handoff key from the CURRENT ADV secret, then rotate it: the proof
     // proves continuity from the prior secret, while the PairingRequest carries the
     // new one.
@@ -600,22 +638,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passkey_prologue_request_without_options_emits_error() {
+    async fn passkey_prologue_request_without_inline_options_falls_back_to_fetch() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
         client.register_handler(collector.clone() as Arc<dyn EventHandler>);
 
+        // No inline <passkey_request_options>: the handler falls back to an IQ fetch.
+        // The test client isn't connected, so the fetch fails fast and surfaces a
+        // non-continuation error (proving the fallback path runs).
         client
             .process_node(server_notification("passkey_prologue_request", None))
             .await;
 
-        assert!(
-            collector.events().iter().any(|e| matches!(
-                e.as_ref(),
-                Event::PairPasskeyError(err) if !err.continuation
-            )),
-            "missing passkey_request_options must emit a non-continuation error"
-        );
+        wait_for(
+            &collector,
+            |e| matches!(e, Event::PairPasskeyError(err) if !err.continuation),
+        )
+        .await;
     }
 
     #[tokio::test]
