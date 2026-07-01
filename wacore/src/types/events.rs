@@ -976,13 +976,43 @@ pub enum DecryptFailMode {
     Hide,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, crate::WireEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum UnavailableType {
     #[wire_default]
     #[wire = "unknown"]
     Unknown,
     #[wire = "view_once"]
     ViewOnce,
+    #[wire = "hosted"]
+    Hosted,
+    #[wire = "bot"]
+    Bot,
+}
+
+impl UnavailableType {
+    /// Classify an `<unavailable>` fanout the way WA Web picks its
+    /// placeholderType, honouring the same precedence (bot > hosted >
+    /// view_once). Anything else is a plain fanout (`Unknown`).
+    pub fn from_fanout_flags(is_bot: bool, is_hosted: bool, is_view_once: bool) -> Self {
+        if is_bot {
+            Self::Bot
+        } else if is_hosted {
+            Self::Hosted
+        } else if is_view_once {
+            Self::ViewOnce
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// Bot, hosted and view-once fanouts are the three subtypes
+    /// `WAWebNonMessageDataRequestPlaceholderMessageResendUtils` excludes from
+    /// placeholder-resend: the phone won't share that content with a companion,
+    /// so a resend to our own device only returns empty. A plain fanout
+    /// (`Unknown`) stays recoverable.
+    pub fn is_unrecoverable_fanout(&self) -> bool {
+        matches!(self, Self::ViewOnce | Self::Hosted | Self::Bot)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1263,6 +1293,37 @@ mod tests {
     use super::*;
     use prost::Message;
     use waproto::whatsapp as wa;
+
+    #[test]
+    fn unavailable_fanout_flags_follow_wa_web_precedence() {
+        use UnavailableType::*;
+        // bot wins over hosted and view_once
+        assert_eq!(UnavailableType::from_fanout_flags(true, true, true), Bot);
+        assert_eq!(UnavailableType::from_fanout_flags(true, false, false), Bot);
+        // hosted wins over view_once
+        assert_eq!(
+            UnavailableType::from_fanout_flags(false, true, true),
+            Hosted
+        );
+        assert_eq!(
+            UnavailableType::from_fanout_flags(false, false, true),
+            ViewOnce
+        );
+        // nothing set is a plain fanout
+        assert_eq!(
+            UnavailableType::from_fanout_flags(false, false, false),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn only_plain_fanout_is_recoverable() {
+        use UnavailableType::*;
+        assert!(Bot.is_unrecoverable_fanout());
+        assert!(Hosted.is_unrecoverable_fanout());
+        assert!(ViewOnce.is_unrecoverable_fanout());
+        assert!(!Unknown.is_unrecoverable_fanout());
+    }
 
     /// Build a HistorySync proto with conversations, returning its
     /// zlib-compressed wire form plus the exact decompressed size.

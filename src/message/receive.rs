@@ -88,40 +88,45 @@ impl Client {
         if let Some(unavailable) = unavailable_node
             && all_enc_nodes.is_empty()
         {
-            let unavailable_type = match unavailable.get_attr("type").map(|v| v.as_str()).as_deref()
-            {
-                Some("view_once") => crate::types::events::UnavailableType::ViewOnce,
-                _ => crate::types::events::UnavailableType::Unknown,
-            };
-            // View-once media is never fanned out to companion/linked devices,
-            // so a PDO placeholder-resend to our own phone always comes back
-            // empty — the content is unrecoverable by design. Worse, that peer
-            // round-trip is surfaced by the phone as a spurious "Finished
-            // syncing with WhatsApp on <device>" notification for every
-            // view-once message received. Skip the PDO for view-once; still
-            // dispatch the event (so consumers see the failure) and still ack
-            // so the offline queue is cleared and the stanza is not redelivered.
-            let is_view_once = matches!(
-                unavailable_type,
-                crate::types::events::UnavailableType::ViewOnce
+            // WA Web never placeholder-resends bot, hosted or view-once
+            // <unavailable> fanouts (WAWebNonMessageDataRequestPlaceholderMessageResendUtils
+            // skips those subtypes). The phone won't share that content with a
+            // companion, so a resend to our own device only comes back empty and
+            // surfaces a spurious "Finished syncing" notification for each one.
+            // Detect the three the way WA Web's parser does (bot via a <bot>
+            // child, hosted via the `hosted` attr, view-once via the `type`
+            // attr) and skip the PDO for them, still dispatching the event and
+            // acking. A plain fanout (Unknown) stays recoverable via PDO.
+            let is_bot = nr.get_optional_child("bot").is_some();
+            let is_hosted = unavailable
+                .get_attr("hosted")
+                .map(|v| v.as_str())
+                .as_deref()
+                == Some("true");
+            let is_view_once =
+                unavailable.get_attr("type").map(|v| v.as_str()).as_deref() == Some("view_once");
+            let unavailable_type = crate::types::events::UnavailableType::from_fanout_flags(
+                is_bot,
+                is_hosted,
+                is_view_once,
             );
-            if is_view_once {
+            let unrecoverable = unavailable_type.is_unrecoverable_fanout();
+
+            if unrecoverable {
                 log::info!(
-                    "[msg:{}] Message has <unavailable> child (type: ViewOnce); \
-                     unrecoverable via PDO — skipping request and acking",
+                    "[msg:{}] Message has unrecoverable <unavailable> child (type: {:?}); \
+                     skipping futile PDO placeholder-resend and acking directly",
                     info.id,
+                    unavailable_type,
                 );
             } else {
                 log::info!(
                     "[msg:{}] Message has <unavailable> child (type: {:?}), requesting from phone via PDO",
                     info.id,
-                    unavailable_type
+                    unavailable_type,
                 );
             }
-            // PDO is the only recovery here (no retry receipt), so run it before
-            // the transport ack in one flush task: the ack must not clear the
-            // offline queue before the PDO request goes out. status is acked by
-            // the should_ack gate. Mirrors whatsmeow's request-then-ack.
+
             self.dispatch_undecryptable_event(
                 Arc::clone(&info),
                 true,
@@ -133,11 +138,11 @@ impl Client {
             let info2 = Arc::clone(&info);
             let skip_ack = info.source.chat.is_status_broadcast();
             self.outbound_flush.spawn(&*self.runtime, async move {
-                // View-once has no recoverable content, so skip the PDO entirely
-                // and ack directly. Otherwise PDO is the only recovery: ack only
-                // once the request is out (or skipped as ancient); a transient
-                // send failure leaves it queued for redelivery.
-                let should_ack = if is_view_once {
+                // Unrecoverable fanouts have no content the phone will resend, so
+                // ack directly. Otherwise PDO is the only recovery (no retry
+                // receipt): ack only once the request is out, or skipped as
+                // ancient, so a transient send failure leaves it queued.
+                let should_ack = if unrecoverable {
                     true
                 } else {
                     client.run_pdo_request(&info2).await
