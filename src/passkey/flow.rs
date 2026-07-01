@@ -250,6 +250,37 @@ pub(crate) struct PasskeyFlowState {
     authenticator: Option<Arc<dyn PasskeyAuthenticator>>,
 }
 
+/// Releases the `opening` reservation on drop, so a `send_passkey_response` that is
+/// cancelled mid-open can't leave the flow permanently blocked. On the success path
+/// [`finish`](Self::finish) clears it under the already-held lock and disarms this.
+struct OpeningGuard<'a> {
+    state: &'a async_lock::Mutex<PasskeyFlowState>,
+    armed: bool,
+}
+
+impl<'a> OpeningGuard<'a> {
+    fn new(state: &'a async_lock::Mutex<PasskeyFlowState>) -> Self {
+        Self { state, armed: true }
+    }
+
+    fn finish(mut self, state: &mut PasskeyFlowState) {
+        state.opening = false;
+        self.armed = false;
+    }
+}
+
+impl Drop for OpeningGuard<'_> {
+    fn drop(&mut self) {
+        // The lock is free at any await point where cancellation can occur, so a
+        // best-effort try_lock reliably clears the reservation there.
+        if self.armed
+            && let Some(mut state) = self.state.try_lock()
+        {
+            state.opening = false;
+        }
+    }
+}
+
 fn server_jid() -> Jid {
     Jid::new("", Server::Pn)
 }
@@ -391,11 +422,14 @@ impl Client {
             state.opening = true;
             state.handoff_key.take()
         };
+        // Releases the reservation on every exit, including if this future is
+        // cancelled mid-open, so a dropped attempt can't block the flow forever.
+        let guard = OpeningGuard::new(&self.passkey_state);
 
-        let opened = ShortcakeSession::open(self, assertion, handoff_key).await;
+        let session = ShortcakeSession::open(self, assertion, handoff_key).await?;
         let mut state = self.passkey_state.lock().await;
-        state.opening = false;
-        state.session = Some(opened?);
+        guard.finish(&mut state);
+        state.session = Some(session);
         Ok(())
     }
 
@@ -406,9 +440,10 @@ impl Client {
         // premature call must NOT drop the in-flight attempt.
         let mut session = {
             let mut state = self.passkey_state.lock().await;
-            match &state.session {
-                Some(s) if s.stage == Stage::AwaitingConfirmation => state.session.take().unwrap(),
-                Some(_) => {
+            match state.session.take() {
+                Some(s) if s.stage == Stage::AwaitingConfirmation => s,
+                Some(s) => {
+                    state.session = Some(s);
                     return Err(PasskeyError::Flow(
                         "confirmation before the verification stage".into(),
                     ));
@@ -835,6 +870,19 @@ mod tests {
         assert!(
             client.passkey_state.lock().await.session.is_some(),
             "a premature confirmation must not drop the in-flight attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_open_releases_the_reservation() {
+        let client = create_test_client().await;
+        client.passkey_state.lock().await.opening = true;
+        // A guard dropped without `finish` stands in for a send_passkey_response
+        // future cancelled mid-open; it must release the reservation.
+        drop(OpeningGuard::new(&client.passkey_state));
+        assert!(
+            !client.passkey_state.lock().await.opening,
+            "a cancelled open must release the reservation"
         );
     }
 
