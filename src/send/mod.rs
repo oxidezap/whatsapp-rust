@@ -2007,16 +2007,17 @@ pub(crate) fn is_self_dm_recipient(
 
 /// The outer `<message to>`, the DeviceSentMessage destinationJid, and the
 /// reporting-token remote jid must share the participants' namespace.
-/// WAWebSendMsgCreateFanoutStanza builds the whole stanza from one CHAT_JID,
-/// so the `to` is the resolved wire jid whenever the caller's namespace
-/// differs from it (LID upgrade, or PN downgrade on an unmigrated account).
-/// A `to` mixing namespaces with the participants is rejected wholesale by
-/// the server with `ack error="400"`.
+/// WAWebSendMsgCreateFanoutStanza builds the whole stanza from one CHAT_JID
+/// (always a bare user wid), so the `to` is the resolved wire jid whenever
+/// the caller's namespace differs from it (LID upgrade, or PN downgrade on
+/// an unmigrated account), and a device-qualified caller jid is normalized
+/// to the bare chat jid. A `to` mixing namespaces with the participants is
+/// rejected wholesale by the server with `ack error="400"`.
 pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
     if recipient_bare.is_lid() || to.is_lid() {
         recipient_bare.clone()
     } else {
-        to.clone()
+        to.to_non_ad()
     }
 }
 
@@ -2039,6 +2040,9 @@ mod tests {
         // LID caller downgraded to PN wire (unmigrated account): `to` must be
         // the PN — reusing the caller's LID would mix namespaces.
         assert_eq!(dm_stanza_to(&pn, &lid), pn);
+        // Device-qualified caller jid is normalized to the bare chat jid.
+        let pn_device: Jid = "5511987650001:5@s.whatsapp.net".parse().unwrap();
+        assert_eq!(dm_stanza_to(&pn, &pn_device), pn);
     }
 
     #[test]

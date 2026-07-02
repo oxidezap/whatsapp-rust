@@ -419,7 +419,7 @@ impl Client {
     /// migrates past WAITING_PROP with the prop on), persists the account as
     /// migrated so DMs switch to LID wire addressing.
     pub(crate) async fn handle_lid_migration_mapping_sync(
-        &self,
+        self: &Arc<Self>,
         sync: &waproto::whatsapp::LidMigrationMappingSyncMessage,
     ) {
         use prost::Message as _;
@@ -437,24 +437,25 @@ impl Client {
             }
         };
 
-        for mapping in &payload.pn_to_lid_mappings {
-            let lid = mapping.latest_lid.unwrap_or(mapping.assigned_lid);
-            // Absent scalar fields decode as 0; a "0" user would poison the cache.
-            if mapping.pn == 0 || lid == 0 {
-                log::warn!("Skipping migration mapping with zero pn/lid");
-                continue;
-            }
-            if let Err(e) = self
-                .add_lid_pn_mapping(
-                    &lid.to_string(),
-                    &mapping.pn.to_string(),
-                    crate::lid_pn_cache::LearningSource::MigrationSyncLatest,
-                )
-                .await
-            {
-                log::warn!("Failed to persist migration mapping: {e:?}");
-            }
-        }
+        let mappings: Vec<(String, String)> = payload
+            .pn_to_lid_mappings
+            .iter()
+            .filter_map(|mapping| {
+                let lid = mapping.latest_lid.unwrap_or(mapping.assigned_lid);
+                // Absent scalar fields decode as 0; a "0" user would poison the cache.
+                if mapping.pn == 0 || lid == 0 {
+                    log::warn!("Skipping migration mapping with zero pn/lid");
+                    return None;
+                }
+                Some((lid.to_string(), mapping.pn.to_string()))
+            })
+            .collect();
+        self.learn_lid_pn_mappings_batch(
+            mappings,
+            crate::lid_pn_cache::LearningSource::MigrationSyncLatest,
+            false,
+        )
+        .await;
 
         if !self.persistence_manager.get_device_snapshot().lid_migrated
             && self
