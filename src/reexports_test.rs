@@ -52,6 +52,12 @@ impl whatsapp_rust::InboundDurabilityHook for NoopHook {
 }
 
 #[test]
+fn hook_impl_is_object_safe_and_constructible() {
+    let hook: Box<dyn whatsapp_rust::InboundDurabilityHook> = Box::new(NoopHook);
+    let _ = &hook;
+}
+
+#[test]
 fn bytes_and_chrono_reexports_are_usable() {
     let b = whatsapp_rust::bytes::Bytes::from_static(b"frame");
     assert_eq!(b.len(), 5);
