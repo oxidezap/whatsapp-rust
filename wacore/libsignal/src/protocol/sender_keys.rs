@@ -50,16 +50,6 @@ impl SenderMessageKey {
         }
     }
 
-    pub(crate) fn from_protobuf(smk: sender_key_state_structure::SenderMessageKey) -> Self {
-        // Seed is validated at deserialization time; fall back to zeroes on corrupt in-memory data.
-        let seed: [u8; 32] = smk
-            .seed
-            .as_deref()
-            .and_then(|b| b.try_into().ok())
-            .unwrap_or_default();
-        Self::new(smk.iteration.unwrap_or_default(), seed)
-    }
-
     pub fn iteration(&self) -> u32 {
         self.iteration
     }
@@ -71,12 +61,36 @@ impl SenderMessageKey {
     pub fn cipher_key(&self) -> &[u8] {
         &self.cipher_key
     }
+}
 
-    pub(crate) fn as_protobuf(&self) -> sender_key_state_structure::SenderMessageKey {
-        use bytes::Bytes;
+/// Backlog entry for a skipped message key: only the (iteration, seed) pair the
+/// full [`SenderMessageKey`] is re-derived from on removal. `Copy`, so the
+/// `Arc::make_mut` copy-on-write of the backlog is one flat memcpy — with the
+/// protobuf element type, the first COW after a cold load promoted one `Bytes`
+/// seed (a shared-control-block malloc) per cached key.
+#[derive(Debug, Clone, Copy)]
+struct StoredMessageKey {
+    iteration: u32,
+    seed: [u8; 32],
+}
+
+impl StoredMessageKey {
+    fn from_protobuf(smk: &sender_key_state_structure::SenderMessageKey) -> Self {
+        // Seed is validated at deserialization time; fall back to zeroes on corrupt in-memory data.
+        Self {
+            iteration: smk.iteration.unwrap_or_default(),
+            seed: smk
+                .seed
+                .as_deref()
+                .and_then(|b| b.try_into().ok())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn as_protobuf(&self) -> sender_key_state_structure::SenderMessageKey {
         sender_key_state_structure::SenderMessageKey {
             iteration: Some(self.iteration),
-            seed: Some(Bytes::copy_from_slice(&self.seed)),
+            seed: Some(bytes::Bytes::copy_from_slice(&self.seed)),
         }
     }
 }
@@ -188,7 +202,7 @@ pub struct SenderKeyState {
     /// `Arc::make_mut`, leaving any sharing clone (the cache's copy) intact.
     /// `state.sender_message_keys` is kept empty in memory; this is the source of
     /// truth, reassembled into the protobuf only at `as_protobuf` (serialization).
-    message_keys: std::sync::Arc<Vec<sender_key_state_structure::SenderMessageKey>>,
+    message_keys: std::sync::Arc<Vec<StoredMessageKey>>,
     /// Parsed signing key with its XEdDSA cache pre-derived, memoized so the
     /// per-send signature skips a basepoint multiplication (~18% of a warm
     /// group send when re-derived from bytes every message). Clones carry the
@@ -272,7 +286,12 @@ impl SenderKeyState {
     pub(crate) fn from_protobuf(mut state: SenderKeyStateStructure) -> Self {
         // Move the backlog out of the protobuf into the shared Arc so the
         // in-memory `state` stays empty; see `message_keys` field docs.
-        let message_keys = std::sync::Arc::new(std::mem::take(&mut state.sender_message_keys));
+        let message_keys = std::sync::Arc::new(
+            std::mem::take(&mut state.sender_message_keys)
+                .iter()
+                .map(StoredMessageKey::from_protobuf)
+                .collect::<Vec<_>>(),
+        );
         Self {
             state,
             message_keys,
@@ -371,13 +390,20 @@ impl SenderKeyState {
             "backlog must live only in `message_keys`; the protobuf copy stays empty"
         );
         let mut state = self.state.clone();
-        state.sender_message_keys = self.message_keys.as_ref().clone();
+        state.sender_message_keys = self
+            .message_keys
+            .iter()
+            .map(StoredMessageKey::as_protobuf)
+            .collect();
         state
     }
 
     pub fn add_sender_message_key(&mut self, sender_message_key: &SenderMessageKey) {
         let keys = std::sync::Arc::make_mut(&mut self.message_keys);
-        keys.push(sender_message_key.as_protobuf());
+        keys.push(StoredMessageKey {
+            iteration: sender_message_key.iteration,
+            seed: sender_message_key.seed,
+        });
         // AMORTIZED EVICTION: Only prune when exceeding MAX + threshold.
         // This reduces O(n) drain() calls from every insert to once every PRUNE_THRESHOLD inserts.
         let len = keys.len();
@@ -393,9 +419,9 @@ impl SenderKeyState {
         let index = self
             .message_keys
             .iter()
-            .position(|x| x.iteration.unwrap_or_default() == iteration)?;
+            .position(|x| x.iteration == iteration)?;
         let smk = std::sync::Arc::make_mut(&mut self.message_keys).remove(index);
-        Some(SenderMessageKey::from_protobuf(smk))
+        Some(SenderMessageKey::new(smk.iteration, smk.seed))
     }
 }
 
