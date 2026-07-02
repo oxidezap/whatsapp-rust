@@ -169,11 +169,28 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.iq", level = "debug", skip_all, fields(ns = %query.namespace, kind = ?query.query_type), err(Debug)))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.iq",
+            level = "debug",
+            skip_all,
+            fields(
+                ns = %query.namespace,
+                kind = ?query.query_type,
+                lid = tracing::field::Empty,
+                pn = tracing::field::Empty
+            ),
+            err(Debug)
+        )
+    )]
     pub async fn send_iq(
         &self,
         query: InfoQuery<'_>,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_span(&tracing::Span::current());
+
         let default_timeout = Duration::from_secs(75);
         let iq_timeout = query.timeout.unwrap_or(default_timeout);
         let req_id = query

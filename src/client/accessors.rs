@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Identity for span/error tagging. Named fields, not a tuple — LID/PN transposition would
+/// otherwise be a silent, unchecked bug at call sites.
+#[cfg(feature = "tracing")]
+#[derive(Debug, Clone, Default)]
+pub struct IdentityTags {
+    pub lid: Option<String>,
+    pub pn: Option<String>,
+}
+
 impl Client {
     pub(crate) async fn get_group_cache(&self) -> Arc<GroupCache> {
         let mut guard = self.group_cache.lock().await;
@@ -154,6 +163,34 @@ impl Client {
 
     pub fn get_lid(&self) -> Option<Jid> {
         self.persistence_manager.get_device_snapshot().lid.clone()
+    }
+
+    /// Snapshot-consistent identity for span/error tagging (redacted PN, raw LID). Named
+    /// fields, not a tuple — LID/PN transposition would otherwise be a silent, unchecked bug.
+    #[cfg(feature = "tracing")]
+    pub fn identity_tags(&self) -> IdentityTags {
+        let snapshot = self.persistence_manager.get_device_snapshot();
+        IdentityTags {
+            lid: snapshot.lid.as_ref().map(|j| j.to_string()),
+            pn: snapshot.pn.as_ref().map(|j| j.observe().to_string()),
+        }
+    }
+
+    /// Shared so every identity-tagged span leaves a field absent (not `""`) when unknown —
+    /// duplicating this per call site would drift out of sync. Skips the snapshot read when
+    /// the span is disabled.
+    #[cfg(feature = "tracing")]
+    pub(crate) fn record_identity_on_span(&self, span: &tracing::Span) {
+        if span.is_disabled() {
+            return;
+        }
+        let tags = self.identity_tags();
+        if let Some(lid) = tags.lid {
+            span.record("lid", tracing::field::display(lid));
+        }
+        if let Some(pn) = tags.pn {
+            span.record("pn", tracing::field::display(pn));
+        }
     }
 
     pub(crate) fn require_pn(&self) -> Result<Jid> {

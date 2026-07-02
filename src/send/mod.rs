@@ -570,13 +570,29 @@ impl Client {
         async move { Box::pin(self.send_message_with_options_inner(to, message, options)).await }
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.send.message",
+            level = "debug",
+            skip_all,
+            fields(
+                to = %to.observe(),
+                lid = tracing::field::Empty,
+                pn = tracing::field::Empty
+            ),
+            err(Debug)
+        )
+    )]
     async fn send_message_with_options_inner(
         &self,
         to: Jid,
         mut message: Box<wa::Message>,
         options: SendOptions,
     ) -> Result<SendResult, SendError> {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_span(&tracing::Span::current());
+
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
         wacore::telemetry::send(match to.server {
             wacore_binary::Server::Group => "group",
