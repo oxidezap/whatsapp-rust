@@ -396,8 +396,6 @@ impl<'a> HistorySyncStream<'a> {
     }
 }
 
-/// Compute `pos + len` with overflow and bounds checking.
-#[inline(always)]
 /// `Option` (Copy) for the same happy-path drop_glue reason as
 /// [`read_varint`]; `?` sites map `None` via [`field_overflow`].
 // inline(always): same hot-path/thin-LTO rationale as read_varint.
