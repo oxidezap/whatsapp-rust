@@ -33,6 +33,8 @@ pub use async_channel;
 pub use async_trait::async_trait;
 pub use bytes;
 pub use futures;
+pub use serde;
+pub use serde_json;
 pub use wacore::chrono;
 pub use waproto::buffa;
 
