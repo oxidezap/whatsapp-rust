@@ -295,6 +295,17 @@ impl Client {
         entries: Vec<LidPnEntry>,
         is_new_flags: Vec<bool>,
     ) -> Result<()> {
+        let storage = self.persist_lid_pn_batch(entries).await?;
+        self.migrate_lid_pn_batch(storage, is_new_flags).await;
+        Ok(())
+    }
+
+    /// Durable half of the batch learn: one backend transaction plus the
+    /// cache persisted-markers, no migrations.
+    async fn persist_lid_pn_batch(
+        &self,
+        entries: Vec<LidPnEntry>,
+    ) -> Result<Vec<LidPnMappingEntry>> {
         use anyhow::anyhow;
 
         // Consume entries so `lid`/`phone_number` move into storage rather
@@ -317,10 +328,20 @@ impl Client {
             .await
             .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
 
-        for (entry, is_new) in storage.iter().zip(is_new_flags.iter()) {
+        for entry in &storage {
             self.lid_pn_cache
                 .mark_persisted(&entry.phone_number, &entry.lid)
                 .await;
+        }
+        Ok(storage)
+    }
+
+    /// Registry + Signal-session migrations for a persisted batch. Split from
+    /// the persist so callers on the message pipeline can await durability but
+    /// defer this part — each new mapping walks up to MIGRATION_DEVICE_RANGE
+    /// per-address locks, which must not stall the global processing permit.
+    async fn migrate_lid_pn_batch(&self, storage: Vec<LidPnMappingEntry>, is_new_flags: Vec<bool>) {
+        for (entry, is_new) in storage.iter().zip(is_new_flags.iter()) {
             if *is_new {
                 self.migrate_device_registry_on_lid_discovery(&entry.phone_number, &entry.lid)
                     .await;
@@ -328,8 +349,6 @@ impl Client {
                     .await;
             }
         }
-
-        Ok(())
     }
 
     /// Ensure phone-to-LID mappings are resolved for the given JIDs.
@@ -370,6 +389,11 @@ impl Client {
     /// Mirrors WA Web `SignalAddress.toString()` (`WAWeb/Signal/Address.js`):
     /// upgrade Pn → Lid and Hosted → HostedLid when a mapping is known, else
     /// preserve the input.
+    ///
+    /// Session-layer addressing only: outbound DM wire jids must go through
+    /// [`Self::resolve_dm_wire_jid`] instead, which gates the namespace on
+    /// the account's 1:1-LID-migration state (an unmigrated account's LID
+    /// stanza is 400-nacked by the server).
     pub(crate) async fn resolve_encryption_jid(&self, target: &Jid) -> Jid {
         use wacore_binary::Server;
         let lid_server = match target.server {
@@ -402,12 +426,36 @@ impl Client {
             .await
     }
 
+    /// One-way latch run after every props fetch: the props cache is not
+    /// persisted, so without this a prop-only-migrated account re-enters PN
+    /// wire addressing on every process start until the fetch lands, flapping
+    /// the DM namespace. Persisting the observation makes the state durable,
+    /// like WA Web's pref outliving the prop.
+    pub(crate) async fn latch_lid_migrated_from_props(&self) {
+        if !self.persistence_manager.get_device_snapshot().lid_migrated
+            && self
+                .ab_props()
+                .is_enabled(wacore::iq::abprops::web::LID_ONE_ON_ONE_MIGRATION_ENABLED)
+                .await
+        {
+            log::info!("Account is 1:1-LID-migrated (ab prop observation)");
+            self.persistence_manager
+                .process_command(crate::store::commands::DeviceCommand::SetLidMigrated(true))
+                .await;
+        }
+    }
+
     /// Wire namespace for a 1:1 recipient. WAWebSendMsgCreateFanoutStanza
     /// addresses the whole DM stanza from the chat wid, which is LID only once
     /// the account is 1:1-LID-migrated (WAWebMessageDestinationChat); an
     /// unmigrated account keeps 1:1 chats on PN even with a known mapping.
     /// Signal session addressing is NOT gated by this — WAWebSignalAddress
     /// upgrades PN to LID unconditionally.
+    ///
+    /// Known limit: a LID input with no cached PN mapping stays LID even on
+    /// an unmigrated account (and may 400). There is no reverse LID-to-PN
+    /// resolution to fall back on — WA Web has none either; its unmigrated
+    /// accounts simply never hold LID 1:1 chats.
     pub(crate) async fn resolve_dm_wire_jid(&self, to: &Jid) -> Jid {
         if self.is_lid_migrated().await {
             return self.resolve_encryption_jid(to).await.into_non_ad();
@@ -426,7 +474,7 @@ impl Client {
     /// migrates past WAITING_PROP with the prop on), persists the account as
     /// migrated so DMs switch to LID wire addressing.
     pub(crate) async fn handle_lid_migration_mapping_sync(
-        &self,
+        self: &Arc<Self>,
         sync: &waproto::whatsapp::LidMigrationMappingSyncMessage,
     ) {
         use prost::Message as _;
@@ -448,8 +496,14 @@ impl Client {
             .pn_to_lid_mappings
             .iter()
             .filter_map(|mapping| {
-                let lid = mapping.latest_lid.unwrap_or(mapping.assigned_lid);
-                // Absent scalar fields decode as 0; a "0" user would poison the cache.
+                // Absent (or explicit-zero) scalar fields decode as 0; a "0"
+                // user would poison the cache, and a zero latest_lid falls
+                // back to the required assigned_lid instead of dropping the
+                // whole mapping.
+                let lid = mapping
+                    .latest_lid
+                    .filter(|&l| l != 0)
+                    .unwrap_or(mapping.assigned_lid);
                 if mapping.pn == 0 || lid == 0 {
                     log::warn!("Skipping migration mapping with zero pn/lid");
                     return None;
@@ -457,25 +511,38 @@ impl Client {
                 Some((lid.to_string(), mapping.pn.to_string()))
             })
             .collect();
-        // Awaited (unlike the fire-and-forget learn path) so the mappings are
-        // durable before the migrated flag below is; a crash in between must
-        // not leave a migrated account without its mapping rows.
+        // The persist is awaited (unlike the fire-and-forget learn path) so
+        // the mappings are durable before the migrated flag below is; a crash
+        // in between must not leave a migrated account without its mapping
+        // rows. The per-mapping registry/session migrations are deferred to a
+        // detached task instead: this handler runs under the message
+        // pipeline's processing permit, and a large first push walking
+        // MIGRATION_DEVICE_RANGE locks per mapping would stall it.
         let (entries, is_new_flags) = self
             .record_lid_pn_batch_in_memory(
                 mappings,
                 crate::lid_pn_cache::LearningSource::MigrationSyncLatest,
             )
             .await;
-        if !entries.is_empty()
-            && let Err(e) = self
-                .persist_and_migrate_lid_pn_batch(entries, is_new_flags)
-                .await
-        {
-            // Do not advance migration state on a failed save (WA Web's
-            // setLidMigrationMappings rethrows); the primary's push is gone,
-            // but the ab prop keeps addressing correct until re-pair.
-            log::warn!("Failed to persist migration mappings: {e:?}");
-            return;
+        if !entries.is_empty() {
+            match self.persist_lid_pn_batch(entries).await {
+                Ok(storage) => {
+                    let client = Arc::clone(self);
+                    self.runtime
+                        .spawn(Box::pin(async move {
+                            client.migrate_lid_pn_batch(storage, is_new_flags).await;
+                        }))
+                        .detach();
+                }
+                Err(e) => {
+                    // Do not advance migration state on a failed save (WA
+                    // Web's setLidMigrationMappings rethrows); the primary's
+                    // push is gone, but the ab prop keeps addressing correct
+                    // until re-pair.
+                    log::warn!("Failed to persist migration mappings: {e:?}");
+                    return;
+                }
+            }
         }
 
         if !self.persistence_manager.get_device_snapshot().lid_migrated
@@ -729,6 +796,57 @@ mod tests {
     use std::sync::Arc;
     use wacore_binary::Server;
 
+    /// Fixture: test client with one cached peer LID-PN mapping.
+    async fn client_with_peer_mapping() -> (Arc<Client>, &'static str, &'static str) {
+        let client = create_test_client().await;
+        let pn = "5511987650001";
+        let lid = "111000011112222";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+        (client, pn, lid)
+    }
+
+    #[tokio::test]
+    async fn test_latch_lid_migrated_from_props() {
+        let client: Arc<Client> = create_test_client().await;
+
+        // Prop absent: nothing latched.
+        client.latch_lid_migrated_from_props().await;
+        assert!(
+            !client
+                .persistence_manager
+                .get_device_snapshot()
+                .lid_migrated
+        );
+
+        // Prop observed on: persisted, and it outlives the prop disappearing
+        // from a later fetch.
+        client
+            .ab_props()
+            .apply_props(
+                false,
+                std::iter::once((
+                    wacore::iq::abprops::web::LID_ONE_ON_ONE_MIGRATION_ENABLED.code,
+                    "1".into(),
+                )),
+            )
+            .await;
+        client.latch_lid_migrated_from_props().await;
+        client
+            .ab_props()
+            .apply_props(false, std::iter::empty())
+            .await;
+        assert!(
+            client
+                .persistence_manager
+                .get_device_snapshot()
+                .lid_migrated
+        );
+        assert!(client.is_lid_migrated().await);
+    }
+
     #[tokio::test]
     async fn test_resolve_encryption_jid_pn_to_lid() {
         let client: Arc<Client> = create_test_client().await;
@@ -772,13 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_dm_wire_jid_unmigrated_keeps_pn() {
-        let client: Arc<Client> = create_test_client().await;
-        let pn = "5511987650001";
-        let lid = "111000011112222";
-        client
-            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
-            .await
-            .unwrap();
+        let (client, pn, lid) = client_with_peer_mapping().await;
 
         // Unmigrated account: the wire jid stays PN even with a cached mapping.
         assert_eq!(client.resolve_dm_wire_jid(&Jid::pn(pn)).await, Jid::pn(pn));
@@ -801,13 +913,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_dm_wire_jid_migrated_flag_upgrades_to_lid() {
-        let client: Arc<Client> = create_test_client().await;
-        let pn = "5511987650001";
-        let lid = "111000011112222";
-        client
-            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
-            .await
-            .unwrap();
+        let (client, pn, lid) = client_with_peer_mapping().await;
 
         client
             .persistence_manager
@@ -823,13 +929,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_dm_wire_jid_migration_prop_upgrades_to_lid() {
-        let client: Arc<Client> = create_test_client().await;
-        let pn = "5511987650001";
-        let lid = "111000011112222";
-        client
-            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
-            .await
-            .unwrap();
+        let (client, pn, lid) = client_with_peer_mapping().await;
 
         assert!(!client.is_lid_migrated().await);
         client

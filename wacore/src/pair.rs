@@ -147,6 +147,22 @@ impl PairUtils {
         wa::ClientPairingProps::decode(bytes).ok()
     }
 
+    /// Pair-time `lid_migrated` write decision. `Some(true)` whenever the
+    /// primary reports the account migrated; `Some(false)` only when a
+    /// DIFFERENT account is being paired onto this store (WA Web starts those
+    /// from prefs cleared at logout); `None` preserves the stored value on a
+    /// same-account relink whose pair-success omitted client-props — WA Web's
+    /// HandlePairSuccess never lowers the pref.
+    pub fn lid_migrated_update(props_migrated: bool, account_changed: bool) -> Option<bool> {
+        if props_migrated {
+            Some(true)
+        } else if account_changed {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// Performs the cryptographic operations for pairing
     pub fn do_pair_crypto(
         device_state: &DeviceState,
@@ -839,6 +855,18 @@ mod tests {
         let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
             .expect("client-props child must decode");
         assert!(!props.is_chat_db_lid_migrated());
+    }
+
+    #[test]
+    fn lid_migrated_update_only_lowers_on_account_change() {
+        // Primary reports migrated: always raise.
+        assert_eq!(PairUtils::lid_migrated_update(true, false), Some(true));
+        assert_eq!(PairUtils::lid_migrated_update(true, true), Some(true));
+        // Different account without (or with false) client-props: reset so the
+        // new account never inherits the previous one's state.
+        assert_eq!(PairUtils::lid_migrated_update(false, true), Some(false));
+        // Same-account relink without client-props: preserve the stored value.
+        assert_eq!(PairUtils::lid_migrated_update(false, false), None);
     }
 
     #[test]

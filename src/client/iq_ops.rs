@@ -48,6 +48,7 @@ impl Client {
         self.ab_props
             .apply_props(response.delta_update, response.experiment_props.into_iter())
             .await;
+        self.latch_lid_migrated_from_props().await;
 
         if let Some(new_hash) = response.hash {
             self.persistence_manager
