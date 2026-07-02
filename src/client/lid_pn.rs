@@ -527,6 +527,11 @@ impl Client {
         if !entries.is_empty() {
             match self.persist_lid_pn_batch(entries).await {
                 Ok(storage) => {
+                    // A shutdown can drop this task with the migrations unrun;
+                    // that is accepted, not retried: both halves self-heal
+                    // lazily (decrypt-side session migration via
+                    // try_pn_to_lid_migration_decrypt, and a LID registry miss
+                    // just re-warms over the network on the next send).
                     let client = Arc::clone(self);
                     self.runtime
                         .spawn(Box::pin(async move {
