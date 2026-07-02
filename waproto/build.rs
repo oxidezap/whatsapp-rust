@@ -153,17 +153,6 @@ fn main() -> std::io::Result<()> {
         .compile()
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    // Buffa <0.7 generated an owned `__buffa_cached_size` field that needed to be
-    // skipped for serde. Buffa 0.7 removed it, so keep the patch only for older
-    // generated output.
-    let generated = out_path.join("whatsapp.rs");
-    let original = std::fs::read_to_string(&generated)?;
-    let needle = "pub __buffa_cached_size:";
-    if original.matches(needle).count() > 0 {
-        let patched = original.replace(needle, &format!("#[serde(skip)]\n    {needle}"));
-        std::fs::write(&generated, patched)?;
-    }
-
     Ok(())
 }
 

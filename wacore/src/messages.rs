@@ -427,13 +427,19 @@ pub fn sender_key_distribution_only_plaintext(
 pub fn has_only_sender_key_distribution_top_level_fields(
     encoded: &[u8],
 ) -> Result<bool, buffa::DecodeError> {
+    // Generated tag constants, so a proto renumber updates the classifier
+    // instead of silently misrouting SKDM-only messages.
+    use waproto::tags::message as m;
     let mut cur = encoded;
     let mut has_sender_key_distribution = false;
     while !cur.is_empty() {
         let tag = buffa::encoding::Tag::decode(&mut cur)?;
         match tag.field_number() {
-            2 | 15 => has_sender_key_distribution = true,
-            35 => {}
+            m::SENDER_KEY_DISTRIBUTION_MESSAGE
+            | m::FAST_RATCHET_KEY_SENDER_KEY_DISTRIBUTION_MESSAGE => {
+                has_sender_key_distribution = true
+            }
+            m::MESSAGE_CONTEXT_INFO => {}
             _ => return Ok(false),
         }
         buffa::encoding::skip_field_depth(tag, &mut cur, buffa::RECURSION_LIMIT)?;
