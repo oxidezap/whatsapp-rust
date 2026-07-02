@@ -465,9 +465,8 @@ impl SessionState {
         }
 
         if let Some(position) = message_key_position {
-            // Only now do we mutate. swap_remove: lookup is by counter, so
-            // slot order is free to scramble; remove(position) would shift
-            // every later key down (O(n) on a buffer of up to 2000).
+            // swap_remove: lookup is by counter, so slot order is free to
+            // scramble.
             let message_key = self.session.receiver_chains[chain_idx]
                 .message_keys
                 .swap_remove(position);
@@ -496,22 +495,23 @@ impl SessionState {
         let len = chain.message_keys.len();
         if len > consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD {
             let excess = len - consts::MAX_MESSAGE_KEYS;
-            // Evict the oldest (lowest-counter) keys. Selection must be by
-            // counter value, not slot position: swap_remove here and in
-            // get_message_keys scrambles slot order, so the front is not the
-            // oldest after the first prune. select_nth + swap_remove writes
-            // only O(excess) entries where drain(..excess) memmoved every
-            // survivor (~200 KB per prune at MAX = 2000).
+            // Evict the oldest keys by counter value, not slot position:
+            // swap_remove (here and in get_message_keys) scrambles slot
+            // order, so the front is not the oldest after the first prune.
             let mut counters: Vec<u32> = chain
                 .message_keys
                 .iter()
                 .map(|m| m.index.unwrap_or(0))
                 .collect();
             let (_, &mut threshold, _) = counters.select_nth_unstable(excess - 1);
+            // The removal ceiling keeps duplicate counters at the threshold
+            // (impossible in a valid session) from evicting extra keys.
+            let mut removed = 0;
             let mut i = 0;
-            while i < chain.message_keys.len() {
+            while i < chain.message_keys.len() && removed < excess {
                 if chain.message_keys[i].index.unwrap_or(0) <= threshold {
                     chain.message_keys.swap_remove(i);
+                    removed += 1;
                 } else {
                     i += 1;
                 }
