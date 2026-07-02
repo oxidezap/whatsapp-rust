@@ -6,6 +6,15 @@
 //! `whatsapp.proto`, run `scripts/regenerate-proto-desc.sh` (wraps `protoc`).
 
 #![allow(clippy::large_enum_variant)]
+/// The protobuf runtime this crate's generated types are built on.
+///
+/// `MessageField<T>` (optional sub-messages), the `Message` encode/decode
+/// trait, and `Enumeration` all come from here and appear throughout the
+/// generated API, so the crate is re-exported: depend on this re-export
+/// instead of pinning your own `buffa`, which would have to match this
+/// crate's version exactly to avoid mismatched-type errors.
+pub use buffa;
+
 pub mod whatsapp {
     #![allow(
         non_camel_case_types,

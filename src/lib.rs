@@ -25,6 +25,26 @@ pub use wacore;
 pub use wacore_binary;
 pub use waproto;
 
+// Third-party re-exports: these crates' types appear in this crate's public
+// API, so consumers must name them — via these re-exports, not their own
+// dependency, which would have to version-match this crate exactly.
+//   buffa:       `MessageField` in every `wa::Message` literal, the `Message`
+//                encode/decode trait (`.into()` and the generated `with_*`
+//                setters avoid naming `MessageField` in most literals).
+//   anyhow:      error type of the implementable traits (stores, transport,
+//                `InboundDurabilityHook`).
+//   async_trait: the macro those same trait impls require.
+//   bytes:       `Bytes` in `Transport::send` and message payloads.
+//   chrono:      timestamps returned by `wacore::time` and message metadata.
+//   futures:     `oneshot::Receiver` returned by the response-waiting
+//                accessors.
+pub use anyhow;
+pub use async_trait::async_trait;
+pub use bytes;
+pub use futures;
+pub use wacore::chrono;
+pub use waproto::buffa;
+
 pub mod cache;
 pub mod portable_cache;
 pub(crate) mod resend_rate_limiter;
@@ -136,6 +156,9 @@ pub mod prelude {
     pub use crate::types::message::MessageInfo;
     pub use crate::{Jid, Server};
     pub use wacore::proto_helpers::{MessageBuilderExt, MessageExt};
+    /// Optional sub-message wrapper used in `wa::Message` literals
+    /// (`MessageField::some(..)`; plain values also convert via `.into()`).
+    pub use waproto::buffa::MessageField;
     /// The protobuf namespace (`wa::Message`, `wa::message::*`).
     pub use waproto::whatsapp as wa;
 }
@@ -144,3 +167,6 @@ pub use spam_report::{SpamFlow, SpamReportRequest, SpamReportResult};
 
 #[cfg(test)]
 pub mod test_utils;
+
+#[cfg(test)]
+mod reexports_test;
