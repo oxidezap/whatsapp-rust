@@ -471,7 +471,11 @@ impl Client {
                 .persist_and_migrate_lid_pn_batch(entries, is_new_flags)
                 .await
         {
+            // Do not advance migration state on a failed save (WA Web's
+            // setLidMigrationMappings rethrows); the primary's push is gone,
+            // but the ab prop keeps addressing correct until re-pair.
             log::warn!("Failed to persist migration mappings: {e:?}");
+            return;
         }
 
         if !self.persistence_manager.get_device_snapshot().lid_migrated
