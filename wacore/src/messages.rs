@@ -57,19 +57,17 @@ impl MessageUtils {
         extra_context: Option<&wa::MessageContextInfo>,
     ) -> Vec<u8> {
         let pad = Self::random_pad_len();
-        let extra_len = extra_context.map_or(0, |c| {
-            let mut c_cache = buffa::SizeCache::new();
-            len_delimited_len(
-                TAG_MESSAGE_CONTEXT_INFO,
-                waproto::codec::message_context_info_compute_size(c, &mut c_cache),
-            )
-        });
+        // Size the extra mci once; the same cache feeds the write below.
+        let mut c_cache = buffa::SizeCache::new();
+        let extra_inner = extra_context
+            .map(|c| waproto::codec::message_context_info_compute_size(c, &mut c_cache));
+        let extra_len = extra_inner.map_or(0, |sz| len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, sz));
         let mut msg_cache = buffa::SizeCache::new();
         let msg_size = waproto::codec::message_compute_size(msg, &mut msg_cache);
         let mut buf = Vec::with_capacity(msg_size + extra_len + pad as usize);
         waproto::codec::message_write_to(msg, &mut msg_cache, &mut buf);
-        if let Some(c) = extra_context {
-            push_message_field(TAG_MESSAGE_CONTEXT_INFO, c, &mut buf);
+        if let (Some(c), Some(sz)) = (extra_context, extra_inner) {
+            push_message_field_sized(TAG_MESSAGE_CONTEXT_INFO, c, sz, &mut c_cache, &mut buf);
         }
         buf.resize(buf.len() + pad as usize, pad);
         buf
@@ -86,17 +84,14 @@ impl MessageUtils {
         extra_context: Option<&wa::MessageContextInfo>,
     ) -> Vec<u8> {
         let pad = Self::random_pad_len();
-        let extra_len = extra_context.map_or(0, |c| {
-            let mut c_cache = buffa::SizeCache::new();
-            len_delimited_len(
-                TAG_MESSAGE_CONTEXT_INFO,
-                waproto::codec::message_context_info_compute_size(c, &mut c_cache),
-            )
-        });
+        let mut c_cache = buffa::SizeCache::new();
+        let extra_inner = extra_context
+            .map(|c| waproto::codec::message_context_info_compute_size(c, &mut c_cache));
+        let extra_len = extra_inner.map_or(0, |sz| len_delimited_len(TAG_MESSAGE_CONTEXT_INFO, sz));
         let mut buf = Vec::with_capacity(content.len() + extra_len + pad as usize);
         buf.extend_from_slice(content);
-        if let Some(c) = extra_context {
-            push_message_field(TAG_MESSAGE_CONTEXT_INFO, c, &mut buf);
+        if let (Some(c), Some(sz)) = (extra_context, extra_inner) {
+            push_message_field_sized(TAG_MESSAGE_CONTEXT_INFO, c, sz, &mut c_cache, &mut buf);
         }
         buf.resize(buf.len() + pad as usize, pad);
         buf
@@ -511,9 +506,24 @@ fn len_delimited_len(field: u64, payload_len: usize) -> usize {
 fn push_message_field(field: u64, msg: &wa::MessageContextInfo, out: &mut Vec<u8>) {
     let mut cache = buffa::SizeCache::new();
     let size = waproto::codec::message_context_info_compute_size(msg, &mut cache);
+    push_message_field_sized(field, msg, size, &mut cache, out);
+}
+
+/// Same as [`push_message_field`] but reuses a `SizeCache` the caller already
+/// filled by `message_context_info_compute_size` (e.g. for a buffer capacity
+/// estimate). `cache` must hold exactly that message's sizes with the cursor at
+/// 0; `write_to` consumes them, so this avoids measuring the sub-tree twice.
+#[inline]
+fn push_message_field_sized(
+    field: u64,
+    msg: &wa::MessageContextInfo,
+    size: usize,
+    cache: &mut buffa::SizeCache,
+    out: &mut Vec<u8>,
+) {
     push_varint((field << 3) | 2, out);
     push_varint(size as u64, out);
-    waproto::codec::message_context_info_write_to(msg, &mut cache, out);
+    waproto::codec::message_context_info_write_to(msg, cache, out);
 }
 
 /// Wrap a message into a DeviceSentMessage for own-device sync, hoisting

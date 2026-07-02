@@ -831,7 +831,7 @@ impl buffa::Message for DecryptionErrorMessageProto {
         &mut self,
         tag: buffa::encoding::Tag,
         buf: &mut impl buffa::bytes::Buf,
-        _ctx: buffa::DecodeContext<'_>,
+        ctx: buffa::DecodeContext<'_>,
     ) -> core::result::Result<(), buffa::DecodeError> {
         use buffa::encoding::WireType;
         // Validate wire type per field; a mismatch falls through to skip_field
@@ -847,7 +847,10 @@ impl buffa::Message for DecryptionErrorMessageProto {
                 self.device_id = Some(buffa::types::decode_uint32(buf)?);
             }
             _ => {
-                buffa::encoding::skip_field(tag, buf)?;
+                // Thread the live recursion budget through: a bare skip_field
+                // restarts it at RECURSION_LIMIT, which unknown group fields
+                // could exploit for depth-doubling.
+                buffa::encoding::skip_field_depth(tag, buf, ctx.depth())?;
             }
         }
         Ok(())

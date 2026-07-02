@@ -1138,15 +1138,17 @@ fn scan_message_level(msg: &[u8]) -> Result<MsgLevel<'_>, WalkStop> {
     Ok(level)
 }
 
+/// Max wrapper layers to unwrap before treating a message as its own base.
+/// Shared by the fast lazy walk and the full-decode fallback so they classify
+/// (poll/forwarded/bot) the same base at every depth; prost had no cap but
+/// aborted decode near its recursion limit, and real messages nest few levels.
+const MAX_MESSAGE_WRAP_DEPTH: usize = 40;
+
 /// Follow the wrapper chain (device-sent/ephemeral/view-once/...) to the base
 /// message, mirroring `MessageInternalFields::base_message`: at each level the
 /// first wrapper in priority order that has an inner message wins.
 fn unwrap_to_base(mut level: MsgLevel<'_>) -> Result<MsgLevel<'_>, WalkStop> {
-    // prost aborts decode past its recursion limit (no record); deeper chains
-    // defer to it rather than re-deriving the exact cutoff here.
-    const MAX_UNWRAPS: usize = 40;
-
-    for _ in 0..MAX_UNWRAPS {
+    for _ in 0..MAX_MESSAGE_WRAP_DEPTH {
         let mut next: Option<&[u8]> = None;
         for (&inner_tag, wrapper) in WRAPPER_INNER_TAGS.iter().zip(level.wrappers) {
             let Some(wrapper) = wrapper else {
@@ -1426,7 +1428,7 @@ fn push_secret_record(
 fn base_message_view(message: &wa::Message) -> &wa::Message {
     let mut current = message;
     let mut depth = 0usize;
-    while depth <= 16 {
+    while depth < MAX_MESSAGE_WRAP_DEPTH {
         match first_wrapped_message(current) {
             Some(inner) => {
                 current = inner;
@@ -1473,7 +1475,7 @@ fn message_is_forwarded(message: &wa::Message) -> bool {
 }
 
 fn message_is_forwarded_at_depth(message: &wa::Message, depth: usize) -> bool {
-    if depth > 16 {
+    if depth >= MAX_MESSAGE_WRAP_DEPTH {
         return false;
     }
 
