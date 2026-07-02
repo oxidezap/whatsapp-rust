@@ -439,6 +439,11 @@ impl Client {
 
         for mapping in &payload.pn_to_lid_mappings {
             let lid = mapping.latest_lid.unwrap_or(mapping.assigned_lid);
+            // Absent scalar fields decode as 0; a "0" user would poison the cache.
+            if mapping.pn == 0 || lid == 0 {
+                log::warn!("Skipping migration mapping with zero pn/lid");
+                continue;
+            }
             if let Err(e) = self
                 .add_lid_pn_mapping(
                     &lid.to_string(),
@@ -459,7 +464,7 @@ impl Client {
         {
             log::info!("Account is 1:1-LID-migrated (primary mapping sync)");
             self.persistence_manager
-                .process_command(crate::store::commands::DeviceCommand::SetLidMigrated)
+                .process_command(crate::store::commands::DeviceCommand::SetLidMigrated(true))
                 .await;
         }
     }
@@ -784,7 +789,7 @@ mod tests {
 
         client
             .persistence_manager
-            .process_command(crate::store::commands::DeviceCommand::SetLidMigrated)
+            .process_command(crate::store::commands::DeviceCommand::SetLidMigrated(true))
             .await;
 
         assert!(client.is_lid_migrated().await);

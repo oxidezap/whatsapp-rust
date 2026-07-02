@@ -4050,7 +4050,7 @@ mod tests {
         // LID wire addressing is gated on the account being 1:1-LID-migrated.
         client
             .persistence_manager
-            .process_command(DeviceCommand::SetLidMigrated)
+            .process_command(DeviceCommand::SetLidMigrated(true))
             .await;
 
         let request_id = "LID_DM_TO_1";
