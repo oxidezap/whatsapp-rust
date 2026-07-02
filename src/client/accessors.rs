@@ -156,6 +156,17 @@ impl Client {
         self.persistence_manager.get_device_snapshot().lid.clone()
     }
 
+    /// Tracing-safe identity strings for this client's own account — LID as-is (not treated
+    /// as sensitive), phone number via `.observe()` (redacts it, matching every other place a
+    /// phone number is logged in this crate). For tagging spans/errors so operators can tell
+    /// which account an issue came from without exposing the raw number in telemetry.
+    #[cfg(feature = "tracing")]
+    pub fn identity_tags(&self) -> (Option<String>, Option<String>) {
+        let lid = self.get_lid().map(|j| j.to_string());
+        let pn = self.get_pn().map(|j| j.observe().to_string());
+        (lid, pn)
+    }
+
     pub(crate) fn require_pn(&self) -> Result<Jid> {
         self.get_pn().ok_or(ClientError::NotLoggedIn.into())
     }

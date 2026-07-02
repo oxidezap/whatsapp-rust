@@ -307,7 +307,7 @@ impl Client {
             name = "wa.conn.run",
             level = "info",
             skip_all,
-            fields(account = tracing::field::Empty)
+            fields(lid = tracing::field::Empty, pn = tracing::field::Empty)
         )
     )]
     pub async fn run(self: &Arc<Self>) {
@@ -315,11 +315,19 @@ impl Client {
             warn!("Client `run` method called while already running.");
             return;
         }
-        // Tag the session-root span with our own (pseudonymous) account id so
-        // connection-lifecycle traces are attributable per account.
+        // Tag the session-root span with our own identity so connection-lifecycle traces
+        // are attributable per account — `lid`/`pn` field names match every other
+        // instrumented span (wa.iq, wa.send.message) for consistent cross-transaction
+        // filtering in GlitchTip/Sentry.
         #[cfg(feature = "tracing")]
-        if let Some(lid) = self.get_lid() {
-            tracing::Span::current().record("account", tracing::field::display(lid.observe()));
+        {
+            let span = tracing::Span::current();
+            if let Some(lid) = self.get_lid() {
+                span.record("lid", tracing::field::display(lid));
+            }
+            if let Some(pn) = self.get_pn() {
+                span.record("pn", tracing::field::display(pn.observe()));
+            }
         }
         while self.is_running.load(Ordering::Relaxed) {
             self.expected_disconnect.store(false, Ordering::Relaxed);

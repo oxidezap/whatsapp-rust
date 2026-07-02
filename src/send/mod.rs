@@ -570,7 +570,20 @@ impl Client {
         async move { Box::pin(self.send_message_with_options_inner(to, message, options)).await }
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.send.message",
+            level = "debug",
+            skip_all,
+            fields(
+                to = %to.observe(),
+                lid = %self.get_lid().map(|j| j.to_string()).unwrap_or_default(),
+                pn = %self.get_pn().map(|j| j.observe().to_string()).unwrap_or_default()
+            ),
+            err(Debug)
+        )
+    )]
     async fn send_message_with_options_inner(
         &self,
         to: Jid,
