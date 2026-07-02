@@ -465,10 +465,11 @@ impl SessionState {
         }
 
         if let Some(position) = message_key_position {
-            // Only now do we mutate - remove the message key directly
+            // swap_remove: lookup is by counter, so slot order is free to
+            // scramble.
             let message_key = self.session.receiver_chains[chain_idx]
                 .message_keys
-                .remove(position);
+                .swap_remove(position);
             let keys = MessageKeyGenerator::from_pb(message_key).map_err(InvalidSessionError)?;
             return Ok(Some(keys));
         }
@@ -488,13 +489,33 @@ impl SessionState {
         let chain = &mut self.session.receiver_chains[chain_idx];
 
         // AMORTIZED EVICTION: Only prune when exceeding MAX + threshold.
-        // This reduces O(n) drain() calls from every insert to once every PRUNE_THRESHOLD inserts.
+        // This reduces O(n) prunes from every insert to once every PRUNE_THRESHOLD inserts.
         // The lookup in get_message_keys() does a linear search by counter value, so order
         // doesn't matter for correctness.
         let len = chain.message_keys.len();
         if len > consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD {
             let excess = len - consts::MAX_MESSAGE_KEYS;
-            chain.message_keys.drain(..excess);
+            // Evict the oldest keys by counter value, not slot position:
+            // swap_remove (here and in get_message_keys) scrambles slot
+            // order, so the front is not the oldest after the first prune.
+            let mut counters: Vec<u32> = chain
+                .message_keys
+                .iter()
+                .map(|m| m.index.unwrap_or(0))
+                .collect();
+            let (_, &mut threshold, _) = counters.select_nth_unstable(excess - 1);
+            // The removal ceiling keeps duplicate counters at the threshold
+            // (impossible in a valid session) from evicting extra keys.
+            let mut removed = 0;
+            let mut i = 0;
+            while i < chain.message_keys.len() && removed < excess {
+                if chain.message_keys[i].index.unwrap_or(0) <= threshold {
+                    chain.message_keys.swap_remove(i);
+                    removed += 1;
+                } else {
+                    i += 1;
+                }
+            }
         }
         chain.message_keys.push(message_keys.into_pb());
 
@@ -1157,6 +1178,40 @@ mod tests {
 
         // Newer keys should still exist
         for counter in evicted_count as u32..total_keys as u32 {
+            let key = state.get_message_keys(&sender_key, counter).unwrap();
+            assert!(key.is_some(), "Key {} should exist", counter);
+        }
+    }
+
+    /// Eviction must drop the lowest counters on EVERY prune, not just the
+    /// first: swap_remove scrambles slot order, so a position-based prune
+    /// would evict the freshly skipped (most likely to arrive) keys from the
+    /// second prune on.
+    #[test]
+    fn test_message_keys_eviction_stays_oldest_across_prunes() {
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let mut state = create_test_session_state(3, &base_key);
+
+        let sender_key = KeyPair::generate(&mut rng()).public_key;
+        let chain_key = crate::protocol::ratchet::ChainKey::new([2u8; 32], 0);
+        state.add_receiver_chain(&sender_key, &chain_key);
+
+        // Enough inserts for two prunes: pushing counter 2051 prunes 0..=50,
+        // pushing counter 2102 prunes 51..=101 (the trigger re-arms only
+        // after the buffer refills past MAX + THRESHOLD).
+        let total_keys =
+            (consts::MAX_MESSAGE_KEYS + 2 * (consts::MESSAGE_KEY_PRUNE_THRESHOLD + 1) + 1) as u32;
+        for counter in 0..total_keys {
+            let keys = create_test_message_key_generator(counter);
+            state.set_message_keys(&sender_key, keys).unwrap();
+        }
+
+        let evicted = 2 * (consts::MESSAGE_KEY_PRUNE_THRESHOLD + 1) as u32;
+        for counter in 0..evicted {
+            let key = state.get_message_keys(&sender_key, counter).unwrap();
+            assert!(key.is_none(), "Key {} should have been evicted", counter);
+        }
+        for counter in evicted..total_keys {
             let key = state.get_message_keys(&sender_key, counter).unwrap();
             assert!(key.is_some(), "Key {} should exist", counter);
         }
