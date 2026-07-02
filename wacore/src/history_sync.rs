@@ -269,9 +269,11 @@ fn process_history_sync_streaming(
         nct_salt: None,
         conversations_processed: 0,
         tc_token_candidates: Vec::new(),
-        // Grown on demand: a full pre-count pass scanned the whole blob just to
-        // size a Vec that only holds the secret-record subset (it over-allocated
-        // and cost ~2.5% of the decode); plain growth is cheaper here.
+        // Starts empty and gets a one-shot density-based reserve once the
+        // walk has seen RESERVE_SAMPLE_RECORDS (see below). A full pre-count
+        // pass was tried before: it scanned the whole blob just to size a Vec
+        // holding only the secret-record subset (over-allocating, ~2.5% of
+        // the decode).
         msg_secret_records: Vec::new(),
         compressed_bytes: None,
         decompressed_size: 0,
