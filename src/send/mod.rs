@@ -578,8 +578,8 @@ impl Client {
             skip_all,
             fields(
                 to = %to.observe(),
-                lid = %self.get_lid().map(|j| j.to_string()).unwrap_or_default(),
-                pn = %self.get_pn().map(|j| j.observe().to_string()).unwrap_or_default()
+                lid = tracing::field::Empty,
+                pn = tracing::field::Empty
             ),
             err(Debug)
         )
@@ -590,6 +590,9 @@ impl Client {
         mut message: Box<wa::Message>,
         options: SendOptions,
     ) -> Result<SendResult, SendError> {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_span(&tracing::Span::current());
+
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
         wacore::telemetry::send(match to.server {
             wacore_binary::Server::Group => "group",

@@ -156,15 +156,37 @@ impl Client {
         self.persistence_manager.get_device_snapshot().lid.clone()
     }
 
-    /// Tracing-safe identity strings for this client's own account — LID as-is (not treated
-    /// as sensitive), phone number via `.observe()` (redacts it, matching every other place a
-    /// phone number is logged in this crate). For tagging spans/errors so operators can tell
-    /// which account an issue came from without exposing the raw number in telemetry.
+    /// Identity pair for span/error tagging so operators can attribute traces to specific
+    /// accounts without exposing raw phone numbers in telemetry.
+    ///
+    /// Reads both fields from one snapshot (not two separate `get_lid()`/`get_pn()` calls) so
+    /// a concurrent pairing update — which commits `SetId` and `SetLid` as separate
+    /// `process_command` calls — can't produce a pair straddling two different snapshots.
     #[cfg(feature = "tracing")]
     pub fn identity_tags(&self) -> (Option<String>, Option<String>) {
-        let lid = self.get_lid().map(|j| j.to_string());
-        let pn = self.get_pn().map(|j| j.observe().to_string());
+        let snapshot = self.persistence_manager.get_device_snapshot();
+        let lid = snapshot.lid.as_ref().map(|j| j.to_string());
+        let pn = snapshot.pn.as_ref().map(|j| j.observe().to_string());
         (lid, pn)
+    }
+
+    /// Records `identity_tags()` onto `span`'s `lid`/`pn` fields — the shared implementation
+    /// behind every instrumented span that tags account identity (`wa.conn.run`, `wa.iq`,
+    /// `wa.send.message`), so they stay consistent: absent (not `""`) when the account isn't
+    /// known yet, so `field:*` queries in GlitchTip/Sentry reliably mean "attributed", not
+    /// "attribution attempted". A no-op when the span is disabled, skipping the snapshot read.
+    #[cfg(feature = "tracing")]
+    pub(crate) fn record_identity_on_span(&self, span: &tracing::Span) {
+        if span.is_disabled() {
+            return;
+        }
+        let (lid, pn) = self.identity_tags();
+        if let Some(lid) = lid {
+            span.record("lid", tracing::field::display(lid));
+        }
+        if let Some(pn) = pn {
+            span.record("pn", tracing::field::display(pn));
+        }
     }
 
     pub(crate) fn require_pn(&self) -> Result<Jid> {

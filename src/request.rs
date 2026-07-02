@@ -178,8 +178,8 @@ impl Client {
             fields(
                 ns = %query.namespace,
                 kind = ?query.query_type,
-                lid = %self.get_lid().map(|j| j.to_string()).unwrap_or_default(),
-                pn = %self.get_pn().map(|j| j.observe().to_string()).unwrap_or_default()
+                lid = tracing::field::Empty,
+                pn = tracing::field::Empty
             ),
             err(Debug)
         )
@@ -188,6 +188,9 @@ impl Client {
         &self,
         query: InfoQuery<'_>,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_span(&tracing::Span::current());
+
         let default_timeout = Duration::from_secs(75);
         let iq_timeout = query.timeout.unwrap_or(default_timeout);
         let req_id = query

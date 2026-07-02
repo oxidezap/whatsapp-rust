@@ -315,21 +315,16 @@ impl Client {
             warn!("Client `run` method called while already running.");
             return;
         }
-        // Tag the session-root span with our own identity so connection-lifecycle traces
-        // are attributable per account — `lid`/`pn` field names match every other
-        // instrumented span (wa.iq, wa.send.message) for consistent cross-transaction
-        // filtering in GlitchTip/Sentry.
-        #[cfg(feature = "tracing")]
-        {
-            let span = tracing::Span::current();
-            if let Some(lid) = self.get_lid() {
-                span.record("lid", tracing::field::display(lid));
-            }
-            if let Some(pn) = self.get_pn() {
-                span.record("pn", tracing::field::display(pn.observe()));
-            }
-        }
         while self.is_running.load(Ordering::Relaxed) {
+            // Re-record every iteration, not just once before the loop: a freshly-paired
+            // device has no lid/pn yet on the first pass, and dispatch_connected() (where
+            // pairing actually resolves them) runs in a detached spawned task with no
+            // ambient span to record onto. The next reconnect iteration — which happens
+            // routinely (server-initiated stream-end, network blips) — picks up the
+            // by-then-known identity on this same span instead.
+            #[cfg(feature = "tracing")]
+            self.record_identity_on_span(&tracing::Span::current());
+
             self.expected_disconnect.store(false, Ordering::Relaxed);
 
             if let Err(connect_err) = self.connect().await {
