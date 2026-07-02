@@ -10,10 +10,10 @@ type DetHashMap<K, V> = HashMap<K, V, DetState>;
 /// bits), which CodSpeed reads as noise. A counter keeps distinct call sites
 /// on distinct streams so parties never share key material.
 fn bench_rng() -> rand::rngs::StdRng {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static CTR: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CTR: AtomicU32 = AtomicU32::new(0);
     <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(
-        0xB3AC_0000 + CTR.fetch_add(1, Ordering::Relaxed),
+        0xB3AC_0000 + u64::from(CTR.fetch_add(1, Ordering::Relaxed)),
     )
 }
 
