@@ -34,6 +34,11 @@ pub enum DeviceCommand {
     ClearServerCertChain,
     /// Bump the persisted `lc` (login counter) ahead of a login payload.
     IncrementLoginCounter,
+    /// Set the account's 1:1-LID-migrated state. Runtime paths only ever set
+    /// `true`, like WA Web's `WAIsAccountLidFieldMigrated` pref; `false` is
+    /// reserved for pair-success, where a fresh pairing must not inherit the
+    /// previous account's migration state.
+    SetLidMigrated(bool),
 }
 
 pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
@@ -92,6 +97,9 @@ pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
         }
         DeviceCommand::IncrementLoginCounter => {
             device.login_counter = device.login_counter.saturating_add(1);
+        }
+        DeviceCommand::SetLidMigrated(migrated) => {
+            device.lid_migrated = migrated;
         }
     }
 }
@@ -217,6 +225,20 @@ mod tests {
         device.login_counter = i32::MAX;
         apply_command_to_device(&mut device, DeviceCommand::IncrementLoginCounter);
         assert_eq!(device.login_counter, i32::MAX);
+    }
+
+    #[test]
+    fn set_lid_migrated_roundtrips() {
+        let mut device = Device::new();
+        assert!(!device.lid_migrated);
+
+        apply_command_to_device(&mut device, DeviceCommand::SetLidMigrated(true));
+        assert!(device.lid_migrated);
+
+        // Reset happens only at pair time, so a fresh pairing does not
+        // inherit the previous account's migration state.
+        apply_command_to_device(&mut device, DeviceCommand::SetLidMigrated(false));
+        assert!(!device.lid_migrated);
     }
 
     #[test]

@@ -135,6 +135,34 @@ impl PairUtils {
             .and_then(|n| n.content_bytes())
     }
 
+    /// Decode the optional `<client-props>` protobuf the primary attaches to
+    /// `pair-success` (WA Web `parseSetRegRequestPairSuccessClientProps`).
+    /// Carries account state such as `isChatDbLidMigrated`. A malformed
+    /// payload is treated as absent: the props are advisory and must never
+    /// fail the pairing itself.
+    pub fn extract_pairing_props(success_node: &NodeRef<'_>) -> Option<wa::ClientPairingProps> {
+        let bytes = success_node
+            .get_optional_child_by_tag(&["client-props"])?
+            .content_bytes()?;
+        wa::ClientPairingProps::decode_from_slice(bytes).ok()
+    }
+
+    /// Pair-time `lid_migrated` write decision. `Some(true)` whenever the
+    /// primary reports the account migrated; `Some(false)` only when a
+    /// DIFFERENT account is being paired onto this store (WA Web starts those
+    /// from prefs cleared at logout); `None` preserves the stored value on a
+    /// same-account relink whose pair-success omitted client-props — WA Web's
+    /// HandlePairSuccess never lowers the pref.
+    pub fn lid_migrated_update(props_migrated: bool, account_changed: bool) -> Option<bool> {
+        if props_migrated {
+            Some(true)
+        } else if account_changed {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// Performs the cryptographic operations for pairing
     pub fn do_pair_crypto(
         device_state: &DeviceState,
@@ -812,6 +840,87 @@ mod tests {
 
         assert_eq!(err.code, 500);
         assert!(err.source.to_string().contains("missing key_index"));
+    }
+
+    #[test]
+    fn extract_pairing_props_decodes_client_props_child() {
+        let pair_success = NodeBuilder::new("pair-success")
+            .children([
+                NodeBuilder::new("device-identity")
+                    .bytes(vec![0x01u8])
+                    .build(),
+                NodeBuilder::new("client-props")
+                    .bytes(
+                        wa::ClientPairingProps {
+                            is_chat_db_lid_migrated: Some(true),
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    )
+                    .build(),
+            ])
+            .build();
+
+        let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
+            .expect("client-props child must decode");
+        assert!(props.is_chat_db_lid_migrated.unwrap_or(false));
+    }
+
+    #[test]
+    fn extract_pairing_props_explicit_false_decodes_as_unmigrated() {
+        let pair_success = NodeBuilder::new("pair-success")
+            .children([NodeBuilder::new("client-props")
+                .bytes(
+                    wa::ClientPairingProps {
+                        is_chat_db_lid_migrated: Some(false),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .build()])
+            .build();
+
+        let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
+            .expect("client-props child must decode");
+        assert!(!props.is_chat_db_lid_migrated.unwrap_or(false));
+    }
+
+    #[test]
+    fn extract_pairing_props_field_absent_defaults_to_unmigrated() {
+        let pair_success = NodeBuilder::new("pair-success")
+            .children([NodeBuilder::new("client-props")
+                .bytes(wa::ClientPairingProps::default().encode_to_vec())
+                .build()])
+            .build();
+
+        let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
+            .expect("client-props child must decode");
+        assert!(!props.is_chat_db_lid_migrated.unwrap_or(false));
+    }
+
+    #[test]
+    fn lid_migrated_update_only_lowers_on_account_change() {
+        // Primary reports migrated: always raise.
+        assert_eq!(PairUtils::lid_migrated_update(true, false), Some(true));
+        assert_eq!(PairUtils::lid_migrated_update(true, true), Some(true));
+        // Different account without (or with false) client-props: reset so the
+        // new account never inherits the previous one's state.
+        assert_eq!(PairUtils::lid_migrated_update(false, true), Some(false));
+        // Same-account relink without client-props: preserve the stored value.
+        assert_eq!(PairUtils::lid_migrated_update(false, false), None);
+    }
+
+    #[test]
+    fn extract_pairing_props_absent_or_malformed_is_none() {
+        let bare = NodeBuilder::new("pair-success").build();
+        assert!(PairUtils::extract_pairing_props(&bare.as_node_ref()).is_none());
+
+        let malformed = NodeBuilder::new("pair-success")
+            .children([NodeBuilder::new("client-props")
+                .bytes(vec![0xFFu8, 0xFF, 0xFF])
+                .build()])
+            .build();
+        assert!(PairUtils::extract_pairing_props(&malformed.as_node_ref()).is_none());
     }
 
     #[test]

@@ -270,6 +270,30 @@ async fn handle_pair_success<'a>(
                 )))
                 .await;
 
+            // The primary reports whether the account is 1:1-LID-migrated via
+            // <client-props> (WA Web HandlePairSuccess -> setIsLidMigrated).
+            // This gates outbound DM wire addressing between LID and PN.
+            // Pairing a different account must not inherit the previous
+            // account's state, but a same-account relink whose pair-success
+            // omitted client-props must not lose it either.
+            let props_migrated = PairUtils::extract_pairing_props(success_node)
+                .is_some_and(|props| props.is_chat_db_lid_migrated.unwrap_or(false));
+            let account_changed = device_snapshot
+                .pn
+                .as_ref()
+                .is_none_or(|prev| prev.user != jid.user);
+            if let Some(lid_migrated) =
+                PairUtils::lid_migrated_update(props_migrated, account_changed)
+            {
+                info!("Account 1:1-LID-migrated (pair-success client-props): {lid_migrated}");
+                client
+                    .persistence_manager
+                    .process_command(crate::store::commands::DeviceCommand::SetLidMigrated(
+                        lid_migrated,
+                    ))
+                    .await;
+            }
+
             // A prior pairing's `server_has_prekeys=true` would make
             // `upload_pre_keys_at_login` skip and leave the server bundle stale.
             // Reset it so the next connect re-uploads, matching WA Web where a

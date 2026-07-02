@@ -283,6 +283,14 @@ pub struct Device {
     /// signal. Persisted so it survives restarts.
     #[serde(default)]
     pub login_counter: i32,
+    /// WA Web's `WAIsAccountLidFieldMigrated` pref: whether the account is
+    /// 1:1-LID-migrated. Set from `ClientPairingProps.isChatDbLidMigrated` at
+    /// pair time or when the primary pushes migration mappings. Gates outbound
+    /// DM wire addressing (LID vs PN); the Signal session layer stays LID-first
+    /// regardless, mirroring WAWebSignalAddress. Once set it never reverts,
+    /// like the WA Web pref.
+    #[serde(default)]
+    pub lid_migrated: bool,
 }
 
 /// Minimal cached form of a Noise certificate. Mirrors the JSON shape WA Web
@@ -379,6 +387,7 @@ impl Device {
             nct_salt_sync_seen: false,
             server_cert_chain: None,
             login_counter: 0,
+            lid_migrated: false,
         }
     }
 
