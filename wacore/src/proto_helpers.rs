@@ -1698,7 +1698,13 @@ mod tests {
     fn test_merge_dsm_context_outer_only() {
         let outer = wa::MessageContextInfo {
             message_secret: Some(vec![4, 5, 6]),
-            limit_sharing_v2: buffa::MessageField::some(wa::LimitSharing::default()),
+            // Distinguishable payload: is_set() alone cannot tell outer's
+            // value apart from a default the merge might set on its own.
+            limit_sharing_v2: buffa::MessageField::some(wa::LimitSharing {
+                sharing_limited: Some(true),
+                limit_sharing_setting_timestamp: Some(12345),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let result = merge_dsm_context(None, Some(&outer)).unwrap();
@@ -1707,10 +1713,12 @@ mod tests {
             Some(vec![4, 5, 6]),
             "message_secret should come from outer when inner is None"
         );
-        assert!(
-            result.limit_sharing_v2.is_set(),
-            "limit_sharing_v2 should come from outer"
-        );
+        let ls = result
+            .limit_sharing_v2
+            .as_option()
+            .expect("limit_sharing_v2 should come from outer");
+        assert_eq!(ls.sharing_limited, Some(true));
+        assert_eq!(ls.limit_sharing_setting_timestamp, Some(12345));
     }
 
     #[test]
