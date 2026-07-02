@@ -208,7 +208,9 @@ impl PairCodeUtils {
     /// Encodes 5 bytes to an 8-character Crockford Base32 string.
     ///
     /// 5 bytes = 40 bits = 8 × 5-bit groups, each mapped to the alphabet.
-    fn encode_crockford(bytes: &[u8; 5]) -> String {
+    /// `pub(crate)` so the Shortcake passkey flow reuses the exact same encoder
+    /// for its verification code (see `crate::shortcake`).
+    pub(crate) fn encode_crockford(bytes: &[u8; 5]) -> String {
         // Combine 5 bytes into a 40-bit value
         let mut accumulator: u64 = 0;
         for &byte in bytes {

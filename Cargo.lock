@@ -409,8 +409,9 @@ dependencies = [
 
 [[package]]
 name = "buffa"
-version = "0.8.0"
-source = "git+https://github.com/anthropics/buffa?rev=f1c8088b6a4548b0fdd286ad54caa1320ac70855#f1c8088b6a4548b0fdd286ad54caa1320ac70855"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33f29a40702df4b86ccd84211bfde8cee0bce6d0811450ade4a86a7d0958a23a"
 dependencies = [
  "base64",
  "bytes",
@@ -420,14 +421,15 @@ dependencies = [
  "rustversion",
  "serde",
  "serde_json",
- "smoothutf8",
+ "smoothutf8 0.1.1",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "buffa-build"
-version = "0.8.0"
-source = "git+https://github.com/anthropics/buffa?rev=f1c8088b6a4548b0fdd286ad54caa1320ac70855#f1c8088b6a4548b0fdd286ad54caa1320ac70855"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef33217cabddfad99c0a54d42ddb7ca5b73fa492f7b16ddb621132ef51107556"
 dependencies = [
  "buffa",
  "buffa-codegen",
@@ -436,8 +438,9 @@ dependencies = [
 
 [[package]]
 name = "buffa-codegen"
-version = "0.8.0"
-source = "git+https://github.com/anthropics/buffa?rev=f1c8088b6a4548b0fdd286ad54caa1320ac70855#f1c8088b6a4548b0fdd286ad54caa1320ac70855"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6681b562b18ea719622d0d12684e88ecbdca600d517557dc7bcef7704631e28"
 dependencies = [
  "buffa",
  "buffa-descriptor",
@@ -450,8 +453,9 @@ dependencies = [
 
 [[package]]
 name = "buffa-descriptor"
-version = "0.8.0"
-source = "git+https://github.com/anthropics/buffa?rev=f1c8088b6a4548b0fdd286ad54caa1320ac70855#f1c8088b6a4548b0fdd286ad54caa1320ac70855"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57ed423c4ecec86d1500879ce42e7e5f6def01bc632985ac756c1fd723fa21fc"
 dependencies = [
  "buffa",
  "rustversion",
@@ -1299,7 +1303,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2255,7 +2259,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2982,7 +2986,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3344,6 +3348,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "smoothutf8"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b4ec95892483d6d94284caccfddb9b77111a4dcac33ed25d624248def0fa5f1"
+
+[[package]]
 name = "socket2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3438,10 +3448,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3451,7 +3461,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3898,6 +3908,7 @@ dependencies = [
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "smoothutf8 0.2.3",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
@@ -3947,8 +3958,10 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "smoothutf8 0.2.3",
  "stable_deref_trait",
  "yoke",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -4310,6 +4323,7 @@ dependencies = [
  "libsqlite3-sys",
  "log",
  "portable-atomic",
+ "scheduled-thread-pool",
  "serde_json",
  "sha2 0.11.0",
  "tokio",
@@ -4386,7 +4400,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4752,9 +4766,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "977347db8caa080403f6b6b7c1cda9479a8e869316f7e13a59b19076a40f94e3"
+checksum = "5431d5661c32445236631278f27946e444ddafe4684cac70b185272d4f9c52d5"
 
 [[package]]
 name = "zmij"

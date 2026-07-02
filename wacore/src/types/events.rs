@@ -261,6 +261,9 @@ pub enum EventKind {
     NewsletterLiveUpdate,
     RawNode,
     MexNotification,
+    PairPasskeyRequest,
+    PairPasskeyConfirmation,
+    PairPasskeyError,
     // When adding a variant, mind the 64-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u64) and keep the guard pointing at the
     // last variant.
@@ -274,7 +277,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::MexNotification as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::PairPasskeyError as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. The event bus skips
 /// materializing and dispatching events whose kind no handler wants, so a
@@ -700,6 +703,46 @@ pub enum Event {
     /// Server-pushed MEX (GraphQL) update. Routed by the textual `op_name`,
     /// which is stable across WA Web bundle releases.
     MexNotification(MexNotification),
+
+    /// SHORTCAKE_PASSKEY: the server asked for a WebAuthn assertion to gate this
+    /// companion link. Carries the verbatim `PublicKeyCredentialRequestOptions`
+    /// JSON; the host obtains an assertion (via [`crate::sync_marker`]-agnostic
+    /// authenticator) and the client sends it back. If a passkey authenticator is
+    /// registered the client drives this automatically; this event is for hosts
+    /// that drive the assertion manually.
+    PairPasskeyRequest(PairPasskeyRequest),
+
+    /// SHORTCAKE_PASSKEY: the link reached the verification stage. `code` is the
+    /// 8-char (dashed) pairing code; when `skip_handoff_ux` is set, continuity was
+    /// proven via the handoff proof and the code need not be shown to the user.
+    PairPasskeyConfirmation(PairPasskeyConfirmation),
+
+    /// SHORTCAKE_PASSKEY: the passkey link failed. `continuation` distinguishes a
+    /// failure during the continuation/verification stage from the initial request.
+    PairPasskeyError(PairPasskeyError),
+}
+
+/// Payload for [`Event::PairPasskeyRequest`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PairPasskeyRequest {
+    /// Verbatim `PublicKeyCredentialRequestOptions` JSON from the server. Pass it
+    /// straight to a WebAuthn `get` (e.g. Android Credential Manager), or parse it
+    /// with `whatsapp_rust::passkey::parse_request_options`.
+    pub request_options_json: String,
+}
+
+/// Payload for [`Event::PairPasskeyConfirmation`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PairPasskeyConfirmation {
+    pub code: String,
+    pub skip_handoff_ux: bool,
+}
+
+/// Payload for [`Event::PairPasskeyError`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PairPasskeyError {
+    pub error: String,
+    pub continuation: bool,
 }
 
 /// `payload` shape depends on `op_name`. `offline` mirrors the raw string
@@ -771,6 +814,9 @@ impl Event {
             Event::NewsletterLiveUpdate(_) => EventKind::NewsletterLiveUpdate,
             Event::RawNode(_) => EventKind::RawNode,
             Event::MexNotification(_) => EventKind::MexNotification,
+            Event::PairPasskeyRequest(_) => EventKind::PairPasskeyRequest,
+            Event::PairPasskeyConfirmation(_) => EventKind::PairPasskeyConfirmation,
+            Event::PairPasskeyError(_) => EventKind::PairPasskeyError,
         }
     }
 
@@ -976,13 +1022,43 @@ pub enum DecryptFailMode {
     Hide,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, crate::WireEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum UnavailableType {
     #[wire_default]
     #[wire = "unknown"]
     Unknown,
     #[wire = "view_once"]
     ViewOnce,
+    #[wire = "hosted"]
+    Hosted,
+    #[wire = "bot"]
+    Bot,
+}
+
+impl UnavailableType {
+    /// Classify an `<unavailable>` fanout the way WA Web picks its
+    /// placeholderType, honouring the same precedence (bot > hosted >
+    /// view_once). Anything else is a plain fanout (`Unknown`).
+    pub fn from_fanout_flags(is_bot: bool, is_hosted: bool, is_view_once: bool) -> Self {
+        if is_bot {
+            Self::Bot
+        } else if is_hosted {
+            Self::Hosted
+        } else if is_view_once {
+            Self::ViewOnce
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// Bot, hosted and view-once fanouts are the three subtypes
+    /// `WAWebNonMessageDataRequestPlaceholderMessageResendUtils` excludes from
+    /// placeholder-resend: the phone won't share that content with a companion,
+    /// so a resend to our own device only returns empty. A plain fanout
+    /// (`Unknown`) stays recoverable.
+    pub fn is_unrecoverable_fanout(&self) -> bool {
+        matches!(self, Self::ViewOnce | Self::Hosted | Self::Bot)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1263,6 +1339,37 @@ mod tests {
     use super::*;
     use buffa::Message;
     use waproto::whatsapp as wa;
+
+    #[test]
+    fn unavailable_fanout_flags_follow_wa_web_precedence() {
+        use UnavailableType::*;
+        // bot wins over hosted and view_once
+        assert_eq!(UnavailableType::from_fanout_flags(true, true, true), Bot);
+        assert_eq!(UnavailableType::from_fanout_flags(true, false, false), Bot);
+        // hosted wins over view_once
+        assert_eq!(
+            UnavailableType::from_fanout_flags(false, true, true),
+            Hosted
+        );
+        assert_eq!(
+            UnavailableType::from_fanout_flags(false, false, true),
+            ViewOnce
+        );
+        // nothing set is a plain fanout
+        assert_eq!(
+            UnavailableType::from_fanout_flags(false, false, false),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn only_plain_fanout_is_recoverable() {
+        use UnavailableType::*;
+        assert!(Bot.is_unrecoverable_fanout());
+        assert!(Hosted.is_unrecoverable_fanout());
+        assert!(ViewOnce.is_unrecoverable_fanout());
+        assert!(!Unknown.is_unrecoverable_fanout());
+    }
 
     /// Build a HistorySync proto with conversations, returning its
     /// zlib-compressed wire form plus the exact decompressed size.

@@ -61,6 +61,12 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
         "disappearing_mode" => handle_disappearing_mode_notification(client, nr),
         "newsletter" => handle_newsletter_notification(client, Arc::clone(&node)),
         "mex" => handle_mex_notification(client, nr),
+        crate::passkey::flow::NOTIF_PASSKEY_REQUEST => {
+            crate::passkey::flow::handle_passkey_notification(client, Arc::clone(&node)).await;
+        }
+        crate::passkey::flow::NOTIF_PASSKEY_CONTINUATION => {
+            crate::passkey::flow::handle_passkey_continuation(client, Arc::clone(&node)).await;
+        }
         "mediaretry" => {
             debug!(
                 "Received mediaretry notification for msg {}",

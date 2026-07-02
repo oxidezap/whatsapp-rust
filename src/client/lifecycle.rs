@@ -225,6 +225,8 @@ impl Client {
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
+            passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
+            passkey_opening: AtomicBool::new(false),
             custom_enc_handlers: std::sync::OnceLock::new(),
             inbound_durability_hook: std::sync::OnceLock::new(),
             chatstate_handlers: Arc::new(RwLock::new(Vec::new())),
@@ -241,6 +243,16 @@ impl Client {
             group_devices_memo_enabled: cache_config.cache_stores.device_registry_cache.is_none()
                 && cache_config.cache_stores.lid_pn_cache.is_none(),
             group_devices_memo: Cache::builder()
+                .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
+                .build(),
+            // Evicting a lock whose guard is still held only lets one extra
+            // send re-run that group's fan-out (the pre-single-flight
+            // behavior); the sender-key chain lock still guarantees ratchet
+            // correctness.
+            group_distribution_locks: Cache::builder()
+                .max_capacity(cache_config.group_distribution_locks_capacity.max(1))
+                .build(),
+            skdm_warm_memo: Cache::builder()
                 .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
                 .build(),
             stanza_router: Self::create_stanza_router(),

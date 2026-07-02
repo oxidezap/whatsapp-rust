@@ -4900,12 +4900,10 @@ impl EventRecorder {
             .collect()
     }
 
-    /// Count of `UndecryptableMessage` events marked as the "stub"
-    /// variant (`is_unavailable=true`, `UnavailableType::ViewOnce`) —
-    /// i.e. the branch that routes to PDO instead of falling through to
-    /// decrypt.
-    fn view_once_unavailable_count(&self) -> usize {
-        use crate::types::events::UnavailableType;
+    /// Count of `UndecryptableMessage` stub events (`is_unavailable=true`)
+    /// carrying the given `UnavailableType` — i.e. the `<unavailable>` branch
+    /// rather than a decrypt failure.
+    fn unavailable_count(&self, ty: crate::types::events::UnavailableType) -> usize {
         self.events
             .lock()
             .unwrap()
@@ -4914,31 +4912,58 @@ impl EventRecorder {
                 matches!(
                     &***e,
                     Event::UndecryptableMessage(u)
-                        if u.is_unavailable
-                            && matches!(u.unavailable_type, UnavailableType::ViewOnce)
+                        if u.is_unavailable && u.unavailable_type == ty
                 )
             })
             .count()
     }
+
+    fn view_once_unavailable_count(&self) -> usize {
+        self.unavailable_count(crate::types::events::UnavailableType::ViewOnce)
+    }
 }
 
-fn build_unavailable_stanza(sender: &str, msg_id: &str, with_enc: bool) -> Arc<OwnedNodeRef> {
+/// The three unrecoverable `<unavailable>` fanout flavours WA Web signals
+/// distinctly, plus a plain (recoverable) fanout.
+#[derive(Clone, Copy)]
+enum UnavailableKind {
+    ViewOnce,
+    Hosted,
+    Bot,
+    Plain,
+}
+
+fn build_unavailable_kind_stanza(
+    sender: &str,
+    msg_id: &str,
+    kind: UnavailableKind,
+    with_enc: bool,
+) -> Arc<OwnedNodeRef> {
     let t = wacore::time::now_secs().to_string();
-    let unavailable = NodeBuilder::new("unavailable")
-        .attr("type", "view_once")
-        .build();
-    let children = if with_enc {
-        vec![
-            unavailable,
+    let unavailable = match kind {
+        UnavailableKind::ViewOnce => NodeBuilder::new("unavailable")
+            .attr("type", "view_once")
+            .build(),
+        UnavailableKind::Hosted => NodeBuilder::new("unavailable")
+            .attr("hosted", "true")
+            .build(),
+        UnavailableKind::Bot | UnavailableKind::Plain => NodeBuilder::new("unavailable").build(),
+    };
+    let mut children = Vec::new();
+    // Bot fanouts are marked by a sibling <bot> child, not by an <unavailable> attr.
+    if matches!(kind, UnavailableKind::Bot) {
+        children.push(NodeBuilder::new("bot").build());
+    }
+    children.push(unavailable);
+    if with_enc {
+        children.push(
             NodeBuilder::new("enc")
                 .attr("type", "msg")
                 .attr("v", "2")
                 .bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])
                 .build(),
-        ]
-    } else {
-        vec![unavailable]
-    };
+        );
+    }
     node_to_arc(
         NodeBuilder::new("message")
             .attr("from", sender)
@@ -4948,6 +4973,10 @@ fn build_unavailable_stanza(sender: &str, msg_id: &str, with_enc: bool) -> Arc<O
             .children(children)
             .build(),
     )
+}
+
+fn build_unavailable_stanza(sender: &str, msg_id: &str, with_enc: bool) -> Arc<OwnedNodeRef> {
+    build_unavailable_kind_stanza(sender, msg_id, UnavailableKind::ViewOnce, with_enc)
 }
 
 /// Locks the dispatch ordering: consumers must see the event before any
@@ -5220,8 +5249,9 @@ async fn test_unavailable_with_enc_skips_unavailable_shortcut() {
 
 /// Untrusted companions (web-class `PlatformType`) get the bare stub —
 /// `<unavailable>` without `<enc>`. That path must still emit a
-/// `ViewOnce` `UndecryptableMessage` so consumers surface the failure
-/// while the phone relays via PDO.
+/// `ViewOnce` `UndecryptableMessage` so consumers surface the failure.
+/// (The PDO resend is deliberately skipped for view-once — see
+/// `view_once_stub_acks_without_pdo`.)
 #[tokio::test]
 async fn test_unavailable_without_enc_dispatches_view_once_event() {
     let client = create_test_client_for_retry_with_id("unavailable_stub").await;
@@ -5235,6 +5265,171 @@ async fn test_unavailable_without_enc_dispatches_view_once_event() {
         recorder.view_once_unavailable_count(),
         1,
         "bare <unavailable> stub must dispatch exactly one ViewOnce UndecryptableMessage",
+    );
+}
+
+/// View-once media is never shared with companion/linked devices, so a PDO
+/// placeholder-resend to our own phone comes back empty — and that peer
+/// round-trip surfaces as a spurious "Finished syncing with WhatsApp on
+/// <device>" notification on the user's phone for every view-once received.
+/// The bare view-once stub must therefore ack the stanza directly (so the
+/// server stops redelivering it) instead of gating the ack on a futile PDO
+/// request, while still surfacing the failure to consumers.
+#[tokio::test]
+async fn view_once_stub_acks_without_pdo() {
+    let (client, transport) = capturing_client("view_once_ack").await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.register_handler(recorder.clone());
+
+    let node = build_unavailable_stanza("5511777776666@s.whatsapp.net", "VIEW_ONCE_ACK_1", false);
+    client.clone().handle_incoming_message(node).await;
+
+    // The (unrecoverable) failure still surfaces to consumers.
+    assert_eq!(
+        recorder.view_once_unavailable_count(),
+        1,
+        "bare view-once stub must still dispatch a ViewOnce UndecryptableMessage",
+    );
+
+    // The stanza is acked so the offline queue drains, without gating on a PDO.
+    assert!(
+        poll_for_message_ack(&transport, "VIEW_ONCE_ACK_1").await,
+        "view-once stub must emit an <ack class=\"message\"> to drain the offline queue",
+    );
+}
+
+/// Polls the captured transport for the `<ack class="message">` of `id`, the
+/// signal that stub was cleared from the offline queue. Keyed to the id so an
+/// unrelated ack can't green the test. In this harness a PDO can never complete
+/// (no self-session), so the ack appears only when the PDO was skipped: a
+/// regression routing one of these fanouts back through PDO would leave
+/// `should_ack` false and fail the assertion.
+async fn poll_for_message_ack(
+    transport: &crate::transport::mock::CapturingMockTransport,
+    id: &str,
+) -> bool {
+    for _ in 0..80 {
+        if find_message_ack_for(&transport.sent(), id).is_some() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// Bot fanouts (a sibling `<bot>` child) are one of the three subtypes WA Web
+/// never placeholder-resends, so the bare stub must ack directly instead of
+/// gating on a futile PDO.
+#[tokio::test]
+async fn bot_unavailable_stub_acks_without_pdo() {
+    use crate::types::events::UnavailableType;
+    let (client, transport) = capturing_client("bot_unavail_ack").await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.register_handler(recorder.clone());
+
+    let node = build_unavailable_kind_stanza(
+        "5511777776666@s.whatsapp.net",
+        "BOT_UNAVAIL_1",
+        UnavailableKind::Bot,
+        false,
+    );
+    client.clone().handle_incoming_message(node).await;
+
+    assert_eq!(
+        recorder.unavailable_count(UnavailableType::Bot),
+        1,
+        "bot <unavailable> stub must dispatch a Bot UndecryptableMessage",
+    );
+    assert!(
+        poll_for_message_ack(&transport, "BOT_UNAVAIL_1").await,
+        "bot stub must ack directly without a PDO round-trip",
+    );
+}
+
+/// Hosted fanouts (`<unavailable hosted="true">`) are likewise excluded from
+/// placeholder-resend, so the bare stub acks directly.
+#[tokio::test]
+async fn hosted_unavailable_stub_acks_without_pdo() {
+    use crate::types::events::UnavailableType;
+    let (client, transport) = capturing_client("hosted_unavail_ack").await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.register_handler(recorder.clone());
+
+    let node = build_unavailable_kind_stanza(
+        "5511777776666@s.whatsapp.net",
+        "HOSTED_UNAVAIL_1",
+        UnavailableKind::Hosted,
+        false,
+    );
+    client.clone().handle_incoming_message(node).await;
+
+    assert_eq!(
+        recorder.unavailable_count(UnavailableType::Hosted),
+        1,
+        "hosted <unavailable> stub must dispatch a Hosted UndecryptableMessage",
+    );
+    assert!(
+        poll_for_message_ack(&transport, "HOSTED_UNAVAIL_1").await,
+        "hosted stub must ack directly without a PDO round-trip",
+    );
+}
+
+/// `hosted` is a wire boolean, so the numeric spelling `hosted="1"` must
+/// classify as Hosted just like `hosted="true"` and skip the futile PDO.
+#[tokio::test]
+async fn hosted_numeric_bool_unavailable_stub_acks_without_pdo() {
+    use crate::types::events::UnavailableType;
+    let (client, transport) = capturing_client("hosted_num_ack").await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.register_handler(recorder.clone());
+
+    let t = wacore::time::now_secs().to_string();
+    let node = node_to_arc(
+        NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "HOSTED_NUM_1")
+            .attr("t", &t)
+            .attr("type", "media")
+            .children(vec![
+                NodeBuilder::new("unavailable").attr("hosted", "1").build(),
+            ])
+            .build(),
+    );
+    client.clone().handle_incoming_message(node).await;
+
+    assert_eq!(
+        recorder.unavailable_count(UnavailableType::Hosted),
+        1,
+        "hosted=\"1\" must classify as Hosted via wire-boolean coercion",
+    );
+    assert!(
+        poll_for_message_ack(&transport, "HOSTED_NUM_1").await,
+        "numeric hosted stub must ack directly without a PDO round-trip",
+    );
+}
+
+/// A plain `<unavailable>` fanout (no bot/hosted/view-once marker) stays
+/// recoverable, so it must classify as `Unknown` and keep the PDO path rather
+/// than being short-circuited like the three unrecoverable subtypes.
+#[tokio::test]
+async fn plain_unavailable_stub_classifies_as_unknown() {
+    use crate::types::events::UnavailableType;
+    let (client, _transport) = capturing_client("plain_unavail").await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.register_handler(recorder.clone());
+
+    let node = build_unavailable_kind_stanza(
+        "5511777776666@s.whatsapp.net",
+        "PLAIN_UNAVAIL_1",
+        UnavailableKind::Plain,
+        false,
+    );
+    client.clone().handle_incoming_message(node).await;
+
+    assert_eq!(
+        recorder.unavailable_count(UnavailableType::Unknown),
+        1,
+        "plain <unavailable> fanout must classify as Unknown (recoverable via PDO)",
     );
 }
 

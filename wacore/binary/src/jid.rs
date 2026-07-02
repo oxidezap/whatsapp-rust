@@ -1575,6 +1575,11 @@ mod tests {
         let broadcast_list = Jid::new("12345", Server::Broadcast);
         assert!(broadcast_list.is_broadcast_list());
         assert!(!broadcast_list.is_status_broadcast());
+
+        // A group is not a status broadcast (the send path gates addressing_mode on this).
+        let group: Jid = "120363012345678901@g.us".parse().expect("should parse");
+        assert!(group.is_group());
+        assert!(!group.is_status_broadcast());
     }
 
     #[test]

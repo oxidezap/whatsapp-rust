@@ -201,6 +201,11 @@ pub struct CacheConfig {
     pub session_locks_capacity: u64,
     /// Per-chat lane capacity (combined lock + queue). Default: 5000.
     pub chat_lanes_capacity: u64,
+    /// Per-group cold sender-key distribution lock capacity. Default: 512
+    /// (far above any realistic number of groups distributing at once; an
+    /// evicted live lock only lets one extra send repeat that group's
+    /// fan-out, the ratchet stays correct under the chain lock).
+    pub group_distribution_locks_capacity: u64,
     /// Per-chat resend rate-limiter capacity: one token-bucket entry per group
     /// recently driving retry resends. Keep above the count of concurrently
     /// storming groups: eviction is FIFO and fail-open (an evicted bucket is
@@ -280,6 +285,10 @@ impl std::fmt::Debug for CacheConfig {
             .field("session_locks_capacity", &self.session_locks_capacity)
             .field("chat_lanes_capacity", &self.chat_lanes_capacity)
             .field(
+                "group_distribution_locks_capacity",
+                &self.group_distribution_locks_capacity,
+            )
+            .field(
                 "resend_rate_limiter_capacity",
                 &self.resend_rate_limiter_capacity,
             )
@@ -339,6 +348,7 @@ impl Default for CacheConfig {
             // breaking serialization. Size generously to avoid eviction pressure.
             session_locks_capacity: 10_000,
             chat_lanes_capacity: 5_000,
+            group_distribution_locks_capacity: 512,
             resend_rate_limiter_capacity: 4_096,
             sent_message_ttl_secs: 7200,
             // Bounded by default: seed only the still-relevant slice of history

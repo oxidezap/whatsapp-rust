@@ -45,6 +45,18 @@ impl Client {
             .await
     }
 
+    /// Acquire the per-group cold-distribution single-flight guard.
+    pub(crate) async fn group_distribution_lock(
+        &self,
+        group: &Jid,
+    ) -> async_lock::MutexGuardArc<()> {
+        self.group_distribution_locks
+            .get_with_by_ref(group, async { Arc::new(async_lock::Mutex::new(())) })
+            .await
+            .lock_arc()
+            .await
+    }
+
     /// Get the active noise socket, or error if not connected.
     pub(crate) async fn get_noise_socket(
         &self,

@@ -88,20 +88,43 @@ impl Client {
         if let Some(unavailable) = unavailable_node
             && all_enc_nodes.is_empty()
         {
-            let unavailable_type = match unavailable.get_attr("type").map(|v| v.as_str()).as_deref()
-            {
-                Some("view_once") => crate::types::events::UnavailableType::ViewOnce,
-                _ => crate::types::events::UnavailableType::Unknown,
-            };
-            log::info!(
-                "[msg:{}] Message has <unavailable> child (type: {:?}), requesting from phone via PDO",
-                info.id,
-                unavailable_type
+            // WA Web never placeholder-resends bot, hosted or view-once
+            // <unavailable> fanouts (WAWebNonMessageDataRequestPlaceholderMessageResendUtils
+            // skips those subtypes). The phone won't share that content with a
+            // companion, so a resend to our own device only comes back empty and
+            // surfaces a spurious "Finished syncing" notification for each one.
+            // Detect the three the way WA Web's parser does (bot via a <bot>
+            // child, hosted via the `hosted` attr, view-once via the `type`
+            // attr) and skip the PDO for them, still dispatching the event and
+            // acking. A plain fanout (Unknown) stays recoverable via PDO.
+            let is_bot = nr.get_optional_child("bot").is_some();
+            // `hosted` is a wire boolean (server sends "true"/"1"), so coerce it
+            // instead of matching one spelling and misclassifying the rest.
+            let is_hosted = unavailable.attrs().optional_bool("hosted");
+            let is_view_once = unavailable.get_attr("type").map(|v| v.as_str()).as_deref()
+                == Some(crate::types::events::UnavailableType::ViewOnce.as_str());
+            let unavailable_type = crate::types::events::UnavailableType::from_fanout_flags(
+                is_bot,
+                is_hosted,
+                is_view_once,
             );
-            // PDO is the only recovery here (no retry receipt), so run it before
-            // the transport ack in one flush task: the ack must not clear the
-            // offline queue before the PDO request goes out. status is acked by
-            // the should_ack gate. Mirrors whatsmeow's request-then-ack.
+            let unrecoverable = unavailable_type.is_unrecoverable_fanout();
+
+            if unrecoverable {
+                log::info!(
+                    "[msg:{}] Message has unrecoverable <unavailable> child (type: {:?}); \
+                     skipping futile PDO placeholder-resend and acking directly",
+                    info.id,
+                    unavailable_type,
+                );
+            } else {
+                log::info!(
+                    "[msg:{}] Message has <unavailable> child (type: {:?}), requesting from phone via PDO",
+                    info.id,
+                    unavailable_type,
+                );
+            }
+
             self.dispatch_undecryptable_event(
                 Arc::clone(&info),
                 true,
@@ -113,10 +136,16 @@ impl Client {
             let info2 = Arc::clone(&info);
             let skip_ack = info.source.chat.is_status_broadcast();
             self.outbound_flush.spawn(&*self.runtime, async move {
-                // Only ack once the PDO request is out (or skipped as ancient);
-                // a transient send failure leaves it queued for redelivery.
-                let pdo_sent = client.run_pdo_request(&info2).await;
-                if !skip_ack && pdo_sent {
+                // Unrecoverable fanouts have no content the phone will resend, so
+                // ack directly. Otherwise PDO is the only recovery (no retry
+                // receipt): ack only once the request is out, or skipped as
+                // ancient, so a transient send failure leaves it queued.
+                let should_ack = if unrecoverable {
+                    true
+                } else {
+                    client.run_pdo_request(&info2).await
+                };
+                if !skip_ack && should_ack {
                     client.send_transport_ack(&info2).await;
                 }
             });

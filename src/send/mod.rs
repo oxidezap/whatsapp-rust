@@ -628,7 +628,12 @@ impl Client {
 
         let extra_nodes =
             build_extra_stanza_nodes(&to, inferred_meta, biz, options.extra_stanza_nodes);
-        self.send_message_impl(
+        // send_message_impl's state machine is ~13 KB (the whole send path in
+        // one async fn). Boxing keeps `send_message`'s future pointer-sized, so
+        // callers embedding it in their own futures (event handlers, spawned
+        // tasks) don't inherit those 13 KB per instance; the box is allocated
+        // only when a send actually runs.
+        Box::pin(self.send_message_impl(
             to,
             &message,
             Some(request_id),
@@ -637,7 +642,7 @@ impl Client {
             edit,
             extra_nodes,
             stanza_type_override,
-        )
+        ))
         .await
         .map_err(SendError::from_anyhow)?;
         Ok(result)
@@ -1048,12 +1053,34 @@ impl Client {
             .await
         {
             Ok(all_devices) => {
+                // Skip the O(devices) filter_skdm_targets scan when the same
+                // (devices, sender-key-map) Arc pair was already fully warm. Both
+                // Arcs swap on any warm-state or membership change, so a stale skip
+                // is impossible. Needs the device memo for a stable devices Arc.
+                if self.group_devices_memo_enabled
+                    && let Some((dw, cw)) = self.skdm_warm_memo.get(group).await
+                    && std::ptr::eq(dw.as_ptr(), std::sync::Arc::as_ptr(&all_devices))
+                    && std::ptr::eq(cw.as_ptr(), std::sync::Arc::as_ptr(&cached_map))
+                {
+                    return Some((all_devices, Vec::new()));
+                }
                 let needs_skdm = self.filter_skdm_targets(
                     group_jid,
                     all_devices.devices(),
                     &cached_map,
                     own_sending_jid,
                 );
+                if needs_skdm.is_empty() && self.group_devices_memo_enabled {
+                    self.skdm_warm_memo
+                        .insert(
+                            group.clone(),
+                            (
+                                std::sync::Arc::downgrade(&all_devices),
+                                std::sync::Arc::downgrade(&cached_map),
+                            ),
+                        )
+                        .await;
+                }
                 Some((all_devices, needs_skdm))
             }
             Err(e) => {
@@ -1288,6 +1315,11 @@ impl Client {
             stale_users: Vec<String>,
         }
         let mut skdm_update: Option<SkdmUpdate> = None;
+        // Single-flight for cold group sends: held from SKDM target resolution
+        // through `update_sender_key_devices` (bottom of this function) so a
+        // concurrent cold send re-resolves against the winner's warm marking
+        // instead of redoing the full per-member fan-out. None on warm sends.
+        let mut distribution_guard: Option<async_lock::MutexGuardArc<()>> = None;
         let mut should_issue_tc_token_after_send = false;
         let mut used_cached_tc_token_key: Option<String> = None;
         let tc_issue_target = to.clone();
@@ -1352,21 +1384,24 @@ impl Client {
             // participant list and expect self to be present.
             let group_info = ensure_self_in_group(group_info, &own_sending_jid);
 
-            let force_skdm = {
-                use wacore::libsignal::store::sender_key_name::SenderKeyName;
-                let sender_address = own_sending_jid.to_protocol_address();
-                let sender_key_name = SenderKeyName::from_parts(&to_str, sender_address.as_str());
-
+            // Side-effect-free cold check: does the sender key record exist,
+            // and has its chain advanced past the rotation threshold? Reads
+            // the record without deleting anything, so a false positive (a
+            // concurrent send already rotating/recreating) costs only the
+            // re-check under the lock below.
+            use wacore::libsignal::store::sender_key_name::SenderKeyName;
+            let sender_address = own_sending_jid.to_protocol_address();
+            let sender_key_name = SenderKeyName::from_parts(&to_str, sender_address.as_str());
+            // WA Web posts SenderKeyExpired with `PERIODIC_ROTATION` after
+            // a chain advances past a threshold. Captured-js doesn't show
+            // the value; 1000 mirrors common Signal hygiene defaults.
+            const SENDER_KEY_ROTATION_THRESHOLD: u32 = 1000;
+            let read_sender_key_state = || async {
                 let record = self
                     .signal_cache
                     .get_sender_key(&sender_key_name, &*device_snapshot.backend)
                     .await?;
                 let key_exists = record.is_some();
-
-                // WA Web posts SenderKeyExpired with `PERIODIC_ROTATION` after
-                // a chain advances past a threshold. Captured-js doesn't show
-                // the value; 1000 mirrors common Signal hygiene defaults.
-                const SENDER_KEY_ROTATION_THRESHOLD: u32 = 1000;
                 // Read the chain iteration through the shared `Arc` without cloning
                 // the record: borrow the current state instead of `*_mut().cloned()`.
                 let needs_rotation = record
@@ -1375,10 +1410,23 @@ impl Client {
                     .and_then(|state| state.sender_chain_key())
                     .map(|ck| ck.iteration())
                     .is_some_and(|iter| iter >= SENDER_KEY_ROTATION_THRESHOLD);
+                Ok::<(bool, bool), anyhow::Error>((key_exists, needs_rotation))
+            };
 
+            let (key_exists, needs_rotation) = read_sender_key_state().await?;
+            let mut force_skdm = force_key_distribution || !key_exists || needs_rotation;
+            if force_skdm {
+                // Serialize the whole rotation/redistribution under the
+                // per-group guard and RE-CHECK once inside it: a send that
+                // merely raced the winner's delete->recreate window sees the
+                // fresh record here and downgrades to a warm send instead of
+                // redistributing to every member again.
+                distribution_guard = Some(self.group_distribution_lock(&to).await);
+                let (key_exists, needs_rotation) = read_sender_key_state().await?;
+                force_skdm = force_key_distribution || !key_exists || needs_rotation;
                 if needs_rotation {
                     log::info!(
-                        "Periodic sender-key rotation for {} (chain iteration ≥ {SENDER_KEY_ROTATION_THRESHOLD})",
+                        "Periodic sender-key rotation for {} (chain iteration >= {SENDER_KEY_ROTATION_THRESHOLD})",
                         to.observe()
                     );
                     self.signal_cache
@@ -1393,9 +1441,10 @@ impl Client {
                     }
                     self.sender_key_device_cache.invalidate(&to_str).await;
                 }
-
-                force_key_distribution || !key_exists || needs_rotation
-            };
+                if !force_skdm {
+                    distribution_guard = None;
+                }
+            }
 
             let mut store_adapter = self.signal_adapter_from(device_store_arc.clone());
 
@@ -1423,7 +1472,42 @@ impl Client {
                     )
                     .await
                 {
-                    Some((all, needs)) => (Some(all), Some(needs)),
+                    Some((all, needs)) if needs.is_empty() => (Some(all), Some(needs)),
+                    Some((first_all, first_needs)) => {
+                        // Cold: wait for any in-flight distribution, then
+                        // re-resolve. The loser usually finds every device
+                        // already marked warm by the winner and downgrades to a
+                        // plain skmsg send; if the winner failed, the targets
+                        // are still cold and this send distributes normally.
+                        distribution_guard = Some(self.group_distribution_lock(&to).await);
+                        // Force a DB re-read: a concurrent warm send may have
+                        // started the cache init before the winner's marking
+                        // landed and then published that stale (empty) map,
+                        // which would otherwise turn this into a full
+                        // re-distribution to every member.
+                        self.sender_key_device_cache.invalidate(&to_str).await;
+                        match self
+                            .resolve_skdm_targets_memoized(
+                                &to,
+                                &to_str,
+                                &group_info_for_memo,
+                                &own_sending_jid,
+                            )
+                            .await
+                        {
+                            Some((all, needs)) => {
+                                if needs.is_empty() {
+                                    distribution_guard = None;
+                                }
+                                (Some(all), Some(needs))
+                            }
+                            // Transient re-resolve failure: keep the first
+                            // resolve's targets rather than silently sending
+                            // without the distribution it already knew was
+                            // needed.
+                            None => (Some(first_all), Some(first_needs)),
+                        }
+                    }
                     None => (None, None),
                 }
             };
@@ -1466,14 +1550,44 @@ impl Client {
                             to.observe()
                         );
 
-                        if let Err(e) = self
-                            .persistence_manager
-                            .clear_sender_key_devices(&to_str)
-                            .await
-                        {
-                            log::warn!("Failed to clear SKDM recipients: {:?}", e);
+                        // This retry redistributes, so it needs the same
+                        // single-flight guard as a cold send (a warm send that
+                        // lost its sender key arrives here without one).
+                        if distribution_guard.is_none() {
+                            distribution_guard = Some(self.group_distribution_lock(&to).await);
                         }
-                        self.sender_key_device_cache.invalidate(&to_str).await;
+
+                        // Re-check under the guard: a concurrent retry may have
+                        // already recreated the key and marked the devices, in
+                        // which case this send retries warm instead of clearing
+                        // the tracking and redistributing to every member again.
+                        let (key_recreated, _) = read_sender_key_state().await?;
+                        let warm_targets = if key_recreated {
+                            self.sender_key_device_cache.invalidate(&to_str).await;
+                            self.resolve_skdm_targets_memoized(
+                                &to,
+                                &to_str,
+                                &group_info_for_memo,
+                                &own_sending_jid,
+                            )
+                            .await
+                        } else {
+                            None
+                        };
+                        let (retry_force, retry_targets, retry_all) = match warm_targets {
+                            Some((all, needs)) => (false, Some(needs), Some(all)),
+                            None => {
+                                if let Err(e) = self
+                                    .persistence_manager
+                                    .clear_sender_key_devices(&to_str)
+                                    .await
+                                {
+                                    log::warn!("Failed to clear SKDM recipients: {:?}", e);
+                                }
+                                self.sender_key_device_cache.invalidate(&to_str).await;
+                                (true, None, None)
+                            }
+                        };
 
                         let mut store_adapter_retry =
                             self.signal_adapter_from(device_store_arc.clone());
@@ -1490,9 +1604,9 @@ impl Client {
                             to,
                             message,
                             request_id,
-                            true,
-                            None,
-                            None,
+                            retry_force,
+                            retry_targets,
+                            retry_all,
                             edit.clone(),
                             &extra_stanza_nodes,
                         )
@@ -1769,6 +1883,8 @@ impl Client {
                 self.invalidate_device_cache(user).await;
             }
         }
+        // Warm marking is visible; a waiting cold send may now re-resolve.
+        drop(distribution_guard);
 
         // Flush cached Signal state to DB after encryption
         self.flush_signal_cache_logged("send_message_impl", None)

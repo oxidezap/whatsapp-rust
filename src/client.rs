@@ -560,6 +560,15 @@ pub struct Client {
     /// Tracks the pending pair code request and ephemeral keys.
     pub(crate) pair_code_state: Arc<Mutex<wacore::pair_code::PairCodeState>>,
 
+    /// SHORTCAKE_PASSKEY linking flow state: the pending handoff key, the
+    /// per-attempt ephemeral linking cache, and the optional host authenticator.
+    pub(crate) passkey_state: Arc<Mutex<crate::passkey::flow::PasskeyFlowState>>,
+
+    /// Wait-free "an open is in flight" reservation for the passkey flow. Kept
+    /// outside `passkey_state` so it can be released synchronously on drop (a
+    /// cancelled open can't leave it stuck), unlike a flag behind the async lock.
+    pub(crate) passkey_opening: AtomicBool,
+
     /// Custom handlers for encrypted message types. Set once at `Bot::build` and
     /// immutable afterward, so the receive hot path reads it with a plain
     /// `OnceLock::get` (no lock) and no per-node guard acquisition.
@@ -609,6 +618,23 @@ pub struct Client {
     /// repeat send skips the per-member cache fan-out.
     pub(crate) group_devices_memo:
         Cache<Jid, Arc<crate::client::device_registry::GroupDevicesMemo>>,
+
+    /// Single-flight for cold SKDM distribution, keyed per group. Concurrent
+    /// cold sends each re-ran the full per-member fan-out before any of them
+    /// marked the devices warm; the loser now waits here and re-resolves,
+    /// finding everything warm. Warm sends never touch it.
+    pub(crate) group_distribution_locks: Cache<Jid, Arc<async_lock::Mutex<()>>>,
+
+    /// Last `(devices, sender-key-device map)` Arc pair with an empty `needs_skdm`,
+    /// so a warm repeat send skips `filter_skdm_targets`. `Weak` keeps the pointer
+    /// comparison ABA-safe, matching `GroupDevicesMemo`.
+    pub(crate) skdm_warm_memo: Cache<
+        Jid,
+        (
+            std::sync::Weak<wacore::send::ResolvedGroupDevices>,
+            std::sync::Weak<crate::sender_key_device_cache::SenderKeyDeviceMap>,
+        ),
+    >,
 
     /// Router for dispatching stanzas to their appropriate handlers
     pub(crate) stanza_router: crate::handlers::router::StanzaRouter,

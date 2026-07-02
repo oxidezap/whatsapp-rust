@@ -40,6 +40,7 @@ pub mod runtime;
 pub mod secret_enc_addon;
 pub mod send;
 pub mod session;
+pub mod shortcake;
 pub mod stanza;
 pub mod sticker_pack;
 

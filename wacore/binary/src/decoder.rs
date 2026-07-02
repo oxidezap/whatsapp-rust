@@ -99,9 +99,16 @@ impl<'a> Decoder<'a> {
     #[inline(always)]
     fn read_string(&mut self, len: usize) -> Result<NodeStr<'a>> {
         let bytes = self.read_bytes(len)?;
-        match std::str::from_utf8(bytes) {
-            Ok(s) => Ok(NodeStr::Borrowed(s)),
-            Err(e) => Err(BinaryError::InvalidUtf8(e)),
+        // smoothutf8 has a faster fast-path for the short strings dominating the
+        // wire (tags, attribute values, JID parts). It only answers valid/invalid,
+        // so the cold rejection path reuses std to recover the precise Utf8Error.
+        if let Some(s) = smoothutf8::from_utf8(bytes) {
+            Ok(NodeStr::Borrowed(s))
+        } else {
+            match std::str::from_utf8(bytes) {
+                Ok(s) => Ok(NodeStr::Borrowed(s)),
+                Err(e) => Err(BinaryError::InvalidUtf8(e)),
+            }
         }
     }
 
