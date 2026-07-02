@@ -3,6 +3,11 @@
 use async_trait::async_trait;
 use buffa::Message as ProtoMessage;
 use std::collections::HashMap;
+
+/// SipHash with fixed keys: the default RandomState seeds per process, so
+/// bucket layout (and thus cache behavior) differed between benchmark runs.
+type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+type DetHashMap<K, V> = HashMap<K, V, DetState>;
 use std::hint::black_box;
 use wacore::client::context::{GroupInfo, SendContextResolver};
 use wacore::messages::MessageUtils;
@@ -143,7 +148,7 @@ impl Runtime for BenchRuntime {
 struct MemIdentityStore {
     key_pair: IdentityKeyPair,
     reg_id: u32,
-    identities: std::sync::Arc<std::sync::Mutex<HashMap<ProtocolAddress, IdentityKey>>>,
+    identities: std::sync::Arc<std::sync::Mutex<DetHashMap<ProtocolAddress, IdentityKey>>>,
 }
 
 impl MemIdentityStore {
@@ -151,7 +156,7 @@ impl MemIdentityStore {
         Self {
             key_pair,
             reg_id,
-            identities: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            identities: std::sync::Arc::new(std::sync::Mutex::new(DetHashMap::default())),
         }
     }
 }
@@ -188,7 +193,7 @@ impl IdentityKeyStore for MemIdentityStore {
     }
 }
 
-struct MemPreKeyStore(HashMap<PreKeyId, PreKeyRecord>);
+struct MemPreKeyStore(DetHashMap<PreKeyId, PreKeyRecord>);
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -209,7 +214,7 @@ impl PreKeyStore for MemPreKeyStore {
     }
 }
 
-struct MemSignedPreKeyStore(HashMap<SignedPreKeyId, SignedPreKeyRecord>);
+struct MemSignedPreKeyStore(DetHashMap<SignedPreKeyId, SignedPreKeyRecord>);
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -233,7 +238,9 @@ impl SignedPreKeyStore for MemSignedPreKeyStore {
 /// Bench fixture wrapping shared session state — see `MemIdentityStore`
 /// for the rationale.
 #[derive(Clone, Default)]
-struct MemSessionStore(std::sync::Arc<std::sync::Mutex<HashMap<ProtocolAddress, SessionRecord>>>);
+struct MemSessionStore(
+    std::sync::Arc<std::sync::Mutex<DetHashMap<ProtocolAddress, SessionRecord>>>,
+);
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -250,7 +257,7 @@ impl SessionStore for MemSessionStore {
     }
 }
 
-struct MemSenderKeyStore(HashMap<SenderKeyName, SenderKeyRecord>);
+struct MemSenderKeyStore(DetHashMap<SenderKeyName, SenderKeyRecord>);
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -300,8 +307,8 @@ impl User {
         let spk_record =
             SignedPreKeyRecord::new(spk_id, Timestamp::from_epoch_millis(0), &spk_pair, &spk_sig);
 
-        let mut prekeys = MemPreKeyStore(HashMap::new());
-        let mut signed_prekeys = MemSignedPreKeyStore(HashMap::new());
+        let mut prekeys = MemPreKeyStore(DetHashMap::default());
+        let mut signed_prekeys = MemSignedPreKeyStore(DetHashMap::default());
         futures::executor::block_on(async {
             prekeys.save_pre_key(pk_id, &pk_record).await.unwrap();
             signed_prekeys
@@ -324,7 +331,7 @@ impl User {
             prekeys,
             signed_prekeys,
             sessions: MemSessionStore::default(),
-            sender_keys: MemSenderKeyStore(HashMap::new()),
+            sender_keys: MemSenderKeyStore(DetHashMap::default()),
             prekey_pair: pk_pair,
             signed_prekey_pair: spk_pair,
             signed_prekey_sig: spk_sig.to_vec(),

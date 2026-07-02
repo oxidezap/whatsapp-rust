@@ -1,5 +1,22 @@
 use std::collections::HashMap;
 
+/// SipHash with fixed keys: the default RandomState seeds per process, so
+/// bucket layout (and thus cache behavior) differed between benchmark runs.
+type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+type DetHashMap<K, V> = HashMap<K, V, DetState>;
+
+/// Deterministic per-call-site RNG: entropy-seeded keys made every run measure
+/// different instruction counts (vartime signature paths depend on scalar
+/// bits), which CodSpeed reads as noise. A counter keeps distinct call sites
+/// on distinct streams so parties never share key material.
+fn bench_rng() -> rand::rngs::StdRng {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(
+        0xB3AC_0000 + CTR.fetch_add(1, Ordering::Relaxed),
+    )
+}
+
 use async_trait::async_trait;
 use divan::black_box;
 
@@ -20,7 +37,7 @@ use wacore_libsignal::store::sender_key_name::SenderKeyName;
 struct InMemoryIdentityKeyStore {
     identity_key_pair: IdentityKeyPair,
     registration_id: u32,
-    identities: HashMap<ProtocolAddress, IdentityKey>,
+    identities: DetHashMap<ProtocolAddress, IdentityKey>,
 }
 
 impl InMemoryIdentityKeyStore {
@@ -28,7 +45,7 @@ impl InMemoryIdentityKeyStore {
         Self {
             identity_key_pair,
             registration_id,
-            identities: HashMap::new(),
+            identities: DetHashMap::default(),
         }
     }
 }
@@ -77,13 +94,13 @@ impl IdentityKeyStore for InMemoryIdentityKeyStore {
 }
 
 struct InMemoryPreKeyStore {
-    prekeys: HashMap<PreKeyId, PreKeyRecord>,
+    prekeys: DetHashMap<PreKeyId, PreKeyRecord>,
 }
 
 impl InMemoryPreKeyStore {
     fn new() -> Self {
         Self {
-            prekeys: HashMap::new(),
+            prekeys: DetHashMap::default(),
         }
     }
 }
@@ -120,13 +137,13 @@ impl PreKeyStore for InMemoryPreKeyStore {
 }
 
 struct InMemorySignedPreKeyStore {
-    signed_prekeys: HashMap<SignedPreKeyId, SignedPreKeyRecord>,
+    signed_prekeys: DetHashMap<SignedPreKeyId, SignedPreKeyRecord>,
 }
 
 impl InMemorySignedPreKeyStore {
     fn new() -> Self {
         Self {
-            signed_prekeys: HashMap::new(),
+            signed_prekeys: DetHashMap::default(),
         }
     }
 }
@@ -155,13 +172,13 @@ impl SignedPreKeyStore for InMemorySignedPreKeyStore {
 }
 
 struct InMemorySessionStore {
-    sessions: HashMap<ProtocolAddress, SessionRecord>,
+    sessions: DetHashMap<ProtocolAddress, SessionRecord>,
 }
 
 impl InMemorySessionStore {
     fn new() -> Self {
         Self {
-            sessions: HashMap::new(),
+            sessions: DetHashMap::default(),
         }
     }
 }
@@ -194,13 +211,13 @@ impl SessionStore for InMemorySessionStore {
 }
 
 struct InMemorySenderKeyStore {
-    sender_keys: HashMap<SenderKeyName, SenderKeyRecord>,
+    sender_keys: DetHashMap<SenderKeyName, SenderKeyRecord>,
 }
 
 impl InMemorySenderKeyStore {
     fn new() -> Self {
         Self {
-            sender_keys: HashMap::new(),
+            sender_keys: DetHashMap::default(),
         }
     }
 }
@@ -241,7 +258,7 @@ struct User {
 
 impl User {
     fn new(name: &str, device_id: u32) -> Self {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng();
 
         let identity_key_pair = IdentityKeyPair::generate(&mut rng);
         let registration_id = rand::random::<u32>() & 0x3FFF;
@@ -321,7 +338,7 @@ fn setup_dm_session() -> (User, User) {
     let (mut alice, bob) = setup_dm_users();
 
     let bob_bundle = bob.get_prekey_bundle();
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut rng = bench_rng();
 
     futures::executor::block_on(async {
         process_prekey_bundle(
@@ -374,7 +391,7 @@ fn setup_established_dm_session() -> (User, User) {
         let ct_msg = CiphertextMessage::PreKeySignalMessage(
             wacore_libsignal::protocol::PreKeySignalMessage::try_from(ct.serialize()).unwrap(),
         );
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng();
         message_decrypt(
             &ct_msg,
             &alice.address,
@@ -404,7 +421,7 @@ fn setup_group_with_distribution() -> (User, User, SenderKeyName) {
     let mut bob = User::new("bob", 1);
 
     futures::executor::block_on(async {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng();
         let skdm = create_sender_key_distribution_message(
             &sender_key_name,
             &mut alice.sender_key_store,
@@ -434,7 +451,7 @@ fn bench_dm_session_establishment(bencher: divan::Bencher) {
     bencher.with_inputs(setup_dm_users).bench_refs(|data| {
         let (alice, bob) = data;
         let bob_bundle = bob.get_prekey_bundle();
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng();
 
         futures::executor::block_on(async {
             process_prekey_bundle(
@@ -480,7 +497,7 @@ fn bench_dm_decrypt_first_message(bencher: divan::Bencher) {
         .with_inputs(setup_dm_with_first_message)
         .bench_refs(|data| {
             let (alice, bob, ciphertext_bytes) = data;
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut rng = bench_rng();
 
             let plaintext = futures::executor::block_on(async {
                 let ciphertext = CiphertextMessage::PreKeySignalMessage(
@@ -539,7 +556,7 @@ fn setup_dm_with_inorder_subsequent_message() -> (User, User, Vec<u8>) {
     let (mut alice, mut bob) = setup_established_dm_session();
 
     futures::executor::block_on(async {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng();
 
         // Bob replies and Alice decrypts it, clearing Alice's pending prekey so
         // her subsequent messages are plain SignalMessages.
@@ -616,7 +633,7 @@ fn bench_dm_decrypt_subsequent_message(bencher: divan::Bencher) {
         .with_inputs(setup_dm_with_inorder_subsequent_message)
         .bench_refs(|data| {
             let (alice, bob, ciphertext_bytes) = data;
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut rng = bench_rng();
 
             let plaintext = futures::executor::block_on(async {
                 let ciphertext = CiphertextMessage::SignalMessage(
@@ -647,7 +664,7 @@ fn bench_dm_decrypt_subsequent_message(bencher: divan::Bencher) {
 fn bench_group_create_distribution_message(bencher: divan::Bencher) {
     bencher.with_inputs(setup_group_sender).bench_refs(|data| {
         let (alice, sender_key_name) = data;
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng();
 
         let skdm = futures::executor::block_on(async {
             create_sender_key_distribution_message(
@@ -670,7 +687,7 @@ fn bench_group_encrypt_message(bencher: divan::Bencher) {
         .bench_refs(|data| {
             let (alice, _bob, sender_key_name) = data;
             let plaintext = b"Hello group! This is a group message from Alice.";
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut rng = bench_rng();
 
             let ciphertext = futures::executor::block_on(async {
                 group_encrypt(
@@ -691,7 +708,7 @@ fn setup_group_with_encrypted_message() -> (User, User, SenderKeyName, Vec<u8>) 
     let (mut alice, bob, sender_key_name) = setup_group_with_distribution();
 
     let ciphertext = futures::executor::block_on(async {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng();
         let skm = group_encrypt(
             &mut alice.sender_key_store,
             &sender_key_name,
@@ -738,7 +755,7 @@ fn bench_full_dm_conversation(bencher: divan::Bencher) {
         .with_inputs(setup_conversation_data)
         .bench_refs(|data| {
             let (alice, bob) = data;
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut rng = bench_rng();
 
             futures::executor::block_on(async {
                 let bob_bundle = bob.get_prekey_bundle();
@@ -836,7 +853,7 @@ fn bench_full_dm_conversation(bencher: divan::Bencher) {
 
 // Signature-specific benchmarks to measure the XEdDSA optimization
 fn setup_keypair_with_message() -> (KeyPair, [u8; 64]) {
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut rng = bench_rng();
     let keypair = KeyPair::generate(&mut rng);
     let message = [0x42u8; 64]; // Fixed message for consistent benchmarking
     (keypair, message)
@@ -850,7 +867,7 @@ fn bench_signature_creation(bencher: divan::Bencher) {
         .with_inputs(setup_keypair_with_message)
         .bench_refs(|data| {
             let (keypair, message) = data;
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut rng = bench_rng();
 
             // Sign multiple times to amortize any setup overhead
             for _ in 0..10 {
@@ -869,7 +886,7 @@ fn bench_signature_verification(bencher: divan::Bencher) {
         .with_inputs(setup_keypair_with_message)
         .bench_refs(|data| {
             let (keypair, message) = data;
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut rng = bench_rng();
             let signature = keypair
                 .calculate_signature(&message[..], &mut rng)
                 .expect("signature");
@@ -887,7 +904,7 @@ fn bench_signature_verification(bencher: divan::Bencher) {
 // Benchmark key generation (shows the added cost of caching)
 #[divan::bench]
 fn bench_key_generation() {
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut rng = bench_rng();
     for _ in 0..10 {
         let keypair = KeyPair::generate(&mut rng);
         black_box(keypair);
@@ -899,7 +916,7 @@ fn bench_key_generation() {
 fn setup_with_archived_sessions() -> (User, User, Vec<Vec<u8>>) {
     let mut alice = User::new("alice", 1);
     let mut bob = User::new("bob", 1);
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut rng = bench_rng();
 
     // Store ciphertexts encrypted with each session version
     let mut old_ciphertexts = Vec::new();
@@ -1026,7 +1043,7 @@ fn bench_decrypt_with_previous_session(bencher: divan::Bencher) {
         .with_inputs(setup_with_archived_sessions)
         .bench_refs(|data| {
             let (alice, bob, ciphertexts) = data;
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut rng = bench_rng();
 
             // Try to decrypt an old message (encrypted with a previous session)
             // This forces the decryption to iterate through previous sessions
@@ -1062,7 +1079,7 @@ fn setup_out_of_order_messages() -> (User, User, Vec<Vec<u8>>) {
     let mut messages = Vec::new();
 
     futures::executor::block_on(async {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng();
 
         // Alice sends initial PreKey message to Bob
         let msg = message_encrypt(
@@ -1142,7 +1159,7 @@ fn bench_out_of_order_decryption(bencher: divan::Bencher) {
         .with_inputs(setup_out_of_order_messages)
         .bench_refs(|data| {
             let (alice, bob, messages) = data;
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut rng = bench_rng();
 
             futures::executor::block_on(async {
                 // Decrypt messages in reverse order (worst case for message key storage)
@@ -1175,7 +1192,7 @@ fn bench_out_of_order_decryption(bencher: divan::Bencher) {
 fn setup_promote_matching_session() -> (User, User, Vec<u8>) {
     let mut alice = User::new("alice", 1);
     let mut bob = User::new("bob", 1);
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut rng = bench_rng();
 
     let prekey_message = futures::executor::block_on(async {
         // Create initial session
@@ -1293,7 +1310,7 @@ fn bench_promote_matching_session(bencher: divan::Bencher) {
         .with_inputs(setup_promote_matching_session)
         .bench_refs(|data| {
             let (alice, bob, prekey_message) = data;
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut rng = bench_rng();
 
             futures::executor::block_on(async {
                 // Process multiple PreKey messages to exercise promote_matching_session
@@ -1336,7 +1353,7 @@ fn create_test_session_state(
     version: u8,
     base_key: &wacore_libsignal::protocol::PublicKey,
 ) -> SessionState {
-    let mut csprng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut csprng = bench_rng();
     let identity_keypair = KeyPair::generate(&mut csprng);
     let their_identity = IdentityKey::new(identity_keypair.public_key);
     let our_identity = IdentityKey::new(KeyPair::generate(&mut csprng).public_key);
@@ -1355,7 +1372,7 @@ fn create_test_session_state(
 /// Setup for message key eviction benchmark.
 /// Creates a session with a receiver chain pre-filled near capacity.
 fn setup_message_key_eviction() -> (SessionState, wacore_libsignal::protocol::PublicKey) {
-    let mut csprng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut csprng = bench_rng();
     let base_key = KeyPair::generate(&mut csprng).public_key;
     let mut state = create_test_session_state(3, &base_key);
 
@@ -1424,7 +1441,7 @@ fn setup_group_out_of_order_worst_case() -> (User, SenderKeyName, Vec<u8>) {
     );
 
     let worst_case_ct = futures::executor::block_on(async {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng();
         let mut ciphertexts: Vec<Vec<u8>> = Vec::with_capacity((N + 1) as usize);
         for i in 0..=N {
             let skm = group_encrypt(
@@ -1495,7 +1512,7 @@ fn setup_group_in_order_decrypt_with_backlog() -> (User, SenderKeyName, Vec<u8>)
     );
 
     let in_order_ct = futures::executor::block_on(async {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng();
         let mut ciphertexts: Vec<Vec<u8>> = Vec::with_capacity((N + 2) as usize);
         for i in 0..=(N + 1) {
             let skm = group_encrypt(
@@ -1560,7 +1577,7 @@ fn setup_skdm_ingest() -> (
         alice.address.name().to_string(),
     );
     let skdm = futures::executor::block_on(async {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = bench_rng();
         create_sender_key_distribution_message(
             &sender_key_name,
             &mut alice.sender_key_store,

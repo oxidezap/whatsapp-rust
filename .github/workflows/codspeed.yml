@@ -3,8 +3,10 @@ name: CodSpeed
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
   pull_request:
     branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
   # Allows CodSpeed to trigger backtest performance analysis to generate
   # initial baseline data.
   workflow_dispatch:
@@ -20,11 +22,28 @@ concurrency:
 env:
   CARGO_TERM_COLOR: never
   PROTOC_VERSION: "3.25.3"
+  # Freeze glibc malloc's adaptive thresholds: mmap/trim/arena decisions vary
+  # with allocation history and read as spurious instruction/memory deltas
+  # under the deterministic instruments (codspeed.io/docs -> reducing-variance).
+  MALLOC_ARENA_MAX: "1"
+  MALLOC_MMAP_THRESHOLD_: "131072"
+  MALLOC_TRIM_THRESHOLD_: "131072"
+  MALLOC_TOP_PAD_: "131072"
 
 jobs:
   benchmarks:
-    name: Run CodSpeed benchmarks
-    runs-on: ubuntu-latest
+    name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      # Shards split by package within one workflow (same OIDC auth), halving
+      # the serial wall time; CodSpeed merges shard results into one run
+      # (codspeed.io/docs -> sharded-benchmarks).
+      matrix:
+        shard:
+          - name: core
+            packages: -p wacore -p wacore-noise
+          - name: proto-signal
+            packages: -p wacore-binary -p wacore-libsignal -p wacore-appstate
     steps:
       - uses: actions/checkout@v6
         with:
@@ -42,7 +61,7 @@ jobs:
       - name: Cache Rust registry
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ${{ runner.os }}-cargo-codspeed
+          prefix-key: ${{ runner.os }}-cargo-codspeed-${{ matrix.shard.name }}
           cache-targets: "false"
 
       # simulation and memory share the same instrumented build, so one
@@ -50,8 +69,7 @@ jobs:
       - name: Build the benchmark targets
         run: >
           cargo codspeed build -m simulation -m memory
-          -p wacore -p wacore-binary -p wacore-libsignal
-          -p wacore-appstate -p wacore-noise
+          ${{ matrix.shard.packages }}
 
       # Both instruments run serially in a single invocation so each
       # benchmark uploads as one run carrying CPU and memory metrics.
@@ -59,14 +77,14 @@ jobs:
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation,memory
-          run: cargo codspeed run
+          run: cargo codspeed run ${{ matrix.shard.packages }}
 
   # Integration benches drive the real async client against the bartender mock
   # server, so they need the service container + MOCK_SERVER_URL. Kept as a
   # separate job so the unit-bench job above stays fast and mock-server-free.
   integration-benchmarks:
     name: Run CodSpeed integration benchmarks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # These benches drive the real client (connect/reconnect handshakes) under
     # Valgrind, so they are slow; cap the job so a stuck run can't hang CI
     # indefinitely. A healthy run finishes well under this even on slow runners.
