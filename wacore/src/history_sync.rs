@@ -113,6 +113,29 @@ impl<'a> FieldWalker<'a> {
         self.reader.total_out()
     }
 
+    /// Decompressed bytes already handed to the parser. Excludes the buffered
+    /// not-yet-parsed window, so a density observed over this prefix is not
+    /// diluted by data the inflater ran ahead on.
+    fn parsed_bytes(&self) -> u64 {
+        self.reader
+            .total_out()
+            .saturating_sub(self.reader.available().len() as u64)
+    }
+
+    /// Total decompressed size extrapolated from the zlib ratio observed so
+    /// far; exact once the stream has fully inflated.
+    fn estimated_total_out(&self) -> u64 {
+        let (in_pos, in_len) = self.reader.compressed_progress();
+        if in_pos == 0 {
+            return self.reader.total_out();
+        }
+        self.reader
+            .total_out()
+            .saturating_mul(in_len as u64)
+            .checked_div(in_pos as u64)
+            .unwrap_or(0)
+    }
+
     /// Re-borrow the payload of the field most recently yielded by
     /// [`FieldWalker::next_field`] (it stays buffered until the next call).
     fn pending_payload(&self, payload_start: usize) -> &[u8] {
@@ -250,6 +273,20 @@ fn process_history_sync_streaming(
         decompressed_size: 0,
     };
 
+    // One-shot capacity extrapolation for the secret-record accumulator. A
+    // full pre-count pass (see the field comment above) was measured at ~2.5%
+    // of the decode, so instead the record density observed over a prefix is
+    // scaled to the blob's extrapolated decompressed size. Costs O(1), adapts
+    // to blobs with few secrets, and an off estimate just falls back to
+    // doubling. Extrapolating from the first conversation alone overshot to
+    // the clamp on measured blobs (doubling the transient peak), so the
+    // sample must first reach RESERVE_SAMPLE_RECORDS; the doubling ladder up
+    // to that point copies only ~2x its own bytes, which is noise. The clamp
+    // bounds over-allocation to ~2 MB.
+    const RESERVE_SAMPLE_RECORDS: usize = 128;
+    const RECORD_RESERVE_CAP: usize = 16384;
+    let mut density_reserved = false;
+
     while let Some(field) = walker.next_field()? {
         if field.wire_type != wire_type::LENGTH_DELIMITED {
             continue;
@@ -263,6 +300,19 @@ fn process_history_sync_streaming(
                     extract_conversation_fields(value, &mut result.msg_secret_records)
                 {
                     result.tc_token_candidates.push(candidate);
+                }
+                if !density_reserved && result.msg_secret_records.len() >= RESERVE_SAMPLE_RECORDS {
+                    density_reserved = true;
+                    let parsed = walker.parsed_bytes().max(1);
+                    let records = result.msg_secret_records.len();
+                    let estimated = (records as u64)
+                        .saturating_mul(walker.estimated_total_out())
+                        .checked_div(parsed)
+                        .map_or(records, |est| est as usize)
+                        .min(RECORD_RESERVE_CAP);
+                    result
+                        .msg_secret_records
+                        .reserve(estimated.saturating_sub(records));
                 }
             }
             // pushnames (repeated) — only our own is needed
