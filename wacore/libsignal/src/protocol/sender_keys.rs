@@ -82,8 +82,10 @@ impl SenderMessageKey {
 }
 
 fn seed_to_array(seed: Option<&bytes::Bytes>) -> Result<[u8; 32], SignalProtocolError> {
-    seed.ok_or(SignalProtocolError::InvalidProtobufEncoding)?
-        .as_ref()
+    let Some(seed) = seed else {
+        return Err(SignalProtocolError::InvalidProtobufEncoding);
+    };
+    seed.as_ref()
         .try_into()
         .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)
 }

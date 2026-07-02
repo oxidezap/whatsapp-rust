@@ -446,9 +446,10 @@ impl<'a> Decoder<'a> {
             let Some(key) = self.read_value_as_string()? else {
                 return Err(BinaryError::NonStringKey);
             };
-            let value = self
-                .read_value()?
-                .unwrap_or(ValueRef::String(NodeStr::Borrowed("")));
+            let value = match self.read_value()? {
+                Some(v) => v,
+                None => ValueRef::String(NodeStr::Borrowed("")),
+            };
             v.push((key, value));
         }
         Ok(AttrsRef::from_vec(v))

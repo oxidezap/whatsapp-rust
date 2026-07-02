@@ -79,9 +79,9 @@ pub async fn group_encrypt<R: Rng + CryptoRng>(
         .try_into()
         .map_err(|_| SignalProtocolError::InvalidSenderKeySession)?;
 
-    let sender_chain_key = sender_key_state
-        .sender_chain_key()
-        .ok_or(SignalProtocolError::InvalidSenderKeySession)?;
+    let Some(sender_chain_key) = sender_key_state.sender_chain_key() else {
+        return Err(SignalProtocolError::InvalidSenderKeySession);
+    };
 
     let (message_keys, next_sender_chain_key) = sender_chain_key.step_with_message_key()?;
 
@@ -119,9 +119,9 @@ pub async fn group_encrypt<R: Rng + CryptoRng>(
 }
 
 fn get_sender_key(state: &mut SenderKeyState, iteration: u32) -> Result<SenderMessageKey> {
-    let sender_chain_key = state
-        .sender_chain_key()
-        .ok_or(SignalProtocolError::InvalidSenderKeySession)?;
+    let Some(sender_chain_key) = state.sender_chain_key() else {
+        return Err(SignalProtocolError::InvalidSenderKeySession);
+    };
     let current_iteration = sender_chain_key.iteration();
 
     if current_iteration > iteration {
@@ -292,9 +292,9 @@ fn build_skdm_from_record(record: &SenderKeyRecord) -> Result<SenderKeyDistribut
     let state = record
         .sender_key_state()
         .map_err(|_| SignalProtocolError::InvalidSenderKeySession)?;
-    let sender_chain_key = state
-        .sender_chain_key()
-        .ok_or(SignalProtocolError::InvalidSenderKeySession)?;
+    let Some(sender_chain_key) = state.sender_chain_key() else {
+        return Err(SignalProtocolError::InvalidSenderKeySession);
+    };
     let message_version = state
         .message_version()
         .try_into()

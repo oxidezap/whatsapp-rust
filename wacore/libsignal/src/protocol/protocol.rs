@@ -176,9 +176,10 @@ impl SignalMessage {
         let proto_bytes = &self.serialized[1..self.serialized.len() - Self::MAC_LENGTH];
         let view = waproto::whatsapp::SignalMessageView::decode_view(proto_bytes)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-        view.ciphertext
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)
-            .map(Box::from)
+        match view.ciphertext {
+            Some(ciphertext) => Ok(Box::from(ciphertext)),
+            None => Err(SignalProtocolError::InvalidProtobufEncoding),
+        }
     }
 
     pub fn verify_mac(
@@ -253,18 +254,18 @@ impl TryFrom<&[u8]> for SignalMessage {
         )
         .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
-        let sender_ratchet_key = view
-            .ratchet_key
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        let Some(sender_ratchet_key) = view.ratchet_key else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
         let sender_ratchet_key = PublicKey::deserialize(sender_ratchet_key)?;
-        let counter = view
-            .counter
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        let Some(counter) = view.counter else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
         let previous_counter = view.previous_counter.unwrap_or(0);
-        let ciphertext = view
-            .ciphertext
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)
-            .map(Box::from)?;
+        let Some(ciphertext) = view.ciphertext else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
+        let ciphertext: Box<[u8]> = Box::from(ciphertext);
 
         let ciphertext_cache = OnceLock::new();
         let _ = ciphertext_cache.set(ciphertext);
@@ -398,18 +399,18 @@ impl TryFrom<&[u8]> for PreKeySignalMessage {
         let view = waproto::whatsapp::PreKeySignalMessageView::decode_view(&value[1..])
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
-        let base_key = view
-            .base_key
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
-        let identity_key = view
-            .identity_key
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
-        let message = view
-            .message
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
-        let signed_pre_key_id = view
-            .signed_pre_key_id
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        let Some(base_key) = view.base_key else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
+        let Some(identity_key) = view.identity_key else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
+        let Some(message) = view.message else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
+        let Some(signed_pre_key_id) = view.signed_pre_key_id else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
 
         let base_key = PublicKey::deserialize(base_key)?;
 
@@ -550,9 +551,10 @@ impl SenderKeyMessage {
         let proto_bytes = &self.serialized[1..self.serialized.len() - Self::SIGNATURE_LEN];
         let view = waproto::whatsapp::SenderKeyMessageView::decode_view(proto_bytes)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-        view.ciphertext
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)
-            .map(Box::from)
+        match view.ciphertext {
+            Some(ciphertext) => Ok(Box::from(ciphertext)),
+            None => Err(SignalProtocolError::InvalidProtobufEncoding),
+        }
     }
 
     #[inline]
@@ -595,16 +597,16 @@ impl TryFrom<&[u8]> for SenderKeyMessage {
         )
         .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
-        let chain_id = view
-            .id
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
-        let iteration = view
-            .iteration
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
-        let ciphertext = view
-            .ciphertext
-            .ok_or(SignalProtocolError::InvalidProtobufEncoding)
-            .map(Box::from)?;
+        let Some(chain_id) = view.id else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
+        let Some(iteration) = view.iteration else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
+        let Some(ciphertext) = view.ciphertext else {
+            return Err(SignalProtocolError::InvalidProtobufEncoding);
+        };
+        let ciphertext: Box<[u8]> = Box::from(ciphertext);
 
         let ciphertext_cache = OnceLock::new();
         let _ = ciphertext_cache.set(ciphertext);

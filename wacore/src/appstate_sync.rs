@@ -33,12 +33,12 @@ fn mutation_index_mac(m: &wa::SyncdMutation) -> Option<&[u8]> {
 /// `get_mutation_macs` HashMap fetch, so the order is unspecified.
 ///
 /// Small patches dedup with a linear scan that allocates only the keepers,
-/// cheaper than a sort at small N. Larger patches decode each MAC once into the
-/// returned `Vec` and sort + dedup in place: the comparator works on the owned
-/// bytes, never re-walking the boxed record/index/blob `MessageField` chain (the
-/// part buffa makes pricier than prost's `Option` derefs), with no scratch
-/// beyond the returned `Vec`. Distinct indices are the realistic patch shape, so
-/// the pre-dedup `Vec` is essentially already unique.
+/// cheaper than a sort at small N. Larger patches sort + dedup borrowed MAC
+/// slices and only then materialize the keepers with an exact-sized `Vec`: the
+/// comparator works on borrows walked once (never re-walking the boxed
+/// record/index/blob `MessageField` chain, the part buffa makes pricier than
+/// prost's `Option` derefs), duplicates are dropped before ever owning bytes,
+/// and the pre-dedup scratch holds 16-byte slices instead of `Vec` headers.
 pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>> {
     if mutations.len() <= MAC_DEDUP_SCAN_LIMIT {
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
@@ -52,13 +52,11 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>
         return out;
     }
 
-    let mut out: Vec<Vec<u8>> = mutations
-        .iter()
-        .filter_map(|m| mutation_index_mac(m).map(<[u8]>::to_vec))
-        .collect();
-    out.sort_unstable();
-    out.dedup();
-    out
+    let mut macs: Vec<&[u8]> = Vec::with_capacity(mutations.len());
+    macs.extend(mutations.iter().filter_map(mutation_index_mac));
+    macs.sort_unstable();
+    macs.dedup();
+    macs.into_iter().map(<[u8]>::to_vec).collect()
 }
 
 /// Mutation count at or below which [`collect_unique_index_macs`] dedups with a
