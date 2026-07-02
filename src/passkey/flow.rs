@@ -26,6 +26,7 @@ use wacore::shortcake::ShortcakeUtils;
 use wacore::sync_marker::MaybeSendSync;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeContent, NodeRef, OwnedNodeRef, SERVER_JID, Server};
+use waproto::whatsapp as wa;
 
 /// `<notification type=...>` routing keys, consumed by the notification dispatcher.
 pub(crate) const NOTIF_PASSKEY_REQUEST: &str = "passkey_prologue_request";
@@ -52,7 +53,7 @@ const CODE_GROUP_LEN: usize = 4;
 struct DeviceMaterial {
     noise_public: [u8; 32],
     identity_public: [u8; 32],
-    device_type: i32,
+    device_type: wa::device_props::PlatformType,
 }
 
 /// The effects the handshake needs from its environment. Abstracted so the full
@@ -80,7 +81,7 @@ struct ShortcakeSession {
     keypair: KeyPair,
     companion_nonce: [u8; 32],
     pairing_ref: String,
-    device_type: i32,
+    device_type: wa::device_props::PlatformType,
     new_adv_secret: [u8; 32],
     skip_handoff_ux: bool,
     stage: Stage,
@@ -366,7 +367,7 @@ impl ShortcakeIo for Client {
             device_type: snapshot
                 .device_props
                 .platform_type
-                .map_or(0, |p| buffa::Enumeration::to_i32(&p)),
+                .unwrap_or(wa::device_props::PlatformType::UNKNOWN),
         })
     }
 
@@ -729,7 +730,7 @@ mod tests {
         let device = DeviceMaterial {
             noise_public: [0x11; 32],
             identity_public: [0x12; 32],
-            device_type: 1,
+            device_type: wa::device_props::PlatformType::CHROME,
         };
         let io = MockIo {
             device: device.clone(),
@@ -815,8 +816,12 @@ mod tests {
             .private_key
             .calculate_agreement(&PublicKey::from_djb_public_key_bytes(&companion_eph_pub).unwrap())
             .unwrap();
-        let key = ShortcakeUtils::derive_encryption_key_from_shared_secret(&shared, 1, "REF-XYZ")
-            .unwrap();
+        let key = ShortcakeUtils::derive_encryption_key_from_shared_secret(
+            &shared,
+            wa::device_props::PlatformType::CHROME,
+            "REF-XYZ",
+        )
+        .unwrap();
         let wrapped = match io.sent_node(TAG_ENCRYPTED_PAIRING_REQUEST).content {
             Some(NodeContent::Bytes(bytes)) => bytes,
             _ => panic!("encrypted_pairing_request must carry bytes"),
@@ -848,7 +853,7 @@ mod tests {
             keypair: KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()),
             companion_nonce: [0; 32],
             pairing_ref: "r".into(),
-            device_type: 1,
+            device_type: wa::device_props::PlatformType::CHROME,
             new_adv_secret: [1; 32],
             skip_handoff_ux: false,
             stage: Stage::AwaitingPrimaryIdentity,
