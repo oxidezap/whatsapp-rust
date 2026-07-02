@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Identity for span/error tagging. Named fields, not a tuple — LID/PN transposition would
+/// otherwise be a silent, unchecked bug at call sites.
+#[cfg(feature = "tracing")]
+#[derive(Debug, Clone, Default)]
+pub struct IdentityTags {
+    pub lid: Option<String>,
+    pub pn: Option<String>,
+}
+
 impl Client {
     pub(crate) async fn get_group_cache(&self) -> Arc<GroupCache> {
         let mut guard = self.group_cache.lock().await;
@@ -156,35 +165,30 @@ impl Client {
         self.persistence_manager.get_device_snapshot().lid.clone()
     }
 
-    /// Identity pair for span/error tagging so operators can attribute traces to specific
-    /// accounts without exposing raw phone numbers in telemetry.
-    ///
-    /// Reads both fields from one snapshot (not two separate `get_lid()`/`get_pn()` calls) so
-    /// a concurrent pairing update — which commits `SetId` and `SetLid` as separate
-    /// `process_command` calls — can't produce a pair straddling two different snapshots.
+    /// Snapshot-consistent identity for span/error tagging (redacted PN, raw LID). Named
+    /// fields, not a tuple — LID/PN transposition would otherwise be a silent, unchecked bug.
     #[cfg(feature = "tracing")]
-    pub fn identity_tags(&self) -> (Option<String>, Option<String>) {
+    pub fn identity_tags(&self) -> IdentityTags {
         let snapshot = self.persistence_manager.get_device_snapshot();
-        let lid = snapshot.lid.as_ref().map(|j| j.to_string());
-        let pn = snapshot.pn.as_ref().map(|j| j.observe().to_string());
-        (lid, pn)
+        IdentityTags {
+            lid: snapshot.lid.as_ref().map(|j| j.to_string()),
+            pn: snapshot.pn.as_ref().map(|j| j.observe().to_string()),
+        }
     }
 
-    /// Records `identity_tags()` onto `span`'s `lid`/`pn` fields — the shared implementation
-    /// behind every instrumented span that tags account identity (`wa.conn.run`, `wa.iq`,
-    /// `wa.send.message`), so they stay consistent: absent (not `""`) when the account isn't
-    /// known yet, so `field:*` queries in GlitchTip/Sentry reliably mean "attributed", not
-    /// "attribution attempted". A no-op when the span is disabled, skipping the snapshot read.
+    /// Shared so every identity-tagged span leaves a field absent (not `""`) when unknown —
+    /// duplicating this per call site would drift out of sync. Skips the snapshot read when
+    /// the span is disabled.
     #[cfg(feature = "tracing")]
     pub(crate) fn record_identity_on_span(&self, span: &tracing::Span) {
         if span.is_disabled() {
             return;
         }
-        let (lid, pn) = self.identity_tags();
-        if let Some(lid) = lid {
+        let tags = self.identity_tags();
+        if let Some(lid) = tags.lid {
             span.record("lid", tracing::field::display(lid));
         }
-        if let Some(pn) = pn {
+        if let Some(pn) = tags.pn {
             span.record("pn", tracing::field::display(pn));
         }
     }
