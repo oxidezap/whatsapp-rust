@@ -398,10 +398,10 @@ impl<'a> HistorySyncStream<'a> {
 
 /// Compute `pos + len` with overflow and bounds checking.
 #[inline(always)]
-/// Bounds-checked `pos + len` within `buf_len`. `None` on overflow or
-/// truncation; kept `Copy` for the same happy-path reason as
-/// [`read_varint`]. `?` sites map `None` via [`field_overflow`].
-#[inline]
+/// `Option` (Copy) for the same happy-path drop_glue reason as
+/// [`read_varint`]; `?` sites map `None` via [`field_overflow`].
+// inline(always): same hot-path/thin-LTO rationale as read_varint.
+#[inline(always)]
 fn checked_end(pos: usize, len: u64, buf_len: usize) -> Option<usize> {
     let len = usize::try_from(len).ok()?;
     let end = pos.checked_add(len)?;
@@ -416,9 +416,8 @@ fn field_overflow(field: &str, pos: usize, len: u64, buf_len: usize) -> HistoryS
     ))
 }
 
-/// Read a protobuf varint from `data`, returning (value, bytes_consumed).
-/// `None` covers truncation and 64-bit overflow alike; the walk loops call
-/// this per field and discard the failure, so the type must stay `Copy`. A
+/// `None` covers truncation and 64-bit overflow alike: the walk loops call
+/// this per field and discard the failure, so the return must stay `Copy`. A
 /// `Result` carrying a heap error here put `drop_glue` on the happy path of
 /// every field visit (~2% of a full-blob decode). `?` sites map `None` via
 /// [`malformed_varint`].
