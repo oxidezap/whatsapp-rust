@@ -1680,7 +1680,14 @@ impl Client {
             // DM fanout: all known recipient devices + own companions.
             // WAWebSendUserMsgJob reads local device table only on the send
             // path; WAWebDBDeviceListFanout excludes hosted devices.
-            let recipient_bare = self.resolve_encryption_jid(&to).await.into_non_ad();
+            // With PN addressing forced the fanout keys stay on the namespace
+            // the caller gave us (see Client::set_force_pn_addressing), which
+            // also keeps stanza_to below on PN.
+            let recipient_bare = if self.force_pn_addressing_enabled() {
+                to.to_non_ad()
+            } else {
+                self.resolve_encryption_jid(&to).await.into_non_ad()
+            };
             let recipient_is_lid = recipient_bare.is_lid();
 
             // The outer `<message to>`, the DeviceSentMessage destinationJid, and
@@ -1974,7 +1981,13 @@ impl Client {
     pub(crate) async fn build_session_lock_keys(&self, device_jids: &[Jid]) -> Vec<Jid> {
         let mut keys: Vec<Jid> = Vec::with_capacity(device_jids.len());
         for jid in device_jids {
-            keys.push(self.resolve_encryption_jid(jid).await);
+            // Locks must key the same namespace encryption will use; with PN
+            // addressing forced that is the JID as given.
+            if self.force_pn_addressing_enabled() {
+                keys.push(jid.clone());
+            } else {
+                keys.push(self.resolve_encryption_jid(jid).await);
+            }
         }
         keys.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
         keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());

@@ -260,6 +260,7 @@ impl Client {
             http_client,
             override_version,
             skip_history_sync: AtomicBool::new(false),
+            force_pn_addressing: AtomicBool::new(false),
             wanted_pre_key_count: AtomicUsize::new(crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT),
             cache_config,
             self_weak: std::sync::OnceLock::new(),

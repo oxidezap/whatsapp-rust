@@ -652,6 +652,13 @@ pub struct Client {
     /// or processed. Set via `BotBuilder::skip_history_sync()`.
     pub(crate) skip_history_sync: AtomicBool,
 
+    /// When true, outbound DM addressing (device fanout, session creation,
+    /// stanza prep and session locks) keeps the PN namespace instead of
+    /// upgrading to LID. Inbound decrypt addressing is not affected. Escape
+    /// hatch for companion registrations whose LID-addressed DMs are 400-nacked
+    /// by the server (see issue #941); PN addressing matches pre-0.6 behavior.
+    pub(crate) force_pn_addressing: AtomicBool,
+
     /// Number of one-time pre-keys generated per upload batch. Defaults to
     /// [`crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT`]; set via
     /// [`BotBuilder::with_wanted_pre_key_count`] or [`Client::set_wanted_pre_key_count`].

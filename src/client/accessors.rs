@@ -44,6 +44,19 @@ impl Client {
         self.skip_history_sync.load(Ordering::Relaxed)
     }
 
+    /// Keep outbound DM addressing on phone-number JIDs even when a LID
+    /// mapping is known. Some companion registrations get LID-addressed DMs
+    /// 400-nacked by the server (issue #941); this restores pre-0.6 PN
+    /// addressing for the outbound path only.
+    pub fn set_force_pn_addressing(&self, enabled: bool) {
+        self.force_pn_addressing.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Returns `true` if outbound DM addressing is pinned to phone-number JIDs.
+    pub fn force_pn_addressing_enabled(&self) -> bool {
+        self.force_pn_addressing.load(Ordering::Relaxed)
+    }
+
     /// Set how many one-time pre-keys are generated per upload batch.
     ///
     /// Defaults to WA Web's UPLOAD_KEYS_COUNT (812). Call before connecting; it

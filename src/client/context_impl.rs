@@ -53,6 +53,11 @@ impl SendContextResolver for Client {
     }
 
     async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {
+        // Reporting no mapping keeps stanza prep (participants, enc nodes) on
+        // the PN namespace (see Client::set_force_pn_addressing).
+        if self.force_pn_addressing_enabled() {
+            return None;
+        }
         self.lid_pn_cache.get_current_lid(phone_user).await
     }
 
