@@ -264,7 +264,7 @@ impl User {
         // Same deterministic stream: the id is varint-encoded into prekey
         // bundles, so an entropy draw here still shifted payload sizes.
         let registration_id = {
-            use rand::Rng as _;
+            use rand::RngExt as _;
             rng.random::<u32>() & 0x3FFF
         };
 
