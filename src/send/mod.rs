@@ -503,28 +503,35 @@ impl Client {
     ///
     /// Newsletter messages are sent as plaintext (no E2E encryption).
     /// For status/story updates use [`Client::status()`] instead.
-    pub async fn send_message(
+    pub fn send_message(
         &self,
         to: impl Into<Jid>,
         message: wa::Message,
-    ) -> Result<SendResult, SendError> {
-        self.send_message_with_options_inner(to.into(), message, SendOptions::default())
-            .await
+    ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
+        // Sync-prologue box: a plain async fn would hold the ~1 KB message
+        // by value in every embedder's frame.
+        let to = to.into();
+        let message = Box::new(message);
+        async move {
+            // Box::pin: the inner future carries ~1 KB of pre-encrypt locals.
+            Box::pin(self.send_message_with_options_inner(to, message, SendOptions::default()))
+                .await
+        }
     }
 
     /// Plain-text convenience over [`Client::send_message`].
-    pub async fn send_text(
+    pub fn send_text(
         &self,
         to: impl Into<Jid>,
         text: impl Into<String>,
-    ) -> Result<SendResult, SendError> {
+    ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         use wacore::proto_helpers::MessageBuilderExt;
-        self.send_message_with_options_inner(
-            to.into(),
-            wa::Message::text(text),
-            SendOptions::default(),
-        )
-        .await
+        let to = to.into();
+        let message = Box::new(wa::Message::text(text));
+        async move {
+            Box::pin(self.send_message_with_options_inner(to, message, SendOptions::default()))
+                .await
+        }
     }
 
     /// Forward an existing message to a chat.
@@ -535,35 +542,39 @@ impl Client {
     /// `message` may be a received body or a wrapper (ephemeral/view-once); the
     /// inner content is unwrapped before forwarding. Existing media is relayed
     /// from the same CDN blob rather than re-uploaded.
-    pub async fn forward_message(
+    pub fn forward_message(
         &self,
         to: impl Into<Jid>,
         message: &wa::Message,
-    ) -> Result<SendResult, SendError> {
+    ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         use wacore::proto_helpers::MessageExt;
-        let body = *message.get_base_message().prepare_for_forward();
-        self.send_message_with_options_inner(to.into(), body, SendOptions::default())
-            .await
+        let to = to.into();
+        let body = message.get_base_message().prepare_for_forward();
+        async move {
+            Box::pin(self.send_message_with_options_inner(to, body, SendOptions::default())).await
+        }
     }
 
     /// Send a message with additional options.
-    pub async fn send_message_with_options(
+    pub fn send_message_with_options(
         &self,
         to: impl Into<Jid>,
         message: wa::Message,
         options: SendOptions,
-    ) -> Result<SendResult, SendError> {
+    ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         // Thin generic shim: the large async body below stays monomorphic so
         // each `Into<Jid>` instantiation does not duplicate the state machine.
-        self.send_message_with_options_inner(to.into(), message, options)
-            .await
+        // Sync-prologue box + Box::pin as in send_message.
+        let to = to.into();
+        let message = Box::new(message);
+        async move { Box::pin(self.send_message_with_options_inner(to, message, options)).await }
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     async fn send_message_with_options_inner(
         &self,
         to: Jid,
-        mut message: wa::Message,
+        mut message: Box<wa::Message>,
         options: SendOptions,
     ) -> Result<SendResult, SendError> {
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
@@ -4669,5 +4680,37 @@ mod jid_into_convention {
         let _ = client
             .keep_message(jid, wa::MessageKey::default(), true)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod future_size_tests {
+    /// The public send futures embed in every event-handler and spawned-task
+    /// frame, so their size is a per-event heap cost. Keep them pointer-scale
+    /// (measured 64-128 B; the bound leaves slack only for layout drift).
+    #[tokio::test]
+    async fn send_futures_stay_small() {
+        let client = crate::test_utils::create_test_client().await;
+        let jid: wacore_binary::jid::Jid = "5511999990000@s.whatsapp.net".parse().unwrap();
+        let msg = waproto::whatsapp::Message::default();
+
+        let f = client.send_message(jid.clone(), msg.clone());
+        assert!(std::mem::size_of_val(&f) <= 192, "send_message future grew");
+        drop(f);
+        let f = client.send_text(jid.clone(), "x");
+        assert!(std::mem::size_of_val(&f) <= 192, "send_text future grew");
+        drop(f);
+        let f = client.forward_message(jid.clone(), &msg);
+        assert!(
+            std::mem::size_of_val(&f) <= 192,
+            "forward_message future grew"
+        );
+        drop(f);
+        let f = client.send_message_with_options(jid, msg, Default::default());
+        assert!(
+            std::mem::size_of_val(&f) <= 192,
+            "send_message_with_options future grew"
+        );
+        drop(f);
     }
 }

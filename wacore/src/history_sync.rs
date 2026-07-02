@@ -113,6 +113,33 @@ impl<'a> FieldWalker<'a> {
         self.reader.total_out()
     }
 
+    /// Decompressed bytes already handed to the parser, INCLUDING the field
+    /// most recently yielded by `next_field` (its bytes stay buffered until
+    /// the next call, but the caller has already processed them). Excludes
+    /// only the tail beyond it, so a density observed over this prefix is
+    /// neither diluted by inflater read-ahead nor inflated by dropping the
+    /// very conversation whose records were just counted: on a blob whose
+    /// first conversation alone reaches the sample threshold, the old
+    /// exclusive form left a near-zero denominator and the estimate clamped.
+    fn parsed_bytes(&self) -> u64 {
+        let unparsed_tail = self.reader.available().len().saturating_sub(self.pending);
+        self.reader.total_out().saturating_sub(unparsed_tail as u64)
+    }
+
+    /// Total decompressed size extrapolated from the zlib ratio observed so
+    /// far; exact once the stream has fully inflated.
+    fn estimated_total_out(&self) -> u64 {
+        let (in_pos, in_len) = self.reader.compressed_progress();
+        if in_pos == 0 {
+            return self.reader.total_out();
+        }
+        self.reader
+            .total_out()
+            .saturating_mul(in_len as u64)
+            .checked_div(in_pos as u64)
+            .unwrap_or(0)
+    }
+
     /// Re-borrow the payload of the field most recently yielded by
     /// [`FieldWalker::next_field`] (it stays buffered until the next call).
     fn pending_payload(&self, payload_start: usize) -> &[u8] {
@@ -147,7 +174,7 @@ impl<'a> FieldWalker<'a> {
         self.reader
             .ensure(10)
             .map_err(HistorySyncError::DecompressionError)?;
-        let (tag, tlen) = read_varint(self.reader.available())?;
+        let (tag, tlen) = read_varint(self.reader.available()).ok_or_else(malformed_varint)?;
         let field_number = (tag >> 3) as u32;
         let wire_type_raw = (tag & 0x7) as u32;
 
@@ -156,7 +183,8 @@ impl<'a> FieldWalker<'a> {
                 self.reader
                     .ensure(tlen + 10)
                     .map_err(HistorySyncError::DecompressionError)?;
-                let (len, vlen) = read_varint(&self.reader.available()[tlen..])?;
+                let (len, vlen) =
+                    read_varint(&self.reader.available()[tlen..]).ok_or_else(malformed_varint)?;
                 let len = usize::try_from(len).map_err(|_| {
                     HistorySyncError::MalformedProtobuf(format!(
                         "field length overflows usize: {len}"
@@ -183,7 +211,8 @@ impl<'a> FieldWalker<'a> {
                 self.reader
                     .ensure(tlen + 10)
                     .map_err(HistorySyncError::DecompressionError)?;
-                let (_, vlen) = read_varint(&self.reader.available()[tlen..])?;
+                let (_, vlen) =
+                    read_varint(&self.reader.available()[tlen..]).ok_or_else(malformed_varint)?;
                 (tlen + vlen, tlen)
             }
             wire_type::FIXED64 => {
@@ -242,13 +271,29 @@ fn process_history_sync_streaming(
         nct_salt: None,
         conversations_processed: 0,
         tc_token_candidates: Vec::new(),
-        // Grown on demand (#691): a full pre-count pass scanned the whole blob
-        // just to size a Vec that only holds the secret-record subset (it
-        // over-allocated and cost ~2.5% of the decode); plain growth is cheaper.
+        // Starts empty and gets a one-shot density-based reserve once the
+        // walk has seen RESERVE_SAMPLE_RECORDS (see below). A full pre-count
+        // pass was tried before: it scanned the whole blob just to size a Vec
+        // holding only the secret-record subset (over-allocating, ~2.5% of
+        // the decode).
         msg_secret_records: Vec::new(),
         compressed_bytes: None,
         decompressed_size: 0,
     };
+
+    // One-shot capacity extrapolation for the secret-record accumulator. A
+    // full pre-count pass (see the field comment above) was measured at ~2.5%
+    // of the decode, so instead the record density observed over a prefix is
+    // scaled to the blob's extrapolated decompressed size. Costs O(1), adapts
+    // to blobs with few secrets, and an off estimate just falls back to
+    // doubling. Extrapolating from the first conversation alone overshot to
+    // the clamp on measured blobs (doubling the transient peak), so the
+    // sample must first reach RESERVE_SAMPLE_RECORDS; the doubling ladder up
+    // to that point copies only ~2x its own bytes, which is noise. The clamp
+    // bounds over-allocation to ~2 MB.
+    const RESERVE_SAMPLE_RECORDS: usize = 128;
+    const RECORD_RESERVE_CAP: usize = 16384;
+    let mut density_reserved = false;
 
     while let Some(field) = walker.next_field()? {
         if field.wire_type != wire_type::LENGTH_DELIMITED {
@@ -263,6 +308,19 @@ fn process_history_sync_streaming(
                     extract_conversation_fields(value, &mut result.msg_secret_records)
                 {
                     result.tc_token_candidates.push(candidate);
+                }
+                if !density_reserved && result.msg_secret_records.len() >= RESERVE_SAMPLE_RECORDS {
+                    density_reserved = true;
+                    // max(1) makes the division safe; parsed_bytes is only 0
+                    // if nothing decompressed yet, impossible past a record.
+                    let parsed = walker.parsed_bytes().max(1);
+                    let records = result.msg_secret_records.len();
+                    let estimated = ((records as u64).saturating_mul(walker.estimated_total_out())
+                        / parsed) as usize;
+                    let estimated = estimated.min(RECORD_RESERVE_CAP);
+                    result
+                        .msg_secret_records
+                        .reserve(estimated.saturating_sub(records));
                 }
             }
             // pushnames (repeated) — only our own is needed
@@ -394,68 +452,62 @@ impl<'a> HistorySyncStream<'a> {
     }
 }
 
-/// Compute `pos + len` with overflow and bounds checking.
+/// `Option` (Copy) for the same happy-path drop_glue reason as
+/// [`read_varint`]; `?` sites map `None` via [`field_overflow`].
+// inline(always): same hot-path/thin-LTO rationale as read_varint.
 #[inline(always)]
-fn checked_end(
-    pos: usize,
-    len: u64,
-    buf_len: usize,
-    field: &str,
-) -> Result<usize, HistorySyncError> {
-    let len = usize::try_from(len).map_err(|_| {
-        HistorySyncError::MalformedProtobuf(format!("{field} length overflows usize: {len}"))
-    })?;
-    let end = pos.checked_add(len).ok_or_else(|| {
-        HistorySyncError::MalformedProtobuf(format!(
-            "{field} field overflows: pos={pos}, len={len}"
-        ))
-    })?;
-    if end > buf_len {
-        return Err(HistorySyncError::MalformedProtobuf(format!(
-            "{field} field overflows buffer: pos={pos}, len={len}, buf={buf_len}"
-        )));
-    }
-    Ok(end)
+fn checked_end(pos: usize, len: u64, buf_len: usize) -> Option<usize> {
+    let len = usize::try_from(len).ok()?;
+    let end = pos.checked_add(len)?;
+    (end <= buf_len).then_some(end)
 }
 
-/// Read a protobuf varint from `data`, returning (value, bytes_consumed).
+/// Rich error for `?` boundaries around [`checked_end`]; failure-path only.
+#[cold]
+fn field_overflow(field: &str, pos: usize, len: u64, buf_len: usize) -> HistorySyncError {
+    HistorySyncError::MalformedProtobuf(format!(
+        "{field} field overflows buffer: pos={pos}, len={len}, buf={buf_len}"
+    ))
+}
+
+/// `None` covers truncation and 64-bit overflow alike: the walk loops call
+/// this per field and discard the failure, so the return must stay `Copy`. A
+/// `Result` carrying a heap error here put `drop_glue` on the happy path of
+/// every field visit (~2% of a full-blob decode). `?` sites map `None` via
+/// [`malformed_varint`].
 // inline(always): per-field hot path; the thin-LTO bench profile keeps plain
 // #[inline] candidates outlined and the call overhead dominates the walk.
 #[inline(always)]
-fn read_varint(data: &[u8]) -> Result<(u64, usize), HistorySyncError> {
-    // Single-byte fast-path: most history-sync varints (tags, small lengths)
-    // fit in one byte (#686).
-    let Some(&first) = data.first() else {
-        return Err(HistorySyncError::MalformedProtobuf(
-            "unexpected end of data in varint".into(),
-        ));
-    };
+fn read_varint(data: &[u8]) -> Option<(u64, usize)> {
+    // Single-byte fast-path: most history-sync varints (tags, small lengths) fit in one byte.
+    let &first = data.first()?;
     if first < 0x80 {
-        return Ok((first as u64, 1));
+        return Some((first as u64, 1));
     }
     let mut value = (first & 0x7F) as u64;
     let mut shift = 7u32;
     for (i, &byte) in data[1..].iter().enumerate() {
         // The 10th byte of a 64-bit varint may only carry one bit.
         if shift == 63 && byte > 1 {
-            return Err(HistorySyncError::MalformedProtobuf(
-                "varint overflows 64 bits".into(),
-            ));
+            return None;
         }
         value |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
-            return Ok((value, i + 2));
+            return Some((value, i + 2));
         }
         shift += 7;
         if shift >= 64 {
-            return Err(HistorySyncError::MalformedProtobuf(
-                "varint too long".into(),
-            ));
+            return None;
         }
     }
-    Err(HistorySyncError::MalformedProtobuf(
-        "unexpected end of data in varint".into(),
-    ))
+    None
+}
+
+/// Rich error for `?` boundaries around [`read_varint`]; built only on the
+/// (malformed-blob) failure path so the walk loops stay allocation-free.
+#[cold]
+fn malformed_varint() -> HistorySyncError {
+    HistorySyncError::MalformedProtobuf("truncated or overlong varint".into())
 }
 
 /// Skip a protobuf field based on wire type, returning the new position.
@@ -463,15 +515,18 @@ fn read_varint(data: &[u8]) -> Result<(u64, usize), HistorySyncError> {
 fn skip_field(wire_type: u32, buf: &[u8], pos: usize) -> Result<usize, HistorySyncError> {
     match wire_type {
         wire_type::VARINT => {
-            let (_, vlen) = read_varint(&buf[pos..])?;
+            let (_, vlen) = read_varint(&buf[pos..]).ok_or_else(malformed_varint)?;
             Ok(pos + vlen)
         }
-        wire_type::FIXED64 => checked_end(pos, 8, buf.len(), "fixed64"),
+        wire_type::FIXED64 => checked_end(pos, 8, buf.len())
+            .ok_or_else(|| field_overflow("fixed64", pos, 8, buf.len())),
         wire_type::LENGTH_DELIMITED => {
-            let (len, vlen) = read_varint(&buf[pos..])?;
-            checked_end(pos + vlen, len, buf.len(), "length-delimited")
+            let (len, vlen) = read_varint(&buf[pos..]).ok_or_else(malformed_varint)?;
+            checked_end(pos + vlen, len, buf.len())
+                .ok_or_else(|| field_overflow("length-delimited", pos + vlen, len, buf.len()))
         }
-        wire_type::FIXED32 => checked_end(pos, 4, buf.len(), "fixed32"),
+        wire_type::FIXED32 => checked_end(pos, 4, buf.len())
+            .ok_or_else(|| field_overflow("fixed32", pos, 4, buf.len())),
         _ => {
             log::warn!("Unknown wire type {wire_type} in history sync, cannot skip");
             Err(HistorySyncError::MalformedProtobuf(format!(
@@ -488,14 +543,14 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
     let mut pushname: Option<String> = None;
 
     while pos < data.len() {
-        let (tag, bytes_read) = read_varint(data.get(pos..)?).ok()?;
+        let (tag, bytes_read) = read_varint(data.get(pos..)?)?;
         pos += bytes_read;
         let field_number = (tag >> 3) as u32;
         let wt = (tag & 0x7) as u32;
 
         match field_number {
             tags::pushname::ID if wt == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(data.get(pos..)?).ok()?;
+                let (len, vlen) = read_varint(data.get(pos..)?)?;
                 pos += vlen;
                 let len = usize::try_from(len).ok()?;
                 let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
@@ -507,7 +562,7 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
                 pos = end;
             }
             tags::pushname::PUSHNAME if wt == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(data.get(pos..)?).ok()?;
+                let (len, vlen) = read_varint(data.get(pos..)?)?;
                 pos += vlen;
                 let len = usize::try_from(len).ok()?;
                 let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
@@ -830,7 +885,7 @@ impl<'a> Iterator for FieldIter<'a> {
         if self.pos >= self.data.len() {
             return None;
         }
-        let Ok((tag, br)) = read_varint(&self.data[self.pos..]) else {
+        let Some((tag, br)) = read_varint(&self.data[self.pos..]) else {
             self.pos = self.data.len();
             return Some(Err(WalkStop::Malformed));
         };
@@ -846,12 +901,12 @@ impl<'a> Iterator for FieldIter<'a> {
         let wt = (tag & 0x7) as u32;
         match wt {
             wire_type::LENGTH_DELIMITED => {
-                let Ok((len, vl)) = read_varint(&self.data[self.pos..]) else {
+                let Some((len, vl)) = read_varint(&self.data[self.pos..]) else {
                     self.pos = self.data.len();
                     return Some(Err(WalkStop::Malformed));
                 };
                 self.pos += vl;
-                let Ok(end) = checked_end(self.pos, len, self.data.len(), "field") else {
+                let Some(end) = checked_end(self.pos, len, self.data.len()) else {
                     self.pos = self.data.len();
                     return Some(Err(WalkStop::Malformed));
                 };
@@ -865,7 +920,7 @@ impl<'a> Iterator for FieldIter<'a> {
                 }))
             }
             wire_type::VARINT => {
-                let Ok((v, vl)) = read_varint(&self.data[self.pos..]) else {
+                let Some((v, vl)) = read_varint(&self.data[self.pos..]) else {
                     self.pos = self.data.len();
                     return Some(Err(WalkStop::Malformed));
                 };
@@ -1252,7 +1307,7 @@ fn extract_conversation_fields(
     let mut tc_token_sender_timestamp: Option<u64> = None;
 
     while pos < data.len() {
-        let Ok((tag, br)) = read_varint(&data[pos..]) else {
+        let Some((tag, br)) = read_varint(&data[pos..]) else {
             break;
         };
         pos += br;
@@ -1260,11 +1315,11 @@ fn extract_conversation_fields(
         let wt = (tag & 0x7) as u32;
         match (field, wt) {
             (tags::conversation::ID, wire_type::LENGTH_DELIMITED) => {
-                let Ok((len, vl)) = read_varint(&data[pos..]) else {
+                let Some((len, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
                 pos += vl;
-                let Ok(end) = checked_end(pos, len, data.len(), "conv-id") else {
+                let Some(end) = checked_end(pos, len, data.len()) else {
                     break;
                 };
                 let Some(id) = smoothutf8::from_utf8(&data[pos..end]) else {
@@ -1280,11 +1335,11 @@ fn extract_conversation_fields(
                 pos = end;
             }
             (tags::conversation::MESSAGES, wire_type::LENGTH_DELIMITED) => {
-                let Ok((len, vl)) = read_varint(&data[pos..]) else {
+                let Some((len, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
                 pos += vl;
-                let Ok(end) = checked_end(pos, len, data.len(), "conv-msg") else {
+                let Some(end) = checked_end(pos, len, data.len()) else {
                     break;
                 };
                 // The id guard keeps records from a (malformed) blob that
@@ -1322,25 +1377,25 @@ fn extract_conversation_fields(
                 pos = end;
             }
             (tags::conversation::TC_TOKEN, wire_type::LENGTH_DELIMITED) => {
-                let Ok((len, vl)) = read_varint(&data[pos..]) else {
+                let Some((len, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
                 pos += vl;
-                let Ok(end) = checked_end(pos, len, data.len(), "conv-tctoken") else {
+                let Some(end) = checked_end(pos, len, data.len()) else {
                     break;
                 };
                 tc_token = &data[pos..end];
                 pos = end;
             }
             (tags::conversation::TC_TOKEN_TIMESTAMP, wire_type::VARINT) => {
-                let Ok((v, vl)) = read_varint(&data[pos..]) else {
+                let Some((v, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
                 tc_token_timestamp = Some(v);
                 pos += vl;
             }
             (tags::conversation::TC_TOKEN_SENDER_TIMESTAMP, wire_type::VARINT) => {
-                let Ok((v, vl)) = read_varint(&data[pos..]) else {
+                let Some((v, vl)) = read_varint(&data[pos..]) else {
                     break;
                 };
                 tc_token_sender_timestamp = Some(v);
@@ -2153,6 +2208,65 @@ mod tests {
             .msg_secret_records
     }
 
+    /// The density reserve must not clamp when a SINGLE conversation reaches
+    /// the sample threshold: parsed_bytes includes the pending (just yielded)
+    /// field, so the denominator covers the conversation whose records were
+    /// counted. With the exclusive form the denominator was ~0 and the
+    /// estimate hit RECORD_RESERVE_CAP, over-reserving ~2 MB.
+    #[test]
+    fn test_reserve_single_big_conversation_does_not_clamp() {
+        let chat = "5511777776666@s.whatsapp.net";
+        let mut conv = Vec::new();
+        emit_len_field(&mut conv, tags::conversation::ID, chat.as_bytes());
+        let total_msgs = 200usize;
+        for i in 0..total_msgs {
+            let wm = wa::WebMessageInfo {
+                key: buffa::MessageField::some(wa::MessageKey {
+                    from_me: Some(false),
+                    id: Some(format!("MSG{i:04}")),
+                    ..Default::default()
+                }),
+                // Varied payload so zlib does not flatten the blob to nothing.
+                message_secret: Some(vec![(i % 251) as u8; 32]),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let mut history_msg = Vec::new();
+            emit_len_field(&mut history_msg, tags::history_sync_msg::MESSAGE, &wm);
+            emit_len_field(&mut conv, tags::conversation::MESSAGES, &history_msg);
+        }
+        let mut hs = Vec::new();
+        emit_len_field(&mut hs, tags::history_sync::CONVERSATIONS, &conv);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let records = process_history_sync(compressed, None, false)
+            .unwrap()
+            .msg_secret_records;
+        assert_eq!(records.len(), total_msgs);
+        assert!(
+            records.capacity() < 2048,
+            "estimate should track the real count (~{total_msgs}), got capacity {}",
+            records.capacity()
+        );
+    }
+
+    /// The zlib-ratio extrapolation is exact once the stream fully inflates.
+    #[test]
+    fn test_estimated_total_out_exact_after_drain() {
+        let mut hs = Vec::new();
+        emit_len_field(&mut hs, tags::history_sync::PUSHNAMES, b"\x0a\x03abc");
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut walker = FieldWalker::new(&compressed, MAX_DECOMPRESSED);
+        while walker.next_field().unwrap().is_some() {}
+        assert_eq!(walker.estimated_total_out(), walker.total_out());
+        assert_eq!(walker.total_out(), hs.len() as u64);
+    }
+
     /// A (malformed) conversation that carries messages BEFORE its id must not
     /// emit records under an empty chat id.
     #[test]
@@ -2384,10 +2498,9 @@ mod tests {
     fn read_varint_rejects_overflowing_tenth_byte() {
         let overflowing = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
 
-        let err = read_varint(&overflowing).expect_err("10th byte above 0x01 must fail");
-
         assert!(
-            matches!(err, HistorySyncError::MalformedProtobuf(msg) if msg == "varint overflows 64 bits")
+            read_varint(&overflowing).is_none(),
+            "10th byte above 0x01 must fail"
         );
     }
 
@@ -2716,7 +2829,7 @@ mod tests {
                 tags::history_sync::CONVERSATIONS if wt == wire_type::LENGTH_DELIMITED => {
                     let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
                     pos += vlen;
-                    let end = checked_end(pos, len, decompressed.len(), "conversation").unwrap();
+                    let end = checked_end(pos, len, decompressed.len()).unwrap();
                     result.conversations_processed += 1;
                     if let Some(candidate) = extract_conversation_fields(
                         &decompressed[pos..end],
@@ -2733,7 +2846,7 @@ mod tests {
                 {
                     let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
                     pos += vlen;
-                    let end = checked_end(pos, len, decompressed.len(), "pushname").unwrap();
+                    let end = checked_end(pos, len, decompressed.len()).unwrap();
                     if let Some(own) = own_user
                         && let Some(name) = extract_own_pushname(&decompressed[pos..end], own)
                     {
@@ -2744,7 +2857,7 @@ mod tests {
                 tags::history_sync::NCT_SALT if wt == wire_type::LENGTH_DELIMITED => {
                     let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
                     pos += vlen;
-                    let end = checked_end(pos, len, decompressed.len(), "nctSalt").unwrap();
+                    let end = checked_end(pos, len, decompressed.len()).unwrap();
                     let salt = decompressed[pos..end].to_vec();
                     if !salt.is_empty() {
                         result.nct_salt = Some(salt);

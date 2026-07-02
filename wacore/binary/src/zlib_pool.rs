@@ -129,6 +129,14 @@ impl<'a> InflateReader<'a> {
         self.total_out
     }
 
+    /// Compressed input consumed so far plus the input's full length. The
+    /// ratio lets callers extrapolate totals (e.g. record counts) from a
+    /// prefix without a second pass over the blob.
+    #[inline]
+    pub fn compressed_progress(&self) -> (usize, usize) {
+        (self.in_pos, self.input.len())
+    }
+
     /// Whether zlib reported a proper stream end (terminator + adler32
     /// checksum). An EOF (`ensure` returning false) without this means the
     /// input was truncated, not finished.
