@@ -35,6 +35,9 @@ jobs:
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
     strategy:
+      # One shard failing must not cancel the other: CodSpeed merges shards
+      # into a single run, and a cancelled shard leaves it incomplete.
+      fail-fast: false
       # Shards split by package within one workflow (same OIDC auth), halving
       # the serial wall time; CodSpeed merges shard results into one run
       # (codspeed.io/docs -> sharded-benchmarks).
@@ -67,17 +70,21 @@ jobs:
       # simulation and memory share the same instrumented build, so one
       # build covers both instruments.
       - name: Build the benchmark targets
+        env:
+          SHARD_PACKAGES: ${{ matrix.shard.packages }}
         run: >
           cargo codspeed build -m simulation -m memory
-          ${{ matrix.shard.packages }}
+          $SHARD_PACKAGES
 
       # Both instruments run serially in a single invocation so each
       # benchmark uploads as one run carrying CPU and memory metrics.
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
+        env:
+          SHARD_PACKAGES: ${{ matrix.shard.packages }}
         with:
           mode: simulation,memory
-          run: cargo codspeed run ${{ matrix.shard.packages }}
+          run: cargo codspeed run $SHARD_PACKAGES
 
   # Integration benches drive the real async client against the bartender mock
   # server, so they need the service container + MOCK_SERVER_URL. Kept as a

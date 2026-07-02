@@ -261,7 +261,9 @@ impl User {
         let mut rng = bench_rng();
 
         let identity_key_pair = IdentityKeyPair::generate(&mut rng);
-        let registration_id = rand::random::<u32>() & 0x3FFF;
+        // Same deterministic stream: the id is varint-encoded into prekey
+        // bundles, so an entropy draw here still shifted payload sizes.
+        let registration_id = rand::Rng::random::<u32>(&mut rng) & 0x3FFF;
 
         let prekey_id: PreKeyId = 1.into();
         let prekey_pair = KeyPair::generate(&mut rng);
