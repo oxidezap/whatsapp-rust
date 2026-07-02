@@ -507,7 +507,7 @@ impl Client {
         &self,
         to: impl Into<Jid>,
         message: wa::Message,
-    ) -> impl Future<Output = Result<SendResult, SendError>> + Send + '_ {
+    ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         // Box in a sync prologue: wa::Message is ~1 KB by value, and a plain
         // async fn would hold that copy in every caller's future (event
         // handlers embed several). The returned future captures only the Box.
@@ -526,7 +526,7 @@ impl Client {
         &self,
         to: impl Into<Jid>,
         text: impl Into<String>,
-    ) -> impl Future<Output = Result<SendResult, SendError>> + Send + '_ {
+    ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         use wacore::proto_helpers::MessageBuilderExt;
         let to = to.into();
         let message = Box::new(wa::Message::text(text));
@@ -548,7 +548,7 @@ impl Client {
         &self,
         to: impl Into<Jid>,
         message: &wa::Message,
-    ) -> impl Future<Output = Result<SendResult, SendError>> + Send + '_ {
+    ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         use wacore::proto_helpers::MessageExt;
         let to = to.into();
         let body = message.get_base_message().prepare_for_forward();
@@ -563,7 +563,7 @@ impl Client {
         to: impl Into<Jid>,
         message: wa::Message,
         options: SendOptions,
-    ) -> impl Future<Output = Result<SendResult, SendError>> + Send + '_ {
+    ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         // Thin generic shim: the large async body below stays monomorphic so
         // each `Into<Jid>` instantiation does not duplicate the state machine.
         // Sync prologue boxes the ~1 KB message so the returned future stays
