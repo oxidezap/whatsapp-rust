@@ -166,14 +166,37 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        if mappings.is_empty() {
+        let (entries, is_new_flags) = self.record_lid_pn_batch_in_memory(mappings, source).await;
+
+        // Every pair was already durable; nothing to persist or migrate.
+        if is_offline || entries.is_empty() {
             return;
         }
-        // Dedup by phone_number, last lid wins. Otherwise the same phone
-        // appearing twice in one batch yields is_new=true for the first
-        // (lid_A) and is_new=false for the second (lid_B), so signal
-        // migration runs for lid_A while the persisted mapping ends up
-        // pointing at lid_B — migration done against the wrong LID.
+
+        let client = Arc::clone(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                if let Err(err) = client
+                    .persist_and_migrate_lid_pn_batch(entries, is_new_flags)
+                    .await
+                {
+                    log::warn!("Background LID-PN batch persist failed: {err}");
+                }
+            }))
+            .detach();
+    }
+
+    /// Batch cache warm-up shared by the fire-and-forget learn path and the
+    /// migration-sync handler (which awaits persistence instead). Dedups by
+    /// phone_number (last lid wins) — otherwise the same phone appearing twice
+    /// in one batch yields is_new=true for the first (lid_A) and is_new=false
+    /// for the second (lid_B), so signal migration runs for lid_A while the
+    /// persisted mapping ends up pointing at lid_B.
+    async fn record_lid_pn_batch_in_memory(
+        &self,
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+    ) -> (Vec<LidPnEntry>, Vec<bool>) {
         let cap = mappings.len();
         let mut deduped: std::collections::HashMap<String, String> =
             std::collections::HashMap::with_capacity(cap);
@@ -203,23 +226,7 @@ impl Client {
             entries.push(entry);
             is_new_flags.push(is_new);
         }
-
-        // Every pair was already durable; nothing to persist or migrate.
-        if is_offline || entries.is_empty() {
-            return;
-        }
-
-        let client = Arc::clone(self);
-        self.runtime
-            .spawn(Box::pin(async move {
-                if let Err(err) = client
-                    .persist_and_migrate_lid_pn_batch(entries, is_new_flags)
-                    .await
-                {
-                    log::warn!("Background LID-PN batch persist failed: {err}");
-                }
-            }))
-            .detach();
+        (entries, is_new_flags)
     }
 
     async fn record_lid_pn_in_memory(
@@ -419,7 +426,7 @@ impl Client {
     /// migrates past WAITING_PROP with the prop on), persists the account as
     /// migrated so DMs switch to LID wire addressing.
     pub(crate) async fn handle_lid_migration_mapping_sync(
-        self: &Arc<Self>,
+        &self,
         sync: &waproto::whatsapp::LidMigrationMappingSyncMessage,
     ) {
         use prost::Message as _;
@@ -450,12 +457,22 @@ impl Client {
                 Some((lid.to_string(), mapping.pn.to_string()))
             })
             .collect();
-        self.learn_lid_pn_mappings_batch(
-            mappings,
-            crate::lid_pn_cache::LearningSource::MigrationSyncLatest,
-            false,
-        )
-        .await;
+        // Awaited (unlike the fire-and-forget learn path) so the mappings are
+        // durable before the migrated flag below is; a crash in between must
+        // not leave a migrated account without its mapping rows.
+        let (entries, is_new_flags) = self
+            .record_lid_pn_batch_in_memory(
+                mappings,
+                crate::lid_pn_cache::LearningSource::MigrationSyncLatest,
+            )
+            .await;
+        if !entries.is_empty()
+            && let Err(e) = self
+                .persist_and_migrate_lid_pn_batch(entries, is_new_flags)
+                .await
+        {
+            log::warn!("Failed to persist migration mappings: {e:?}");
+        }
 
         if !self.persistence_manager.get_device_snapshot().lid_migrated
             && self
