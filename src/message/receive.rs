@@ -1392,6 +1392,24 @@ impl Client {
             }
         }
 
+        // 1:1 LID-migration mappings are pushed by the primary to its own
+        // companions (WA Web HandleMsgProcess -> setLidMigrationMappings).
+        // Self-only: a peer could otherwise flip the account to LID addressing
+        // and poison the LID-PN cache.
+        if let Some(protocol_msg) = &msg.protocol_message
+            && let Some(mapping_sync) = &protocol_msg.lid_migration_mapping_sync_message
+        {
+            if info.source.is_from_me {
+                self.handle_lid_migration_mapping_sync(mapping_sync).await;
+            } else {
+                warn!(
+                    "[msg:{}] Dropping lid_migration_mapping_sync from non-self sender {}",
+                    info.id,
+                    info.source.sender.observe()
+                );
+            }
+        }
+
         // PDO responses come from our own account (is_from_me) via device 0 (primary phone)
         if info.source.is_from_me
             && let Some(protocol_msg) = &msg.protocol_message

@@ -66,6 +66,7 @@ pub mod stale {
 /// name strings) materialize in the binary; the rest of the vendored registry is
 /// unreferenced and emitted nowhere.
 pub const WATCHED: &[abprops::AbProp] = &[
+    abprops::web::LID_ONE_ON_ONE_MIGRATION_ENABLED,
     abprops::web::PRIVACY_TOKEN_SENDING_ON_ALL_1_ON_1_MESSAGES,
     abprops::web::PRIVACY_TOKEN_SENDING_ON_GROUP_CREATE,
     abprops::web::PRIVACY_TOKEN_SENDING_ON_GROUP_PARTICIPANT_ADD,

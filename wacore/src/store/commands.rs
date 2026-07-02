@@ -34,6 +34,9 @@ pub enum DeviceCommand {
     ClearServerCertChain,
     /// Bump the persisted `lc` (login counter) ahead of a login payload.
     IncrementLoginCounter,
+    /// Mark the account as 1:1-LID-migrated. One-way, like WA Web's
+    /// `WAIsAccountLidFieldMigrated` pref: there is no unset command.
+    SetLidMigrated,
 }
 
 pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
@@ -92,6 +95,9 @@ pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
         }
         DeviceCommand::IncrementLoginCounter => {
             device.login_counter = device.login_counter.saturating_add(1);
+        }
+        DeviceCommand::SetLidMigrated => {
+            device.lid_migrated = true;
         }
     }
 }
@@ -217,6 +223,18 @@ mod tests {
         device.login_counter = i32::MAX;
         apply_command_to_device(&mut device, DeviceCommand::IncrementLoginCounter);
         assert_eq!(device.login_counter, i32::MAX);
+    }
+
+    #[test]
+    fn set_lid_migrated_is_one_way() {
+        let mut device = Device::new();
+        assert!(!device.lid_migrated);
+
+        apply_command_to_device(&mut device, DeviceCommand::SetLidMigrated);
+        assert!(device.lid_migrated);
+
+        apply_command_to_device(&mut device, DeviceCommand::SetLidMigrated);
+        assert!(device.lid_migrated);
     }
 
     #[test]

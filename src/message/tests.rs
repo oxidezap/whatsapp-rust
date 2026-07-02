@@ -7442,6 +7442,75 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     );
 }
 
+/// Security regression: the primary's `lid_migration_mapping_sync_message`
+/// must be honoured only from self — a peer could otherwise poison the
+/// LID-PN cache and flip the account to LID wire addressing.
+#[tokio::test]
+async fn lid_migration_mapping_sync_honored_only_from_self() {
+    use prost::Message as _;
+    use wacore::messages::MessageUtils;
+
+    let client = crate::test_utils::create_test_client().await;
+    ensure_bob_paired(&client).await;
+
+    let peer_pn = "5510000123456";
+    let peer_lid = "222000033334444";
+    let payload = wa::LidMigrationMappingSyncPayload {
+        pn_to_lid_mappings: vec![wa::LidMigrationMapping {
+            pn: peer_pn.parse().unwrap(),
+            assigned_lid: peer_lid.parse().unwrap(),
+            latest_lid: None,
+        }],
+        chat_db_migration_timestamp: None,
+    };
+    let sync = wa::Message {
+        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
+            lid_migration_mapping_sync_message: Some(wa::LidMigrationMappingSyncMessage {
+                encoded_mapping_payload: Some(payload.encode_to_vec()),
+            }),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let padded = MessageUtils::encode_and_pad(&sync);
+
+    // Non-self sender: the mapping push must be dropped.
+    let mut info =
+        create_test_message_info("5510000@s.whatsapp.net", "LMS1", "5510000@s.whatsapp.net");
+    info.source.is_from_me = false;
+    client
+        .clone()
+        .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+        .await
+        .unwrap();
+    assert!(
+        client.lid_pn_cache.get_current_lid(peer_pn).await.is_none(),
+        "mapping from a non-self sender must not be learned"
+    );
+
+    // Self sender: mappings are learned.
+    let mut info = create_test_message_info(
+        "9000000000000@s.whatsapp.net",
+        "LMS2",
+        "9000000000000@s.whatsapp.net",
+    );
+    info.source.is_from_me = true;
+    client
+        .clone()
+        .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .lid_pn_cache
+            .get_current_lid(peer_pn)
+            .await
+            .as_deref(),
+        Some(peer_lid),
+        "mapping from self must be learned"
+    );
+}
+
 // ---- msmsg inbound dispatch -----------------------------------------
 
 fn find_message_nack_error(frames: &[bytes::Bytes], id: &str) -> Option<u32> {

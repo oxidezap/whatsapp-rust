@@ -135,6 +135,18 @@ impl PairUtils {
             .and_then(|n| n.content_bytes())
     }
 
+    /// Decode the optional `<client-props>` protobuf the primary attaches to
+    /// `pair-success` (WA Web `parseSetRegRequestPairSuccessClientProps`).
+    /// Carries account state such as `isChatDbLidMigrated`. A malformed
+    /// payload is treated as absent: the props are advisory and must never
+    /// fail the pairing itself.
+    pub fn extract_pairing_props(success_node: &NodeRef<'_>) -> Option<wa::ClientPairingProps> {
+        let bytes = success_node
+            .get_optional_child_by_tag(&["client-props"])?
+            .content_bytes()?;
+        wa::ClientPairingProps::decode(bytes).ok()
+    }
+
     /// Performs the cryptographic operations for pairing
     pub fn do_pair_crypto(
         device_state: &DeviceState,
@@ -771,6 +783,75 @@ mod tests {
         // decryption of <encryption-metadata> required.
         PairUtils::do_pair_crypto(&state, di_bytes)
             .expect("device-identity HMAC must verify for the passkey pair-success");
+    }
+
+    #[test]
+    fn extract_pairing_props_decodes_client_props_child() {
+        let pair_success = NodeBuilder::new("pair-success")
+            .children([
+                NodeBuilder::new("device-identity")
+                    .bytes(vec![0x01u8])
+                    .build(),
+                NodeBuilder::new("client-props")
+                    .bytes(
+                        wa::ClientPairingProps {
+                            is_chat_db_lid_migrated: Some(true),
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    )
+                    .build(),
+            ])
+            .build();
+
+        let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
+            .expect("client-props child must decode");
+        assert!(props.is_chat_db_lid_migrated());
+    }
+
+    #[test]
+    fn extract_pairing_props_explicit_false_decodes_as_unmigrated() {
+        let pair_success = NodeBuilder::new("pair-success")
+            .children([NodeBuilder::new("client-props")
+                .bytes(
+                    wa::ClientPairingProps {
+                        is_chat_db_lid_migrated: Some(false),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .build()])
+            .build();
+
+        let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
+            .expect("client-props child must decode");
+        assert!(!props.is_chat_db_lid_migrated());
+    }
+
+    #[test]
+    fn extract_pairing_props_field_absent_defaults_to_unmigrated() {
+        let pair_success = NodeBuilder::new("pair-success")
+            .children([NodeBuilder::new("client-props")
+                .bytes(wa::ClientPairingProps::default().encode_to_vec())
+                .build()])
+            .build();
+
+        let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
+            .expect("client-props child must decode");
+        assert!(!props.is_chat_db_lid_migrated());
+    }
+
+    #[test]
+    fn extract_pairing_props_absent_or_malformed_is_none() {
+        let bare = NodeBuilder::new("pair-success").build();
+        assert!(PairUtils::extract_pairing_props(&bare.as_node_ref()).is_none());
+
+        let malformed = NodeBuilder::new("pair-success")
+            .children([NodeBuilder::new("client-props")
+                .bytes(vec![0xFFu8, 0xFF, 0xFF])
+                .build()])
+            .build();
+        assert!(PairUtils::extract_pairing_props(&malformed.as_node_ref()).is_none());
     }
 
     #[test]

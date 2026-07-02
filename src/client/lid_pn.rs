@@ -382,6 +382,88 @@ impl Client {
         }
     }
 
+    /// Mirrors WA Web `Lid1X1MigrationUtils.isLidMigrated()`: the pairing- or
+    /// migration-persisted account flag, with the `lid_one_on_one_migration_enabled`
+    /// ab prop covering sessions paired before the flag existed (the prop is
+    /// what lets WA Web start the 1:1 migration on an already-linked client).
+    pub async fn is_lid_migrated(&self) -> bool {
+        if self.persistence_manager.get_device_snapshot().lid_migrated {
+            return true;
+        }
+        self.ab_props()
+            .is_enabled(wacore::iq::abprops::web::LID_ONE_ON_ONE_MIGRATION_ENABLED)
+            .await
+    }
+
+    /// Wire namespace for a 1:1 recipient. WAWebSendMsgCreateFanoutStanza
+    /// addresses the whole DM stanza from the chat wid, which is LID only once
+    /// the account is 1:1-LID-migrated (WAWebMessageDestinationChat); an
+    /// unmigrated account keeps 1:1 chats on PN even with a known mapping.
+    /// Signal session addressing is NOT gated by this — WAWebSignalAddress
+    /// upgrades PN to LID unconditionally.
+    pub(crate) async fn resolve_dm_wire_jid(&self, to: &Jid) -> Jid {
+        if self.is_lid_migrated().await {
+            return self.resolve_encryption_jid(to).await.into_non_ad();
+        }
+        let bare = to.to_non_ad();
+        if bare.is_lid() {
+            self.swap_pn_lid_namespace(&bare).await.unwrap_or(bare)
+        } else {
+            bare
+        }
+    }
+
+    /// Handle the primary's 1:1 LID-migration mapping push (WA Web
+    /// HandleMsgProcess -> `setLidMigrationMappings`). Learns the PN-LID pairs
+    /// and, once the migration ab prop allows it (WA Web's state machine only
+    /// migrates past WAITING_PROP with the prop on), persists the account as
+    /// migrated so DMs switch to LID wire addressing.
+    pub(crate) async fn handle_lid_migration_mapping_sync(
+        &self,
+        sync: &waproto::whatsapp::LidMigrationMappingSyncMessage,
+    ) {
+        use prost::Message as _;
+
+        let Some(payload_bytes) = sync.encoded_mapping_payload.as_deref() else {
+            log::warn!("lid_migration_mapping_sync without payload");
+            return;
+        };
+        let payload = match waproto::whatsapp::LidMigrationMappingSyncPayload::decode(payload_bytes)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Failed to decode LID migration mapping payload: {e}");
+                return;
+            }
+        };
+
+        for mapping in &payload.pn_to_lid_mappings {
+            let lid = mapping.latest_lid.unwrap_or(mapping.assigned_lid);
+            if let Err(e) = self
+                .add_lid_pn_mapping(
+                    &lid.to_string(),
+                    &mapping.pn.to_string(),
+                    crate::lid_pn_cache::LearningSource::MigrationSyncLatest,
+                )
+                .await
+            {
+                log::warn!("Failed to persist migration mapping: {e:?}");
+            }
+        }
+
+        if !self.persistence_manager.get_device_snapshot().lid_migrated
+            && self
+                .ab_props()
+                .is_enabled(wacore::iq::abprops::web::LID_ONE_ON_ONE_MIGRATION_ENABLED)
+                .await
+        {
+            log::info!("Account is 1:1-LID-migrated (primary mapping sync)");
+            self.persistence_manager
+                .process_command(crate::store::commands::DeviceCommand::SetLidMigrated)
+                .await;
+        }
+    }
+
     /// Swap a JID's namespace between PN and LID, preserving device/agent/integrator.
     /// Returns `None` if no mapping exists or the JID is neither PN nor LID.
     pub(crate) async fn swap_pn_lid_namespace(&self, jid: &Jid) -> Option<Jid> {
@@ -659,6 +741,224 @@ mod tests {
         let resolved = client.resolve_encryption_jid(&pn_jid).await;
 
         assert_eq!(resolved, pn_jid);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_dm_wire_jid_unmigrated_keeps_pn() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5511987650001";
+        let lid = "111000011112222";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+
+        // Unmigrated account: the wire jid stays PN even with a cached mapping.
+        assert_eq!(client.resolve_dm_wire_jid(&Jid::pn(pn)).await, Jid::pn(pn));
+        // A LID chat id maps back to the PN chat (WA Web keeps 1:1 chats on
+        // PN until the account migrates).
+        assert_eq!(
+            client.resolve_dm_wire_jid(&Jid::lid(lid)).await,
+            Jid::pn(pn)
+        );
+        // Signal session addressing is deliberately not gated.
+        assert_eq!(client.resolve_encryption_jid(&Jid::pn(pn)).await.user, lid);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_dm_wire_jid_unmigrated_unmapped_lid_stays_lid() {
+        let client: Arc<Client> = create_test_client().await;
+        let lid_jid = Jid::lid("111000011112222");
+        assert_eq!(client.resolve_dm_wire_jid(&lid_jid).await, lid_jid);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_dm_wire_jid_migrated_flag_upgrades_to_lid() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5511987650001";
+        let lid = "111000011112222";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLidMigrated)
+            .await;
+
+        assert!(client.is_lid_migrated().await);
+        assert_eq!(
+            client.resolve_dm_wire_jid(&Jid::pn(pn)).await,
+            Jid::lid(lid)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_dm_wire_jid_migration_prop_upgrades_to_lid() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5511987650001";
+        let lid = "111000011112222";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+
+        assert!(!client.is_lid_migrated().await);
+        client
+            .ab_props()
+            .apply_props(
+                false,
+                std::iter::once((
+                    wacore::iq::abprops::web::LID_ONE_ON_ONE_MIGRATION_ENABLED.code,
+                    "1".into(),
+                )),
+            )
+            .await;
+
+        assert!(client.is_lid_migrated().await);
+        assert_eq!(
+            client.resolve_dm_wire_jid(&Jid::pn(pn)).await,
+            Jid::lid(lid)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lid_migration_mapping_sync_learns_and_migrates_with_prop() {
+        use prost::Message as _;
+        use waproto::whatsapp as wa;
+
+        let client: Arc<Client> = create_test_client().await;
+        let payload = wa::LidMigrationMappingSyncPayload {
+            pn_to_lid_mappings: vec![wa::LidMigrationMapping {
+                pn: 5511987650001,
+                assigned_lid: 111000011112222,
+                latest_lid: None,
+            }],
+            chat_db_migration_timestamp: None,
+        };
+        let sync = wa::LidMigrationMappingSyncMessage {
+            encoded_mapping_payload: Some(payload.encode_to_vec()),
+        };
+
+        // Prop off: mappings are learned but the account stays unmigrated,
+        // mirroring WA Web's state machine parking at WAITING_PROP.
+        client.handle_lid_migration_mapping_sync(&sync).await;
+        assert_eq!(
+            client
+                .resolve_encryption_jid(&Jid::pn("5511987650001"))
+                .await
+                .user,
+            "111000011112222"
+        );
+        assert!(!client.is_lid_migrated().await);
+
+        // Prop on: the same push persists the migrated flag...
+        client
+            .ab_props()
+            .apply_props(
+                false,
+                std::iter::once((
+                    wacore::iq::abprops::web::LID_ONE_ON_ONE_MIGRATION_ENABLED.code,
+                    "1".into(),
+                )),
+            )
+            .await;
+        client.handle_lid_migration_mapping_sync(&sync).await;
+
+        // ...which outlives the prop, like the WA Web pref.
+        client
+            .ab_props()
+            .apply_props(false, std::iter::empty())
+            .await;
+        assert!(client.is_lid_migrated().await);
+    }
+
+    #[tokio::test]
+    async fn test_is_lid_migrated_prop_zero_or_absent_is_false() {
+        let client: Arc<Client> = create_test_client().await;
+        assert!(!client.is_lid_migrated().await);
+
+        client
+            .ab_props()
+            .apply_props(
+                false,
+                std::iter::once((
+                    wacore::iq::abprops::web::LID_ONE_ON_ONE_MIGRATION_ENABLED.code,
+                    "0".into(),
+                )),
+            )
+            .await;
+        assert!(!client.is_lid_migrated().await);
+    }
+
+    #[tokio::test]
+    async fn test_lid_migration_mapping_sync_missing_or_malformed_payload_is_ignored() {
+        use waproto::whatsapp as wa;
+
+        let client: Arc<Client> = create_test_client().await;
+        client
+            .ab_props()
+            .apply_props(
+                false,
+                std::iter::once((
+                    wacore::iq::abprops::web::LID_ONE_ON_ONE_MIGRATION_ENABLED.code,
+                    "1".into(),
+                )),
+            )
+            .await;
+
+        // Missing payload: WA Web treats this as malformed; nothing is
+        // learned and the account must not flip to migrated.
+        let missing = wa::LidMigrationMappingSyncMessage {
+            encoded_mapping_payload: None,
+        };
+        client.handle_lid_migration_mapping_sync(&missing).await;
+        assert!(
+            !client
+                .persistence_manager
+                .get_device_snapshot()
+                .lid_migrated
+        );
+
+        let malformed = wa::LidMigrationMappingSyncMessage {
+            encoded_mapping_payload: Some(vec![0xFF, 0xFF, 0xFF]),
+        };
+        client.handle_lid_migration_mapping_sync(&malformed).await;
+        assert!(
+            !client
+                .persistence_manager
+                .get_device_snapshot()
+                .lid_migrated
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lid_migration_mapping_sync_prefers_latest_lid() {
+        use prost::Message as _;
+        use waproto::whatsapp as wa;
+
+        let client: Arc<Client> = create_test_client().await;
+        let payload = wa::LidMigrationMappingSyncPayload {
+            pn_to_lid_mappings: vec![wa::LidMigrationMapping {
+                pn: 5511987650001,
+                assigned_lid: 111000011112222,
+                latest_lid: Some(999000099990000),
+            }],
+            chat_db_migration_timestamp: None,
+        };
+        let sync = wa::LidMigrationMappingSyncMessage {
+            encoded_mapping_payload: Some(payload.encode_to_vec()),
+        };
+
+        client.handle_lid_migration_mapping_sync(&sync).await;
+        assert_eq!(
+            client
+                .resolve_encryption_jid(&Jid::pn("5511987650001"))
+                .await
+                .user,
+            "999000099990000"
+        );
     }
 
     #[tokio::test]
