@@ -213,6 +213,11 @@ pub struct CacheConfig {
     /// Default: 4096.
     pub resend_rate_limiter_capacity: u64,
 
+    /// Per-sender retry-receipt rate-limiter capacity: one token-bucket entry per
+    /// sender recently driving decrypt-failure retries. Same fail-open eviction
+    /// semantics as `resend_rate_limiter_capacity`. Default: 4096.
+    pub retry_receipt_limiter_capacity: u64,
+
     // --- Sent message DB cleanup ---
     /// TTL in seconds for sent messages in DB before periodic cleanup. Must
     /// outlive retry receipts (which can arrive well after a send) or the retry
@@ -292,6 +297,10 @@ impl std::fmt::Debug for CacheConfig {
                 "resend_rate_limiter_capacity",
                 &self.resend_rate_limiter_capacity,
             )
+            .field(
+                "retry_receipt_limiter_capacity",
+                &self.retry_receipt_limiter_capacity,
+            )
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
             .field("msg_secret_policy", &self.msg_secret_policy)
             .field("msg_secret_retention", &self.msg_secret_retention)
@@ -350,6 +359,7 @@ impl Default for CacheConfig {
             chat_lanes_capacity: 5_000,
             group_distribution_locks_capacity: 512,
             resend_rate_limiter_capacity: 4_096,
+            retry_receipt_limiter_capacity: 4_096,
             sent_message_ttl_secs: 7200,
             // Bounded by default: seed only the still-relevant slice of history
             // and prune by per-add-on-kind event-time horizons, so the store no

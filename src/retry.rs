@@ -2233,6 +2233,40 @@ mod tests {
         }
     }
 
+    /// The per-sender retry-receipt limiter is reachable and tunable through the
+    /// public `Client` API, and its drops surface on
+    /// `retry_receipts_throttled_total`. Covers the wiring the
+    /// `handle_decrypt_failure` hook relies on; the bucket logic itself is
+    /// unit-tested in `retry_receipt_limiter`.
+    #[tokio::test]
+    async fn client_retry_receipt_limiter_is_wired_and_tunable() {
+        let client =
+            crate::test_utils::create_test_client_with_failing_http("retry_receipt_rl_wired").await;
+        let sender: Jid = "100000000000001@lid".parse().unwrap();
+
+        // Tight ceiling, no refill: the bucket holds exactly `burst` tokens.
+        client.set_retry_receipt_rate_limit(3, 0);
+        let mut allowed = 0;
+        for _ in 0..10 {
+            if client.retry_receipt_limiter.try_acquire(&sender).await {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 3, "client honors the configured per-sender burst");
+        assert_eq!(
+            client.retry_receipts_throttled_total(),
+            7,
+            "public counter tracks dropped retry receipts"
+        );
+
+        // Disabling restores unthrottled behavior.
+        client.set_retry_receipt_rate_limit(0, 0);
+        let other: Jid = "100000000000002@lid".parse().unwrap();
+        for _ in 0..50 {
+            assert!(client.retry_receipt_limiter.try_acquire(&other).await);
+        }
+    }
+
     /// End-to-end: a throttled group retry drops the resend (returns Ok, sends
     /// nothing) while the path up to the limiter still runs, and the cached
     /// message is retained for the device's later re-request. Exercises the hook
