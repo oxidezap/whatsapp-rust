@@ -64,8 +64,7 @@ pub fn encrypt_message_edit(
     message_secret: &[u8],
     ctx: &MessageEditContext<'_>,
 ) -> Result<(Vec<u8>, [u8; IV_SIZE])> {
-    let mut plaintext = Vec::new();
-    waproto::codec::message_encode_into(inner_message, &mut plaintext);
+    let plaintext = waproto::codec::message_to_vec(inner_message);
     encrypt_addon(&plaintext, message_secret, &ctx.as_addon_ctx())
 }
 
@@ -179,26 +178,26 @@ pub fn decrypt_message_edit_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message as _;
+    use buffa::MessageField;
     use waproto::whatsapp as wa;
 
     fn make_inner_edit(new_text: &str) -> wa::Message {
         wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                key: Some(wa::MessageKey {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                key: MessageField::some(wa::MessageKey {
                     remote_jid: Some("g@g.us".to_string()),
                     from_me: Some(true),
                     id: Some("AC1234567890ABCDEF".to_string()),
                     participant: None,
                 }),
-                r#type: Some(wa::message::protocol_message::Type::MessageEdit as i32),
-                edited_message: Some(Box::new(wa::Message {
+                r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                edited_message: MessageField::some(wa::Message {
                     conversation: Some(new_text.to_string()),
                     ..Default::default()
-                })),
+                }),
                 timestamp_ms: Some(1_700_000_000_000),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         }
     }
@@ -217,8 +216,8 @@ mod tests {
         let decoded = decrypt_message_edit(&enc, &iv, &secret, &ctx).unwrap();
         let edited = decoded
             .protocol_message
-            .as_ref()
-            .and_then(|pm| pm.edited_message.as_ref())
+            .as_option()
+            .and_then(|pm| pm.edited_message.as_option())
             .expect("inner edited message present");
         assert_eq!(edited.conversation.as_deref(), Some("edited text"));
     }
@@ -237,8 +236,8 @@ mod tests {
         assert_eq!(
             decoded
                 .protocol_message
-                .as_ref()
-                .and_then(|pm| pm.edited_message.as_ref())
+                .as_option()
+                .and_then(|pm| pm.edited_message.as_option())
                 .and_then(|m| m.conversation.as_deref()),
             Some("B")
         );
@@ -289,6 +288,7 @@ mod tests {
     #[test]
     fn general_decrypt_roundtrips_non_edit_use_case() {
         use crate::secret_enc_addon::{AddonContext, ModificationType, encrypt_addon};
+        use buffa::Message as _;
 
         // A POLL_EDIT envelope: same shape as MESSAGE_EDIT, different use-case.
         let secret = [0x71u8; 32];
@@ -343,8 +343,8 @@ mod tests {
             .expect("fallback should rescue");
         assert_eq!(
             m.protocol_message
-                .as_ref()
-                .and_then(|pm| pm.edited_message.as_ref())
+                .as_option()
+                .and_then(|pm| pm.edited_message.as_option())
                 .and_then(|m| m.conversation.as_deref()),
             Some("hello")
         );

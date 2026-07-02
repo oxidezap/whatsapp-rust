@@ -1,8 +1,8 @@
 use crate::client::Client;
 use crate::lid_pn_cache::LearningSource;
 use crate::types::events::{Event, PairError, PairSuccess};
+use buffa::Message;
 use log::{debug, error, info, warn};
-use prost::Message;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -232,7 +232,7 @@ async fn handle_pair_success<'a>(
 
     match result {
         Ok((self_signed_identity_bytes, key_index)) => {
-            let signed_identity_for_event = match wa::AdvSignedDeviceIdentity::decode(
+            let signed_identity_for_event = match wa::ADVSignedDeviceIdentity::decode_from_slice(
                 self_signed_identity_bytes.as_slice(),
             ) {
                 Ok(identity) => identity,
@@ -277,7 +277,7 @@ async fn handle_pair_success<'a>(
             // account's state, but a same-account relink whose pair-success
             // omitted client-props must not lose it either.
             let props_migrated = PairUtils::extract_pairing_props(success_node)
-                .is_some_and(|props| props.is_chat_db_lid_migrated());
+                .is_some_and(|props| props.is_chat_db_lid_migrated.unwrap_or(false));
             let account_changed = device_snapshot
                 .pn
                 .as_ref()

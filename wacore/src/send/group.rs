@@ -16,7 +16,7 @@ pub async fn prepare_group_retry_stanza<S, I>(
     message: &wa::Message,
     message_id: String,
     retry_count: u8,
-    account: Option<&wa::AdvSignedDeviceIdentity>,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
     addressing_mode: crate::types::message::AddressingMode,
     edit: Option<crate::types::message::EditAttribute>,
 ) -> Result<Node>
@@ -120,7 +120,7 @@ pub async fn prepare_group_stanza(
     group_info: &GroupInfo,
     own_jid: &Jid,
     own_lid: &Jid,
-    account: Option<&wa::AdvSignedDeviceIdentity>,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
     to_jid: Jid,
     message: &wa::Message,
     request_id: String,
@@ -146,7 +146,7 @@ pub async fn prepare_group_stanza(
     // existing mci, diverging from the bytes the token is computed over, so it re-encodes.
     let shared_content = message
         .message_context_info
-        .is_none()
+        .is_unset()
         .then(|| waproto::codec::message_to_vec(message));
 
     // Generate reporting token if the message type supports it.
@@ -404,10 +404,12 @@ pub async fn prepare_group_stanza(
 
         if let Some(plan) = session_plan {
             let skdm_wrapper_msg = wa::Message {
-                sender_key_distribution_message: Some(wa::message::SenderKeyDistributionMessage {
-                    group_id: Some(to_jid.to_string()),
-                    axolotl_sender_key_distribution_message: Some(axolotl_skdm_bytes),
-                }),
+                sender_key_distribution_message: buffa::MessageField::some(
+                    wa::message::SenderKeyDistributionMessage {
+                        group_id: Some(to_jid.to_string()),
+                        axolotl_sender_key_distribution_message: Some(axolotl_skdm_bytes),
+                    },
+                ),
                 ..Default::default()
             };
             let skdm_plaintext_to_encrypt = MessageUtils::encode_and_pad(&skdm_wrapper_msg);
@@ -639,14 +641,14 @@ pub async fn create_sender_key_distribution_message_for_group(
 /// `ts_secs` is unix seconds, matching WA Web's `unixTime()`.
 pub fn build_member_label_message(label: String, ts_secs: i64) -> wa::Message {
     wa::Message {
-        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-            r#type: Some(wa::message::protocol_message::Type::GroupMemberLabelChange as i32),
-            member_label: Some(wa::MemberLabel {
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::GroupMemberLabelChange),
+            member_label: buffa::MessageField::some(wa::MemberLabel {
                 label: Some(label),
                 label_timestamp: Some(ts_secs),
             }),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     }
 }

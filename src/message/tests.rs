@@ -4188,34 +4188,34 @@ fn test_is_sender_key_distribution_only() {
 
     // SKDM only → true
     assert!(is_sender_key_distribution_only(&mut wa::Message {
-        sender_key_distribution_message: Some(skdm.clone()),
+        sender_key_distribution_message: buffa::MessageField::some(skdm.clone()),
         ..Default::default()
     }));
 
     // SKDM + message_context_info → still true (context_info is metadata)
     assert!(is_sender_key_distribution_only(&mut wa::Message {
-        sender_key_distribution_message: Some(skdm.clone()),
-        message_context_info: Some(Box::default()),
+        sender_key_distribution_message: buffa::MessageField::some(skdm.clone()),
+        message_context_info: buffa::MessageField::some(Default::default()),
         ..Default::default()
     }));
 
     // SKDM + sticker → false (has user content)
     assert!(!is_sender_key_distribution_only(&mut wa::Message {
-        sender_key_distribution_message: Some(skdm.clone()),
-        sticker_message: Some(Box::new(wa::message::StickerMessage::default())),
+        sender_key_distribution_message: buffa::MessageField::some(skdm.clone()),
+        sticker_message: buffa::MessageField::some(wa::message::StickerMessage::default()),
         ..Default::default()
     }));
 
     // SKDM + text → false (has user content)
     assert!(!is_sender_key_distribution_only(&mut wa::Message {
-        sender_key_distribution_message: Some(skdm.clone()),
+        sender_key_distribution_message: buffa::MessageField::some(skdm.clone()),
         conversation: Some("hello".into()),
         ..Default::default()
     }));
 
     // protocol_message only (no SKDM) → false
     assert!(!is_sender_key_distribution_only(&mut wa::Message {
-        protocol_message: Some(Box::new(wa::message::ProtocolMessage::default())),
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage::default()),
         ..Default::default()
     }));
 }
@@ -4225,20 +4225,22 @@ fn skdm_only_detection_restores_carrier_fields() {
     // The slow path takes the carrier fields out to compare the rest against
     // default; it must restore them so callers still see the original message.
     let mut msg = wa::Message {
-        sender_key_distribution_message: Some(wa::message::SenderKeyDistributionMessage {
-            group_id: Some("group".into()),
-            axolotl_sender_key_distribution_message: Some(vec![1, 2, 3]),
-        }),
-        fast_ratchet_key_sender_key_distribution_message: Some(
+        sender_key_distribution_message: buffa::MessageField::some(
+            wa::message::SenderKeyDistributionMessage {
+                group_id: Some("group".into()),
+                axolotl_sender_key_distribution_message: Some(vec![1, 2, 3]),
+            },
+        ),
+        fast_ratchet_key_sender_key_distribution_message: buffa::MessageField::some(
             wa::message::SenderKeyDistributionMessage {
                 group_id: Some("group".into()),
                 axolotl_sender_key_distribution_message: Some(vec![4, 5, 6]),
             },
         ),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(vec![9, 8, 7]),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
 
@@ -4249,21 +4251,21 @@ fn skdm_only_detection_restores_carrier_fields() {
     // original contents) must fail here.
     assert_eq!(
         msg.sender_key_distribution_message
-            .as_ref()
+            .as_option()
             .and_then(|s| s.axolotl_sender_key_distribution_message.as_deref()),
         Some([1, 2, 3].as_slice()),
         "sender_key_distribution_message payload must be restored unchanged"
     );
     assert_eq!(
         msg.fast_ratchet_key_sender_key_distribution_message
-            .as_ref()
+            .as_option()
             .and_then(|s| s.axolotl_sender_key_distribution_message.as_deref()),
         Some([4, 5, 6].as_slice()),
         "fast_ratchet carrier payload must be restored unchanged"
     );
     assert_eq!(
         msg.message_context_info
-            .as_ref()
+            .as_option()
             .and_then(|c| c.message_secret.as_deref()),
         Some([9, 8, 7].as_slice()),
         "message_context_info payload must be restored unchanged"
@@ -4274,29 +4276,29 @@ fn skdm_only_detection_restores_carrier_fields() {
 #[test]
 fn test_unwrap_device_sent_extracts_reaction() {
     let wrapped = wa::Message {
-        device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+        device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
             destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
-            message: Some(Box::new(wa::Message {
-                reaction_message: Some(Box::new(wa::message::ReactionMessage {
+            message: buffa::MessageField::some(wa::Message {
+                reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
                     text: Some("\u{2764}".to_string()),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
-            })),
+            }),
             phash: None,
-        })),
+        }),
         ..Default::default()
     };
 
     let mut unwrapped = unwrap_device_sent(wrapped);
     assert!(
-        unwrapped.device_sent_message.is_none(),
+        unwrapped.device_sent_message.is_unset(),
         "DSM wrapper should be removed"
     );
     assert_eq!(
         unwrapped
             .reaction_message
-            .as_ref()
+            .as_option()
             .and_then(|r| r.text.as_deref()),
         Some("\u{2764}"),
         "reaction should be accessible after unwrapping"
@@ -4311,17 +4313,17 @@ fn test_unwrap_device_sent_extracts_reaction() {
 #[test]
 fn test_unwrap_device_sent_preserves_empty_wrapper() {
     let wrapped = wa::Message {
-        device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+        device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
             destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
-            message: None,
+            message: Default::default(),
             phash: None,
-        })),
+        }),
         ..Default::default()
     };
 
     let result = unwrap_device_sent(wrapped);
     assert!(
-        result.device_sent_message.is_some(),
+        result.device_sent_message.is_set(),
         "empty DSM wrapper should be preserved"
     );
 }
@@ -4344,29 +4346,29 @@ fn test_unwrap_device_sent_passthrough() {
 fn test_unwrap_device_sent_merges_context_info() {
     let wrapped = wa::Message {
         // Outer message_context_info (from the DSM envelope)
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(vec![10, 20, 30]),
-            limit_sharing_v2: Some(wa::LimitSharing::default()),
+            limit_sharing_v2: buffa::MessageField::some(wa::LimitSharing::default()),
             ..Default::default()
-        })),
-        device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+        }),
+        device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
             destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
-            message: Some(Box::new(wa::Message {
+            message: buffa::MessageField::some(wa::Message {
                 conversation: Some("hello".to_string()),
                 // Inner has its own message_secret but no limit_sharing_v2
-                message_context_info: Some(Box::new(wa::MessageContextInfo {
+                message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
                     message_secret: Some(vec![1, 2, 3]),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
-            })),
+            }),
             phash: None,
-        })),
+        }),
         ..Default::default()
     };
 
     let result = unwrap_device_sent(wrapped);
-    let ctx = result.message_context_info.as_ref().unwrap();
+    let ctx = result.message_context_info.as_option().unwrap();
 
     assert_eq!(
         ctx.message_secret,
@@ -4374,7 +4376,7 @@ fn test_unwrap_device_sent_merges_context_info() {
         "inner message_secret should be preferred"
     );
     assert!(
-        ctx.limit_sharing_v2.is_some(),
+        ctx.limit_sharing_v2.is_set(),
         "limit_sharing_v2 should come from outer (always)"
     );
 }
@@ -4383,24 +4385,24 @@ fn test_unwrap_device_sent_merges_context_info() {
 #[test]
 fn test_unwrap_device_sent_secret_fallback() {
     let wrapped = wa::Message {
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(vec![10, 20, 30]),
             ..Default::default()
-        })),
-        device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+        }),
+        device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
             destination_jid: Some("5511999999999@s.whatsapp.net".to_string()),
-            message: Some(Box::new(wa::Message {
+            message: buffa::MessageField::some(wa::Message {
                 conversation: Some("hello".to_string()),
                 // Inner has no message_context_info at all
                 ..Default::default()
-            })),
+            }),
             phash: None,
-        })),
+        }),
         ..Default::default()
     };
 
     let result = unwrap_device_sent(wrapped);
-    let ctx = result.message_context_info.as_ref().unwrap();
+    let ctx = result.message_context_info.as_option().unwrap();
     assert_eq!(
         ctx.message_secret,
         Some(vec![10, 20, 30]),
@@ -6363,7 +6365,7 @@ async fn skdm_only_group_session_acknowledged_once_without_message_event() {
     let group: Jid = "120363408782575443@g.us".parse().expect("group");
     let skdm = alice.create_group_skdm(&group).await;
     let plaintext = MessageUtils::encode_and_pad(&wa::Message {
-        sender_key_distribution_message: Some(skdm),
+        sender_key_distribution_message: buffa::MessageField::some(skdm),
         ..Default::default()
     });
     let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
@@ -6491,7 +6493,7 @@ async fn mixed_skdm_and_bad_plaintext_session_is_nacked_not_positive_acked() {
     let group: Jid = "120363408782575449@g.us".parse().expect("group");
     let skdm = alice.create_group_skdm(&group).await;
     let skdm_plaintext = MessageUtils::encode_and_pad(&wa::Message {
-        sender_key_distribution_message: Some(skdm),
+        sender_key_distribution_message: buffa::MessageField::some(skdm),
         ..Default::default()
     });
     let skdm_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
@@ -6556,7 +6558,7 @@ async fn bad_session_plaintext_skips_skmsg_sibling_after_nack() {
     let group: Jid = "120363408782575450@g.us".parse().expect("group");
     let skdm = alice.create_group_skdm(&group).await;
     let skdm_plaintext = MessageUtils::encode_and_pad(&wa::Message {
-        sender_key_distribution_message: Some(skdm),
+        sender_key_distribution_message: buffa::MessageField::some(skdm),
         ..Default::default()
     });
     let skdm_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
@@ -6623,7 +6625,7 @@ async fn skdm_only_session_with_msmsg_waits_for_bot_payload_response() {
     let group: Jid = "120363408782575451@g.us".parse().expect("group");
     let skdm = alice.create_group_skdm(&group).await;
     let plaintext = MessageUtils::encode_and_pad(&wa::Message {
-        sender_key_distribution_message: Some(skdm),
+        sender_key_distribution_message: buffa::MessageField::some(skdm),
         ..Default::default()
     });
     let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
@@ -6724,7 +6726,7 @@ async fn status_skdm_only_session_uses_one_status_receipt() {
     let status: Jid = "status@broadcast".parse().expect("status");
     let skdm = alice.create_group_skdm(&status).await;
     let plaintext = MessageUtils::encode_and_pad(&wa::Message {
-        sender_key_distribution_message: Some(skdm),
+        sender_key_distribution_message: buffa::MessageField::some(skdm),
         ..Default::default()
     });
     let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
@@ -6829,7 +6831,7 @@ async fn skdm_session_with_skmsg_sibling_acknowledged_once() {
     let group: Jid = "120363408782575444@g.us".parse().expect("group");
     let skdm = alice.create_group_skdm(&group).await;
     let skdm_plaintext = MessageUtils::encode_and_pad(&wa::Message {
-        sender_key_distribution_message: Some(skdm),
+        sender_key_distribution_message: buffa::MessageField::some(skdm),
         ..Default::default()
     });
     let session_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
@@ -6890,7 +6892,7 @@ async fn own_group_skdm_only_session_uses_transport_ack_once() {
     let group: Jid = "120363408782575445@g.us".parse().expect("group");
     let skdm = alice.create_group_skdm(&group).await;
     let plaintext = MessageUtils::encode_and_pad(&wa::Message {
-        sender_key_distribution_message: Some(skdm),
+        sender_key_distribution_message: buffa::MessageField::some(skdm),
         ..Default::default()
     });
     let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
@@ -7386,25 +7388,29 @@ async fn app_state_sync_key_share_honored_only_from_self() {
 
     let key_id = vec![1u8, 2, 3, 4, 5, 6];
     let share = wa::Message {
-        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-            app_state_sync_key_share: Some(wa::message::AppStateSyncKeyShare {
-                keys: vec![wa::message::AppStateSyncKey {
-                    key_id: Some(wa::message::AppStateSyncKeyId {
-                        key_id: Some(key_id.clone()),
-                    }),
-                    key_data: Some(wa::message::AppStateSyncKeyData {
-                        key_data: Some(vec![7u8; 32]),
-                        fingerprint: Some(wa::message::AppStateSyncKeyFingerprint {
-                            raw_id: Some(1),
-                            current_index: Some(0),
-                            device_indexes: vec![0],
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            app_state_sync_key_share: buffa::MessageField::some(
+                wa::message::AppStateSyncKeyShare {
+                    keys: vec![wa::message::AppStateSyncKey {
+                        key_id: buffa::MessageField::some(wa::message::AppStateSyncKeyId {
+                            key_id: Some(key_id.clone()),
                         }),
-                        timestamp: Some(123),
-                    }),
-                }],
-            }),
+                        key_data: buffa::MessageField::some(wa::message::AppStateSyncKeyData {
+                            key_data: Some(vec![7u8; 32]),
+                            fingerprint: buffa::MessageField::some(
+                                wa::message::AppStateSyncKeyFingerprint {
+                                    raw_id: Some(1),
+                                    current_index: Some(0),
+                                    device_indexes: vec![0],
+                                },
+                            ),
+                            timestamp: Some(123),
+                        }),
+                    }],
+                },
+            ),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     let padded = MessageUtils::encode_and_pad(&share);
@@ -7447,7 +7453,7 @@ async fn app_state_sync_key_share_honored_only_from_self() {
 /// LID-PN cache and flip the account to LID wire addressing.
 #[tokio::test]
 async fn lid_migration_mapping_sync_honored_only_from_self() {
-    use prost::Message as _;
+    use buffa::Message as _;
     use wacore::messages::MessageUtils;
 
     let client = crate::test_utils::create_test_client().await;
@@ -7455,8 +7461,8 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
 
     let peer_pn = "5510000123456";
     let peer_lid = "222000033334444";
-    let payload = wa::LidMigrationMappingSyncPayload {
-        pn_to_lid_mappings: vec![wa::LidMigrationMapping {
+    let payload = wa::LIDMigrationMappingSyncPayload {
+        pn_to_lid_mappings: vec![wa::LIDMigrationMapping {
             pn: peer_pn.parse().unwrap(),
             assigned_lid: peer_lid.parse().unwrap(),
             latest_lid: None,
@@ -7464,12 +7470,14 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
         chat_db_migration_timestamp: None,
     };
     let sync = wa::Message {
-        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-            lid_migration_mapping_sync_message: Some(wa::LidMigrationMappingSyncMessage {
-                encoded_mapping_payload: Some(payload.encode_to_vec()),
-            }),
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            lid_migration_mapping_sync_message: buffa::MessageField::some(
+                wa::LIDMigrationMappingSyncMessage {
+                    encoded_mapping_payload: Some(payload.encode_to_vec()),
+                },
+            ),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     let padded = MessageUtils::encode_and_pad(&sync);
@@ -7536,14 +7544,14 @@ fn find_message_nack_error(frames: &[bytes::Bytes], id: &str) -> Option<u32> {
 }
 
 fn encode_message_secret_message(iv: &[u8], payload: &[u8]) -> Vec<u8> {
-    use prost::Message as _;
+    use buffa::Message as _;
     let ms = wa::MessageSecretMessage {
         version: Some(1),
         enc_iv: Some(iv.to_vec()),
         enc_payload: Some(payload.to_vec()),
     };
-    let mut out = Vec::with_capacity(ms.encoded_len());
-    ms.encode(&mut out).expect("encode MessageSecretMessage");
+    let mut out = Vec::with_capacity(ms.encoded_len() as usize);
+    ms.encode(&mut out);
     out
 }
 
@@ -7572,34 +7580,34 @@ where
 
 fn legacy_edit_text(msg: &wa::Message) -> Option<&str> {
     msg.protocol_message
-        .as_ref()
-        .and_then(|pm| pm.edited_message.as_ref())
+        .as_option()
+        .and_then(|pm| pm.edited_message.as_option())
         .and_then(|edited| edited.conversation.as_deref())
 }
 
 fn inner_message_edit(text: &str, next_secret: Option<Vec<u8>>) -> wa::Message {
     wa::Message {
-        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-            key: Some(wa::MessageKey {
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            key: buffa::MessageField::some(wa::MessageKey {
                 remote_jid: Some("5511777776666@s.whatsapp.net".to_string()),
                 from_me: Some(false),
                 id: Some("PARENT_EDIT".to_string()),
                 participant: None,
             }),
-            r#type: Some(wa::message::protocol_message::Type::MessageEdit as i32),
-            edited_message: Some(Box::new(wa::Message {
+            r#type: Some(wa::message::protocol_message::Type::MessageEdit),
+            edited_message: buffa::MessageField::some(wa::Message {
                 conversation: Some(text.to_string()),
                 ..Default::default()
-            })),
+            }),
             timestamp_ms: Some(1_770_000_000_000),
             ..Default::default()
-        })),
-        message_context_info: next_secret.map(|secret| {
-            Box::new(wa::MessageContextInfo {
+        }),
+        message_context_info: next_secret
+            .map(|secret| wa::MessageContextInfo {
                 message_secret: Some(secret),
                 ..Default::default()
             })
-        }),
+            .into(),
         ..Default::default()
     }
 }
@@ -7626,15 +7634,15 @@ fn encrypted_message_edit(
     .expect("test edit encryption");
 
     wa::Message {
-        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
-            target_message_key: Some(target_key),
+        secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
+            target_message_key: buffa::MessageField::some(target_key),
             enc_payload: Some(enc_payload),
             enc_iv: Some(enc_iv.to_vec()),
             secret_enc_type: Some(
-                wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
+                wa::message::secret_encrypted_message::SecretEncType::MessageEdit,
             ),
             remote_key_id: None,
-        })),
+        }),
         ..Default::default()
     }
 }
@@ -7682,7 +7690,7 @@ async fn secret_encrypted_message_edit_dispatches_legacy_edit() {
             matches!(e, wacore::types::events::Event::Message(msg, info)
                     if info.id == edit_id
                         && legacy_edit_text(msg.as_ref()) == Some("edited")
-                        && msg.secret_encrypted_message.is_none())
+                        && msg.secret_encrypted_message.is_unset())
         },
         500,
     )
@@ -7743,7 +7751,7 @@ async fn secret_encrypted_peer_edit_resolves_sender_from_envelope() {
             matches!(e, wacore::types::events::Event::Message(msg, info)
                     if info.id == edit_id
                         && legacy_edit_text(msg.as_ref()) == Some("edited")
-                        && msg.secret_encrypted_message.is_none())
+                        && msg.secret_encrypted_message.is_unset())
         },
         500,
     )
@@ -7807,7 +7815,7 @@ async fn run_secret_edit_with_window(test_id: &str, parent_ts: i64, edit_offset:
             matches!(e, wacore::types::events::Event::Message(msg, info)
                     if info.id == edit_id
                         && legacy_edit_text(msg.as_ref()) == Some("edited")
-                        && msg.secret_encrypted_message.is_none())
+                        && msg.secret_encrypted_message.is_unset())
         },
         500,
     )
@@ -7940,7 +7948,7 @@ async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
             matches!(e, wacore::types::events::Event::Message(msg, info)
                     if info.id == edit_id
                         && legacy_edit_text(msg.as_ref()) == Some("edited via resolver")
-                        && msg.secret_encrypted_message.is_none())
+                        && msg.secret_encrypted_message.is_unset())
         },
         500,
     )
@@ -8269,9 +8277,9 @@ async fn msmsg_decrypts_when_secret_is_stored() {
         ..Default::default()
     };
     let pt_bytes = {
-        use prost::Message as _;
-        let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
-        plaintext_msg.encode(&mut v).unwrap();
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
         v
     };
     let ctx = BotMessageContext {
@@ -8461,9 +8469,9 @@ async fn msmsg_bot_edit_uses_edit_target_id_for_hkdf() {
         ..Default::default()
     };
     let pt_bytes = {
-        use prost::Message as _;
-        let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
-        plaintext_msg.encode(&mut v).unwrap();
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
         v
     };
     let ctx = BotMessageContext {
@@ -8608,9 +8616,9 @@ async fn msmsg_bot_edit_first_keeps_info_id() {
         ..Default::default()
     };
     let pt_bytes = {
-        use prost::Message as _;
-        let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
-        plaintext_msg.encode(&mut v).unwrap();
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
         v
     };
     let ctx = BotMessageContext {
@@ -8682,9 +8690,9 @@ async fn msmsg_falls_back_to_info_id_when_primary_uses_edit_target() {
         ..Default::default()
     };
     let pt_bytes = {
-        use prost::Message as _;
-        let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
-        plaintext_msg.encode(&mut v).unwrap();
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
         v
     };
     let ctx = BotMessageContext {
@@ -8765,9 +8773,9 @@ async fn msmsg_falls_back_to_edit_target_when_primary_uses_info_id() {
         ..Default::default()
     };
     let pt_bytes = {
-        use prost::Message as _;
-        let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
-        plaintext_msg.encode(&mut v).unwrap();
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
         v
     };
     // Encrypt under edit_target_id even though edit=first → primary
@@ -8912,10 +8920,10 @@ async fn maybe_capture_inbound_msg_secret_persists_for_bot_chats() {
     });
     let msg = wa::Message {
         conversation: Some("hi bot".into()),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(vec![0xAB; 32]),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -8952,10 +8960,10 @@ async fn maybe_capture_inbound_msg_secret_persists_for_non_bot_chats() {
     });
     let msg = wa::Message {
         conversation: Some("hi".into()),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(vec![0xCD; 32]),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -9001,18 +9009,18 @@ async fn maybe_capture_inbound_msg_secret_persists_for_group_with_bot_mention() 
         ..Default::default()
     });
     let msg = wa::Message {
-        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
             text: Some("hey @MetaAI tell me a joke".into()),
-            context_info: Some(Box::new(wa::ContextInfo {
+            context_info: buffa::MessageField::some(wa::ContextInfo {
                 mentioned_jid: vec!["867051314767696@bot".into()],
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
-        })),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        }),
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(vec![0xEE; 32]),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -9059,18 +9067,18 @@ async fn maybe_capture_inbound_msg_secret_skips_forwarded() {
         ..Default::default()
     });
     let msg = wa::Message {
-        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
             text: Some("forwarded".into()),
-            context_info: Some(Box::new(wa::ContextInfo {
+            context_info: buffa::MessageField::some(wa::ContextInfo {
                 is_forwarded: Some(true),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
-        })),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        }),
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(vec![0xFF; 32]),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -9117,19 +9125,19 @@ async fn maybe_capture_inbound_msg_secret_via_bot_metadata_without_mention() {
         ..Default::default()
     });
     let msg = wa::Message {
-        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
             text: Some("continue".into()),
             // No mention at all — just bot_metadata signals the invocation.
             ..Default::default()
-        })),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        }),
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(vec![0x7B; 32]),
-            bot_metadata: Some(wa::BotMetadata {
+            bot_metadata: buffa::MessageField::some(wa::BotMetadata {
                 persona_id: Some("867051314767696".into()),
                 ..Default::default()
             }),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -9184,10 +9192,10 @@ async fn bot_only_captures_group_bot_prompt_skips_plain() {
     });
     let plain_msg = wa::Message {
         conversation: Some("hi".into()),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(vec![0x01; 32]),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     client
@@ -9218,18 +9226,18 @@ async fn bot_only_captures_group_bot_prompt_skips_plain() {
         ..Default::default()
     });
     let bot_msg = wa::Message {
-        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
             text: Some("continue".into()),
             ..Default::default()
-        })),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        }),
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(vec![0x02; 32]),
-            bot_metadata: Some(wa::BotMetadata {
+            bot_metadata: buffa::MessageField::some(wa::BotMetadata {
                 persona_id: Some("867051314767696".into()),
                 ..Default::default()
             }),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     client
@@ -9267,18 +9275,18 @@ async fn maybe_capture_inbound_msg_secret_keys_under_other_participant() {
         ..Default::default()
     });
     let msg = wa::Message {
-        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
             text: Some("@MetaAI question".into()),
-            context_info: Some(Box::new(wa::ContextInfo {
+            context_info: buffa::MessageField::some(wa::ContextInfo {
                 mentioned_jid: vec!["867051314767696@bot".into()],
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
-        })),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        }),
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(vec![0x5A; 32]),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     client.maybe_capture_inbound_msg_secret(&msg, &info).await;
@@ -9443,9 +9451,9 @@ async fn mixed_msmsg_and_unknown_enc_still_decrypts_msmsg() {
         ..Default::default()
     };
     let pt_bytes = {
-        use prost::Message as _;
-        let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
-        plaintext_msg.encode(&mut v).unwrap();
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
         v
     };
     let ctx = BotMessageContext {
@@ -9547,9 +9555,9 @@ async fn msmsg_alternate_lookup_resolves_lid_to_stored_pn() {
         ..Default::default()
     };
     let pt_bytes = {
-        use prost::Message as _;
-        let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
-        plaintext_msg.encode(&mut v).unwrap();
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
         v
     };
     let ctx = BotMessageContext {
@@ -9635,10 +9643,10 @@ async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
     });
     let fanout_msg = wa::Message {
         conversation: Some("hi bot".into()),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(secret.to_vec()),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     client
@@ -9668,9 +9676,9 @@ async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
         ..Default::default()
     };
     let pt_bytes = {
-        use prost::Message as _;
-        let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
-        plaintext_msg.encode(&mut v).unwrap();
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
         v
     };
     let ctx = BotMessageContext {
@@ -9764,9 +9772,9 @@ async fn msmsg_outbound_put_and_inbound_get_match_for_lid_bot() {
         ..Default::default()
     };
     let pt_bytes = {
-        use prost::Message as _;
-        let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
-        plaintext_msg.encode(&mut v).unwrap();
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
         v
     };
     let ctx = BotMessageContext {
@@ -9841,9 +9849,9 @@ async fn msmsg_with_bot_device_suffix_round_trips() {
         ..Default::default()
     };
     let pt_bytes = {
-        use prost::Message as _;
-        let mut v = Vec::with_capacity(plaintext_msg.encoded_len());
-        plaintext_msg.encode(&mut v).unwrap();
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
         v
     };
     let ctx = BotMessageContext {
@@ -9967,11 +9975,11 @@ async fn enc_reaction_inbound_decrypts_to_plaintext_shape() {
         participant: Some(author.to_string()),
     };
     let msg = wa::Message {
-        enc_reaction_message: Some(Box::new(wa::message::EncReactionMessage {
-            target_message_key: Some(target_key.clone()),
+        enc_reaction_message: buffa::MessageField::some(wa::message::EncReactionMessage {
+            target_message_key: buffa::MessageField::some(target_key.clone()),
             enc_payload: Some(payload),
             enc_iv: Some(iv.to_vec()),
-        })),
+        }),
         ..Default::default()
     };
     let info = Arc::new(MessageInfo {
@@ -9990,16 +9998,19 @@ async fn enc_reaction_inbound_decrypts_to_plaintext_shape() {
         .maybe_decrypt_secret_encrypted_message(&msg, &info)
         .await
         .expect("reaction must decrypt");
-    let rm = out.reaction_message.expect("plaintext reaction shape");
+    let rm = out
+        .reaction_message
+        .into_option()
+        .expect("plaintext reaction shape");
     assert_eq!(rm.text.as_deref(), Some("\u{1F525}"));
     assert_eq!(rm.sender_timestamp_ms, Some(1_700_000_000_000));
     assert_eq!(
-        rm.key.as_ref().and_then(|k| k.id.as_deref()),
+        rm.key.as_option().and_then(|k| k.id.as_deref()),
         Some(PARENT_ID),
         "key must be filled from the envelope target"
     );
     assert_eq!(
-        rm.key.as_ref().and_then(|k| k.participant.as_deref()),
+        rm.key.as_option().and_then(|k| k.participant.as_deref()),
         Some(author.to_string().as_str())
     );
 }
@@ -10040,13 +10051,13 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
         .expect("persist parent secret");
 
     let body = wa::Message {
-        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
             text: Some("great post".to_string()),
             ..Default::default()
-        })),
+        }),
         // Present but secret-less: the outer secret must merge in, not be
         // dropped because a context already exists.
-        message_context_info: Some(Box::default()),
+        message_context_info: buffa::MessageField::some(Default::default()),
         ..Default::default()
     };
     let (payload, iv) = wacore::comment::encrypt_comment_with_secret(
@@ -10059,8 +10070,8 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
     .expect("encrypt");
 
     let msg = wa::Message {
-        enc_comment_message: Some(Box::new(wa::message::EncCommentMessage {
-            target_message_key: Some(wa::MessageKey {
+        enc_comment_message: buffa::MessageField::some(wa::message::EncCommentMessage {
+            target_message_key: buffa::MessageField::some(wa::MessageKey {
                 remote_jid: Some(group.to_string()),
                 from_me: Some(false),
                 id: Some(PARENT_ID.to_string()),
@@ -10068,13 +10079,13 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
             }),
             enc_payload: Some(payload),
             enc_iv: Some(iv.to_vec()),
-        })),
+        }),
         // WA Web ships the comment's own secret on the OUTER envelope (the
         // comment msgData), not inside the encrypted body.
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(comment_secret.to_vec()),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     let info = Arc::new(MessageInfo {
@@ -10103,13 +10114,13 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
                 seen = true;
                 assert_eq!(
                     msg.extended_text_message
-                        .as_ref()
+                        .as_option()
                         .and_then(|m| m.text.as_deref()),
                     Some("great post"),
                     "the decrypted body must be dispatched"
                 );
                 assert!(
-                    msg.enc_comment_message.is_none(),
+                    msg.enc_comment_message.is_unset(),
                     "the envelope must not survive substitution"
                 );
                 assert_eq!(
@@ -10119,7 +10130,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
                 );
                 assert_eq!(
                     msg.message_context_info
-                        .as_ref()
+                        .as_option()
                         .and_then(|m| m.message_secret.as_deref()),
                     Some(comment_secret.as_slice()),
                     "the comment's own secret must survive substitution for app-managed storage"
@@ -10178,10 +10189,10 @@ async fn addon_decrypts_right_after_capture_without_flush() {
 
     let parent_msg = wa::Message {
         conversation: Some("hello".to_string()),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(secret.to_vec()),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     let mk_info = |id: &str| {

@@ -18,6 +18,7 @@ bundled-sqlite = ["libsqlite3-sys/bundled"]
 
 [dependencies]
 async-trait = { workspace = true }
+buffa = { workspace = true }
 bytes = { workspace = true }
 diesel = { version = "2.3.10", default-features = false, features = [
     "sqlite",
@@ -29,13 +30,16 @@ diesel_migrations = { version = "2.3.2", default-features = false, features = [
 ] }
 libsqlite3-sys = { version = "0.37", default-features = false, optional = true }
 log = { workspace = true }
-prost = { workspace = true }
 # Shared across all r2d2 pools so each per-session store doesn't spawn its own pool of
 # management threads. Already in the tree transitively via r2d2 0.8.
 scheduled-thread-pool = "0.2"
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 wacore = { workspace = true }
+
+[build-dependencies]
+buffa-build = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 portable-atomic = { workspace = true }

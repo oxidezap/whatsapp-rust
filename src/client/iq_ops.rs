@@ -200,17 +200,17 @@ impl Client {
 fn build_ephemeral_setting_message(duration: u32, now_secs: i64) -> waproto::whatsapp::Message {
     use waproto::whatsapp as wa;
     wa::Message {
-        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-            r#type: Some(wa::message::protocol_message::Type::EphemeralSetting as i32),
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::EphemeralSetting),
             ephemeral_expiration: Some(duration),
             ephemeral_setting_timestamp: Some(now_secs),
-            disappearing_mode: Some(wa::DisappearingMode {
-                initiator: Some(wa::disappearing_mode::Initiator::ChangedInChat as i32),
-                trigger: Some(wa::disappearing_mode::Trigger::Unknown as i32),
+            disappearing_mode: buffa::MessageField::some(wa::DisappearingMode {
+                initiator: Some(wa::disappearing_mode::Initiator::ChangedInChat),
+                trigger: Some(wa::disappearing_mode::Trigger::Unknown),
                 ..Default::default()
             }),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     }
 }
@@ -223,27 +223,36 @@ mod tests {
     #[test]
     fn ephemeral_setting_message_shape() {
         let msg = build_ephemeral_setting_message(86400, 1_700_000_000);
-        let pm = msg.protocol_message.expect("protocol_message set");
+        let pm = msg
+            .protocol_message
+            .as_option()
+            .expect("protocol_message set");
         assert_eq!(
             pm.r#type,
-            Some(wa::message::protocol_message::Type::EphemeralSetting as i32)
+            Some(wa::message::protocol_message::Type::EphemeralSetting)
         );
         assert_eq!(pm.ephemeral_expiration, Some(86400));
         assert_eq!(pm.ephemeral_setting_timestamp, Some(1_700_000_000));
-        let dm = pm.disappearing_mode.expect("disappearing_mode set");
+        let dm = pm
+            .disappearing_mode
+            .as_option()
+            .expect("disappearing_mode set");
         assert_eq!(
             dm.initiator,
-            Some(wa::disappearing_mode::Initiator::ChangedInChat as i32)
+            Some(wa::disappearing_mode::Initiator::ChangedInChat)
         );
-        assert_eq!(
-            dm.trigger,
-            Some(wa::disappearing_mode::Trigger::Unknown as i32)
-        );
+        assert_eq!(dm.trigger, Some(wa::disappearing_mode::Trigger::Unknown));
     }
 
     #[test]
     fn ephemeral_setting_disable_uses_zero_duration() {
         let msg = build_ephemeral_setting_message(0, 1);
-        assert_eq!(msg.protocol_message.unwrap().ephemeral_expiration, Some(0));
+        assert_eq!(
+            msg.protocol_message
+                .as_option()
+                .unwrap()
+                .ephemeral_expiration,
+            Some(0)
+        );
     }
 }

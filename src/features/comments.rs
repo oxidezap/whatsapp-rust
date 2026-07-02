@@ -41,10 +41,10 @@ impl<'a> Comments<'a> {
         let chat = &chat.into();
         // WA Web encryptExtendedTextComment: the body is an extendedTextMessage.
         let body = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some(text.to_string()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         self.send_message(chat, parent_key, body).await
@@ -97,15 +97,15 @@ impl<'a> Comments<'a> {
         };
 
         let message = wa::Message {
-            enc_comment_message: Some(Box::new(wa::message::EncCommentMessage {
-                target_message_key: Some(parent_key),
+            enc_comment_message: buffa::MessageField::some(wa::message::EncCommentMessage {
+                target_message_key: buffa::MessageField::some(parent_key),
                 enc_payload: Some(enc_payload),
                 enc_iv: Some(iv.to_vec()),
-            })),
-            message_context_info: Some(Box::new(wa::MessageContextInfo {
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
                 message_secret: Some(comment_secret.to_vec()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         let result = client.send_message(chat, message).await?;

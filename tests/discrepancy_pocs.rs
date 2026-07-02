@@ -13,10 +13,10 @@ use waproto::whatsapp as wa;
 #[test]
 fn regression_a1_revoked_reaction_returns_sender_revoke() {
     let msg = wa::Message {
-        reaction_message: Some(Box::new(wa::message::ReactionMessage {
+        reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
             text: Some(String::new()),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     assert_eq!(
@@ -28,14 +28,14 @@ fn regression_a1_revoked_reaction_returns_sender_revoke() {
 #[test]
 fn regression_a1_keep_in_chat_undo_returns_sender_revoke() {
     let msg = wa::Message {
-        keep_in_chat_message: Some(Box::new(wa::message::KeepInChatMessage {
-            key: Some(wa::MessageKey {
+        keep_in_chat_message: buffa::MessageField::some(wa::message::KeepInChatMessage {
+            key: buffa::MessageField::some(wa::MessageKey {
                 from_me: Some(true),
                 ..Default::default()
             }),
-            keep_type: Some(wa::KeepType::UndoKeepForAll as i32),
+            keep_type: Some(wa::KeepType::UNDO_KEEP_FOR_ALL),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     assert_eq!(
@@ -47,12 +47,12 @@ fn regression_a1_keep_in_chat_undo_returns_sender_revoke() {
 #[test]
 fn regression_a1_secret_encrypted_message_edit_returns_message_edit() {
     let msg = wa::Message {
-        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
+        secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
             secret_enc_type: Some(
-                wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
+                wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT,
             ),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     assert_eq!(
@@ -64,12 +64,10 @@ fn regression_a1_secret_encrypted_message_edit_returns_message_edit() {
 #[test]
 fn regression_a1_secret_encrypted_event_edit_returns_message_edit() {
     let msg = wa::Message {
-        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
-            secret_enc_type: Some(
-                wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32,
-            ),
+        secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
+            secret_enc_type: Some(wa::message::secret_encrypted_message::SecretEncType::EVENT_EDIT),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     };
     assert_eq!(
@@ -105,7 +103,8 @@ fn regression_a5_useragent_phone_id_is_omitted_by_default() {
     let mut device = Device::new();
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
 
-    let user_agent = device.get_client_payload().user_agent.unwrap();
+    let payload = device.get_client_payload();
+    let user_agent = payload.user_agent.as_option().unwrap();
     assert!(
         user_agent.phone_id.is_none(),
         "phone_id must stay unset on the wire (WA Web never assigns UserAgent.phoneId)"
@@ -122,7 +121,12 @@ fn regression_a5_useragent_phone_id_can_be_overridden() {
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
 
     assert_eq!(
-        device.get_client_payload().user_agent.unwrap().phone_id,
+        device
+            .get_client_payload()
+            .user_agent
+            .into_option()
+            .unwrap()
+            .phone_id,
         Some("deadbeef-0000-0000-0000-000000000000".to_string()),
     );
 }
@@ -131,7 +135,8 @@ fn regression_a5_useragent_phone_id_can_be_overridden() {
 fn regression_a5_useragent_locale_is_configurable_and_default_is_country_code() {
     let mut device = Device::new();
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
-    let ua = device.get_client_payload().user_agent.unwrap();
+    let payload = device.get_client_payload();
+    let ua = payload.user_agent.as_option().unwrap();
     assert_eq!(ua.locale_language_iso6391.as_deref(), Some("en"));
     assert_eq!(ua.locale_country_iso31661_alpha2.as_deref(), Some("US"));
 
@@ -141,7 +146,8 @@ fn regression_a5_useragent_locale_is_configurable_and_default_is_country_code() 
     let mut device = Device::new();
     device.set_client_profile(profile);
     device.pn = Some("5511999999999@s.whatsapp.net".parse().unwrap());
-    let ua = device.get_client_payload().user_agent.unwrap();
+    let payload = device.get_client_payload();
+    let ua = payload.user_agent.as_option().unwrap();
     assert_eq!(ua.locale_language_iso6391.as_deref(), Some("pt"));
     assert_eq!(ua.locale_country_iso31661_alpha2.as_deref(), Some("BR"));
 }
@@ -227,7 +233,7 @@ fn wa_web_value_mac(
 fn regression_a7_content_mac_matches_wa_web_at_short_key_id() {
     use wacore::appstate::hash::generate_content_mac;
 
-    let op = wa::syncd_mutation::SyncdOperation::Set;
+    let op = wa::syncd_mutation::SyncdOperation::SET;
     let key = [7u8; 32];
     let key_id = vec![0u8, 0, 0, 0, 42, 1]; // 6 bytes, ad.length = 7
     let data = b"some-value";
@@ -243,7 +249,7 @@ fn regression_a7_content_mac_matches_wa_web_at_wrap_boundary() {
 
     // ad.length = 256: WA Web encodes octet[7] = 0; the pre-fix Rust code
     // encoded [0,0,0,0,0,0,1,0] (256 BE), which differed.
-    let op = wa::syncd_mutation::SyncdOperation::Set;
+    let op = wa::syncd_mutation::SyncdOperation::SET;
     let key = [9u8; 32];
     let key_id = vec![0xAA; 255];
     let data = b"x";

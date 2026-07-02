@@ -128,8 +128,8 @@ pub fn is_bot_context(chat_is_bot: bool, msg: &wa::Message) -> bool {
 fn invokes_bot(msg: &wa::Message) -> bool {
     let has_bot_metadata = |m: &wa::Message| {
         m.message_context_info
-            .as_ref()
-            .is_some_and(|c| c.bot_metadata.is_some())
+            .as_option()
+            .is_some_and(|c| c.bot_metadata.as_option().is_some())
     };
     // botMetadata sits on the top-level MessageContextInfo even when wrapped.
     has_bot_metadata(msg) || has_bot_metadata(msg.get_base_message()) || msg.mentions_any_bot()
@@ -137,10 +137,10 @@ fn invokes_bot(msg: &wa::Message) -> bool {
 
 fn message_is_poll_or_event(msg: &wa::Message) -> bool {
     let base = msg.get_base_message();
-    base.poll_creation_message.is_some()
-        || base.poll_creation_message_v2.is_some()
-        || base.poll_creation_message_v3.is_some()
-        || base.event_message.is_some()
+    base.poll_creation_message.as_option().is_some()
+        || base.poll_creation_message_v2.as_option().is_some()
+        || base.poll_creation_message_v3.as_option().is_some()
+        || base.event_message.as_option().is_some()
 }
 
 /// Classify a message for retention. Bot context wins (bot horizon), then
@@ -347,10 +347,10 @@ mod tests {
         assert!(is_bot_context(true, &wa::Message::default()));
         // bot_metadata on a non-bot (e.g. group) chat is still a bot context.
         let prompt = wa::Message {
-            message_context_info: Some(Box::new(wa::MessageContextInfo {
-                bot_metadata: Some(wa::BotMetadata::default()),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+                bot_metadata: buffa::MessageField::some(wa::BotMetadata::default()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(is_bot_context(false, &prompt));

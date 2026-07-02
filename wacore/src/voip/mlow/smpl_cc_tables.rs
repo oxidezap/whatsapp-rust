@@ -200,33 +200,7 @@ const NUM_RUNLEN_CMFS: usize = 20; // SMPL_MAX_SF_LEN(160) / RUNLENGTH_STEP
 const SPLIT_NUM_TABLES: usize = SMPL_MAX_PULSES_PER_SF * 4 - 1; // num_pulses 1..160
 
 /// On-disk packed seed (`tables.proto` `CcSeed`). `bytes` fields reshape row-major at build.
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct CcSeed {
-    #[prost(bytes = "vec", tag = "1")]
-    nrgres_gain4_dcmf: Vec<u8>, // [84]
-    #[prost(bytes = "vec", tag = "2")]
-    nrgres_shape4_dcmf: Vec<u8>, // [98]
-    #[prost(bytes = "vec", tag = "3")]
-    fcbg_offset_dcmf: Vec<u8>, // [3][4][176]
-    #[prost(bytes = "vec", tag = "4")]
-    acbgains_hr_dcmf: Vec<u8>, // [17][16]
-    #[prost(bytes = "vec", tag = "5")]
-    fcbgains_v_dcmf: Vec<u8>, // [34]
-    #[prost(bytes = "vec", tag = "6")]
-    fcbgains_v_delta_dcmf: Vec<u8>, // [67]
-    #[prost(sint32, repeated, tag = "7")]
-    acbgains_cb_hr_q14: Vec<i32>, // [16][2]
-    #[prost(uint32, tag = "8")]
-    gain_recon_base: u32,
-    #[prost(bytes = "vec", tag = "9")]
-    gain_recon: Vec<u8>, // gain-reconstruction int16 rodata
-    #[prost(bytes = "vec", tag = "10")]
-    n_pulses_dcmf_bgn: Vec<u8>, // [17]
-    #[prost(bytes = "vec", tag = "11")]
-    n_pulses_dcmf_uv: Vec<u8>, // [33]
-    #[prost(bytes = "vec", tag = "12")]
-    n_pulses_dcmf_v: Vec<u8>, // [33]
-}
+pub(crate) use super::smpl_tables_blob::tables::CcSeed;
 
 /// Runtime tables. CDFs are `u16` (the integer cmf fits 16 bits) to feed `decode_cdf`/`encode_cdf`
 /// directly, byte-identical to the old heap u16 reads. The accessor takes the LOGICAL index.
@@ -331,7 +305,7 @@ static TABLES: OnceLock<CcTables> = OnceLock::new();
 pub(crate) fn load_cc_tables() -> &'static CcTables {
     TABLES.get_or_init(|| {
         let seed: CcSeed =
-            super::smpl_tables_blob::load_blob_prost(include_bytes!("testdata/cc_seed.bin"));
+            super::smpl_tables_blob::load_blob_buffa(include_bytes!("testdata/cc_seed.bin"));
         seed.build()
     })
 }

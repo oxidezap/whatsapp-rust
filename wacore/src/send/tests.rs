@@ -95,26 +95,26 @@ mod peer_message_options {
     use super::*;
     use crate::types::message::{PrivacySensitiveType, PushPriority};
 
-    fn pdo_message_raw(request_type: i32) -> wa::Message {
+    fn pdo_message_raw(
+        request_type: Option<wa::message::PeerDataOperationRequestType>,
+    ) -> wa::Message {
         wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(
-                    wa::message::protocol_message::Type::PeerDataOperationRequestMessage as i32,
-                ),
-                peer_data_operation_request_message: Some(
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::PeerDataOperationRequestMessage),
+                peer_data_operation_request_message: buffa::MessageField::some(
                     wa::message::PeerDataOperationRequestMessage {
-                        peer_data_operation_request_type: Some(request_type),
+                        peer_data_operation_request_type: request_type,
                         ..Default::default()
                     },
                 ),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         }
     }
 
     fn pdo_message(request_type: wa::message::PeerDataOperationRequestType) -> wa::Message {
-        pdo_message_raw(request_type as i32)
+        pdo_message_raw(Some(request_type))
     }
 
     #[test]
@@ -177,17 +177,19 @@ mod peer_message_options {
     #[test]
     fn non_pdo_and_unknown_pdo_keep_peer_defaults() {
         let app_state_key_request = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest as i32),
-                app_state_sync_key_request: Some(wa::message::AppStateSyncKeyRequest {
-                    key_ids: Vec::new(),
-                }),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest),
+                app_state_sync_key_request: buffa::MessageField::some(
+                    wa::message::AppStateSyncKeyRequest {
+                        key_ids: Vec::new(),
+                    },
+                ),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
 
-        for msg in [app_state_key_request, pdo_message_raw(99)] {
+        for msg in [app_state_key_request, pdo_message_raw(None)] {
             let options = peer_message_options_from_message(&msg);
             assert_eq!(options.push_priority(), PushPriority::High);
             assert_eq!(options.privacy_sensitive(), None);
@@ -201,10 +203,10 @@ mod status_carries_privacy_meta {
     #[test]
     fn true_for_text_post() {
         let msg = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some("hi".into()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(status_carries_privacy_meta(&msg));
@@ -213,7 +215,7 @@ mod status_carries_privacy_meta {
     #[test]
     fn true_for_image_post() {
         let msg = wa::Message {
-            image_message: Some(Box::new(wa::message::ImageMessage::default())),
+            image_message: buffa::MessageField::some(wa::message::ImageMessage::default()),
             ..Default::default()
         };
         assert!(status_carries_privacy_meta(&msg));
@@ -222,10 +224,10 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_reaction() {
         let msg = wa::Message {
-            reaction_message: Some(Box::new(wa::message::ReactionMessage {
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
                 text: Some("💚".into()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(
@@ -237,7 +239,7 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_enc_reaction() {
         let msg = wa::Message {
-            enc_reaction_message: Some(Box::default()),
+            enc_reaction_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
@@ -246,10 +248,10 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_revoke() {
         let msg = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::Revoke as i32),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
@@ -260,10 +262,10 @@ mod status_carries_privacy_meta {
         // Other ProtocolMessage types (e.g., EphemeralSettings) aren't
         // reactions and aren't revokes — treat as posts for now.
         let msg = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::EphemeralSetting as i32),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::EphemeralSetting),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(status_carries_privacy_meta(&msg));
@@ -272,13 +274,13 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_reaction_inside_ephemeral_wrapper() {
         let inner = wa::Message {
-            reaction_message: Some(Box::default()),
+            reaction_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         let msg = wa::Message {
-            ephemeral_message: Some(Box::new(wa::message::FutureProofMessage {
-                message: Some(Box::new(inner)),
-            })),
+            ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(inner),
+            }),
             ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
@@ -287,18 +289,18 @@ mod status_carries_privacy_meta {
     #[test]
     fn false_for_revoke_inside_device_sent_wrapper() {
         let inner = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::Revoke as i32),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::Revoke),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         let msg = wa::Message {
-            device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+            device_sent_message: buffa::MessageField::some(wa::message::DeviceSentMessage {
                 destination_jid: Some(String::new()),
-                message: Some(Box::new(inner)),
+                message: buffa::MessageField::some(inner),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(!status_carries_privacy_meta(&msg));
@@ -308,16 +310,19 @@ mod status_carries_privacy_meta {
 #[test]
 fn build_member_label_message_sets_fields() {
     let msg = build_member_label_message("VIP".to_string(), 1_766_847_151);
-    let pm = msg.protocol_message.as_ref().expect("protocol_message set");
+    let pm = msg
+        .protocol_message
+        .as_option()
+        .expect("protocol_message set");
     assert_eq!(
         pm.r#type,
-        Some(wa::message::protocol_message::Type::GroupMemberLabelChange as i32)
+        Some(wa::message::protocol_message::Type::GroupMemberLabelChange)
     );
-    let ml = pm.member_label.as_ref().expect("member_label set");
+    let ml = pm.member_label.as_option().expect("member_label set");
     assert_eq!(ml.label.as_deref(), Some("VIP"));
     assert_eq!(ml.label_timestamp, Some(1_766_847_151));
     assert!(
-        pm.key.is_none(),
+        pm.key.is_unset(),
         "MessageKey must NOT be set (WA Web parity)"
     );
 }
@@ -327,10 +332,10 @@ fn build_member_label_message_clear_uses_empty_string() {
     let msg = build_member_label_message(String::new(), 1);
     let ml = msg
         .protocol_message
-        .as_ref()
+        .as_option()
         .unwrap()
         .member_label
-        .as_ref()
+        .as_option()
         .unwrap();
     assert_eq!(ml.label.as_deref(), Some(""));
 }
@@ -340,10 +345,10 @@ fn build_member_label_message_preserves_unicode() {
     let msg = build_member_label_message("🚀 BOT".to_string(), 2);
     let ml = msg
         .protocol_message
-        .as_ref()
+        .as_option()
         .unwrap()
         .member_label
-        .as_ref()
+        .as_option()
         .unwrap();
     assert_eq!(ml.label.as_deref(), Some("🚀 BOT"));
 }
@@ -1547,7 +1552,7 @@ mod group_retry {
     async fn dm_retry_pkmsg_with_account_has_device_identity() {
         let (mut ss, mut is, jid) = setup_session().await;
         let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
-        let acc = wa::AdvSignedDeviceIdentity {
+        let acc = wa::ADVSignedDeviceIdentity {
             details: Some(b"t".to_vec()),
             ..Default::default()
         };
@@ -1581,7 +1586,7 @@ mod group_retry {
         let (mut ss, mut is, jid) = setup_session().await;
         let group: Jid = "120363098765432100@g.us".parse().unwrap();
         let p: Jid = jid.to_string().parse().unwrap();
-        let acc = wa::AdvSignedDeviceIdentity {
+        let acc = wa::ADVSignedDeviceIdentity {
             details: Some(b"t".to_vec()),
             ..Default::default()
         };
@@ -1634,7 +1639,7 @@ mod group_retry {
             &wa::Message::default(),
             "m2".into(),
             3,
-            Some(&wa::AdvSignedDeviceIdentity::default()),
+            Some(&wa::ADVSignedDeviceIdentity::default()),
             AddressingMode::Lid,
             None,
         )
@@ -1726,10 +1731,10 @@ mod group_retry {
     // layer skips session promotion. Mirrors whatsmeow's
     // `preparePeerMessageNode`.
 
-    fn pkmsg_account_proto() -> wa::AdvSignedDeviceIdentity {
+    fn pkmsg_account_proto() -> wa::ADVSignedDeviceIdentity {
         // Opaque placeholder bytes — the assertions only check that
         // the element carries non-empty content.
-        wa::AdvSignedDeviceIdentity {
+        wa::ADVSignedDeviceIdentity {
             details: Some(vec![0u8; 32]),
             account_signature_key: Some(vec![0u8; 32]),
             account_signature: Some(vec![0u8; 64]),
@@ -1738,13 +1743,13 @@ mod group_retry {
     }
 
     async fn build_peer_stanza(
-        account: Option<&wa::AdvSignedDeviceIdentity>,
+        account: Option<&wa::ADVSignedDeviceIdentity>,
     ) -> wacore_binary::Node {
         build_peer_stanza_with_options(account, PeerMessageOptions::default()).await
     }
 
     async fn build_peer_stanza_with_options(
-        account: Option<&wa::AdvSignedDeviceIdentity>,
+        account: Option<&wa::ADVSignedDeviceIdentity>,
         options: PeerMessageOptions,
     ) -> wacore_binary::Node {
         let (mut ss, mut is, jid) = setup_session().await;
@@ -2119,7 +2124,7 @@ mod decrypt_fail {
     #[test]
     fn reaction() {
         let msg = wa::Message {
-            reaction_message: Some(Box::default()),
+            reaction_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2128,7 +2133,7 @@ mod decrypt_fail {
     #[test]
     fn pin() {
         let msg = wa::Message {
-            pin_in_chat_message: Some(Box::default()),
+            pin_in_chat_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2137,10 +2142,10 @@ mod decrypt_fail {
     #[test]
     fn poll_vote() {
         let msg = wa::Message {
-            poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
-                vote: Some(Default::default()),
+            poll_update_message: buffa::MessageField::some(wa::message::PollUpdateMessage {
+                vote: buffa::MessageField::some(Default::default()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2149,7 +2154,7 @@ mod decrypt_fail {
     #[test]
     fn poll_update_without_vote() {
         let msg = wa::Message {
-            poll_update_message: Some(Box::default()),
+            poll_update_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(!should_hide_decrypt_fail(&msg));
@@ -2158,12 +2163,12 @@ mod decrypt_fail {
     #[test]
     fn reaction_inside_ephemeral_wrapper() {
         let msg = wa::Message {
-            ephemeral_message: Some(Box::new(wa::message::FutureProofMessage {
-                message: Some(Box::new(wa::Message {
-                    reaction_message: Some(Box::default()),
+            ephemeral_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                message: buffa::MessageField::some(wa::Message {
+                    reaction_message: buffa::MessageField::some(Default::default()),
                     ..Default::default()
-                })),
-            })),
+                }),
+            }),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2172,7 +2177,7 @@ mod decrypt_fail {
     #[test]
     fn conditional_reveal() {
         let msg = wa::Message {
-            conditional_reveal_message: Some(Box::default()),
+            conditional_reveal_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2182,10 +2187,12 @@ mod decrypt_fail {
     fn poll_add_option_edit() {
         use wa::message::secret_encrypted_message::SecretEncType;
         let msg = wa::Message {
-            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
-                secret_enc_type: Some(SecretEncType::PollAddOption as i32),
-                ..Default::default()
-            })),
+            secret_encrypted_message: buffa::MessageField::some(
+                wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(SecretEncType::PollAddOption),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail(&msg));
@@ -2231,7 +2238,7 @@ mod decrypt_fail_for_send {
     fn revoke_does_not_block_content_based_hide() {
         // A reaction still hides on its own merits even under a revoke edit.
         let msg = wa::Message {
-            reaction_message: Some(Box::default()),
+            reaction_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert!(should_hide_decrypt_fail_for_send(
@@ -2247,10 +2254,12 @@ mod stanza_type {
 
     fn secret(enc: SecretEncType) -> wa::Message {
         wa::Message {
-            secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
-                secret_enc_type: Some(enc as i32),
-                ..Default::default()
-            })),
+            secret_encrypted_message: buffa::MessageField::some(
+                wa::message::SecretEncryptedMessage {
+                    secret_enc_type: Some(enc),
+                    ..Default::default()
+                },
+            ),
             ..Default::default()
         }
     }
@@ -2274,7 +2283,7 @@ mod stanza_type {
     #[test]
     fn album_is_text() {
         let msg = wa::Message {
-            album_message: Some(Box::default()),
+            album_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&msg), stanza::MSG_TYPE_TEXT);
@@ -2283,10 +2292,10 @@ mod stanza_type {
     // Helpers for wrapper tests. WA Web's typeAttributeFromProtobuf unwraps
     // FutureProofMessage wrappers (via getUnwrappedProtobufMessage) and then
     // classifies the inner message.
-    fn fpm(inner: wa::Message) -> Box<wa::message::FutureProofMessage> {
-        Box::new(wa::message::FutureProofMessage {
-            message: Some(Box::new(inner)),
-        })
+    fn fpm(inner: wa::Message) -> wa::message::FutureProofMessage {
+        wa::message::FutureProofMessage {
+            message: buffa::MessageField::some(inner),
+        }
     }
     fn text_inner() -> wa::Message {
         wa::Message {
@@ -2296,7 +2305,7 @@ mod stanza_type {
     }
     fn image_inner() -> wa::Message {
         wa::Message {
-            image_message: Some(Box::default()),
+            image_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         }
     }
@@ -2304,7 +2313,7 @@ mod stanza_type {
     #[test]
     fn group_status_v2_classifies_by_inner() {
         let txt = wa::Message {
-            group_status_message_v2: Some(fpm(text_inner())),
+            group_status_message_v2: buffa::MessageField::some(fpm(text_inner())),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&txt), stanza::MSG_TYPE_TEXT);
@@ -2313,7 +2322,7 @@ mod stanza_type {
         // mediatype and silently dropped the stanza. WA Web unwraps it and
         // sends type="media" mediatype="image".
         let img = wa::Message {
-            group_status_message_v2: Some(fpm(image_inner())),
+            group_status_message_v2: buffa::MessageField::some(fpm(image_inner())),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&img), stanza::MSG_TYPE_MEDIA);
@@ -2326,7 +2335,7 @@ mod stanza_type {
         // (ephemeral/groupMentioned/botInvoke/deviceSent), so it falls through
         // to the media default in both WA Web and here.
         let m = wa::Message {
-            group_status_message_v2: Some(Box::default()),
+            group_status_message_v2: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_MEDIA);
@@ -2337,23 +2346,23 @@ mod stanza_type {
         // Payment family classifies as text; the media default would be dropped.
         let cases = [
             wa::Message {
-                request_payment_message: Some(Box::default()),
+                request_payment_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
             wa::Message {
-                send_payment_message: Some(Box::default()),
+                send_payment_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
             wa::Message {
-                decline_payment_request_message: Some(Box::default()),
+                decline_payment_request_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
             wa::Message {
-                cancel_payment_request_message: Some(Box::default()),
+                cancel_payment_request_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
             wa::Message {
-                payment_invite_message: Some(Box::default()),
+                payment_invite_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             },
         ];
@@ -2366,13 +2375,13 @@ mod stanza_type {
     #[test]
     fn backfilled_wrappers_classify_by_inner() {
         let spoiler = wa::Message {
-            spoiler_message: Some(fpm(text_inner())),
+            spoiler_message: buffa::MessageField::some(fpm(text_inner())),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&spoiler), stanza::MSG_TYPE_TEXT);
 
         let status_mention = wa::Message {
-            status_mention_message: Some(fpm(image_inner())),
+            status_mention_message: buffa::MessageField::some(fpm(image_inner())),
             ..Default::default()
         };
         assert_eq!(
@@ -2382,13 +2391,13 @@ mod stanza_type {
         assert_eq!(media_type_from_message(&status_mention), Some("image"));
 
         let question = wa::Message {
-            question_message: Some(fpm(text_inner())),
+            question_message: buffa::MessageField::some(fpm(text_inner())),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&question), stanza::MSG_TYPE_TEXT);
 
         let group_status_v1 = wa::Message {
-            group_status_message: Some(fpm(text_inner())),
+            group_status_message: buffa::MessageField::some(fpm(text_inner())),
             ..Default::default()
         };
         assert_eq!(
@@ -2401,11 +2410,11 @@ mod stanza_type {
     fn nested_wrappers_reach_innermost() {
         // ephemeral { viewOnceV2 { image } } -> media + mediatype.
         let inner = wa::Message {
-            view_once_message_v2: Some(fpm(image_inner())),
+            view_once_message_v2: buffa::MessageField::some(fpm(image_inner())),
             ..Default::default()
         };
         let m = wa::Message {
-            ephemeral_message: Some(fpm(inner)),
+            ephemeral_message: buffa::MessageField::some(fpm(inner)),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_MEDIA);
@@ -2415,19 +2424,19 @@ mod stanza_type {
     #[test]
     fn preserved_classifier_branches() {
         let r = wa::Message {
-            reaction_message: Some(Box::default()),
+            reaction_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&r), stanza::MSG_TYPE_REACTION);
 
         let ev = wa::Message {
-            event_message: Some(Box::default()),
+            event_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&ev), stanza::MSG_TYPE_EVENT);
 
         let poll = wa::Message {
-            poll_creation_message_v3: Some(Box::default()),
+            poll_creation_message_v3: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&poll), stanza::MSG_TYPE_POLL);
@@ -2442,16 +2451,16 @@ mod stanza_type {
         );
 
         let proto = wa::Message {
-            protocol_message: Some(Box::default()),
+            protocol_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&proto), stanza::MSG_TYPE_TEXT);
 
         let url = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 matched_text: Some("https://example.com".to_string()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&url), stanza::MSG_TYPE_MEDIA);
@@ -2462,14 +2471,14 @@ mod stanza_type {
         // WA Web's mediaTypeFromProtobuf maps these to concrete mediatypes;
         // omitting the attribute makes the server drop the type="media" stanza.
         let list = wa::Message {
-            list_message: Some(Box::default()),
+            list_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&list), stanza::MSG_TYPE_MEDIA);
         assert_eq!(media_type_from_message(&list), Some("list"));
 
         let list_response = wa::Message {
-            list_response_message: Some(Box::default()),
+            list_response_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(
@@ -2478,7 +2487,7 @@ mod stanza_type {
         );
 
         let buttons_response = wa::Message {
-            buttons_response_message: Some(Box::default()),
+            buttons_response_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(
@@ -2487,19 +2496,19 @@ mod stanza_type {
         );
 
         let order = wa::Message {
-            order_message: Some(Box::default()),
+            order_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(media_type_from_message(&order), Some("order"));
 
         let product = wa::Message {
-            product_message: Some(Box::default()),
+            product_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(media_type_from_message(&product), Some("product"));
 
         let interactive_response = wa::Message {
-            interactive_response_message: Some(Box::default()),
+            interactive_response_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(
@@ -2508,7 +2517,7 @@ mod stanza_type {
         );
 
         let history_bundle = wa::Message {
-            message_history_bundle: Some(Box::default()),
+            message_history_bundle: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(
@@ -2523,7 +2532,7 @@ mod stanza_type {
         // mapper has no Button case (returns null/DROP_ATTR), so the attribute
         // is omitted. Adding a "buttons" mediatype would diverge from WA Web.
         let buttons = wa::Message {
-            buttons_message: Some(Box::default()),
+            buttons_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(media_type_from_message(&buttons), None);
@@ -2532,8 +2541,8 @@ mod stanza_type {
     #[test]
     fn ephemeral_wrapped_list_reaches_list_mediatype() {
         let m = wa::Message {
-            ephemeral_message: Some(fpm(wa::Message {
-                list_message: Some(Box::default()),
+            ephemeral_message: buffa::MessageField::some(fpm(wa::Message {
+                list_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             })),
             ..Default::default()
@@ -2547,7 +2556,7 @@ mod stanza_type {
         // as a terminal "sticker" and does NOT recurse into it, unlike the
         // stanza-type path which unwraps it.
         let lottie = wa::Message {
-            lottie_sticker_message: Some(fpm(image_inner())),
+            lottie_sticker_message: buffa::MessageField::some(fpm(image_inner())),
             ..Default::default()
         };
         assert_eq!(media_type_from_message(&lottie), Some("sticker"));
@@ -3119,10 +3128,10 @@ mod mark_full_distribution_list {
 
         // Excluded type (reaction) → no secret, no <reporting> node.
         let reaction = wa::Message {
-            reaction_message: Some(Box::new(wa::message::ReactionMessage {
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
                 text: Some("👍".into()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         let (node, has_secret) = prepare(

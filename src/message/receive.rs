@@ -1331,7 +1331,7 @@ impl Client {
 
         // Validate DSM presence against sender identity
         // (WAWebHandleMsgError.DeviceSentMessageError)
-        if original_msg.device_sent_message.is_some() && !info.source.is_from_me {
+        if original_msg.device_sent_message.is_set() && !info.source.is_from_me {
             warn!(
                 "[msg:{}] DeviceSentMessage present but sender {} is not self",
                 info.id,
@@ -1343,7 +1343,7 @@ impl Client {
         // phashV2 of the broadcast recipients in deviceSentMessage.phash.
         // Recompute over our <participants> view and warn on divergence. We log
         // only (no drop) until the participant hash form is confirmed live.
-        if let Some(dsm) = &original_msg.device_sent_message
+        if let Some(dsm) = original_msg.device_sent_message.as_option()
             && let Some(expected) = dsm.phash.as_deref()
             && !info.bcl_participants.is_empty()
             && !wacore::messages::MessageUtils::validate_bcl_hash(&info.bcl_participants, expected)
@@ -1362,7 +1362,7 @@ impl Client {
         let mut msg = wacore::messages::unwrap_device_sent(original_msg);
 
         // Post-decryption logic (SKDM, sync keys, etc.)
-        if let Some(skdm) = &msg.sender_key_distribution_message
+        if let Some(skdm) = msg.sender_key_distribution_message.as_option()
             && let Some(axolotl_bytes) = &skdm.axolotl_sender_key_distribution_message
         {
             self.handle_sender_key_distribution_message(
@@ -1378,8 +1378,8 @@ impl Client {
         // inject keys and forge app-state mutations, so honour it only from
         // self. WA Web `WAWebKeyManagementHandleKeyShareApi` gates on
         // `isMeAccountNonLid(from)`; whatsmeow on `info.IsFromMe`.
-        if let Some(protocol_msg) = &msg.protocol_message
-            && let Some(keys) = &protocol_msg.app_state_sync_key_share
+        if let Some(protocol_msg) = msg.protocol_message.as_option()
+            && let Some(keys) = protocol_msg.app_state_sync_key_share.as_option()
         {
             if info.source.is_from_me {
                 self.handle_app_state_sync_key_share(keys).await;
@@ -1396,8 +1396,8 @@ impl Client {
         // companions (WA Web HandleMsgProcess -> setLidMigrationMappings).
         // Self-only: a peer could otherwise flip the account to LID addressing
         // and poison the LID-PN cache.
-        if let Some(protocol_msg) = &msg.protocol_message
-            && let Some(mapping_sync) = &protocol_msg.lid_migration_mapping_sync_message
+        if let Some(protocol_msg) = msg.protocol_message.as_option()
+            && let Some(mapping_sync) = protocol_msg.lid_migration_mapping_sync_message.as_option()
         {
             if info.source.is_from_me {
                 self.handle_lid_migration_mapping_sync(mapping_sync).await;
@@ -1412,8 +1412,10 @@ impl Client {
 
         // PDO responses come from our own account (is_from_me) via device 0 (primary phone)
         if info.source.is_from_me
-            && let Some(protocol_msg) = &msg.protocol_message
-            && let Some(pdo_response) = &protocol_msg.peer_data_operation_request_response_message
+            && let Some(protocol_msg) = msg.protocol_message.as_option()
+            && let Some(pdo_response) = protocol_msg
+                .peer_data_operation_request_response_message
+                .as_option()
         {
             self.handle_pdo_response(pdo_response, info).await;
         }
@@ -1421,7 +1423,7 @@ impl Client {
         // Note: msg might be modified by take() below
         let history_sync_taken = msg
             .protocol_message
-            .as_mut()
+            .as_option_mut()
             .and_then(|pm| pm.history_sync_notification.take());
 
         // history_sync_notification is self-only (our phone drives history sync).

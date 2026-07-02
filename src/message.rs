@@ -2,8 +2,6 @@ use crate::client::Client;
 use crate::types::events::Event;
 use crate::types::message::MessageInfo;
 use log::{debug, warn};
-use prost::Message as ProtoMessage;
-
 use std::sync::Arc;
 use wacore::libsignal::crypto::DecryptionError;
 use wacore::libsignal::protocol::SenderKeyDistributionMessage;

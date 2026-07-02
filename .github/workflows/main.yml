@@ -77,6 +77,12 @@ jobs:
         run: cargo build --workspace --exclude e2e-tests --all-targets --verbose
       - name: Run tests
         run: cargo test --workspace --exclude e2e-tests --verbose -- --nocapture
+      # waproto serde tests are feature-gated and produce zero tests under the
+      # default feature set, so exercise each representation explicitly.
+      - name: Test waproto serde (enum repr)
+        run: cargo test -p waproto --features serde-enum-repr --verbose
+      - name: Test waproto serde (snake_case)
+        run: cargo test -p waproto --features serde-snake-case --verbose
 
   test-all-features:
     name: Build & Lint (all features)

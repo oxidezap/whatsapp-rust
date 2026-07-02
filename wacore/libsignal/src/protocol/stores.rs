@@ -1,6 +1,6 @@
 // Re-exporting structures from waproto to avoid duplication
 pub use waproto::whatsapp::{
-    IdentityKeyPairStructure, PreKeyRecordStructure, RecordStructure, SenderKeyRecordStructure,
+    IdentityKeyPairStructure, PreKeyRecordStructure, SenderKeyRecordStructure,
     SenderKeyStateStructure, SessionStructure, SignedPreKeyRecordStructure,
 };
 

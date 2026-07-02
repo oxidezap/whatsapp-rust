@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use log::warn;
-use prost::Message as _;
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 use wacore::stanza::call::{CAPABILITY_OFFER, OfferDeviceKey, OfferParams, build_offer};
@@ -145,10 +144,11 @@ impl<'a> AcceptCall<'a> {
             .map_err(|e| CallError::Decrypt(e.to_string()))?;
         let unpadded = MessageUtils::unpad_message_ref(&plaintext, enc.version)
             .map_err(|e| CallError::Decrypt(e.to_string()))?;
-        let msg = wa::Message::decode(unpadded)
+        let msg = waproto::codec::message_decode(unpadded)
             .map_err(|e| CallError::Decrypt(format!("decode call message: {e}")))?;
         let call_key = msg
             .call
+            .into_option()
             .and_then(|c| c.call_key)
             .ok_or(CallError::Media("offer carried no callKey"))?;
 
@@ -431,10 +431,10 @@ async fn place_call(
     // decrypting the per-device <enc> we send below.
     let call_key = rand::random::<[u8; 32]>();
     let padded = MessageUtils::encode_and_pad(&wa::Message {
-        call: Some(Box::new(wa::message::Call {
+        call: buffa::MessageField::some(wa::message::Call {
             call_key: Some(call_key.to_vec()),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     });
 
@@ -1691,7 +1691,7 @@ mod tests {
         .await;
         // Set the ADV account so a pkmsg offer attaches a <device-identity> (as the send path does).
         pm.process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
-            wa::AdvSignedDeviceIdentity {
+            wa::ADVSignedDeviceIdentity {
                 details: Some(vec![0u8; 32]),
                 account_signature_key: Some(vec![0u8; 32]),
                 account_signature: Some(vec![0u8; 64]),
@@ -2507,7 +2507,7 @@ mod tests {
         )))
         .await;
         pm.process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
-            wa::AdvSignedDeviceIdentity {
+            wa::ADVSignedDeviceIdentity {
                 details: Some(vec![0u8; 32]),
                 account_signature_key: Some(vec![0u8; 32]),
                 account_signature: Some(vec![0u8; 64]),

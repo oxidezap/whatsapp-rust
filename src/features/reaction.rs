@@ -8,6 +8,7 @@
 //! message's `messageSecret` and emits an `enc_reaction_message` envelope.
 //! [`Client::send_reaction`] applies the same gate transparently.
 
+use buffa::MessageField;
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
@@ -102,11 +103,11 @@ impl Client {
         }
 
         let message = wa::Message {
-            enc_reaction_message: Some(Box::new(wa::message::EncReactionMessage {
-                target_message_key: Some(target_key),
+            enc_reaction_message: MessageField::some(wa::message::EncReactionMessage {
+                target_message_key: MessageField::some(target_key),
                 enc_payload: Some(enc_payload),
                 enc_iv: Some(iv.to_vec()),
-            })),
+            }),
             ..Default::default()
         };
         self.send_message(chat, message).await

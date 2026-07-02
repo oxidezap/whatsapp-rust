@@ -36,15 +36,15 @@ fn bench_participant_list_hash_1600(bencher: divan::Bencher) {
 
 fn text_message() -> wa::Message {
     wa::Message {
-        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
             text: Some("Benchmark message with a realistic amount of text content.".into()),
-            context_info: Some(Box::new(wa::ContextInfo {
+            context_info: buffa::MessageField::some(wa::ContextInfo {
                 stanza_id: Some("3EB0F4E1D2C3B4A59687".into()),
                 participant: Some("5511999990000@s.whatsapp.net".into()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     }
 }
@@ -63,7 +63,7 @@ fn bench_encode_and_pad(bencher: divan::Bencher) {
 fn bench_unpad_message_ref(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| {
-            use prost::Message as _;
+            use buffa::Message as _;
             MessageUtils::pad_message_v2(text_message().encode_to_vec())
         })
         .bench_refs(|padded| {
@@ -79,7 +79,7 @@ fn dm_shape(shape: &str) -> wa::Message {
     match shape {
         "text_reply" => text_message(),
         "media_refs" => wa::Message {
-            image_message: Some(Box::new(wa::message::ImageMessage {
+            image_message: buffa::MessageField::some(wa::message::ImageMessage {
                 url: Some("https://mmg.whatsapp.net/v/t62.7118-24/abc123".into()),
                 direct_path: Some("/v/t62.7118-24/abc123".into()),
                 mimetype: Some("image/jpeg".into()),
@@ -92,7 +92,7 @@ fn dm_shape(shape: &str) -> wa::Message {
                 width: Some(960),
                 jpeg_thumbnail: Some(vec![0x7F; 6 * 1024]),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         },
         "large_text" => wa::Message {
@@ -108,10 +108,12 @@ fn recv_shape(shape: &str) -> wa::Message {
         // The first group message from a sender carries the SKDM inline
         // alongside the content.
         "group_skdm_text" => wa::Message {
-            sender_key_distribution_message: Some(wa::message::SenderKeyDistributionMessage {
-                group_id: Some("120363000000000001@g.us".into()),
-                axolotl_sender_key_distribution_message: Some(vec![0x33; 350]),
-            }),
+            sender_key_distribution_message: buffa::MessageField::some(
+                wa::message::SenderKeyDistributionMessage {
+                    group_id: Some("120363000000000001@g.us".into()),
+                    axolotl_sender_key_distribution_message: Some(vec![0x33; 350]),
+                },
+            ),
             conversation: Some("Benchmark group message with realistic text.".into()),
             ..Default::default()
         },
@@ -126,7 +128,7 @@ fn recv_shape(shape: &str) -> wa::Message {
 fn bench_decode_plaintext(bencher: divan::Bencher, shape: &str) {
     bencher
         .with_inputs(|| {
-            use prost::Message as _;
+            use buffa::Message as _;
             MessageUtils::pad_message_v2(recv_shape(shape).encode_to_vec())
         })
         .bench_refs(|padded| {

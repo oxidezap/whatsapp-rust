@@ -64,9 +64,10 @@ fn setup_patch(n: usize) -> PatchFixture {
         let index = format!("[\"star\",\"5511{i:09}@s.whatsapp.net\"]");
         let value = wa::SyncActionValue {
             timestamp: Some(1_700_000_000 + i as i64),
-            star_action: Some(wa::sync_action_value::StarAction {
+            star_action: wa::sync_action_value::StarAction {
                 starred: Some(i % 2 == 0),
-            }),
+            }
+            .into(),
             ..Default::default()
         };
         let iv = [i as u8; 16];
@@ -81,8 +82,8 @@ fn setup_patch(n: usize) -> PatchFixture {
         );
         // Half the indices have a stored previous value the prev-lookup hits.
         if i % 2 == 0
-            && let Some(rec) = &mutation.record
-            && let Some(idx) = rec.index.as_ref().and_then(|x| x.blob.clone())
+            && let Some(rec) = mutation.record.as_option()
+            && let Some(idx) = rec.index.as_option().and_then(|x| x.blob.clone())
         {
             prev_macs.insert(idx, vec![0x55u8; 32]);
         }
@@ -99,11 +100,12 @@ fn setup_patch(n: usize) -> PatchFixture {
     state.version = 0;
 
     let mut patch = wa::SyncdPatch {
-        version: Some(wa::SyncdVersion { version: Some(1) }),
+        version: wa::SyncdVersion { version: Some(1) }.into(),
         mutations,
-        key_id: Some(wa::KeyId {
+        key_id: wa::KeyId {
             id: Some(key_id.clone()),
-        }),
+        }
+        .into(),
         snapshot_mac: Some(snapshot_mac),
         ..Default::default()
     };
@@ -165,9 +167,10 @@ fn setup_record(
                 .to_string(),
             wa::SyncActionValue {
                 timestamp: Some(1_700_000_000),
-                star_action: Some(wa::sync_action_value::StarAction {
+                star_action: wa::sync_action_value::StarAction {
                     starred: Some(true),
-                }),
+                }
+                .into(),
                 ..Default::default()
             },
         ),
@@ -177,11 +180,12 @@ fn setup_record(
             "[\"contact\",\"5511999998888@s.whatsapp.net\"]".to_string(),
             wa::SyncActionValue {
                 timestamp: Some(1_700_000_000),
-                contact_action: Some(wa::sync_action_value::ContactAction {
+                contact_action: wa::sync_action_value::ContactAction {
                     full_name: Some("Benchmark Contact Full Name".to_string()),
                     first_name: Some("Benchmark".to_string()),
                     ..Default::default()
-                }),
+                }
+                .into(),
                 ..Default::default()
             },
         ),

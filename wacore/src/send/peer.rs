@@ -10,7 +10,7 @@ pub async fn prepare_peer_stanza<S, I>(
     signal_address: &ProtocolAddress,
     message: &wa::Message,
     request_id: String,
-    account: Option<&wa::AdvSignedDeviceIdentity>,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
 ) -> Result<Node>
 where
     S: crate::libsignal::protocol::SessionStore,
@@ -39,7 +39,7 @@ pub async fn prepare_peer_stanza_with_options<S, I>(
     signal_address: &ProtocolAddress,
     message: &wa::Message,
     request_id: String,
-    account: Option<&wa::AdvSignedDeviceIdentity>,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
     options: PeerMessageOptions,
 ) -> Result<Node>
 where

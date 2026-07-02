@@ -7,7 +7,7 @@
 
 use crate::libsignal::protocol::PublicKey;
 use crate::store::traits::DeviceInfo;
-use prost::Message;
+use buffa::Message;
 
 // ADV signature prefixes (WAWebAdvSignatureConstants). The hosted ([6,5]/[6,6])
 // variants apply to business-hosted companion devices.
@@ -57,7 +57,8 @@ pub fn validate_adv_with_identity_key(
     fetched_identity_key: &[u8; 32],
     account_identity_fallback: Option<&[u8; 32]>,
 ) -> AdvValidation {
-    let Ok(signed) = waproto::whatsapp::AdvSignedDeviceIdentity::decode(device_identity_bytes)
+    let Ok(signed) =
+        waproto::whatsapp::ADVSignedDeviceIdentity::decode_from_slice(device_identity_bytes)
     else {
         return AdvValidation::Invalid;
     };
@@ -122,9 +123,10 @@ pub struct DecodedKeyIndex {
 /// (the notification arrives over a Noise-encrypted connection, so content is
 /// already authenticated).
 pub fn decode_key_index_list(signed_bytes: &[u8]) -> Option<DecodedKeyIndex> {
-    let signed = waproto::whatsapp::AdvSignedKeyIndexList::decode(signed_bytes).ok()?;
+    let signed = waproto::whatsapp::ADVSignedKeyIndexList::decode_from_slice(signed_bytes).ok()?;
     let details_bytes = signed.details.as_ref()?;
-    let key_index = waproto::whatsapp::AdvKeyIndexList::decode(details_bytes.as_slice()).ok()?;
+    let key_index =
+        waproto::whatsapp::ADVKeyIndexList::decode_from_slice(details_bytes.as_slice()).ok()?;
 
     let raw_id = key_index.raw_id?;
     let timestamp = key_index.timestamp?;
@@ -297,21 +299,20 @@ mod tests {
 
     #[test]
     fn decode_roundtrip() {
-        use prost::Message;
+        use buffa::Message;
 
-        let key_index = waproto::whatsapp::AdvKeyIndexList {
+        let key_index = waproto::whatsapp::ADVKeyIndexList {
             raw_id: Some(42),
             timestamp: Some(1000),
             current_index: Some(5),
             valid_indexes: vec![3, 5, 7],
-            account_type: None,
+            ..Default::default()
         };
         let details = key_index.encode_to_vec();
 
-        let signed = waproto::whatsapp::AdvSignedKeyIndexList {
+        let signed = waproto::whatsapp::ADVSignedKeyIndexList {
             details: Some(details),
-            account_signature: None,
-            account_signature_key: None,
+            ..Default::default()
         };
         let bytes = signed.encode_to_vec();
 
@@ -359,7 +360,7 @@ mod tests {
             )
             .unwrap()
             .to_vec();
-        waproto::whatsapp::AdvSignedDeviceIdentity {
+        waproto::whatsapp::ADVSignedDeviceIdentity {
             details: Some(details.to_vec()),
             account_signature_key: include_account_key.then(|| account_key.to_vec()),
             account_signature: Some(account_sig),
@@ -425,7 +426,7 @@ mod tests {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
-        let no_dev_sig = waproto::whatsapp::AdvSignedDeviceIdentity {
+        let no_dev_sig = waproto::whatsapp::ADVSignedDeviceIdentity {
             details: Some(b"details".to_vec()),
             account_signature_key: Some(account.public_key.public_key_bytes().to_vec()),
             account_signature: Some(vec![0u8; 64]),

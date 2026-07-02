@@ -20,15 +20,15 @@ fn setup_mutations(n: usize) -> Vec<wa::SyncdMutation> {
             let mut index_mac = vec![0u8; 32];
             index_mac[..8].copy_from_slice(&i.to_le_bytes());
             wa::SyncdMutation {
-                operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                record: Some(wa::SyncdRecord {
-                    index: Some(wa::SyncdIndex {
+                operation: Some(wa::syncd_mutation::SyncdOperation::Set),
+                record: buffa::MessageField::some(wa::SyncdRecord {
+                    index: buffa::MessageField::some(wa::SyncdIndex {
                         blob: Some(index_mac),
                     }),
-                    value: Some(wa::SyncdValue {
+                    value: buffa::MessageField::some(wa::SyncdValue {
                         blob: Some(vec![0x5A; 48]),
                     }),
-                    key_id: Some(wa::KeyId {
+                    key_id: buffa::MessageField::some(wa::KeyId {
                         id: Some(b"AAAA".to_vec()),
                     }),
                 }),

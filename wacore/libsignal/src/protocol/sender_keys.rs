@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use prost::Message;
+use buffa::{Message, MessageField};
 
 use hmac::{HmacReset, KeyInit, Mac};
 use sha2::Sha256;
@@ -51,11 +51,12 @@ impl SenderMessageKey {
     }
 
     pub(crate) fn from_protobuf(smk: sender_key_state_structure::SenderMessageKey) -> Self {
-        let seed_bytes = smk.seed.unwrap_or_default();
-        let seed: [u8; 32] = seed_bytes
-            .as_ref()
-            .try_into()
-            .expect("SenderMessageKey seed must be exactly 32 bytes");
+        // Seed is validated at deserialization time; fall back to zeroes on corrupt in-memory data.
+        let seed: [u8; 32] = smk
+            .seed
+            .as_deref()
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or_default();
         Self::new(smk.iteration.unwrap_or_default(), seed)
     }
 
@@ -72,12 +73,19 @@ impl SenderMessageKey {
     }
 
     pub(crate) fn as_protobuf(&self) -> sender_key_state_structure::SenderMessageKey {
-        use prost::bytes::Bytes;
+        use bytes::Bytes;
         sender_key_state_structure::SenderMessageKey {
             iteration: Some(self.iteration),
             seed: Some(Bytes::copy_from_slice(&self.seed)),
         }
     }
+}
+
+fn seed_to_array(seed: Option<&bytes::Bytes>) -> Result<[u8; 32], SignalProtocolError> {
+    seed.ok_or(SignalProtocolError::InvalidProtobufEncoding)?
+        .as_ref()
+        .try_into()
+        .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,7 +166,7 @@ impl SenderChainKey {
     }
 
     pub(crate) fn as_protobuf(&self) -> sender_key_state_structure::SenderChainKey {
-        use prost::bytes::Bytes;
+        use bytes::Bytes;
         sender_key_state_structure::SenderChainKey {
             iteration: Some(self.iteration),
             seed: Some(Bytes::copy_from_slice(&self.chain_key)),
@@ -218,13 +226,17 @@ impl SenderKeyState {
         chain_key: &[u8],
         signature_key: PublicKey,
         signature_private_key: Option<PrivateKey>,
-    ) -> SenderKeyState {
-        use prost::bytes::Bytes;
-        let chain_key_arr: [u8; 32] = chain_key.try_into().expect("chain_key must be 32 bytes");
+    ) -> Result<SenderKeyState, SignalProtocolError> {
+        use bytes::Bytes;
+        let chain_key_arr: [u8; 32] = chain_key
+            .try_into()
+            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
         let state = SenderKeyStateStructure {
             sender_key_id: Some(chain_id),
-            sender_chain_key: Some(SenderChainKey::new(iteration, chain_key_arr).as_protobuf()),
-            sender_signing_key: Some(sender_key_state_structure::SenderSigningKey {
+            sender_chain_key: MessageField::some(
+                SenderChainKey::new(iteration, chain_key_arr).as_protobuf(),
+            ),
+            sender_signing_key: MessageField::some(sender_key_state_structure::SenderSigningKey {
                 public: Some(Bytes::copy_from_slice(&signature_key.serialize())),
                 private: signature_private_key
                     .as_ref()
@@ -240,22 +252,19 @@ impl SenderKeyState {
         }
         let verifying_key_memo = std::sync::OnceLock::new();
         if signing_key_memo.get().is_none() {
-            // Receive-side state (no private key): this key will verify every
-            // incoming message, so build the verifier and derive its Edwards
-            // entries here, at SKDM processing, once per sender rotation.
-            // Send-side states never verify their own messages, so they skip
-            // even the verifier allocation; the memo builds lazily if ever
-            // asked.
+            // Receive-side state (no private key): build the verifier and derive its
+            // Edwards entries here, at SKDM processing, once per sender rotation.
+            // Send-side states skip the allocation; it builds lazily if ever asked.
             let verifier = crate::core::curve::PreparedVerifyingKey::new(&signature_key);
             verifier.precompute();
             let _ = verifying_key_memo.set(verifier);
         }
-        Self {
+        Ok(Self {
             state,
             message_keys: std::sync::Arc::new(Vec::new()),
             signing_key_memo,
             verifying_key_memo,
-        }
+        })
     }
 
     pub(crate) fn from_protobuf(mut state: SenderKeyStateStructure) -> Self {
@@ -279,7 +288,7 @@ impl SenderKeyState {
     }
 
     pub fn sender_chain_key(&self) -> Option<SenderChainKey> {
-        let sender_chain = self.state.sender_chain_key.as_ref()?;
+        let sender_chain = self.state.sender_chain_key.as_option()?;
         let seed: [u8; 32] = sender_chain
             .seed
             .as_deref()
@@ -293,11 +302,11 @@ impl SenderKeyState {
     }
 
     pub fn set_sender_chain_key(&mut self, chain_key: SenderChainKey) {
-        self.state.sender_chain_key = Some(chain_key.as_protobuf());
+        self.state.sender_chain_key = MessageField::some(chain_key.as_protobuf());
     }
 
     pub fn signing_key_public(&self) -> Result<PublicKey, InvalidSenderKeySessionError> {
-        if let Some(ref signing_key) = self.state.sender_signing_key {
+        if let Some(signing_key) = self.state.sender_signing_key.as_option() {
             let public = signing_key
                 .public
                 .as_ref()
@@ -330,7 +339,7 @@ impl SenderKeyState {
         if let Some(key) = self.signing_key_memo.get() {
             return Ok(key.clone());
         }
-        if let Some(ref signing_key) = self.state.sender_signing_key {
+        if let Some(signing_key) = self.state.sender_signing_key.as_option() {
             let private = signing_key
                 .private
                 .as_ref()
@@ -405,12 +414,19 @@ impl SenderKeyRecord {
     }
 
     pub fn deserialize(buf: &[u8]) -> Result<SenderKeyRecord, SignalProtocolError> {
-        let skr = SenderKeyRecordStructure::decode(buf)
+        let skr = SenderKeyRecordStructure::decode_from_slice(buf)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
         let mut states = VecDeque::with_capacity(skr.sender_key_states.len());
         for state in skr.sender_key_states {
-            states.push_back(SenderKeyState::from_protobuf(state))
+            // Validate seeds eagerly so callers get a clear error on corrupt data.
+            if let Some(sender_chain) = state.sender_chain_key.as_option() {
+                let _ = seed_to_array(sender_chain.seed.as_ref())?;
+            }
+            for smk in &state.sender_message_keys {
+                let _ = seed_to_array(smk.seed.as_ref())?;
+            }
+            states.push_back(SenderKeyState::from_protobuf(state));
         }
         Ok(Self { states })
     }
@@ -455,7 +471,7 @@ impl SenderKeyRecord {
         chain_key: &[u8],
         signature_key: PublicKey,
         signature_private_key: Option<PrivateKey>,
-    ) {
+    ) -> Result<(), SignalProtocolError> {
         let existing_state = self.remove_state(chain_id, signature_key);
 
         if self.remove_states_with_chain_id(chain_id) > 0 {
@@ -472,7 +488,7 @@ impl SenderKeyRecord {
                 chain_key,
                 signature_key,
                 signature_private_key,
-            ),
+            )?,
             Some(state) => state,
         };
 
@@ -481,6 +497,7 @@ impl SenderKeyRecord {
         }
 
         self.states.push_front(state);
+        Ok(())
     }
 
     /// Remove the state with the matching `chain_id` and `signature_key`.
@@ -619,7 +636,8 @@ mod tests {
         let keypair = KeyPair::generate(&mut rng);
         let chain_key = [0x42u8; 32];
 
-        let state = SenderKeyState::new(3, 12345, 0, &chain_key, keypair.public_key, None);
+        let state = SenderKeyState::new(3, 12345, 0, &chain_key, keypair.public_key, None)
+            .expect("sender key state should be valid");
 
         assert_eq!(state.chain_id(), 12345);
         assert_eq!(state.message_version(), 3);
@@ -627,6 +645,17 @@ mod tests {
         assert!(state.signing_key_public().is_ok());
         // Private key was not provided
         assert!(state.signing_key_private().is_err());
+    }
+
+    #[test]
+    fn test_sender_key_state_rejects_invalid_chain_key_length() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let keypair = KeyPair::generate(&mut rng);
+
+        let err = SenderKeyState::new(3, 12345, 0, &[0x42u8; 31], keypair.public_key, None)
+            .expect_err("invalid chain key length should fail");
+
+        assert!(matches!(err, SignalProtocolError::InvalidProtobufEncoding));
     }
 
     /// Test SenderKeyState with private signing key
@@ -643,7 +672,8 @@ mod tests {
             &chain_key,
             keypair.public_key,
             Some(keypair.private_key),
-        );
+        )
+        .expect("sender key state should be valid");
 
         assert!(state.signing_key_public().is_ok());
         assert!(state.signing_key_private().is_ok());
@@ -661,7 +691,8 @@ mod tests {
             &chain_key,
             signing.public_key,
             Some(signing.private_key),
-        );
+        )
+        .expect("valid inputs");
 
         // new() received the parsed key: memo pre-populated and pre-warmed.
         assert!(state.signing_key_memo_initialized());
@@ -725,7 +756,8 @@ mod tests {
             &chain_key,
             keypair.public_key,
             Some(keypair.private_key),
-        );
+        )
+        .expect("sender key state should be valid");
 
         let initial_sck = state
             .sender_chain_key()
@@ -756,7 +788,8 @@ mod tests {
             &chain_key,
             keypair.public_key,
             Some(keypair.private_key),
-        );
+        )
+        .expect("sender key state should be valid");
 
         let smk = SenderMessageKey::new(5, [0xAA; 32]);
         state.add_sender_message_key(&smk);
@@ -785,7 +818,8 @@ mod tests {
             &chain_key,
             keypair.public_key,
             Some(keypair.private_key),
-        );
+        )
+        .expect("sender key state should be valid");
 
         // Amortized eviction uses MESSAGE_KEY_PRUNE_THRESHOLD.
         // Eviction triggers when len > MAX_MESSAGE_KEYS + MESSAGE_KEY_PRUNE_THRESHOLD.
@@ -821,14 +855,16 @@ mod tests {
         let chain_key = [0x42u8; 32];
 
         let mut record = SenderKeyRecord::new_empty();
-        record.add_sender_key_state(
-            3,
-            12345,
-            0,
-            &chain_key,
-            keypair.public_key,
-            Some(keypair.private_key),
-        );
+        record
+            .add_sender_key_state(
+                3,
+                12345,
+                0,
+                &chain_key,
+                keypair.public_key,
+                Some(keypair.private_key),
+            )
+            .expect("add_sender_key_state should succeed");
 
         {
             let state = record.sender_key_state_mut().expect("state exists");
@@ -862,7 +898,8 @@ mod tests {
         let keypair = KeyPair::generate(&mut rng);
         let chain_key = [0x42u8; 32];
 
-        let mut original = SenderKeyState::new(3, 1, 0, &chain_key, keypair.public_key, None);
+        let mut original =
+            SenderKeyState::new(3, 1, 0, &chain_key, keypair.public_key, None).expect("valid");
         original.add_sender_message_key(&SenderMessageKey::new(7, [7u8; 32]));
 
         // Clone shares the backlog Arc (mirrors the cache keeping its copy while
@@ -896,14 +933,16 @@ mod tests {
         let chain_key = [0x42u8; 32];
 
         let mut record = SenderKeyRecord::new_empty();
-        record.add_sender_key_state(
-            3,
-            12345,
-            0,
-            &chain_key,
-            keypair.public_key,
-            Some(keypair.private_key),
-        );
+        record
+            .add_sender_key_state(
+                3,
+                12345,
+                0,
+                &chain_key,
+                keypair.public_key,
+                Some(keypair.private_key),
+            )
+            .expect("sender key state should be valid");
 
         let state = record
             .sender_key_state()
@@ -922,14 +961,16 @@ mod tests {
         // Add more than MAX_SENDER_KEY_STATES
         for i in 0..(consts::MAX_SENDER_KEY_STATES + 5) {
             let keypair = KeyPair::generate(&mut rng);
-            record.add_sender_key_state(
-                3,
-                i as u32,
-                0,
-                &chain_key,
-                keypair.public_key,
-                Some(keypair.private_key),
-            );
+            record
+                .add_sender_key_state(
+                    3,
+                    i as u32,
+                    0,
+                    &chain_key,
+                    keypair.public_key,
+                    Some(keypair.private_key),
+                )
+                .expect("sender key state should be valid");
         }
 
         // Should not have more than MAX_SENDER_KEY_STATES
@@ -946,22 +987,26 @@ mod tests {
         let chain_key = [0x42u8; 32];
 
         let mut record = SenderKeyRecord::new_empty();
-        record.add_sender_key_state(
-            3,
-            111,
-            0,
-            &chain_key,
-            keypair1.public_key,
-            Some(keypair1.private_key),
-        );
-        record.add_sender_key_state(
-            3,
-            222,
-            0,
-            &chain_key,
-            keypair2.public_key,
-            Some(keypair2.private_key),
-        );
+        record
+            .add_sender_key_state(
+                3,
+                111,
+                0,
+                &chain_key,
+                keypair1.public_key,
+                Some(keypair1.private_key),
+            )
+            .expect("sender key state should be valid");
+        record
+            .add_sender_key_state(
+                3,
+                222,
+                0,
+                &chain_key,
+                keypair2.public_key,
+                Some(keypair2.private_key),
+            )
+            .expect("sender key state should be valid");
 
         // Should find chain 222 (most recent is at front)
         let state = record.sender_key_state_for_chain_id(222);
@@ -986,14 +1031,16 @@ mod tests {
         let chain_key = [0x42u8; 32];
 
         let mut record = SenderKeyRecord::new_empty();
-        record.add_sender_key_state(
-            3,
-            12345,
-            5,
-            &chain_key,
-            keypair.public_key,
-            Some(keypair.private_key),
-        );
+        record
+            .add_sender_key_state(
+                3,
+                12345,
+                5,
+                &chain_key,
+                keypair.public_key,
+                Some(keypair.private_key),
+            )
+            .expect("sender key state should be valid");
 
         let serialized = record.serialize().expect("serialization should succeed");
         let deserialized =
@@ -1004,6 +1051,48 @@ mod tests {
             .expect("sender key state should exist");
         assert_eq!(state.chain_id(), 12345);
         assert!(state.sender_chain_key().is_some());
+    }
+
+    #[test]
+    fn test_sender_key_record_deserialize_rejects_invalid_chain_seed() {
+        let record = SenderKeyRecordStructure {
+            sender_key_states: vec![SenderKeyStateStructure {
+                sender_key_id: Some(12345),
+                sender_chain_key: MessageField::some(sender_key_state_structure::SenderChainKey {
+                    iteration: Some(0),
+                    seed: Some(bytes::Bytes::copy_from_slice(&[0x42; 31])),
+                }),
+                ..Default::default()
+            }],
+        };
+
+        let err = SenderKeyRecord::deserialize(&record.encode_to_vec())
+            .expect_err("invalid sender chain seed should fail");
+
+        assert!(matches!(err, SignalProtocolError::InvalidProtobufEncoding));
+    }
+
+    #[test]
+    fn test_sender_key_record_deserialize_rejects_invalid_message_seed() {
+        let record = SenderKeyRecordStructure {
+            sender_key_states: vec![SenderKeyStateStructure {
+                sender_key_id: Some(12345),
+                sender_chain_key: MessageField::some(sender_key_state_structure::SenderChainKey {
+                    iteration: Some(0),
+                    seed: Some(bytes::Bytes::copy_from_slice(&[0x42; 32])),
+                }),
+                sender_message_keys: vec![sender_key_state_structure::SenderMessageKey {
+                    iteration: Some(1),
+                    seed: Some(bytes::Bytes::copy_from_slice(&[0x43; 31])),
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let err = SenderKeyRecord::deserialize(&record.encode_to_vec())
+            .expect_err("invalid sender message seed should fail");
+
+        assert!(matches!(err, SignalProtocolError::InvalidProtobufEncoding));
     }
 
     /// Test that step_with_message_key produces the same results as

@@ -1,7 +1,7 @@
 use crate::AppStateError;
 use crate::hash::{generate_content_mac, validate_index_mac};
 use crate::keys::ExpandedAppStateKeys;
-use prost::Message;
+use buffa::Message;
 use wacore_libsignal::crypto::aes_256_cbc_decrypt_into;
 use waproto::whatsapp as wa;
 
@@ -49,8 +49,8 @@ pub fn decode_record(
 ) -> Result<(Mutation, RecordMacs), AppStateError> {
     let value_blob = record
         .value
+        .blob
         .as_ref()
-        .and_then(|v| v.blob.as_ref())
         .ok_or(AppStateError::MissingValueBlob)?;
 
     if value_blob.len() < 16 + 32 {
@@ -76,7 +76,10 @@ pub fn decode_record(
     aes_256_cbc_decrypt_into(ciphertext, &keys.value_encryption, iv, &mut plaintext)
         .map_err(|_| AppStateError::DecryptionFailed)?;
 
-    let action = wa::SyncActionData::decode(plaintext.as_slice())
+    // Owned decode (not a view): the `value` sub-message is needed owned, so a
+    // view would parse it once into a view and copy it again into the owned
+    // form — two passes over the largest field. Owned decode does it in one.
+    let action = wa::SyncActionData::decode_from_slice(plaintext.as_slice())
         .map_err(|_| AppStateError::DecodeFailed)?;
 
     // WA Web (syncdDecryptMutation) computes the index MAC unconditionally over the
@@ -85,14 +88,14 @@ pub fn decode_record(
     if validate_macs {
         let stored = record
             .index
-            .as_ref()
+            .as_option()
             .and_then(|i| i.blob.as_ref())
             .ok_or(AppStateError::MissingIndexMAC)?;
         validate_index_mac(action.index.as_deref().unwrap_or(&[]), stored, &keys.index)?;
     }
 
     let mut index_list: Vec<String> = Vec::new();
-    if let Some(idx_bytes) = action.index.as_ref()
+    if let Some(idx_bytes) = action.index.as_deref()
         && let Ok(parsed) = serde_json::from_slice::<Vec<String>>(idx_bytes)
     {
         index_list = parsed;
@@ -102,12 +105,12 @@ pub fn decode_record(
     // (previously unwrap_or_default() let this through when validate_macs=false).
     let index_mac = record
         .index
-        .as_ref()
-        .and_then(|i| i.blob.clone())
+        .blob
+        .clone()
         .ok_or(AppStateError::MissingIndexMAC)?;
     Ok((
         Mutation {
-            action_value: action.value,
+            action_value: action.value.into_option(),
             index: index_list,
             operation,
         },
@@ -126,37 +129,40 @@ pub fn collect_key_ids_from_patch_list(
     snapshot: Option<&wa::SyncdSnapshot>,
     patches: &[wa::SyncdPatch],
 ) -> Vec<Vec<u8>> {
-    use std::collections::HashSet;
+    collect_key_id_refs_from_patch_list(snapshot, patches)
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect()
+}
 
-    let mut seen = HashSet::new();
+/// Borrowing variant for callers that only need to look up keys immediately.
+pub fn collect_key_id_refs_from_patch_list<'a>(
+    snapshot: Option<&'a wa::SyncdSnapshot>,
+    patches: &'a [wa::SyncdPatch],
+) -> Vec<&'a [u8]> {
+    fn push_unique<'a>(key_ids: &mut Vec<&'a [u8]>, key_id: Option<&'a Vec<u8>>) {
+        if let Some(k) = key_id {
+            let k = k.as_slice();
+            if !key_ids.contains(&k) {
+                key_ids.push(k);
+            }
+        }
+    }
+
     let mut key_ids = Vec::new();
 
-    let mut check = |key_id: Option<&Vec<u8>>| {
-        if let Some(k) = key_id
-            && !seen.contains(k.as_slice())
-        {
-            // Unique key ID: two owned buffers are allocated via k.clone() and
-            // owned.clone() — one stored in `seen` for future dedup checks, one
-            // pushed to `key_ids` as the result. Duplicate key IDs are skipped
-            // by the seen.contains() check above, avoiding any allocation.
-            let owned = k.clone();
-            seen.insert(owned.clone());
-            key_ids.push(owned);
-        }
-    };
-
     if let Some(snapshot) = snapshot {
-        check(snapshot.key_id.as_ref().and_then(|k| k.id.as_ref()));
+        push_unique(&mut key_ids, snapshot.key_id.id.as_ref());
         for rec in &snapshot.records {
-            check(rec.key_id.as_ref().and_then(|k| k.id.as_ref()));
+            push_unique(&mut key_ids, rec.key_id.id.as_ref());
         }
     }
 
     for patch in patches {
-        check(patch.key_id.as_ref().and_then(|k| k.id.as_ref()));
+        push_unique(&mut key_ids, patch.key_id.id.as_ref());
         for mutation in &patch.mutations {
-            if let Some(record) = &mutation.record {
-                check(record.key_id.as_ref().and_then(|k| k.id.as_ref()));
+            if mutation.record.is_set() {
+                push_unique(&mut key_ids, mutation.record.key_id.id.as_ref());
             }
         }
     }
@@ -169,7 +175,7 @@ mod tests {
     use super::*;
     use crate::hash::{generate_content_mac, generate_index_mac};
     use crate::keys::expand_app_state_keys;
-    use prost::Message;
+    use buffa::Message;
     use wacore_libsignal::crypto::aes_256_cbc_encrypt_into;
 
     fn create_test_record(
@@ -192,13 +198,13 @@ mod tests {
 
         let index_bytes = action_data.index.as_deref().unwrap_or(&[]);
         wa::SyncdRecord {
-            index: Some(wa::SyncdIndex {
+            index: buffa::MessageField::some(wa::SyncdIndex {
                 blob: Some(generate_index_mac(index_bytes, &keys.index)),
             }),
-            value: Some(wa::SyncdValue {
+            value: buffa::MessageField::some(wa::SyncdValue {
                 blob: Some(value_blob),
             }),
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.to_vec()),
             }),
         }
@@ -211,7 +217,7 @@ mod tests {
         let key_id = b"test_key_id".to_vec();
 
         let action_data = wa::SyncActionData {
-            value: Some(wa::SyncActionValue {
+            value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(1234567890),
                 ..Default::default()
             }),
@@ -219,14 +225,14 @@ mod tests {
         };
 
         let record = create_test_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &keys,
             &key_id,
             &action_data,
         );
 
         let (mutation, macs) = decode_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &record,
             &keys,
             &key_id,
@@ -238,7 +244,7 @@ mod tests {
             mutation.action_value.as_ref().and_then(|v| v.timestamp),
             Some(1234567890)
         );
-        assert_eq!(mutation.operation, wa::syncd_mutation::SyncdOperation::Set);
+        assert_eq!(mutation.operation, wa::syncd_mutation::SyncdOperation::SET);
         // MACs are returned separately and must carry the real bytes, not empty
         // or swapped values: index_mac is the HMAC of the (absent here) index.
         assert_eq!(macs.index_mac, generate_index_mac(&[], &keys.index));
@@ -253,7 +259,7 @@ mod tests {
         let key_id = b"test_key_id".to_vec();
 
         let action_data = wa::SyncActionData {
-            value: Some(wa::SyncActionValue {
+            value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(1234567890),
                 ..Default::default()
             }),
@@ -261,7 +267,7 @@ mod tests {
         };
 
         let record = create_test_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &keys,
             &key_id,
             &action_data,
@@ -269,7 +275,7 @@ mod tests {
 
         // No index field, but the stored index MAC matches the empty-index HMAC: passes.
         let result = decode_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &record,
             &keys,
             &key_id,
@@ -285,26 +291,26 @@ mod tests {
         let key_id = b"test_key_id".to_vec();
 
         let action_data = wa::SyncActionData {
-            value: Some(wa::SyncActionValue {
+            value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(1234567890),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let mut record = create_test_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &keys,
             &key_id,
             &action_data,
         );
         // Tamper the stored index MAC: with no index field the old code skipped the
         // check entirely and accepted this; WA Web (and now we) reject it.
-        record.index = Some(wa::SyncdIndex {
+        record.index = buffa::MessageField::some(wa::SyncdIndex {
             blob: Some(vec![0xFF; 32]),
         });
 
         let err = decode_record(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &record,
             &keys,
             &key_id,
@@ -322,11 +328,11 @@ mod tests {
         let key_id_4 = vec![10, 11, 12];
 
         let snapshot = wa::SyncdSnapshot {
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id_1.clone()),
             }),
             records: vec![wa::SyncdRecord {
-                key_id: Some(wa::KeyId {
+                key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id_2.clone()),
                 }),
                 ..Default::default()
@@ -335,12 +341,12 @@ mod tests {
         };
 
         let patches = vec![wa::SyncdPatch {
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id_3.clone()),
             }),
             mutations: vec![wa::SyncdMutation {
-                record: Some(wa::SyncdRecord {
-                    key_id: Some(wa::KeyId {
+                record: buffa::MessageField::some(wa::SyncdRecord {
+                    key_id: buffa::MessageField::some(wa::KeyId {
                         id: Some(key_id_4.clone()),
                     }),
                     ..Default::default()
@@ -364,11 +370,11 @@ mod tests {
         let key_id = vec![1, 2, 3];
 
         let snapshot = wa::SyncdSnapshot {
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             records: vec![wa::SyncdRecord {
-                key_id: Some(wa::KeyId {
+                key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id.clone()),
                 }),
                 ..Default::default()
@@ -377,7 +383,7 @@ mod tests {
         };
 
         let patches = vec![wa::SyncdPatch {
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             ..Default::default()

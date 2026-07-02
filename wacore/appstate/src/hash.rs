@@ -53,8 +53,8 @@ impl HashState {
         fn index_mac_of(mutation: &wa::SyncdMutation) -> Option<&[u8]> {
             mutation
                 .record
-                .as_ref()
-                .and_then(|r| r.index.as_ref())
+                .as_option()
+                .and_then(|r| r.index.as_option())
                 .and_then(|idx| idx.blob.as_deref())
         }
         let index_mode = mutations.iter().all(|m| index_mac_of(m).is_some());
@@ -68,7 +68,7 @@ impl HashState {
         if index_mode {
             for mutation in mutations {
                 if mutation.operation.unwrap_or_default()
-                    == wa::syncd_mutation::SyncdOperation::Remove as i32
+                    == wa::syncd_mutation::SyncdOperation::REMOVE
                     && let Some(index_mac) = index_mac_of(mutation)
                 {
                     removed_in_patch.push(index_mac);
@@ -83,11 +83,10 @@ impl HashState {
 
         for (i, mutation) in mutations.iter().enumerate() {
             let op = mutation.operation.unwrap_or_default();
-            let is_set = op == wa::syncd_mutation::SyncdOperation::Set as i32;
+            let is_set = op == wa::syncd_mutation::SyncdOperation::SET;
             if is_set
-                && let Some(record) = &mutation.record
-                && let Some(value) = &record.value
-                && let Some(blob) = &value.blob
+                && mutation.record.is_set()
+                && let Some(blob) = &mutation.record.value.blob
                 && blob.len() >= 32
             {
                 added.push(&blob[blob.len() - 32..]);
@@ -99,7 +98,7 @@ impl HashState {
                 match get_prev_set_value_mac(index_mac, i) {
                     Ok(Some(prev)) => removed.push(prev),
                     Ok(None) => {
-                        if op == wa::syncd_mutation::SyncdOperation::Remove as i32 {
+                        if op == wa::syncd_mutation::SyncdOperation::REMOVE {
                             result.has_missing_remove = true;
                             log::trace!(
                                 target: "AppState",
@@ -128,8 +127,8 @@ impl HashState {
             .filter_map(|record| {
                 record
                     .value
+                    .blob
                     .as_ref()
-                    .and_then(|v| v.blob.as_ref())
                     .filter(|blob| blob.len() >= 32)
                     .map(|blob| &blob[blob.len() - 32..])
             })
@@ -158,9 +157,8 @@ pub fn generate_patch_mac(patch: &wa::SyncdPatch, name: &str, key: &[u8], versio
         mac.update(sm);
     }
     for m in &patch.mutations {
-        if let Some(record) = &m.record
-            && let Some(val) = &record.value
-            && let Some(blob) = &val.blob
+        if m.record.is_set()
+            && let Some(blob) = &m.record.value.blob
             && blob.len() >= 32
         {
             mac.update(&blob[blob.len() - 32..]);
@@ -237,14 +235,20 @@ mod tests {
             blob
         });
 
+        let value = if let Some(b) = value_blob {
+            buffa::MessageField::some(wa::SyncdValue { blob: Some(b) })
+        } else {
+            buffa::MessageField::none()
+        };
+
         wa::SyncdMutation {
-            operation: Some(operation as i32),
-            record: Some(wa::SyncdRecord {
-                index: Some(wa::SyncdIndex {
+            operation: Some(operation),
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
                     blob: Some(index_mac),
                 }),
-                value: value_blob.map(|b| wa::SyncdValue { blob: Some(b) }),
-                key_id: Some(wa::KeyId {
+                value,
+                key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(b"test_key_id".to_vec()),
                 }),
             }),
@@ -266,12 +270,12 @@ mod tests {
         let mut state = HashState::default();
         let initial_mutations = vec![
             create_mutation(
-                wa::syncd_mutation::SyncdOperation::Set,
+                wa::syncd_mutation::SyncdOperation::SET,
                 INDEX_MAC_1.to_vec(),
                 Some(VALUE_MAC_1.to_vec()),
             ),
             create_mutation(
-                wa::syncd_mutation::SyncdOperation::Set,
+                wa::syncd_mutation::SyncdOperation::SET,
                 INDEX_MAC_2.to_vec(),
                 Some(VALUE_MAC_2.to_vec()),
             ),
@@ -295,12 +299,12 @@ mod tests {
 
         let update_and_remove_mutations = vec![
             create_mutation(
-                wa::syncd_mutation::SyncdOperation::Set,
+                wa::syncd_mutation::SyncdOperation::SET,
                 INDEX_MAC_1.to_vec(),
                 Some(VALUE_MAC_3_OVERWRITE.to_vec()),
             ),
             create_mutation(
-                wa::syncd_mutation::SyncdOperation::Remove,
+                wa::syncd_mutation::SyncdOperation::REMOVE,
                 INDEX_MAC_2.to_vec(),
                 None,
             ),
@@ -336,12 +340,12 @@ mod tests {
 
         let mutations = vec![
             create_mutation(
-                wa::syncd_mutation::SyncdOperation::Set,
+                wa::syncd_mutation::SyncdOperation::SET,
                 INDEX_MAC.to_vec(),
                 Some(NEW_VALUE.to_vec()),
             ),
             create_mutation(
-                wa::syncd_mutation::SyncdOperation::Remove,
+                wa::syncd_mutation::SyncdOperation::REMOVE,
                 INDEX_MAC.to_vec(),
                 Some(PREV_VALUE.to_vec()),
             ),
@@ -374,22 +378,22 @@ mod tests {
         const NEW_VALUE: &[u8] = &[20; 32];
 
         let mut index_less = create_mutation(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             vec![],
             Some(vec![30; 32]),
         );
-        if let Some(rec) = index_less.record.as_mut() {
-            rec.index = None;
+        if let Some(rec) = index_less.record.as_option_mut() {
+            rec.index = Default::default();
         }
 
         let mutations = vec![
             create_mutation(
-                wa::syncd_mutation::SyncdOperation::Set,
+                wa::syncd_mutation::SyncdOperation::SET,
                 INDEX_MAC.to_vec(),
                 Some(NEW_VALUE.to_vec()),
             ),
             create_mutation(
-                wa::syncd_mutation::SyncdOperation::Remove,
+                wa::syncd_mutation::SyncdOperation::REMOVE,
                 INDEX_MAC.to_vec(),
                 Some(PREV_VALUE.to_vec()),
             ),
@@ -419,12 +423,12 @@ mod tests {
 
         let mutations = vec![
             create_mutation(
-                wa::syncd_mutation::SyncdOperation::Set,
+                wa::syncd_mutation::SyncdOperation::SET,
                 INDEX_MAC.to_vec(),
                 Some(NEW_VALUE.to_vec()),
             ),
             create_mutation(
-                wa::syncd_mutation::SyncdOperation::Remove,
+                wa::syncd_mutation::SyncdOperation::REMOVE,
                 INDEX_MAC.to_vec(),
                 Some(NEW_VALUE.to_vec()),
             ),
@@ -459,25 +463,23 @@ mod tests {
         blob2.extend_from_slice(&[0x33u8; 32]);
 
         let patch = wa::SyncdPatch {
-            version: Some(wa::SyncdVersion {
+            version: buffa::MessageField::some(wa::SyncdVersion {
                 version: Some(version),
             }),
             snapshot_mac: Some(snapshot_mac.clone()),
             mutations: vec![
                 wa::SyncdMutation {
-                    operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                    record: Some(wa::SyncdRecord {
-                        index: None,
-                        value: Some(wa::SyncdValue { blob: Some(blob1) }),
-                        key_id: None,
+                    operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                    record: buffa::MessageField::some(wa::SyncdRecord {
+                        value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob1) }),
+                        ..Default::default()
                     }),
                 },
                 wa::SyncdMutation {
-                    operation: Some(wa::syncd_mutation::SyncdOperation::Set as i32),
-                    record: Some(wa::SyncdRecord {
-                        index: None,
-                        value: Some(wa::SyncdValue { blob: Some(blob2) }),
-                        key_id: None,
+                    operation: Some(wa::syncd_mutation::SyncdOperation::SET),
+                    record: buffa::MessageField::some(wa::SyncdRecord {
+                        value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob2) }),
+                        ..Default::default()
                     }),
                 },
             ],

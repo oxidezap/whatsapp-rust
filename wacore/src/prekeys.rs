@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn extract_prekey_public_key_matches_full_decode_validation() {
-        use prost::Message;
+        use buffa::Message;
         let public_key = vec![0x05u8; 33];
         let record = waproto::whatsapp::PreKeyRecordStructure {
             id: Some(1),
@@ -441,7 +441,7 @@ mod tests {
         // it; the extractor must agree (return None) so the upload path never ships
         // a record the consume path's full decode would later reject.
         let truncated = &record[..record.len() - 1];
-        assert!(waproto::whatsapp::PreKeyRecordStructure::decode(truncated).is_err());
+        assert!(waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(truncated).is_err());
         assert_eq!(extract_prekey_public_key(truncated), None);
 
         // A malformed varint in a trailing field (10 continuation bytes that never
@@ -450,14 +450,18 @@ mod tests {
         let mut bad_varint = record.clone();
         bad_varint.push(0x08); // field 1, wire type 0 (varint)
         bad_varint.extend_from_slice(&[0xFF; 10]);
-        assert!(waproto::whatsapp::PreKeyRecordStructure::decode(&bad_varint[..]).is_err());
+        assert!(
+            waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&bad_varint[..]).is_err()
+        );
         assert_eq!(extract_prekey_public_key(&bad_varint), None);
 
         // An unsupported wire type (3 = start group): prost rejects the dangling
         // group, and the extractor rejects every wire type it cannot frame.
         let mut bad_wire = record.clone();
         bad_wire.push(0x0B); // field 1, wire type 3 (start group)
-        assert!(waproto::whatsapp::PreKeyRecordStructure::decode(&bad_wire[..]).is_err());
+        assert!(
+            waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&bad_wire[..]).is_err()
+        );
         assert_eq!(extract_prekey_public_key(&bad_wire), None);
     }
 
@@ -572,7 +576,7 @@ mod tests {
         device: &crate::libsignal::protocol::KeyPair,
         details: &[u8],
     ) -> Vec<u8> {
-        use prost::Message;
+        use buffa::Message;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let identity = device.public_key.public_key_bytes();
         let account_key = account.public_key.public_key_bytes();
@@ -589,7 +593,7 @@ mod tests {
             )
             .unwrap()
             .to_vec();
-        waproto::whatsapp::AdvSignedDeviceIdentity {
+        waproto::whatsapp::ADVSignedDeviceIdentity {
             details: Some(details.to_vec()),
             account_signature_key: None,
             account_signature: Some(account_sig),

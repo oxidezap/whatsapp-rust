@@ -48,7 +48,7 @@ pub(crate) fn dispatch_label_mutation(
     match kind {
         "label_edit" => {
             if let Some(val) = &m.action_value
-                && let Some(act) = &val.label_edit_action
+                && let Some(act) = val.label_edit_action.as_option()
             {
                 event_bus.dispatch(Event::LabelEditUpdate(LabelEditUpdate {
                     label_id,
@@ -74,7 +74,7 @@ pub(crate) fn dispatch_label_mutation(
                 }
             };
             if let Some(val) = &m.action_value
-                && let Some(act) = &val.label_association_action
+                && let Some(act) = val.label_association_action.as_option()
             {
                 event_bus.dispatch(Event::LabelAssociationUpdate(LabelAssociationUpdate {
                     label_id,
@@ -125,7 +125,7 @@ impl<'a> Labels<'a> {
             name.len()
         );
         let value = wa::SyncActionValue {
-            label_edit_action: Some(wa::sync_action_value::LabelEditAction {
+            label_edit_action: buffa::MessageField::some(wa::sync_action_value::LabelEditAction {
                 name: Some(name.to_string()),
                 color: Some(color),
                 deleted: Some(false),
@@ -149,7 +149,7 @@ impl<'a> Labels<'a> {
         }
         debug!("Deleting label {label_id}");
         let value = wa::SyncActionValue {
-            label_edit_action: Some(wa::sync_action_value::LabelEditAction {
+            label_edit_action: buffa::MessageField::some(wa::sync_action_value::LabelEditAction {
                 deleted: Some(true),
                 ..Default::default()
             }),
@@ -197,10 +197,12 @@ impl<'a> Labels<'a> {
         );
         let chat = chat_jid.to_string();
         let value = wa::SyncActionValue {
-            label_association_action: Some(wa::sync_action_value::LabelAssociationAction {
-                labeled: Some(labeled),
-                ..Default::default()
-            }),
+            label_association_action: buffa::MessageField::some(
+                wa::sync_action_value::LabelAssociationAction {
+                    labeled: Some(labeled),
+                    ..Default::default()
+                },
+            ),
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
         };
@@ -257,12 +259,14 @@ mod tests {
         let m = set_mutation(
             vec!["label_edit", "5"],
             wa::SyncActionValue {
-                label_edit_action: Some(wa::sync_action_value::LabelEditAction {
-                    name: Some("Work".into()),
-                    color: Some(2),
-                    deleted: Some(false),
-                    ..Default::default()
-                }),
+                label_edit_action: buffa::MessageField::some(
+                    wa::sync_action_value::LabelEditAction {
+                        name: Some("Work".into()),
+                        color: Some(2),
+                        deleted: Some(false),
+                        ..Default::default()
+                    },
+                ),
                 timestamp: Some(1000),
                 ..Default::default()
             },
@@ -286,10 +290,12 @@ mod tests {
         let m = set_mutation(
             vec!["label_jid", "5", "15551112222@s.whatsapp.net"],
             wa::SyncActionValue {
-                label_association_action: Some(wa::sync_action_value::LabelAssociationAction {
-                    labeled: Some(true),
-                    ..Default::default()
-                }),
+                label_association_action: buffa::MessageField::some(
+                    wa::sync_action_value::LabelAssociationAction {
+                        labeled: Some(true),
+                        ..Default::default()
+                    },
+                ),
                 timestamp: Some(1000),
                 ..Default::default()
             },
@@ -347,10 +353,12 @@ mod tests {
         let m = set_mutation(
             vec!["label_jid", "5", "not a jid"],
             wa::SyncActionValue {
-                label_association_action: Some(wa::sync_action_value::LabelAssociationAction {
-                    labeled: Some(true),
-                    ..Default::default()
-                }),
+                label_association_action: buffa::MessageField::some(
+                    wa::sync_action_value::LabelAssociationAction {
+                        labeled: Some(true),
+                        ..Default::default()
+                    },
+                ),
                 ..Default::default()
             },
         );

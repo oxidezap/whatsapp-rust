@@ -31,8 +31,8 @@ impl Client {
         if decrypted.is_some()
             && let Some(target) = msg
                 .enc_comment_message
-                .as_ref()
-                .and_then(|c| c.target_message_key.clone())
+                .as_option()
+                .and_then(|c| c.target_message_key.as_option().cloned())
         {
             Arc::make_mut(&mut info).comment_target = Some(target);
         }

@@ -89,9 +89,9 @@ pub fn status_carries_privacy_meta(message: &wa::Message) -> bool {
     let msg = unwrap_message(message);
     let is_revoke = msg
         .protocol_message
-        .as_ref()
-        .is_some_and(|pm| pm.r#type == Some(wa::message::protocol_message::Type::Revoke as i32));
-    let is_reaction = msg.reaction_message.is_some() || msg.enc_reaction_message.is_some();
+        .as_option()
+        .is_some_and(|pm| pm.r#type == Some(wa::message::protocol_message::Type::Revoke));
+    let is_reaction = msg.reaction_message.is_set() || msg.enc_reaction_message.is_set();
     !is_revoke && !is_reaction
 }
 

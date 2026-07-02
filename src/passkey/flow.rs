@@ -26,6 +26,7 @@ use wacore::shortcake::ShortcakeUtils;
 use wacore::sync_marker::MaybeSendSync;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeContent, NodeRef, OwnedNodeRef, SERVER_JID, Server};
+use waproto::whatsapp as wa;
 
 /// `<notification type=...>` routing keys, consumed by the notification dispatcher.
 pub(crate) const NOTIF_PASSKEY_REQUEST: &str = "passkey_prologue_request";
@@ -52,7 +53,7 @@ const CODE_GROUP_LEN: usize = 4;
 struct DeviceMaterial {
     noise_public: [u8; 32],
     identity_public: [u8; 32],
-    device_type: i32,
+    device_type: wa::device_props::PlatformType,
 }
 
 /// The effects the handshake needs from its environment. Abstracted so the full
@@ -80,7 +81,7 @@ struct ShortcakeSession {
     keypair: KeyPair,
     companion_nonce: [u8; 32],
     pairing_ref: String,
-    device_type: i32,
+    device_type: wa::device_props::PlatformType,
     new_adv_secret: [u8; 32],
     skip_handoff_ux: bool,
     stage: Stage,
@@ -363,7 +364,10 @@ impl ShortcakeIo for Client {
         Ok(DeviceMaterial {
             noise_public,
             identity_public,
-            device_type: snapshot.device_props.platform_type.unwrap_or(0),
+            device_type: snapshot
+                .device_props
+                .platform_type
+                .unwrap_or(wa::device_props::PlatformType::UNKNOWN),
         })
     }
 
@@ -618,7 +622,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{TestEventCollector, create_test_client, node_to_owned_ref};
     use crate::types::events::EventHandler;
-    use prost::Message as _;
+    use buffa::Message as _;
     use std::sync::Mutex;
     use std::time::Duration;
     use wacore::libsignal::protocol::PublicKey;
@@ -726,7 +730,7 @@ mod tests {
         let device = DeviceMaterial {
             noise_public: [0x11; 32],
             identity_public: [0x12; 32],
-            device_type: 1,
+            device_type: wa::device_props::PlatformType::CHROME,
         };
         let io = MockIo {
             device: device.clone(),
@@ -798,8 +802,8 @@ mod tests {
         // The primary decrypts the pairing request and reads the SAME secret that
         // was committed — proving the deferred rotation delivers what it persists.
         let prologue_payload = child_bytes(&prologue, TAG_PROLOGUE_PAYLOAD);
-        let companion_eph_pub = wa::CompanionEphemeralIdentity::decode(
-            wa::ProloguePayload::decode(prologue_payload.as_slice())
+        let companion_eph_pub = wa::CompanionEphemeralIdentity::decode_from_slice(
+            wa::ProloguePayload::decode_from_slice(prologue_payload.as_slice())
                 .unwrap()
                 .companion_ephemeral_identity
                 .unwrap()
@@ -812,13 +816,17 @@ mod tests {
             .private_key
             .calculate_agreement(&PublicKey::from_djb_public_key_bytes(&companion_eph_pub).unwrap())
             .unwrap();
-        let key = ShortcakeUtils::derive_encryption_key_from_shared_secret(&shared, 1, "REF-XYZ")
-            .unwrap();
+        let key = ShortcakeUtils::derive_encryption_key_from_shared_secret(
+            &shared,
+            wa::device_props::PlatformType::CHROME,
+            "REF-XYZ",
+        )
+        .unwrap();
         let wrapped = match io.sent_node(TAG_ENCRYPTED_PAIRING_REQUEST).content {
             Some(NodeContent::Bytes(bytes)) => bytes,
             _ => panic!("encrypted_pairing_request must carry bytes"),
         };
-        let epr = wa::EncryptedPairingRequest::decode(wrapped.as_slice()).unwrap();
+        let epr = wa::EncryptedPairingRequest::decode_from_slice(wrapped.as_slice()).unwrap();
         let iv: [u8; 12] = epr.iv.unwrap().as_slice().try_into().unwrap();
         let mut plaintext = Vec::new();
         wacore::libsignal::crypto::aes_256_gcm_decrypt(
@@ -829,7 +837,7 @@ mod tests {
             &mut plaintext,
         )
         .unwrap();
-        let pr = wa::PairingRequest::decode(plaintext.as_slice()).unwrap();
+        let pr = wa::PairingRequest::decode_from_slice(plaintext.as_slice()).unwrap();
         assert_eq!(pr.adv_secret.as_deref(), Some(&committed[..]));
         assert_eq!(
             pr.companion_public_key.as_deref(),
@@ -845,7 +853,7 @@ mod tests {
             keypair: KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()),
             companion_nonce: [0; 32],
             pairing_ref: "r".into(),
-            device_type: 1,
+            device_type: wa::device_props::PlatformType::CHROME,
             new_adv_secret: [1; 32],
             skip_handoff_ux: false,
             stage: Stage::AwaitingPrimaryIdentity,
@@ -972,7 +980,7 @@ mod tests {
             nonce: Some(vec![0xCD; 32]),
         };
         let child = NodeBuilder::new(TAG_PRIMARY_EPHEMERAL_IDENTITY)
-            .bytes(prost::Message::encode_to_vec(&primary))
+            .bytes(buffa::Message::encode_to_vec(&primary))
             .build();
         client
             .process_node(server_notification(NOTIF_PASSKEY_CONTINUATION, Some(child)))

@@ -36,44 +36,11 @@ const ST2_QLVLS_SCALE: f32 = 0.0034478905;
 const QSTEP_COND_MULT: f32 = 0.9; // LSF_QSTEP_COND_MULT
 
 /// On-disk packed LSF ROM (flat row-major; `tables.proto` `LsfSeed`). Reshaped before expansion.
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct LsfSeed {
-    #[prost(bytes = "vec", tag = "1")]
-    rot_8: Vec<u8>, // [2][16][16][16]
-    #[prost(bytes = "vec", tag = "2")]
-    rot_cond_8: Vec<u8>, // [2][2][16][16]
-    #[prost(bytes = "vec", tag = "3")]
-    st2_all_qlvls_8: Vec<u8>, // [9593]
-    #[prost(bytes = "vec", tag = "4")]
-    st2_all_qlvl_dcmfs: Vec<u8>, // [9593]
-    #[prost(bytes = "vec", tag = "5")]
-    st2_min_qi: Vec<u8>, // [2][2][17][16] i8
-    #[prost(bytes = "vec", tag = "6")]
-    st2_max_qi: Vec<u8>, // [2][2][17][16] i8
-    #[prost(uint32, repeated, tag = "7")]
-    cb_16: Vec<u32>, // [2][16][16]
-    #[prost(uint32, repeated, tag = "8")]
-    cinv_16: Vec<u32>, // [2][136]
-    #[prost(uint32, repeated, tag = "9")]
-    cmf: Vec<u32>, // [2][17]
-    #[prost(uint32, repeated, tag = "10")]
-    cmf_cond: Vec<u32>, // [2][18]
-    #[prost(uint32, repeated, tag = "11")]
-    lsf_sel: Vec<u32>, // [3][3]
-    #[prost(uint32, repeated, tag = "12")]
-    lsf_extra: Vec<u32>, // [3]
-    #[prost(float, repeated, tag = "13")]
-    mean: Vec<f32>, // [2][16]
-    #[prost(float, repeated, tag = "14")]
-    min_dist: Vec<f32>, // [2][17]
-    #[prost(float, repeated, tag = "15")]
-    reg_cond: Vec<f32>, // [2]
-    #[prost(float, repeated, tag = "16")]
-    qstep: Vec<f32>, // [2][2]
-                     // grid16_w/alpha/matrices and centroids16/matrices16 are not stored: the synth grid16 tables are
-                     // derived at load (grid16_w = mean[1-v], grid16_alpha = reg_cond, grid16_matrices = unpack8(rot_cond_8)),
-                     // and the grid==16 centroids/matrices rows are never read (grid==16 returns before indexing them).
-}
+///
+/// grid16_w/alpha/matrices and centroids16/matrices16 are not stored: the synth grid16 tables are
+/// derived at load (grid16_w = mean[1-v], grid16_alpha = reg_cond, grid16_matrices = unpack8(rot_cond_8)),
+/// and the grid==16 centroids/matrices rows are never read (grid==16 returns before indexing them).
+pub(crate) use super::smpl_tables_blob::tables::LsfSeed;
 
 /// The packed ROM reshaped into the nested arrays the expansion indexes. Outer index `[voiced]`.
 struct LsfSeedNested {
@@ -598,7 +565,7 @@ static LSF_BUILT: OnceLock<LsfBuilt> = OnceLock::new();
 pub(crate) fn lsf_built() -> &'static LsfBuilt {
     LSF_BUILT.get_or_init(|| {
         let seed: LsfSeed =
-            super::smpl_tables_blob::load_blob_prost(include_bytes!("testdata/lsf_seed.bin"));
+            super::smpl_tables_blob::load_blob_buffa(include_bytes!("testdata/lsf_seed.bin"));
         seed.build()
     })
 }
@@ -751,7 +718,7 @@ mod tests {
     /// computed synth tables from the seed fields they're derived from.
     #[test]
     fn lsf_seed_grid16_derivation() {
-        let seed: LsfSeed = super::super::smpl_tables_blob::load_blob_prost(include_bytes!(
+        let seed: LsfSeed = super::super::smpl_tables_blob::load_blob_buffa(include_bytes!(
             "testdata/lsf_seed.bin"
         ));
         let nested = seed.reshape();

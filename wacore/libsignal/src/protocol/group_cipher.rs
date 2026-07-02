@@ -280,7 +280,7 @@ pub async fn process_sender_key_distribution_message(
         skdm.chain_key(),
         *skdm.signing_key(),
         None,
-    );
+    )?;
     sender_key_store
         .store_sender_key(sender_key_name, sender_key_record)
         .await?;
@@ -336,7 +336,7 @@ pub async fn create_sender_key_distribution_message<R: Rng + CryptoRng>(
                 &sender_key,
                 signing_key.public_key,
                 Some(signing_key.private_key),
-            );
+            )?;
             // Build SKDM before store so we can move ownership
             let skdm = build_skdm_from_record(&record)?;
             sender_key_store

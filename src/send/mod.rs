@@ -214,34 +214,34 @@ pub(crate) fn infer_stanza_metadata(msg: &wa::Message) -> (Option<EditAttribute>
     let mut meta = NodeBuilder::new("meta");
     let mut has_attr = false;
 
-    if msg.poll_creation_message.is_some()
-        || msg.poll_creation_message_v2.is_some()
-        || msg.poll_creation_message_v3.is_some()
+    if msg.poll_creation_message.is_set()
+        || msg.poll_creation_message_v2.is_set()
+        || msg.poll_creation_message_v3.is_set()
     {
         meta = meta.attr("polltype", "creation");
         has_attr = true;
-    } else if let Some(ref poll_update) = msg.poll_update_message
-        && poll_update.vote.is_some()
+    } else if let Some(poll_update) = msg.poll_update_message.as_option()
+        && poll_update.vote.is_set()
     {
         meta = meta.attr("polltype", "vote");
         has_attr = true;
         // TODO: polltype="result_snapshot" for poll_result_snapshot_message (gated behind AB flag)
-    } else if msg.event_message.is_some() {
+    } else if msg.event_message.is_set() {
         meta = meta.attr("event_type", "creation");
         has_attr = true;
-    } else if msg.enc_event_response_message.is_some() {
+    } else if msg.enc_event_response_message.is_set() {
         meta = meta.attr("event_type", "response");
         has_attr = true;
-    } else if let Some(ref sec) = msg.secret_encrypted_message
+    } else if let Some(sec) = msg.secret_encrypted_message.as_option()
         && sec.secret_enc_type
-            == Some(wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32)
+            == Some(wa::message::secret_encrypted_message::SecretEncType::EventEdit)
     {
         meta = meta.attr("event_type", "edit");
         has_attr = true;
     } else if let Some(ml) = msg
         .protocol_message
-        .as_ref()
-        .and_then(|pm| pm.member_label.as_ref())
+        .as_option()
+        .and_then(|pm| pm.member_label.as_option())
     {
         // genMetaNode (MsgMetaNode `d`/`p`): a member_label protocol message carries
         // appdata="member_tag" and tag_reason="user_delete" when the label is cleared
@@ -369,13 +369,13 @@ fn build_nested_biz(privacy_mode_ts: &str, flow_name: &str) -> Node {
 fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::InteractiveMessage> {
     // Only checks documentWithCaptionMessage wrapper (for media headers) and direct field.
     // Does not use unwrap_message() since we need the InteractiveMessage specifically.
-    if let Some(ref doc) = msg.document_with_caption_message
-        && let Some(ref inner) = doc.message
-        && let Some(ref im) = inner.interactive_message
+    if let Some(doc) = msg.document_with_caption_message.as_option()
+        && let Some(inner) = doc.message.as_option()
+        && let Some(im) = inner.interactive_message.as_option()
     {
         return Some(im);
     }
-    msg.interactive_message.as_deref()
+    msg.interactive_message.as_option()
 }
 
 /// Assemble the `extra_stanza_nodes` vector for a non-newsletter send.
@@ -413,16 +413,16 @@ fn build_revoke_message(
     participant: Option<String>,
 ) -> wa::Message {
     wa::Message {
-        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-            key: Some(wa::MessageKey {
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            key: buffa::MessageField::some(wa::MessageKey {
                 remote_jid: Some(remote_jid.to_string()),
                 from_me: Some(from_me),
                 id: Some(message_id),
                 participant,
             }),
-            r#type: Some(wa::message::protocol_message::Type::Revoke as i32),
+            r#type: Some(wa::message::protocol_message::Type::Revoke),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     }
 }
@@ -482,18 +482,18 @@ pub(crate) fn build_edit_message(
     timestamp_ms: i64,
 ) -> wa::Message {
     wa::Message {
-        protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-            key: Some(wa::MessageKey {
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            key: buffa::MessageField::some(wa::MessageKey {
                 remote_jid: Some(remote_jid.to_string()),
                 from_me: Some(true),
                 id: Some(message_id),
                 participant,
             }),
-            r#type: Some(wa::message::protocol_message::Type::MessageEdit as i32),
-            edited_message: Some(Box::new(new_content)),
+            r#type: Some(wa::message::protocol_message::Type::MessageEdit),
+            edited_message: buffa::MessageField::some(new_content),
             timestamp_ms: Some(timestamp_ms),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     }
 }
@@ -1283,8 +1283,8 @@ impl Client {
         let (to, is_status_addon) = if to.is_status_broadcast() {
             let author = message
                 .reaction_message
-                .as_ref()
-                .and_then(|rm| rm.key.as_ref())
+                .as_option()
+                .and_then(|rm| rm.key.as_option())
                 .and_then(|k| k.participant.as_ref())
                 .and_then(|p| p.parse::<Jid>().ok())
                 .filter(|jid| jid.is_pn() || jid.is_lid())
@@ -2135,8 +2135,8 @@ mod tests {
             .send_message(
                 to,
                 wa::Message {
-                    reaction_message: Some(Box::new(wa::message::ReactionMessage {
-                        key: Some(wa::MessageKey {
+                    reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+                        key: buffa::MessageField::some(wa::MessageKey {
                             remote_jid: Some("status@broadcast".into()),
                             from_me: Some(false),
                             id: Some("ORIGID".into()),
@@ -2145,7 +2145,7 @@ mod tests {
                         text: Some("❤️".into()),
                         sender_timestamp_ms: Some(1),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
                 },
             )
@@ -2165,8 +2165,8 @@ mod tests {
             .send_message(
                 to,
                 wa::Message {
-                    reaction_message: Some(Box::new(wa::message::ReactionMessage {
-                        key: Some(wa::MessageKey {
+                    reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+                        key: buffa::MessageField::some(wa::MessageKey {
                             remote_jid: Some("status@broadcast".into()),
                             from_me: Some(false),
                             id: Some("ORIGID".into()),
@@ -2175,7 +2175,7 @@ mod tests {
                         text: Some("❤️".into()),
                         sender_timestamp_ms: Some(1),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
                 },
             )
@@ -2243,8 +2243,8 @@ mod tests {
 
         let revoke_message = build_revoke_message(&to, from_me, message_id.clone(), participant);
 
-        let proto_msg = revoke_message.protocol_message.unwrap();
-        let key = proto_msg.key.unwrap();
+        let proto_msg = revoke_message.protocol_message.into_option().unwrap();
+        let key = proto_msg.key.into_option().unwrap();
         assert_eq!(key.from_me, Some(true));
         assert_eq!(key.participant, None);
         assert_eq!(key.id, Some(message_id));
@@ -2284,8 +2284,8 @@ mod tests {
         let revoke_message =
             build_revoke_message(&to, from_me, message_id.clone(), participant.clone());
 
-        let proto_msg = revoke_message.protocol_message.unwrap();
-        let key = proto_msg.key.unwrap();
+        let proto_msg = revoke_message.protocol_message.into_option().unwrap();
+        let key = proto_msg.key.into_option().unwrap();
         assert_eq!(key.from_me, Some(false));
         // Participant should be the original sender with device number stripped
         assert_eq!(key.participant, Some("236395184570386@lid".to_string()));
@@ -2865,7 +2865,7 @@ mod tests {
         #[test]
         fn pin_returns_edit_attribute() {
             let msg = wa::Message {
-                pin_in_chat_message: Some(Box::default()),
+                pin_in_chat_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2876,7 +2876,7 @@ mod tests {
         #[test]
         fn poll_creation_v3_returns_meta_node() {
             let msg = wa::Message {
-                poll_creation_message_v3: Some(Box::default()),
+                poll_creation_message_v3: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2893,7 +2893,7 @@ mod tests {
         #[test]
         fn event_returns_meta_node() {
             let msg = wa::Message {
-                event_message: Some(Box::default()),
+                event_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2950,7 +2950,7 @@ mod tests {
         #[test]
         fn poll_creation_v1_returns_meta_node() {
             let msg = wa::Message {
-                poll_creation_message: Some(Box::default()),
+                poll_creation_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2967,7 +2967,7 @@ mod tests {
         #[test]
         fn poll_creation_v2_returns_meta_node() {
             let msg = wa::Message {
-                poll_creation_message_v2: Some(Box::default()),
+                poll_creation_message_v2: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -2984,10 +2984,10 @@ mod tests {
         #[test]
         fn poll_vote_returns_meta_node() {
             let msg = wa::Message {
-                poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
-                    vote: Some(wa::message::PollEncValue::default()),
+                poll_update_message: buffa::MessageField::some(wa::message::PollUpdateMessage {
+                    vote: buffa::MessageField::some(wa::message::PollEncValue::default()),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3001,10 +3001,10 @@ mod tests {
         #[test]
         fn view_once_image_emits_view_once_meta() {
             let msg = wa::Message {
-                image_message: Some(Box::new(wa::message::ImageMessage {
+                image_message: buffa::MessageField::some(wa::message::ImageMessage {
                     view_once: Some(true),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             let (_, node) = infer_stanza_metadata(&msg);
@@ -3019,7 +3019,7 @@ mod tests {
         #[test]
         fn plain_image_emits_no_meta() {
             let msg = wa::Message {
-                image_message: Some(Box::new(wa::message::ImageMessage::default())),
+                image_message: buffa::MessageField::some(wa::message::ImageMessage::default()),
                 ..Default::default()
             };
             assert!(infer_stanza_metadata(&msg).1.is_none());
@@ -3028,7 +3028,7 @@ mod tests {
         #[test]
         fn event_response_returns_meta_node() {
             let msg = wa::Message {
-                enc_event_response_message: Some(Box::default()),
+                enc_event_response_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3045,10 +3045,9 @@ mod tests {
         #[test]
         fn poll_update_without_vote_returns_none() {
             let msg = wa::Message {
-                poll_update_message: Some(Box::new(wa::message::PollUpdateMessage {
-                    vote: None,
+                poll_update_message: buffa::MessageField::some(wa::message::PollUpdateMessage {
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3059,10 +3058,10 @@ mod tests {
         #[test]
         fn revoked_reaction_returns_sender_revoke() {
             let msg = wa::Message {
-                reaction_message: Some(Box::new(wa::message::ReactionMessage {
+                reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
                     text: Some(String::new()),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -3072,14 +3071,14 @@ mod tests {
         #[test]
         fn keep_in_chat_undo_returns_sender_revoke() {
             let msg = wa::Message {
-                keep_in_chat_message: Some(Box::new(wa::message::KeepInChatMessage {
-                    key: Some(wa::MessageKey {
+                keep_in_chat_message: buffa::MessageField::some(wa::message::KeepInChatMessage {
+                    key: buffa::MessageField::some(wa::MessageKey {
                         from_me: Some(true),
                         ..Default::default()
                     }),
-                    keep_type: Some(wa::KeepType::UndoKeepForAll as i32),
+                    keep_type: Some(wa::KeepType::UndoKeepForAll),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -3089,12 +3088,14 @@ mod tests {
         #[test]
         fn secret_encrypted_message_edit_returns_message_edit() {
             let msg = wa::Message {
-                secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
-                    secret_enc_type: Some(
-                        wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
-                    ),
-                    ..Default::default()
-                })),
+                secret_encrypted_message: buffa::MessageField::some(
+                    wa::message::SecretEncryptedMessage {
+                        secret_enc_type: Some(
+                            wa::message::secret_encrypted_message::SecretEncType::MessageEdit,
+                        ),
+                        ..Default::default()
+                    },
+                ),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -3106,12 +3107,14 @@ mod tests {
             // EVENT_EDIT is the one case where the edit attribute AND the
             // meta node both fire: `event_type=edit` meta + `edit="1"` attr.
             let msg = wa::Message {
-                secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
-                    secret_enc_type: Some(
-                        wa::message::secret_encrypted_message::SecretEncType::EventEdit as i32,
-                    ),
-                    ..Default::default()
-                })),
+                secret_encrypted_message: buffa::MessageField::some(
+                    wa::message::SecretEncryptedMessage {
+                        secret_enc_type: Some(
+                            wa::message::secret_encrypted_message::SecretEncType::EventEdit,
+                        ),
+                        ..Default::default()
+                    },
+                ),
                 ..Default::default()
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -3126,9 +3129,9 @@ mod tests {
         #[test]
         fn top_level_edited_message_returns_message_edit() {
             let msg = wa::Message {
-                edited_message: Some(Box::new(wa::message::FutureProofMessage {
-                    message: Some(Box::new(wa::Message::default())),
-                })),
+                edited_message: buffa::MessageField::some(wa::message::FutureProofMessage {
+                    message: buffa::MessageField::some(wa::Message::default()),
+                }),
                 ..Default::default()
             };
             let (edit, _) = infer_stanza_metadata(&msg);
@@ -3154,25 +3157,25 @@ mod tests {
             // Canonical WA Web shape: top-level protocolMessage(type=MESSAGE_EDIT),
             // not the Message.editedMessage FutureProofMessage history wrapper.
             assert!(
-                msg.edited_message.is_none(),
+                msg.edited_message.is_unset(),
                 "edit must not use the FutureProofMessage wrapper"
             );
             let pm = msg
                 .protocol_message
-                .as_deref()
+                .as_option()
                 .expect("top-level protocol_message");
             assert_eq!(
                 pm.r#type,
-                Some(wa::message::protocol_message::Type::MessageEdit as i32)
+                Some(wa::message::protocol_message::Type::MessageEdit)
             );
             assert_eq!(
-                pm.key.as_ref().and_then(|k| k.id.as_deref()),
+                pm.key.as_option().and_then(|k| k.id.as_deref()),
                 Some("ORIG_ID")
             );
-            assert_eq!(pm.key.as_ref().and_then(|k| k.from_me), Some(true));
+            assert_eq!(pm.key.as_option().and_then(|k| k.from_me), Some(true));
             assert_eq!(
                 pm.edited_message
-                    .as_ref()
+                    .as_option()
                     .and_then(|m| m.conversation.as_deref()),
                 Some("edited")
             );
@@ -3198,9 +3201,9 @@ mod tests {
 
         fn msg_with_native_flow_button(button_name: &str) -> wa::Message {
             wa::Message {
-                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
                     interactive_message: Some(
-                        interactive_message::InteractiveMessage::NativeFlowMessage(
+                        interactive_message::InteractiveMessage::NativeFlowMessage(Box::new(
                             NativeFlowMessage {
                                 buttons: vec![NativeFlowButton {
                                     name: Some(button_name.to_string()),
@@ -3209,10 +3212,10 @@ mod tests {
                                 message_version: Some(1),
                                 message_params_json: None,
                             },
-                        ),
+                        )),
                     ),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             }
         }
@@ -3362,14 +3365,14 @@ mod tests {
         #[test]
         fn interactive_without_native_flow_returns_none() {
             let msg = wa::Message {
-                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
                     interactive_message: Some(
                         interactive_message::InteractiveMessage::CollectionMessage(
                             Default::default(),
                         ),
                     ),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
@@ -3379,18 +3382,18 @@ mod tests {
         #[test]
         fn native_flow_without_buttons_returns_none() {
             let msg = wa::Message {
-                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
                     interactive_message: Some(
-                        interactive_message::InteractiveMessage::NativeFlowMessage(
+                        interactive_message::InteractiveMessage::NativeFlowMessage(Box::new(
                             NativeFlowMessage {
                                 buttons: vec![],
                                 message_version: Some(1),
                                 message_params_json: None,
                             },
-                        ),
+                        )),
                     ),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
@@ -3400,9 +3403,9 @@ mod tests {
         #[test]
         fn button_without_name_returns_none() {
             let msg = wa::Message {
-                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
                     interactive_message: Some(
-                        interactive_message::InteractiveMessage::NativeFlowMessage(
+                        interactive_message::InteractiveMessage::NativeFlowMessage(Box::new(
                             NativeFlowMessage {
                                 buttons: vec![NativeFlowButton {
                                     name: None,
@@ -3411,10 +3414,10 @@ mod tests {
                                 message_version: Some(1),
                                 message_params_json: None,
                             },
-                        ),
+                        )),
                     ),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             assert!(infer_biz_node(&msg, FIXED_NOW).is_none());
@@ -3425,9 +3428,9 @@ mod tests {
         #[test]
         fn document_with_caption_wrapper() {
             let inner = wa::Message {
-                interactive_message: Some(Box::new(wa::message::InteractiveMessage {
+                interactive_message: buffa::MessageField::some(wa::message::InteractiveMessage {
                     interactive_message: Some(
-                        interactive_message::InteractiveMessage::NativeFlowMessage(
+                        interactive_message::InteractiveMessage::NativeFlowMessage(Box::new(
                             NativeFlowMessage {
                                 buttons: vec![NativeFlowButton {
                                     name: Some("quick_reply".into()),
@@ -3436,16 +3439,18 @@ mod tests {
                                 message_version: Some(1),
                                 message_params_json: None,
                             },
-                        ),
+                        )),
                     ),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             };
             let msg = wa::Message {
-                document_with_caption_message: Some(Box::new(wa::message::FutureProofMessage {
-                    message: Some(Box::new(inner)),
-                })),
+                document_with_caption_message: buffa::MessageField::some(
+                    wa::message::FutureProofMessage {
+                        message: buffa::MessageField::some(inner),
+                    },
+                ),
                 ..Default::default()
             };
             let biz = infer_biz_node(&msg, FIXED_NOW)
@@ -3768,8 +3773,8 @@ mod tests {
             .await;
     }
 
-    fn peer_test_account_proto() -> wa::AdvSignedDeviceIdentity {
-        wa::AdvSignedDeviceIdentity {
+    fn peer_test_account_proto() -> wa::ADVSignedDeviceIdentity {
+        wa::ADVSignedDeviceIdentity {
             details: Some(vec![0u8; 32]),
             account_signature_key: Some(vec![0u8; 32]),
             account_signature: Some(vec![0u8; 64]),
@@ -3828,18 +3833,16 @@ mod tests {
 
     fn pdo_request_message(request_type: wa::message::PeerDataOperationRequestType) -> wa::Message {
         wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(
-                    wa::message::protocol_message::Type::PeerDataOperationRequestMessage as i32,
-                ),
-                peer_data_operation_request_message: Some(
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::PeerDataOperationRequestMessage),
+                peer_data_operation_request_message: buffa::MessageField::some(
                     wa::message::PeerDataOperationRequestMessage {
-                        peer_data_operation_request_type: Some(request_type as i32),
+                        peer_data_operation_request_type: Some(request_type),
                         ..Default::default()
                     },
                 ),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         }
     }
@@ -4262,7 +4265,7 @@ mod tests {
     /// and a text edit carries no mediatype.
     #[test]
     fn build_newsletter_edit_node_emits_plaintext_edit() {
-        use prost::Message as _;
+        use buffa::Message as _;
         let to: Jid = "120363000000000001@newsletter".parse().unwrap();
         let content = wa::Message {
             conversation: Some("edited text".to_string()),
@@ -4287,7 +4290,7 @@ mod tests {
             Some(wacore_binary::NodeContent::Bytes(b)) => b.clone(),
             other => panic!("expected plaintext bytes, got {other:?}"),
         };
-        let decoded = wa::Message::decode(bytes.as_slice()).expect("decode plaintext");
+        let decoded = wa::Message::decode_from_slice(bytes.as_slice()).expect("decode plaintext");
         assert_eq!(decoded.conversation.as_deref(), Some("edited text"));
     }
 
@@ -4296,10 +4299,10 @@ mod tests {
     fn build_newsletter_edit_node_media_edit() {
         let to: Jid = "120363000000000001@newsletter".parse().unwrap();
         let content = wa::Message {
-            image_message: Some(Box::new(wa::message::ImageMessage {
+            image_message: buffa::MessageField::some(wa::message::ImageMessage {
                 caption: Some("new caption".to_string()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         let node = build_newsletter_edit_node(&to, "3EB0MEDIA", NewsletterEdit::Edit(&content));

@@ -687,14 +687,14 @@ mod tests {
     fn props(os: Option<&str>, pt: Option<wa::device_props::PlatformType>) -> wa::DeviceProps {
         wa::DeviceProps {
             os: os.map(|s| s.to_string()),
-            platform_type: pt.map(|v| v as i32),
+            platform_type: pt,
             ..Default::default()
         }
     }
 
     #[test]
     fn derive_chrome_linux_matches_wa_web() {
-        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::Chrome));
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::CHROME));
         assert_eq!(
             derive_companion_platform(&p),
             (CompanionWebClientType::Chrome, "Chrome (Linux)".to_string())
@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn derive_firefox_uses_companion_web_client_wire() {
-        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::Firefox));
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::FIREFOX));
         let (id, display) = derive_companion_platform(&p);
         assert_eq!(id, CompanionWebClientType::Firefox);
         assert_eq!(id.wire_byte(), b'3');
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn derive_edge_uses_companion_web_client_wire() {
-        let p = props(Some("Windows"), Some(wa::device_props::PlatformType::Edge));
+        let p = props(Some("Windows"), Some(wa::device_props::PlatformType::EDGE));
         let (id, display) = derive_companion_platform(&p);
         assert_eq!(id, CompanionWebClientType::Edge);
         assert_eq!(id.wire_byte(), b'2');
@@ -722,7 +722,7 @@ mod tests {
     #[test]
     fn derive_android_platform_types_map_to_chrome() {
         use wa::device_props::PlatformType as P;
-        for pt in [P::AndroidPhone, P::AndroidTablet, P::AndroidAmbiguous] {
+        for pt in [P::ANDROID_PHONE, P::ANDROID_TABLET, P::ANDROID_AMBIGUOUS] {
             let (id, display) = derive_companion_platform(&props(Some("Android"), Some(pt)));
             assert_eq!(id, CompanionWebClientType::Chrome, "{pt:?}");
             assert_eq!(id.wire_byte(), b'1', "{pt:?}");
@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn derive_ios_phone_falls_back_to_other_web_client_and_chrome() {
-        let p = props(Some("iOS"), Some(wa::device_props::PlatformType::IosPhone));
+        let p = props(Some("iOS"), Some(wa::device_props::PlatformType::IOS_PHONE));
         let (id, display) = derive_companion_platform(&p);
         assert_eq!(id, CompanionWebClientType::OtherWebClient);
         assert_eq!(display, "Chrome (iOS)");
@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn derive_no_os_substitutes_linux() {
-        let p = props(None, Some(wa::device_props::PlatformType::Chrome));
+        let p = props(None, Some(wa::device_props::PlatformType::CHROME));
         assert_eq!(
             derive_companion_platform(&p),
             (CompanionWebClientType::Chrome, "Chrome (Linux)".to_string())
@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn derive_empty_os_substitutes_linux() {
-        let p = props(Some("   "), Some(wa::device_props::PlatformType::Chrome));
+        let p = props(Some("   "), Some(wa::device_props::PlatformType::CHROME));
         assert_eq!(
             derive_companion_platform(&p),
             (CompanionWebClientType::Chrome, "Chrome (Linux)".to_string())
@@ -776,31 +776,31 @@ mod tests {
             "Chrome", "Edge", "Firefox", "IE", "Opera", "Safari", "Android",
         ];
         for pt in [
-            P::Unknown,
-            P::Chrome,
-            P::Firefox,
-            P::Ie,
-            P::Opera,
-            P::Safari,
-            P::Edge,
-            P::Desktop,
-            P::Ipad,
-            P::AndroidTablet,
-            P::Ohana,
-            P::Aloha,
-            P::Catalina,
-            P::TclTv,
-            P::IosPhone,
-            P::IosCatalyst,
-            P::AndroidPhone,
-            P::AndroidAmbiguous,
-            P::WearOs,
-            P::ArWrist,
-            P::ArDevice,
-            P::Uwp,
-            P::Vr,
-            P::CloudApi,
-            P::Smartglasses,
+            P::UNKNOWN,
+            P::CHROME,
+            P::FIREFOX,
+            P::IE,
+            P::OPERA,
+            P::SAFARI,
+            P::EDGE,
+            P::DESKTOP,
+            P::IPAD,
+            P::ANDROID_TABLET,
+            P::OHANA,
+            P::ALOHA,
+            P::CATALINA,
+            P::TCL_TV,
+            P::IOS_PHONE,
+            P::IOS_CATALYST,
+            P::ANDROID_PHONE,
+            P::ANDROID_AMBIGUOUS,
+            P::WEAR_OS,
+            P::AR_WRIST,
+            P::AR_DEVICE,
+            P::UWP,
+            P::VR,
+            P::CLOUD_API,
+            P::SMARTGLASSES,
         ] {
             let p = props(Some("Linux"), Some(pt));
             let (id, display) = derive_companion_platform(&p);
@@ -825,7 +825,7 @@ mod tests {
     fn resolve_explicit_id_overrides_derived() {
         let p = props(
             Some("Android"),
-            Some(wa::device_props::PlatformType::AndroidPhone),
+            Some(wa::device_props::PlatformType::ANDROID_PHONE),
         );
         let opts = PairCodeOptions {
             platform_id: Some(CompanionWebClientType::Chrome),
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn resolve_default_uses_derived() {
-        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::Edge));
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::EDGE));
         assert_eq!(
             resolve_companion_platform(&PairCodeOptions::default(), &p),
             (CompanionWebClientType::Edge, "Edge (Linux)".to_string())
@@ -1107,7 +1107,7 @@ mod tests {
     fn android_device_props_emit_server_accepted_companion_hello() {
         let props = wa::DeviceProps {
             os: Some("Android".into()),
-            platform_type: Some(wa::device_props::PlatformType::AndroidPhone as i32),
+            platform_type: Some(wa::device_props::PlatformType::ANDROID_PHONE),
             ..Default::default()
         };
         let (pid, pdisp) = resolve_companion_platform(&PairCodeOptions::default(), &props);
@@ -1130,7 +1130,7 @@ mod tests {
     fn explicit_options_override_id_and_display_follows() {
         let props = wa::DeviceProps {
             os: Some("Android".into()),
-            platform_type: Some(wa::device_props::PlatformType::AndroidPhone as i32),
+            platform_type: Some(wa::device_props::PlatformType::ANDROID_PHONE),
             ..Default::default()
         };
         let opts = PairCodeOptions {
@@ -1146,7 +1146,7 @@ mod tests {
     #[test]
     fn pair_code_id_matches_qr_id_for_same_device_props() {
         use crate::companion_reg::companion_web_client_type_for_props;
-        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::Edge));
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::EDGE));
         let (pair_code_id, _) = derive_companion_platform(&p);
         let qr_id = companion_web_client_type_for_props(&p);
         assert_eq!(pair_code_id, qr_id);

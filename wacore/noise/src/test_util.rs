@@ -2,7 +2,7 @@
 //! integration tests. Visible only under `#[cfg(test)]` (this crate) or
 //! when the `test-util` feature is enabled.
 
-use prost::Message;
+use buffa::Message;
 use waproto::whatsapp::{self as wa, cert_chain::noise_certificate};
 
 /// Builds a minimal `CertChain` blob whose leaf.key matches `server_static_pub`.
@@ -13,7 +13,7 @@ use waproto::whatsapp::{self as wa, cert_chain::noise_certificate};
 ///
 /// Signatures are zero-filled — the client today does NOT verify the
 /// intermediate's Ed25519 signature against `WA_CERT_PUB_KEY`, so the bytes
-/// only need to round-trip through prost.
+/// only need to round-trip through protobuf encoding.
 pub fn build_cert_chain_bytes(server_static_pub: &[u8; 32]) -> Vec<u8> {
     let intermediate_details = noise_certificate::Details {
         serial: Some(1),
@@ -22,10 +22,7 @@ pub fn build_cert_chain_bytes(server_static_pub: &[u8; 32]) -> Vec<u8> {
         not_before: Some(1_700_000_000),
         not_after: Some(1_900_000_000),
     };
-    let mut intermediate_details_bytes = Vec::new();
-    intermediate_details
-        .encode(&mut intermediate_details_bytes)
-        .expect("encode intermediate details");
+    let intermediate_details_bytes = intermediate_details.encode_to_vec();
 
     let leaf_details = noise_certificate::Details {
         serial: Some(2),
@@ -34,22 +31,17 @@ pub fn build_cert_chain_bytes(server_static_pub: &[u8; 32]) -> Vec<u8> {
         not_before: Some(1_700_000_500),
         not_after: Some(1_899_999_500),
     };
-    let mut leaf_details_bytes = Vec::new();
-    leaf_details
-        .encode(&mut leaf_details_bytes)
-        .expect("encode leaf details");
+    let leaf_details_bytes = leaf_details.encode_to_vec();
 
     let chain = wa::CertChain {
-        leaf: Some(wa::cert_chain::NoiseCertificate {
+        leaf: buffa::MessageField::some(wa::cert_chain::NoiseCertificate {
             details: Some(leaf_details_bytes),
             signature: Some(vec![0u8; 64]),
         }),
-        intermediate: Some(wa::cert_chain::NoiseCertificate {
+        intermediate: buffa::MessageField::some(wa::cert_chain::NoiseCertificate {
             details: Some(intermediate_details_bytes),
             signature: Some(vec![0u8; 64]),
         }),
     };
-    let mut bytes = Vec::new();
-    chain.encode(&mut bytes).expect("encode chain");
-    bytes
+    chain.encode_to_vec()
 }

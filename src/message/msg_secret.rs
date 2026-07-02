@@ -13,7 +13,7 @@ impl Client {
     ) {
         use wacore::proto_helpers::MessageExt;
 
-        let mci = msg.message_context_info.as_ref();
+        let mci = msg.message_context_info.as_option();
         let Some(secret_bytes) = mci.and_then(|m| m.message_secret.as_deref()) else {
             return;
         };
@@ -335,10 +335,10 @@ impl Client {
         // lives in the envelope, so the surfaced plaintext-shape reaction gets
         // it from there (parity with a plaintext reaction_message).
         if env.kind == SecretEncKind::EncReaction
-            && let Some(rm) = inner.reaction_message.as_mut()
-            && rm.key.is_none()
+            && let Some(rm) = inner.reaction_message.as_option_mut()
+            && rm.key.is_unset()
         {
-            rm.key = Some(env.target_message_key.clone());
+            rm.key = buffa::MessageField::some(env.target_message_key.clone());
         }
 
         // A comment's own messageSecret rides the OUTER envelope (WA Web puts
@@ -349,12 +349,10 @@ impl Client {
         if env.kind == SecretEncKind::EncComment
             && let Some(outer_secret) = msg
                 .message_context_info
-                .as_ref()
+                .as_option()
                 .and_then(|m| m.message_secret.as_ref())
         {
-            let inner_mci = inner
-                .message_context_info
-                .get_or_insert_with(Default::default);
+            let inner_mci = inner.message_context_info.get_or_insert_default();
             if inner_mci.message_secret.is_none() {
                 inner_mci.message_secret = Some(outer_secret.clone());
             }
@@ -380,7 +378,7 @@ impl Client {
 
         if let Some(secret_bytes) = inner
             .message_context_info
-            .as_ref()
+            .as_option()
             .and_then(|m| m.message_secret.as_deref())
         {
             // The re-persisted secret keys the NEXT add-on. For the edit/poll
@@ -466,12 +464,12 @@ impl Client {
         info: &Arc<MessageInfo>,
         payload: EncPayload,
     ) {
-        use prost::Message as _;
+        use buffa::Message as _;
         use wa::MessageSecretMessage;
         use wacore::bot_message::{BotMessageContext, decrypt_bot_message};
         use wacore::protocol::nack::NackReason;
 
-        let ms_msg = match MessageSecretMessage::decode(&*payload.ciphertext) {
+        let ms_msg = match MessageSecretMessage::decode_from_slice(&payload.ciphertext) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!(

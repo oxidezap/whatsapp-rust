@@ -185,7 +185,7 @@ static GROUP_INVITE_MESSAGE_SUBFIELDS: &[ReportingField] = &[
     ReportingField::with_subfields(7, CONTEXT_INFO_SUBFIELDS), // contextInfo (at field 7 here)
 ];
 
-/// PollOption subfields
+/// `Option` (poll option) subfields
 static POLL_OPTION_SUBFIELDS: &[ReportingField] = &[
     ReportingField::new(1), // optionName
     ReportingField::new(2), // optionValue
@@ -517,10 +517,10 @@ pub fn extract_reporting_token_content(
 
 /// Check if reporting token should be included for this message type.
 pub fn should_include_reporting_token(message: &wa::Message) -> bool {
-    message.reaction_message.is_none()
-        && message.enc_reaction_message.is_none()
-        && message.poll_update_message.is_none()
-        && message.keep_in_chat_message.is_none()
+    message.reaction_message.is_unset()
+        && message.enc_reaction_message.is_unset()
+        && message.poll_update_message.is_unset()
+        && message.keep_in_chat_message.is_unset()
 }
 
 /// Generate reporting token content by extracting whitelisted protobuf fields.
@@ -650,7 +650,7 @@ pub fn prepare_message_with_context(
     let mut context_info = new_message.message_context_info.take().unwrap_or_default();
     context_info.message_secret = Some(message_secret.to_vec());
     context_info.reporting_token_version = Some(REPORTING_TOKEN_VERSION);
-    new_message.message_context_info = Some(context_info);
+    new_message.message_context_info = buffa::MessageField::some(context_info);
     new_message
 }
 
@@ -671,14 +671,13 @@ pub fn reporting_context_info(result: &ReportingTokenResult) -> wa::MessageConte
 pub fn extract_message_secret(message: &wa::Message) -> Option<&[u8]> {
     message
         .message_context_info
-        .as_ref()
+        .as_option()
         .and_then(|ctx| ctx.message_secret.as_deref())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message;
 
     #[test]
     fn test_generate_message_secret() {
@@ -700,10 +699,10 @@ mod tests {
         let secret = [0x42u8; MESSAGE_SECRET_SIZE];
         let msg = wa::Message {
             conversation: Some("hi".into()),
-            message_context_info: Some(Box::new(wa::MessageContextInfo {
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
                 message_secret: Some(secret.to_vec()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         let to: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
@@ -821,10 +820,10 @@ mod tests {
     #[test]
     fn test_generate_reporting_token_content_extended_text() {
         let message = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some("Extended text message".to_string()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
 
@@ -851,18 +850,19 @@ mod tests {
 
         // Reaction message should NOT include token
         let reaction_message = wa::Message {
-            reaction_message: Some(Box::new(wa::message::ReactionMessage {
-                key: None,
-                text: Some("👍".to_string()),
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+                text: Some("\u{1f44d}".to_string()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&reaction_message));
 
         // Poll update should NOT include token
         let poll_update = wa::Message {
-            poll_update_message: Some(Box::default()),
+            poll_update_message: buffa::MessageField::some(
+                wa::message::PollUpdateMessage::default(),
+            ),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&poll_update));
@@ -876,7 +876,7 @@ mod tests {
             ..Default::default()
         };
 
-        let message_bytes = message.encode_to_vec();
+        let message_bytes = waproto::codec::message_to_vec(&message);
         let extracted = extract_reporting_token_content(&message_bytes, REPORTING_FIELDS);
 
         assert!(extracted.is_some());
@@ -891,15 +891,15 @@ mod tests {
     fn test_extract_filters_non_whitelisted_fields() {
         // Create an extended text message with contextInfo that has non-whitelisted fields
         let message = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some("Hello".to_string()),
-                context_info: Some(Box::new(wa::ContextInfo {
+                context_info: buffa::MessageField::some(wa::ContextInfo {
                     stanza_id: Some("should-be-excluded".to_string()), // Field 1 - NOT in whitelist
                     is_forwarded: Some(true),                          // Field 22 - in whitelist
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
 
@@ -1002,10 +1002,10 @@ mod tests {
         // Excluded type (reaction): both paths bail before extraction/secret/key (the
         // reorder makes that skip explicit) and return None.
         let reaction = wa::Message {
-            reaction_message: Some(Box::new(wa::message::ReactionMessage {
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
                 text: Some("👍".to_string()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         let reaction_encoded = waproto::codec::message_to_vec(&reaction);
@@ -1084,21 +1084,28 @@ mod tests {
         let secret = [0x42u8; MESSAGE_SECRET_SIZE];
         let prepared = prepare_message_with_context(&message, &secret);
 
-        let ctx = prepared
-            .message_context_info
-            .expect("prepared message should have context info");
-        assert_eq!(ctx.message_secret, Some(secret.to_vec()));
-        assert_eq!(ctx.reporting_token_version, Some(REPORTING_TOKEN_VERSION));
+        assert!(
+            prepared.message_context_info.is_set(),
+            "prepared message should have context info"
+        );
+        assert_eq!(
+            prepared.message_context_info.message_secret,
+            Some(secret.to_vec())
+        );
+        assert_eq!(
+            prepared.message_context_info.reporting_token_version,
+            Some(REPORTING_TOKEN_VERSION)
+        );
     }
 
     #[test]
     fn test_extract_message_secret() {
         let secret = vec![0x55u8; MESSAGE_SECRET_SIZE];
         let message = wa::Message {
-            message_context_info: Some(Box::new(wa::MessageContextInfo {
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
                 message_secret: Some(secret.clone()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
 
@@ -1198,10 +1205,10 @@ mod tests {
     fn test_golden_extended_text_content_extraction() {
         // Golden test: extended text message content extraction
         let message = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some("Hi".to_string()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
 
@@ -1263,17 +1270,17 @@ mod tests {
     fn test_context_info_filtering_only_extracts_whitelisted() {
         // Verify that contextInfo only extracts fields 21 (forwardingScore) and 22 (isForwarded)
         let message = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some("Test".to_string()),
-                context_info: Some(Box::new(wa::ContextInfo {
+                context_info: buffa::MessageField::some(wa::ContextInfo {
                     stanza_id: Some("SHOULD_BE_EXCLUDED".to_string()), // Field 1
                     participant: Some("ALSO_EXCLUDED".to_string()),    // Field 2
                     is_forwarded: Some(true),                          // Field 22 - INCLUDED
                     forwarding_score: Some(5),                         // Field 21 - INCLUDED
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
 
@@ -1356,11 +1363,11 @@ mod tests {
     fn test_extraction_handles_empty_nested_message() {
         // An extended text message with empty contextInfo should still extract the text
         let message = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some("Content".to_string()),
-                context_info: Some(Box::new(wa::ContextInfo::default())), // Empty
+                context_info: buffa::MessageField::some(wa::ContextInfo::default()), // Empty
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
 
@@ -1433,29 +1440,35 @@ mod tests {
         // Verify all excluded message types return None/false
 
         let reaction = wa::Message {
-            reaction_message: Some(Box::new(wa::message::ReactionMessage {
-                text: Some("👍".to_string()),
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+                text: Some("\u{1f44d}".to_string()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&reaction));
         assert!(generate_reporting_token_content(&reaction).is_none());
 
         let enc_reaction = wa::Message {
-            enc_reaction_message: Some(Box::default()),
+            enc_reaction_message: buffa::MessageField::some(
+                wa::message::EncReactionMessage::default(),
+            ),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&enc_reaction));
 
         let poll_update = wa::Message {
-            poll_update_message: Some(Box::default()),
+            poll_update_message: buffa::MessageField::some(
+                wa::message::PollUpdateMessage::default(),
+            ),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&poll_update));
 
         let keep_in_chat = wa::Message {
-            keep_in_chat_message: Some(Box::default()),
+            keep_in_chat_message: buffa::MessageField::some(
+                wa::message::KeepInChatMessage::default(),
+            ),
             ..Default::default()
         };
         assert!(!should_include_reporting_token(&keep_in_chat));
@@ -1491,7 +1504,7 @@ mod tests {
         // MessageContextInfo added with correct values
         let ctx = prepared
             .message_context_info
-            .as_ref()
+            .as_option()
             .expect("prepared message should have context info");
         assert_eq!(
             ctx.message_secret
@@ -1507,10 +1520,10 @@ mod tests {
         // If message already has MessageContextInfo, we should update it, not replace
         let original = wa::Message {
             conversation: Some("Test".to_string()),
-            message_context_info: Some(Box::new(wa::MessageContextInfo {
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
                 device_list_metadata_version: Some(42), // Some existing field
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
 
@@ -1519,7 +1532,7 @@ mod tests {
 
         let ctx = prepared
             .message_context_info
-            .as_ref()
+            .as_option()
             .expect("prepared message should have existing context info preserved");
         assert_eq!(
             ctx.message_secret

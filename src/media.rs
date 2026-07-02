@@ -66,7 +66,7 @@ pub struct AudioOptions {
 /// Build an image message from an upload result.
 pub fn image_message(upload: UploadResponse, opts: ImageOptions) -> wa::Message {
     wa::Message {
-        image_message: Some(Box::new(wa::message::ImageMessage {
+        image_message: buffa::MessageField::some(wa::message::ImageMessage {
             url: Some(upload.url),
             direct_path: Some(upload.direct_path),
             media_key: Some(upload.media_key.to_vec()),
@@ -77,9 +77,12 @@ pub fn image_message(upload: UploadResponse, opts: ImageOptions) -> wa::Message 
             mimetype: Some(opts.mimetype.unwrap_or_else(|| "image/jpeg".to_string())),
             caption: opts.caption,
             jpeg_thumbnail: opts.jpeg_thumbnail,
-            context_info: opts.context_info,
+            context_info: opts
+                .context_info
+                .map(|ci| buffa::MessageField::some(*ci))
+                .unwrap_or_default(),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     }
 }
@@ -88,7 +91,7 @@ pub fn image_message(upload: UploadResponse, opts: ImageOptions) -> wa::Message 
 /// (progressive-playback HMAC table) from the upload when present.
 pub fn video_message(upload: UploadResponse, opts: VideoOptions) -> wa::Message {
     wa::Message {
-        video_message: Some(Box::new(wa::message::VideoMessage {
+        video_message: buffa::MessageField::some(wa::message::VideoMessage {
             url: Some(upload.url),
             direct_path: Some(upload.direct_path),
             media_key: Some(upload.media_key.to_vec()),
@@ -102,9 +105,12 @@ pub fn video_message(upload: UploadResponse, opts: VideoOptions) -> wa::Message 
             jpeg_thumbnail: opts.jpeg_thumbnail,
             seconds: opts.duration_seconds,
             gif_playback: opts.gif_playback,
-            context_info: opts.context_info,
+            context_info: opts
+                .context_info
+                .map(|ci| buffa::MessageField::some(*ci))
+                .unwrap_or_default(),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     }
 }
@@ -112,7 +118,7 @@ pub fn video_message(upload: UploadResponse, opts: VideoOptions) -> wa::Message 
 /// Build a document message from an upload result.
 pub fn document_message(upload: UploadResponse, opts: DocumentOptions) -> wa::Message {
     wa::Message {
-        document_message: Some(Box::new(wa::message::DocumentMessage {
+        document_message: buffa::MessageField::some(wa::message::DocumentMessage {
             url: Some(upload.url),
             direct_path: Some(upload.direct_path),
             media_key: Some(upload.media_key.to_vec()),
@@ -129,9 +135,12 @@ pub fn document_message(upload: UploadResponse, opts: DocumentOptions) -> wa::Me
             caption: opts.caption,
             page_count: opts.page_count,
             jpeg_thumbnail: opts.jpeg_thumbnail,
-            context_info: opts.context_info,
+            context_info: opts
+                .context_info
+                .map(|ci| buffa::MessageField::some(*ci))
+                .unwrap_or_default(),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     }
 }
@@ -140,7 +149,7 @@ pub fn document_message(upload: UploadResponse, opts: DocumentOptions) -> wa::Me
 /// streaming sidecar from the upload when present.
 pub fn audio_message(upload: UploadResponse, opts: AudioOptions) -> wa::Message {
     wa::Message {
-        audio_message: Some(Box::new(wa::message::AudioMessage {
+        audio_message: buffa::MessageField::some(wa::message::AudioMessage {
             url: Some(upload.url),
             direct_path: Some(upload.direct_path),
             media_key: Some(upload.media_key.to_vec()),
@@ -156,9 +165,12 @@ pub fn audio_message(upload: UploadResponse, opts: AudioOptions) -> wa::Message 
             seconds: opts.duration_seconds,
             ptt: opts.ptt,
             waveform: opts.waveform,
-            context_info: opts.context_info,
+            context_info: opts
+                .context_info
+                .map(|ci| buffa::MessageField::some(*ci))
+                .unwrap_or_default(),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     }
 }
@@ -258,7 +270,7 @@ mod tests {
 
         let image = image_msg.image_message.unwrap();
 
-        assert!(image.context_info.is_some());
+        assert!(image.context_info.is_set());
     }
 
     #[test]
@@ -275,6 +287,6 @@ mod tests {
 
         let video = video_msg.video_message.unwrap();
 
-        assert!(video.context_info.is_some());
+        assert!(video.context_info.is_set());
     }
 }

@@ -1,14 +1,29 @@
 //! # Updating the proto
 //!
-//! 1. Edit `src/whatsapp.proto`.
+//! 1. Edit `src/whatsapp.proto` (kept in the upstream / whatspec camelCase
+//!    form — do NOT hand-rename fields to snake_case).
 //! 2. Optional: format with `buf format src/whatsapp.proto -w`.
 //! 3. Regenerate the descriptor: `scripts/regenerate-proto-desc.sh`
-//!    (wraps `protoc --descriptor_set_out=src/whatsapp.desc ...`).
-//! 4. `cargo build` — this script consumes `whatsapp.desc` and writes
-//!    `whatsapp.rs` + `tags.rs` to `OUT_DIR`. Consumers never need `protoc`
-//!    installed; only editors of the proto do.
+//!    (wraps `protoc --descriptor_set_out=src/whatsapp.desc …`).
+//! 4. `cargo build` — this script consumes `whatsapp.desc`, snake_cases the
+//!    field names for the Rust API, and writes `whatsapp.rs` to `OUT_DIR`.
+//!    Consumers never need `protoc`; only editors of the proto do.
+//!
+//! ## Why the descriptor is snake_cased at build time
+//!
+//! buffa generates Rust field idents verbatim from the proto field names, so a
+//! camelCase proto would yield camelCase Rust fields. To keep the proto in the
+//! upstream camelCase form (so it can be regenerated from whatspec untouched)
+//! while exposing the prost-style snake_case Rust API the codebase uses, this
+//! script decodes the committed descriptor, snake_cases every message/oneof
+//! field name, and feeds the rewritten descriptor to buffa. Wire format is
+//! unaffected (the wire keys on field numbers, not names); message/enum type
+//! names and enum value names are left as-is. Drop this once buffa grows a
+//! native idiomatic-field-names option (anthropics/buffa#256).
 
-use prost::Message as _;
+use buffa::Message as _;
+use buffa_descriptor::generated::descriptor::{DescriptorProto, FileDescriptorSet};
+use heck::ToSnakeCase as _;
 
 fn main() -> std::io::Result<()> {
     // Rerun on desc change (new codegen) and proto change (so the staleness
@@ -20,158 +35,181 @@ fn main() -> std::io::Result<()> {
 
     ensure_proto_descriptor_hash()?;
 
-    let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| {
-        std::io::Error::other("OUT_DIR not set (cargo always sets it for build scripts)")
-    })?);
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by cargo");
+    let out_path = std::path::PathBuf::from(&out_dir);
 
-    let fds =
-        prost_types::FileDescriptorSet::decode(std::fs::read("src/whatsapp.desc")?.as_slice())
-            .map_err(std::io::Error::other)?;
+    // Rewrite the committed camelCase descriptor into a snake_case-field one for
+    // buffa codegen (see module docs). buffa reads the rewritten copy from OUT_DIR.
+    let snake_desc = out_path.join("whatsapp.snake.desc");
+    snake_case_descriptor_fields("src/whatsapp.desc", &snake_desc)?;
 
-    let mut config = prost_build::Config::new();
+    // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
+    // Generated from the original descriptor; the shouty/snake transforms are
+    // unaffected by the camelCase->snake_case field rename.
+    let fds = FileDescriptorSet::decode_from_slice(&std::fs::read("src/whatsapp.desc")?)
+        .map_err(std::io::Error::other)?;
+    generate_tags(&fds, &out_path.join("tags.rs"))?;
 
-    // Serialize always; Deserialize only for WASM bridge (halves serde codegen).
-    config.type_attribute(".", "#[derive(serde::Serialize)]");
-    config.type_attribute(
-        ".",
-        "#[cfg_attr(feature = \"serde-deserialize\", derive(serde::Deserialize))]",
-    );
-    // Default missing fields to match protobuf semantics (structs only).
-    config.message_attribute(
-        ".",
-        "#[cfg_attr(feature = \"serde-deserialize\", serde(default))]",
-    );
+    buffa_build::Config::new()
+        .descriptor_set(&snake_desc)
+        .files(&["whatsapp.proto"])
+        // Box every singular message field. buffa defaults them to inline; for
+        // WhatsApp's deep, many-optional-field messages (every message variant
+        // is its own inline slot) that makes size_of explode recursively,
+        // turning decode and Vec growth into large struct memcpys. Box keeps
+        // the structs pointer-sized.
+        .box_type(buffa_build::PointerRepr::Box)
+        // Messages + oneofs: serde over the struct/oneof shape. Serialize always;
+        // Deserialize only for the WASM bridge (halves serde codegen).
+        .message_attribute(".", "#[derive(serde::Serialize)]")
+        .message_attribute(
+            ".",
+            "#[cfg_attr(feature = \"serde-deserialize\", derive(serde::Deserialize))]",
+        )
+        .message_attribute(
+            ".",
+            "#[cfg_attr(feature = \"serde-deserialize\", serde(default))]",
+        )
+        .oneof_attribute(".", "#[derive(serde::Serialize)]")
+        .oneof_attribute(
+            ".",
+            "#[cfg_attr(feature = \"serde-deserialize\", derive(serde::Deserialize))]",
+        )
+        // Enums: variant name by default; numeric repr (prost parity, JS bridge)
+        // under `serde-enum-repr`. Targeting enums separately from oneofs needs
+        // buffa's enum_attribute/oneof_attribute split.
+        .enum_attribute(
+            ".",
+            "#[cfg_attr(not(feature = \"serde-enum-repr\"), derive(serde::Serialize))]",
+        )
+        .enum_attribute(
+            ".",
+            "#[cfg_attr(feature = \"serde-enum-repr\", derive(serde_repr::Serialize_repr))]",
+        )
+        .enum_attribute(
+            ".",
+            "#[cfg_attr(all(feature = \"serde-deserialize\", not(feature = \"serde-enum-repr\")), derive(serde::Deserialize))]",
+        )
+        .enum_attribute(
+            ".",
+            "#[cfg_attr(all(feature = \"serde-deserialize\", feature = \"serde-enum-repr\"), derive(serde_repr::Deserialize_repr))]",
+        )
+        // buffa emits SCREAMING_SNAKE variant names (CHROME, MESSAGE_EDIT), so
+        // `lowercase` yields the intended chrome / message_edit. `snake_case`
+        // would insert a separator before every char (c_h_r_o_m_e).
+        .enum_attribute(
+            ".",
+            "#[cfg_attr(all(feature = \"serde-snake-case\", not(feature = \"serde-enum-repr\")), serde(rename_all(deserialize = \"lowercase\")))]",
+        )
+        // O(1)-clone Bytes for hot-path crypto structures instead of Vec<u8>.
+        .use_bytes_type_in(&[
+            ".whatsapp.SessionStructure.Chain.ChainKey",
+            ".whatsapp.SessionStructure.Chain.MessageKey",
+            ".whatsapp.SenderKeyStateStructure.SenderChainKey",
+            ".whatsapp.SenderKeyStateStructure.SenderMessageKey",
+            ".whatsapp.SenderKeyStateStructure.SenderSigningKey",
+        ])
+        // Bytes fields lack serde support; skip them (internal crypto state).
+        .field_attribute(
+            ".whatsapp.SessionStructure.Chain.ChainKey.key",
+            "#[serde(skip)]",
+        )
+        .field_attribute(
+            ".whatsapp.SessionStructure.Chain.MessageKey.cipher_key",
+            "#[serde(skip)]",
+        )
+        .field_attribute(
+            ".whatsapp.SessionStructure.Chain.MessageKey.mac_key",
+            "#[serde(skip)]",
+        )
+        .field_attribute(
+            ".whatsapp.SessionStructure.Chain.MessageKey.iv",
+            "#[serde(skip)]",
+        )
+        .field_attribute(
+            ".whatsapp.SenderKeyStateStructure.SenderChainKey.seed",
+            "#[serde(skip)]",
+        )
+        .field_attribute(
+            ".whatsapp.SenderKeyStateStructure.SenderMessageKey.seed",
+            "#[serde(skip)]",
+        )
+        .field_attribute(
+            ".whatsapp.SenderKeyStateStructure.SenderSigningKey.public",
+            "#[serde(skip)]",
+        )
+        .field_attribute(
+            ".whatsapp.SenderKeyStateStructure.SenderSigningKey.private",
+            "#[serde(skip)]",
+        )
+        // We control both encoder and decoder — no need to preserve unknown
+        // fields. Disabling removes __buffa_unknown_fields from every struct,
+        // eliminating allocation/drop overhead in nested types like
+        // SessionStructure (chains × message keys).
+        .preserve_unknown_fields(false)
+        // Generate view types for zero-copy decoding.
+        .generate_views(true)
+        .out_dir(&out_path)
+        .compile()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    // Accept snake_case on deserialization for WASM bridge enum variants.
-    config.type_attribute(
-        ".",
-        "#[cfg_attr(feature = \"serde-snake-case\", serde(rename_all(deserialize = \"snake_case\")))]",
-    );
-
-    // O(1)-clone Bytes for hot-path crypto structures instead of Vec<u8>.
-    config.bytes([
-        ".whatsapp.SessionStructure.Chain.ChainKey",
-        ".whatsapp.SessionStructure.Chain.MessageKey",
-        ".whatsapp.SenderKeyStateStructure.SenderChainKey",
-        ".whatsapp.SenderKeyStateStructure.SenderMessageKey",
-        ".whatsapp.SenderKeyStateStructure.SenderSigningKey",
-    ]);
-
-    // Boxed: large (and mostly absent-on-the-wire) submessages whose inline
-    // form makes prost's repeated-field decode memcpy-bound — every element
-    // pays push(default) plus Vec-growth copies of the full struct size.
-    config.boxed(".whatsapp.HistorySyncMsg.message");
-    config.boxed(".whatsapp.WebMessageInfo.message");
-    config.boxed(".whatsapp.WebMessageInfo.statusMentionMessageInfo");
-    config.boxed(".whatsapp.Message.messageContextInfo");
-
-    // Box the remaining inline message-typed fields so `wa::Message` — a union
-    // of ~110 content variants of which exactly one is ever set — stops paying
-    // for all of them inline. prost already boxes the variants in recursion
-    // cycles; these are the rest. Shrinking the struct makes every clone,
-    // decode, and `Arc<Message>` event cheaper to move and hold.
-    for field in [
-        "bcallMessage",
-        "callLogMesssage",
-        "cancelPaymentRequestMessage",
-        "chat",
-        "conditionalRevealMessage",
-        "declinePaymentRequestMessage",
-        "encCommentMessage",
-        "encEventResponseMessage",
-        "encReactionMessage",
-        "groupRootKeyShare",
-        "invoiceMessage",
-        "keepInChatMessage",
-        "paymentInviteMessage",
-        "paymentReminderMessage",
-        "pinInChatMessage",
-        "placeholderMessage",
-        "pollAddOptionMessage",
-        "pollUpdateMessage",
-        "questionResponseMessage",
-        "reactionMessage",
-        "rootSecretDistributeMessage",
-        "scheduledCallCreationMessage",
-        "scheduledCallEditMessage",
-        "secretEncryptedMessage",
-        "statusNotificationMessage",
-        "statusQuestionAnswerMessage",
-        "statusQuotedMessage",
-        "statusStickerInteractionMessage",
-        "stickerSyncRmrMessage",
-    ] {
-        config.boxed(format!(".whatsapp.Message.{field}").as_str());
-    }
-
-    // Bytes fields lack serde support; skip them (internal crypto state).
-    config.field_attribute(
-        ".whatsapp.SessionStructure.Chain.ChainKey.key",
-        "#[serde(skip)]",
-    );
-    config.field_attribute(
-        ".whatsapp.SessionStructure.Chain.MessageKey.cipherKey",
-        "#[serde(skip)]",
-    );
-    config.field_attribute(
-        ".whatsapp.SessionStructure.Chain.MessageKey.macKey",
-        "#[serde(skip)]",
-    );
-    config.field_attribute(
-        ".whatsapp.SessionStructure.Chain.MessageKey.iv",
-        "#[serde(skip)]",
-    );
-    config.field_attribute(
-        ".whatsapp.SenderKeyStateStructure.SenderChainKey.seed",
-        "#[serde(skip)]",
-    );
-    config.field_attribute(
-        ".whatsapp.SenderKeyStateStructure.SenderMessageKey.seed",
-        "#[serde(skip)]",
-    );
-    config.field_attribute(
-        ".whatsapp.SenderKeyStateStructure.SenderSigningKey.public",
-        "#[serde(skip)]",
-    );
-    config.field_attribute(
-        ".whatsapp.SenderKeyStateStructure.SenderSigningKey.private",
-        "#[serde(skip)]",
-    );
-
-    config.out_dir(&out_dir);
-    config.compile_fds(fds.clone())?;
-
-    generate_tags(&fds, &out_dir.join("tags.rs"))
+    Ok(())
 }
 
-/// Generate `tags.rs`: one module per message carrying a `u32` const per
-/// field with its wire tag, straight from the descriptor. Hand-written
-/// partial decoders reference these consts (or compile-time assert against
-/// them), so a schema change that renumbers, renames or removes a field breaks
-/// the build instead of silently desyncing.
-fn generate_tags(
-    fds: &prost_types::FileDescriptorSet,
-    out_path: &std::path::Path,
-) -> std::io::Result<()> {
-    use heck::{ToShoutySnakeCase, ToSnakeCase};
-    use prost_types::DescriptorProto;
+/// Decode the committed (camelCase-field) descriptor, snake_case every message
+/// and oneof field name, and write the rewritten descriptor to `output`. Field
+/// numbers — the only thing the wire format depends on — are untouched, so this
+/// is wire-compatible; it only changes the Rust field idents buffa generates.
+fn snake_case_descriptor_fields(input: &str, output: &std::path::Path) -> std::io::Result<()> {
+    let mut fds = FileDescriptorSet::decode_from_slice(&std::fs::read(input)?)
+        .map_err(std::io::Error::other)?;
+    for file in &mut fds.file {
+        for message in &mut file.message_type {
+            snake_case_message_fields(message);
+        }
+    }
+    std::fs::write(output, fds.encode_to_vec())
+}
 
-    /// prost-parity identifier sanitization (mirror of prost-build's
-    /// `ident::sanitize_identifier` + `to_snake`), so module names always
-    /// match what prost would generate for the same message.
+fn snake_case_message_fields(message: &mut DescriptorProto) {
+    for field in &mut message.field {
+        if let Some(name) = &field.name {
+            let snake = name.to_snake_case();
+            // Keep json_name in sync so buffa's serde/proto_name matches the ident.
+            field.json_name = Some(snake.clone());
+            field.name = Some(snake);
+        }
+    }
+    for oneof in &mut message.oneof_decl {
+        if let Some(name) = &oneof.name {
+            oneof.name = Some(name.to_snake_case());
+        }
+    }
+    for nested in &mut message.nested_type {
+        snake_case_message_fields(nested);
+    }
+}
+
+/// Emit `tags.rs`: a nested module tree mirroring the proto's message
+/// hierarchy, with one `pub const <FIELD>: u32 = <number>;` per field. Reads
+/// the original (camelCase) descriptor; const/module names go through
+/// shouty/snake transforms that yield the same output regardless of the
+/// camelCase->snake_case rename, so the consts match the generated Rust API.
+fn generate_tags(fds: &FileDescriptorSet, out_path: &std::path::Path) -> std::io::Result<()> {
+    use heck::{ToShoutySnakeCase as _, ToSnakeCase as _};
+
+    /// Mirror of prost-build's identifier sanitization so module names always
+    /// match the message names buffa/prost would generate.
     fn module_ident(name: &str) -> String {
         let snake = name.to_snake_case();
         match snake.as_str() {
-            // Strict and reserved keywords across editions: raw identifier.
             "as" | "break" | "const" | "continue" | "else" | "enum" | "false" | "fn" | "for"
             | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move" | "mut" | "pub"
             | "ref" | "return" | "static" | "struct" | "trait" | "true" | "type" | "unsafe"
             | "use" | "where" | "while" | "dyn" | "abstract" | "become" | "box" | "do"
             | "final" | "macro" | "override" | "priv" | "typeof" | "unsized" | "virtual"
             | "yield" | "async" | "await" | "try" | "gen" => format!("r#{snake}"),
-            // Not usable as raw identifiers: underscore suffix.
             "_" | "super" | "self" | "crate" | "extern" => format!("{snake}_"),
-            // Digit-leading names get an underscore prefix.
             other if other.starts_with(|c: char| c.is_numeric()) => format!("_{snake}"),
             _ => snake,
         }
@@ -181,27 +219,31 @@ fn generate_tags(
         // Synthetic map-entry messages have no hand-decodable surface.
         if msg
             .options
-            .as_ref()
+            .as_option()
             .and_then(|o| o.map_entry)
             .unwrap_or(false)
         {
             return;
         }
+        let msg_name = msg.name.as_deref().unwrap_or_default();
         let pad = "    ".repeat(indent);
-        out.push_str(&format!("{pad}pub mod {} {{\n", module_ident(msg.name())));
+        out.push_str(&format!("{pad}pub mod {} {{\n", module_ident(msg_name)));
         let mut seen = std::collections::HashSet::new();
         for field in &msg.field {
-            let const_name = field.name().to_shouty_snake_case();
+            let const_name = field
+                .name
+                .as_deref()
+                .unwrap_or_default()
+                .to_shouty_snake_case();
             // Two field names collapsing to one const (e.g. fooBar/foo_bar)
             // would emit duplicate consts; fail loudly at generation time.
             assert!(
                 seen.insert(const_name.clone()),
-                "tags.rs: const name collision `{const_name}` in message `{}`",
-                msg.name()
+                "tags.rs: const name collision `{const_name}` in message `{msg_name}`"
             );
             out.push_str(&format!(
                 "{pad}    pub const {const_name}: u32 = {};\n",
-                field.number()
+                field.number.unwrap_or_default()
             ));
         }
         for nested in &msg.nested_type {

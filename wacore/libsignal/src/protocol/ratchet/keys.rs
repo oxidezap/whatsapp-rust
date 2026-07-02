@@ -79,7 +79,7 @@ impl MessageKeyGenerator {
             Self::Serialized(pb) => pb,
             // Need to serialize: derive keys and convert
             Self::Seed(_) | Self::Keys(_) => {
-                use prost::bytes::Bytes;
+                use bytes::Bytes;
                 let keys = self.generate_keys();
                 session_structure::chain::MessageKey {
                     cipher_key: Some(Bytes::copy_from_slice(keys.cipher_key())),

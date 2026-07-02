@@ -1850,8 +1850,8 @@ mod tests {
         current_index: u32,
         valid_indexes: Vec<u32>,
     ) -> Vec<u8> {
-        use prost::Message;
-        let details = waproto::whatsapp::AdvKeyIndexList {
+        use buffa::Message;
+        let details = waproto::whatsapp::ADVKeyIndexList {
             raw_id: Some(raw_id),
             timestamp: Some(100),
             current_index: Some(current_index),
@@ -1859,7 +1859,7 @@ mod tests {
             account_type: None,
         }
         .encode_to_vec();
-        waproto::whatsapp::AdvSignedKeyIndexList {
+        waproto::whatsapp::ADVSignedKeyIndexList {
             details: Some(details),
             account_signature: None,
             account_signature_key: None,

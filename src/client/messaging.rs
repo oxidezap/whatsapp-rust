@@ -419,8 +419,8 @@ fn build_secret_message_edit(
         wacore::message_edit::encrypt_message_edit(&inner, message_secret, &ctx)?;
 
     Ok(wa::Message {
-        secret_encrypted_message: Some(Box::new(wa::message::SecretEncryptedMessage {
-            target_message_key: Some(wa::MessageKey {
+        secret_encrypted_message: buffa::MessageField::some(wa::message::SecretEncryptedMessage {
+            target_message_key: buffa::MessageField::some(wa::MessageKey {
                 remote_jid: Some(to.to_string()),
                 from_me: Some(true),
                 id: Some(original_id.to_string()),
@@ -429,14 +429,14 @@ fn build_secret_message_edit(
             enc_payload: Some(enc_payload),
             enc_iv: Some(iv.to_vec()),
             secret_enc_type: Some(
-                wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32,
+                wa::message::secret_encrypted_message::SecretEncType::MessageEdit,
             ),
             remote_key_id: None,
-        })),
-        message_context_info: Some(Box::new(wa::MessageContextInfo {
+        }),
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(message_secret.to_vec()),
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     })
 }
@@ -458,16 +458,16 @@ mod secret_message_edit_tests {
         let envelope =
             build_secret_message_edit(&to, "ORIGID", None, self_str, &secret, new_content).unwrap();
 
-        let sem = envelope.secret_encrypted_message.as_ref().unwrap();
+        let sem = envelope.secret_encrypted_message.as_option().unwrap();
         assert_eq!(
             sem.secret_enc_type,
-            Some(wa::message::secret_encrypted_message::SecretEncType::MessageEdit as i32)
+            Some(wa::message::secret_encrypted_message::SecretEncType::MessageEdit)
         );
         // The envelope carries the original secret (WAWebGenerateSecretMessageEditProto).
         assert_eq!(
             envelope
                 .message_context_info
-                .as_ref()
+                .as_option()
                 .and_then(|c| c.message_secret.as_deref()),
             Some(&secret[..])
         );
@@ -487,7 +487,8 @@ mod secret_message_edit_tests {
         .unwrap();
         let edited = inner
             .protocol_message
-            .and_then(|pm| pm.edited_message)
+            .into_option()
+            .and_then(|pm| pm.edited_message.into_option())
             .and_then(|m| m.conversation);
         assert_eq!(edited.as_deref(), Some("edited!"));
     }
@@ -509,7 +510,7 @@ mod secret_message_edit_tests {
             },
         )
         .unwrap();
-        let sem = envelope.secret_encrypted_message.as_ref().unwrap();
+        let sem = envelope.secret_encrypted_message.as_option().unwrap();
         let ctx = wacore::message_edit::MessageEditContext {
             original_msg_id: "ORIGID",
             original_sender_jid: self_str,

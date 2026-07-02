@@ -7,7 +7,7 @@ mod tests {
     use super::*;
     use async_lock::Mutex;
     use async_trait::async_trait;
-    use prost::Message;
+    use buffa::Message;
     use std::collections::HashMap;
     use std::sync::Arc;
     use wacore::appstate::WAPATCH_INTEGRITY;
@@ -329,15 +329,15 @@ mod tests {
         value_blob.extend_from_slice(&value_mac);
 
         wa::SyncdMutation {
-            operation: Some(op as i32),
-            record: Some(wa::SyncdRecord {
-                index: Some(wa::SyncdIndex {
+            operation: Some(op),
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
                     blob: Some(index_mac.to_vec()),
                 }),
-                value: Some(wa::SyncdValue {
+                value: buffa::MessageField::some(wa::SyncdValue {
                     blob: Some(value_blob),
                 }),
-                key_id: Some(wa::KeyId {
+                key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id_bytes.to_vec()),
                 }),
             }),
@@ -365,7 +365,7 @@ mod tests {
             .expect("test backend should accept sync key");
 
         let original_plaintext = wa::SyncActionData {
-            value: Some(wa::SyncActionValue {
+            value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(1000),
                 ..Default::default()
             }),
@@ -373,7 +373,7 @@ mod tests {
         }
         .encode_to_vec();
         let original_mutation = create_encrypted_mutation(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &original_plaintext,
             &keys,
@@ -394,8 +394,10 @@ mod tests {
 
         let original_value_blob = original_mutation
             .record
+            .into_option()
             .expect("mutation should have record")
             .value
+            .into_option()
             .expect("record should have value")
             .blob
             .expect("value should have blob");
@@ -413,7 +415,7 @@ mod tests {
             .expect("test backend should accept mutation MACs");
 
         let new_plaintext = wa::SyncActionData {
-            value: Some(wa::SyncActionValue {
+            value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(2000),
                 ..Default::default()
             }),
@@ -421,7 +423,7 @@ mod tests {
         }
         .encode_to_vec();
         let overwrite_mutation = create_encrypted_mutation(
-            wa::syncd_mutation::SyncdOperation::Set,
+            wa::syncd_mutation::SyncdOperation::SET,
             &index_mac,
             &new_plaintext,
             &keys,
@@ -433,8 +435,8 @@ mod tests {
             has_more_patches: false,
             patches: vec![wa::SyncdPatch {
                 mutations: vec![overwrite_mutation.clone()],
-                version: Some(wa::SyncdVersion { version: Some(2) }),
-                key_id: Some(wa::KeyId {
+                version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
+                key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id_bytes),
                 }),
                 ..Default::default()
@@ -456,8 +458,10 @@ mod tests {
         let mut expected_state = initial_state.clone();
         let new_value_blob = overwrite_mutation
             .record
+            .into_option()
             .expect("mutation should have record")
             .value
+            .into_option()
             .expect("record should have value")
             .blob
             .expect("value should have blob");
@@ -528,7 +532,7 @@ mod tests {
             .expect("test backend should accept mutation MACs");
 
         let plaintext = wa::SyncActionData {
-            value: Some(wa::SyncActionValue {
+            value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(2000),
                 ..Default::default()
             }),
@@ -550,9 +554,9 @@ mod tests {
             has_more_patches: false,
             patches: vec![],
             snapshot: Some(wa::SyncdSnapshot {
-                version: Some(wa::SyncdVersion { version: Some(2) }),
+                version: buffa::MessageField::some(wa::SyncdVersion { version: Some(2) }),
                 records: vec![record],
-                key_id: Some(wa::KeyId {
+                key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id_bytes),
                 }),
                 ..Default::default()
@@ -576,7 +580,7 @@ mod tests {
         let master_key = [9u8; 32];
         let keys = expand_app_state_keys(&master_key);
         let plaintext = wa::SyncActionData {
-            value: Some(wa::SyncActionValue {
+            value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(3000),
                 ..Default::default()
             }),
@@ -593,10 +597,10 @@ mod tests {
             );
             patch_list.patches.push(wa::SyncdPatch {
                 mutations: vec![mutation],
-                version: Some(wa::SyncdVersion {
+                version: buffa::MessageField::some(wa::SyncdVersion {
                     version: Some(version),
                 }),
-                key_id: Some(wa::KeyId {
+                key_id: buffa::MessageField::some(wa::KeyId {
                     id: Some(key_id_bytes.clone()),
                 }),
                 ..Default::default()
@@ -617,7 +621,7 @@ mod tests {
 
         let snapshot = pl.snapshot.as_ref().expect("snapshot handed back");
         assert_eq!(
-            snapshot.version.as_ref().and_then(|v| v.version),
+            snapshot.version.as_option().and_then(|v| v.version),
             Some(2),
             "the same snapshot must come back, not a substitute"
         );
@@ -626,7 +630,7 @@ mod tests {
         let patch_versions: Vec<_> = pl
             .patches
             .iter()
-            .map(|p| p.version.as_ref().and_then(|v| v.version))
+            .map(|p| p.version.as_option().and_then(|v| v.version))
             .collect();
         assert_eq!(
             patch_versions,
@@ -639,8 +643,8 @@ mod tests {
             .map(|p| {
                 p.mutations[0]
                     .record
-                    .as_ref()
-                    .and_then(|r| r.index.as_ref())
+                    .as_option()
+                    .and_then(|r| r.index.as_option())
                     .and_then(|i| i.blob.as_deref())
                     .map(|b| b[0])
             })
@@ -710,7 +714,7 @@ mod tests {
             .expect("test backend should accept mutation MACs");
 
         let plaintext = wa::SyncActionData {
-            value: Some(wa::SyncActionValue {
+            value: buffa::MessageField::some(wa::SyncActionValue {
                 timestamp: Some(5000),
                 ..Default::default()
             }),
@@ -774,7 +778,8 @@ mod tests {
         let expected_snapshot_mac =
             expected_state.generate_snapshot_mac(collection_name.as_str(), &keys.snapshot_mac);
 
-        let patch = wa::SyncdPatch::decode(patch_bytes.as_slice()).expect("patch should decode");
+        let patch =
+            wa::SyncdPatch::decode_from_slice(patch_bytes.as_slice()).expect("patch should decode");
         assert_eq!(
             patch.snapshot_mac.as_deref(),
             Some(expected_snapshot_mac.as_slice()),
@@ -842,7 +847,7 @@ mod tests {
             name: WAPatchName::Regular,
             has_more_patches: false,
             patches: vec![wa::SyncdPatch {
-                version: Some(wa::SyncdVersion { version: Some(5) }),
+                version: buffa::MessageField::some(wa::SyncdVersion { version: Some(5) }),
                 ..Default::default()
             }],
             snapshot: None,
@@ -902,7 +907,7 @@ mod tests {
             name,
             has_more_patches: false,
             patches: vec![wa::SyncdPatch {
-                version: Some(wa::SyncdVersion { version: Some(1) }),
+                version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
                 ..Default::default()
             }],
             snapshot: None,
@@ -938,7 +943,7 @@ mod tests {
 
         let snapshot_key_id = b"snapshot-key-xyz".to_vec();
         let snapshot_bytes = wa::SyncdSnapshot {
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(snapshot_key_id.clone()),
             }),
             ..Default::default()

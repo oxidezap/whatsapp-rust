@@ -8,28 +8,10 @@
 use std::sync::OnceLock;
 
 /// `tables.proto` Region.
-#[derive(Clone, PartialEq, prost::Message)]
-struct SmplMemRegion {
-    #[prost(uint32, tag = "1")]
-    base: u32,
-    #[prost(bytes = "vec", tag = "2")]
-    data: Vec<u8>,
-}
+use super::smpl_tables_blob::tables::Region as SmplMemRegion;
 
 /// `tables.proto` HeapWindow; the runtime window built by `build_smpl_mem`.
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct SmplMem {
-    #[prost(message, repeated, tag = "1")]
-    regions: Vec<SmplMemRegion>,
-    #[prost(uint32, tag = "2")]
-    pub(crate) g_cc: u32,
-    #[prost(uint32, tag = "3")]
-    pub(crate) g_nrg: u32,
-    #[prost(uint32, tag = "4")]
-    pub(crate) g_pitch: u32,
-    #[prost(uint32, tag = "5")]
-    pub(crate) g_clk: u32,
-}
+pub(crate) use super::smpl_tables_blob::tables::HeapWindow as SmplMem;
 
 static SMPL_MEM: OnceLock<SmplMem> = OnceLock::new();
 
@@ -89,7 +71,7 @@ const NUM_CONTOURS: usize = 217;
 /// every address the consumer reads.
 fn build_smpl_mem() -> SmplMem {
     let seed: super::smpl_pitch_seed::PitchSeed =
-        super::smpl_tables_blob::load_blob_prost(include_bytes!("testdata/pitch_seed.bin"));
+        super::smpl_tables_blob::load_blob_buffa(include_bytes!("testdata/pitch_seed.bin"));
     let w = seed.build_contour_window();
 
     let mut regions = Vec::with_capacity(6);

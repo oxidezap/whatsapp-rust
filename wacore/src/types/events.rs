@@ -107,7 +107,7 @@ impl LazyHistorySync {
         self.progress
     }
 
-    /// `None` for server-pushed syncs (e.g. `INITIAL_BOOTSTRAP`).
+    /// `None` for server-pushed syncs (e.g. `InitialBootstrap`).
     pub fn peer_data_request_session_id(&self) -> Option<&str> {
         self.peer_data_request_session_id.as_deref()
     }
@@ -1337,7 +1337,7 @@ pub struct LabelAssociationUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message;
+    use buffa::Message;
     use waproto::whatsapp as wa;
 
     #[test]
@@ -1377,7 +1377,7 @@ mod tests {
         use flate2::{Compression, write::ZlibEncoder};
         use std::io::Write;
         let hs = wa::HistorySync {
-            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+            sync_type: wa::history_sync::HistorySyncType::InitialBootstrap,
             conversations,
             ..Default::default()
         };
@@ -1455,7 +1455,7 @@ mod tests {
         // Consumer can partial-decode from the inflated bytes.
         let raw = lazy.decompress().expect("inflates");
         assert_eq!(raw.len(), lazy.decompressed_size());
-        let decoded = wa::HistorySync::decode(&raw[..]).expect("should decode");
+        let decoded = wa::HistorySync::decode_from_slice(&raw[..]).expect("should decode");
         assert_eq!(decoded.conversations[0].id, "raw@s.whatsapp.net");
 
         // No caching: a second call inflates again and matches.
@@ -1512,7 +1512,7 @@ mod tests {
         let remainder = stream.remainder().expect("remainder decodes");
         assert!(remainder.conversations.is_empty());
         assert_eq!(
-            remainder.sync_type(),
+            remainder.sync_type,
             wa::history_sync::HistorySyncType::InitialBootstrap
         );
     }
@@ -1578,13 +1578,15 @@ mod tests {
         let conv = wa::Conversation {
             id: "chat@s.whatsapp.net".to_string(),
             messages: vec![wa::HistorySyncMsg {
-                message: Some(Box::new(wa::WebMessageInfo {
+                message: wa::WebMessageInfo {
                     key: wa::MessageKey {
                         id: Some("msg-0".to_string()),
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..Default::default()
-                })),
+                }
+                .into(),
                 msg_order_id: Some(0),
             }],
             ..Default::default()
@@ -1596,7 +1598,7 @@ mod tests {
         assert_eq!(
             hs.conversations[0].messages[0]
                 .message
-                .as_ref()
+                .as_option()
                 .unwrap()
                 .key
                 .id

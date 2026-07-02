@@ -57,6 +57,9 @@ async-channel = { version = "2.5.0", default-features = false, features = ["std"
 async-lock = { version = "3", default-features = false }
 async-trait = "0.1.89"
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
+buffa = { version = "0.8.1", default-features = false, features = ["json"] }
+buffa-build = { version = "0.8.1", default-features = false }
+buffa-descriptor = { version = "0.8.1", default-features = false }
 bytemuck = { version = "1.25", default-features = false }
 bytes = { version = "1.12", default-features = false }
 cbc = { version = "0.2", features = ["alloc"] }
@@ -77,9 +80,6 @@ itoa = "1"
 log = "0.4"
 metrics = "0.24"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
-prost = { version = "0.14.4", default-features = false, features = ["std"] }
-prost-build = { version = "0.14.4", default-features = false }
-prost-types = { version = "0.14.4", default-features = false, features = ["std"] }
 rand = "0.10"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
@@ -158,6 +158,7 @@ async-channel = { workspace = true }
 async-lock = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+buffa = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 event-listener = { workspace = true }
@@ -167,7 +168,6 @@ itoa = { workspace = true }
 log = { workspace = true }
 opus = { version = "0.3", optional = true }
 portable-atomic = { workspace = true }
-prost = { workspace = true }
 rand = { workspace = true }
 # Only with `voip`: lets us install the `ring` rustls CryptoProvider before the DTLS handshake.
 # webrtc-dtls picks rustls' process-default provider, and the tree carries both ring and aws-lc-rs,
@@ -250,7 +250,7 @@ incremental = false
 # Off-hot-path crates run per connection / sync / request, not per message,
 # so size-optimizing them shrinks the binary at no measurable throughput cost.
 # The per-message/per-frame crypto/protocol crates (libsignal, wacore-binary,
-# waproto, prost, aes, sha2, hkdf, flate2, curve25519, wacore-noise) stay at
+# waproto, buffa, aes, sha2, hkdf, flate2, curve25519, wacore-noise) stay at
 # opt-level 3 — wacore-noise's NoiseCipher runs the transport AEAD per frame,
 # so despite owning the once-per-connection handshake it is not handshake-only.
 # z = persistence (Diesel/SQLite, I/O-bound), media HTTP (ureq, network-bound),

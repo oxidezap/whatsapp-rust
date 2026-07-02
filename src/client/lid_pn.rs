@@ -475,16 +475,17 @@ impl Client {
     /// migrated so DMs switch to LID wire addressing.
     pub(crate) async fn handle_lid_migration_mapping_sync(
         self: &Arc<Self>,
-        sync: &waproto::whatsapp::LidMigrationMappingSyncMessage,
+        sync: &waproto::whatsapp::LIDMigrationMappingSyncMessage,
     ) {
-        use prost::Message as _;
+        use buffa::Message as _;
 
         let Some(payload_bytes) = sync.encoded_mapping_payload.as_deref() else {
             log::warn!("lid_migration_mapping_sync without payload");
             return;
         };
-        let payload = match waproto::whatsapp::LidMigrationMappingSyncPayload::decode(payload_bytes)
-        {
+        let payload = match waproto::whatsapp::LIDMigrationMappingSyncPayload::decode_from_slice(
+            payload_bytes,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("Failed to decode LID migration mapping payload: {e}");
@@ -957,19 +958,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_lid_migration_mapping_sync_learns_and_migrates_with_prop() {
-        use prost::Message as _;
+        use buffa::Message as _;
         use waproto::whatsapp as wa;
 
         let client: Arc<Client> = create_test_client().await;
-        let payload = wa::LidMigrationMappingSyncPayload {
-            pn_to_lid_mappings: vec![wa::LidMigrationMapping {
+        let payload = wa::LIDMigrationMappingSyncPayload {
+            pn_to_lid_mappings: vec![wa::LIDMigrationMapping {
                 pn: 5511987650001,
                 assigned_lid: 111000011112222,
                 latest_lid: None,
             }],
             chat_db_migration_timestamp: None,
         };
-        let sync = wa::LidMigrationMappingSyncMessage {
+        let sync = wa::LIDMigrationMappingSyncMessage {
             encoded_mapping_payload: Some(payload.encode_to_vec()),
         };
 
@@ -1042,7 +1043,7 @@ mod tests {
 
         // Missing payload: WA Web treats this as malformed; nothing is
         // learned and the account must not flip to migrated.
-        let missing = wa::LidMigrationMappingSyncMessage {
+        let missing = wa::LIDMigrationMappingSyncMessage {
             encoded_mapping_payload: None,
         };
         client.handle_lid_migration_mapping_sync(&missing).await;
@@ -1053,7 +1054,7 @@ mod tests {
                 .lid_migrated
         );
 
-        let malformed = wa::LidMigrationMappingSyncMessage {
+        let malformed = wa::LIDMigrationMappingSyncMessage {
             encoded_mapping_payload: Some(vec![0xFF, 0xFF, 0xFF]),
         };
         client.handle_lid_migration_mapping_sync(&malformed).await;
@@ -1067,19 +1068,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_lid_migration_mapping_sync_prefers_latest_lid() {
-        use prost::Message as _;
+        use buffa::Message as _;
         use waproto::whatsapp as wa;
 
         let client: Arc<Client> = create_test_client().await;
-        let payload = wa::LidMigrationMappingSyncPayload {
-            pn_to_lid_mappings: vec![wa::LidMigrationMapping {
+        let payload = wa::LIDMigrationMappingSyncPayload {
+            pn_to_lid_mappings: vec![wa::LIDMigrationMapping {
                 pn: 5511987650001,
                 assigned_lid: 111000011112222,
                 latest_lid: Some(999000099990000),
             }],
             chat_db_migration_timestamp: None,
         };
-        let sync = wa::LidMigrationMappingSyncMessage {
+        let sync = wa::LIDMigrationMappingSyncMessage {
             encoded_mapping_payload: Some(payload.encode_to_vec()),
         };
 
@@ -1484,14 +1485,14 @@ mod tests {
             remote_identity_public: None,
             root_key: None,
             previous_counter: Some(0),
-            sender_chain: None,
+            sender_chain: buffa::MessageField::none(),
             receiver_chains: vec![],
-            pending_pre_key: None,
+            pending_pre_key: buffa::MessageField::none(),
             remote_registration_id: Some(remote_regid),
             local_registration_id: Some(0),
             alice_base_key: Some(vec![]),
             needs_refresh: None,
-            pending_key_exchange: None,
+            pending_key_exchange: buffa::MessageField::none(),
         });
         SessionRecord::new(state)
             .serialize()

@@ -82,7 +82,7 @@ static TABLES: OnceLock<PitchTables> = OnceLock::new();
 pub(crate) fn load_pitch_tables() -> &'static PitchTables {
     TABLES.get_or_init(|| {
         let seed: super::smpl_pitch_seed::PitchSeed =
-            super::smpl_tables_blob::load_blob_prost(include_bytes!("testdata/pitch_seed.bin"));
+            super::smpl_tables_blob::load_blob_buffa(include_bytes!("testdata/pitch_seed.bin"));
         seed.build()
     })
 }

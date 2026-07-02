@@ -164,7 +164,7 @@ pub struct EncryptForDevicesRaw {
 /// - `!includes_prekey` -> `Ok(None)`
 pub fn needs_device_identity(
     includes_prekey: bool,
-    account: Option<&wa::AdvSignedDeviceIdentity>,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
 ) -> Result<Option<Vec<u8>>> {
     if !includes_prekey {
         return Ok(None);

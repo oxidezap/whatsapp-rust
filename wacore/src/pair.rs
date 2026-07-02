@@ -3,16 +3,16 @@ use crate::libsignal::crypto::aes_256_gcm_encrypt;
 use crate::libsignal::protocol::{KeyPair, PublicKey};
 use base64::Engine as _;
 use base64::prelude::*;
+use buffa::Message;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use prost::Message;
 
 use sha2::Sha256;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, SERVER_JID};
 use wacore_binary::{Node, NodeRef};
 use waproto::whatsapp as wa;
-use waproto::whatsapp::AdvEncryptionType;
+use waproto::whatsapp::ADVEncryptionType;
 
 // Prefixes from whatsmeow/pair.go, crucial for signature verification
 const ADV_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 0];
@@ -144,7 +144,7 @@ impl PairUtils {
         let bytes = success_node
             .get_optional_child_by_tag(&["client-props"])?
             .content_bytes()?;
-        wa::ClientPairingProps::decode(bytes).ok()
+        wa::ClientPairingProps::decode_from_slice(bytes).ok()
     }
 
     /// Pair-time `lid_migrated` write decision. `Some(true)` whenever the
@@ -169,16 +169,17 @@ impl PairUtils {
         device_identity_bytes: &[u8],
     ) -> Result<(Vec<u8>, u32), PairCryptoError> {
         // 1. Unmarshal HMAC container and verify HMAC
-        let hmac_container = wa::AdvSignedDeviceIdentityHmac::decode(device_identity_bytes)
-            .map_err(|e| PairCryptoError {
-                code: 500,
-                text: "internal-error",
-                source: e.into(),
-            })?;
+        let hmac_container = wa::ADVSignedDeviceIdentityHMAC::decode_from_slice(
+            device_identity_bytes,
+        )
+        .map_err(|e| PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: e.into(),
+        })?;
 
         // Determine if this is a hosted account
-        let is_hosted_account = hmac_container.account_type.is_some()
-            && hmac_container.account_type() == AdvEncryptionType::Hosted;
+        let is_hosted_account = hmac_container.account_type == Some(ADVEncryptionType::HOSTED);
 
         let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(&device_state.adv_secret_key)
             .map_err(|e| PairCryptoError {
@@ -219,16 +220,26 @@ impl PairUtils {
         })?;
 
         // 2. Unmarshal inner container and verify account signature
-        let mut signed_identity =
-            wa::AdvSignedDeviceIdentity::decode(details_bytes).map_err(|e| PairCryptoError {
+        let mut signed_identity = wa::ADVSignedDeviceIdentity::decode_from_slice(details_bytes)
+            .map_err(|e| PairCryptoError {
                 code: 500,
                 text: "internal-error",
                 source: e.into(),
             })?;
 
-        let account_sig_key_bytes = signed_identity.account_signature_key();
-        let account_sig_bytes = signed_identity.account_signature();
-        let inner_details_bytes = signed_identity.details().to_vec();
+        let account_sig_key_bytes = signed_identity
+            .account_signature_key
+            .as_deref()
+            .unwrap_or_default();
+        let account_sig_bytes = signed_identity
+            .account_signature
+            .as_deref()
+            .unwrap_or_default();
+        let inner_details_bytes = signed_identity
+            .details
+            .as_deref()
+            .unwrap_or_default()
+            .to_vec();
 
         let account_sig_prefix = if is_hosted_account {
             ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE
@@ -282,13 +293,17 @@ impl PairUtils {
         signed_identity.device_signature = Some(device_signature.to_vec());
 
         // 4. Unmarshal final details to get key_index
-        let identity_details =
-            wa::AdvDeviceIdentity::decode(&*inner_details_bytes).map_err(|e| PairCryptoError {
+        let identity_details = wa::ADVDeviceIdentity::decode_from_slice(&inner_details_bytes)
+            .map_err(|e| PairCryptoError {
                 code: 500,
                 text: "internal-error",
                 source: e.into(),
             })?;
-        let key_index = identity_details.key_index();
+        let key_index = identity_details.key_index.ok_or_else(|| PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: anyhow::anyhow!("ADVDeviceIdentity missing key_index"),
+        })?;
 
         // 5. Marshal the modified signed_identity to send back
         let self_signed_identity_bytes = signed_identity.encode_to_vec();
@@ -592,23 +607,23 @@ mod tests {
         use waproto::whatsapp as wa;
 
         let cases = [
-            (wa::device_props::PlatformType::Chrome, "1"),
-            (wa::device_props::PlatformType::Firefox, "3"),
-            (wa::device_props::PlatformType::Safari, "6"),
-            (wa::device_props::PlatformType::Edge, "2"),
-            (wa::device_props::PlatformType::Desktop, "7"),
-            (wa::device_props::PlatformType::Uwp, "8"),
-            (wa::device_props::PlatformType::AndroidPhone, "1"),
-            (wa::device_props::PlatformType::AndroidTablet, "1"),
-            (wa::device_props::PlatformType::AndroidAmbiguous, "1"),
-            (wa::device_props::PlatformType::IosPhone, "9"),
-            (wa::device_props::PlatformType::Vr, "9"),
-            (wa::device_props::PlatformType::Unknown, "9"),
+            (wa::device_props::PlatformType::CHROME, "1"),
+            (wa::device_props::PlatformType::FIREFOX, "3"),
+            (wa::device_props::PlatformType::SAFARI, "6"),
+            (wa::device_props::PlatformType::EDGE, "2"),
+            (wa::device_props::PlatformType::DESKTOP, "7"),
+            (wa::device_props::PlatformType::UWP, "8"),
+            (wa::device_props::PlatformType::ANDROID_PHONE, "1"),
+            (wa::device_props::PlatformType::ANDROID_TABLET, "1"),
+            (wa::device_props::PlatformType::ANDROID_AMBIGUOUS, "1"),
+            (wa::device_props::PlatformType::IOS_PHONE, "9"),
+            (wa::device_props::PlatformType::VR, "9"),
+            (wa::device_props::PlatformType::UNKNOWN, "9"),
         ];
         let state = dummy_device_state();
         for (pt, expected_wire) in cases {
             let props = wa::DeviceProps {
-                platform_type: Some(pt as i32),
+                platform_type: Some(pt),
                 ..Default::default()
             };
             let ct = companion_web_client_type_for_props(&props);
@@ -666,18 +681,31 @@ mod tests {
         adv_secret_for_hmac: &[u8; 32],
         is_hosted: bool,
     ) -> Vec<u8> {
-        use prost::Message;
+        build_pair_success_payload_with_key_index(state, adv_secret_for_hmac, is_hosted, Some(0))
+    }
+
+    fn build_pair_success_payload_with_key_index(
+        state: &DeviceState,
+        adv_secret_for_hmac: &[u8; 32],
+        is_hosted: bool,
+        key_index: Option<u32>,
+    ) -> Vec<u8> {
+        use buffa::Message;
         use waproto::whatsapp as wa;
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account_kp = KeyPair::generate(&mut rng);
-        let account_type_value = if is_hosted { 1 } else { 0 };
-        let inner = wa::AdvDeviceIdentity {
+        let account_type = if is_hosted {
+            wa::ADVEncryptionType::HOSTED
+        } else {
+            wa::ADVEncryptionType::E2EE
+        };
+        let inner = wa::ADVDeviceIdentity {
             raw_id: Some(1),
             timestamp: Some(0),
-            key_index: Some(0),
-            account_type: Some(account_type_value),
-            device_type: Some(account_type_value),
+            key_index,
+            account_type: Some(account_type),
+            device_type: Some(account_type),
         }
         .encode_to_vec();
         let account_sig_prefix: &[u8] = if is_hosted {
@@ -693,7 +721,7 @@ mod tests {
             .private_key
             .calculate_signature(&to_sign, &mut rng)
             .unwrap();
-        let signed = wa::AdvSignedDeviceIdentity {
+        let signed = wa::ADVSignedDeviceIdentity {
             details: Some(inner),
             account_signature_key: Some(account_kp.public_key.public_key_bytes().to_vec()),
             account_signature: Some(sig.to_vec()),
@@ -706,10 +734,10 @@ mod tests {
         }
         mac.update(&signed);
         let hmac_bytes = mac.finalize().into_bytes().to_vec();
-        wa::AdvSignedDeviceIdentityHmac {
+        wa::ADVSignedDeviceIdentityHMAC {
             details: Some(signed),
             hmac: Some(hmac_bytes),
-            account_type: Some(account_type_value),
+            account_type: Some(account_type),
         }
         .encode_to_vec()
     }
@@ -802,6 +830,19 @@ mod tests {
     }
 
     #[test]
+    fn do_pair_crypto_rejects_missing_key_index() {
+        let state = dummy_device_state();
+        let payload =
+            build_pair_success_payload_with_key_index(&state, &state.adv_secret_key, false, None);
+
+        let err = PairUtils::do_pair_crypto(&state, &payload)
+            .expect_err("missing key_index should abort pairing");
+
+        assert_eq!(err.code, 500);
+        assert!(err.source.to_string().contains("missing key_index"));
+    }
+
+    #[test]
     fn extract_pairing_props_decodes_client_props_child() {
         let pair_success = NodeBuilder::new("pair-success")
             .children([
@@ -822,7 +863,7 @@ mod tests {
 
         let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
             .expect("client-props child must decode");
-        assert!(props.is_chat_db_lid_migrated());
+        assert!(props.is_chat_db_lid_migrated.unwrap_or(false));
     }
 
     #[test]
@@ -841,7 +882,7 @@ mod tests {
 
         let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
             .expect("client-props child must decode");
-        assert!(!props.is_chat_db_lid_migrated());
+        assert!(!props.is_chat_db_lid_migrated.unwrap_or(false));
     }
 
     #[test]
@@ -854,7 +895,7 @@ mod tests {
 
         let props = PairUtils::extract_pairing_props(&pair_success.as_node_ref())
             .expect("client-props child must decode");
-        assert!(!props.is_chat_db_lid_migrated());
+        assert!(!props.is_chat_db_lid_migrated.unwrap_or(false));
     }
 
     #[test]

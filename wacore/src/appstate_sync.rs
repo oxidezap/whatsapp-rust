@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use async_lock::Mutex;
 use async_trait::async_trait;
-use prost::Message;
+use buffa::Message;
 use thiserror::Error;
 
 use crate::appstate::hash::HashState;
@@ -14,7 +14,7 @@ use crate::appstate::patch_decode::{
     parse_patch_lists, parse_patch_lists_ref,
 };
 use crate::appstate::{
-    collect_key_ids_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
+    collect_key_id_refs_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
 };
 use crate::store::traits::Backend;
 use wacore_binary::{Node, NodeRef};
@@ -25,18 +25,20 @@ pub use crate::appstate::Mutation;
 
 /// Index MAC carried by a mutation's record, if present.
 fn mutation_index_mac(m: &wa::SyncdMutation) -> Option<&[u8]> {
-    m.record.as_ref()?.index.as_ref()?.blob.as_deref()
+    m.record.as_option()?.index.as_option()?.blob.as_deref()
 }
 
-/// Unique index MACs of a patch's mutations, in first-seen order, feeding the
-/// batched previous-value-MAC backend lookup.
+/// Distinct index MACs of a patch's mutations, feeding the batched
+/// previous-value-MAC backend lookup. Both callers pass the result straight to a
+/// `get_mutation_macs` HashMap fetch, so the order is unspecified.
 ///
-/// Small patches use a cache-friendly linear scan (a HashSet measured 6-120%
-/// slower at small N here). Patches carry up to ~1000 mutations, where the
-/// scan's O(n²) compares dominate, so above [`MAC_DEDUP_SCAN_LIMIT`] dedup runs
-/// through a sort of position indices — O(n log n) with only a `Vec<u32>` of
-/// scratch, far cheaper than a `HashSet` of 32-byte MACs — then re-emits in
-/// first-seen order.
+/// Small patches dedup with a linear scan that allocates only the keepers,
+/// cheaper than a sort at small N. Larger patches decode each MAC once into the
+/// returned `Vec` and sort + dedup in place: the comparator works on the owned
+/// bytes, never re-walking the boxed record/index/blob `MessageField` chain (the
+/// part buffa makes pricier than prost's `Option` derefs), with no scratch
+/// beyond the returned `Vec`. Distinct indices are the realistic patch shape, so
+/// the pre-dedup `Vec` is essentially already unique.
 pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>> {
     if mutations.len() <= MAC_DEDUP_SCAN_LIMIT {
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
@@ -50,33 +52,18 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>
         return out;
     }
 
-    // Indices in `order` always carry a MAC, so the default branch is dead; it
-    // only keeps the lookup `unwrap`-free.
-    let mac_at = |i: u32| mutation_index_mac(&mutations[i as usize]).unwrap_or_default();
-
-    // Positions of mutations carrying a MAC, in first-seen order. Pre-sized to
-    // one allocation (the only scratch this path adds over the returned Vec).
-    let mut order: Vec<u32> = Vec::with_capacity(mutations.len());
-    order.extend(
-        mutations
-            .iter()
-            .enumerate()
-            .filter_map(|(i, m)| mutation_index_mac(m).map(|_| i as u32)),
-    );
-
-    // Group equal MACs (ties broken by position so each run's first occurrence
-    // leads it), drop all but each run's leader, then restore first-seen order.
-    order.sort_unstable_by(|&a, &b| mac_at(a).cmp(mac_at(b)).then(a.cmp(&b)));
-    order.dedup_by(|&mut a, &mut b| mac_at(a) == mac_at(b));
-    order.sort_unstable();
-
-    order.into_iter().map(|i| mac_at(i).to_vec()).collect()
+    let mut out: Vec<Vec<u8>> = mutations
+        .iter()
+        .filter_map(|m| mutation_index_mac(m).map(<[u8]>::to_vec))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
-/// Mutation count above which [`collect_unique_index_macs`] switches from the
-/// cache-friendly O(n²) linear scan to the O(n log n) index sort. Chosen well
-/// below the ~1000-mutation patch ceiling and above the small-N range where the
-/// scan beats sorting.
+/// Mutation count at or below which [`collect_unique_index_macs`] dedups with a
+/// linear scan instead of a sort; above it the sort wins despite allocating
+/// every MAC before deduping.
 const MAC_DEDUP_SCAN_LIMIT: usize = 64;
 
 fn lookup_app_state_key(
@@ -112,17 +99,21 @@ where
     {
         let data =
             download(ext).with_context(|| format!("download external snapshot for {name:?}"))?;
-        let snapshot = wa::SyncdSnapshot::decode(data.as_slice())
+        let snapshot = wa::SyncdSnapshot::decode_from_slice(data.as_slice())
             .with_context(|| format!("decode external snapshot for {name:?}"))?;
         pl.snapshot = Some(snapshot);
     }
 
     for patch in &mut pl.patches {
-        if let Some(ext) = &patch.external_mutations {
-            let v = patch.version.as_ref().and_then(|x| x.version).unwrap_or(0);
+        if let Some(ext) = patch.external_mutations.as_option() {
+            let v = patch
+                .version
+                .as_option()
+                .and_then(|x| x.version)
+                .unwrap_or(0);
             let data = download(ext)
                 .with_context(|| format!("download external mutations for {name:?} v{v}"))?;
-            let ext_mutations = wa::SyncdMutations::decode(data.as_slice())
+            let ext_mutations = wa::SyncdMutations::decode_from_slice(data.as_slice())
                 .with_context(|| format!("decode external mutations for {name:?} v{v}"))?;
             patch.mutations = ext_mutations.mutations;
         }
@@ -182,10 +173,10 @@ impl AppStateProcessor {
 
     /// Pre-fetch and cache all keys needed for a patch list.
     async fn prefetch_keys(&self, pl: &PatchList) -> Result<()> {
-        let key_ids = collect_key_ids_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
+        let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
         for key_id in key_ids {
             // This will fetch and cache if not already cached
-            let _ = self.get_app_state_key(&key_id).await;
+            let _ = self.get_app_state_key(key_id).await;
         }
         Ok(())
     }
@@ -329,7 +320,7 @@ impl AppStateProcessor {
         // roll the collection backward. No-op on the benign first-sync path, where snapshots
         // are requested only at version 0.
         let snapshot_fresh = pl.snapshot.as_ref().is_some_and(|snapshot| {
-            let snapshot_version = snapshot.version.as_ref().and_then(|v| v.version).unwrap_or(0);
+            let snapshot_version = snapshot.version.as_option().and_then(|v| v.version).unwrap_or(0);
             if snapshot_is_stale(state.version, snapshot_version) {
                 log::warn!(
                     target: "AppState",
@@ -408,7 +399,7 @@ impl AppStateProcessor {
             let first_version = pl
                 .patches
                 .first()
-                .and_then(|p| p.version.as_ref())
+                .and_then(|p| p.version.as_option())
                 .and_then(|v| v.version)
                 .unwrap_or(0);
             if !pl.patches.is_empty() && first_version != 1 {
@@ -567,7 +558,7 @@ impl AppStateProcessor {
         // Build the patch — matching whatsmeow: no Version or DeviceIndex fields
         let mut patch = wa::SyncdPatch {
             snapshot_mac: Some(snapshot_mac),
-            key_id: Some(wa::KeyId {
+            key_id: buffa::MessageField::some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
             mutations,
@@ -585,11 +576,11 @@ impl AppStateProcessor {
     }
 
     pub async fn get_missing_key_ids(&self, pl: &PatchList) -> Result<Vec<Vec<u8>>> {
-        let key_ids = collect_key_ids_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
+        let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
         let mut missing = Vec::with_capacity(key_ids.len());
         for id in key_ids {
-            if self.backend.get_sync_key(&id).await?.is_none() {
-                missing.push(id);
+            if self.backend.get_sync_key(id).await?.is_none() {
+                missing.push(id.to_vec());
             }
         }
         Ok(missing)
@@ -749,7 +740,7 @@ mod external_blob_tests {
             name: WAPatchName::Regular,
             has_more_patches: false,
             patches: vec![wa::SyncdPatch {
-                external_mutations: Some(wa::ExternalBlobReference {
+                external_mutations: buffa::MessageField::some(wa::ExternalBlobReference {
                     direct_path: Some("/mutations".into()),
                     ..Default::default()
                 }),
@@ -779,8 +770,8 @@ mod dedup_tests {
 
     fn mutation(index_mac: &[u8]) -> wa::SyncdMutation {
         wa::SyncdMutation {
-            record: Some(wa::SyncdRecord {
-                index: Some(wa::SyncdIndex {
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
                     blob: Some(index_mac.to_vec()),
                 }),
                 ..Default::default()
@@ -790,7 +781,7 @@ mod dedup_tests {
     }
 
     /// Builds `n` mutations whose index MACs repeat every `distinct` values, so
-    /// the expected output is the first `distinct` MACs in first-seen order.
+    /// the distinct set is the first `distinct` MACs.
     fn build(n: usize, distinct: usize) -> Vec<wa::SyncdMutation> {
         (0..n)
             .map(|i| {
@@ -811,38 +802,19 @@ mod dedup_tests {
         (0..distinct).map(mac_bytes).collect()
     }
 
-    /// Both dedup paths must yield identical first-seen-order unique results;
-    /// the index-sort path (large N) and scan path (small N) cannot diverge.
+    /// Dedups to the distinct index MACs across small and large N, dropping
+    /// repeats. Order is unspecified (callers feed a HashMap lookup), so compare
+    /// as sorted sets.
     #[test]
-    fn scan_and_sort_paths_agree() {
-        // Small N exercises the linear scan; large N (> limit) the index sort.
-        for &n in &[8usize, MAC_DEDUP_SCAN_LIMIT, MAC_DEDUP_SCAN_LIMIT + 1, 1000] {
+    fn dedups_to_distinct_macs() {
+        for &n in &[8usize, 64, 65, 1000] {
             let distinct = (n / 2).max(1);
-            assert_eq!(
-                collect_unique_index_macs(&build(n, distinct)),
-                expected(distinct),
-                "n = {n}"
-            );
+            let mut got = collect_unique_index_macs(&build(n, distinct));
+            got.sort_unstable();
+            let mut want = expected(distinct);
+            want.sort_unstable();
+            assert_eq!(got, want, "n = {n}");
         }
-    }
-
-    /// The index-sort path must re-emit in first-seen order, not byte-sort order.
-    /// Force that path (> limit MACs) with first appearances running opposite to
-    /// byte order, plus trailing duplicates that must be dropped — so a bug in
-    /// the order-restoration step can't pass by coinciding with the sort order.
-    #[test]
-    fn sort_path_restores_first_seen_order() {
-        let distinct = MAC_DEDUP_SCAN_LIMIT + 20;
-        // First-seen order is descending i; byte order is ascending (i < 256).
-        let mut mutations: Vec<wa::SyncdMutation> = (0..distinct)
-            .rev()
-            .map(|i| mutation(&mac_bytes(i)))
-            .collect();
-        for i in [distinct - 1, distinct / 2, 0] {
-            mutations.push(mutation(&mac_bytes(i)));
-        }
-        let want: Vec<Vec<u8>> = (0..distinct).rev().map(mac_bytes).collect();
-        assert_eq!(collect_unique_index_macs(&mutations), want);
     }
 
     #[test]
@@ -853,7 +825,8 @@ mod dedup_tests {
             mutation(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             mutation(b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
         ];
-        let macs = collect_unique_index_macs(&mutations);
+        let mut macs = collect_unique_index_macs(&mutations);
+        macs.sort_unstable();
         assert_eq!(
             macs,
             vec![

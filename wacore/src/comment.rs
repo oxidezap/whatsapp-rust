@@ -85,10 +85,10 @@ mod tests {
 
     fn body(text: &str) -> wa::Message {
         wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some(text.to_string()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         }
     }
@@ -102,7 +102,7 @@ mod tests {
             decrypt_comment_with_secret(&enc, &iv, &SECRET, PARENT_ID, AUTHOR, COMMENTER).unwrap();
         assert_eq!(
             out.extended_text_message
-                .as_ref()
+                .as_option()
                 .and_then(|m| m.text.as_deref()),
             Some("nice post")
         );

@@ -148,7 +148,7 @@ impl<'a> Profile<'a> {
         use waproto::whatsapp as wa;
 
         let value = wa::SyncActionValue {
-            push_name_setting: Some(wa::sync_action_value::PushNameSetting {
+            push_name_setting: buffa::MessageField::some(wa::sync_action_value::PushNameSetting {
                 name: Some(name.to_string()),
             }),
             timestamp: Some(wacore::time::now_millis()),

@@ -89,12 +89,12 @@ impl<'a> Polls<'a> {
         // WA Web: v3 for single-select, v1 for multi-select (GeneratePollCreationMessageProto.js:39-41)
         let mut message = if selectable_count == 1 {
             wa::Message {
-                poll_creation_message_v3: Some(Box::new(poll_msg)),
+                poll_creation_message_v3: buffa::MessageField::some(poll_msg),
                 ..Default::default()
             }
         } else {
             wa::Message {
-                poll_creation_message: Some(Box::new(poll_msg)),
+                poll_creation_message: buffa::MessageField::some(poll_msg),
                 ..Default::default()
             }
         };
@@ -108,10 +108,10 @@ impl<'a> Polls<'a> {
             secret
         };
 
-        message.message_context_info = Some(Box::new(wa::MessageContextInfo {
+        message.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(message_secret.clone()),
             ..Default::default()
-        }));
+        });
 
         let result = self.client.send_message(to, message).await?;
         Ok((result, message_secret))
@@ -152,7 +152,7 @@ impl<'a> Polls<'a> {
         let from_me = my_base.is_same_user_as(poll_creator_jid);
 
         let poll_update = wa::message::PollUpdateMessage {
-            poll_creation_message_key: Some(wa::MessageKey {
+            poll_creation_message_key: buffa::MessageField::some(wa::MessageKey {
                 remote_jid: Some(chat_jid.to_string()),
                 from_me: Some(from_me),
                 id: Some(poll_msg_id.to_string()),
@@ -162,18 +162,18 @@ impl<'a> Polls<'a> {
                     None
                 },
             }),
-            vote: Some(wa::message::PollEncValue {
+            vote: buffa::MessageField::some(wa::message::PollEncValue {
                 enc_payload: Some(enc_payload),
                 enc_iv: Some(iv.to_vec()),
             }),
             // WA Web's GeneratePollVoteMessageProto never sets metadata; a Some(empty)
             // submessage emits a stray `1A 00` (tag 3) on the wire. Omit it.
-            metadata: None,
+            metadata: buffa::MessageField::none(),
             sender_timestamp_ms: Some(wacore::time::now_millis()),
         };
 
         let message = wa::Message {
-            poll_update_message: Some(Box::new(poll_update)),
+            poll_update_message: buffa::MessageField::some(poll_update),
             ..Default::default()
         };
 
@@ -286,9 +286,9 @@ impl<'a> Polls<'a> {
         let creator_str = creator.to_string();
         let creator_alt = self.swapped_user(&creator).await;
 
-        // Keyed by canonical (LID-preferred) identity; value holds the
-        // as-received JID for the reported voters list. Last-vote-wins.
-        let mut latest_votes: HashMap<String, (String, Vec<Vec<u8>>)> =
+        // Keyed by canonical (LID-preferred) identity. The optional display JID
+        // is only stored when it differs from the key. Last-vote-wins.
+        let mut latest_votes: HashMap<String, (Option<String>, Vec<usize>)> =
             HashMap::with_capacity(votes.len());
         for (voter_jid, ciphertext) in votes {
             let voter = voter_jid.to_non_ad();
@@ -310,11 +310,26 @@ impl<'a> Polls<'a> {
                 },
                 fallback,
             ) {
-                Ok(selected_hashes) => {
-                    if selected_hashes.is_empty() {
-                        latest_votes.remove(&canonical_voter);
+                Ok(hashes) => {
+                    let display_jid = if voter.is_lid() {
+                        None
+                    } else if voter_alt.is_some() {
+                        Some(voter_str)
                     } else {
-                        latest_votes.insert(canonical_voter, (voter_str, selected_hashes));
+                        None
+                    };
+                    if hashes.is_empty() {
+                        latest_votes.remove(canonical_voter.as_str());
+                    } else {
+                        let selected_indices: Vec<usize> = hashes
+                            .iter()
+                            .filter_map(|h| {
+                                <[u8; 32]>::try_from(h.as_slice()).ok().and_then(|arr| {
+                                    option_hashes.iter().position(|(oh, _)| *oh == arr)
+                                })
+                            })
+                            .collect();
+                        latest_votes.insert(canonical_voter, (display_jid, selected_indices));
                     }
                 }
                 Err(e) => {
@@ -331,13 +346,13 @@ impl<'a> Polls<'a> {
             })
             .collect();
 
-        for (display_jid, selected_hashes) in latest_votes.values() {
-            for hash in selected_hashes {
-                if let Ok(hash_arr) = <[u8; 32]>::try_from(hash.as_slice())
-                    && let Some(idx) = option_hashes.iter().position(|(h, _)| *h == hash_arr)
-                {
-                    results[idx].voters.push(display_jid.clone());
+        for (canonical_jid, (display_jid, selected_indices)) in latest_votes {
+            let display_jid = display_jid.unwrap_or(canonical_jid);
+            if let Some((last_idx, prefix_indices)) = selected_indices.split_last() {
+                for idx in prefix_indices {
+                    results[*idx].voters.push(display_jid.clone());
                 }
+                results[*last_idx].voters.push(display_jid);
             }
         }
 
@@ -403,9 +418,12 @@ fn build_poll_creation_message(
                 // createOptionHashHexFromString (the proto field is a string, not bytes).
                 option_hash: Some(hex::encode(poll::compute_option_hash(correct))),
             };
-            (Some(wa::message::PollType::Quiz as i32), Some(answer))
+            (
+                Some(wa::message::PollType::QUIZ),
+                buffa::MessageField::some(answer),
+            )
         }
-        None => (None, None),
+        None => (None, buffa::MessageField::none()),
     };
 
     let poll_options: Vec<wa::message::poll_creation_message::Option> = options
@@ -421,11 +439,11 @@ fn build_poll_creation_message(
         name: Some(name.to_string()),
         options: poll_options,
         selectable_options_count: Some(selectable_count),
-        context_info: None,
+        context_info: buffa::MessageField::none(),
         // WA Web's GeneratePollCreationMessageProto always sets pollContentType
         // (TEXT=1 for a normal poll); omitting it drops a field the real client
         // always emits.
-        poll_content_type: Some(wa::message::PollContentType::Text as i32),
+        poll_content_type: Some(wa::message::PollContentType::TEXT),
         poll_type,
         correct_answer,
         ..Default::default()
@@ -447,11 +465,11 @@ mod tests {
         let options = vec!["A".to_string(), "B".to_string(), "C".to_string()];
         let msg = build_poll_creation_message("Q?", &options, 2, None).unwrap();
         assert_eq!(msg.poll_type, None);
-        assert!(msg.correct_answer.is_none());
+        assert!(msg.correct_answer.is_unset());
         assert_eq!(msg.selectable_options_count, Some(2));
         assert_eq!(
             msg.poll_content_type,
-            Some(wa::message::PollContentType::Text as i32)
+            Some(wa::message::PollContentType::TEXT)
         );
         assert_eq!(msg.options.len(), 3);
         assert!(msg.options.iter().all(|o| o.option_hash.is_none()));
@@ -461,9 +479,10 @@ mod tests {
     fn quiz_sets_poll_type_and_correct_answer() {
         let options = vec!["A".to_string(), "B".to_string(), "C".to_string()];
         let msg = build_poll_creation_message("Q?", &options, 1, Some(1)).unwrap();
-        assert_eq!(msg.poll_type, Some(wa::message::PollType::Quiz as i32));
+        assert_eq!(msg.poll_type, Some(wa::message::PollType::QUIZ));
         let answer = msg
             .correct_answer
+            .as_option()
             .expect("quiz must carry a correct answer");
         // WA Web sets BOTH name and hash on the chosen option, even for text polls;
         // the hash is the lowercase hex of SHA-256(name).

@@ -3,9 +3,9 @@
 //! decompressed). This is the heaviest single-shot pipeline in the library
 //! and the hottest consumer of the varint scan.
 
+use buffa::Message;
 use divan::black_box;
 use flate2::{Compression, write::ZlibEncoder};
-use prost::Message;
 use std::io::Write;
 use waproto::whatsapp as wa;
 
@@ -44,34 +44,36 @@ fn build_realistic_history_sync(n_convos: usize, msgs_per_convo: usize) -> Vec<u
                 }
             } else {
                 wa::Message {
-                    extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
-                        text: Some(pseudo_text((c * 43 + m) as u64, 24)),
-                        context_info: Some(Box::new(wa::ContextInfo {
-                            is_forwarded: Some(m % 4 == 0),
-                            forwarding_score: Some((m % 7) as u32),
+                    extended_text_message: buffa::MessageField::some(
+                        wa::message::ExtendedTextMessage {
+                            text: Some(pseudo_text((c * 43 + m) as u64, 24)),
+                            context_info: buffa::MessageField::some(wa::ContextInfo {
+                                is_forwarded: Some(m % 4 == 0),
+                                forwarding_score: Some((m % 7) as u32),
+                                ..Default::default()
+                            }),
                             ..Default::default()
-                        })),
-                        ..Default::default()
-                    })),
-                    message_context_info: Some(Box::new(wa::MessageContextInfo {
+                        },
+                    ),
+                    message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
                         message_secret: Some(vec![m as u8; 32]),
                         ..Default::default()
-                    })),
+                    }),
                     ..Default::default()
                 }
             };
             messages.push(wa::HistorySyncMsg {
-                message: Some(Box::new(wa::WebMessageInfo {
-                    key: wa::MessageKey {
+                message: buffa::MessageField::some(wa::WebMessageInfo {
+                    key: buffa::MessageField::some(wa::MessageKey {
                         remote_jid: Some(chat.clone()),
                         from_me: Some(from_me),
                         id: Some(format!("MSGID{c:04}{m:04}ABCDEF")),
                         participant: None,
-                    },
-                    message: Some(Box::new(inner)),
+                    }),
+                    message: buffa::MessageField::some(inner),
                     message_timestamp: Some(1_700_000_000 + (c * msgs_per_convo + m) as u64),
                     ..Default::default()
-                })),
+                }),
                 ..Default::default()
             });
         }
@@ -82,7 +84,7 @@ fn build_realistic_history_sync(n_convos: usize, msgs_per_convo: usize) -> Vec<u
         });
     }
     let hs = wa::HistorySync {
-        sync_type: wa::history_sync::HistorySyncType::InitialBootstrap as i32,
+        sync_type: wa::history_sync::HistorySyncType::InitialBootstrap,
         conversations,
         ..Default::default()
     };

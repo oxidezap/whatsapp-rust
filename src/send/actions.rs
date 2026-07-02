@@ -148,15 +148,15 @@ impl Client {
         duration_secs: u32,
     ) -> Result<(), SendError> {
         let message = wa::Message {
-            pin_in_chat_message: Some(Box::new(wa::message::PinInChatMessage {
-                key: Some(key),
-                r#type: Some(pin_type as i32),
+            pin_in_chat_message: buffa::MessageField::some(wa::message::PinInChatMessage {
+                key: buffa::MessageField::some(key),
+                r#type: Some(pin_type),
                 sender_timestamp_ms: Some(wacore::time::now_millis()),
-            })),
-            message_context_info: Some(Box::new(wa::MessageContextInfo {
+            }),
+            message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
                 message_add_on_duration_in_secs: Some(duration_secs),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
 

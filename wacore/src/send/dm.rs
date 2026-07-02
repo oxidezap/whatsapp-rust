@@ -53,7 +53,7 @@ pub async fn prepare_dm_stanza(
     resolver: &dyn SendContextResolver,
     own_jid: &Jid,
     own_lid: Option<&Jid>,
-    account: Option<&wa::AdvSignedDeviceIdentity>,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
     to_jid: Jid,
     message: &wa::Message,
     request_id: String,
@@ -68,7 +68,7 @@ pub async fn prepare_dm_stanza(
     // existing mci, diverging from the bytes the token is computed over, so it re-encodes.
     let shared_content = message
         .message_context_info
-        .is_none()
+        .is_unset()
         .then(|| waproto::codec::message_to_vec(message));
 
     // sender is the author's own jid, remote is the chat jid (WAWebReportingTokenUtils:
@@ -289,7 +289,7 @@ pub async fn prepare_dm_retry_stanza<S, I>(
     message: &wa::Message,
     message_id: String,
     retry_count: u8,
-    account: Option<&wa::AdvSignedDeviceIdentity>,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
     edit: Option<crate::types::message::EditAttribute>,
 ) -> Result<Node>
 where

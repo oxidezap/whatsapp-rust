@@ -1,8 +1,8 @@
 use crate::client::Client;
 use crate::message::RetryReason;
 use crate::types::events::Receipt;
+use buffa::Message;
 use log::{debug, info, warn};
-use prost::Message;
 use wacore::types::message::MessageCategory;
 
 use scopeguard;
@@ -1857,14 +1857,14 @@ mod tests {
             remote_identity_public: None,
             root_key: None,
             previous_counter: Some(0),
-            sender_chain: None,
+            sender_chain: buffa::MessageField::default(),
             receiver_chains: vec![],
-            pending_pre_key: None,
+            pending_pre_key: buffa::MessageField::default(),
             remote_registration_id: Some(remote_regid),
             local_registration_id: Some(0),
             alice_base_key: Some(base_key),
             needs_refresh: None,
-            pending_key_exchange: None,
+            pending_key_exchange: buffa::MessageField::default(),
         });
         SessionRecord::new(state)
             .serialize()
@@ -3083,10 +3083,10 @@ mod tests {
         .await;
 
         let msg = wa::Message {
-            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
                 text: Some("status text".to_string()),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
 
@@ -3112,7 +3112,7 @@ mod tests {
                     .unwrap()
                     .0
                     .extended_text_message
-                    .as_ref()
+                    .as_option()
                     .unwrap()
                     .text
                     .as_deref(),

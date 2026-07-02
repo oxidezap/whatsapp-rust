@@ -6,7 +6,7 @@
 use std::convert::AsRef;
 use std::fmt;
 
-use prost::Message;
+use buffa::Message;
 
 use crate::protocol::{
     KeyPair, PrivateKey, PublicKey, Result, SignalProtocolError, Timestamp,
@@ -89,7 +89,7 @@ pub trait GenericSignedPreKey {
         Self: Sized,
     {
         Ok(Self::from_storage(
-            SignedPreKeyRecordStructure::decode(data)
+            SignedPreKeyRecordStructure::decode_from_slice(data)
                 .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?,
         ))
     }

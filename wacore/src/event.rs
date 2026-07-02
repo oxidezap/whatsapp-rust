@@ -4,7 +4,7 @@
 //! `EventResponseMessage` proto and the `"Event Response"` use-case.
 
 use anyhow::{Result, ensure};
-use prost::Message;
+use buffa::Message;
 use waproto::whatsapp::message::EventResponseMessage;
 
 use crate::secret_enc_addon::{AddonContext, ModificationType, decrypt_addon, encrypt_addon};
@@ -71,7 +71,7 @@ pub fn decrypt_event_response_with_secret(
         message_secret,
         &event_response_addon_ctx(stanza_id, event_creator_jid, responder_jid),
     )?;
-    Ok(EventResponseMessage::decode(&plaintext[..])?)
+    Ok(EventResponseMessage::decode_from_slice(&plaintext[..])?)
 }
 
 #[cfg(test)]
@@ -83,7 +83,7 @@ mod tests {
     fn event_response_roundtrip() {
         let secret = [0x55u8; 32];
         let resp = EventResponseMessage {
-            response: Some(EventResponseType::Going as i32),
+            response: Some(EventResponseType::Going),
             timestamp_ms: Some(1_700_000_000_000),
             extra_guest_count: Some(2),
         };
@@ -104,7 +104,7 @@ mod tests {
             "5511888888888@s.whatsapp.net",
         )
         .unwrap();
-        assert_eq!(out.response, Some(EventResponseType::Going as i32));
+        assert_eq!(out.response, Some(EventResponseType::Going));
         assert_eq!(out.extra_guest_count, Some(2));
     }
 
@@ -114,7 +114,7 @@ mod tests {
         // must fail rather than silently mis-decrypt.
         let secret = [0x55u8; 32];
         let resp = EventResponseMessage {
-            response: Some(EventResponseType::Maybe as i32),
+            response: Some(EventResponseType::Maybe),
             timestamp_ms: None,
             extra_guest_count: None,
         };

@@ -31,9 +31,9 @@
 use crate::libsignal::crypto::aes_256_gcm_encrypt;
 use crate::libsignal::protocol::{CurveError, KeyPair, PublicKey};
 use crate::pair_code::PairCodeUtils;
+use buffa::{Enumeration, Message};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit as _, Mac};
-use prost::Message;
 use rand::RngExt;
 use sha2::{Digest, Sha256};
 use waproto::whatsapp as wa;
@@ -86,10 +86,11 @@ pub struct ShortcakeUtils;
 impl ShortcakeUtils {
     /// Encode the companion ephemeral identity protobuf.
     /// `public_key` is the RAW 32-byte X25519 pubkey (no 0x05 prefix).
-    /// `device_type` is the numeric `DeviceProps.PlatformType` (CHROME = 1).
+    /// Typed `device_type` keeps the wire value and the key-derivation salt in
+    /// lockstep by construction (the salt embeds the same enum number).
     pub fn build_companion_ephemeral_identity(
         public_key: &[u8; 32],
-        device_type: i32,
+        device_type: wa::device_props::PlatformType,
         ref_str: &str,
     ) -> Vec<u8> {
         wa::CompanionEphemeralIdentity {
@@ -119,7 +120,7 @@ impl ShortcakeUtils {
     ) -> Vec<u8> {
         wa::ProloguePayload {
             companion_ephemeral_identity: Some(companion_ephemeral_identity.to_vec()),
-            commitment: Some(wa::CompanionCommitment {
+            commitment: buffa::MessageField::some(wa::CompanionCommitment {
                 hash: Some(commitment_hash.to_vec()),
             }),
         }
@@ -133,7 +134,7 @@ impl ShortcakeUtils {
     pub fn parse_primary_ephemeral_identity(
         bytes: &[u8],
     ) -> Result<PrimaryEphemeralIdentity, ShortcakeError> {
-        let parsed = wa::PrimaryEphemeralIdentity::decode(bytes)
+        let parsed = wa::PrimaryEphemeralIdentity::decode_from_slice(bytes)
             .map_err(|_| ShortcakeError::Decode("primary_ephemeral_identity"))?;
         let pk = parsed.public_key.unwrap_or_default();
         let nc = parsed.nonce.unwrap_or_default();
@@ -176,13 +177,17 @@ impl ShortcakeUtils {
     }
 
     /// Derive the AES-256 pairing-request encryption key from the shared secret
-    /// (deterministic core, unit-testable). `device_type` is the numeric enum value.
+    /// (deterministic core, unit-testable). The salt embeds the numeric value of
+    /// `device_type`, matching what the identity protobuf carried on the wire.
     pub fn derive_encryption_key_from_shared_secret(
         shared_secret: &[u8; 32],
-        device_type: i32,
+        device_type: wa::device_props::PlatformType,
         ref_str: &str,
     ) -> Result<[u8; 32], ShortcakeError> {
-        let salt = format!("Companion Pairing {device_type} with ref {ref_str}");
+        let salt = format!(
+            "Companion Pairing {} with ref {ref_str}",
+            device_type.to_i32()
+        );
         let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), shared_secret);
         let mut key = [0u8; 32];
         hk.expand(ENC_KEY_INFO, &mut key)
@@ -194,7 +199,7 @@ impl ShortcakeUtils {
     pub fn derive_encryption_key(
         companion_keypair: &KeyPair,
         primary_public_key: &[u8; 32],
-        device_type: i32,
+        device_type: wa::device_props::PlatformType,
         ref_str: &str,
     ) -> Result<[u8; 32], ShortcakeError> {
         let primary = PublicKey::from_djb_public_key_bytes(primary_public_key)
@@ -399,8 +404,12 @@ mod tests {
     #[test]
     fn encryption_key_uses_string_as_salt_not_info() {
         let ikm = [9u8; 32];
-        let key =
-            ShortcakeUtils::derive_encryption_key_from_shared_secret(&ikm, 1, "REF123").unwrap();
+        let key = ShortcakeUtils::derive_encryption_key_from_shared_secret(
+            &ikm,
+            wa::device_props::PlatformType::CHROME,
+            "REF123",
+        )
+        .unwrap();
         // independent re-derivation with the documented salt/info placement
         let salt = "Companion Pairing 1 with ref REF123";
         let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), &ikm);
@@ -416,11 +425,21 @@ mod tests {
         // device_type and ref are bound into the key
         assert_ne!(
             key,
-            ShortcakeUtils::derive_encryption_key_from_shared_secret(&ikm, 2, "REF123").unwrap()
+            ShortcakeUtils::derive_encryption_key_from_shared_secret(
+                &ikm,
+                wa::device_props::PlatformType::FIREFOX,
+                "REF123"
+            )
+            .unwrap()
         );
         assert_ne!(
             key,
-            ShortcakeUtils::derive_encryption_key_from_shared_secret(&ikm, 1, "OTHER").unwrap()
+            ShortcakeUtils::derive_encryption_key_from_shared_secret(
+                &ikm,
+                wa::device_props::PlatformType::CHROME,
+                "OTHER"
+            )
+            .unwrap()
         );
     }
 
@@ -443,25 +462,32 @@ mod tests {
 
     #[test]
     fn protobufs_roundtrip_with_expected_fields() {
-        let id = ShortcakeUtils::build_companion_ephemeral_identity(&[0xAA; 32], 1, "theref");
-        let decoded = wa::CompanionEphemeralIdentity::decode(id.as_slice()).unwrap();
+        let id = ShortcakeUtils::build_companion_ephemeral_identity(
+            &[0xAA; 32],
+            wa::device_props::PlatformType::CHROME,
+            "theref",
+        );
+        let decoded = wa::CompanionEphemeralIdentity::decode_from_slice(id.as_slice()).unwrap();
         assert_eq!(decoded.public_key.as_deref(), Some(&[0xAA; 32][..]));
-        assert_eq!(decoded.device_type, Some(1));
+        assert_eq!(
+            decoded.device_type,
+            Some(wa::device_props::PlatformType::CHROME)
+        );
         assert_eq!(decoded.r#ref.as_deref(), Some("theref"));
 
         let prologue = ShortcakeUtils::build_prologue_payload(&id, &[0xBB; 32]);
-        let dp = wa::ProloguePayload::decode(prologue.as_slice()).unwrap();
+        let dp = wa::ProloguePayload::decode_from_slice(prologue.as_slice()).unwrap();
         assert_eq!(
             dp.companion_ephemeral_identity.as_deref(),
             Some(id.as_slice())
         );
         assert_eq!(
-            dp.commitment.and_then(|c| c.hash).as_deref(),
+            dp.commitment.into_option().and_then(|c| c.hash).as_deref(),
             Some(&[0xBB; 32][..])
         );
 
         let pr = ShortcakeUtils::build_pairing_request(&[1; 32], &[2; 32], &[3; 32]);
-        let dpr = wa::PairingRequest::decode(pr.as_slice()).unwrap();
+        let dpr = wa::PairingRequest::decode_from_slice(pr.as_slice()).unwrap();
         assert_eq!(dpr.companion_public_key.as_deref(), Some(&[1u8; 32][..]));
         assert_eq!(dpr.companion_identity_key.as_deref(), Some(&[2u8; 32][..]));
         assert_eq!(dpr.adv_secret.as_deref(), Some(&[3u8; 32][..]));
@@ -475,7 +501,7 @@ mod tests {
         // ciphertext + 16-byte GCM tag
         assert_eq!(enc.encrypted_payload.len(), b"hello pairing".len() + 16);
         let wire = ShortcakeUtils::build_encrypted_pairing_request(&enc);
-        let d = wa::EncryptedPairingRequest::decode(wire.as_slice()).unwrap();
+        let d = wa::EncryptedPairingRequest::decode_from_slice(wire.as_slice()).unwrap();
         assert_eq!(d.iv.as_deref(), Some(&enc.iv[..]));
         assert_eq!(d.encrypted_payload, Some(enc.encrypted_payload));
     }
@@ -487,7 +513,7 @@ mod tests {
     fn full_handshake_interops_with_a_simulated_primary() {
         use crate::libsignal::crypto::aes_256_gcm_decrypt;
 
-        let device_type = 1; // CHROME
+        let device_type = wa::device_props::PlatformType::CHROME;
         let pairing_ref = "REF-XYZ";
         let prior_adv_secret = [0x11u8; 32]; // a prior linked session's secret
         let new_adv_secret = [0x22u8; 32]; // rotated for this link
@@ -570,7 +596,7 @@ mod tests {
             ShortcakeUtils::build_pairing_request(&[0xAA; 32], &[0xBB; 32], &new_adv_secret);
         let enc = ShortcakeUtils::encrypt_pairing_request(&request, &companion_key).unwrap();
         let wire = ShortcakeUtils::build_encrypted_pairing_request(&enc);
-        let decoded = wa::EncryptedPairingRequest::decode(wire.as_slice()).unwrap();
+        let decoded = wa::EncryptedPairingRequest::decode_from_slice(wire.as_slice()).unwrap();
         let iv: [u8; 12] = decoded.iv.unwrap().as_slice().try_into().unwrap();
 
         let mut plaintext = Vec::new();
@@ -582,7 +608,7 @@ mod tests {
             &mut plaintext,
         )
         .unwrap();
-        let recovered = wa::PairingRequest::decode(plaintext.as_slice()).unwrap();
+        let recovered = wa::PairingRequest::decode_from_slice(plaintext.as_slice()).unwrap();
         assert_eq!(recovered.adv_secret.as_deref(), Some(&new_adv_secret[..]));
         assert_eq!(
             recovered.companion_public_key.as_deref(),

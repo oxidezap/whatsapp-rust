@@ -1,6 +1,7 @@
 //! Special message types: newsletter, app-state key share, sender-key distribution.
 
 use super::*;
+use buffa::Message as _;
 
 impl Client {
     /// Handles a newsletter plaintext message.
@@ -65,15 +66,15 @@ impl Client {
 
         /// Extract components from an AppStateSyncKey for storage.
         fn extract_key_components(key: &wa::message::AppStateSyncKey) -> Option<KeyComponents<'_>> {
-            let key_id = key.key_id.as_ref()?.key_id.as_ref()?;
-            let key_data = key.key_data.as_ref()?;
-            let fingerprint = key_data.fingerprint.as_ref()?;
+            let key_id = key.key_id.as_option()?.key_id.as_ref()?;
+            let key_data = key.key_data.as_option()?;
+            let fingerprint = key_data.fingerprint.as_option()?;
             let data = key_data.key_data.as_ref()?;
             Some(KeyComponents {
                 key_id,
                 data,
                 fingerprint_bytes: fingerprint.encode_to_vec(),
-                timestamp: key_data.timestamp(),
+                timestamp: key_data.timestamp.unwrap_or_default(),
             })
         }
 
@@ -132,7 +133,7 @@ impl Client {
     ) {
         let skdm = match SenderKeyDistributionMessage::try_from(axolotl_bytes) {
             Ok(msg) => msg,
-            Err(e1) => match wa::SenderKeyDistributionMessage::decode(axolotl_bytes) {
+            Err(e1) => match wa::SenderKeyDistributionMessage::decode_from_slice(axolotl_bytes) {
                 Ok(go_msg) => {
                     let (Some(signing_key), Some(id), Some(iteration), Some(chain_key)) = (
                         go_msg.signing_key.as_ref(),

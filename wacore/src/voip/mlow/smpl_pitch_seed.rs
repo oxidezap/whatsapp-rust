@@ -12,23 +12,7 @@ const NUM_BLOCKTRACKS: usize = 187;
 const PITCH_NUM_BLOCKS: usize = 9;
 
 /// On-disk packed pitch ROM (`tables.proto` `PitchSeed`). `bytes` fields reshape row-major at build.
-#[derive(Clone, PartialEq, prost::Message)]
-pub(crate) struct PitchSeed {
-    #[prost(bytes = "vec", tag = "1")]
-    blocksegs_bitstream: Vec<u8>, // 676; range-decoder source
-    #[prost(bytes = "vec", tag = "2")]
-    blocksegs2idx: Vec<u8>, // [217]
-    #[prost(bytes = "vec", tag = "3")]
-    blocksegs_ix: Vec<u8>, // [187][2]
-    #[prost(bytes = "vec", tag = "4")]
-    firstblock_range: Vec<u8>, // [9][2]
-    #[prost(bytes = "vec", tag = "5")]
-    blockseg_idx_dcmf: Vec<u8>, // [217]
-    #[prost(bytes = "vec", tag = "6")]
-    delta_lag_dcmfs: Vec<u8>, // [3][319]
-    #[prost(bytes = "vec", tag = "7")]
-    block_transition_dcmf: Vec<u8>, // [9][9]
-}
+pub(crate) use super::smpl_tables_blob::tables::PitchSeed;
 
 /// Decode a uniform symbol in `[0, N)`.
 fn ec_decode_uniform(dec: &mut RangeDecoder, n: u32) -> u32 {

@@ -249,7 +249,7 @@ impl Client {
 
                     // Download external mutations
                     for patch in &pl.patches {
-                        if let Some(ext) = &patch.external_mutations
+                        if let Some(ext) = patch.external_mutations.as_option()
                             && let Some(path) = &ext.direct_path
                         {
                             match self.download(ext).await {
@@ -257,8 +257,11 @@ impl Client {
                                     pre_downloaded.insert(path.clone(), bytes);
                                 }
                                 Err(e) => {
-                                    let v =
-                                        patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
+                                    let v = patch
+                                        .version
+                                        .as_option()
+                                        .and_then(|v| v.version)
+                                        .unwrap_or(0);
                                     warn!(
                                         "Failed to download external mutations for patch v{}: {e}",
                                         v
@@ -496,11 +499,14 @@ impl Client {
 
                 // Download external mutations for each patch that has them
                 for patch in &pl.patches {
-                    if let Some(ext) = &patch.external_mutations
+                    if let Some(ext) = patch.external_mutations.as_option()
                         && let Some(path) = &ext.direct_path
                     {
-                        let patch_version =
-                            patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
+                        let patch_version = patch
+                            .version
+                            .as_option()
+                            .and_then(|v| v.version)
+                            .unwrap_or(0);
                         match self.download(ext).await {
                             Ok(bytes) => {
                                 debug!(target: "Client/AppState", "Downloaded external mutations for patch v{} ({} bytes)", patch_version, bytes.len());
@@ -682,11 +688,13 @@ impl Client {
             })
             .collect();
         let msg = wa::Message {
-            protocol_message: Some(Box::new(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest as i32),
-                app_state_sync_key_request: Some(wa::message::AppStateSyncKeyRequest { key_ids }),
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest),
+                app_state_sync_key_request: buffa::MessageField::some(
+                    wa::message::AppStateSyncKeyRequest { key_ids },
+                ),
                 ..Default::default()
-            })),
+            }),
             ..Default::default()
         };
         self.send_message_impl(
@@ -765,7 +773,7 @@ impl Client {
                     .process_command(DeviceCommand::SetNctSalt(None))
                     .await;
             } else if let Some(val) = &m.action_value
-                && let Some(act) = &val.nct_salt_sync_action
+                && let Some(act) = val.nct_salt_sync_action.as_option()
                 && let Some(salt) = &act.salt
             {
                 if salt.is_empty() {
@@ -802,7 +810,7 @@ impl Client {
         // Handle client-internal mutations that need persistence/presence access
         if m.index[0] == "setting_pushName"
             && let Some(val) = &m.action_value
-            && let Some(act) = &val.push_name_setting
+            && let Some(act) = val.push_name_setting.as_option()
             && let Some(new_name) = &act.name
         {
             let new_name = new_name.clone();

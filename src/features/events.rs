@@ -46,7 +46,7 @@ impl<'a> Events<'a> {
         }
 
         let mut message = wa::Message {
-            event_message: Some(Box::new(build_event_message(params))),
+            event_message: buffa::MessageField::some(build_event_message(params)),
             ..Default::default()
         };
 
@@ -59,10 +59,10 @@ impl<'a> Events<'a> {
             rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut secret);
             secret
         };
-        message.message_context_info = Some(Box::new(wa::MessageContextInfo {
+        message.message_context_info = buffa::MessageField::some(wa::MessageContextInfo {
             message_secret: Some(message_secret.clone()),
             ..Default::default()
-        }));
+        });
 
         let result = self.client.send_message(to, message).await?;
         Ok((result, message_secret))
@@ -98,7 +98,7 @@ impl<'a> Events<'a> {
         let creator_str = event_creator_jid.to_non_ad_string();
 
         let response_msg = wa::message::EventResponseMessage {
-            response: Some(response as i32),
+            response: Some(response),
             timestamp_ms: Some(wacore::time::now_millis()),
             extra_guest_count,
         };
@@ -113,7 +113,7 @@ impl<'a> Events<'a> {
 
         let from_me = my_base.is_same_user_as(event_creator_jid);
         let enc = wa::message::EncEventResponseMessage {
-            event_creation_message_key: Some(wa::MessageKey {
+            event_creation_message_key: buffa::MessageField::some(wa::MessageKey {
                 remote_jid: Some(chat_jid.to_string()),
                 from_me: Some(from_me),
                 id: Some(event_msg_id.to_string()),
@@ -128,7 +128,7 @@ impl<'a> Events<'a> {
         };
 
         let message = wa::Message {
-            enc_event_response_message: Some(Box::new(enc)),
+            enc_event_response_message: buffa::MessageField::some(enc),
             ..Default::default()
         };
 
@@ -164,7 +164,7 @@ fn build_event_message(params: EventCreationParams) -> wa::message::EventMessage
         start_time: params.start_time,
         end_time: params.end_time,
         join_link: params.join_link,
-        location: params.location.map(Box::new),
+        location: params.location.into(),
         is_schedule_call: params.is_scheduled_call,
         extra_guests_allowed: params.extra_guests_allowed,
         ..Default::default()

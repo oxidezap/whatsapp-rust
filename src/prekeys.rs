@@ -353,8 +353,9 @@ impl Client {
                         })
                         .await;
                 }
-                use prost::Message;
-                let structure = waproto::whatsapp::PreKeyRecordStructure::decode(&record[..])?;
+                use buffa::Message;
+                let structure =
+                    waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&record)?;
                 let record = wacore::libsignal::store::record_helpers::prekey_structure_to_record(
                     structure,
                 )?;
@@ -380,7 +381,7 @@ impl Client {
         };
         let key_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
         let record = new_pre_key_record(id, &key_pair);
-        use prost::Message;
+        use buffa::Message;
         backend
             .store_prekey(id, &record.encode_to_vec(), false)
             .await?;
@@ -468,7 +469,7 @@ impl Client {
             // the async executor responsive. Records are encoded into one contiguous
             // buffer with zero-copy Bytes slices instead of an alloc per record.
             let (encoded_batch, generated) = wacore::runtime::blocking(&*self.runtime, move || {
-                use prost::Message;
+                use buffa::Message;
 
                 // Seed one CSPRNG and advance it per key, rather than reseeding from
                 // entropy on every iteration.
@@ -488,9 +489,7 @@ impl Client {
                     let pre_key_id = gen_start + i as u32;
                     let key_pair = KeyPair::generate(&mut rng);
                     let start = buf.len();
-                    new_pre_key_record(pre_key_id, &key_pair)
-                        .encode(&mut buf)
-                        .expect("prost encode into pre-sized Vec");
+                    new_pre_key_record(pre_key_id, &key_pair).encode(&mut buf);
                     offsets.push((pre_key_id, start..buf.len()));
                     pubkeys.push((pre_key_id, key_pair.public_key));
                 }
@@ -572,16 +571,17 @@ impl Client {
             // `PreKeyRecordStructure::decode` the consume path runs, so a record
             // accepted here is one this device can later decrypt with. Fresh keys skip
             // decode entirely; their public keys never left memory.
-            use prost::Message;
+            use buffa::Message;
             for (id, record) in &leftover_rows {
-                let public_key = waproto::whatsapp::PreKeyRecordStructure::decode(&record[..])
-                    .map_err(anyhow::Error::from)
-                    .and_then(|s| {
-                        let raw = s
-                            .public_key
-                            .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
-                        PublicKey::from_djb_public_key_bytes(&raw).map_err(anyhow::Error::from)
-                    });
+                let public_key =
+                    waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&record[..])
+                        .map_err(anyhow::Error::from)
+                        .and_then(|s| {
+                            let raw = s
+                                .public_key
+                                .ok_or_else(|| anyhow::anyhow!("record missing public key"))?;
+                            PublicKey::from_djb_public_key_bytes(&raw).map_err(anyhow::Error::from)
+                        });
                 match public_key {
                     Ok(public_key) => pairs.push((*id, public_key)),
                     Err(e) => log::warn!("skipping undecodable prekey record {id}: {e:?}"),
@@ -1108,7 +1108,7 @@ mod window_tests {
     /// heal advances FIRST to the next stored id and reuses it.
     #[tokio::test]
     async fn consumed_head_advances_to_next_live_window_key() {
-        use prost::Message;
+        use buffa::Message;
         use wacore::libsignal::protocol::KeyPair;
         use wacore::libsignal::store::record_helpers::new_pre_key_record;
         use wacore::store::commands::DeviceCommand;
@@ -1221,9 +1221,10 @@ mod window_tests {
             .expect("load");
         assert_eq!(window.len(), 5, "window = retry key + top-up");
 
-        use prost::Message;
-        let structure = waproto::whatsapp::PreKeyRecordStructure::decode(&after[0].1[..])
-            .expect("decode structure");
+        use buffa::Message;
+        let structure =
+            waproto::whatsapp::PreKeyRecordStructure::decode_from_slice(&after[0].1[..])
+                .expect("decode structure");
         let reloaded = PublicKey::from_djb_public_key_bytes(
             structure.public_key.as_deref().expect("public key"),
         )

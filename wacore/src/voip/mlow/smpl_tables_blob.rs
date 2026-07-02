@@ -9,6 +9,23 @@
 
 use std::io::Read;
 
+/// buffa-generated types for the table schemas (`tables.proto`), produced at
+/// build time into `OUT_DIR` (see `wacore/build.rs`). The `.bin` blobs decode
+/// against these by field number, so the format is unchanged from the prior
+/// prost-derived equivalents.
+pub(crate) mod tables {
+    #![allow(
+        unused,
+        non_camel_case_types,
+        non_snake_case,
+        unreachable_patterns,
+        clippy::all,
+        clippy::pedantic,
+        clippy::nursery
+    )]
+    buffa::include_proto!("mlow.tables");
+}
+
 /// Zlib level used by the generator. Fixed so re-running yields identical `.bin` bytes.
 #[cfg(test)]
 const GEN_ZLIB_LEVEL: u32 = 9;
@@ -23,9 +40,9 @@ fn inflate(compressed: &[u8]) -> Vec<u8> {
 }
 
 /// Load a protobuf table from its embedded zlib blob.
-pub(crate) fn load_blob_prost<T: prost::Message + Default>(compressed: &[u8]) -> T {
+pub(crate) fn load_blob_buffa<T: buffa::Message>(compressed: &[u8]) -> T {
     let bytes = inflate(compressed);
-    T::decode(bytes.as_slice()).expect("mlow table blob must protobuf-decode")
+    T::decode_from_slice(bytes.as_slice()).expect("mlow table blob must protobuf-decode")
 }
 
 /// Zlib-compress already-encoded bytes (for callers that encode protobuf themselves). Deterministic.
@@ -76,14 +93,14 @@ mod generator {
         // 1. LSF seed ROM: protobuf (tables.proto `LsfSeed`), then zlib. The expanded LSF tables
         //    (synth/lsf-cb/lsf-decode) are derived from this at load.
         if let Some(j) = try_read_json("lsf_seed.json") {
-            use prost::Message;
+            use buffa::Message;
             let seed = super::super::smpl_lsf_seed::seed_from_json(&j);
             write_bin("lsf_seed.bin", &make_blob_raw(&seed.encode_to_vec()));
         }
 
         // 2. pitch seed ROM: protobuf (tables.proto `PitchSeed`), then zlib.
         if let Some(j) = try_read_json("pitch_seed.json") {
-            use prost::Message;
+            use buffa::Message;
             let seed = super::super::smpl_pitch_seed::seed_from_json(&j);
             write_bin("pitch_seed.bin", &make_blob_raw(&seed.encode_to_vec()));
         }
@@ -91,7 +108,7 @@ mod generator {
         // 3. cc seed ROM: protobuf (tables.proto `CcSeed`), then zlib. The nrgres/gains (Group A/E)
         //    and LTP gain (Group C) CDFs are derived from this at load.
         if let Some(j) = try_read_json("cc_seed.json") {
-            use prost::Message;
+            use buffa::Message;
             let seed = super::super::smpl_cc_tables::seed_from_json(&j);
             write_bin("cc_seed.bin", &make_blob_raw(&seed.encode_to_vec()));
         }
