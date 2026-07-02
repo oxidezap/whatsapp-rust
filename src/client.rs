@@ -503,6 +503,14 @@ pub struct Client {
     /// or processed. Set via `BotBuilder::skip_history_sync()`.
     pub(crate) skip_history_sync: AtomicBool,
 
+    /// When true, outbound DM addressing (device fanout, session creation,
+    /// stanza prep and session locks) keeps the PN namespace instead of
+    /// upgrading to LID. Inbound decrypt addressing is not affected. Escape
+    /// hatch for companion registrations whose LID-addressed DMs are accepted
+    /// by the server but never delivered (no Delivered receipt); PN
+    /// addressing matches pre-0.6 behavior.
+    pub(crate) force_pn_addressing: AtomicBool,
+
     /// Cache configuration for TTL and capacity of all caches.
     /// Stored for use by lazily-initialized caches (group_cache).
     pub(crate) cache_config: CacheConfig,
@@ -626,6 +634,18 @@ impl Client {
     /// notifications but will not download or process the data.
     pub fn set_skip_history_sync(&self, enabled: bool) {
         self.skip_history_sync.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Keep DM addressing on phone-number JIDs even when a LID mapping is
+    /// known. Some companion registrations observe LID-addressed DMs being
+    /// accepted but never delivered; this restores pre-0.6 PN addressing.
+    pub fn set_force_pn_addressing(&self, enabled: bool) {
+        self.force_pn_addressing.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Returns `true` if DM addressing is pinned to phone-number JIDs.
+    pub fn force_pn_addressing_enabled(&self) -> bool {
+        self.force_pn_addressing.load(Ordering::Relaxed)
     }
 
     /// Override `DeviceProps` fields before the initial pairing. Only fields
@@ -841,6 +861,7 @@ impl Client {
             http_client,
             override_version,
             skip_history_sync: AtomicBool::new(false),
+            force_pn_addressing: AtomicBool::new(false),
             cache_config,
             self_weak: std::sync::OnceLock::new(),
             saver_handle: std::sync::OnceLock::new(),

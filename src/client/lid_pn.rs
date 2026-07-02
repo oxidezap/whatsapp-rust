@@ -267,6 +267,12 @@ impl Client {
     /// This checks the local cache for existing mappings. For JIDs without cached mappings,
     /// the caller should consider fetching them via usync query if establishing sessions.
     pub(crate) async fn resolve_lid_mappings(&self, jids: &[Jid]) -> Vec<Jid> {
+        // Outbound sessions must stay on the PN namespace when PN addressing
+        // is forced, or encryption would look up sessions the fanout never
+        // created (see Client::set_force_pn_addressing).
+        if self.force_pn_addressing_enabled() {
+            return jids.to_vec();
+        }
         let mut resolved = Vec::with_capacity(jids.len());
 
         for jid in jids {
@@ -511,6 +517,45 @@ mod tests {
 
         assert_eq!(resolved.user, lid);
         assert_eq!(resolved.server, Server::Lid);
+    }
+
+    #[tokio::test]
+    async fn test_force_pn_addressing_scopes_to_outbound_paths() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "55999999999";
+        let lid = "100000012345678";
+
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+        client.set_force_pn_addressing(true);
+
+        let pn_jid = Jid::pn(pn);
+
+        // Outbound fanout/session paths keep the PN namespace as given.
+        let mapped = client
+            .resolve_lid_mappings(std::slice::from_ref(&pn_jid))
+            .await;
+        assert_eq!(mapped, vec![pn_jid.clone()]);
+        let locks = client
+            .build_session_lock_keys(std::slice::from_ref(&pn_jid))
+            .await;
+        assert_eq!(locks, vec![pn_jid.clone()]);
+
+        // Inbound decrypt addressing is NOT gated: the upgrade still applies
+        // so sessions migrated to LID keep resolving.
+        let resolved = client.resolve_encryption_jid(&pn_jid).await;
+        assert_eq!(resolved.user, lid);
+        assert_eq!(resolved.server, Server::Lid);
+
+        // Turning the flag off restores stock outbound behavior.
+        client.set_force_pn_addressing(false);
+        let mapped = client
+            .resolve_lid_mappings(std::slice::from_ref(&pn_jid))
+            .await;
+        assert_eq!(mapped[0].user, lid);
+        assert_eq!(mapped[0].server, Server::Lid);
     }
 
     #[tokio::test]
