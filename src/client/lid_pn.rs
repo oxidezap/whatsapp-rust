@@ -676,7 +676,10 @@ mod tests {
             .await;
         assert_eq!(mapped, vec![pn_jid.clone()]);
         let locks = client
-            .build_session_lock_keys(std::slice::from_ref(&pn_jid))
+            .build_session_lock_keys(
+                std::slice::from_ref(&pn_jid),
+                client.force_pn_addressing_enabled(),
+            )
             .await;
         assert_eq!(locks, vec![pn_jid.clone()]);
 

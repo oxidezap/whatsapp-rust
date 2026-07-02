@@ -1682,8 +1682,11 @@ impl Client {
             // path; WAWebDBDeviceListFanout excludes hosted devices.
             // With PN addressing forced the fanout keys stay on the namespace
             // the caller gave us (see Client::set_force_pn_addressing), which
-            // also keeps stanza_to below on PN.
-            let recipient_bare = if self.force_pn_addressing_enabled() {
+            // also keeps stanza_to below on PN. Status reactions share this
+            // fanout but must keep LID addressing (WA Web's toUserLid), so
+            // the flag is scoped to actual DMs.
+            let force_pn_for_dm = self.force_pn_addressing_enabled() && !is_status_addon;
+            let recipient_bare = if force_pn_for_dm {
                 to.to_non_ad()
             } else {
                 self.resolve_encryption_jid(&to).await.into_non_ad()
@@ -1791,7 +1794,9 @@ impl Client {
                 debug!(target: "Client/TcToken", "Scheduled tc token issuance after send for {}", to.observe());
             }
 
-            let lock_jids = self.build_session_lock_keys(&all_dm_jids).await;
+            let lock_jids = self
+                .build_session_lock_keys(&all_dm_jids, force_pn_for_dm)
+                .await;
             let _session_mutexes = self.session_mutexes_for(&lock_jids).await;
             let mut _session_guards = Vec::with_capacity(_session_mutexes.len());
             for mutex in &_session_mutexes {
@@ -1978,12 +1983,17 @@ impl Client {
     /// INVARIANT: Keys are sorted to prevent deadlocks when acquiring multiple
     /// session locks (e.g. DM sends that encrypt for recipient + own devices).
     /// Resolve encryption JIDs and sort for deadlock-free lock acquisition.
-    pub(crate) async fn build_session_lock_keys(&self, device_jids: &[Jid]) -> Vec<Jid> {
+    pub(crate) async fn build_session_lock_keys(
+        &self,
+        device_jids: &[Jid],
+        force_pn_addressing: bool,
+    ) -> Vec<Jid> {
         let mut keys: Vec<Jid> = Vec::with_capacity(device_jids.len());
         for jid in device_jids {
             // Locks must key the same namespace encryption will use; with PN
-            // addressing forced that is the JID as given.
-            if self.force_pn_addressing_enabled() {
+            // addressing forced that is the JID as given. Callers pass their
+            // scoped decision (e.g. DMs exclude status reactions).
+            if force_pn_addressing {
                 keys.push(jid.clone());
             } else {
                 keys.push(self.resolve_encryption_jid(jid).await);
@@ -3554,7 +3564,7 @@ mod tests {
             .collect();
 
             // Uses the production helper (resolve_encryption_jid + sort + dedup)
-            let send_lock_keys = client.build_session_lock_keys(&devices).await;
+            let send_lock_keys = client.build_session_lock_keys(&devices, false).await;
 
             assert_eq!(send_lock_keys.len(), 3);
             // Sorted by (server, user, device_numeric): 0, 5, 33
@@ -3678,7 +3688,7 @@ mod tests {
                 .to_non_ad();
 
             let all_dm_jids = vec![recipient_bare.clone(), own_device_5.clone()];
-            let lock_jids = client.build_session_lock_keys(&all_dm_jids).await;
+            let lock_jids = client.build_session_lock_keys(&all_dm_jids, false).await;
 
             // Recipient lock key must be BARE (device 0), matching decrypt path
             assert_eq!(

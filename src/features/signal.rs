@@ -298,7 +298,10 @@ impl<'a> Signal<'a> {
         self.client.ensure_e2e_sessions(&device_jids).await?;
 
         // Acquire per-device session locks before encrypting (matches DM send path)
-        let lock_jids = self.client.build_session_lock_keys(&device_jids).await;
+        let lock_jids = self
+            .client
+            .build_session_lock_keys(&device_jids, self.client.force_pn_addressing_enabled())
+            .await;
         let session_mutexes = self.client.session_mutexes_for(&lock_jids).await;
         let mut _session_guards = Vec::with_capacity(session_mutexes.len());
         for mutex in &session_mutexes {

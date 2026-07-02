@@ -308,7 +308,10 @@ impl<'a> OutgoingCall<'a> {
             // would_emit_pkmsg does a load_session + store_session round-trip (a redundant write-back
             // in the shared pre-flight); hold the per-device session locks place_call's encrypt also
             // takes, so it can't clobber a concurrent send advancing the same session.
-            let lock_jids = self.client.build_session_lock_keys(&devices).await;
+            let lock_jids = self
+                .client
+                .build_session_lock_keys(&devices, self.client.force_pn_addressing_enabled())
+                .await;
             let session_mutexes = self.client.session_mutexes_for(&lock_jids).await;
             let mut session_guards = Vec::with_capacity(session_mutexes.len());
             for mutex in &session_mutexes {
@@ -448,7 +451,9 @@ async fn place_call(
     // Take the per-device session locks once (the send path's batch model) instead of a per-device
     // lock; concurrent ratchet mutations would corrupt session state.
     let raw = {
-        let lock_jids = client.build_session_lock_keys(devices).await;
+        let lock_jids = client
+            .build_session_lock_keys(devices, client.force_pn_addressing_enabled())
+            .await;
         let session_mutexes = client.session_mutexes_for(&lock_jids).await;
         let mut _session_guards = Vec::with_capacity(session_mutexes.len());
         for mutex in &session_mutexes {

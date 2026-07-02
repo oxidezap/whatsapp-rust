@@ -48,6 +48,11 @@ impl Client {
     /// mapping is known. Some companion registrations get LID-addressed DMs
     /// 400-nacked by the server (issue #941); this restores pre-0.6 PN
     /// addressing for the outbound path only.
+    ///
+    /// Intended as deployment configuration: set once before `connect()`.
+    /// Flipping it while sends are in flight is not synchronized — the
+    /// addressing decisions inside an in-flight send may observe different
+    /// values (the fanout/lock pair is snapshotted together, the rest is not).
     pub fn set_force_pn_addressing(&self, enabled: bool) {
         self.force_pn_addressing.store(enabled, Ordering::Relaxed);
     }
