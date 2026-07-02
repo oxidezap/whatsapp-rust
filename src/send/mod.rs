@@ -508,14 +508,12 @@ impl Client {
         to: impl Into<Jid>,
         message: wa::Message,
     ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
-        // Box in a sync prologue: wa::Message is ~1 KB by value, and a plain
-        // async fn would hold that copy in every caller's future (event
-        // handlers embed several). The returned future captures only the Box.
+        // Sync-prologue box: a plain async fn would hold the ~1 KB message
+        // by value in every embedder's frame.
         let to = to.into();
         let message = Box::new(message);
         async move {
-            // The inner future itself is ~1 KB of pre-encrypt locals; pin it
-            // to the heap on first poll so this wrapper stays pointer-sized.
+            // Box::pin: the inner future carries ~1 KB of pre-encrypt locals.
             Box::pin(self.send_message_with_options_inner(to, message, SendOptions::default()))
                 .await
         }
@@ -566,8 +564,7 @@ impl Client {
     ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         // Thin generic shim: the large async body below stays monomorphic so
         // each `Into<Jid>` instantiation does not duplicate the state machine.
-        // Sync prologue boxes the ~1 KB message so the returned future stays
-        // small (see send_message).
+        // Sync-prologue box + Box::pin as in send_message.
         let to = to.into();
         let message = Box::new(message);
         async move { Box::pin(self.send_message_with_options_inner(to, message, options)).await }
@@ -4686,10 +4683,8 @@ mod jid_into_convention {
 #[cfg(test)]
 mod future_size_tests {
     /// The public send futures embed in every event-handler and spawned-task
-    /// frame, so their size is a per-event heap cost (the dispatch path boxes
-    /// the handler future). Before the sync-prologue + Box::pin split they
-    /// carried the ~1 KB wa::Message by value through three nested frames
-    /// (3.8 KB each). Keep them pointer-scale.
+    /// frame, so their size is a per-event heap cost. Keep them pointer-scale
+    /// (measured 64-128 B; the bound leaves slack only for layout drift).
     #[tokio::test]
     async fn send_futures_stay_small() {
         let client = crate::test_utils::create_test_client().await;
@@ -4697,14 +4692,20 @@ mod future_size_tests {
         let msg = waproto::whatsapp::Message::default();
 
         let f = client.send_message(jid.clone(), msg.clone());
-        assert!(std::mem::size_of_val(&f) <= 256, "send_message future grew");
+        assert!(std::mem::size_of_val(&f) <= 192, "send_message future grew");
         drop(f);
         let f = client.send_text(jid.clone(), "x");
-        assert!(std::mem::size_of_val(&f) <= 256, "send_text future grew");
+        assert!(std::mem::size_of_val(&f) <= 192, "send_text future grew");
+        drop(f);
+        let f = client.forward_message(jid.clone(), &msg);
+        assert!(
+            std::mem::size_of_val(&f) <= 192,
+            "forward_message future grew"
+        );
         drop(f);
         let f = client.send_message_with_options(jid, msg, Default::default());
         assert!(
-            std::mem::size_of_val(&f) <= 256,
+            std::mem::size_of_val(&f) <= 192,
             "send_message_with_options future grew"
         );
         drop(f);
