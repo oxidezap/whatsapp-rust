@@ -140,9 +140,9 @@ impl<'a> Decoder<'a> {
     fn read_ad_jid(&mut self) -> Result<JidRef<'a>> {
         let agent = self.read_u8()?;
         let device = self.read_u8()? as u16;
-        let user: NodeStr<'a> = self
-            .read_value_as_string()?
-            .ok_or(BinaryError::InvalidNode)?;
+        let Some(user) = self.read_value_as_string()? else {
+            return Err(BinaryError::InvalidNode);
+        };
 
         // Domain type mapping must mirror WA Web decodeJidU.
         // WA Web: 0=WHATSAPP, 1=LID, even+bit7=HOSTED, 129=HOSTED_LID, else throw.
@@ -169,9 +169,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_interop_jid(&mut self) -> Result<JidRef<'a>> {
-        let user = self
-            .read_value_as_string()?
-            .ok_or(BinaryError::InvalidNode)?;
+        let Some(user) = self.read_value_as_string()? else {
+            return Err(BinaryError::InvalidNode);
+        };
         let device = self.read_u16_be()?;
         let integrator = self.read_u16_be()?;
         let server_str = self.read_value_as_string()?.unwrap_or_default();
@@ -188,9 +188,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_fb_jid(&mut self) -> Result<JidRef<'a>> {
-        let user = self
-            .read_value_as_string()?
-            .ok_or(BinaryError::InvalidNode)?;
+        let Some(user) = self.read_value_as_string()? else {
+            return Err(BinaryError::InvalidNode);
+        };
         let device = self.read_u16_be()?;
         let server_str = self.read_value_as_string()?.unwrap_or_default();
         if server_str.as_ref() != crate::jid::MESSENGER_SERVER {
@@ -243,13 +243,15 @@ impl<'a> Decoder<'a> {
             }
             tag @ token::DICTIONARY_0..=token::DICTIONARY_3 => {
                 let index = self.read_u8()?;
-                token::get_double_token(tag - token::DICTIONARY_0, index)
-                    .map(|s| Some(NodeStr::Borrowed(s)))
-                    .ok_or(BinaryError::InvalidToken(tag))
+                match token::get_double_token(tag - token::DICTIONARY_0, index) {
+                    Some(s) => Ok(Some(NodeStr::Borrowed(s))),
+                    None => Err(BinaryError::InvalidToken(tag)),
+                }
             }
-            _ => token::get_single_token(tag)
-                .map(|s| Some(NodeStr::Borrowed(s)))
-                .ok_or(BinaryError::InvalidToken(tag)),
+            _ => match token::get_single_token(tag) {
+                Some(s) => Ok(Some(NodeStr::Borrowed(s))),
+                None => Err(BinaryError::InvalidToken(tag)),
+            },
         }
     }
 
@@ -278,13 +280,15 @@ impl<'a> Decoder<'a> {
                 .map(|s| Some(ValueRef::String(NodeStr::Owned(s)))),
             tag @ token::DICTIONARY_0..=token::DICTIONARY_3 => {
                 let index = self.read_u8()?;
-                token::get_double_token(tag - token::DICTIONARY_0, index)
-                    .map(|s| Some(ValueRef::String(NodeStr::Borrowed(s))))
-                    .ok_or(BinaryError::InvalidToken(tag))
+                match token::get_double_token(tag - token::DICTIONARY_0, index) {
+                    Some(s) => Ok(Some(ValueRef::String(NodeStr::Borrowed(s)))),
+                    None => Err(BinaryError::InvalidToken(tag)),
+                }
             }
-            _ => token::get_single_token(tag)
-                .map(|s| Some(ValueRef::String(NodeStr::Borrowed(s))))
-                .ok_or(BinaryError::InvalidToken(tag)),
+            _ => match token::get_single_token(tag) {
+                Some(s) => Ok(Some(ValueRef::String(NodeStr::Borrowed(s)))),
+                None => Err(BinaryError::InvalidToken(tag)),
+            },
         }
     }
 
@@ -439,9 +443,9 @@ impl<'a> Decoder<'a> {
         }
         let mut v = Vec::with_capacity(size);
         for _ in 0..size {
-            let key = self
-                .read_value_as_string()?
-                .ok_or(BinaryError::NonStringKey)?;
+            let Some(key) = self.read_value_as_string()? else {
+                return Err(BinaryError::NonStringKey);
+            };
             let value = self
                 .read_value()?
                 .unwrap_or(ValueRef::String(NodeStr::Borrowed("")));
@@ -503,9 +507,9 @@ impl<'a> Decoder<'a> {
             return Err(BinaryError::InvalidNode);
         }
 
-        let tag = self
-            .read_value_as_string()?
-            .ok_or(BinaryError::InvalidNode)?;
+        let Some(tag) = self.read_value_as_string()? else {
+            return Err(BinaryError::InvalidNode);
+        };
 
         let attr_count = (list_size - 1) / 2;
         let has_content = list_size.is_multiple_of(2);
