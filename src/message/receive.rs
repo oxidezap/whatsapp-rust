@@ -373,15 +373,12 @@ impl Client {
             );
         }
 
-        // Acquire global processing permit (1 during offline sync, N after).
-        // Read generation + clone Arc under the same mutex so the pair is consistent.
-        //
-        // When the semaphore transitions from 1→N (offline→online), tasks waiting on
-        // the old 1-permit semaphore must re-acquire from the new N-permit semaphore.
-        // Without this re-acquire loop, those tasks would be silently dropped, which
-        // can lose pkmsg messages carrying SKDM (sender key distribution). If the
-        // SKDM is lost, ALL subsequent skmsg messages from that sender will fail
-        // with "No sender key state".
+        // Acquire the global processing permit (1 during offline sync, N after).
+        // The helper re-acquires across a 1→N semaphore swap (offline→online):
+        // without that, a task waiting on the old 1-permit semaphore would be
+        // silently dropped, losing pkmsg messages carrying SKDM (sender key
+        // distribution) — and a lost SKDM fails ALL subsequent skmsg from that
+        // sender with "No sender key state".
         let _global_permit = self.acquire_message_processing_permit().await;
         if self
             .connection_generation
