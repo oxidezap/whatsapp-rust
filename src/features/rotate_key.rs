@@ -178,16 +178,32 @@ impl Client {
         {
             Ok(()) => {}
             Err(IqError::ServerError { code, text, .. }) => {
+                // A 4xx (WA Web 406 = bad key, 409 = validation fail) is a
+                // deterministic rejection of THIS key: the server did not accept
+                // it, so reusing the staged candidate would wedge rotation
+                // forever. Drop it so the next attempt mints a fresh one. A 5xx
+                // is transient — keep the staged key and reuse it later.
+                let discard = code < 500;
+                if discard && let Err(e) = backend.remove_signed_prekey(new_id).await {
+                    log::warn!("failed to drop rejected staged signed pre-key {new_id}: {e}");
+                }
                 log::warn!(
                     "signed pre-key rotation upload rejected (code={code}, text='{text}'); \
-                     keeping the current key, will retry on a later connect"
+                     {}, will retry on a later connect",
+                    if discard {
+                        "discarded the rejected key"
+                    } else {
+                        "keeping the staged key"
+                    }
                 );
                 return Ok(());
             }
             Err(e) => {
+                // Ambiguous transport failure: the server may have accepted the
+                // key, so keep the staged candidate and reuse it on retry.
                 log::warn!(
                     "signed pre-key rotation upload failed: {e:?}; \
-                     keeping the current key, will retry on a later connect"
+                     keeping the staged key, will retry on a later connect"
                 );
                 return Ok(());
             }
