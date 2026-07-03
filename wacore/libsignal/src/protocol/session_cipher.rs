@@ -60,6 +60,17 @@ fn encryption_buffer_capacity() -> usize {
     ENCRYPTION_BUFFER.with(|b| b.borrow().buffer.capacity())
 }
 use crate::protocol::consts::MAX_FORWARD_JUMPS;
+
+/// Max chain steps a single decrypt may derive before rejecting a
+/// too-far-ahead counter. Peer sessions match WA Web's `signalFutureMessagesMax`
+/// (2000); a session with our own devices gets the wider self ceiling.
+const fn forward_jump_limit(is_self: bool) -> usize {
+    if is_self {
+        crate::protocol::consts::MAX_FORWARD_JUMPS_SELF
+    } else {
+        MAX_FORWARD_JUMPS
+    }
+}
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, UsePQRatchet};
 use crate::protocol::state::PreKeyId;
@@ -1057,20 +1068,17 @@ fn get_or_create_message_key(
 
     let jump = (counter - chain_index) as usize;
 
-    if jump > MAX_FORWARD_JUMPS {
-        if state.session_with_self()? {
-            log::info!(
-                "{remote_address} Jumping ahead {jump} messages (index: {chain_index}, counter: {counter})"
-            );
-        } else {
-            log::error!(
-                "{remote_address} Exceeded future message limit: {MAX_FORWARD_JUMPS}, index: {chain_index}, counter: {counter})"
-            );
-            return Err(SignalProtocolError::InvalidMessage(
-                original_message_type,
-                "message from too far into the future",
-            ));
-        }
+    // Trusted self-sessions get a wider (but no longer unbounded) ceiling; peer
+    // sessions match WA Web's `signalFutureMessagesMax`.
+    let limit = forward_jump_limit(state.session_with_self()?);
+    if jump > limit {
+        log::error!(
+            "{remote_address} Exceeded future message limit: {limit}, index: {chain_index}, counter: {counter})"
+        );
+        return Err(SignalProtocolError::InvalidMessage(
+            original_message_type,
+            "message from too far into the future",
+        ));
     }
 
     let mut chain_key = *chain_key;
@@ -1092,6 +1100,23 @@ mod tests {
     use crate::protocol::*;
     use async_trait::async_trait;
     use std::collections::HashMap;
+
+    #[test]
+    fn forward_jump_limit_matches_wa_web_signal_future_messages_max() {
+        // Peer sessions cap at WA Web's `signalFutureMessagesMax` (2000); the
+        // self ceiling stays wider but bounded (previously unbounded).
+        assert_eq!(forward_jump_limit(false), 2_000);
+        assert_eq!(
+            forward_jump_limit(false),
+            crate::protocol::consts::MAX_FORWARD_JUMPS
+        );
+        assert_eq!(forward_jump_limit(true), 25_000);
+        assert_eq!(
+            forward_jump_limit(true),
+            crate::protocol::consts::MAX_FORWARD_JUMPS_SELF
+        );
+        assert!(forward_jump_limit(true) > forward_jump_limit(false));
+    }
 
     // -- In-memory stores for test isolation --
 

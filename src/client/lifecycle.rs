@@ -7,6 +7,10 @@ use super::*;
 const GROUP_DEVICES_MEMO_CAPACITY: u64 = 64;
 
 impl Client {
+    /// WA Web `resetDelay: 30000` — only after a connection has stayed up this
+    /// long is the reconnect backoff counter reset to its base.
+    pub(crate) const STABLE_CONNECTION_RESET_MS: i64 = 30_000;
+
     pub fn shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
         self.shutdown_notifier.subscribe()
     }
@@ -202,6 +206,8 @@ impl Client {
 
             enable_auto_reconnect: Arc::new(AtomicBool::new(true)),
             auto_reconnect_errors: Arc::new(AtomicU32::new(0)),
+            connected_at_ms: Arc::new(portable_atomic::AtomicI64::new(0)),
+            backoff_reset_suppressed: Arc::new(AtomicBool::new(false)),
 
             needs_initial_full_sync: Arc::new(AtomicBool::new(false)),
 
@@ -392,8 +398,20 @@ impl Client {
             // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 self.auto_reconnect_errors.store(0, Ordering::Relaxed);
+                // Consume the auth timestamp so a later failed connect can't
+                // read this cycle's stale value as a "stable" connection.
+                self.connected_at_ms.store(0, Ordering::Relaxed);
                 info!("Expected disconnect (e.g., 515), reconnecting immediately...");
                 continue;
+            }
+
+            // Reset the backoff only after a stable connection, unless an
+            // explicit penalty (429 / manual reconnect) must survive — WA Web
+            // `resetDelay` + `cancelReset`.
+            let connected_at = self.connected_at_ms.swap(0, Ordering::Relaxed);
+            let penalty = self.backoff_reset_suppressed.load(Ordering::Relaxed);
+            if should_reset_backoff(connected_at, wacore::time::now_millis(), penalty) {
+                self.auto_reconnect_errors.store(0, Ordering::Relaxed);
             }
 
             let error_count = self.auto_reconnect_errors.fetch_add(1, Ordering::SeqCst);
@@ -670,6 +688,8 @@ impl Client {
         self.intentional_reconnect.store(true, Ordering::Relaxed);
         self.auto_reconnect_errors
             .store(Self::RECONNECT_BACKOFF_STEP, Ordering::Relaxed);
+        // Deliberate step: the stability reset must not erase it.
+        self.backoff_reset_suppressed.store(true, Ordering::Relaxed);
 
         // Same durable-before-receipts gate as disconnect().
         if self

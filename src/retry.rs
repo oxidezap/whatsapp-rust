@@ -1111,21 +1111,25 @@ impl Client {
             .build();
 
         let keys_node = if wacore::protocol::retry::should_include_keys(retry_count, reason) {
-            // WA Web's getOrGenSinglePreKey = getOrGenPreKeys(1): the retry
-            // prekey is the first unuploaded window key (reused when one is
-            // left over, freshly generated and stored otherwise) and the next
-            // batch upload re-offers it to the server pool. Hold
-            // prekey_upload_lock to serialize the watermark math with uploads.
-            let prekey_guard = self.prekey_upload_lock.lock().await;
-            let (new_prekey_id, new_prekey_public) = self.get_or_gen_single_pre_key().await?;
-            drop(prekey_guard);
-            let device_snapshot = self.persistence_manager.get_device_snapshot();
-
+            // Validate the account BEFORE reserving/marking the prekey: a missing
+            // account bails here, and marking after would abandon a one-time
+            // prekey from the upload window without any receipt going out.
             let device_identity_bytes = device_snapshot
                 .account
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Missing device account info for retry receipt"))?
                 .encode_to_vec();
+
+            // markKeyAsUploaded: the retry prekey goes directly to the peer, so
+            // it must not also be re-offered to the server pool (a third party
+            // could consume the same one-time id and fail to decrypt). Hold
+            // prekey_upload_lock so get-or-gen and the mark are one atomic step
+            // against the batch upload path.
+            let prekey_guard = self.prekey_upload_lock.lock().await;
+            let (new_prekey_id, new_prekey_public) = self.get_or_gen_single_pre_key().await?;
+            self.mark_single_prekey_uploaded(&prekey_guard, new_prekey_id)
+                .await?;
+            drop(prekey_guard);
 
             Some(wacore::protocol::retry::build_retry_keys_node(
                 &device_snapshot.identity_key.public_key,

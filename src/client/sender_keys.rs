@@ -113,6 +113,23 @@ impl Client {
             return;
         }
 
+        self.force_rotate_own_sender_key(group_jid).await;
+    }
+
+    /// Unconditional forward-secrecy rotation: delete the bot's own sender key
+    /// for the group and wipe `sender_key_devices` so the next send takes the
+    /// `force_skdm=true` path and regenerates + redistributes a fresh key.
+    /// Used by the removal audit and by the `<modify>` (number/LID migration)
+    /// path, which WA Web (`modifyParticipantInfo`) rotates unconditionally.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.session.force_rotate_sender_key",
+            level = "debug",
+            skip_all
+        )
+    )]
+    pub(crate) async fn force_rotate_own_sender_key(&self, group_jid: &str) {
         use wacore::libsignal::store::sender_key_name::SenderKeyName;
         use wacore::types::jid::JidExt;
         let snapshot = self.persistence_manager.get_device_snapshot();
@@ -123,7 +140,7 @@ impl Client {
                 .delete_sender_key(sk_name.cache_key())
                 .await;
         }
-        self.flush_signal_cache_batch_safe_logged("rotate_sender_key_on_participant_remove", None)
+        self.flush_signal_cache_batch_safe_logged("force_rotate_own_sender_key", None)
             .await;
 
         if let Err(e) = self
@@ -131,7 +148,7 @@ impl Client {
             .clear_sender_key_devices(group_jid)
             .await
         {
-            log::warn!("rotate_sender_key_on_participant_remove: clear DB failed: {e}");
+            log::warn!("force_rotate_own_sender_key: clear DB failed: {e}");
         }
         self.sender_key_device_cache.invalidate(group_jid).await;
     }

@@ -201,6 +201,37 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                     )
                     .await;
             }
+            GroupNotificationAction::Modify { .. } => {
+                // A participant changed number / migrated PN<->LID. WA Web
+                // (`modifyParticipantInfo`) deletes the old user's sender-key
+                // entry, adds the new device, and sets `rotateKey`
+                // unconditionally. We can't granularly patch (the action
+                // carries only the new participants, not the old JID), so drop
+                // the now-stale metadata blob and force-rotate our own sender
+                // key so the next send regenerates and redistributes — matching
+                // WA Web's forward-secrecy rotation and clearing the stale
+                // has_key tracking for the departed number.
+                debug!(
+                    target: "Client/Group",
+                    "Group modify (number/LID migration) for {}: invalidating metadata and rotating sender key",
+                    notification.group_jid.observe()
+                );
+                client
+                    .invalidate_persisted_group_metadata(&notification.group_jid)
+                    .await;
+                // Also drop the in-memory blob: query_info() checks group_cache
+                // before storage, so a stale Arc<GroupInfo> here would let the
+                // next send rebuild the sender key against the old participant
+                // list (missing the migrated JID, still targeting the old one).
+                client
+                    .get_group_cache()
+                    .await
+                    .invalidate(&notification.group_jid)
+                    .await;
+                client
+                    .force_rotate_own_sender_key(&notification.group_jid.to_string())
+                    .await;
+            }
             _ => {}
         }
 

@@ -46,7 +46,7 @@ use rand::{Rng, RngExt};
 use scopeguard;
 use wacore_binary::Jid;
 
-use portable_atomic::AtomicU64;
+use portable_atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -530,6 +530,13 @@ pub struct Client {
     /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
     /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
     pub(crate) auto_reconnect_errors: Arc<AtomicU32>,
+    /// Wall-clock ms of the last successful authentication (`<success>`), or 0.
+    /// Gates the WA Web `resetDelay` backoff reset (see [`should_reset_backoff`]).
+    pub(crate) connected_at_ms: Arc<AtomicI64>,
+    /// Set when an explicit backoff penalty was applied this connection (429
+    /// rate-limit, manual `reconnect()`); cleared on the next `<success>`. Keeps
+    /// the stability reset from erasing a deliberate penalty (WA Web `cancelReset`).
+    pub(crate) backoff_reset_suppressed: Arc<AtomicBool>,
 
     pub(crate) needs_initial_full_sync: Arc<AtomicBool>,
 
@@ -936,6 +943,22 @@ fn is_encrypt_identity_notification(node: &wacore_binary::NodeRef<'_>) -> bool {
             .get_attr("type")
             .is_some_and(|v| v.as_str() == "encrypt")
         && node.get_optional_child("identity").is_some()
+}
+
+/// Whether the reconnect backoff counter should snap back to its 1s base after
+/// a disconnect — WA Web's `resetDelay` (30s) semantics. `penalty_pending`
+/// mirrors WA Web's `cancelReset()`: an explicit penalty applied this cycle
+/// (429 rate-limit, or a manual `reconnect()` step) must survive, so a
+/// long-lived-then-rate-limited connection keeps its deliberate backoff instead
+/// of snapping to 1s.
+pub(crate) fn should_reset_backoff(
+    connected_at_ms: i64,
+    now_ms: i64,
+    penalty_pending: bool,
+) -> bool {
+    !penalty_pending
+        && connected_at_ms != 0
+        && now_ms.saturating_sub(connected_at_ms) >= Client::STABLE_CONNECTION_RESET_MS
 }
 
 /// Computes a reconnect delay matching WhatsApp Web's Fibonacci backoff:

@@ -779,6 +779,79 @@ mod tests {
         }
     }
 
+    /// Group `w:gp2` `<modify>` (number/LID migration): WA Web rotates the
+    /// sender key unconditionally, so our handler must force-rotate the own
+    /// group sender key (delete it) so the next send regenerates and
+    /// redistributes — and clear the stale has_key tracking for the old number.
+    #[tokio::test]
+    async fn test_group_modify_rotates_sender_key() {
+        use wacore::libsignal::store::sender_key_name::SenderKeyName;
+        use wacore::types::jid::JidExt;
+
+        let client = create_test_client().await;
+        let own_jid: Jid = "12025550101@s.whatsapp.net".parse().unwrap();
+        client
+            .persistence_manager
+            .modify_device(|d| d.pn = Some(own_jid.clone()))
+            .await;
+
+        let group = "120363000000000000@g.us";
+        // Seed has_key tracking for the migrating device so we can assert the
+        // rotation clears it (not just the cached sender key).
+        let migrated_jid: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
+        client
+            .set_sender_key_status_for_devices(
+                group,
+                std::slice::from_ref(&migrated_jid),
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let sk_name = SenderKeyName::from_parts(group, own_jid.to_protocol_address().as_str());
+        client
+            .signal_cache
+            .put_sender_key(
+                &sk_name,
+                wacore::libsignal::protocol::SenderKeyRecord::new_empty(),
+            )
+            .await;
+
+        let node = NodeBuilder::new("notification")
+            .attr("type", "w:gp2")
+            .attr("from", group)
+            .attr("id", "gp2-modify-1")
+            .attr("t", "1773519041")
+            .children([NodeBuilder::new("modify")
+                .children([NodeBuilder::new("participant")
+                    .attr("jid", "12025550102@s.whatsapp.net")
+                    .build()])
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(node)).await;
+
+        let backend = client.persistence_manager.backend();
+        let sk = client
+            .signal_cache
+            .get_sender_key(&sk_name, &*backend)
+            .await
+            .unwrap();
+        assert!(
+            sk.is_none(),
+            "group <modify> must rotate (delete) the own group sender key"
+        );
+        assert!(
+            client
+                .persistence_manager
+                .get_sender_key_devices(group)
+                .await
+                .unwrap()
+                .is_empty(),
+            "group <modify> must clear stale sender_key_devices tracking"
+        );
+    }
+
     #[tokio::test]
     async fn test_contacts_update_hash_only_ignored() {
         // WA Web sends <update hash="Quvc"/> without jid when using hash-based lookup.

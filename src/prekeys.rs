@@ -405,6 +405,46 @@ impl Client {
         Ok((id, key_pair.public_key))
     }
 
+    /// WA Web `markKeyAsUploaded`: exclude a retry-distributed one-time prekey
+    /// from the next batch upload's server offer, so the same id is never both
+    /// direct-distributed AND pooled. The `_guard` proof makes holding
+    /// `prekey_upload_lock` a compile-time requirement: the snapshot read and
+    /// the watermark write must be atomic against the batch upload path, or a
+    /// stale `next_pre_key_id` could roll the upper watermark back. Idempotent.
+    pub(crate) async fn mark_single_prekey_uploaded(
+        &self,
+        _guard: &async_lock::MutexGuard<'_, ()>,
+        id: u32,
+    ) -> Result<(), anyhow::Error> {
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        if device_snapshot.first_unupload_pre_key_id != id {
+            return Ok(());
+        }
+        let next_first = if id >= MAX_PREKEY_ID { 1 } else { id + 1 };
+        // Only when marking the terminal id itself (id == MAX) does a preceding
+        // allocation leave NEXT at MAX+1 (out of range); collapse it onto the
+        // wrapped low watermark so the next window is empty ([next_first,
+        // next_first)). Keying on NEXT alone would wrongly discard a non-terminal
+        // high-end window whose head sits just below MAX.
+        let next_pre_key_id =
+            if id >= MAX_PREKEY_ID && device_snapshot.next_pre_key_id > MAX_PREKEY_ID {
+                next_first
+            } else {
+                device_snapshot.next_pre_key_id
+            };
+        self.persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id,
+                first_unupload_pre_key_id: next_first,
+            })
+            .await;
+        self.persistence_manager
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to flush prekey watermark after mark: {e:?}"))?;
+        Ok(())
+    }
+
     /// Generate and upload the configured number of pre-keys (see
     /// [`Client::set_wanted_pre_key_count`]). Shared by `upload_pre_keys` and
     /// `upload_pre_keys_at_login` to avoid redundant server count queries.
@@ -1102,6 +1142,117 @@ mod window_tests {
         let (next, first) = snapshot(&client);
         assert_eq!(first, id3);
         assert_eq!(next, id3 + 1);
+    }
+
+    /// WA Web `markKeyAsUploaded`: a retry-distributed prekey must leave the
+    /// unuploaded window so the next batch upload does not re-offer it (which
+    /// would let a third party consume the same one-time id).
+    #[tokio::test]
+    async fn marking_retry_prekey_uploaded_excludes_it_from_reuse() {
+        let client = crate::test_utils::create_test_client_with_name("prekey_mark_uploaded").await;
+
+        let (id1, _) = client.get_or_gen_single_pre_key().await.expect("gen");
+        let (next, first) = snapshot(&client);
+        assert_eq!(first, id1);
+        assert_eq!(next, id1 + 1);
+
+        let guard = client.prekey_upload_lock.lock().await;
+        client
+            .mark_single_prekey_uploaded(&guard, id1)
+            .await
+            .expect("mark");
+        drop(guard);
+        let (next2, first2) = snapshot(&client);
+        assert_eq!(
+            first2,
+            id1 + 1,
+            "low watermark advances past the marked key"
+        );
+        assert_eq!(next2, id1 + 1, "window is now empty");
+
+        // The next retry key is a fresh id, not a reuse of the marked one.
+        let (id2, _) = client.get_or_gen_single_pre_key().await.expect("fresh");
+        assert_ne!(id2, id1, "marked key must not be reused");
+
+        // Marking with a now-stale id is a no-op (idempotent, head already moved).
+        let guard = client.prekey_upload_lock.lock().await;
+        client
+            .mark_single_prekey_uploaded(&guard, id1)
+            .await
+            .expect("noop");
+        drop(guard);
+        let (_, first3) = snapshot(&client);
+        assert_eq!(first3, id2, "stale mark leaves the current head untouched");
+    }
+
+    /// Marking a non-terminal head near the 24-bit edge must NOT collapse NEXT:
+    /// only advancing past MAX itself wraps. Here the head sits at MAX-1 while
+    /// the window still holds MAX; keying the collapse on NEXT alone would drop
+    /// the surviving terminal key.
+    #[tokio::test]
+    async fn marking_near_boundary_head_preserves_terminal_window_key() {
+        use wacore::store::commands::DeviceCommand;
+
+        let client =
+            crate::test_utils::create_test_client_with_name("prekey_mark_near_boundary").await;
+        // Window [MAX-1, MAX+1): holds ids MAX-1 and MAX. NEXT is legitimately
+        // out of range (exclusive upper bound past the terminal id).
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: super::MAX_PREKEY_ID + 1,
+                first_unupload_pre_key_id: super::MAX_PREKEY_ID - 1,
+            })
+            .await;
+
+        let guard = client.prekey_upload_lock.lock().await;
+        client
+            .mark_single_prekey_uploaded(&guard, super::MAX_PREKEY_ID - 1)
+            .await
+            .expect("mark");
+        drop(guard);
+
+        let (next, first) = snapshot(&client);
+        assert_eq!(
+            first,
+            super::MAX_PREKEY_ID,
+            "head advances onto the surviving key"
+        );
+        assert_eq!(
+            next,
+            super::MAX_PREKEY_ID + 1,
+            "NEXT untouched: terminal key MAX is still in the window"
+        );
+    }
+
+    /// Marking the terminal id itself DOES collapse: with NEXT already pinned at
+    /// MAX+1, the window must wrap to an empty low range, not a ~16M span.
+    #[tokio::test]
+    async fn marking_terminal_head_collapses_wrapped_window() {
+        use wacore::store::commands::DeviceCommand;
+
+        let client = crate::test_utils::create_test_client_with_name("prekey_mark_terminal").await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: super::MAX_PREKEY_ID + 1,
+                first_unupload_pre_key_id: super::MAX_PREKEY_ID,
+            })
+            .await;
+
+        let guard = client.prekey_upload_lock.lock().await;
+        client
+            .mark_single_prekey_uploaded(&guard, super::MAX_PREKEY_ID)
+            .await
+            .expect("mark");
+        drop(guard);
+
+        let (next, first) = snapshot(&client);
+        assert_eq!(first, 1, "head wraps to the low watermark");
+        assert_eq!(
+            next, 1,
+            "NEXT collapses onto the wrapped head: window empty"
+        );
     }
 
     /// A consumed window head must not abandon the live keys behind it: the

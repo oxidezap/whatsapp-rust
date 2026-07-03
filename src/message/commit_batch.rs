@@ -14,15 +14,15 @@ use std::sync::atomic::Ordering;
 use wacore::store::traits::{PendingInboundKey, PendingInboundRow};
 use wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
 
-/// WA Web pulls the offline backlog in server batches of 200
-/// (`DEFAULT_MAX_BATCH_SIZE`); one commit per server batch is the natural
-/// granularity.
-const MAX_BATCH_MESSAGES: usize = 200;
-/// Byte cap so a media-heavy backlog cannot hold multi-MB protos in memory;
-/// WA Web caps by count only, we are stricter.
+/// WA Web `web_message_processing_cache_size` (400) — the snapshot flush
+/// granularity, distinct from the 200-msg offline *pull* size.
+const MAX_BATCH_MESSAGES: usize = 400;
+/// Byte cap so a media-heavy backlog cannot hold multi-MB protos in memory
+/// (WA Web caps by count only; we are stricter).
 const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
-/// WA Web's offline pre-ack batcher uses `delayMs: 3000`; the message cache
-/// timeout is an AB prop of the same magnitude.
+/// Safety-net so a slow trickle still commits durably instead of waiting for
+/// the size cap or end-of-drain. Deliberately stricter than WA Web (whose cache
+/// timeout defaults to 0) because our durability hook must not lag.
 const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Default)]
@@ -766,6 +766,16 @@ impl Client {
         for item in items.iter() {
             self.ack_received_message(&item.info);
         }
+        // WA Web `createSnapshot` sends `sendAggregateOfflineReceipts` per
+        // snapshot, not once at drain end. Flush the receipts this batch's acks
+        // just buffered now that the batch is durable: bounds the buffer over a
+        // large backlog and caps redelivery on a mid-drain disconnect to a
+        // single snapshot instead of the whole backlog (a disconnect clears the
+        // buffer, so anything already flushed is not re-sent). Gated on the
+        // durable path — a non-durable batch returned above without acking.
+        if is_drain {
+            self.flush_offline_receipts();
+        }
         self.core.event_bus.dispatch(Event::Messages(MessageBatch {
             messages: items,
             origin,
@@ -909,7 +919,10 @@ mod tests {
         assert_eq!(batches.len(), 1, "one commit for the full batch");
         assert_eq!(batches[0].len(), MAX_BATCH_MESSAGES);
         assert_eq!(batches[0][0], "S0");
-        assert_eq!(batches[0][MAX_BATCH_MESSAGES - 1], "S199");
+        assert_eq!(
+            batches[0][MAX_BATCH_MESSAGES - 1],
+            format!("S{}", MAX_BATCH_MESSAGES - 1)
+        );
     }
 
     // Without a hook, the drain still batches the event dispatch.
@@ -1262,6 +1275,36 @@ mod tests {
                 .flush_inbound_commits_under_permit(false, None, None)
                 .await,
             "with the flush succeeding the empty commit reports durable"
+        );
+    }
+
+    // WA Web createSnapshot flushes aggregate offline receipts per snapshot;
+    // a durable OfflineDrain commit must drain the buffer instead of holding it
+    // until end-of-drain.
+    #[tokio::test]
+    async fn durable_drain_commit_flushes_offline_receipts_per_snapshot() {
+        let client = create_test_client_with_failing_http("batch_offline_flush").await;
+        client.inbound_commit_batch.reset(); // back into drain mode
+
+        // Batcher active → the receipt buffers instead of going 1:1.
+        let buffered = item("R1").info;
+        assert!(client.try_buffer_offline_receipt(&buffered));
+        assert_eq!(client.offline_receipt_buffer.lock().expect("buf").len(), 1);
+
+        client.commit_or_batch_inbound(item("D1")).await;
+        assert!(
+            client
+                .flush_inbound_commits_under_permit(false, None, None)
+                .await,
+            "the drain batch must commit durably"
+        );
+        assert!(
+            client
+                .offline_receipt_buffer
+                .lock()
+                .expect("buf")
+                .is_empty(),
+            "a durable drain commit flushes the buffered offline receipts per snapshot"
         );
     }
 
