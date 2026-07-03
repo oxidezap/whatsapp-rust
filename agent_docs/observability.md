@@ -78,10 +78,12 @@ runtime untouched, so there is no per-spawn or per-poll cost when unset.
   does.
 
 Scope caveats: the hook covers tasks spawned *by the client* through the
-`Runtime` trait. Work executed on the caller's own task (e.g. awaiting
-`send_message`) belongs to the caller — instrument that side yourself if you
-need it. The `voip` feature's media tasks (call driver, relay I/O) currently
-spawn directly on Tokio and are not instrumented.
+`Runtime` trait, plus the main run loop itself — `Bot::run` meters its own
+future (`Bot::spawn` reaches it via `Runtime::spawn`), so the read loop is
+covered on either launch path. Work executed on the caller's own task (e.g.
+awaiting `send_message`) belongs to the caller — instrument that side
+yourself if you need it. The `voip` feature's media tasks (call driver,
+relay I/O) currently spawn directly on Tokio and are not instrumented.
 
 ## Relation to the `metrics`/`tracing` features
 

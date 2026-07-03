@@ -353,12 +353,32 @@ impl std::future::Future for BotHandle {
     }
 }
 
+/// Meter `fut` with `instrument` when set. `Bot::run` polls the client's main
+/// run loop (connect, handshake, read loop) on the caller's task, so the
+/// instrumented runtime never sees that future — without this, the most
+/// CPU-relevant work of a session would be missing from the hook on the
+/// common `bot.run().await` launch path. `Bot::spawn` needs no equivalent:
+/// it routes the same loop through `Runtime::spawn`.
+async fn run_metered<F: std::future::Future<Output = ()>>(
+    fut: F,
+    instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
+) {
+    match instrument {
+        Some(i) => wacore::stats::MeteredFuture::new(Box::pin(fut), i).await,
+        None => fut.await,
+    }
+}
+
 pub struct Bot {
     client: Arc<Client>,
     sync_task_receiver: Option<async_channel::Receiver<crate::sync_task::MajorSyncTask>>,
     event_handlers: Vec<RegisteredHandler>,
     raw_handlers: Vec<Arc<dyn EventHandler>>,
     pair_code_options: Option<PairCodeOptions>,
+    /// Kept alongside the instrumented runtime: `Bot::run` polls the main run
+    /// loop on the caller's task, so it must meter that future itself —
+    /// `Runtime::spawn` never sees it (`Bot::spawn` does go through it).
+    task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
 }
 
 impl std::fmt::Debug for Bot {
@@ -408,8 +428,9 @@ impl Bot {
         tracing::instrument(name = "wa.bot.run", level = "debug", skip_all)
     )]
     async fn run_graph(self) {
+        let instrument = self.task_instrument.clone();
         let client = self.start_background();
-        client.run().await;
+        run_metered(client.run(), instrument).await;
     }
 
     /// Start the bot on its runtime and return a [`BotHandle`] to await,
@@ -440,6 +461,7 @@ impl Bot {
             event_handlers,
             raw_handlers,
             pair_code_options,
+            task_instrument: _,
         } = self;
 
         if let Some(receiver) = sync_task_receiver {
@@ -653,8 +675,10 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// each poll (and around blocking work).
     ///
     /// Runtime-agnostic: the hook wraps whatever runtime the client uses, so
-    /// every task spawned through the `Runtime` trait is covered (`voip`
-    /// media tasks spawn directly on Tokio and are not). Pass a
+    /// every task spawned through the `Runtime` trait is covered, and
+    /// [`Bot::run`] meters the main run loop itself — the read loop reports
+    /// on either launch path (`voip` media tasks spawn directly on Tokio and
+    /// are not covered). Pass a
     /// [`CpuMeter`](wacore::stats::CpuMeter) for per-session CPU accounting
     /// (keep a clone to read snapshots), or a custom hook to scope
     /// allocator-attribution or platform samplers to this client's work.
@@ -1025,9 +1049,11 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         };
 
         // Instrument the runtime before anything spawns through it, so every
-        // internal task (read loop, noise sender, saver, workers) reports to
-        // the hook. Default (None): the original runtime is used untouched.
-        let runtime: Arc<dyn Runtime> = match self.task_instrument {
+        // internal task (noise sender, saver, workers) reports to the hook.
+        // Default (None): the original runtime is used untouched. The Bot
+        // keeps its own copy for the `run()` path (see the field doc).
+        let task_instrument = self.task_instrument;
+        let runtime: Arc<dyn Runtime> = match task_instrument.clone() {
             Some(instrument) => {
                 Arc::new(wacore::stats::InstrumentedRuntime::new(runtime, instrument))
             }
@@ -1107,6 +1133,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             event_handlers: self.event_handlers,
             raw_handlers: self.raw_handlers,
             pair_code_options: self.pair_code_options,
+            task_instrument,
         })
     }
 }
@@ -1664,5 +1691,22 @@ mod tests {
             key.participant.as_deref(),
             Some("15551112222@s.whatsapp.net")
         );
+    }
+
+    #[tokio::test]
+    async fn run_metered_reports_to_instrument() {
+        let meter = Arc::new(wacore::stats::CpuMeter::new());
+        run_metered(
+            async {
+                tokio::task::yield_now().await;
+            },
+            Some(meter.clone()),
+        )
+        .await;
+        // yield_now forces Pending once, so the wrapper must see >= 2 polls.
+        assert!(meter.snapshot().polls >= 2);
+
+        // No instrument: plain passthrough must still drive to completion.
+        run_metered(async {}, None).await;
     }
 }
