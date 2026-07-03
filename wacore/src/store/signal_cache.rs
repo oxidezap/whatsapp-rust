@@ -767,21 +767,34 @@ impl SignalStoreCache {
     ) {
         use crate::stats::CollectionStats;
 
-        let sessions = {
+        // Sizing a record walks its whole protobuf tree, and these mutexes
+        // serialize the Signal encrypt/decrypt path — so only key lengths and
+        // Arc refcount bumps happen under the locks; the estimated_size walks
+        // run after each guard drops. Identities are raw bytes (len is free)
+        // and stay fully under their lock.
+        let (session_count, session_keys_len, session_recs): (u64, usize, Vec<_>) = {
             let s = self.sessions.lock().await;
-            let bytes: usize = s
+            let mut keys_len = 0usize;
+            let recs = s
                 .cache
                 .iter()
-                .map(|(k, v)| {
-                    k.len()
-                        + match v {
-                            SessionEntry::Present(rec) => rec.estimated_size(),
-                            SessionEntry::Absent | SessionEntry::CheckedOut => 0,
-                        }
+                .filter_map(|(k, v)| {
+                    keys_len += k.len();
+                    match v {
+                        SessionEntry::Present(rec) => Some(rec.clone()),
+                        SessionEntry::Absent | SessionEntry::CheckedOut => None,
+                    }
                 })
-                .sum();
-            CollectionStats::new(s.cache.len() as u64, bytes as u64)
+                .collect();
+            (s.cache.len() as u64, keys_len, recs)
         };
+        let session_bytes: usize = session_keys_len
+            + session_recs
+                .iter()
+                .map(|r| r.estimated_size())
+                .sum::<usize>();
+        let sessions = CollectionStats::new(session_count, session_bytes as u64);
+
         let identities = {
             let i = self.identities.lock().await;
             let bytes: usize = i
@@ -791,15 +804,24 @@ impl SignalStoreCache {
                 .sum();
             CollectionStats::new(i.cache.len() as u64, bytes as u64)
         };
-        let sender_keys = {
+
+        let (sk_count, sk_keys_len, sk_recs): (u64, usize, Vec<_>) = {
             let sk = self.sender_keys.lock().await;
-            let bytes: usize = sk
+            let mut keys_len = 0usize;
+            let recs = sk
                 .cache
                 .iter()
-                .map(|(k, v)| k.len() + v.as_ref().map_or(0, |r| r.estimated_size()))
-                .sum();
-            CollectionStats::new(sk.cache.len() as u64, bytes as u64)
+                .filter_map(|(k, v)| {
+                    keys_len += k.len();
+                    v.clone()
+                })
+                .collect();
+            (sk.cache.len() as u64, keys_len, recs)
         };
+        let sk_bytes: usize =
+            sk_keys_len + sk_recs.iter().map(|r| r.estimated_size()).sum::<usize>();
+        let sender_keys = CollectionStats::new(sk_count, sk_bytes as u64);
+
         (sessions, identities, sender_keys)
     }
 

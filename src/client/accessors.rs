@@ -109,55 +109,50 @@ impl Client {
 
         let (signal_sessions, signal_identities, signal_sender_keys) =
             self.signal_cache.memory_stats().await;
-        let (lid_pn_lid_entries, lid_pn_pn_entries) = self.lid_pn_cache.memory_stats();
+        let (lid_pn_lid_entries, lid_pn_pn_entries) = self.lid_pn_cache.memory_stats().await;
         let pending_retries_count = self
             .pending_retries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .len();
 
-        let group_cache = match self.group_cache.lock().await.as_ref() {
+        // Only the Arc is taken under the mutex — the walk must not block
+        // get_group_cache(), which every group send goes through.
+        let group_cache_arc = self.group_cache.lock().await.clone();
+        let group_cache = match group_cache_arc {
+            // Arc<T>'s HeapSize already includes size_of::<GroupInfo>().
             Some(cache) => {
-                // Arc<T>'s HeapSize already includes size_of::<GroupInfo>().
-                let bytes: usize = cache
-                    .iter_local()
-                    .map(|iter| iter.map(|(k, v)| k.heap_bytes() + v.heap_bytes()).sum())
-                    .unwrap_or(0);
-                CollectionStats::new(cache.entry_count(), bytes as u64)
+                cache
+                    .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
+                    .await
             }
             None => CollectionStats::default(),
         };
 
-        let recent_messages = {
-            let bytes: usize = self
-                .recent_messages
-                .iter()
-                .map(|(k, v)| k.chat.heap_bytes() + k.id.len() + v.capacity())
-                .sum();
-            CollectionStats::new(self.recent_messages.entry_count(), bytes as u64)
-        };
+        let recent_messages = self
+            .recent_messages
+            .memory_stats(|k, v| k.chat.heap_bytes() + k.id.heap_bytes() + v.heap_bytes())
+            .await;
 
-        let group_devices_memo = {
-            let bytes: usize = self
-                .group_devices_memo
-                .iter()
-                .map(|(k, v)| {
-                    k.heap_bytes()
-                        + v.members.iter().map(|m| m.heap_bytes()).sum::<usize>()
-                        + v.members.capacity() * std::mem::size_of::<wacore_binary::CompactString>()
-                        + v.devices.heap_bytes()
-                })
-                .sum();
-            CollectionStats::new(self.group_devices_memo.entry_count(), bytes as u64)
-        };
+        let group_devices_memo = self
+            .group_devices_memo
+            .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
+            .await;
+
+        // Each count read into a local so no two guards are ever held at once.
+        let response_waiters = self.response_waiters.lock().await.len();
+        let presence_subscriptions = self.presence_subscriptions.lock().await.len();
+        let app_state_key_requests = self.app_state_key_requests.lock().await.len();
+        let app_state_syncing = self.app_state_syncing.lock().await.len();
+        let chatstate_handlers = self.chatstate_handlers.read().await.len();
 
         MemoryReport {
             group_cache,
-            device_registry_cache: self.device_registry_cache.memory_stats(),
+            device_registry_cache: self.device_registry_cache.memory_stats().await,
             lid_pn_lid_entries,
             lid_pn_pn_entries,
             recent_messages,
-            sender_key_device_cache: self.sender_key_device_cache.memory_stats(),
+            sender_key_device_cache: self.sender_key_device_cache.memory_stats().await,
             group_devices_memo,
             message_retry_counts: self.message_retry_counts.entry_count(),
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
@@ -166,16 +161,16 @@ impl Client {
             session_locks: self.session_locks.entry_count(),
             chat_lanes: self.chat_lanes.entry_count(),
             resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
-            response_waiters: self.response_waiters.lock().await.len(),
+            response_waiters,
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,
-            presence_subscriptions: self.presence_subscriptions.lock().await.len(),
-            app_state_key_requests: self.app_state_key_requests.lock().await.len(),
-            app_state_syncing: self.app_state_syncing.lock().await.len(),
+            presence_subscriptions,
+            app_state_key_requests,
+            app_state_syncing,
             signal_sessions,
             signal_identities,
             signal_sender_keys,
-            chatstate_handlers: self.chatstate_handlers.read().await.len(),
+            chatstate_handlers,
             custom_enc_handlers: self.custom_enc_handlers.get().map_or(0, |m| m.len()),
         }
     }

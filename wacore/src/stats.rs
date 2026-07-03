@@ -11,8 +11,8 @@
 //!   on a path that already does AEAD crypto plus a transport write.
 //! - [`HeapSize`] / memory reports only run when called; unused report code
 //!   is dropped by fat LTO.
-//! - [`TaskInstrument`] costs one `Option` check per *spawn* when unset. Only
-//!   an installed instrument pays the per-poll hook.
+//! - [`TaskInstrument`] is resolved once at client build: unset leaves the
+//!   runtime untouched. Only an installed instrument pays the per-poll hook.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -95,18 +95,27 @@ impl SessionStats {
     }
 
     /// One transport data event carrying `frames` decodable frames.
+    ///
+    /// Refreshes the receive timestamp only for multi-frame batches: the
+    /// arrival stamp ([`Self::mark_recv_activity`]) is still fresh in the
+    /// single-frame steady state, and the completion re-stamp exists to keep
+    /// the dead-socket watchdog quiet while a long batch (offline sync)
+    /// drains — not to pay a second clock read per frame.
     #[inline]
     pub fn record_recv_batch(&self, wire_bytes: usize, frames: u32) {
         self.bytes_received
             .fetch_add(wire_bytes as u64, Ordering::Relaxed);
         self.frames_received
             .fetch_add(frames as u64, Ordering::Relaxed);
-        self.last_data_received_ms
-            .store(Self::now_ms(), Ordering::Relaxed);
+        if frames > 1 {
+            self.last_data_received_ms
+                .store(Self::now_ms(), Ordering::Relaxed);
+        }
     }
 
-    /// Refresh the receive-activity timestamp without counting traffic
-    /// (batch completion, so keepalive sees drain time, not arrival time).
+    /// Stamp receive activity at data arrival, without counting traffic
+    /// (WA Web: deadSocketTimer reset). Batch completion is re-stamped by
+    /// [`Self::record_recv_batch`].
     #[inline]
     pub fn mark_recv_activity(&self) {
         self.last_data_received_ms
@@ -319,24 +328,27 @@ impl CpuMeter {
 }
 
 std::thread_local! {
-    /// Poll start of the innermost metered poll on this thread. Executors do
-    /// not nest polls of separately spawned tasks; if a caller ever does, the
-    /// inner poll wins and the outer one records nothing (never double).
-    static POLL_START: core::cell::Cell<Option<crate::time::Instant>> =
-        const { core::cell::Cell::new(None) };
+    /// Start times of the metered polls active on this thread, innermost
+    /// last. A stack, not a single slot: metered scopes can nest (an executor
+    /// may poll a freshly spawned task inline from within an already-metered
+    /// poll, and several meters can share one thread), and each scope must
+    /// keep its own start. Poll scopes strictly nest, so LIFO holds; a nested
+    /// scope's time is also part of its enclosing scope's elapsed.
+    static POLL_START: core::cell::RefCell<Vec<crate::time::Instant>> =
+        const { core::cell::RefCell::new(Vec::new()) };
 }
 
 impl TaskInstrument for CpuMeter {
     fn on_poll_start(&self) {
-        POLL_START.with(|s| s.set(Some(crate::time::Instant::now())));
+        POLL_START.with(|s| s.borrow_mut().push(crate::time::Instant::now()));
     }
 
     fn on_poll_end(&self) {
-        if let Some(start) = POLL_START.with(|s| s.take()) {
+        if let Some(start) = POLL_START.with(|s| s.borrow_mut().pop()) {
             self.busy_nanos
                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.polls.fetch_add(1, Ordering::Relaxed);
         }
-        self.polls.fetch_add(1, Ordering::Relaxed);
     }
 }
 

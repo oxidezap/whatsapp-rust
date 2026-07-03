@@ -111,11 +111,9 @@ impl SenderKeyDeviceCache {
     }
 
     /// Approximate entry count plus estimated retained bytes.
-    pub(crate) fn memory_stats(&self) -> wacore::stats::CollectionStats {
-        let bytes: usize = self
-            .inner
-            .iter()
-            .map(|(k, v)| {
+    pub(crate) async fn memory_stats(&self) -> wacore::stats::CollectionStats {
+        self.inner
+            .memory_stats(|k, v| {
                 k.capacity()
                     + v.devices
                         .iter()
@@ -126,7 +124,6 @@ impl SenderKeyDeviceCache {
                         })
                         .sum::<usize>()
             })
-            .sum();
-        wacore::stats::CollectionStats::new(self.inner.entry_count(), bytes as u64)
+            .await
     }
 }

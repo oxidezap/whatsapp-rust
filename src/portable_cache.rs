@@ -325,6 +325,30 @@ where
         Self::snapshot(&guard)
     }
 
+    /// Reliable awaited fold over `(&K, &V)`. Unlike the snapshot walks this
+    /// clones nothing — memory reports must not themselves allocate in
+    /// proportion to the cache — and unlike [`iter`](Self::iter) it cannot
+    /// degrade to an empty walk under write contention.
+    pub async fn fold_entries<A>(&self, init: A, mut f: impl FnMut(A, &K, &V) -> A) -> A {
+        let guard = self.inner.read().await;
+        guard
+            .map
+            .iter()
+            .fold(init, |acc, (k, e)| f(acc, k, &e.value))
+    }
+
+    /// Entry count plus estimated retained bytes, summing `per_entry` under a
+    /// single awaited read guard so the pair is mutually consistent (and never
+    /// the empty best-effort snapshot [`iter`](Self::iter) can degrade to).
+    pub async fn memory_stats(
+        &self,
+        mut per_entry: impl FnMut(&K, &V) -> usize,
+    ) -> wacore::stats::CollectionStats {
+        let guard = self.inner.read().await;
+        let bytes: usize = guard.map.iter().map(|(k, e)| per_entry(k, &e.value)).sum();
+        wacore::stats::CollectionStats::new(guard.map.len() as u64, bytes as u64)
+    }
+
     /// Eager snapshot iterator over `(Arc<K>, V)`: snapshot, not lazy. Includes
     /// expired-but-not-yet-evicted entries (consistent with `entry_count`).
     /// Best-effort (`try_read` spin); use [`snapshot_entries`](Self::snapshot_entries)

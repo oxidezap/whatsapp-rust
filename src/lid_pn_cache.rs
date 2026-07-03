@@ -120,38 +120,32 @@ impl LidPnCache {
     /// the LID map no longer holds (transient eviction asymmetry), keeping
     /// every entry counted exactly once. `Arc<T>`'s `HeapSize` already
     /// includes `size_of::<LidPnEntry>()`.
-    pub fn memory_stats(
+    pub async fn memory_stats(
         &self,
     ) -> (
         wacore::stats::CollectionStats,
         wacore::stats::CollectionStats,
     ) {
-        use wacore::stats::{CollectionStats, HeapSize};
+        use wacore::stats::HeapSize;
         let mut lid_ptrs = std::collections::HashSet::new();
-        let lid_bytes: usize = self
+        let lid = self
             .lid_to_entry
-            .iter_local()
-            .map(|iter| {
-                iter.map(|(_, v)| {
-                    lid_ptrs.insert(Arc::as_ptr(&v));
-                    v.heap_bytes()
-                })
-                .sum()
+            .memory_stats(|_, v| {
+                lid_ptrs.insert(Arc::as_ptr(v));
+                v.heap_bytes()
             })
-            .unwrap_or(0);
-        let pn_bytes: usize = self
+            .await;
+        let pn = self
             .pn_to_entry
-            .iter_local()
-            .map(|iter| {
-                iter.filter(|(_, v)| !lid_ptrs.contains(&Arc::as_ptr(v)))
-                    .map(|(_, v)| v.heap_bytes())
-                    .sum()
+            .memory_stats(|_, v| {
+                if lid_ptrs.contains(&Arc::as_ptr(v)) {
+                    0
+                } else {
+                    v.heap_bytes()
+                }
             })
-            .unwrap_or(0);
-        (
-            CollectionStats::new(self.lid_to_entry.entry_count(), lid_bytes as u64),
-            CollectionStats::new(self.pn_to_entry.entry_count(), pn_bytes as u64),
-        )
+            .await;
+        (lid, pn)
     }
 
     /// Get the current LID for a phone number.

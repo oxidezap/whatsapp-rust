@@ -227,6 +227,20 @@ where
         }
     }
 
+    /// Entry count plus estimated retained bytes, summing `per_entry` over the
+    /// in-process backend (a reliable by-reference walk — no clones, cannot
+    /// degrade to an empty snapshot under write contention). Custom stores
+    /// report zero: their entries live outside this process.
+    pub async fn memory_stats(
+        &self,
+        per_entry: impl FnMut(&K, &V) -> usize,
+    ) -> wacore::stats::CollectionStats {
+        match &self.inner {
+            Inner::Local(cache) => cache.memory_stats(per_entry).await,
+            Inner::Custom { .. } => wacore::stats::CollectionStats::default(),
+        }
+    }
+
     /// Approximate entry count (sync). Returns `0` for custom backends.
     ///
     /// For diagnostics that need custom backend counts, use

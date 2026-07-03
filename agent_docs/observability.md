@@ -52,19 +52,22 @@ figures come from the `wacore::stats::HeapSize` trait:
 - Store-backed caches (Redis etc.) report `bytes: 0` — their entries are not
   process memory.
 
-Semantics: honest estimates for attribution and leak detection (the e2e
-`memory_soak.rs` asserts growth bounds on it), not byte-exact accounting.
-When a new cache is added to `Client`, add it to `memory_report()` and — if
-it can dominate memory — implement `HeapSize` for its value type next to that
-type's definition.
+Semantics: honest estimates for attribution and leak detection, not
+byte-exact accounting. The e2e `memory_soak.rs` logs the byte totals next to
+RSS; its growth-bound assertions are on entry counts.
+When a new cache is added to `Client`, add it to `memory_report()` (the
+`MemoryReport::collections()` list keeps the total and `Display` in sync) and
+— if it can dominate memory — implement `HeapSize` for its value type next to
+that type's definition.
 
 ### 3. `BotBuilder::with_task_instrument` — CPU / custom attribution (opt-in)
 
 `wacore::stats::TaskInstrument` is an object-safe enter/exit hook called
 around every poll of the client's internal tasks and around its blocking
 work. Wiring: `build()` wraps the runtime in `InstrumentedRuntime`, so all
-spawns are covered without touching call sites; `None` (default) keeps spawns
-unwrapped — the cost is one `Option` check per spawn, nothing per poll.
+spawns through the `Runtime` trait are covered without touching call sites.
+The `Option` is resolved once at `build()` — `None` (default) leaves the
+runtime untouched, so there is no per-spawn or per-poll cost when unset.
 
 - `CpuMeter` (built-in): busy time (direct CPU proxy) + poll count via
   `wacore::time::Instant`. Works on wasm/embedded once a monotonic provider
@@ -74,9 +77,11 @@ unwrapped — the cost is one `Option` check per spawn, nothing per poll.
   ESP-IDF `heap_caps` sampling, etc. The library never learns what the hook
   does.
 
-Scope caveat: the hook covers tasks spawned *by the client*. Work executed on
-the caller's own task (e.g. awaiting `send_message`) belongs to the caller —
-instrument that side yourself if you need it.
+Scope caveats: the hook covers tasks spawned *by the client* through the
+`Runtime` trait. Work executed on the caller's own task (e.g. awaiting
+`send_message`) belongs to the caller — instrument that side yourself if you
+need it. The `voip` feature's media tasks (call driver, relay I/O) currently
+spawn directly on Tokio and are not instrumented.
 
 ## Relation to the `metrics`/`tracing` features
 

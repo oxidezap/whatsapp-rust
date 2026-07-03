@@ -648,15 +648,17 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self.cast()
     }
 
-    /// Instrument every internal task of this client with a
+    /// Instrument the client's internal tasks with a
     /// [`TaskInstrument`](wacore::stats::TaskInstrument) hook, called around
     /// each poll (and around blocking work).
     ///
-    /// Runtime-agnostic: the hook wraps whatever runtime the client uses. Pass
-    /// a [`CpuMeter`](wacore::stats::CpuMeter) for per-session CPU accounting
+    /// Runtime-agnostic: the hook wraps whatever runtime the client uses, so
+    /// every task spawned through the `Runtime` trait is covered (`voip`
+    /// media tasks spawn directly on Tokio and are not). Pass a
+    /// [`CpuMeter`](wacore::stats::CpuMeter) for per-session CPU accounting
     /// (keep a clone to read snapshots), or a custom hook to scope
     /// allocator-attribution or platform samplers to this client's work.
-    /// Default: no hook, no per-poll overhead.
+    /// Default: no hook — the runtime is used untouched.
     pub fn with_task_instrument(
         mut self,
         instrument: Arc<dyn wacore::stats::TaskInstrument>,

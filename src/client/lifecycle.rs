@@ -309,7 +309,16 @@ impl Client {
             warn!("Client `run` method called while already running.");
             return;
         }
+        // Reconnects are counted at iteration start: every pass after the
+        // first is an attempt actually being made. Counting at the branches
+        // below would also count a final pass that never reconnects (a user
+        // disconnect() flips is_running while the branch runs).
+        let mut first_connect = true;
         while self.is_running.load(Ordering::Relaxed) {
+            if !first_connect {
+                self.stats.record_reconnect();
+            }
+            first_connect = false;
             self.expected_disconnect.store(false, Ordering::Relaxed);
 
             if let Err(connect_err) = self.connect().await {
@@ -381,12 +390,10 @@ impl Client {
             // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 self.auto_reconnect_errors.store(0, Ordering::Relaxed);
-                self.stats.record_reconnect();
                 info!("Expected disconnect (e.g., 515), reconnecting immediately...");
                 continue;
             }
 
-            self.stats.record_reconnect();
             let error_count = self.auto_reconnect_errors.fetch_add(1, Ordering::SeqCst);
             // WA Web: Fibonacci backoff with 10% jitter, max 900s.
             // algo: { type: "fibonacci", first: 1000, second: 1000 }

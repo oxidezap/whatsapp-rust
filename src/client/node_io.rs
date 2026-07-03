@@ -160,6 +160,10 @@ impl Client {
                                     // Check if we should exit after processing (e.g., after 515 stream error)
                                     if self.expected_disconnect.load(Ordering::Relaxed) {
                                         debug!("Expected disconnect signaled during frame processing. Exiting message loop.");
+                                        // The batch (this frame included — its counter
+                                        // increment is below) must not vanish from the
+                                        // wire counters on this exit path.
+                                        self.stats.record_recv_batch(wire_bytes, frames_in_batch + 1);
                                         return Ok(ReadLoopExit::Expected);
                                     }
 

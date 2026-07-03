@@ -27,6 +27,16 @@ pub(crate) struct GroupDevicesMemo {
     pub(crate) devices: Arc<wacore::send::ResolvedGroupDevices>,
 }
 
+impl wacore::stats::HeapSize for GroupDevicesMemo {
+    fn heap_bytes(&self) -> usize {
+        // The Weak keeps only the GroupInfo allocation header alive; the memo
+        // does not retain its payload.
+        self.members.iter().map(|m| m.heap_bytes()).sum::<usize>()
+            + self.members.capacity() * std::mem::size_of::<wacore_binary::CompactString>()
+            + self.devices.heap_bytes()
+    }
+}
+
 /// Result of resolving a user identifier to lookup keys.
 /// This makes the LID/PN relationship explicit instead of using magic indices.
 #[derive(Debug, Clone)]

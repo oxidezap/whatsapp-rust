@@ -226,18 +226,27 @@ pub struct MemoryReport {
 }
 
 impl MemoryReport {
+    /// Every byte-carrying collection with its display name — the single list
+    /// [`Self::total_estimated_bytes`] and `Display` derive from, so a new
+    /// collection cannot be summed but not shown (or vice versa).
+    fn collections(&self) -> [(&'static str, &CollectionStats); 10] {
+        [
+            ("group_cache:", &self.group_cache),
+            ("device_registry_cache:", &self.device_registry_cache),
+            ("lid_pn (lid):", &self.lid_pn_lid_entries),
+            ("lid_pn (pn):", &self.lid_pn_pn_entries),
+            ("recent_messages:", &self.recent_messages),
+            ("sk_device_cache:", &self.sender_key_device_cache),
+            ("group_devices_memo:", &self.group_devices_memo),
+            ("signal_sessions:", &self.signal_sessions),
+            ("signal_identities:", &self.signal_identities),
+            ("signal_sender_keys:", &self.signal_sender_keys),
+        ]
+    }
+
     /// Sum of every estimated byte figure in the report.
     pub fn total_estimated_bytes(&self) -> u64 {
-        self.group_cache.bytes
-            + self.device_registry_cache.bytes
-            + self.lid_pn_lid_entries.bytes
-            + self.lid_pn_pn_entries.bytes
-            + self.recent_messages.bytes
-            + self.sender_key_device_cache.bytes
-            + self.group_devices_memo.bytes
-            + self.signal_sessions.bytes
-            + self.signal_identities.bytes
-            + self.signal_sender_keys.bytes
+        self.collections().iter().map(|(_, c)| c.bytes).sum()
     }
 }
 
@@ -250,15 +259,12 @@ impl std::fmt::Display for MemoryReport {
         ) -> std::fmt::Result {
             writeln!(f, "  {name:<22} {:>7} entries {:>10} B", c.entries, c.bytes)
         }
+        let collections = self.collections();
         writeln!(f, "=== Memory Report ===")?;
         writeln!(f, "--- TTL-bounded caches ---")?;
-        line(f, "group_cache:", &self.group_cache)?;
-        line(f, "device_registry_cache:", &self.device_registry_cache)?;
-        line(f, "lid_pn (lid):", &self.lid_pn_lid_entries)?;
-        line(f, "lid_pn (pn):", &self.lid_pn_pn_entries)?;
-        line(f, "recent_messages:", &self.recent_messages)?;
-        line(f, "sk_device_cache:", &self.sender_key_device_cache)?;
-        line(f, "group_devices_memo:", &self.group_devices_memo)?;
+        for (name, c) in &collections[..7] {
+            line(f, name, c)?;
+        }
         writeln!(f, "  message_retry_counts:   {}", self.message_retry_counts)?;
         writeln!(
             f,
@@ -290,9 +296,9 @@ impl std::fmt::Display for MemoryReport {
             self.app_state_key_requests
         )?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
-        line(f, "signal_sessions:", &self.signal_sessions)?;
-        line(f, "signal_identities:", &self.signal_identities)?;
-        line(f, "signal_sender_keys:", &self.signal_sender_keys)?;
+        for (name, c) in &collections[7..] {
+            line(f, name, c)?;
+        }
         writeln!(f, "--- Misc ---")?;
         writeln!(f, "  chatstate_handlers:     {}", self.chatstate_handlers)?;
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;
