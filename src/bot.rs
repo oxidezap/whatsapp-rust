@@ -707,6 +707,10 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         instrument: Arc<dyn wacore::stats::TaskInstrument>,
     ) -> Self {
         self.task_instrument = Some(instrument);
+        // Clear any alloc-meter handle: only the last instrument set is driven by
+        // the poll hooks, so a stale handle would make resource_report() report a
+        // never-updated all-zero snapshot instead of `None`.
+        self.alloc_meter = None;
         self
     }
 
@@ -1232,6 +1236,45 @@ mod tests {
                 .await
                 .expect("Failed to create test SqliteStore"),
         ) as Arc<dyn Backend>
+    }
+
+    /// Regression: a `with_task_instrument` after `with_alloc_meter` must drop
+    /// the alloc-meter handle, so `resource_report()` doesn't report a
+    /// never-driven all-zero snapshot as if the meter were active.
+    #[tokio::test]
+    async fn task_instrument_after_alloc_meter_clears_stale_handle() {
+        use wacore::stats::{AllocMeter, CpuMeter};
+
+        let bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_alloc_meter(Arc::new(AllocMeter::new()))
+            .with_task_instrument(Arc::new(CpuMeter::new()))
+            .build()
+            .await
+            .expect("build");
+        assert!(
+            bot.client().resource_report().await.alloc.is_none(),
+            "a later with_task_instrument must drop the alloc-meter handle"
+        );
+
+        // Reverse order: with_alloc_meter is last, so its snapshot is present.
+        let bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_task_instrument(Arc::new(CpuMeter::new()))
+            .with_alloc_meter(Arc::new(AllocMeter::new()))
+            .build()
+            .await
+            .expect("build");
+        assert!(
+            bot.client().resource_report().await.alloc.is_some(),
+            "with_alloc_meter installs the handle when it is the last setter"
+        );
     }
 
     #[tokio::test]

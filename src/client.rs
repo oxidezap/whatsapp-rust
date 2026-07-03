@@ -358,10 +358,13 @@ impl ResourceReport {
     /// - components reporting `None` contribute 0 (absent, not zero);
     /// - `alloc` (churn, not residency) is excluded.
     pub fn total_estimated_bytes(&self) -> u64 {
-        self.client.total_estimated_bytes()
-            + self.storage.total_bytes()
-            + self.transport.map_or(0, |t| t.total_bytes())
-            + self.http.map_or(0, |h| h.total_bytes())
+        // Saturating: a caller-built or backend-supplied component could carry a
+        // large value; the total must stay conservative, never wrap.
+        self.client
+            .total_estimated_bytes()
+            .saturating_add(self.storage.total_bytes())
+            .saturating_add(self.transport.map_or(0, |t| t.total_bytes()))
+            .saturating_add(self.http.map_or(0, |h| h.total_bytes()))
     }
 }
 

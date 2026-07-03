@@ -3481,32 +3481,55 @@ impl DeviceStore for SqliteStore {
     ///
     /// SQLite's exact cache-in-use (`sqlite3_db_status(SQLITE_DBSTATUS_CACHE_USED)`)
     /// needs the raw `sqlite3*` handle, which Diesel does not expose through a
-    /// safe API. Instead we bound it with PRAGMAs: the page cache never holds
-    /// more than the database's own pages, nor more than the configured cap, so
-    /// `memory_bytes = min(cache cap, db size)` is a tight upper bound for the
-    /// target workload — a fresh per-session DB whose file is far smaller than
-    /// the 512 KiB cap. `pages` is the database page count (a size indicator).
+    /// safe API. Instead we bound it with PRAGMAs: a connection's page cache
+    /// never holds more than the database's own pages, nor more than the
+    /// configured cap, so `min(cache cap, db size)` is a tight per-connection
+    /// upper bound for the target workload (a fresh per-session DB far smaller
+    /// than the 512 KiB cap). Each pooled connection keeps its OWN cache (no
+    /// shared cache), so the figure is scaled by the number of open connections
+    /// — a no-op for the default single-connection store. `pages` is the
+    /// database page count (a size indicator, shared across connections).
+    ///
+    /// Caveat: this does not account for [`SqliteStoreConfig::mmap_size`]. With
+    /// mmap enabled, some reads bypass the heap page cache via an OS-reclaimable
+    /// file mapping, so the estimate can overstate actual process-heap residency
+    /// for that session.
     async fn resource_report(&self) -> wacore::stats::StorageResourceReport {
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
-            let mut conn = match pool.get() {
-                Ok(conn) => conn,
-                // Best-effort: a report is never load-bearing, so a pool hiccup
-                // yields "not reported" rather than an error.
-                Err(_) => return wacore::stats::StorageResourceReport::default(),
+            // Non-blocking checkout: this report is best-effort, so contention
+            // (e.g. a long write holding the only connection) degrades to "not
+            // reported" immediately instead of blocking up to r2d2's connection
+            // timeout.
+            let Some(mut conn) = pool.try_get() else {
+                return wacore::stats::StorageResourceReport::default();
             };
-            let page_size = pragma_i64(&mut conn, "page_size").unwrap_or(0).max(0) as u64;
-            let page_count = pragma_i64(&mut conn, "page_count").unwrap_or(0).max(0) as u64;
+            // A failed PRAGMA read means "unavailable", not "zero": fall back to
+            // the all-`None` default so the report never asserts zero usage it
+            // couldn't actually confirm (Some(0) is a positive claim).
+            let (Some(page_size), Some(page_count), Some(cache_size)) = (
+                pragma_i64(&mut conn, "page_size"),
+                pragma_i64(&mut conn, "page_count"),
+                pragma_i64(&mut conn, "cache_size"),
+            ) else {
+                return wacore::stats::StorageResourceReport::default();
+            };
+            let page_size = page_size.max(0) as u64;
+            let page_count = page_count.max(0) as u64;
             // `PRAGMA cache_size`: negative = KiB, positive = pages.
-            let cache_size = pragma_i64(&mut conn, "cache_size").unwrap_or(0);
             let cache_cap_bytes = if cache_size < 0 {
-                cache_size.unsigned_abs() * 1024
+                cache_size.unsigned_abs().saturating_mul(1024)
             } else {
-                cache_size as u64 * page_size
+                (cache_size as u64).saturating_mul(page_size)
             };
-            let db_bytes = page_count * page_size;
+            let db_bytes = page_count.saturating_mul(page_size);
+            let per_conn_cache = cache_cap_bytes.min(db_bytes);
+            // Open connections (idle + the one just checked out), each with its
+            // own independent page cache. Defaults to 1 for the single-connection
+            // store, so this only widens the bound when pool_size > 1.
+            let open_connections = pool.state().connections.max(1) as u64;
             wacore::stats::StorageResourceReport {
-                memory_bytes: Some(cache_cap_bytes.min(db_bytes)),
+                memory_bytes: Some(per_conn_cache.saturating_mul(open_connections)),
                 pages: Some(page_count),
                 ..Default::default()
             }
@@ -3516,9 +3539,21 @@ impl DeviceStore for SqliteStore {
     }
 }
 
-/// Read a single-integer `PRAGMA` off a connection. Returns `None` on any
+/// Read a single-integer `PRAGMA` off a connection. `pragma` MUST be a bare
+/// identifier (all current callers pass string literals). Returns `None` on any
 /// error so callers degrade to "not reported" instead of failing.
 fn pragma_i64(conn: &mut SqliteConnection, pragma: &str) -> Option<i64> {
+    // The name is interpolated into SQL below, so reject anything that isn't a
+    // bare identifier — defense-in-depth against a future caller passing
+    // non-constant input. Constant callers always pass this.
+    if pragma.is_empty()
+        || !pragma
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        debug_assert!(false, "pragma_i64 requires an identifier, got {pragma:?}");
+        return None;
+    }
     #[derive(diesel::QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::BigInt)]

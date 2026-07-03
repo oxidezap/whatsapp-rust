@@ -38,8 +38,13 @@ struct AttributingAllocator;
 
 unsafe impl GlobalAlloc for AttributingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        AllocMeter::on_alloc(layout.size());
-        unsafe { System.alloc(layout) }
+        // Count only a successful allocation, so an OOM null return doesn't
+        // inflate the counter with bytes that were never allocated.
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            AllocMeter::on_alloc(layout.size());
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {

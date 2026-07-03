@@ -299,11 +299,13 @@ pub struct TransportResourceReport {
 }
 
 impl TransportResourceReport {
-    /// Sum of the present byte fields.
+    /// Sum of the present byte fields (saturating — `total_bytes` is public, so
+    /// a caller-built report with large values must not wrap).
     pub fn total_bytes(&self) -> u64 {
-        self.read_buffer_bytes.unwrap_or(0)
-            + self.write_buffer_bytes.unwrap_or(0)
-            + self.tls_state_bytes.unwrap_or(0)
+        self.read_buffer_bytes
+            .unwrap_or(0)
+            .saturating_add(self.write_buffer_bytes.unwrap_or(0))
+            .saturating_add(self.tls_state_bytes.unwrap_or(0))
     }
 }
 
@@ -321,9 +323,12 @@ pub struct HttpResourceReport {
 }
 
 impl HttpResourceReport {
-    /// Sum of the present byte fields (excludes the connection count).
+    /// Sum of the present byte fields (excludes the connection count). Saturating
+    /// — `total_bytes` is public, so a caller-built report must not wrap.
     pub fn total_bytes(&self) -> u64 {
-        self.pool_buffer_bytes.unwrap_or(0) + self.inflight_bytes.unwrap_or(0)
+        self.pool_buffer_bytes
+            .unwrap_or(0)
+            .saturating_add(self.inflight_bytes.unwrap_or(0))
     }
 }
 
@@ -441,8 +446,23 @@ std::thread_local! {
     /// `on_poll_end` pops; the host's global allocator charges the innermost.
     /// A stack (not a slot) for the same reason as `POLL_START`: metered poll
     /// scopes nest and several meters can share a thread.
-    static ACTIVE_ALLOC_METER: core::cell::RefCell<Vec<*const AllocMeter>> =
+    ///
+    /// Holds an owned `Arc<AllocMeterInner>`, not a raw pointer: `on_poll_start`
+    /// is a safe public method, so a caller could move or drop a stack-local
+    /// meter before `on_poll_end` — the strong ref here keeps the counters alive
+    /// for the whole scope, so `on_alloc` (driven by the allocator on every
+    /// allocation) can never dereference freed memory.
+    static ACTIVE_ALLOC_METER: core::cell::RefCell<Vec<Arc<AllocMeterInner>>> =
         const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Shared counters behind an [`AllocMeter`]. Held by `Arc` so a scope on the
+/// active-meter stack owns the lifetime independently of the `AllocMeter` handle.
+#[derive(Debug, Default)]
+struct AllocMeterInner {
+    allocated: AtomicU64,
+    freed: AtomicU64,
+    allocations: AtomicU64,
 }
 
 /// Built-in [`TaskInstrument`] that attributes heap bytes **allocated and
@@ -472,11 +492,9 @@ std::thread_local! {
 /// [`CpuMeter`]. Expect a measurable overhead while a counting allocator is
 /// installed (~10-20% for this design); it is a diagnostics tool, not an
 /// always-on meter.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AllocMeter {
-    allocated: AtomicU64,
-    freed: AtomicU64,
-    allocations: AtomicU64,
+    inner: Arc<AllocMeterInner>,
 }
 
 /// Point-in-time copy of an [`AllocMeter`]. Counters are cumulative over the
@@ -513,9 +531,9 @@ impl AllocMeter {
     /// inside the allocator without recursing.
     #[inline]
     pub fn on_alloc(bytes: usize) {
-        Self::with_active(|m| {
-            m.allocated.fetch_add(bytes as u64, Ordering::Relaxed);
-            m.allocations.fetch_add(1, Ordering::Relaxed);
+        Self::with_active(|inner| {
+            inner.allocated.fetch_add(bytes as u64, Ordering::Relaxed);
+            inner.allocations.fetch_add(1, Ordering::Relaxed);
         });
     }
 
@@ -523,36 +541,31 @@ impl AllocMeter {
     /// thread, if any. Call from a global allocator's `dealloc`.
     #[inline]
     pub fn on_dealloc(bytes: usize) {
-        Self::with_active(|m| {
-            m.freed.fetch_add(bytes as u64, Ordering::Relaxed);
+        Self::with_active(|inner| {
+            inner.freed.fetch_add(bytes as u64, Ordering::Relaxed);
         });
     }
 
     #[inline]
-    fn with_active(f: impl FnOnce(&AllocMeter)) {
+    fn with_active(f: impl FnOnce(&AllocMeterInner)) {
         // `try_with` guards TLS-destroyed-on-exit; `try_borrow` guards the
         // reentrancy where `on_poll_start`'s own `push` reallocates the stack
         // and lands back here — in that window the borrow fails and we skip
         // (charging that tiny bookkeeping allocation to no one).
         let _ = ACTIVE_ALLOC_METER.try_with(|cell| {
             if let Ok(stack) = cell.try_borrow()
-                && let Some(&ptr) = stack.last()
+                && let Some(inner) = stack.last()
             {
-                // SAFETY: `ptr` was pushed by `on_poll_start` on this thread and
-                // is popped by its matching `on_poll_end` on this same thread
-                // (the `TaskInstrument` contract). Between those calls the meter
-                // is borrowed and thus alive, and allocations only reach here on
-                // that thread within that window, so the pointer is live.
-                f(unsafe { &*ptr });
+                f(inner);
             }
         });
     }
 
     pub fn snapshot(&self) -> AllocSnapshot {
         AllocSnapshot {
-            allocated_bytes: self.allocated.load(Ordering::Relaxed),
-            freed_bytes: self.freed.load(Ordering::Relaxed),
-            allocations: self.allocations.load(Ordering::Relaxed),
+            allocated_bytes: self.inner.allocated.load(Ordering::Relaxed),
+            freed_bytes: self.inner.freed.load(Ordering::Relaxed),
+            allocations: self.inner.allocations.load(Ordering::Relaxed),
         }
     }
 }
@@ -561,13 +574,18 @@ impl TaskInstrument for AllocMeter {
     fn on_poll_start(&self) {
         // `borrow_mut` while pushing: a reentrant `on_alloc` from the push's own
         // reallocation sees the active borrow and skips (see `with_active`).
-        let _ = ACTIVE_ALLOC_METER.try_with(|cell| cell.borrow_mut().push(self as *const Self));
+        let _ = ACTIVE_ALLOC_METER.try_with(|cell| cell.borrow_mut().push(self.inner.clone()));
     }
 
     fn on_poll_end(&self) {
-        let _ = ACTIVE_ALLOC_METER.try_with(|cell| {
-            cell.borrow_mut().pop();
-        });
+        // Pop under the borrow, then drop the popped Arc AFTER the borrow is
+        // released: if it was the last strong ref, its deallocation reenters the
+        // allocator (→ `on_dealloc`), which must not find the stack still borrowed.
+        let popped = ACTIVE_ALLOC_METER
+            .try_with(|cell| cell.borrow_mut().pop())
+            .ok()
+            .flatten();
+        drop(popped);
     }
 }
 
@@ -772,5 +790,37 @@ mod tests {
         }
         // Innermost meter got its own charge; no panic reaching here is the test.
         assert_eq!(meters.last().unwrap().snapshot().allocations, 1);
+    }
+
+    #[test]
+    fn alloc_meter_scope_outlives_a_dropped_handle() {
+        // Regression for the raw-pointer soundness hole: the active-meter scope
+        // owns an `Arc` to the counters, so a charge after the caller's handle is
+        // dropped touches valid memory (with the old `*const AllocMeter` this was
+        // a dangling-pointer deref).
+        let keep = AllocMeter::new();
+        let temp = keep.clone(); // shares the same counters
+        temp.on_poll_start();
+        drop(temp); // handle gone; the scope's Arc keeps the counters alive
+        AllocMeter::on_alloc(128);
+        keep.on_poll_end(); // LIFO pop; any handle pops the top scope
+        assert_eq!(keep.snapshot().allocated_bytes, 128);
+    }
+
+    #[test]
+    fn resource_report_total_bytes_saturate() {
+        let t = TransportResourceReport {
+            read_buffer_bytes: Some(u64::MAX),
+            write_buffer_bytes: Some(10),
+            tls_state_bytes: Some(10),
+        };
+        assert_eq!(t.total_bytes(), u64::MAX, "transport total must not wrap");
+
+        let h = HttpResourceReport {
+            pool_connections: Some(3),
+            pool_buffer_bytes: Some(u64::MAX),
+            inflight_bytes: Some(1),
+        };
+        assert_eq!(h.total_bytes(), u64::MAX, "http total must not wrap");
     }
 }
