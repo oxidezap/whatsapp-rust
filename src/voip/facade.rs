@@ -472,7 +472,7 @@ async fn place_call(
         .map_err(|e| CallError::Setup(e.to_string()))?;
         drop(_session_guards);
         client
-            .flush_signal_cache()
+            .flush_signal_cache_batch_safe()
             .await
             .map_err(|e| CallError::Setup(e.to_string()))?;
         raw

@@ -2156,6 +2156,46 @@ impl AppSyncStore for SqliteStore {
     }
 }
 
+/// Single source of the pending-inbound row insert, shared by the single-row
+/// and batch write paths so a schema or conflict-strategy change cannot
+/// silently diverge between them.
+fn insert_pending_inbound_row(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    sender: &str,
+    id: &str,
+    message: &[u8],
+) -> diesel::QueryResult<usize> {
+    diesel::replace_into(pending_inbound_messages::table)
+        .values((
+            pending_inbound_messages::chat.eq(chat),
+            pending_inbound_messages::sender.eq(sender),
+            pending_inbound_messages::id.eq(id),
+            pending_inbound_messages::message.eq(message),
+            pending_inbound_messages::device_id.eq(device_id),
+        ))
+        .execute(conn)
+}
+
+/// Batch/single-row shared delete; see [`insert_pending_inbound_row`].
+fn delete_pending_inbound_row(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    sender: &str,
+    id: &str,
+) -> diesel::QueryResult<usize> {
+    diesel::delete(
+        pending_inbound_messages::table
+            .filter(pending_inbound_messages::chat.eq(chat))
+            .filter(pending_inbound_messages::sender.eq(sender))
+            .filter(pending_inbound_messages::id.eq(id))
+            .filter(pending_inbound_messages::device_id.eq(device_id)),
+    )
+    .execute(conn)
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ProtocolStore for SqliteStore {
@@ -2992,6 +3032,8 @@ impl ProtocolStore for SqliteStore {
         id: &str,
         message: &[u8],
     ) -> Result<()> {
+        // Row statement shared with store_pending_inbound_batch via
+        // insert_pending_inbound_row, so the two write paths cannot diverge.
         let chat = chat.to_string();
         let sender = sender.to_string();
         let id = id.to_string();
@@ -3004,15 +3046,7 @@ impl ProtocolStore for SqliteStore {
             let id = id.clone();
             let message = Arc::clone(&message);
             Box::new(move |conn: &mut SqliteConnection| {
-                diesel::replace_into(pending_inbound_messages::table)
-                    .values((
-                        pending_inbound_messages::chat.eq(&chat),
-                        pending_inbound_messages::sender.eq(&sender),
-                        pending_inbound_messages::id.eq(&id),
-                        pending_inbound_messages::message.eq(message.as_slice()),
-                        pending_inbound_messages::device_id.eq(device_id),
-                    ))
-                    .execute(conn)?;
+                insert_pending_inbound_row(conn, device_id, &chat, &sender, &id, &message)?;
                 Ok(())
             })
         })
@@ -3060,14 +3094,7 @@ impl ProtocolStore for SqliteStore {
             let sender = sender.clone();
             let id = id.clone();
             Box::new(move |conn: &mut SqliteConnection| {
-                diesel::delete(
-                    pending_inbound_messages::table
-                        .filter(pending_inbound_messages::chat.eq(&chat))
-                        .filter(pending_inbound_messages::sender.eq(&sender))
-                        .filter(pending_inbound_messages::id.eq(&id))
-                        .filter(pending_inbound_messages::device_id.eq(device_id)),
-                )
-                .execute(conn)?;
+                delete_pending_inbound_row(conn, device_id, &chat, &sender, &id)?;
                 Ok(())
             })
         })
@@ -3126,15 +3153,7 @@ impl ProtocolStore for SqliteStore {
                 // 32 KiB per-PR budget — not worth it for microseconds.
                 conn.transaction(|conn| {
                     for (chat, sender, id, message) in rows.iter() {
-                        diesel::replace_into(pending_inbound_messages::table)
-                            .values((
-                                pending_inbound_messages::chat.eq(chat),
-                                pending_inbound_messages::sender.eq(sender),
-                                pending_inbound_messages::id.eq(id),
-                                pending_inbound_messages::message.eq(message.as_slice()),
-                                pending_inbound_messages::device_id.eq(device_id),
-                            ))
-                            .execute(conn)?;
+                        insert_pending_inbound_row(conn, device_id, chat, sender, id, message)?;
                     }
                     Ok(())
                 })
@@ -3164,14 +3183,7 @@ impl ProtocolStore for SqliteStore {
                 // transaction already amortizes the WAL commit.
                 conn.transaction(|conn| {
                     for (chat, sender, id) in keys.iter() {
-                        diesel::delete(
-                            pending_inbound_messages::table
-                                .filter(pending_inbound_messages::chat.eq(chat))
-                                .filter(pending_inbound_messages::sender.eq(sender))
-                                .filter(pending_inbound_messages::id.eq(id))
-                                .filter(pending_inbound_messages::device_id.eq(device_id)),
-                        )
-                        .execute(conn)?;
+                        delete_pending_inbound_row(conn, device_id, chat, sender, id)?;
                     }
                     Ok(())
                 })

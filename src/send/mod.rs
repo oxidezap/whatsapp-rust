@@ -927,7 +927,7 @@ impl Client {
             self.invalidate_device_cache(user).await;
         }
 
-        self.flush_signal_cache_logged("send_status_message", None)
+        self.flush_signal_cache_batch_safe_logged("send_status_message", None)
             .await;
 
         Ok(SendResult {
@@ -1252,7 +1252,7 @@ impl Client {
                     self.signal_cache.delete_sender_key(sk.cache_key()).await;
                 }
                 let _ = self
-                    .flush_signal_cache_logged("phash-mismatch-fallback", None)
+                    .flush_signal_cache_batch_safe_logged("phash-mismatch-fallback", None)
                     .await;
             }
         }
@@ -1935,7 +1935,7 @@ impl Client {
         drop(distribution_guard);
 
         // Flush cached Signal state to DB after encryption
-        self.flush_signal_cache_logged("send_message_impl", None)
+        self.flush_signal_cache_batch_safe_logged("send_message_impl", None)
             .await;
 
         // Issue new tc token after send if a bucket boundary was crossed.
@@ -4049,8 +4049,10 @@ mod tests {
         }
 
         // The test client never connects, so the send's `ensure_e2e_sessions`
-        // would otherwise block on `wait_for_offline_delivery_end` until timeout.
-        client.complete_offline_sync(0).await;
+        // would otherwise block on `wait_for_offline_delivery_end` until
+        // timeout. Enter live state synchronously (the real finisher now runs
+        // as a spawned task).
+        client.enter_live_mode_for_tests();
 
         // Seed a Signal session for the peer's LID device so the offline fanout
         // can encrypt without fetching prekeys over the (absent) socket. The

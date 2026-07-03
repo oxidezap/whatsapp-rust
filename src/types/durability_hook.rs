@@ -39,7 +39,9 @@ pub use wacore::types::events::InboundMessage;
 /// Scope and known limitations:
 /// - Covers end-to-end encrypted messages (1:1 and group). Newsletter / broadcast
 ///   channel messages are not encrypted and are acked on their own path, so the
-///   hook does not gate them.
+///   hook does not gate them (they dispatch event-only). The same applies to PDO
+///   placeholder recoveries (`info.unavailable_request_id` is set): their ack runs
+///   on the PDO path, so the hook never sees them.
 /// - If the durable buffer write itself fails (e.g. disk full, after retries),
 ///   the acks are suppressed, but if the process does not crash the Signal
 ///   ratchet still advances and those messages degrade to at-most-once on their

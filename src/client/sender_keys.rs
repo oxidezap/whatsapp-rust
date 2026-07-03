@@ -123,7 +123,7 @@ impl Client {
                 .delete_sender_key(sk_name.cache_key())
                 .await;
         }
-        self.flush_signal_cache_logged("rotate_sender_key_on_participant_remove", None)
+        self.flush_signal_cache_batch_safe_logged("rotate_sender_key_on_participant_remove", None)
             .await;
 
         if let Err(e) = self

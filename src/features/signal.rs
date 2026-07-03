@@ -70,7 +70,7 @@ impl<'a> Signal<'a> {
         .await?;
 
         drop(_guard);
-        self.client.flush_signal_cache().await?;
+        self.client.flush_signal_cache_batch_safe().await?;
 
         let (_, is_prekey, bytes) = wacore::send::extract_ciphertext(encrypted)
             .ok_or_else(|| SignalError::Unsupported("unexpected ciphertext variant".into()))?;
@@ -144,7 +144,7 @@ impl<'a> Signal<'a> {
         }
 
         drop(_guard);
-        self.client.flush_signal_cache().await?;
+        self.client.flush_signal_cache_batch_safe().await?;
 
         Ok(decrypted.plaintext)
     }
@@ -208,7 +208,7 @@ impl<'a> Signal<'a> {
         )
         .await?;
 
-        self.client.flush_signal_cache().await?;
+        self.client.flush_signal_cache_batch_safe().await?;
 
         Ok((skdm_bytes, ciphertext.into_serialized().into_vec()))
     }
@@ -238,7 +238,7 @@ impl<'a> Signal<'a> {
         )
         .await?;
 
-        self.client.flush_signal_cache().await?;
+        self.client.flush_signal_cache_batch_safe().await?;
 
         Ok(plaintext.to_vec())
     }
@@ -279,7 +279,7 @@ impl<'a> Signal<'a> {
             self.client.signal_cache.delete_identity(&addr).await;
         }
 
-        self.client.flush_signal_cache().await?;
+        self.client.flush_signal_cache_batch_safe().await?;
         Ok(())
     }
 
@@ -323,7 +323,7 @@ impl<'a> Signal<'a> {
         .await?;
 
         drop(_session_guards);
-        self.client.flush_signal_cache().await?;
+        self.client.flush_signal_cache_batch_safe().await?;
 
         Ok((result.participant_nodes, result.includes_prekey_message))
     }

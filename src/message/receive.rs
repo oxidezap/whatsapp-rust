@@ -741,6 +741,13 @@ impl Client {
                         // archived (not deleted) when the new PreKeySignalMessage is processed,
                         // allowing decryption of any in-flight messages encrypted with the old session.
                         self.signal_cache.delete_identity(address).await;
+                        // This stanza's processing permit is held here, and the
+                        // full-cache flush below would otherwise persist ratchet
+                        // advances for accumulated drain entries that have no
+                        // durable row yet — commit them first.
+                        if self.inbound_commit_batch.is_active() {
+                            self.commit_inbound_batch_holding_permit().await;
+                        }
                         // Flush immediately so the backend is updated BEFORE the retry decrypt below.
                         // Device::is_trusted_identity reads from backend, not cache.
                         if let Err(e) = self.flush_signal_cache().await {

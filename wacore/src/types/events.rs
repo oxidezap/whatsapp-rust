@@ -630,6 +630,14 @@ pub enum Event {
     /// consumer never sees a message that a registered durability hook has
     /// not committed. The `Arc` slice is shared with the hook call — same
     /// items, same order, no copies.
+    ///
+    /// With a hook registered this event is at-least-once, like the hook: a
+    /// redelivery whose buffered copy survived (e.g. the post-commit cleanup
+    /// failed and the ack was lost) replays through the same commit and
+    /// dispatches again. Exceptions that bypass the hook: newsletter
+    /// messages (plaintext, acked on their own path, never redelivered) and
+    /// PDO placeholder recoveries (identified by
+    /// `info.unavailable_request_id`) dispatch event-only.
     Messages(MessageBatch),
     Receipt(Receipt),
     UndecryptableMessage(UndecryptableMessage),
@@ -841,21 +849,6 @@ impl Event {
             .map(|b| b.messages.iter())
             .into_iter()
             .flatten()
-    }
-
-    /// Every plain-text body in this event, in arrival order. Prefer this
-    /// over [`message_text`](Self::message_text) when a batch can carry more
-    /// than one message (offline drain).
-    pub fn message_texts(&self) -> impl Iterator<Item = &str> {
-        self.messages()
-            .filter_map(|m| m.message.conversation.as_deref())
-    }
-
-    /// Convenience: the FIRST plain-text body in this event. A drain batch can
-    /// carry several texts — iterate [`message_texts`](Self::message_texts)
-    /// (or [`messages`](Self::messages)) to see them all.
-    pub fn message_text(&self) -> Option<&str> {
-        self.message_texts().next()
     }
 }
 

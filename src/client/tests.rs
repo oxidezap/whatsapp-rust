@@ -503,6 +503,17 @@ async fn test_wait_for_offline_delivery_end_times_out_when_flag_not_set() {
         .await;
 
     let elapsed = start.elapsed();
+    // The drain finisher runs as a spawned task (off the read loop); wait for
+    // its completion signal before asserting on the state it flips.
+    let listener = client.offline_sync_notifier.listen();
+    if !client
+        .offline_sync_completed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener)
+            .await
+            .expect("drain finisher should complete");
+    }
     // Count available permits by trying to acquire non-blockingly
     let semaphore = match client.message_processing_semaphore.lock() {
         Ok(guard) => guard.clone(),

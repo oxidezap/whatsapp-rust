@@ -554,10 +554,10 @@ impl Client {
     /// flush at offline-sync completion (WA Web `sendAggregateOfflineReceipts`).
     /// Returns `false` when the sync already completed, so the caller falls
     /// back to the live 1:1 receipt. The completed flag is re-checked under
-    /// the buffer lock: `complete_offline_sync` flips the flag before
-    /// draining, so a push that wins the lock either lands before the drain
-    /// (and is included) or observes the flag and goes 1:1 — a receipt can
-    /// never strand in the buffer.
+    /// the buffer lock: the drain finisher (`finish_offline_sync`) flips the
+    /// flag before draining, so a push that wins the lock either lands before
+    /// the drain (and is included) or observes the flag and goes 1:1 — a
+    /// receipt can never strand in the buffer.
     pub(crate) fn try_buffer_offline_receipt(&self, info: &Arc<MessageInfo>) -> bool {
         let mut buffer = self
             .offline_receipt_buffer

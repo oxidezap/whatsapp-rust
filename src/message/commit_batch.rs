@@ -84,10 +84,34 @@ impl InboundCommitBatcher {
         self.active.load(Ordering::Acquire)
     }
 
+    /// Whether uncommitted entries are still accumulated. Teardown uses this
+    /// to decide if flushing the Signal cache is safe: persisting ratchet
+    /// advances for entries about to be dropped would turn their redelivery
+    /// into an unrecoverable duplicate.
+    pub(crate) fn has_entries(&self) -> bool {
+        !self.lock().entries.is_empty()
+    }
+
     /// Switch to immediate (live) commits. Only the end-of-drain flush calls
     /// this, while holding the single processing permit.
     fn deactivate(&self) {
         self.active.store(false, Ordering::Release);
+    }
+
+    /// Last-resort drain exit for the unreachable-in-practice case where the
+    /// finisher cannot run (`self_weak` upgrade failure): drop any entries
+    /// (unacked, so the server redelivers them) and still switch to live mode
+    /// — staying active with a widened semaphore would batch live traffic
+    /// while flushes hold only 1 of its permits.
+    pub(crate) fn force_live_dropping_entries(&self) {
+        let dropped = self.take();
+        if !dropped.is_empty() {
+            log::warn!(
+                "Dropping {} uncommitted inbound messages on forced drain exit; the server will redeliver them",
+                dropped.len()
+            );
+        }
+        self.deactivate();
     }
 
     /// Connection teardown/setup: drop uncommitted entries (they were never
@@ -103,11 +127,63 @@ impl InboundCommitBatcher {
         }
         self.active.store(true, Ordering::Release);
     }
+}
 
-    /// Test-only: enter live mode without running a drain flush.
-    #[cfg(test)]
-    pub(crate) fn deactivate_for_tests(&self) {
-        self.deactivate();
+#[cfg(test)]
+impl Client {
+    /// Test-only mirror of a completed offline sync: the flag, live permit
+    /// count and batcher mode move together so tests can never run in a
+    /// hybrid drain/live state production cannot reach. Kept next to the
+    /// production transition (`finish_offline_sync`) so a new step gets added
+    /// to both.
+    pub(crate) fn enter_live_mode_for_tests(&self) {
+        self.offline_sync_completed.store(true, Ordering::Release);
+        self.offline_sync_finish_started
+            .store(true, Ordering::Release);
+        self.swap_message_semaphore(64);
+        self.inbound_commit_batch.deactivate();
+    }
+}
+
+/// Restores a taken drain batch if the commit is cancelled (bounded teardown
+/// timeout) or fails before its durable point: taken entries must never
+/// vanish while another path can still flush their ratchet advances — a
+/// persisted ratchet without a buffered row makes the redelivery an ackable
+/// duplicate (silent loss for hook consumers).
+struct ReinsertGuard<'a> {
+    batcher: &'a InboundCommitBatcher,
+    items: Option<std::sync::Arc<[InboundMessage]>>,
+}
+
+impl ReinsertGuard<'_> {
+    fn disarm(&mut self) {
+        self.items = None;
+    }
+}
+
+impl Drop for ReinsertGuard<'_> {
+    fn drop(&mut self) {
+        let Some(items) = self.items.take() else {
+            return;
+        };
+        let mut state = self.batcher.lock();
+        let mut restored: Vec<InboundMessage> = items.iter().cloned().collect();
+        // Nothing newer can normally exist (the permit serializes drain
+        // flushes), but keep arrival order if it ever does.
+        restored.append(&mut state.entries);
+        state.bytes = restored
+            .iter()
+            .map(|i| waproto::codec::message_encoded_len(&i.message))
+            .sum();
+        // The taking flush bumped the epoch, so no sleeper owns this batch;
+        // the next enqueue arms a fresh one, and the drain-end/teardown
+        // flushes cover the gap regardless.
+        state.timer_armed = false;
+        state.entries = restored;
+        log::warn!(
+            "Restored {} uncommitted inbound messages to the batch after a failed or cancelled commit",
+            state.entries.len()
+        );
     }
 }
 
@@ -135,17 +211,28 @@ impl Client {
             // Arc::from([item]) builds the event/hook slice in one allocation;
             // a Vec would add an alloc+dealloc per live message (measured
             // ~18ns and 2x the allocations of this step).
-            self.commit_inbound_batch(std::sync::Arc::from([item]), BatchOrigin::Live, false)
+            let _ = self
+                .commit_inbound_batch(std::sync::Arc::from([item]), BatchOrigin::Live)
                 .await;
             return;
         }
         if let Some(epoch) = self.enqueue_inbound_commit(item) {
-            let client = self.clone();
+            // Weak: a sleeper must not keep the whole Client graph alive for
+            // up to 3s after the app drops its handle.
+            let client = Arc::downgrade(self);
+            let runtime = self.runtime.clone();
             self.runtime
                 .spawn(Box::pin(async move {
-                    client.runtime.sleep(FLUSH_TIMEOUT).await;
-                    if client.inbound_commit_batch.epoch.load(Ordering::Acquire) == epoch {
-                        client.flush_inbound_commits_acquiring_permit().await;
+                    runtime.sleep(FLUSH_TIMEOUT).await;
+                    if let Some(client) = client.upgrade()
+                        && client.inbound_commit_batch.epoch.load(Ordering::Acquire) == epoch
+                    {
+                        // The epoch re-checks after permit acquisition: a
+                        // size-trigger flush racing this sleeper must not let
+                        // it commit a batch that is only milliseconds old.
+                        let _ = client
+                            .flush_inbound_commits_under_permit(false, Some(epoch))
+                            .await;
                     }
                 }))
                 .detach();
@@ -162,7 +249,8 @@ impl Client {
         };
         if over {
             let batch = self.inbound_commit_batch.take();
-            self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain, true)
+            let _ = self
+                .commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
                 .await;
         }
     }
@@ -173,11 +261,34 @@ impl Client {
     /// its redelivery into an unrecoverable duplicate. During the drain the
     /// semaphore holds a single permit, so this fully serializes with stanza
     /// processing; after the drain the batcher is empty and this no-ops.
-    pub(crate) async fn flush_inbound_commits_acquiring_permit(self: &Arc<Self>) {
+    ///
+    /// With `deactivate`, this is the end-of-drain transition: commit the tail
+    /// batch and switch the batcher to live mode under the same permit hold.
+    /// That is what makes the transition raceless — no stanza is mid-flight
+    /// when the mode flips (a stanza's enqueue and its stanza-end flush always
+    /// agree), and every stanza still queued behind this permit commits as
+    /// Live strictly AFTER the tail batch, preserving arrival order across the
+    /// boundary. Runs before the semaphore widens to the live permit count.
+    ///
+    /// Returns whether the drain state is durable (see
+    /// [`commit_inbound_batch`](Self::commit_inbound_batch)); callers gate the
+    /// buffered offline-receipt flush on it.
+    pub(crate) async fn flush_inbound_commits_under_permit(
+        self: &Arc<Self>,
+        deactivate: bool,
+        expected_epoch: Option<u64>,
+    ) -> bool {
         let _permit = self.acquire_message_processing_permit().await;
+        if let Some(epoch) = expected_epoch
+            && self.inbound_commit_batch.epoch.load(Ordering::Acquire) != epoch
+        {
+            // Another flush took this sleeper's batch while it waited for the
+            // permit; whatever accumulates now belongs to a newer timer.
+            return true;
+        }
         let was_draining = self.inbound_commit_batch.is_active();
         let batch = self.inbound_commit_batch.take();
-        if batch.is_empty() {
+        let durable = if batch.is_empty() {
             // Even with nothing to commit, a drain-mode flush must persist the
             // Signal cache: SKDM-only stanzas mutate Signal state without
             // enqueueing a message, and their buffered receipts flush right
@@ -185,56 +296,61 @@ impl Client {
             if was_draining {
                 self.flush_signal_cache_logged("commit_batch", None).await;
             }
-            return;
+            true
+        } else {
+            self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
+                .await
+        };
+        if deactivate {
+            self.inbound_commit_batch.deactivate();
         }
-        self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain, true)
-            .await;
+        durable
     }
 
-    /// [`flush_inbound_commits_acquiring_permit`](Self::flush_inbound_commits_acquiring_permit)
+    /// [`flush_inbound_commits_under_permit`](Self::flush_inbound_commits_under_permit)
     /// with a deadline, for connection teardown: a stalled permit holder or a
-    /// hung hook must not wedge disconnect/reconnect. On timeout the entries
-    /// stay unacked and the server redelivers them on the next connect.
+    /// hung hook must not wedge disconnect/reconnect. On timeout (or a failed
+    /// durable write) the entries stay in the batcher unacked — the caller
+    /// must not flush buffered receipts or persist the Signal cache for them,
+    /// and the server redelivers them on the next connect.
     pub(crate) async fn flush_inbound_commits_bounded(
         self: &Arc<Self>,
         limit: std::time::Duration,
-    ) {
-        if wacore::runtime::timeout(
+    ) -> bool {
+        match wacore::runtime::timeout(
             &*self.runtime,
             limit,
-            self.flush_inbound_commits_acquiring_permit(),
+            self.flush_inbound_commits_under_permit(false, None),
         )
         .await
-        .is_err()
         {
-            log::warn!(
-                "Timed out committing the inbound drain batch during teardown; leaving entries for redelivery"
-            );
+            Ok(durable) => durable,
+            Err(_) => {
+                log::warn!(
+                    "Timed out committing the inbound drain batch during teardown; leaving entries for redelivery"
+                );
+                false
+            }
         }
     }
 
-    /// End-of-drain transition: commit the tail batch and switch the batcher
-    /// to live mode, all under the single processing permit. Holding the
-    /// permit across BOTH steps is what makes the transition raceless: no
-    /// stanza is mid-flight when the mode flips (so a stanza's enqueue and its
-    /// stanza-end flush always agree), and every stanza still queued behind
-    /// this permit commits as Live strictly AFTER the tail batch — arrival
-    /// order is preserved across the boundary. Runs before the semaphore
-    /// widens to the live permit count.
-    pub(crate) async fn finish_inbound_commit_drain(self: &Arc<Self>) {
-        let _permit = self.acquire_message_processing_permit().await;
+    /// End-of-drain transition; see
+    /// [`flush_inbound_commits_under_permit`](Self::flush_inbound_commits_under_permit).
+    pub(crate) async fn finish_inbound_commit_drain(self: &Arc<Self>) -> bool {
+        self.flush_inbound_commits_under_permit(true, None).await
+    }
+
+    /// Commit any accumulated entries while the caller ALREADY HOLDS the
+    /// processing permit (mid-stanza recovery paths like UntrustedIdentity),
+    /// so a full-cache Signal flush that follows cannot persist ratchet
+    /// advances for entries without a durable buffered row.
+    pub(crate) async fn commit_inbound_batch_holding_permit(self: &Arc<Self>) {
         let batch = self.inbound_commit_batch.take();
-        self.inbound_commit_batch.deactivate();
-        if batch.is_empty() {
-            // Same rule as flush_inbound_commits_acquiring_permit: SKDM-only
-            // drain stanzas leave Signal state in the cache with their
-            // receipts buffered; those receipts flush right after this, so
-            // the state must be durable first.
-            self.flush_signal_cache_logged("commit_batch", None).await;
-            return;
+        if !batch.is_empty() {
+            let _ = self
+                .commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
+                .await;
         }
-        self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain, true)
-            .await;
     }
 
     /// Commit one batch: durable buffer → Signal flush → hook → clear buffer →
@@ -245,16 +361,32 @@ impl Client {
     /// exactly like that old path: the consumer's durable copy is the hook
     /// commit, not the event. On any commit failure everything stays unacked
     /// and the server redelivers the whole batch.
+    ///
+    /// Drain commits also flush the Signal cache (bulk signal-store commit per
+    /// snapshot, WA Web ordering); live commits leave it to the per-stanza
+    /// flush at the end of processing. A drain batch whose durable write fails
+    /// (or whose future is cancelled by a bounded teardown flush before it) is
+    /// restored to the batcher, so "entries still batched" stays an accurate
+    /// signal for teardown's flush-vs-drop decision.
+    ///
+    /// Returns whether the durable state (buffer rows + Signal flush attempt)
+    /// committed — the gate for flushing buffered offline receipts. A hook
+    /// failure still returns `true`: its rows are durable and the replay path
+    /// retries it, so already-buffered receipts of other messages stay safe.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.commit_batch", level = "debug", skip_all, fields(count = items.len())))]
     pub(crate) async fn commit_inbound_batch(
         self: &Arc<Self>,
         items: std::sync::Arc<[InboundMessage]>,
         origin: BatchOrigin,
-        flush_signal: bool,
-    ) {
+    ) -> bool {
         if items.is_empty() {
-            return;
+            return true;
         }
+        let is_drain = matches!(origin, BatchOrigin::OfflineDrain);
+        let mut reinsert = ReinsertGuard {
+            batcher: &self.inbound_commit_batch,
+            items: is_drain.then(|| std::sync::Arc::clone(&items)),
+        };
 
         if let Some(hook) = self.inbound_durability_hook() {
             // Key strings live for the whole commit; rows borrow them and the
@@ -279,11 +411,14 @@ impl Client {
             {
                 let mut local_arena;
                 let mut shared_arena;
-                let arena: &mut Vec<u8> = if matches!(origin, BatchOrigin::OfflineDrain) {
+                let arena: &mut Vec<u8> = if is_drain {
                     shared_arena = self.inbound_commit_batch.arena.lock().await;
                     &mut shared_arena
                 } else {
-                    local_arena = Vec::new();
+                    // Exact-size reservation: geometric growth would realloc
+                    // several times per live message.
+                    local_arena =
+                        Vec::with_capacity(waproto::codec::message_encoded_len(&items[0].message));
                     &mut local_arena
                 };
                 arena.clear();
@@ -306,18 +441,21 @@ impl Client {
                     .collect();
 
                 // Fail closed: without a durable buffered copy, do not run the
-                // hook and do not ack — the server redelivers once storage
-                // recovers.
+                // hook and do not ack — the entries return to the batcher (via
+                // the guard) and the server redelivers once storage recovers.
                 if let Err(e) = backend.store_pending_inbound_batch(&rows).await {
                     log::error!(
                         "Failed to buffer inbound batch of {}; suppressing acks for redelivery: {e:?}",
                         items.len()
                     );
-                    return;
+                    return false;
                 }
             }
+            // Rows are durable: from here on, redelivery replays from them, so
+            // a cancelled future must not restore the entries.
+            reinsert.disarm();
 
-            if flush_signal {
+            if is_drain {
                 self.flush_signal_cache_logged("commit_batch", None).await;
             }
 
@@ -326,7 +464,7 @@ impl Client {
                     "Inbound durability hook failed for batch of {}; suppressing acks for redelivery: {e:?}",
                     items.len()
                 );
-                return;
+                return true;
             }
 
             let delete_keys: Vec<PendingInboundKey<'_>> = items
@@ -346,8 +484,12 @@ impl Client {
                     delete_keys.len()
                 );
             }
-        } else if flush_signal {
-            self.flush_signal_cache_logged("commit_batch", None).await;
+        } else {
+            if is_drain {
+                self.flush_signal_cache_logged("commit_batch", None).await;
+            }
+            // No hook = at-most-once: the flush is the durable point.
+            reinsert.disarm();
         }
 
         // Acks first (everything durable by now): handle_event runs
@@ -361,6 +503,7 @@ impl Client {
             messages: items,
             origin,
         }));
+        true
     }
 }
 
@@ -431,7 +574,7 @@ mod tests {
             "sub-threshold entries must accumulate, not commit"
         );
 
-        client.flush_inbound_commits_acquiring_permit().await;
+        client.flush_inbound_commits_under_permit(false, None).await;
 
         let batches = hook.batches.lock().expect("hook lock").clone();
         assert_eq!(batches, vec![vec!["B1", "B2", "B3"]]);
@@ -510,7 +653,7 @@ mod tests {
 
         client.commit_or_batch_inbound(item("N1")).await;
         client.commit_or_batch_inbound(item("N2")).await;
-        client.flush_inbound_commits_acquiring_permit().await;
+        client.flush_inbound_commits_under_permit(false, None).await;
 
         let event = rx.try_recv().expect("one batch event");
         assert_eq!(
@@ -524,7 +667,7 @@ mod tests {
 
     // End-of-drain transition: the tail batch commits first (as OfflineDrain),
     // the batcher flips to live mode, and anything after commits as Live —
-    // never interleaved ahead of the tail (cubic/codex P1 regression).
+    // never interleaved ahead of the tail.
     #[tokio::test]
     async fn finish_drain_commits_tail_then_switches_to_live() {
         let client = create_test_client_with_failing_http("batch_transition").await;
@@ -576,7 +719,7 @@ mod tests {
 
         client.commit_or_batch_inbound(item("C1")).await;
         client.inbound_commit_batch.reset();
-        client.flush_inbound_commits_acquiring_permit().await;
+        client.flush_inbound_commits_under_permit(false, None).await;
 
         assert!(hook.batches.lock().expect("hook lock").is_empty());
         assert!(rx.try_recv().is_err());

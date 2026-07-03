@@ -24,11 +24,14 @@ impl Client {
     /// joins the accumulating batch, so its hook commit, ack and event keep
     /// arrival order with the fresh stanzas around it; live it commits
     /// immediately as a batch of one. Either way the batch commit rewrites and
-    /// then clears its pending row, and consumers observe the message there —
-    /// its original batch never dispatched (the hook failed then). A plain ack
-    /// is sent only for a genuine duplicate (no buffered copy). A read failure
-    /// fails closed (no ack) so a transient storage error cannot drop a
-    /// message that still needs its hook to commit.
+    /// then clears its pending row, and consumers observe the message there.
+    /// Usually its original batch never dispatched (the hook failed then); if
+    /// it did (post-commit row cleanup failed AND the ack was lost), event
+    /// consumers see it twice — the documented at-least-once shape of
+    /// `Event::Messages` with a hook registered. A plain ack is sent only for
+    /// a genuine duplicate (no buffered copy). A read failure fails closed
+    /// (no ack) so a transient storage error cannot drop a message that still
+    /// needs its hook to commit.
     pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) {
         if self.inbound_durability_hook().is_some() {
             let backend = self.persistence_manager.backend();
@@ -144,7 +147,7 @@ mod tests {
             Arc::from([test_item("MSG_OK_1"), test_item("MSG_OK_2")]);
         let infos: Vec<_> = items.iter().map(|i| Arc::clone(&i.info)).collect();
         client
-            .commit_inbound_batch(Arc::clone(&items), BatchOrigin::OfflineDrain, false)
+            .commit_inbound_batch(Arc::clone(&items), BatchOrigin::OfflineDrain)
             .await;
 
         assert_eq!(hook.calls.load(Ordering::SeqCst), 1, "one commit per batch");
@@ -187,7 +190,6 @@ mod tests {
                     info: Arc::clone(&info),
                 }]),
                 BatchOrigin::OfflineDrain,
-                false,
             )
             .await;
 

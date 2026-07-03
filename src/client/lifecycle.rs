@@ -214,6 +214,7 @@ impl Client {
             prekey_upload_lock: Arc::new(async_lock::Mutex::new(())),
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
+            offline_sync_finish_started: Arc::new(AtomicBool::new(false)),
             offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             inbound_commit_batch: Default::default(),
             history_sync_tasks_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -455,6 +456,8 @@ impl Client {
         self.is_ready.store(false, Ordering::Relaxed);
         self.is_connected.store(false, Ordering::Relaxed);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.offline_sync_finish_started
+            .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Uncommitted batch entries were never acked; the server redelivers
         // them on this fresh connection.
@@ -580,10 +583,16 @@ impl Client {
         //
         // Commit any accumulated drain batch first so its acks land in this
         // receipt drain. Bounded like the outbound flush below: on timeout the
-        // entries simply stay unacked and the server redelivers them.
-        self.flush_inbound_commits_bounded(std::time::Duration::from_secs(5))
-            .await;
-        self.flush_offline_receipts();
+        // entries simply stay unacked and the server redelivers them — and the
+        // buffered receipts stay unsent too, because their SKDM/session state
+        // may not be durable yet (receipting an SKDM whose sender key only
+        // lives in the cache would lose it to a crash with no redelivery).
+        if self
+            .flush_inbound_commits_bounded(std::time::Duration::from_secs(5))
+            .await
+        {
+            self.flush_offline_receipts();
+        }
         // Prevent late receipt producers from escaping the drain window.
         self.outbound_flush.close();
         self.outbound_flush
@@ -641,9 +650,13 @@ impl Client {
         self.auto_reconnect_errors
             .store(Self::RECONNECT_BACKOFF_STEP, Ordering::Relaxed);
 
-        self.flush_inbound_commits_bounded(std::time::Duration::from_secs(2))
-            .await;
-        self.flush_offline_receipts();
+        // Same durable-before-receipts gate as disconnect().
+        if self
+            .flush_inbound_commits_bounded(std::time::Duration::from_secs(2))
+            .await
+        {
+            self.flush_offline_receipts();
+        }
         self.outbound_flush.close();
         self.outbound_flush
             .flush(&*self.runtime, std::time::Duration::from_secs(2))
@@ -668,9 +681,13 @@ impl Client {
         info!("Reconnecting immediately (expected disconnect).");
         self.expected_disconnect.store(true, Ordering::Relaxed);
 
-        self.flush_inbound_commits_bounded(std::time::Duration::from_secs(2))
-            .await;
-        self.flush_offline_receipts();
+        // Same durable-before-receipts gate as disconnect().
+        if self
+            .flush_inbound_commits_bounded(std::time::Duration::from_secs(2))
+            .await
+        {
+            self.flush_offline_receipts();
+        }
         self.outbound_flush.close();
         self.outbound_flush
             .flush(&*self.runtime, std::time::Duration::from_secs(2))
@@ -768,11 +785,26 @@ impl Client {
         // chain and force a full SKDM re-fanout. A disconnect is not a logout.
         // Only clear on a successful flush; on a backend error keep the cache so
         // the dirty state isn't dropped and the next operation can persist it.
-        match self.flush_signal_cache().await {
-            Ok(()) => self.signal_cache.clear().await,
-            Err(e) => log::error!(
-                "cleanup_connection_state: signal cache flush failed, keeping cache to avoid dropping Signal state: {e:?}"
-            ),
+        //
+        // Exception: if the bounded commit above left entries in the batcher
+        // (timed out or its durable write failed), the cache holds their
+        // ratchet advances. Persisting those would make each redelivery an
+        // ackable duplicate; keeping them cached would make it decrypt as one
+        // in-process. Clearing WITHOUT flushing un-advances them instead —
+        // everything they cover is unacked and redelivers fresh. Committed
+        // state is not at risk: every earlier commit flushed the cache itself.
+        if self.inbound_commit_batch.has_entries() {
+            log::warn!(
+                "cleanup_connection_state: dropping unflushed Signal state for uncommitted drain entries; the server redelivers them"
+            );
+            self.signal_cache.clear().await;
+        } else {
+            match self.flush_signal_cache().await {
+                Ok(()) => self.signal_cache.clear().await,
+                Err(e) => log::error!(
+                    "cleanup_connection_state: signal cache flush failed, keeping cache to avoid dropping Signal state: {e:?}"
+                ),
+            }
         }
         // Reset semaphore to 1 permit for next offline sync.
         self.swap_message_semaphore(1);
@@ -783,6 +815,8 @@ impl Client {
         self.pending_device_sync.clear().await;
         // Reset offline sync state for next connection
         self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.offline_sync_finish_started
+            .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Same rule as receipts: uncommitted entries drop here and the server
         // redelivers them on the next connect.

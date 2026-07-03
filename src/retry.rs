@@ -451,8 +451,11 @@ impl Client {
                 );
                 self.signal_cache.delete_session(&signal_address).await;
                 drop(guard);
-                self.flush_signal_cache_logged("should_recreate_session", Some(&message_id))
-                    .await;
+                self.flush_signal_cache_batch_safe_logged(
+                    "should_recreate_session",
+                    Some(&message_id),
+                )
+                .await;
             }
         }
 
@@ -531,7 +534,7 @@ impl Client {
             .await?;
 
             self.send_node(stanza).await?;
-            self.flush_signal_cache().await?;
+            self.flush_signal_cache_batch_safe().await?;
         } else {
             // DM retry: pairwise resend to the requesting device only.
             // Use _resolved variant: resolved_jid is already in the correct
@@ -566,7 +569,7 @@ impl Client {
             .await?;
 
             self.send_node(stanza).await?;
-            self.flush_signal_cache().await?;
+            self.flush_signal_cache_batch_safe().await?;
         }
 
         Ok(())
@@ -686,8 +689,11 @@ impl Client {
                     let _guard = lock.lock().await;
                     self.signal_cache.delete_session(&signal_address).await;
                     drop(_guard);
-                    self.flush_signal_cache_logged("reg ID mismatch session deletion", None)
-                        .await;
+                    self.flush_signal_cache_batch_safe_logged(
+                        "reg ID mismatch session deletion",
+                        None,
+                    )
+                    .await;
                 }
             }
         }
@@ -759,7 +765,7 @@ impl Client {
                     let _guard = lock.lock().await;
                     self.signal_cache.delete_session(&signal_address).await;
                     drop(_guard);
-                    self.flush_signal_cache_logged(
+                    self.flush_signal_cache_batch_safe_logged(
                         "base key collision — forcing fresh session",
                         None,
                     )
@@ -1021,7 +1027,7 @@ impl Client {
         .await?;
 
         // Flush after session establishment
-        self.flush_signal_cache().await?;
+        self.flush_signal_cache_batch_safe().await?;
 
         if identity_change == wacore::libsignal::protocol::IdentityChange::ReplacedExisting {
             self.react_to_local_identity_change(requester_jid);

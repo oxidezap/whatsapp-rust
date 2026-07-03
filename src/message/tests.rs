@@ -5533,11 +5533,9 @@ async fn capturing_client(
     // other layers but not on this path.
     *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
     seed_test_pn(&client).await;
-    // Live-path semantics by default (flag, live permit count, batcher live);
-    // drain tests re-enter drain state themselves.
-    client.offline_sync_completed.store(true, Ordering::Relaxed);
-    client.swap_message_semaphore(64);
-    client.inbound_commit_batch.deactivate_for_tests();
+    // Live-path semantics by default; drain tests re-enter drain state
+    // themselves.
+    client.enter_live_mode_for_tests();
     (client, transport)
 }
 
@@ -6409,7 +6407,7 @@ async fn skdm_only_group_session_acknowledged_once_without_message_event() {
     assert_eq!(
         message_events_for_id(&rx, id),
         (0, 0),
-        "SKDM-only messages must not surface Event::Message"
+        "SKDM-only messages must not surface Event::Messages"
     );
 }
 
@@ -6459,7 +6457,7 @@ async fn session_plaintext_decode_error_is_not_acked_as_skdm_only() {
     assert_eq!(
         message_events_for_id(&rx, id),
         (0, 0),
-        "invalid plaintext must not surface Event::Message"
+        "invalid plaintext must not surface Event::Messages"
     );
     let mut nack_code = None;
     for _ in 0..80 {
@@ -6764,7 +6762,7 @@ async fn status_skdm_only_session_uses_one_status_receipt() {
     assert_eq!(
         message_events_for_id(&rx, id),
         (0, 0),
-        "status SKDM-only messages must not surface Event::Message"
+        "status SKDM-only messages must not surface Event::Messages"
     );
 }
 
@@ -8337,7 +8335,7 @@ async fn msmsg_decrypts_when_secret_is_stored() {
     .await;
     assert!(
         got.is_some(),
-        "msmsg decryption + dispatch must surface Event::Message"
+        "msmsg decryption + dispatch must surface Event::Messages"
     );
 }
 
@@ -9627,7 +9625,7 @@ async fn msmsg_alternate_lookup_resolves_lid_to_stored_pn() {
 /// End-to-end: phone fanout dispatches a wa::Message carrying the
 /// outbound `messageSecret`; later the Meta AI bot replies via msmsg
 /// referencing the same id. The captured secret must let the reply
-/// decrypt and surface `Event::Message`.
+/// decrypt and surface `Event::Messages`.
 #[tokio::test]
 async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
     use crate::store::commands::DeviceCommand;

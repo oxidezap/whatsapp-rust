@@ -382,8 +382,11 @@ impl TestClient {
         timeout_secs: u64,
     ) -> anyhow::Result<Arc<Event>> {
         let text = text.to_string();
+        // Match anywhere in the batch: a drain event can carry the target
+        // text behind other messages.
         self.wait_for_event(timeout_secs, move |e| {
-            e.message_text() == Some(text.as_str())
+            e.messages()
+                .any(|m| m.message.conversation.as_deref() == Some(text.as_str()))
         })
         .await
     }

@@ -397,7 +397,7 @@ async fn test_delivery_receipts_flushed_on_disconnect() -> anyhow::Result<()> {
     info!("A sent {N} messages: {msg_ids:?}");
 
     // Wait for every message event so later-arriving ones can't slip past the
-    // disconnect. Event::Message dispatches right after the receipt task is
+    // disconnect. Event::Messages dispatches right after the receipt task is
     // spawned, so by then the receipt may still be queued on the runtime.
     let mut seen = std::collections::HashSet::<usize>::new();
     while seen.len() < N {
