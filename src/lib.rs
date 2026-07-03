@@ -130,6 +130,10 @@ pub use features::{
 
 pub mod bot;
 pub mod lid_pn_cache;
+#[cfg(feature = "signal")]
+pub mod shutdown;
+#[cfg(feature = "signal")]
+pub use shutdown::shutdown_signal;
 pub mod spam_report;
 pub mod sync_task;
 pub mod version;
@@ -143,6 +147,8 @@ pub mod prelude {
     #[cfg(feature = "tokio-runtime")]
     pub use crate::runtime_impl::TokioRuntime;
     pub use crate::send::{SendError, SendOptions, SendResult};
+    #[cfg(feature = "signal")]
+    pub use crate::shutdown::shutdown_signal;
     #[cfg(feature = "sqlite-storage")]
     pub use crate::store::SqliteStore;
     pub use crate::types::events::{Event, EventKind};

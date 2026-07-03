@@ -978,7 +978,8 @@ async fn run_bot(mode: Mode) -> Result<()> {
 
     tokio::select! {
         _ = bot.run() => {}
-        _ = tokio::signal::ctrl_c() => { info!("shutting down"); }
+        // SIGINT or SIGTERM: react to `docker stop`/k8s, not just Ctrl+C.
+        _ = whatsapp_rust::shutdown_signal() => { info!("shutting down"); }
     }
     Ok(())
 }
