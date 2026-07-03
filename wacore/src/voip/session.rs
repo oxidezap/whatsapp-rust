@@ -6,7 +6,7 @@ use super::e2e_srtp::{
     E2eSrtpKeys, RecvRocTracker, RocTracker, append_warp_mi_tag, crypt_payload, derive_e2e_keys,
 };
 use super::rtp::{
-    RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, encode_rtp_header, parse_rtp_header,
+    RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, encode_rtp_header_into, parse_rtp_header,
     rtp_header_byte_length,
 };
 use super::ssrc::format_e2e_srtp_participant_id;
@@ -199,7 +199,6 @@ impl MediaPipeline {
     pub fn protect_audio(&mut self, opus_payload: &[u8]) -> Vec<u8> {
         let header = self.rtp.next_packet(opus_payload, false);
         let roc = self.send_roc.advance(header.sequence_number);
-        let header_bytes = encode_rtp_header(&header);
         let encrypted = crypt_payload(
             &self.send_keys,
             header.ssrc,
@@ -207,7 +206,11 @@ impl MediaPipeline {
             roc,
             opus_payload,
         );
-        let mut packet = header_bytes;
+        // One buffer sized for header + ciphertext: the header writes straight
+        // into it (no throwaway Vec), and the exact capacity avoids the growth
+        // realloc the extend would otherwise trigger.
+        let mut packet = Vec::with_capacity(header.byte_size() + encrypted.len());
+        encode_rtp_header_into(&header, &mut packet);
         packet.extend_from_slice(&encrypted);
         append_warp_mi_tag(&self.send_keys.auth_key, &packet, roc, self.warp_mi_tag_len)
     }

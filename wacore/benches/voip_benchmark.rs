@@ -374,3 +374,94 @@ fn call_second_two_peers(bencher: Bencher) {
         })
         .bench_refs(|(a, b, relay)| simulate_call_second(a, b, relay));
 }
+
+// ---- Packet framing: the RTP/STUN/RTCP header parse+encode the media plane runs per packet,
+// separate from the codec/crypto rows above. AllocProfiler makes the per-packet Vec churn on the
+// encode path visible; the parse rows are alloc-free stack decodes whose signal is instruction
+// count under the CodSpeed runner.
+mod framing {
+    use super::*;
+    use wacore::voip::rtcp::{RtcpSenderStats, build_sender_report, parse_rtcp_sender_ssrc};
+    use wacore::voip::rtp::{RtpHeader, encode_rtp_header, parse_rtp_header};
+    use wacore::voip::stun::parse_stun_attributes;
+
+    fn sample_rtp_header() -> RtpHeader {
+        RtpHeader {
+            marker: false,
+            payload_type: 120,
+            sequence_number: 0x1234,
+            timestamp: 0x0009_6000,
+            ssrc: 0xDEAD_BEEF,
+            extension_word: Some(0x3001_0000),
+        }
+    }
+
+    // A STUN allocate-success carrying the attributes a relay handshake actually returns: a 16-byte
+    // relay-token, a 20-byte message-integrity, and a 4-byte lifetime. Header (20) + three TLVs.
+    fn sample_stun_packet() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&[0x01, 0x02]); // allocate-success type
+        p.extend_from_slice(&[0x00, 0x00]); // body length patched below
+        p.extend_from_slice(&0x2112_A442u32.to_be_bytes()); // magic cookie
+        p.extend_from_slice(&[0xAB; 12]); // transaction id
+        let mut push_attr = |ty: u16, val: &[u8]| {
+            p.extend_from_slice(&ty.to_be_bytes());
+            p.extend_from_slice(&(val.len() as u16).to_be_bytes());
+            p.extend_from_slice(val);
+            while p.len() % 4 != 0 {
+                p.push(0);
+            }
+        };
+        push_attr(0x4000, &[0x11; 16]);
+        push_attr(0x0008, &[0x22; 20]);
+        push_attr(0x000D, &[0x00, 0x00, 0x02, 0x58]);
+        let body = (p.len() - 20) as u16;
+        p[2..4].copy_from_slice(&body.to_be_bytes());
+        p
+    }
+
+    #[divan::bench]
+    fn parse_rtp(bencher: Bencher) {
+        bencher
+            .with_inputs(|| encode_rtp_header(&sample_rtp_header()))
+            .bench_refs(|pkt| black_box(parse_rtp_header(black_box(pkt))));
+    }
+
+    #[divan::bench]
+    fn encode_rtp(bencher: Bencher) {
+        bencher
+            .with_inputs(sample_rtp_header)
+            .bench_refs(|h| black_box(encode_rtp_header(black_box(h))));
+    }
+
+    #[divan::bench]
+    fn parse_stun(bencher: Bencher) {
+        bencher.with_inputs(sample_stun_packet).bench_refs(|pkt| {
+            // Consume inside the closure: attributes borrow `pkt`, so they
+            // cannot be returned. Sum the value lengths to keep the parse live.
+            black_box(
+                parse_stun_attributes(black_box(pkt))
+                    .iter()
+                    .map(|a| a.value.len())
+                    .sum::<usize>(),
+            )
+        });
+    }
+
+    #[divan::bench]
+    fn parse_rtcp(bencher: Bencher) {
+        bencher
+            .with_inputs(|| {
+                build_sender_report(
+                    0xDEAD_BEEF,
+                    &RtcpSenderStats {
+                        packets_sent: 1000,
+                        octets_sent: 40_000,
+                        rtp_timestamp: 0x0009_6000,
+                    },
+                    1_700_000_000_000,
+                )
+            })
+            .bench_refs(|sr| black_box(parse_rtcp_sender_ssrc(black_box(sr))));
+    }
+}

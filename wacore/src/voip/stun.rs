@@ -237,28 +237,38 @@ pub fn is_whatsapp_pong(data: &[u8], transaction_id: Option<&[u8]>) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StunAttribute {
+pub struct StunAttribute<'a> {
     pub attr_type: u16,
-    pub value: Vec<u8>,
+    /// Borrows the packet: parsing a handshake's attributes no longer copies
+    /// each value out (it was one heap `Vec` per attribute).
+    pub value: &'a [u8],
 }
 
-/// Parse the STUN attributes after the 20-byte header.
-pub fn parse_stun_attributes(data: &[u8]) -> Vec<StunAttribute> {
+/// The 4-byte STUN attribute TLV header (type, length), as a typed view so the
+/// walk reads fields instead of doing index math per attribute.
+#[derive(zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable, zerocopy::Unaligned)]
+#[repr(C)]
+struct StunAttrHeader {
+    attr_type: zerocopy::big_endian::U16,
+    length: zerocopy::big_endian::U16,
+}
+
+/// Parse the STUN attributes after the 20-byte header, borrowing each value.
+pub fn parse_stun_attributes(data: &[u8]) -> Vec<StunAttribute<'_>> {
     if !is_stun_packet(data) || data.len() < 20 {
         return Vec::new();
     }
     let mut attrs = Vec::new();
     let mut off = 20;
-    while off + 4 <= data.len() {
-        let attr_type = ((data[off] as u16) << 8) | data[off + 1] as u16;
-        let len = ((data[off + 2] as usize) << 8) | data[off + 3] as usize;
+    while let Ok((hdr, _)) = zerocopy::Ref::<_, StunAttrHeader>::from_prefix(&data[off..]) {
+        let len = hdr.length.get() as usize;
         off += 4;
         if off + len > data.len() {
             break;
         }
         attrs.push(StunAttribute {
-            attr_type,
-            value: data[off..off + len].to_vec(),
+            attr_type: hdr.attr_type.get(),
+            value: &data[off..off + len],
         });
         off += len + pad4(len);
     }
