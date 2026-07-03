@@ -333,14 +333,17 @@ impl Client {
             self.flush_signal_cache_logged("commit_batch", None).await;
         }
 
-        let batch = MessageBatch {
-            messages: items.into(),
-            origin,
-        };
-        self.core.event_bus.dispatch(Event::Messages(batch.clone()));
-        for item in batch.messages.iter() {
+        // Acks first (everything durable by now): handle_event runs
+        // synchronously, so a handler that panics or blocks must not be able
+        // to suppress acks for messages the consumer already owns — the
+        // pre-batch at-most-once path acked before dispatching too.
+        for item in items.iter() {
             self.ack_received_message(&item.info);
         }
+        self.core.event_bus.dispatch(Event::Messages(MessageBatch {
+            messages: items,
+            origin,
+        }));
     }
 }
 
