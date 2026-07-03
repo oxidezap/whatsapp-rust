@@ -35,7 +35,22 @@ impl Client {
         &self,
         request: SpamReportRequest,
     ) -> Result<SpamReportResult, IqError> {
-        let spec = SpamReportSpec::new(request);
+        use wacore::iq::abprops::web;
+
+        let mut spec = SpamReportSpec::new(request);
+
+        // Attach the reported contact's tctoken so the report is accepted for a
+        // privacy-restricted account, matching WA Web's OutSpamTCTokenMixin.
+        if self
+            .ab_props()
+            .is_enabled(web::ENABLE_SPAM_REPORT_IQ_WITH_PRIVACY_TOKEN)
+            .await
+            && let Some(reported) = spec.request.from_jid.clone()
+            && let Some(token) = self.lookup_tc_token_for_jid(&reported).await
+        {
+            spec = spec.with_tc_token(token);
+        }
+
         self.execute(spec).await
     }
 }

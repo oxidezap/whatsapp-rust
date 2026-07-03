@@ -18,10 +18,11 @@
 //! ```
 
 use crate::iq::spec::IqSpec;
+use crate::iq::tctoken::build_tc_token_node;
 use crate::request::InfoQuery;
 use crate::types::spam_report::{SpamReportRequest, SpamReportResult, build_spam_list_node};
 use wacore_binary::{Jid, Server};
-use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
+use wacore_binary::{Node, NodeContent, NodeContentRef, NodeRef};
 
 // Re-export types for convenience
 pub use crate::types::spam_report::{
@@ -32,11 +33,23 @@ pub use crate::types::spam_report::{
 #[derive(Debug, Clone)]
 pub struct SpamReportSpec {
     pub request: SpamReportRequest,
+    /// Optional trusted-contact token for the reported contact, matching WA
+    /// Web's `OutSpamTCTokenMixin` (gated on `enable_spam_report_iq_with_privacy_token`).
+    pub tc_token: Option<Vec<u8>>,
 }
 
 impl SpamReportSpec {
     pub fn new(request: SpamReportRequest) -> Self {
-        Self { request }
+        Self {
+            request,
+            tc_token: None,
+        }
+    }
+
+    /// Include the reported contact's tctoken in the spam report IQ.
+    pub fn with_tc_token(mut self, token: Vec<u8>) -> Self {
+        self.tc_token = Some(token);
+        self
     }
 }
 
@@ -44,12 +57,15 @@ impl IqSpec for SpamReportSpec {
     type Response = SpamReportResult;
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        let spam_list_node = build_spam_list_node(&self.request);
+        let mut children: Vec<Node> = vec![build_spam_list_node(&self.request)];
+        if let Some(token) = &self.tc_token {
+            children.push(build_tc_token_node(token));
+        }
 
         InfoQuery::set(
             "spam",
             Jid::new("", Server::Pn),
-            Some(NodeContent::Nodes(vec![spam_list_node])),
+            Some(NodeContent::Nodes(children)),
         )
     }
 
@@ -98,6 +114,33 @@ mod tests {
             );
         } else {
             panic!("Expected NodeContent::Nodes");
+        }
+    }
+
+    #[test]
+    fn test_spam_report_spec_build_iq_with_tctoken() {
+        let request = SpamReportRequest {
+            message_id: "TEST123".to_string(),
+            message_timestamp: 1234567890,
+            spam_flow: SpamFlow::MessageMenu,
+            ..Default::default()
+        };
+
+        let iq = SpamReportSpec::new(request)
+            .with_tc_token(vec![0xCA, 0xFE])
+            .build_iq();
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("Expected NodeContent::Nodes");
+        };
+        assert!(nodes.iter().any(|n| n.tag == "spam_list"));
+        let tctoken = nodes
+            .iter()
+            .find(|n| n.tag == "tctoken")
+            .expect("spam report should carry a tctoken when set");
+        match &tctoken.content {
+            Some(NodeContent::Bytes(b)) => assert_eq!(b, &[0xCA, 0xFE]),
+            _ => panic!("tctoken should carry bytes"),
         }
     }
 

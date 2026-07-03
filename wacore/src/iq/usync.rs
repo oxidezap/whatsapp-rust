@@ -52,6 +52,7 @@
 
 use crate::WireEnum;
 use crate::iq::spec::IqSpec;
+use crate::iq::tctoken::build_tc_token_node;
 use crate::request::InfoQuery;
 use crate::stanza::business::VerifiedName;
 use anyhow::anyhow;
@@ -500,6 +501,11 @@ impl IqSpec for IsOnWhatsAppSpec {
 pub struct UserInfoSpec {
     pub jids: Vec<Jid>,
     pub sid: String,
+    /// Per-user (bare user string) trusted-contact token, attached to the
+    /// matching `<user>` node for privacy-gated subprotocols (status/about),
+    /// matching WA Web's `USyncStatusProtocol.getUserElement` /
+    /// `USyncUser.withTcToken`.
+    pub tc_tokens: HashMap<String, Vec<u8>>,
 }
 
 impl UserInfoSpec {
@@ -507,7 +513,14 @@ impl UserInfoSpec {
         Self {
             jids,
             sid: sid.into(),
+            tc_tokens: HashMap::new(),
         }
+    }
+
+    /// Attach per-user trusted-contact tokens keyed by the query JID's user part.
+    pub fn with_tc_tokens(mut self, tc_tokens: HashMap<String, Vec<u8>>) -> Self {
+        self.tc_tokens = tc_tokens;
+        self
     }
 }
 
@@ -531,9 +544,11 @@ impl IqSpec for UserInfoSpec {
             .jids
             .iter()
             .map(|jid| {
-                NodeBuilder::new("user")
-                    .attr("jid", jid.to_non_ad())
-                    .build()
+                let mut builder = NodeBuilder::new("user").attr("jid", jid.to_non_ad());
+                if let Some(token) = self.tc_tokens.get(jid.user.as_str()) {
+                    builder = builder.children([build_tc_token_node(token)]);
+                }
+                builder.build()
             })
             .collect();
 
@@ -1353,6 +1368,41 @@ mod tests {
         assert_eq!(info.devices_error.as_ref().unwrap().code, Some(500));
         assert!(!info.is_business);
         assert_eq!(info.business_error.as_ref().unwrap().code, Some(406));
+    }
+
+    #[test]
+    fn user_info_attaches_per_user_tctoken() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let mut tokens = HashMap::new();
+        tokens.insert("1234567890".to_string(), vec![0xDE, 0xAD]);
+        let spec = UserInfoSpec::new(vec![jid], "sid").with_tc_tokens(tokens);
+
+        let iq = spec.build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected usync nodes");
+        };
+        let list = nodes[0].get_children_by_tag("list").next().unwrap();
+        let user = list.get_children_by_tag("user").next().unwrap();
+        let tctoken = user
+            .get_children_by_tag("tctoken")
+            .next()
+            .expect("user node should carry a tctoken");
+        match &tctoken.content {
+            Some(NodeContent::Bytes(b)) => assert_eq!(b, &[0xDE, 0xAD]),
+            _ => panic!("tctoken should carry bytes"),
+        }
+    }
+
+    #[test]
+    fn user_info_without_tctoken_omits_it() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let iq = UserInfoSpec::new(vec![jid], "sid").build_iq();
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected usync nodes");
+        };
+        let list = nodes[0].get_children_by_tag("list").next().unwrap();
+        let user = list.get_children_by_tag("user").next().unwrap();
+        assert!(user.get_children_by_tag("tctoken").next().is_none());
     }
 
     #[test]
