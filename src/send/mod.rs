@@ -594,6 +594,7 @@ impl Client {
         self.record_identity_on_span(&tracing::Span::current());
 
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
+        self.stats.record_message_sent();
         wacore::telemetry::send(match to.server {
             wacore_binary::Server::Group => "group",
             wacore_binary::Server::Broadcast => "status",
@@ -702,6 +703,7 @@ impl Client {
 
         // Status posts don't go through send_message_with_options, so count them here.
         let _t = wacore::telemetry::timer(wacore::telemetry::SEND_DURATION);
+        self.stats.record_message_sent();
         wacore::telemetry::send("status");
 
         let to = Jid::status_broadcast();

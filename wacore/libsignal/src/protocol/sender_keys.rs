@@ -562,6 +562,21 @@ impl SenderKeyRecord {
     pub fn serialize(&self) -> Result<Vec<u8>, SignalProtocolError> {
         Ok(self.as_protobuf().encode_to_vec())
     }
+
+    /// Estimated in-memory footprint proxy: encoded size of each state's
+    /// structure plus the out-of-order message-key backlog (held outside the
+    /// protobuf in memory). Size computation only — nothing is cloned or
+    /// encoded. Used by per-session memory reports.
+    pub fn estimated_size(&self) -> usize {
+        let mut cache = buffa::SizeCache::new();
+        self.states
+            .iter()
+            .map(|s| {
+                s.state.compute_size(&mut cache) as usize
+                    + s.message_keys.len() * std::mem::size_of::<StoredMessageKey>()
+            })
+            .sum()
+    }
 }
 
 #[cfg(test)]

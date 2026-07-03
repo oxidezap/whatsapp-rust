@@ -13,11 +13,11 @@ impl Client {
     /// [`send_node`](Client::send_node) for normal stanza sending.
     pub async fn send_raw_bytes(&self, plaintext: Vec<u8>) -> Result<(), ClientError> {
         let noise_socket = self.get_noise_socket().await?;
+        // Wire bytes and the last-sent timestamp are recorded by the noise
+        // sender task at the actual transport write.
         noise_socket
             .encrypt_and_send(bytes::Bytes::from(plaintext))
             .await?;
-        self.last_data_sent_ms
-            .store(wacore::time::now_millis().max(0) as u64, Ordering::Relaxed);
         Ok(())
     }
 

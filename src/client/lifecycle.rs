@@ -129,8 +129,7 @@ impl Client {
             ik_handshake_failures: Arc::new(AtomicU32::new(0)),
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
-            last_data_received_ms: Arc::new(AtomicU64::new(0)),
-            last_data_sent_ms: Arc::new(AtomicU64::new(0)),
+            stats: Arc::new(wacore::stats::SessionStats::new()),
 
             transport: Arc::new(Mutex::new(None)),
             transport_events: Arc::new(Mutex::new(None)),
@@ -382,10 +381,12 @@ impl Client {
             // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 self.auto_reconnect_errors.store(0, Ordering::Relaxed);
+                self.stats.record_reconnect();
                 info!("Expected disconnect (e.g., 515), reconnecting immediately...");
                 continue;
             }
 
+            self.stats.record_reconnect();
             let error_count = self.auto_reconnect_errors.fetch_add(1, Ordering::SeqCst);
             // WA Web: Fibonacci backoff with 10% jitter, max 900s.
             // algo: { type: "fibonacci", first: 1000, second: 1000 }
@@ -493,6 +494,7 @@ impl Client {
             &self.ik_handshake_failures,
             transport.clone(),
             &mut transport_events,
+            Some(self.stats.clone()),
         )
         .await
         {
@@ -745,8 +747,7 @@ impl Client {
         self.swap_message_semaphore(1);
         // Reset dead-socket timestamps so stale values from the previous
         // connection don't trigger an immediate reconnect on the next one.
-        self.last_data_received_ms.store(0, Ordering::Relaxed);
-        self.last_data_sent_ms.store(0, Ordering::Relaxed);
+        self.stats.reset_connection_activity();
         self.pending_device_sync.clear().await;
         // Reset offline sync state for next connection
         self.offline_sync_completed.store(false, Ordering::Relaxed);

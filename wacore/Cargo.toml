@@ -18,7 +18,6 @@ ignored = ["getrandom"]
 [features]
 default = ["simd"]
 simd = ["wacore-appstate/simd"]
-debug-diagnostics = []
 debug-snapshots = []
 # Optional observability: emit tracing spans/events. Off by default (no dep).
 tracing = ["dep:tracing"]

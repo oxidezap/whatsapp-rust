@@ -308,6 +308,7 @@ async fn cold_start_xx_then_cached_ik_reconnect() {
         counter2.as_ref(),
         transport.clone(),
         &mut events_rx,
+        None,
     )
     .await;
 
@@ -351,6 +352,7 @@ async fn cold_start_xx_then_cached_ik_reconnect() {
         counter3.as_ref(),
         transport2.clone(),
         &mut events_rx2,
+        None,
     )
     .await;
 
@@ -450,6 +452,7 @@ async fn post_xxfallback_failure_does_not_invalidate_ik_cache() {
         counter.as_ref(),
         transport.clone(),
         &mut events_rx,
+        None,
     )
     .await;
     task.await.unwrap();
@@ -519,6 +522,7 @@ async fn ik_continue_does_not_overwrite_cached_chain() {
         counter.as_ref(),
         transport.clone(),
         &mut events_rx,
+        None,
     )
     .await;
     task.await.unwrap();
@@ -566,6 +570,7 @@ async fn xx_after_pair_success_persists_cert_chain() {
         counter.as_ref(),
         transport1.clone(),
         &mut events_rx1,
+        None,
     )
     .await
     .expect("unpaired XX must succeed");
@@ -595,6 +600,7 @@ async fn xx_after_pair_success_persists_cert_chain() {
         counter.as_ref(),
         transport2.clone(),
         &mut events_rx2,
+        None,
     )
     .await
     .expect("paired XX must succeed");
@@ -637,6 +643,7 @@ async fn unpaired_xx_does_not_persist_cert_chain() {
         counter.as_ref(),
         transport.clone(),
         &mut events_rx,
+        None,
     )
     .await;
     task.await.unwrap();
@@ -768,6 +775,7 @@ async fn ik_rejected_recovers_via_xxfallback_and_repopulates_cache() {
         counter.as_ref(),
         transport.clone(),
         &mut events_rx,
+        None,
     )
     .await;
     task.await.unwrap();
@@ -861,6 +869,7 @@ async fn ik_with_stale_cache_invalidates_and_increments_counter() {
         counter.as_ref(),
         transport.clone(),
         &mut events_rx,
+        None,
     )
     .await;
 

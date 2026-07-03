@@ -44,6 +44,7 @@ pub mod send;
 pub mod session;
 pub mod shortcake;
 pub mod stanza;
+pub mod stats;
 pub mod sticker_pack;
 
 pub mod store;

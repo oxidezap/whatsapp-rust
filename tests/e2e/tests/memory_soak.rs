@@ -12,7 +12,7 @@ use log::info;
 use std::io::Read as _;
 use wacore::types::events::Event;
 use whatsapp_rust::Jid;
-use whatsapp_rust::client::MemoryDiagnostics;
+use whatsapp_rust::client::MemoryReport;
 use whatsapp_rust::features::{GroupCreateOptions, GroupParticipantOptions};
 use whatsapp_rust::waproto::whatsapp as wa;
 
@@ -45,27 +45,28 @@ fn rss_kib() -> usize {
 #[derive(Debug, Clone)]
 struct Snapshot {
     round: usize,
-    diag: MemoryDiagnostics,
+    diag: MemoryReport,
     rss_kib: usize,
     #[cfg(feature = "dhat-heap")]
     heap_bytes: usize,
 }
 
 async fn snapshot(label: &str, round: usize, client: &whatsapp_rust::client::Client) -> Snapshot {
-    let diag = client.memory_diagnostics().await;
+    let diag = client.memory_report().await;
     let rss = rss_kib();
     #[cfg(feature = "dhat-heap")]
     let heap_bytes = dhat::HeapStats::get().curr_bytes;
 
     info!(
-        "[round {round:>4}] {label} | RSS={rss}K | bounded(recent_msg={},session_locks={},chat_lanes={},device_reg={}) | unbounded(signal_sess={},signal_id={},signal_sk={},resp_waiters={},pending_retries={},presence_subs={},app_state_kr={},app_state_sync={})",
-        diag.recent_messages,
+        "[round {round:>4}] {label} | RSS={rss}K | est_heap={}B | bounded(recent_msg={},session_locks={},chat_lanes={},device_reg={}) | unbounded(signal_sess={},signal_id={},signal_sk={},resp_waiters={},pending_retries={},presence_subs={},app_state_kr={},app_state_sync={})",
+        diag.total_estimated_bytes(),
+        diag.recent_messages.entries,
         diag.session_locks,
         diag.chat_lanes,
-        diag.device_registry_cache,
-        diag.signal_cache_sessions,
-        diag.signal_cache_identities,
-        diag.signal_cache_sender_keys,
+        diag.device_registry_cache.entries,
+        diag.signal_sessions.entries,
+        diag.signal_identities.entries,
+        diag.signal_sender_keys.entries,
         diag.response_waiters,
         diag.pending_retries,
         diag.presence_subscriptions,
@@ -127,18 +128,18 @@ fn analyze_growth(label: &str, snapshots: &[Snapshot]) {
         ),
         (
             "signal_sessions",
-            first.diag.signal_cache_sessions,
-            last.diag.signal_cache_sessions,
+            first.diag.signal_sessions.entries as usize,
+            last.diag.signal_sessions.entries as usize,
         ),
         (
             "signal_identities",
-            first.diag.signal_cache_identities,
-            last.diag.signal_cache_identities,
+            first.diag.signal_identities.entries as usize,
+            last.diag.signal_identities.entries as usize,
         ),
         (
             "signal_sender_keys",
-            first.diag.signal_cache_sender_keys,
-            last.diag.signal_cache_sender_keys,
+            first.diag.signal_sender_keys.entries as usize,
+            last.diag.signal_sender_keys.entries as usize,
         ),
         (
             "chatstate_handlers",
@@ -179,8 +180,8 @@ fn analyze_growth(label: &str, snapshots: &[Snapshot]) {
     let bounded = [
         (
             "recent_messages",
-            first.diag.recent_messages,
-            last.diag.recent_messages,
+            first.diag.recent_messages.entries,
+            last.diag.recent_messages.entries,
         ),
         (
             "session_locks",
@@ -190,10 +191,14 @@ fn analyze_growth(label: &str, snapshots: &[Snapshot]) {
         ("chat_lanes", first.diag.chat_lanes, last.diag.chat_lanes),
         (
             "device_registry_cache",
-            first.diag.device_registry_cache,
-            last.diag.device_registry_cache,
+            first.diag.device_registry_cache.entries,
+            last.diag.device_registry_cache.entries,
         ),
-        ("group_cache", first.diag.group_cache, last.diag.group_cache),
+        (
+            "group_cache",
+            first.diag.group_cache.entries,
+            last.diag.group_cache.entries,
+        ),
     ];
     info!("  Bounded caches:");
     for (name, fv, lv) in &bounded {

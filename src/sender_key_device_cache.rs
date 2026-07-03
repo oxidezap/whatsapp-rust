@@ -110,8 +110,23 @@ impl SenderKeyDeviceCache {
         }
     }
 
-    #[cfg(feature = "debug-diagnostics")]
-    pub(crate) fn entry_count(&self) -> u64 {
-        self.inner.entry_count()
+    /// Approximate entry count plus estimated retained bytes.
+    pub(crate) fn memory_stats(&self) -> wacore::stats::CollectionStats {
+        let bytes: usize = self
+            .inner
+            .iter()
+            .map(|(k, v)| {
+                k.capacity()
+                    + v.devices
+                        .iter()
+                        .map(|(user, by_device)| {
+                            user.len()
+                                + std::mem::size_of::<(Arc<str>, HashMap<u16, bool>)>()
+                                + by_device.capacity() * std::mem::size_of::<(u16, bool)>()
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+        wacore::stats::CollectionStats::new(self.inner.entry_count(), bytes as u64)
     }
 }

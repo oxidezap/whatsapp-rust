@@ -2201,7 +2201,7 @@ mod tests {
     }
 
     /// The resend rate limiter is reachable and tunable through the public
-    /// `Client` API, and its drops surface on `resends_throttled_total`. Covers
+    /// `Client` API, and its drops surface on `stats().resends_throttled`. Covers
     /// the wiring the `handle_retry_receipt` hook relies on; the bucket logic
     /// itself is unit-tested in `resend_rate_limiter`.
     #[tokio::test]
@@ -2220,7 +2220,7 @@ mod tests {
         }
         assert_eq!(allowed, 3, "client honors the configured per-chat burst");
         assert_eq!(
-            client.resends_throttled_total(),
+            client.stats().resends_throttled,
             7,
             "public counter tracks dropped resends"
         );
@@ -2304,7 +2304,7 @@ mod tests {
             "a throttled retry returns Ok(()), not an error"
         );
         assert_eq!(
-            client.resends_throttled_total(),
+            client.stats().resends_throttled,
             1,
             "the resend was dropped by the limiter"
         );

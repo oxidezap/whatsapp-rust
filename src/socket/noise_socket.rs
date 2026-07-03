@@ -39,6 +39,19 @@ impl NoiseSocket {
         write_key: NoiseCipher,
         read_key: NoiseCipher,
     ) -> Self {
+        Self::with_stats(runtime, transport, write_key, read_key, None)
+    }
+
+    /// Like [`Self::new`], recording sent frames into `stats` (the main WA
+    /// session socket passes the client's [`SessionStats`]; VoIP relay
+    /// sockets and tests pass `None`).
+    pub fn with_stats(
+        runtime: Arc<dyn Runtime>,
+        transport: Arc<dyn Transport>,
+        write_key: NoiseCipher,
+        read_key: NoiseCipher,
+        stats: Option<Arc<wacore::stats::SessionStats>>,
+    ) -> Self {
         let write_key = Arc::new(write_key);
         let read_key = Arc::new(read_key);
 
@@ -56,6 +69,7 @@ impl NoiseSocket {
             transport_clone,
             write_key_clone,
             send_job_rx,
+            stats,
         )));
 
         Self {
@@ -74,6 +88,7 @@ impl NoiseSocket {
         transport: Arc<dyn Transport>,
         write_key: Arc<NoiseCipher>,
         send_job_rx: async_channel::Receiver<SendJob>,
+        stats: Option<Arc<wacore::stats::SessionStats>>,
     ) {
         let mut write_counter: u32 = 0;
         let mut enc_buf = Vec::with_capacity(4096);
@@ -90,6 +105,7 @@ impl NoiseSocket {
                 job.plaintext,
                 &mut enc_buf,
                 &mut out_buf,
+                stats.as_deref(),
             )
             .await;
 
@@ -98,6 +114,7 @@ impl NoiseSocket {
     }
 
     /// Process a single send job: encrypt and send the message.
+    #[allow(clippy::too_many_arguments)]
     async fn process_send_job(
         runtime: &Arc<dyn Runtime>,
         transport: &Arc<dyn Transport>,
@@ -106,6 +123,7 @@ impl NoiseSocket {
         plaintext: bytes::Bytes,
         enc_buf: &mut Vec<u8>,
         out_buf: &mut BytesMut,
+        stats: Option<&wacore::stats::SessionStats>,
     ) -> SendResult {
         let counter = *write_counter;
         // Refuse to wrap the per-direction frame counter: reusing an AES-GCM nonce
@@ -151,8 +169,12 @@ impl NoiseSocket {
         // freeze() converts it to Bytes. The original out_buf retains its
         // allocated capacity for the next frame.
         let frame = out_buf.split().freeze();
+        let wire_bytes = frame.len();
         if let Err(e) = transport.send(frame).await {
             return Err(EncryptSendError::transport(e));
+        }
+        if let Some(stats) = stats {
+            stats.record_frame_sent(wire_bytes);
         }
 
         *write_counter = write_counter.wrapping_add(1);
@@ -465,6 +487,38 @@ mod tests {
                 size, expected_max, actual_encrypted_size
             );
         }
+    }
+
+    /// Locks the SessionStats wire accounting to the transport truth: bytes
+    /// counted must equal the frames the transport actually saw.
+    #[tokio::test]
+    async fn session_stats_match_transport_bytes() {
+        let factory = crate::transport::mock::CapturingMockTransportFactory::new();
+        let transport = factory.transport();
+        let key = [0u8; 32];
+        let stats = Arc::new(wacore::stats::SessionStats::new());
+
+        let socket = NoiseSocket::with_stats(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            transport.clone(),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            Some(stats.clone()),
+        );
+
+        for size in [0usize, 100, 5000] {
+            socket
+                .encrypt_and_send(bytes::Bytes::from(vec![0u8; size]))
+                .await
+                .expect("send");
+        }
+
+        let sent = transport.sent();
+        let wire_total: usize = sent.iter().map(|f| f.len()).sum();
+        let snap = stats.snapshot();
+        assert_eq!(snap.frames_sent, sent.len() as u64);
+        assert_eq!(snap.bytes_sent, wire_total as u64);
+        assert!(snap.last_data_sent_ms > 0);
     }
 
     /// Tests edge cases for buffer sizing

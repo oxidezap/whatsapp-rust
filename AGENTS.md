@@ -42,5 +42,6 @@ Read these when working on the relevant area:
 - `agent_docs/e2e_testing.md` — E2E test patterns, file organization, event-driven waiting
 - `agent_docs/debugging.md` — evcxr REPL, binary protocol debugging
 - `agent_docs/binary_size_ci.md` — size-tracking CI: metrics, budgets, baseline semantics
+- `agent_docs/observability.md` — per-session stats (I/O, memory report, TaskInstrument/CPU), design rules
 
 When adding comments to the code, dont be so verbose, also only explain why, not what

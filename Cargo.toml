@@ -106,7 +106,6 @@ yoke = { version = "0.8", features = ["derive"] }
 zlib-rs = { version = "0.6.5", default-features = false, features = ["std", "rust-allocator"] }
 
 [features]
-debug-diagnostics = ["wacore/debug-diagnostics"]
 debug-snapshots = ["wacore/debug-snapshots"]
 # Optional observability. Off by default: no `tracing` dep, zero overhead.
 # Emits tracing spans/events only; the application installs the subscriber

@@ -162,6 +162,7 @@ pub async fn do_handshake(
     ik_handshake_failures: &AtomicU32,
     transport: Arc<dyn Transport>,
     transport_events: &mut async_channel::Receiver<TransportEvent>,
+    stats: Option<Arc<wacore::stats::SessionStats>>,
 ) -> Result<Arc<NoiseSocket>> {
     let device_snapshot = persistence_manager.get_device_snapshot();
     let now_secs = wacore::time::now_secs();
@@ -208,11 +209,12 @@ pub async fn do_handshake(
                     .await;
             }
             ik_handshake_failures.store(0, Ordering::Release);
-            Ok(Arc::new(NoiseSocket::new(
+            Ok(Arc::new(NoiseSocket::with_stats(
                 runtime,
                 transport,
                 success.write_cipher,
                 success.read_cipher,
+                stats,
             )))
         }
         Err(e) => {

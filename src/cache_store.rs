@@ -217,6 +217,16 @@ where
         }
     }
 
+    /// Iterate the in-process backend's entries. `None` for custom stores,
+    /// whose entries live outside this process (memory reports treat them as
+    /// zero retained bytes for the same reason).
+    pub fn iter_local(&self) -> Option<std::vec::IntoIter<(Arc<K>, V)>> {
+        match &self.inner {
+            Inner::Local(cache) => Some(cache.iter()),
+            Inner::Custom { .. } => None,
+        }
+    }
+
     /// Approximate entry count (sync). Returns `0` for custom backends.
     ///
     /// For diagnostics that need custom backend counts, use

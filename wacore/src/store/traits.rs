@@ -96,6 +96,14 @@ pub struct DeviceListRecord {
     pub raw_id: Option<u32>,
 }
 
+impl crate::stats::HeapSize for DeviceListRecord {
+    fn heap_bytes(&self) -> usize {
+        self.user.capacity()
+            + self.devices.capacity() * size_of::<DeviceInfo>()
+            + self.phash.as_ref().map_or(0, |p| p.capacity())
+    }
+}
+
 /// Signal protocol cryptographic storage operations.
 ///
 /// Handles identity keys, sessions, pre-keys, signed pre-keys, and sender keys

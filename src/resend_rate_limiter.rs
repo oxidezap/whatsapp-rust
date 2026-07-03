@@ -132,7 +132,6 @@ impl ResendRateLimiter {
     }
 
     /// Number of chats holding a live bucket (diagnostics).
-    #[cfg_attr(not(feature = "debug-diagnostics"), allow(dead_code))]
     pub(crate) fn entry_count(&self) -> u64 {
         self.buckets.entry_count()
     }

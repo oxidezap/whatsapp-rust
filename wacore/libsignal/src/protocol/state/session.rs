@@ -893,6 +893,24 @@ impl SessionRecord {
         }
     }
 
+    /// Estimated in-memory footprint proxy: the protobuf-encoded size of the
+    /// current plus archived states. Size computation only — no encode buffer
+    /// is allocated. Used by per-session memory reports.
+    pub fn estimated_size(&self) -> usize {
+        let mut cache = buffa::SizeCache::new();
+        let current = self
+            .current_session
+            .as_ref()
+            .map(|s| s.session.compute_size(&mut cache) as usize)
+            .unwrap_or(0);
+        let previous: usize = self
+            .previous_sessions
+            .iter()
+            .map(|s| s.compute_size(&mut cache) as usize)
+            .sum();
+        current + previous
+    }
+
     pub fn remote_registration_id(&self) -> Result<u32, SignalProtocolError> {
         Ok(self
             .session_state()

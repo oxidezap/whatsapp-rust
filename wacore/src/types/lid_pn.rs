@@ -76,6 +76,14 @@ pub struct LidPnEntry {
     pub learning_source: LearningSource,
 }
 
+impl crate::stats::HeapSize for LidPnEntry {
+    /// The identifier strings are shared with the cache keys (`Arc<str>`), so
+    /// counting them here means the report must not count the keys again.
+    fn heap_bytes(&self) -> usize {
+        self.lid.len() + self.phone_number.len()
+    }
+}
+
 impl LidPnEntry {
     /// Create a new entry with the current timestamp
     pub fn new(

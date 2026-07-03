@@ -111,13 +111,28 @@ impl LidPnCache {
         let _ = self.topology.set(topology);
     }
 
-    /// Returns approximate entry counts for the LID and PN maps.
-    #[cfg(feature = "debug-diagnostics")]
-    pub fn entry_counts(&self) -> (u64, u64) {
-        (
-            self.lid_to_entry.entry_count(),
-            self.pn_to_entry.entry_count(),
-        )
+    /// Approximate entry counts plus estimated retained bytes for the LID and
+    /// PN maps. Bytes are `0` when backed by a custom store (entries live
+    /// outside this process). Entry heap bytes cover the identifier strings,
+    /// which the `Arc<str>` keys share — keys are not counted again.
+    pub fn memory_stats(
+        &self,
+    ) -> (
+        wacore::stats::CollectionStats,
+        wacore::stats::CollectionStats,
+    ) {
+        use wacore::stats::{CollectionStats, HeapSize};
+        let measure = |cache: &TypedCache<Arc<str>, Arc<LidPnEntry>>| {
+            let bytes: usize = cache
+                .iter_local()
+                .map(|iter| {
+                    iter.map(|(_, v)| std::mem::size_of::<LidPnEntry>() + v.heap_bytes())
+                        .sum()
+                })
+                .unwrap_or(0);
+            CollectionStats::new(cache.entry_count(), bytes as u64)
+        };
+        (measure(&self.lid_to_entry), measure(&self.pn_to_entry))
     }
 
     /// Get the current LID for a phone number.

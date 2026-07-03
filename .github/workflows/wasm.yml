@@ -41,7 +41,7 @@ jobs:
         run: >
           cargo build -p whatsapp-rust --lib --release
           --target wasm32-unknown-unknown
-          --no-default-features --features debug-diagnostics
+          --no-default-features
       # The sans-IO VoIP core (wacore::voip: the CallEngine, the portable run_call driver,
       # the RelayTransport seam, the MLow codec, SRTP/SFrame crypto) must stay wasm-buildable
       # so the WASM bridge can drive 1:1 calls. whatsapp-rust's `voip` feature compile-errors on

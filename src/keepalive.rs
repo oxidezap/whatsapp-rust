@@ -4,7 +4,6 @@ use futures::FutureExt;
 use log::{debug, warn};
 use rand::RngExt;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use wacore::iq::spec::IqSpec;
 use wacore::protocol::keepalive::{
@@ -162,7 +161,7 @@ impl Client {
                         self.spawn_retention_cleanup(sent_msg_ttl);
                     }
 
-                    let last_recv = self.last_data_received_ms.load(Ordering::Relaxed);
+                    let last_recv = self.stats.last_data_received_ms();
 
                     // WA Web: maybeScheduleHealthCheck — only send ping when idle.
                     // If we recently received data, the connection is proven alive;
@@ -208,8 +207,8 @@ impl Client {
                     // a failed ping. This catches scenarios where pending IQs caused
                     // the ping to be skipped, or where the ping "succeeded" but the
                     // connection died immediately after.
-                    let last_sent = self.last_data_sent_ms.load(Ordering::Relaxed);
-                    let last_recv = self.last_data_received_ms.load(Ordering::Relaxed);
+                    let last_sent = self.stats.last_data_sent_ms();
+                    let last_recv = self.stats.last_data_received_ms();
                     if is_dead_socket(last_sent, last_recv) {
                         let elapsed = ms_since(last_sent).unwrap_or(0);
                         warn!(

@@ -60,10 +60,9 @@ pub use client::Client;
 /// Shared base error for transport/connection concerns; the per-domain error
 /// types embed it.
 pub use client::ClientError;
-#[cfg(feature = "debug-diagnostics")]
-pub use client::MemoryDiagnostics;
 pub use client::NodeFilter;
 pub use client::{CallError, Voip};
+pub use client::{CollectionStats, MemoryReport, StatsSnapshot};
 pub use types::durability_hook::InboundDurabilityHook;
 pub mod download;
 pub mod handlers;

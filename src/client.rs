@@ -173,32 +173,38 @@ const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;
 /// DGW `connectTimeoutMs` defaults to `20000ms`.
 const TRANSPORT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Snapshot of internal collection sizes for memory leak detection.
+pub use wacore::stats::{CollectionStats, StatsSnapshot};
+
+/// On-demand report of the client's internal collections: entry counts plus
+/// estimated retained heap bytes for the memory-dominant caches.
 ///
-/// All counts are approximate (caches may have pending evictions).
-/// Call [`Client::memory_diagnostics`] to obtain a snapshot.
+/// Counts are approximate (caches may have pending evictions); byte figures
+/// are honest estimates (encoded-size proxies for Signal records, payload
+/// sums elsewhere — see [`wacore::stats::HeapSize`]), suitable for
+/// per-session attribution and leak detection, not byte-exact accounting.
+/// Store-backed caches report `bytes: 0` — their entries live outside this
+/// process.
 ///
-/// Requires the `debug-diagnostics` feature.
-#[cfg(feature = "debug-diagnostics")]
+/// Call [`Client::memory_report`] to obtain one. Nothing is computed unless
+/// called.
 #[derive(Debug, Clone)]
-pub struct MemoryDiagnostics {
-    // -- Moka caches (TTL/capacity-bounded) --
-    pub group_cache: u64,
-    pub device_registry_cache: u64,
-    pub lid_pn_lid_entries: u64,
-    pub lid_pn_pn_entries: u64,
-    pub recent_messages: u64,
-    pub sender_key_device_cache: u64,
+pub struct MemoryReport {
+    // -- TTL/capacity-bounded caches --
+    pub group_cache: CollectionStats,
+    pub device_registry_cache: CollectionStats,
+    pub lid_pn_lid_entries: CollectionStats,
+    pub lid_pn_pn_entries: CollectionStats,
+    pub recent_messages: CollectionStats,
+    pub sender_key_device_cache: CollectionStats,
+    pub group_devices_memo: CollectionStats,
     pub message_retry_counts: u64,
     pub undecryptable_dispatched: u64,
     pub pdo_pending_requests: u64,
     pub pdo_requested: u64,
-    // -- Capacity-only caches (no TTL) --
+    // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
     pub chat_lanes: u64,
     pub resend_rate_limiter_chats: u64,
-    /// Total outbound resends dropped by the per-chat rate limiter since start.
-    pub resends_throttled_total: u64,
     // -- Unbounded collections --
     pub response_waiters: usize,
     pub node_waiters: usize,
@@ -206,33 +212,48 @@ pub struct MemoryDiagnostics {
     pub presence_subscriptions: usize,
     pub app_state_key_requests: usize,
     pub app_state_syncing: usize,
-    pub signal_cache_sessions: usize,
-    pub signal_cache_identities: usize,
-    pub signal_cache_sender_keys: usize,
+    pub signal_sessions: CollectionStats,
+    pub signal_identities: CollectionStats,
+    pub signal_sender_keys: CollectionStats,
     // -- Misc --
     pub chatstate_handlers: usize,
     pub custom_enc_handlers: usize,
 }
 
-#[cfg(feature = "debug-diagnostics")]
-impl std::fmt::Display for MemoryDiagnostics {
+impl MemoryReport {
+    /// Sum of every estimated byte figure in the report.
+    pub fn total_estimated_bytes(&self) -> u64 {
+        self.group_cache.bytes
+            + self.device_registry_cache.bytes
+            + self.lid_pn_lid_entries.bytes
+            + self.lid_pn_pn_entries.bytes
+            + self.recent_messages.bytes
+            + self.sender_key_device_cache.bytes
+            + self.group_devices_memo.bytes
+            + self.signal_sessions.bytes
+            + self.signal_identities.bytes
+            + self.signal_sender_keys.bytes
+    }
+}
+
+impl std::fmt::Display for MemoryReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "=== Memory Diagnostics ===")?;
+        fn line(
+            f: &mut std::fmt::Formatter<'_>,
+            name: &str,
+            c: &CollectionStats,
+        ) -> std::fmt::Result {
+            writeln!(f, "  {name:<22} {:>7} entries {:>10} B", c.entries, c.bytes)
+        }
+        writeln!(f, "=== Memory Report ===")?;
         writeln!(f, "--- TTL-bounded caches ---")?;
-        writeln!(f, "  group_cache:            {}", self.group_cache)?;
-        writeln!(
-            f,
-            "  device_registry_cache:  {}",
-            self.device_registry_cache
-        )?;
-        writeln!(f, "  lid_pn (lid):           {}", self.lid_pn_lid_entries)?;
-        writeln!(f, "  lid_pn (pn):            {}", self.lid_pn_pn_entries)?;
-        writeln!(f, "  recent_messages:        {}", self.recent_messages)?;
-        writeln!(
-            f,
-            "  sk_device_cache:        {}",
-            self.sender_key_device_cache
-        )?;
+        line(f, "group_cache:", &self.group_cache)?;
+        line(f, "device_registry_cache:", &self.device_registry_cache)?;
+        line(f, "lid_pn (lid):", &self.lid_pn_lid_entries)?;
+        line(f, "lid_pn (pn):", &self.lid_pn_pn_entries)?;
+        line(f, "recent_messages:", &self.recent_messages)?;
+        line(f, "sk_device_cache:", &self.sender_key_device_cache)?;
+        line(f, "group_devices_memo:", &self.group_devices_memo)?;
         writeln!(f, "  message_retry_counts:   {}", self.message_retry_counts)?;
         writeln!(
             f,
@@ -249,11 +270,6 @@ impl std::fmt::Display for MemoryDiagnostics {
             "  resend_rl_chats:        {}",
             self.resend_rate_limiter_chats
         )?;
-        writeln!(
-            f,
-            "  resends_throttled:      {}",
-            self.resends_throttled_total
-        )?;
         writeln!(f, "--- Unbounded collections ---")?;
         writeln!(f, "  response_waiters:       {}", self.response_waiters)?;
         writeln!(f, "  node_waiters:           {}", self.node_waiters)?;
@@ -269,24 +285,17 @@ impl std::fmt::Display for MemoryDiagnostics {
             self.app_state_key_requests
         )?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
-        writeln!(
-            f,
-            "  signal_sessions:        {}",
-            self.signal_cache_sessions
-        )?;
-        writeln!(
-            f,
-            "  signal_identities:      {}",
-            self.signal_cache_identities
-        )?;
-        writeln!(
-            f,
-            "  signal_sender_keys:     {}",
-            self.signal_cache_sender_keys
-        )?;
+        line(f, "signal_sessions:", &self.signal_sessions)?;
+        line(f, "signal_identities:", &self.signal_identities)?;
+        line(f, "signal_sender_keys:", &self.signal_sender_keys)?;
         writeln!(f, "--- Misc ---")?;
         writeln!(f, "  chatstate_handlers:     {}", self.chatstate_handlers)?;
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;
+        writeln!(
+            f,
+            "  total estimated:        {} B",
+            self.total_estimated_bytes()
+        )?;
         Ok(())
     }
 }
@@ -389,14 +398,10 @@ pub struct Client {
     /// error / connect_failure / disconnect. Per-connection subscribers
     /// (keepalive, request waiters, read loop, offline flush) observe this.
     pub(crate) connection_shutdown: std::sync::Mutex<wacore::runtime::ShutdownNotifier>,
-    /// Timestamp (ms since UNIX epoch) of the last received WebSocket data.
-    /// Updated on every `DataReceived` transport event.
-    /// WA Web: `parseAndHandleStanza` → `deadSocketTimer.cancel()`.
-    pub(crate) last_data_received_ms: Arc<AtomicU64>,
-    /// Timestamp (ms since UNIX epoch) of the last sent WebSocket data.
-    /// Updated on every `send_node` call.
-    /// WA Web: `callStanza` → `deadSocketTimer.onOrBefore(deadSocketTime)`.
-    pub(crate) last_data_sent_ms: Arc<AtomicU64>,
+    /// Per-session wire I/O and activity counters. Written at the transport
+    /// chokepoints (noise sender task, read loop); the keepalive dead-socket
+    /// watchdog reads its activity timestamps. Snapshot via [`Client::stats`].
+    pub(crate) stats: Arc<wacore::stats::SessionStats>,
 
     pub(crate) transport: Arc<Mutex<Option<Arc<dyn crate::transport::Transport>>>>,
     pub(crate) transport_events:
@@ -504,7 +509,9 @@ pub struct Client {
     pub(crate) undecryptable_dispatched: Cache<ChatMessageId, ()>,
 
     pub enable_auto_reconnect: Arc<AtomicBool>,
-    pub auto_reconnect_errors: Arc<AtomicU32>,
+    /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
+    /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
+    pub(crate) auto_reconnect_errors: Arc<AtomicU32>,
 
     pub(crate) needs_initial_full_sync: Arc<AtomicBool>,
 

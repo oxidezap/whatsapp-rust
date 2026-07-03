@@ -2879,3 +2879,99 @@ async fn ack_miss_path_does_not_heap_allocate() {
     }
     assert_eq!(min_delta, 0, "ack miss path must not allocate");
 }
+
+/// The public stats snapshot must reflect the client's counters plus the
+/// client-level fields (reconnect errors, throttled resends) it fills in.
+#[tokio::test]
+async fn stats_snapshot_reflects_counters() {
+    let client = crate::test_utils::create_test_client().await;
+
+    client.stats.record_frame_sent(150);
+    client.stats.record_recv_batch(300, 2);
+    client.stats.record_message_sent();
+    client.auto_reconnect_errors.store(3, Ordering::Relaxed);
+
+    let snap = client.stats();
+    assert_eq!(snap.bytes_sent, 150);
+    assert_eq!(snap.frames_sent, 1);
+    assert_eq!(snap.bytes_received, 300);
+    assert_eq!(snap.frames_received, 2);
+    assert_eq!(snap.messages_sent, 1);
+    assert_eq!(snap.reconnect_errors, 3);
+    assert_eq!(snap.resends_throttled, 0);
+}
+
+/// memory_report must be callable on a fresh client and internally
+/// consistent: empty collections report zero entries and zero bytes.
+#[tokio::test]
+async fn memory_report_on_fresh_client() {
+    // recent_messages is capacity-0 (disabled) by default; enable it so the
+    // byte-attribution assertion below has a collection to land in.
+    let mut cache_config = crate::cache_config::CacheConfig::default();
+    cache_config.recent_messages =
+        crate::cache_config::CacheEntryConfig::new(Some(std::time::Duration::from_secs(300)), 64);
+    let client = crate::test_utils::create_test_client_with_config(
+        "memory_report",
+        std::sync::Arc::new(crate::test_utils::MockHttpClient),
+        cache_config,
+    )
+    .await;
+
+    let report = client.memory_report().await;
+    assert_eq!(report.recent_messages.entries, 0);
+    assert_eq!(report.recent_messages.bytes, 0);
+    assert_eq!(report.signal_sessions.entries, 0);
+    assert_eq!(report.response_waiters, 0);
+
+    // Retained bytes must appear once something is cached.
+    let key = wacore::types::message::ChatMessageId::new(
+        "559980000001@s.whatsapp.net".parse().unwrap(),
+        "3EB0TESTMSGID".to_string(),
+    );
+    client
+        .recent_messages
+        .insert(key, std::sync::Arc::new(vec![0u8; 2048]))
+        .await;
+    let report = client.memory_report().await;
+    assert_eq!(report.recent_messages.entries, 1);
+    assert!(
+        report.recent_messages.bytes >= 2048,
+        "cached payload bytes must be attributed (got {})",
+        report.recent_messages.bytes
+    );
+    assert!(report.total_estimated_bytes() >= 2048);
+    // Display must render without panicking.
+    let _ = report.to_string();
+}
+
+/// InstrumentedRuntime must invoke the TaskInstrument around polls of spawned
+/// futures and blocking closures, and CpuMeter must accumulate them.
+#[tokio::test]
+async fn instrumented_runtime_reports_to_cpu_meter() {
+    use wacore::runtime::Runtime as _;
+    use wacore::stats::{CpuMeter, InstrumentedRuntime};
+
+    let meter = std::sync::Arc::new(CpuMeter::new());
+    let runtime = InstrumentedRuntime::new(
+        std::sync::Arc::new(crate::runtime_impl::TokioRuntime),
+        meter.clone(),
+    );
+
+    let (tx, rx) = futures::channel::oneshot::channel::<()>();
+    runtime
+        .spawn(Box::pin(async move {
+            let _ = tx.send(());
+        }))
+        .detach();
+    rx.await.expect("spawned future ran");
+
+    let after_spawn = meter.snapshot();
+    assert!(after_spawn.polls >= 1, "spawned future polls are metered");
+
+    runtime.spawn_blocking(Box::new(|| {})).await;
+    let after_blocking = meter.snapshot();
+    assert!(
+        after_blocking.polls > after_spawn.polls,
+        "blocking work is metered too"
+    );
+}

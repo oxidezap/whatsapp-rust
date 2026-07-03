@@ -541,6 +541,7 @@ pub struct BotBuilder<
     cache_config: CacheConfig,
     wanted_pre_key_count: Option<usize>,
     resend_rate_limit: Option<(u32, u32)>,
+    task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
     _marker: PhantomData<(B, T, H, R)>,
 }
 
@@ -563,6 +564,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             cache_config: CacheConfig::default(),
             wanted_pre_key_count: None,
             resend_rate_limit: None,
+            task_instrument: None,
             _marker: PhantomData,
         }
     }
@@ -589,6 +591,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             cache_config: self.cache_config,
             wanted_pre_key_count: self.wanted_pre_key_count,
             resend_rate_limit: self.resend_rate_limit,
+            task_instrument: self.task_instrument,
             _marker: PhantomData,
         }
     }
@@ -643,6 +646,23 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     pub fn with_runtime<Rt: Runtime>(mut self, runtime: Rt) -> BotBuilder<B, T, H, Provided> {
         self.runtime = Some(Arc::new(runtime));
         self.cast()
+    }
+
+    /// Instrument every internal task of this client with a
+    /// [`TaskInstrument`](wacore::stats::TaskInstrument) hook, called around
+    /// each poll (and around blocking work).
+    ///
+    /// Runtime-agnostic: the hook wraps whatever runtime the client uses. Pass
+    /// a [`CpuMeter`](wacore::stats::CpuMeter) for per-session CPU accounting
+    /// (keep a clone to read snapshots), or a custom hook to scope
+    /// allocator-attribution or platform samplers to this client's work.
+    /// Default: no hook, no per-poll overhead.
+    pub fn with_task_instrument(
+        mut self,
+        instrument: Arc<dyn wacore::stats::TaskInstrument>,
+    ) -> Self {
+        self.task_instrument = Some(instrument);
+        self
     }
 
     // ── Event handler registration (additive; order of registration is kept,
@@ -986,6 +1006,16 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             self.http_client,
         ) else {
             unreachable!("typestate guarantees all required fields are Provided")
+        };
+
+        // Instrument the runtime before anything spawns through it, so every
+        // internal task (read loop, noise sender, saver, workers) reports to
+        // the hook. Default (None): the original runtime is used untouched.
+        let runtime: Arc<dyn Runtime> = match self.task_instrument {
+            Some(instrument) => {
+                Arc::new(wacore::stats::InstrumentedRuntime::new(runtime, instrument))
+            }
+            None => runtime,
         };
 
         // Note: For multi-account mode, create the backend with SqliteStore::new_for_device()

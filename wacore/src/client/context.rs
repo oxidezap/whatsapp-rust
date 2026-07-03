@@ -164,6 +164,30 @@ impl GroupInfo {
     }
 }
 
+impl crate::stats::HeapSize for GroupInfo {
+    fn heap_bytes(&self) -> usize {
+        let participants = self.participants.capacity() * size_of::<Jid>()
+            + self
+                .participants
+                .iter()
+                .map(|j| j.heap_bytes())
+                .sum::<usize>();
+        let lid_to_pn = self.lid_to_pn_map.capacity() * size_of::<(CompactString, Jid)>()
+            + self
+                .lid_to_pn_map
+                .iter()
+                .map(|(k, v)| k.heap_bytes() + v.heap_bytes())
+                .sum::<usize>();
+        let pn_to_lid = self.pn_to_lid_map.capacity() * size_of::<(CompactString, CompactString)>()
+            + self
+                .pn_to_lid_map
+                .iter()
+                .map(|(k, v)| k.heap_bytes() + v.heap_bytes())
+                .sum::<usize>();
+        participants + lid_to_pn + pn_to_lid
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {

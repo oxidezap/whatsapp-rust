@@ -754,13 +754,53 @@ impl SignalStoreCache {
         Ok(())
     }
 
-    /// Returns the number of entries in each store (sessions, identities, sender_keys).
-    #[cfg(feature = "debug-diagnostics")]
-    pub async fn entry_counts(&self) -> (usize, usize, usize) {
-        let s = self.sessions.lock().await;
-        let i = self.identities.lock().await;
-        let sk = self.sender_keys.lock().await;
-        (s.cache.len(), i.cache.len(), sk.cache.len())
+    /// Entry counts and estimated retained bytes for each store
+    /// (sessions, identities, sender_keys). Sizes use the records' encoded-size
+    /// proxy (see `SessionRecord::estimated_size`); on-demand only — walks the
+    /// caches under their locks.
+    pub async fn memory_stats(
+        &self,
+    ) -> (
+        crate::stats::CollectionStats,
+        crate::stats::CollectionStats,
+        crate::stats::CollectionStats,
+    ) {
+        use crate::stats::CollectionStats;
+
+        let sessions = {
+            let s = self.sessions.lock().await;
+            let bytes: usize = s
+                .cache
+                .iter()
+                .map(|(k, v)| {
+                    k.len()
+                        + match v {
+                            SessionEntry::Present(rec) => rec.estimated_size(),
+                            SessionEntry::Absent | SessionEntry::CheckedOut => 0,
+                        }
+                })
+                .sum();
+            CollectionStats::new(s.cache.len() as u64, bytes as u64)
+        };
+        let identities = {
+            let i = self.identities.lock().await;
+            let bytes: usize = i
+                .cache
+                .iter()
+                .map(|(k, v)| k.len() + v.as_ref().map_or(0, |b| b.len()))
+                .sum();
+            CollectionStats::new(i.cache.len() as u64, bytes as u64)
+        };
+        let sender_keys = {
+            let sk = self.sender_keys.lock().await;
+            let bytes: usize = sk
+                .cache
+                .iter()
+                .map(|(k, v)| k.len() + v.as_ref().map_or(0, |r| r.estimated_size()))
+                .sum();
+            CollectionStats::new(sk.cache.len() as u64, bytes as u64)
+        };
+        (sessions, identities, sender_keys)
     }
 
     /// Clear all cached state (used on disconnect/reconnect).
