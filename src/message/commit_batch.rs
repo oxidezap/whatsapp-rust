@@ -292,11 +292,14 @@ impl Client {
             // Even with nothing to commit, a drain-mode flush must persist the
             // Signal cache: SKDM-only stanzas mutate Signal state without
             // enqueueing a message, and their buffered receipts flush right
-            // after the teardown/drain-end call sites of this function.
+            // after the teardown/drain-end call sites of this function — so a
+            // failed flush must report not-durable to hold those receipts
+            // back (the cache keeps its dirty entries for a later retry).
             if was_draining {
-                self.flush_signal_cache_logged("commit_batch", None).await;
+                self.drain_signal_flush_reporting().await
+            } else {
+                true
             }
-            true
         } else {
             self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
                 .await
@@ -340,6 +343,23 @@ impl Client {
         self.flush_inbound_commits_under_permit(true, None).await
     }
 
+    /// Drain-mode Signal flush that reports success instead of swallowing it:
+    /// the drain call sites gate the buffered offline-receipt flush on this,
+    /// because an SKDM receipt must never be sent while its sender-key state
+    /// is only in the cache. On failure the cache keeps its dirty entries for
+    /// a later retry.
+    async fn drain_signal_flush_reporting(&self) -> bool {
+        match self.flush_signal_cache().await {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!(
+                    "Failed to flush signal cache (commit_batch): {e:?}; holding buffered receipts for redelivery"
+                );
+                false
+            }
+        }
+    }
+
     /// Commit any accumulated entries while the caller ALREADY HOLDS the
     /// processing permit (mid-stanza recovery paths like UntrustedIdentity),
     /// so a full-cache Signal flush that follows cannot persist ratchet
@@ -369,7 +389,7 @@ impl Client {
     /// restored to the batcher, so "entries still batched" stays an accurate
     /// signal for teardown's flush-vs-drop decision.
     ///
-    /// Returns whether the durable state (buffer rows + Signal flush attempt)
+    /// Returns whether the durable state (buffer rows + Signal flush)
     /// committed — the gate for flushing buffered offline receipts. A hook
     /// failure still returns `true`: its rows are durable and the replay path
     /// retries it, so already-buffered receipts of other messages stay safe.
@@ -455,8 +475,10 @@ impl Client {
             // a cancelled future must not restore the entries.
             reinsert.disarm();
 
-            if is_drain {
-                self.flush_signal_cache_logged("commit_batch", None).await;
+            // A failed flush reports not-durable so buffered receipts are held
+            // back; the rows are in place, so redelivery replays the batch.
+            if is_drain && !self.drain_signal_flush_reporting().await {
+                return false;
             }
 
             if let Err(e) = hook.on_messages(self.clone(), &items).await {
@@ -485,10 +507,11 @@ impl Client {
                 );
             }
         } else {
-            if is_drain {
-                self.flush_signal_cache_logged("commit_batch", None).await;
+            // No hook = at-most-once: the flush is the durable point, so a
+            // failure restores the entries (guard still armed) for a retry.
+            if is_drain && !self.drain_signal_flush_reporting().await {
+                return false;
             }
-            // No hook = at-most-once: the flush is the durable point.
             reinsert.disarm();
         }
 
