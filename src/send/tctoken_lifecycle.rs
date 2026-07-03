@@ -1,6 +1,21 @@
 use super::*;
 
 impl Client {
+    /// Whether `jid` is our own account (PN or LID). The privacy-token paths
+    /// never attach to or issue for ourselves; a single source of truth keeps
+    /// the message and call paths from drifting apart.
+    fn is_own_jid(&self, jid: &Jid) -> bool {
+        let snapshot = self.persistence_manager.get_device_snapshot();
+        snapshot
+            .pn
+            .as_ref()
+            .is_some_and(|pn| pn.is_same_user_as(jid))
+            || snapshot
+                .lid
+                .as_ref()
+                .is_some_and(|lid| lid.is_same_user_as(jid))
+    }
+
     /// Look up and include a privacy token in outgoing 1:1 message stanza nodes.
     ///
     /// Follows WA Web's fallback chain (MsgCreateFanoutStanza.js `Re = R(te) ?? D(te, s)`):
@@ -26,16 +41,7 @@ impl Client {
         };
 
         // Skip for own JID — no need to send a privacy token to ourselves.
-        let snapshot = self.persistence_manager.get_device_snapshot();
-        let is_self = snapshot
-            .pn
-            .as_ref()
-            .is_some_and(|pn| pn.is_same_user_as(to))
-            || snapshot
-                .lid
-                .as_ref()
-                .is_some_and(|lid| lid.is_same_user_as(to));
-        if is_self {
+        if self.is_own_jid(to) {
             return false;
         }
 
@@ -79,6 +85,7 @@ impl Client {
             .then_some(entry.token.as_slice())
         });
         // cstoken needs both the NCT salt and a resolved account LID (WA Web `D`).
+        let snapshot = self.persistence_manager.get_device_snapshot();
         let cs_token_inputs: Option<(&[u8], &wacore_binary::CompactString)> =
             match (&snapshot.nct_salt, &resolved_lid) {
                 (Some(salt), Some(lid)) => Some((salt.as_slice(), lid)),
@@ -152,18 +159,8 @@ impl Client {
     pub(crate) async fn should_issue_tc_token(&self, to: &Jid) -> bool {
         use wacore::iq::tctoken::should_send_new_tc_token_with;
 
-        // A self-call must never issue or record a token for our own account
-        // (same guard as maybe_include_tc_token).
-        let snapshot = self.persistence_manager.get_device_snapshot();
-        let is_self = snapshot
-            .pn
-            .as_ref()
-            .is_some_and(|pn| pn.is_same_user_as(to))
-            || snapshot
-                .lid
-                .as_ref()
-                .is_some_and(|lid| lid.is_same_user_as(to));
-        if is_self {
+        // A self-call must never issue or record a token for our own account.
+        if self.is_own_jid(to) {
             return false;
         }
 
