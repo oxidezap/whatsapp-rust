@@ -771,6 +771,16 @@ impl Client {
         for item in items.iter() {
             self.ack_received_message(&item.info);
         }
+        // WA Web `createSnapshot` sends `sendAggregateOfflineReceipts` per
+        // snapshot, not once at drain end. Flush the receipts this batch's acks
+        // just buffered now that the batch is durable: bounds the buffer over a
+        // large backlog and caps redelivery on a mid-drain disconnect to a
+        // single snapshot instead of the whole backlog (a disconnect clears the
+        // buffer, so anything already flushed is not re-sent). Gated on the
+        // durable path — a non-durable batch returned above without acking.
+        if is_drain {
+            self.flush_offline_receipts();
+        }
         self.core.event_bus.dispatch(Event::Messages(MessageBatch {
             messages: items,
             origin,
@@ -1267,6 +1277,36 @@ mod tests {
                 .flush_inbound_commits_under_permit(false, None, None)
                 .await,
             "with the flush succeeding the empty commit reports durable"
+        );
+    }
+
+    // WA Web createSnapshot flushes aggregate offline receipts per snapshot;
+    // a durable OfflineDrain commit must drain the buffer instead of holding it
+    // until end-of-drain.
+    #[tokio::test]
+    async fn durable_drain_commit_flushes_offline_receipts_per_snapshot() {
+        let client = create_test_client_with_failing_http("batch_offline_flush").await;
+        client.inbound_commit_batch.reset(); // back into drain mode
+
+        // Batcher active → the receipt buffers instead of going 1:1.
+        let buffered = item("R1").info;
+        assert!(client.try_buffer_offline_receipt(&buffered));
+        assert_eq!(client.offline_receipt_buffer.lock().expect("buf").len(), 1);
+
+        client.commit_or_batch_inbound(item("D1")).await;
+        assert!(
+            client
+                .flush_inbound_commits_under_permit(false, None, None)
+                .await,
+            "the drain batch must commit durably"
+        );
+        assert!(
+            client
+                .offline_receipt_buffer
+                .lock()
+                .expect("buf")
+                .is_empty(),
+            "a durable drain commit flushes the buffered offline receipts per snapshot"
         );
     }
 
