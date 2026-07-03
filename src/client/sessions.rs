@@ -378,9 +378,12 @@ impl Client {
             );
         }
 
-        // Flush after all sessions established
+        // Flush after all sessions established. Batch-safe: retry receipts
+        // reach here mid-drain, and post-timeout senders reach here during a
+        // deferred live transition — in both windows a raw whole-cache flush
+        // would persist rowless drain entries' ratchet advances.
         if success_count > 0 {
-            self.flush_signal_cache().await?;
+            self.flush_signal_cache_batch_safe().await?;
         }
 
         Ok(success_count)
