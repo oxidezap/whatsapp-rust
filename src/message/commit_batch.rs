@@ -58,6 +58,10 @@ pub(crate) struct InboundCommitBatcher {
     /// backend failure can be injected through the real store).
     #[cfg(test)]
     pub(crate) fail_commits: std::sync::atomic::AtomicBool,
+    /// Test-only injection: fail drain Signal flushes AFTER the durable row
+    /// write, exercising the rows-stored-but-unflushed retry path.
+    #[cfg(test)]
+    pub(crate) fail_flushes: std::sync::atomic::AtomicBool,
     /// Reusable encode arena for drain commits, which the processing permit
     /// already serializes — so this lock is never contended there. Live
     /// commits use a local buffer instead: sharing it would serialize
@@ -75,6 +79,8 @@ impl Default for InboundCommitBatcher {
             arena: async_lock::Mutex::new(Vec::new()),
             #[cfg(test)]
             fail_commits: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_flushes: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -459,6 +465,14 @@ impl Client {
     /// is only in the cache. On failure the cache keeps its dirty entries for
     /// a later retry.
     async fn drain_signal_flush_reporting(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .inbound_commit_batch
+            .fail_flushes
+            .load(Ordering::Acquire)
+        {
+            return false;
+        }
         match self.flush_signal_cache().await {
             Ok(()) => true,
             Err(e) => {
@@ -597,15 +611,19 @@ impl Client {
                     return false;
                 }
             }
-            // Rows are durable: from here on, redelivery replays from them, so
-            // a cancelled future must not restore the entries.
-            reinsert.disarm();
-
             // A failed flush reports not-durable so buffered receipts are held
-            // back; the rows are in place, so redelivery replays the batch.
+            // back. The guard is still armed: the rows are in place and
+            // re-storing them is idempotent (replace-into), so the restored
+            // entries make the batch retryable THIS session — the retry
+            // re-runs the full commit (rows → flush → hook → acks → event)
+            // instead of parking the messages until a reconnect replay.
             if is_drain && !self.drain_signal_flush_reporting().await {
                 return false;
             }
+            // Rows durable and Signal flushed: from here on a cancelled
+            // future must not restore the entries — redelivery replays from
+            // the rows.
+            reinsert.disarm();
 
             if let Err(e) = hook.on_messages(self.clone(), &items).await {
                 log::warn!(
@@ -992,6 +1010,66 @@ mod tests {
         assert_eq!(available_permits(&client), 64);
         let batches = hook.batches.lock().expect("hook lock").clone();
         assert_eq!(batches, vec![vec!["R1"]]);
+    }
+
+    // A Signal-flush failure after the durable row write must keep the batch
+    // retryable this session: entries restored (re-storing rows is
+    // idempotent), hook not yet run, and the retry commits everything.
+    #[tokio::test]
+    async fn flush_failure_after_rows_keeps_batch_retryable() {
+        let client = create_test_client_with_failing_http("batch_flush_fail").await;
+        client.inbound_commit_batch.reset();
+        let hook = Arc::new(RecordingHook {
+            batches: Mutex::new(Vec::new()),
+        });
+        let _ = client.inbound_durability_hook.set(hook.clone());
+
+        client.commit_or_batch_inbound(item("F1")).await;
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(true, Ordering::Release);
+        let durable = client
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await;
+        assert!(!durable);
+        assert!(
+            client.inbound_commit_batch.has_entries(),
+            "entries must be restored for a same-session retry"
+        );
+        assert!(
+            hook.batches.lock().expect("hook lock").is_empty(),
+            "hook must not run before the Signal flush succeeds"
+        );
+        let backend = client.persistence_manager.backend();
+        assert!(
+            backend
+                .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "F1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the durable row from the failed attempt stays in place"
+        );
+
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(false, Ordering::Release);
+        let durable = client
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await;
+        assert!(durable);
+        assert!(!client.inbound_commit_batch.has_entries());
+        let batches = hook.batches.lock().expect("hook lock").clone();
+        assert_eq!(batches, vec![vec!["F1"]]);
+        assert!(
+            backend
+                .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "F1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the retry commit clears the buffered row"
+        );
     }
 
     fn available_permits(client: &Client) -> usize {
