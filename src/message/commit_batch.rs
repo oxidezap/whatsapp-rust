@@ -924,7 +924,10 @@ mod tests {
         assert_eq!(batches.len(), 1, "one commit for the full batch");
         assert_eq!(batches[0].len(), MAX_BATCH_MESSAGES);
         assert_eq!(batches[0][0], "S0");
-        assert_eq!(batches[0][MAX_BATCH_MESSAGES - 1], "S199");
+        assert_eq!(
+            batches[0][MAX_BATCH_MESSAGES - 1],
+            format!("S{}", MAX_BATCH_MESSAGES - 1)
+        );
     }
 
     // Without a hook, the drain still batches the event dispatch.
