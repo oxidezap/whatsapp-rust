@@ -9,8 +9,10 @@ use crate::client::Client;
 use crate::request::IqError;
 use buffa::Message;
 use wacore::iq::prekeys::RotateSignedPreKeySpec;
+use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
 use wacore::libsignal::store::record_helpers::new_signed_pre_key_record;
 use wacore::store::commands::DeviceCommand;
+use waproto::whatsapp::SignedPreKeyRecordStructure;
 
 /// Rotation cadence. This is the one value NOT grounded in the WA Web bundle
 /// (there it is a persisted background job with a server-tuned schedule), so
@@ -69,38 +71,79 @@ impl Client {
         Ok(())
     }
 
-    /// Generate a fresh signed pre-key, upload it, and only then switch to it
-    /// locally: retain the outgoing key so in-flight prekey messages still
-    /// decrypt, promote the new key, stamp the cadence, and prune to
-    /// [`SIGNED_PRE_KEY_RETENTION`].
+    /// Stage a fresh signed pre-key durably, upload it, and only on server
+    /// acceptance promote it locally: retain the outgoing key, advance the
+    /// current key + cadence, and prune to [`SIGNED_PRE_KEY_RETENTION`].
     ///
-    /// Upload-first is deliberate. The server keeps advertising the previous
-    /// signed pre-key until it accepts the new one, so switching or advancing
-    /// the cadence before the server accepts would let a failed upload both skip
-    /// retries for a full interval AND, across repeated failures, prune the key
-    /// the server is still handing out — breaking new prekey sessions.
+    /// The candidate is written to the backend table *before* upload and reused
+    /// verbatim on retry. This makes every partial failure safe: whatever the
+    /// server ends up advertising, we hold its private key. An ambiguous
+    /// transport error (the server may have accepted `new_id`) leaves the staged
+    /// key decryptable via the load fallback; a post-acceptance persistence
+    /// failure likewise cannot strand it; and a definitive rejection just leaves
+    /// the current key in place to retry — never advancing the cadence or
+    /// pruning the key the server still hands out.
     pub(crate) async fn rotate_signed_pre_key(&self) -> Result<(), anyhow::Error> {
         let snapshot = self.persistence_manager.get_device_snapshot();
         let now = wacore::time::now_millis();
-
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let new_kp = wacore::libsignal::protocol::KeyPair::generate(&mut rng);
-        // Sign the new public with the identity private key over the serialized
-        // (not raw) public bytes, matching Device::new().
-        let signature: [u8; 64] = snapshot
-            .identity_key
-            .private_key
-            .calculate_signature(&new_kp.public_key.serialize(), &mut rng)?
-            .as_ref()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Ed25519 signature must be 64 bytes"))?;
+        let backend = self.persistence_manager.backend();
 
         let old_id = snapshot.signed_pre_key_id;
         let new_id = next_signed_pre_key_id(old_id);
 
-        // Upload before any local mutation. WA Web reads 406 = bad key, 409 =
-        // server validation fail, >=500 = transient; none warrant hard-failing
-        // login, and none should advance our state — a later connect retries.
+        // Stage the candidate before upload, reusing an already-staged one for
+        // this id verbatim. A retry after an ambiguous failure then re-uploads
+        // THIS exact key instead of minting a fresh one under the same id, so the
+        // key the server may already have accepted is never overwritten/lost.
+        let (new_kp, signature) = match backend
+            .load_signed_prekey(new_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to load staged signed pre-key: {e}"))?
+        {
+            Some(bytes) => {
+                let s = SignedPreKeyRecordStructure::decode_from_slice(&bytes)
+                    .map_err(|e| anyhow::anyhow!("staged signed pre-key decode: {e}"))?;
+                let public = PublicKey::from_djb_public_key_bytes(
+                    s.public_key
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("staged signed pre-key missing public"))?,
+                )?;
+                let private =
+                    PrivateKey::deserialize(s.private_key.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("staged signed pre-key missing private")
+                    })?)?;
+                let signature: [u8; 64] = s
+                    .signature
+                    .ok_or_else(|| anyhow::anyhow!("staged signed pre-key missing signature"))?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("staged signature must be 64 bytes"))?;
+                (KeyPair::new(public, private), signature)
+            }
+            None => {
+                let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+                let kp = KeyPair::generate(&mut rng);
+                // Sign the new public with the identity private key over the
+                // serialized (not raw) public bytes, matching Device::new().
+                let signature: [u8; 64] = snapshot
+                    .identity_key
+                    .private_key
+                    .calculate_signature(&kp.public_key.serialize(), &mut rng)?
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("Ed25519 signature must be 64 bytes"))?;
+                let record =
+                    new_signed_pre_key_record(new_id, &kp, signature, wacore::time::now_utc());
+                backend
+                    .store_signed_prekey(new_id, &record.encode_to_vec())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to stage new signed pre-key: {e}"))?;
+                (kp, signature)
+            }
+        };
+
+        // WA Web reads 406 = bad key, 409 = server validation fail, >=500 =
+        // transient; none warrant hard-failing login or advancing local state.
+        // On any failure the staged candidate stays put for the next retry.
         match self
             .execute(RotateSignedPreKeySpec::new(
                 new_id,
@@ -126,19 +169,16 @@ impl Client {
             }
         }
 
-        // Server accepted new_id. Retain the outgoing key so prekey messages
-        // naming the old id still decrypt, then promote the new key + stamp.
-        let backend = self.persistence_manager.backend();
+        // Server accepted new_id. Retain the outgoing key (best-effort) so prekey
+        // messages naming the old id still decrypt, then promote + stamp. The
+        // staged new_id is already durable in the backend, so even a promotion or
+        // flush failure below leaves the accepted key decryptable via the fallback.
         let old_record = new_signed_pre_key_record(
             old_id,
             &snapshot.signed_pre_key,
             snapshot.signed_pre_key_signature,
             wacore::time::now_utc(),
         );
-        // Best-effort: the server already accepted new_id, so promotion must
-        // proceed even if retaining the old key fails — otherwise local state
-        // stays on a key the server no longer advertises and new prekey sessions
-        // break. A failed retain only shortens the old key's decrypt window.
         if let Err(e) = backend
             .store_signed_prekey(old_id, &old_record.encode_to_vec())
             .await
@@ -162,10 +202,13 @@ impl Client {
             .await
             .map_err(|e| anyhow::anyhow!("failed to flush rotated signed pre-key: {e:?}"))?;
 
-        // Prune to RETENTION total addressable keys. The current key lives in the
-        // device field (never the backend table), so the backend keeps only the
-        // RETENTION-1 most recent rotated-out keys. Numeric ordering is safe: ids
-        // advance one per rotation, so the wrap at MAX is ~300k years out.
+        // new_id now lives in the device field, so drop its redundant staged copy
+        // before pruning to RETENTION total addressable keys (field + RETENTION-1
+        // rotated-out). Numeric ordering is safe: ids advance one per rotation, so
+        // the wrap at MAX is ~300k years out.
+        if let Err(e) = backend.remove_signed_prekey(new_id).await {
+            log::warn!("failed to drop staged signed pre-key {new_id}: {e}");
+        }
         let mut retained = backend
             .load_all_signed_prekeys()
             .await
