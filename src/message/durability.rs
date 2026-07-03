@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::types::durability_hook::InboundDurabilityHook;
-use wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
+use wacore::types::events::InboundMessage;
 
 impl Client {
     /// The registered inbound durability hook, if any. `None` (default) keeps
@@ -19,74 +19,43 @@ impl Client {
     }
 
     /// Redelivery path: when the server replays an already-decrypted message
-    /// (`DuplicatedMessage`), re-run the hook from the buffered copy instead of
-    /// acking. A plain ack is sent only for a genuine duplicate (no buffered
-    /// copy). A read failure fails closed (no ack) so a transient storage error
-    /// cannot drop a message that still needs its hook to commit.
+    /// (`DuplicatedMessage`), re-commit it from the buffered copy instead of
+    /// acking. The replay routes through the commit batcher: during a drain it
+    /// joins the accumulating batch, so its hook commit, ack and event keep
+    /// arrival order with the fresh stanzas around it; live it commits
+    /// immediately as a batch of one. Either way the batch commit rewrites and
+    /// then clears its pending row, and consumers observe the message there —
+    /// its original batch never dispatched (the hook failed then). A plain ack
+    /// is sent only for a genuine duplicate (no buffered copy). A read failure
+    /// fails closed (no ack) so a transient storage error cannot drop a
+    /// message that still needs its hook to commit.
     pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) {
-        if let Some(hook) = self.inbound_durability_hook() {
+        if self.inbound_durability_hook().is_some() {
             let backend = self.persistence_manager.backend();
             let chat = info.source.chat.to_string();
             let sender = info.source.sender.to_string();
             match backend.get_pending_inbound(&chat, &sender, &info.id).await {
-                Ok(Some(bytes)) => {
-                    match waproto::codec::message_decode(&bytes) {
-                        Ok(msg) => {
-                            let item = InboundMessage {
-                                message: Arc::new(msg),
-                                info: Arc::clone(info),
-                            };
-                            match hook
-                                .on_messages(self.clone(), std::slice::from_ref(&item))
-                                .await
-                            {
-                                Ok(()) => {
-                                    if let Err(e) = backend
-                                        .delete_pending_inbound(&chat, &sender, &info.id)
-                                        .await
-                                    {
-                                        log::debug!(
-                                            "[msg:{}] failed to clear buffered inbound message: {e:?}",
-                                            info.id
-                                        );
-                                    }
-                                    self.ack_received_message(info);
-                                    // First successful commit of this message:
-                                    // its original batch never dispatched (the
-                                    // hook failed then), so consumers see it
-                                    // here or never.
-                                    let origin = if self.inbound_commit_batch.is_active() {
-                                        BatchOrigin::OfflineDrain
-                                    } else {
-                                        BatchOrigin::Live
-                                    };
-                                    self.core.event_bus.dispatch(Event::Messages(MessageBatch {
-                                        messages: Arc::from([item]),
-                                        origin,
-                                    }));
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[msg:{}] inbound durability hook still failing on redelivery; keeping for retry: {e:?}",
-                                        info.id
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            // Corrupt row (our own serialization): it can never be
-                            // replayed, so drop it and ack to unstick the queue.
-                            log::error!(
-                                "[msg:{}] failed to decode buffered inbound message; acking to unstick queue: {e:?}",
-                                info.id
-                            );
-                            let _ = backend
-                                .delete_pending_inbound(&chat, &sender, &info.id)
-                                .await;
-                            self.ack_received_message(info);
-                        }
+                Ok(Some(bytes)) => match waproto::codec::message_decode(&bytes) {
+                    Ok(msg) => {
+                        self.commit_or_batch_inbound(InboundMessage {
+                            message: Arc::new(msg),
+                            info: Arc::clone(info),
+                        })
+                        .await;
                     }
-                }
+                    Err(e) => {
+                        // Corrupt row (our own serialization): it can never be
+                        // replayed, so drop it and ack to unstick the queue.
+                        log::error!(
+                            "[msg:{}] failed to decode buffered inbound message; acking to unstick queue: {e:?}",
+                            info.id
+                        );
+                        let _ = backend
+                            .delete_pending_inbound(&chat, &sender, &info.id)
+                            .await;
+                        self.ack_received_message(info);
+                    }
+                },
                 // Genuine duplicate (never buffered, or already committed): ack it.
                 Ok(None) => self.ack_received_message(info),
                 // Fail closed: a transient read error must not ack a message whose
@@ -108,6 +77,7 @@ mod tests {
     use crate::test_utils::create_test_client_with_failing_http;
     use crate::types::message::MessageInfo;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use wacore::types::events::BatchOrigin;
 
     struct CountingHook {
         calls: AtomicUsize,
