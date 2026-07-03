@@ -754,9 +754,17 @@ impl Client {
             // post-login init.
             check_generation!();
             let rotate_client = client_clone.clone();
+            let rotate_generation = task_generation;
             client_clone
                 .runtime
                 .spawn(Box::pin(async move {
+                    // A newer connection may have taken over between spawn and now;
+                    // rotating on a stale generation would upload a duplicate key.
+                    if rotate_client.connection_generation.load(Ordering::SeqCst)
+                        != rotate_generation
+                    {
+                        return;
+                    }
                     if let Err(e) = rotate_client.maybe_rotate_signed_pre_key().await
                         && !rotate_client.is_shutting_down()
                     {

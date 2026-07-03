@@ -377,7 +377,18 @@ impl SignedPreKeyStore for Device {
     }
 
     async fn contains_signed_prekey(&self, signed_prekey_id: u32) -> Result<bool, StoreError> {
-        Ok(signed_prekey_id == self.signed_pre_key_id)
+        if signed_prekey_id == self.signed_pre_key_id {
+            return Ok(true);
+        }
+        // Stay consistent with load_signed_prekey: a rotated-out key retained in
+        // the backend table must not read as absent, or a gated load would drop
+        // a still-decryptable prekey message.
+        Ok(self
+            .backend
+            .load_signed_prekey(signed_prekey_id)
+            .await
+            .map_err(|e| Box::new(e) as StoreError)?
+            .is_some())
     }
 
     async fn remove_signed_prekey(&self, signed_prekey_id: u32) -> Result<(), StoreError> {
@@ -561,5 +572,23 @@ mod tests {
             .await
             .expect("load must not error");
         assert!(missing.is_none());
+
+        // contains_signed_prekey must agree with load: current, rotated-out, and
+        // unknown ids report present/present/absent respectively.
+        assert!(
+            SignedPreKeyStore::contains_signed_prekey(&device, current)
+                .await
+                .expect("contains current")
+        );
+        assert!(
+            SignedPreKeyStore::contains_signed_prekey(&device, old_id)
+                .await
+                .expect("contains rotated-out")
+        );
+        assert!(
+            !SignedPreKeyStore::contains_signed_prekey(&device, current + 999)
+                .await
+                .expect("contains unknown")
+        );
     }
 }

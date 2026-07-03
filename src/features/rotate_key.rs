@@ -17,8 +17,9 @@ use wacore::store::commands::DeviceCommand;
 /// treat it as a policy default that is safe to tune.
 pub(crate) const SIGNED_PRE_KEY_ROTATION_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1000; // weekly
 
-/// Current signed pre-key plus retained previous ones. Bounds the decrypt
-/// window for delayed prekey messages built against a rotated-out key.
+/// Total signed pre-keys kept addressable: the current key (device field) plus
+/// the RETENTION-1 most recent rotated-out keys in the backend table. Bounds
+/// the decrypt window for delayed prekey messages built against a rotated key.
 pub(crate) const SIGNED_PRE_KEY_RETENTION: usize = 3;
 
 /// 24-bit ceiling, matching the one-time prekey id border. Ids advance by one
@@ -68,9 +69,16 @@ impl Client {
         Ok(())
     }
 
-    /// Generate, persist, and upload a fresh signed pre-key. Retains the old
-    /// current key in the backend table so it stays decryptable, then prunes
-    /// down to [`SIGNED_PRE_KEY_RETENTION`] retained keys.
+    /// Generate a fresh signed pre-key, upload it, and only then switch to it
+    /// locally: retain the outgoing key so in-flight prekey messages still
+    /// decrypt, promote the new key, stamp the cadence, and prune to
+    /// [`SIGNED_PRE_KEY_RETENTION`].
+    ///
+    /// Upload-first is deliberate. The server keeps advertising the previous
+    /// signed pre-key until it accepts the new one, so switching or advancing
+    /// the cadence before the server accepts would let a failed upload both skip
+    /// retries for a full interval AND, across repeated failures, prune the key
+    /// the server is still handing out — breaking new prekey sessions.
     pub(crate) async fn rotate_signed_pre_key(&self) -> Result<(), anyhow::Error> {
         let snapshot = self.persistence_manager.get_device_snapshot();
         let now = wacore::time::now_millis();
@@ -90,10 +98,37 @@ impl Client {
         let old_id = snapshot.signed_pre_key_id;
         let new_id = next_signed_pre_key_id(old_id);
 
-        let backend = self.persistence_manager.backend();
+        // Upload before any local mutation. WA Web reads 406 = bad key, 409 =
+        // server validation fail, >=500 = transient; none warrant hard-failing
+        // login, and none should advance our state — a later connect retries.
+        match self
+            .execute(RotateSignedPreKeySpec::new(
+                new_id,
+                new_kp.public_key,
+                signature.to_vec(),
+            ))
+            .await
+        {
+            Ok(()) => {}
+            Err(IqError::ServerError { code, text, .. }) => {
+                log::warn!(
+                    "signed pre-key rotation upload rejected (code={code}, text='{text}'); \
+                     keeping the current key, will retry on a later connect"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!(
+                    "signed pre-key rotation upload failed: {e:?}; \
+                     keeping the current key, will retry on a later connect"
+                );
+                return Ok(());
+            }
+        }
 
-        // Retain the OLD current key before the command overwrites the field,
-        // so prekey messages naming the old id still decrypt.
+        // Server accepted new_id. Retain the outgoing key so prekey messages
+        // naming the old id still decrypt, then promote the new key + stamp.
+        let backend = self.persistence_manager.backend();
         let old_record = new_signed_pre_key_record(
             old_id,
             &snapshot.signed_pre_key,
@@ -107,7 +142,7 @@ impl Client {
 
         self.persistence_manager
             .process_command(DeviceCommand::SetSignedPreKey {
-                key_pair: new_kp.clone(),
+                key_pair: new_kp,
                 id: new_id,
                 signature,
                 rotation_ms: now,
@@ -118,50 +153,25 @@ impl Client {
             .await
             .map_err(|e| anyhow::anyhow!("failed to flush rotated signed pre-key: {e:?}"))?;
 
-        // Prune retained keys to the RETENTION highest ids. Numeric ordering is
-        // safe: ids advance one per rotation, so the wrap at MAX is ~300k years
-        // out at weekly cadence.
+        // Prune to RETENTION total addressable keys. The current key lives in the
+        // device field (never the backend table), so the backend keeps only the
+        // RETENTION-1 most recent rotated-out keys. Numeric ordering is safe: ids
+        // advance one per rotation, so the wrap at MAX is ~300k years out.
         let mut retained = backend
             .load_all_signed_prekeys()
             .await
             .map_err(|e| anyhow::anyhow!("failed to load retained signed pre-keys: {e}"))?;
         retained.sort_unstable_by_key(|(id, _)| std::cmp::Reverse(*id));
-        for (id, _) in retained.into_iter().skip(SIGNED_PRE_KEY_RETENTION) {
-            if id == new_id {
-                continue;
-            }
+        for (id, _) in retained
+            .into_iter()
+            .skip(SIGNED_PRE_KEY_RETENTION.saturating_sub(1))
+        {
             if let Err(e) = backend.remove_signed_prekey(id).await {
                 log::warn!("failed to prune retained signed pre-key {id}: {e}");
             }
         }
 
-        // Upload the new key. A failure leaves the rotation persisted locally;
-        // a later connect retries. WA Web reads 406 = bad key, 409 = server
-        // validation fail, >=500 = transient — none warrant hard-failing login.
-        match self
-            .execute(RotateSignedPreKeySpec::new(
-                new_id,
-                new_kp.public_key,
-                signature.to_vec(),
-            ))
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(IqError::ServerError { code, text, .. }) => {
-                log::warn!(
-                    "signed pre-key rotation upload rejected (code={code}, text='{text}'); \
-                     rotation persisted locally, will retry on a later connect"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                log::warn!(
-                    "signed pre-key rotation upload failed: {e:?}; \
-                     rotation persisted locally, will retry on a later connect"
-                );
-                Ok(())
-            }
-        }
+        Ok(())
     }
 }
 
