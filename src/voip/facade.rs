@@ -512,6 +512,11 @@ async fn place_call(
         Err(_) => return Err(CallError::MissingDeviceIdentity),
     };
 
+    // Attach the callee's stored trusted-contact token to the offer's `<privacy>` node so a
+    // privacy-restricted callee accepts the offer -- the same token the 1:1 message and presence
+    // paths attach. Absent when we hold no valid token for them.
+    let privacy_token = client.lookup_tc_token_for_jid(peer).await;
+
     // The offer needs a stanza id so the server can ack-correlate it: the initiator's relay rides
     // back on the `<ack type=offer>` reply to THIS id, not on a later <call>.
     let offer_stanza_id = client.generate_request_id();
@@ -520,7 +525,7 @@ async fn place_call(
         to: peer,
         call_creator,
         device_keys: &device_keys,
-        privacy_token: None,
+        privacy_token: privacy_token.as_deref(),
         capability: Some(&CAPABILITY_OFFER),
         device_identity: device_identity.as_deref(),
         id: Some(&offer_stanza_id),
@@ -607,6 +612,11 @@ async fn place_call(
         return Err(e.into());
     }
 
+    // Issue our token to the callee after the offer, mirroring WA Web's `sendTcToken` in
+    // StartCall.js: rate-limited by the sender bucket and fire-and-forget so call setup isn't
+    // blocked on the IQ round-trip. Prevents 463 nacks on later offers to this contact.
+    spawn_call_tc_token_issuance(client, peer);
+
     // The relay arrives in the `<ack type=offer>` reply to the offer's stanza id (live-only, needs a
     // real server). Wait on the ack-waiter with a bounded timeout; attach the engine when the relay
     // lands, else fail the call so a parked wait_ended() resolves.
@@ -692,6 +702,25 @@ fn spawn_outgoing_relay_waiter(
                     );
                     fail_pending_outgoing(&client, &call_id, generation);
                 }
+            }
+        }))
+        .detach();
+}
+
+/// Fire-and-forget issuance of our trusted-contact token to the callee after an outgoing offer,
+/// mirroring WA Web's `sendTcToken` in StartCall.js. Rate-limited by the sender bucket so repeat
+/// calls to the same contact within a window don't re-issue. Best-effort: a failed issuance only
+/// risks a later re-issue, never the call itself.
+fn spawn_call_tc_token_issuance(client: &Client, peer: &Jid) {
+    let Some(client) = client.self_weak.get().and_then(|w| w.upgrade()) else {
+        return;
+    };
+    let runtime = client.runtime.clone();
+    let peer = peer.clone();
+    runtime
+        .spawn(Box::pin(async move {
+            if client.should_issue_tc_token(&peer).await {
+                client.issue_tc_token_after_send(&peer).await;
             }
         }))
         .detach();
@@ -1882,6 +1911,72 @@ mod tests {
         assert!(
             !enc.content_bytes().unwrap_or_default().is_empty(),
             "the per-device <enc> must carry the encrypted callKey"
+        );
+    }
+
+    // A stored, non-expired trusted-contact token for the callee must ride on the offer as the
+    // leading `<privacy>` child (WA Web's tctoken-on-call-offer), so a privacy-restricted callee
+    // accepts it. Without a token the offer carries no `<privacy>` (asserted above).
+    #[tokio::test]
+    async fn place_call_attaches_stored_tctoken_as_privacy_node() {
+        use wacore::store::traits::TcTokenEntry;
+
+        let (client, _sent_count) = make_sending_client().await;
+        let peer_user = Jid::new("333333333333333", Server::Lid);
+        let device = peer_lid();
+        seed_peer_session(&client, &device).await;
+
+        // Keyed by the callee's account LID user (resolve_tc_token_key for a LID peer).
+        client
+            .persistence_manager
+            .backend()
+            .put_tc_token(
+                "333333333333333",
+                &TcTokenEntry {
+                    token: vec![0xAB, 0xCD, 0xEF],
+                    token_timestamp: wacore::time::now_secs(),
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let own_lid = client.get_lid().expect("own lid");
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+
+        place_call(
+            &client,
+            "00abcdef0123456789abcdef01234567".into(),
+            &peer_user,
+            &own_lid,
+            &own_lid,
+            std::slice::from_ref(&device),
+            std::slice::from_ref(&device),
+            Arc::new(mic_rx),
+            Arc::new(spk_tx),
+        )
+        .await
+        .expect("place_call");
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("offer must be sent")
+            .expect("waiter");
+        let r = node.as_node_ref();
+        let offer = &r.children().unwrap()[0];
+        let children = offer.children().unwrap();
+        // `<privacy>` is the load-bearing first child of the offer.
+        assert_eq!(
+            children[0].tag.as_ref(),
+            "privacy",
+            "the stored tctoken must ride as the leading <privacy> child"
+        );
+        assert_eq!(
+            children[0].content_bytes(),
+            Some([0xAB, 0xCD, 0xEF].as_slice())
         );
     }
 

@@ -120,7 +120,7 @@ impl Client {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.issue_tc_token", level = "debug", skip_all, fields(to = %to.observe())))]
-    pub(super) async fn issue_tc_token_after_send(&self, to: &Jid) {
+    pub(crate) async fn issue_tc_token_after_send(&self, to: &Jid) {
         use wacore::iq::tctoken::IssuePrivacyTokensSpec;
 
         // Bots and status broadcast don't participate in the privacy token system.
@@ -142,6 +142,34 @@ impl Client {
             return;
         }
         self.record_tc_token_sender_timestamp(to).await;
+    }
+
+    /// Whether a fresh tctoken should be issued to `to`, rate-limited by the
+    /// sender bucket. Independent of the 1:1 message AB props — WA Web schedules
+    /// `sendTcToken` on its own cadence (`MsgJob`, `StartCall`) regardless of
+    /// whether a token was attached to the outgoing stanza.
+    ///
+    /// The 1:1 message path inlines this decision in `maybe_include_tc_token`
+    /// (it already reads the entry for the token bytes); this standalone form
+    /// serves the call path, which only needs the issuance decision.
+    #[cfg(feature = "voip")]
+    pub(crate) async fn should_issue_tc_token(&self, to: &Jid) -> bool {
+        use wacore::iq::tctoken::should_send_new_tc_token_with;
+
+        if to.is_bot() || to.is_status_broadcast() {
+            return false;
+        }
+
+        let key = self.resolve_tc_token_key(to).await;
+        let sender_ts = match self.persistence_manager.backend().get_tc_token(&key).await {
+            Ok(entry) => entry.and_then(|e| e.sender_timestamp),
+            Err(e) => {
+                log::warn!(target: "Client/TcToken", "Failed to read tc_token for {}: {e}", to.observe());
+                None
+            }
+        };
+
+        should_send_new_tc_token_with(sender_ts, &self.tc_token_config().await)
     }
 
     /// Persist tokens returned by the explicit `tc_token().issue_tokens()` API.
@@ -423,6 +451,42 @@ mod tests {
         assert!(
             entry.sender_timestamp.is_some(),
             "sender_timestamp is advanced on issuance"
+        );
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn should_issue_tc_token_true_for_unknown_contact() {
+        let client = create_test_client().await;
+        let jid = Jid::new("770000003", Server::Lid);
+        assert!(
+            client.should_issue_tc_token(&jid).await,
+            "a contact with no recorded issuance should get a token"
+        );
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn should_issue_tc_token_false_within_sender_bucket() {
+        let client = create_test_client().await;
+        client
+            .persistence_manager
+            .backend()
+            .put_tc_token(
+                "770000004",
+                &TcTokenEntry {
+                    token: Vec::new(),
+                    token_timestamp: 0,
+                    sender_timestamp: Some(wacore::time::now_secs()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let jid = Jid::new("770000004", Server::Lid);
+        assert!(
+            !client.should_issue_tc_token(&jid).await,
+            "a fresh issuance in the current bucket must not re-issue"
         );
     }
 }

@@ -12,11 +12,12 @@
 //! let count = client.tc_token().prune_expired().await?;
 //! ```
 //!
-//! ## TODO: VoIP call integration
-//! WA Web calls `sendTcToken` for each participant when initiating calls
-//! (WAWeb/Voip/StartCall.js). When a calls/VoIP module is added, it should
-//! call `issue_tc_token_after_send` (or equivalent) for every call participant
-//! — both 1:1 and group calls. This prevents 463 nacks on call offers.
+//! ## VoIP call integration
+//! Outgoing 1:1 call offers attach the callee's stored token to the offer's
+//! `<privacy>` node and issue a fresh token after send (WA Web's `sendTcToken`
+//! in StartCall.js), both driven from `voip::facade::place_call`. Group-call
+//! initiation is not yet implemented; when it is, it should attach/issue per
+//! participant the same way to avoid 463 nacks on call offers.
 
 use crate::client::Client;
 use crate::request::IqError;
