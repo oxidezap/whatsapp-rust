@@ -88,6 +88,7 @@ struct DeviceRow {
     first_unupload_pre_key_id: i32,
     lid_migrated: bool,
     last_signed_pre_key_rotation_ms: i64,
+    read_receipts_disabled: bool,
 }
 
 /// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
@@ -504,6 +505,7 @@ impl SqliteStore {
         let login_counter = device_data.login_counter;
         let lid_migrated = device_data.lid_migrated;
         let last_signed_pre_key_rotation_ms = device_data.last_signed_pre_key_rotation_ms;
+        let read_receipts_disabled = device_data.read_receipts_disabled;
         let new_lid: Arc<str> = Arc::from(
             device_data
                 .lid
@@ -565,6 +567,7 @@ impl SqliteStore {
                         device::login_counter.eq(login_counter),
                         device::lid_migrated.eq(lid_migrated),
                         device::last_signed_pre_key_rotation_ms.eq(last_signed_pre_key_rotation_ms),
+                        device::read_receipts_disabled.eq(read_receipts_disabled),
                     ))
                     .on_conflict(device::id)
                     .do_update()
@@ -598,6 +601,7 @@ impl SqliteStore {
                         device::lid_migrated.eq(excluded(device::lid_migrated)),
                         device::last_signed_pre_key_rotation_ms
                             .eq(excluded(device::last_signed_pre_key_rotation_ms)),
+                        device::read_receipts_disabled.eq(excluded(device::read_receipts_disabled)),
                     ))
                     .execute(conn)
                     .map(|_| ())
@@ -666,6 +670,7 @@ impl SqliteStore {
                         device::login_counter.eq(0i32),
                         device::lid_migrated.eq(false),
                         device::last_signed_pre_key_rotation_ms.eq(last_signed_pre_key_rotation_ms),
+                        device::read_receipts_disabled.eq(false),
                     ))
                     .execute(conn)
                     .map(|_| device_id)
@@ -797,6 +802,7 @@ impl SqliteStore {
                 login_counter: row.login_counter,
                 lid_migrated: row.lid_migrated,
                 last_signed_pre_key_rotation_ms: row.last_signed_pre_key_rotation_ms,
+                read_receipts_disabled: row.read_receipts_disabled,
             }))
         } else {
             Ok(None)
