@@ -340,38 +340,49 @@ impl Client {
             } else {
                 wacore::telemetry::connect("ok");
                 let loop_result = self.read_messages_loop().await;
-                let unexpected_disconnect = if let Err(e) = loop_result {
-                    // Check intentional_reconnect AFTER read loop exits — reconnect()
-                    // sets this flag while the loop is running, so it must be read here.
-                    if self.expected_disconnect.load(Ordering::Relaxed)
-                        || self.intentional_reconnect.swap(false, Ordering::Relaxed)
-                    {
-                        debug!("Message loop exited during expected disconnect.");
-                        false
-                    } else {
-                        // read_messages_loop already logged the cause at the right level
-                        // (info for a clean server recycle, warn for a real transport
-                        // error), so keep this at debug to avoid re-flagging a benign
-                        // reconnect as an error. Still treated as an unexpected
-                        // disconnect for the event dispatch + reconnect below.
-                        debug!("Message loop exited, will reconnect if enabled: {e:#}");
-                        true
+                // Some(reason) = unexpected disconnect worth a `Disconnected` event; the
+                // reason distinguishes a routine server recycle from a real failure so
+                // consumers don't have to. Check intentional_reconnect AFTER the read
+                // loop exits — reconnect() sets this flag while the loop is running.
+                let unexpected_disconnect = match loop_result {
+                    Ok(super::node_io::ReadLoopExit::Expected) => {
+                        debug!("Message loop exited gracefully (expected disconnect).");
+                        None
                     }
-                } else if self.expected_disconnect.load(Ordering::Relaxed) {
-                    debug!("Message loop exited gracefully (expected disconnect).");
-                    false
-                } else {
-                    info!("Message loop exited gracefully.");
-                    false
+                    Ok(super::node_io::ReadLoopExit::ServerRecycle(reason)) => {
+                        if self.expected_disconnect.load(Ordering::Relaxed)
+                            || self.intentional_reconnect.swap(false, Ordering::Relaxed)
+                        {
+                            debug!("Message loop exited during expected disconnect.");
+                            None
+                        } else {
+                            // read_messages_loop already logged this at info; a clean
+                            // recycle stays quiet here too.
+                            Some(reason)
+                        }
+                    }
+                    Err(e) => {
+                        if self.expected_disconnect.load(Ordering::Relaxed)
+                            || self.intentional_reconnect.swap(false, Ordering::Relaxed)
+                        {
+                            debug!("Message loop exited during expected disconnect.");
+                            None
+                        } else {
+                            // read_messages_loop already logged the cause at warn; keep
+                            // this at debug to avoid double-reporting.
+                            debug!("Message loop exited, will reconnect if enabled: {e:#}");
+                            Some(e.into_reason())
+                        }
+                    }
                 };
 
                 self.cleanup_connection_state().await;
 
                 // Dispatch after cleanup so handlers see cleared connection state.
-                if unexpected_disconnect {
-                    self.core
-                        .event_bus
-                        .dispatch(Event::Disconnected(crate::types::events::Disconnected));
+                if let Some(reason) = unexpected_disconnect {
+                    self.core.event_bus.dispatch(Event::Disconnected(
+                        crate::types::events::Disconnected { reason },
+                    ));
                 }
             }
 
@@ -417,11 +428,25 @@ impl Client {
         Box::pin(self.connect_graph())
     }
 
+    // err(level = "warn", ...): run()'s caller already classifies failures here itself
+    // (debug! for a transient HandshakeError worth a quiet retry, error! otherwise — see
+    // run()'s connect_err handling) — the default ERROR level on this span ignored that
+    // and turned every transient handshake retry into its own GlitchTip issue. A genuine
+    // failure still surfaces via that caller's error! call, independent of this span's level.
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.conn.connect", level = "info", skip_all, err(Debug))
+        tracing::instrument(
+            name = "wa.conn.connect",
+            level = "info",
+            skip_all,
+            fields(lid = tracing::field::Empty, pn = tracing::field::Empty),
+            err(level = "warn", Debug)
+        )
     )]
     async fn connect_graph(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_span(&tracing::Span::current());
+
         if self.is_connecting.swap(true, Ordering::SeqCst) {
             return Err(ClientError::AlreadyConnected.into());
         }

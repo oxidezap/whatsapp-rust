@@ -1,6 +1,43 @@
 //! Inbound node I/O: read loop, frame decryption, node routing, acks and stream errors.
 
 use super::*;
+use wacore::net::DisconnectReason;
+
+/// Non-error exits of [`Client::read_messages_loop`]. A routine server stream
+/// recycle used to be an `Err`, which forced every severity consumer (logs,
+/// tracing `err(...)` capture, error trackers) to re-derive "was this actually
+/// a problem?" on its own — encoding it in the type does that once.
+pub(crate) enum ReadLoopExit {
+    /// Local, intentional teardown: shutdown signal or an expected disconnect.
+    Expected,
+    /// The server ended the stream cleanly while we did not expect it — the
+    /// routine WhatsApp reconnect path. Callers reconnect and notify consumers,
+    /// but nothing is wrong.
+    ServerRecycle(DisconnectReason),
+}
+
+/// Genuine failures of [`Client::read_messages_loop`] — everything here is
+/// anomalous and worth reporting loudly, unlike [`ReadLoopExit`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReadLoopError {
+    #[error("cannot start message loop: {0}")]
+    NotStarted(&'static str),
+    #[error("transport disconnected: {0}")]
+    Transport(DisconnectReason),
+    #[error("transport event channel closed")]
+    ChannelClosed,
+}
+
+impl ReadLoopError {
+    /// The disconnect reason to surface on the `Disconnected` event; failures
+    /// that carry none map to `Unknown` (conservative, matches `is_clean_shutdown`).
+    pub(crate) fn into_reason(self) -> DisconnectReason {
+        match self {
+            Self::Transport(reason) => reason,
+            Self::NotStarted(_) | Self::ChannelClosed => DisconnectReason::Unknown,
+        }
+    }
+}
 
 impl Client {
     /// Read the current semaphore generation and Arc atomically under the mutex.
@@ -30,17 +67,32 @@ impl Client {
             .fetch_add(1, Ordering::SeqCst);
     }
 
+    // err(...) stays at the default ERROR on purpose: with the routine server
+    // recycle moved to Ok(ServerRecycle), an Err from this loop now always means
+    // something genuinely wrong — so the automatic capture only ever reports
+    // real failures, not WhatsApp's periodic stream recycling.
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "wa.conn.read_loop", level = "debug", skip_all, err(Debug))
+        tracing::instrument(
+            name = "wa.conn.read_loop",
+            level = "debug",
+            skip_all,
+            fields(lid = tracing::field::Empty, pn = tracing::field::Empty),
+            err(Debug)
+        )
     )]
-    pub(crate) async fn read_messages_loop(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+    pub(crate) async fn read_messages_loop(
+        self: &Arc<Self>,
+    ) -> Result<ReadLoopExit, ReadLoopError> {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_span(&tracing::Span::current());
+
         debug!("Starting message processing loop...");
 
         let mut rx_guard = self.transport_events.lock().await;
         let transport_events = rx_guard
             .take()
-            .ok_or_else(|| anyhow::anyhow!("Cannot start message loop: not connected"))?;
+            .ok_or(ReadLoopError::NotStarted("not connected"))?;
         drop(rx_guard);
 
         // The noise socket is installed before this loop starts (connect_internal)
@@ -49,7 +101,7 @@ impl Client {
         let noise_socket = self
             .get_noise_socket()
             .await
-            .map_err(|_| anyhow::anyhow!("Cannot start message loop: no noise socket"))?;
+            .map_err(|_| ReadLoopError::NotStarted("no noise socket"))?;
 
         // Frame decoder to parse incoming data
         let mut frame_decoder = wacore::framing::FrameDecoder::new();
@@ -64,7 +116,7 @@ impl Client {
             futures::select_biased! {
                     _ = shutdown_fut => {
                         debug!("Shutdown signaled in message loop. Exiting message loop.");
-                        return Ok(());
+                        return Ok(ReadLoopExit::Expected);
                     },
                     event_result = transport_events.recv().fuse() => {
                         match event_result {
@@ -113,7 +165,7 @@ impl Client {
                                     // Check if we should exit after processing (e.g., after 515 stream error)
                                     if self.expected_disconnect.load(Ordering::Relaxed) {
                                         debug!("Expected disconnect signaled during frame processing. Exiting message loop.");
-                                        return Ok(());
+                                        return Ok(ReadLoopExit::Expected);
                                     }
 
                                     // Cooperative yield — frequency and behavior are runtime-defined.
@@ -138,18 +190,18 @@ impl Client {
                             },
                             Ok(crate::transport::TransportEvent::Disconnected(reason)) => {
                                 if !self.expected_disconnect.load(Ordering::Relaxed) {
-                                    // Classify the level: a routine server recycle (clean EOF /
-                                    // normal close) is logged quietly, but a real transport error
-                                    // stays at WARN so it's never hidden behind reconnect noise.
+                                    // A routine server recycle (clean EOF / normal close) is not
+                                    // an error — quiet log, Ok exit. A real transport error stays
+                                    // WARN + Err so it's never hidden behind reconnect noise.
                                     if reason.is_clean_shutdown() {
                                         info!("Connection closed by server ({reason}); reconnecting.");
-                                    } else {
-                                        warn!("Transport disconnected: {reason}; reconnecting.");
+                                        return Ok(ReadLoopExit::ServerRecycle(reason));
                                     }
-                                    return Err(anyhow::anyhow!("Transport disconnected: {reason}"));
+                                    warn!("Transport disconnected: {reason}; reconnecting.");
+                                    return Err(ReadLoopError::Transport(reason));
                                 } else {
                                     debug!("Transport disconnected as expected: {reason}");
-                                    return Ok(());
+                                    return Ok(ReadLoopExit::Expected);
                                 }
                             }
                             // Event channel closed (no DisconnectReason available) — the
@@ -159,9 +211,9 @@ impl Client {
                             Err(_) => {
                                 if !self.expected_disconnect.load(Ordering::Relaxed) {
                                     warn!("Transport event channel closed; reconnecting.");
-                                    return Err(anyhow::anyhow!("Transport event channel closed"));
+                                    return Err(ReadLoopError::ChannelClosed);
                                 } else {
-                                    return Ok(());
+                                    return Ok(ReadLoopExit::Expected);
                                 }
                             }
                             Ok(crate::transport::TransportEvent::Connected) => {

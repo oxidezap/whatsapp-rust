@@ -998,7 +998,12 @@ pub struct StreamError {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Disconnected;
+pub struct Disconnected {
+    /// Why the transport ended — lets consumers tell a routine server stream
+    /// recycle (`reason.is_clean_shutdown()`) from a genuine transport failure
+    /// without parsing logs.
+    pub reason: crate::net::DisconnectReason,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OfflineSyncPreview {
