@@ -120,7 +120,9 @@ impl InboundDurabilityHook for InboxArchiver {
                     m.info.source.sender.to_string(),
                     m.info.id.clone(),
                 );
-                if seen.contains(&key) {
+                // Dedup against the archive AND earlier entries of this same
+                // batch, so one fsync can never append a key twice.
+                if seen.contains(&key) || keys.contains(&key) {
                     info!("[{}] already committed, skipping (dedup)", m.info.id);
                     continue;
                 }

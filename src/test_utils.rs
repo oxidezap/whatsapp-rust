@@ -110,11 +110,15 @@ pub async fn create_test_client_with_config(
     .await;
 
     // Tests exercise live-path semantics by default (a fresh client starts in
-    // drain mode, where inbound commits batch instead of dispatching
-    // immediately). Drain-specific tests reset this flag themselves.
+    // drain mode: 1-permit semaphore, inbound commits batch instead of
+    // dispatching immediately). Mirror a completed offline sync — flag, live
+    // permit count, batcher in live mode. Drain-specific tests re-enter drain
+    // state themselves.
     client
         .offline_sync_completed
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    client.swap_message_semaphore(64);
+    client.inbound_commit_batch.deactivate_for_tests();
 
     client
 }

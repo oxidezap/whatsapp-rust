@@ -344,24 +344,7 @@ impl Client {
         // can lose pkmsg messages carrying SKDM (sender key distribution). If the
         // SKDM is lost, ALL subsequent skmsg messages from that sender will fail
         // with "No sender key state".
-        let _global_permit = loop {
-            let (generation, semaphore) = self.read_message_semaphore();
-            let permit = semaphore.acquire_arc().await;
-            if generation
-                == self
-                    .message_semaphore_generation
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                break permit;
-            }
-            // Generation changed while waiting (e.g. offline→online transition).
-            // Drop the stale permit and retry with the new semaphore, which has
-            // more permits and will grant access quickly.
-            log::debug!(
-                "Semaphore generation changed during acquire, re-acquiring from new semaphore"
-            );
-            drop(permit);
-        };
+        let _global_permit = self.acquire_message_processing_permit().await;
 
         log::debug!(
             "Starting PASS 1: Processing {} session establishment messages (pkmsg/msg)",
@@ -533,14 +516,11 @@ impl Client {
         // commit batcher owns the flush — one per batch, before any ack (WA
         // Web's bulk signal-store snapshot) — so here only the batch size/byte
         // triggers are checked, while the global permit is still held.
-        if self
-            .offline_sync_completed
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.inbound_commit_batch.is_active() {
+            self.maybe_flush_inbound_commits().await;
+        } else {
             self.flush_signal_cache_logged("message", Some(&info.id))
                 .await;
-        } else {
-            self.maybe_flush_inbound_commits().await;
         }
     }
 

@@ -64,6 +64,26 @@ impl Client {
             .fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Acquire one permit from the CURRENT message-processing semaphore.
+    ///
+    /// The semaphore can be swapped while a waiter sleeps (offline online
+    /// transition); a permit from the stale semaphore would be a no-op guard,
+    /// so re-acquire until generation and semaphore agree. Shared by stanza
+    /// processing and the commit batcher: both must serialize on the same
+    /// instance for the drain-flush safety argument to hold.
+    pub(crate) async fn acquire_message_processing_permit(&self) -> async_lock::SemaphoreGuardArc {
+        loop {
+            let (generation, semaphore) = self.read_message_semaphore();
+            let permit = semaphore.acquire_arc().await;
+            if generation == self.message_semaphore_generation.load(Ordering::SeqCst) {
+                return permit;
+            }
+            // Generation changed while waiting: drop the stale permit and
+            // retry with the new semaphore.
+            drop(permit);
+        }
+    }
+
     // err(...) stays at the default ERROR on purpose: with the routine server
     // recycle moved to Ok(ServerRecycle), an Err from this loop now always means
     // something genuinely wrong — so the automatic capture only ever reports

@@ -3120,15 +3120,23 @@ impl ProtocolStore for SqliteStore {
             let rows = Arc::clone(&rows);
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.transaction(|conn| {
-                    for (chat, sender, id, message) in rows.iter() {
+                    // Multi-row VALUES per statement; chunked so binds stay far
+                    // under SQLite's variable limit (5 columns × 100 rows).
+                    for chunk in rows.chunks(100) {
+                        let values: Vec<_> = chunk
+                            .iter()
+                            .map(|(chat, sender, id, message)| {
+                                (
+                                    pending_inbound_messages::chat.eq(chat),
+                                    pending_inbound_messages::sender.eq(sender),
+                                    pending_inbound_messages::id.eq(id),
+                                    pending_inbound_messages::message.eq(message.as_slice()),
+                                    pending_inbound_messages::device_id.eq(device_id),
+                                )
+                            })
+                            .collect();
                         diesel::replace_into(pending_inbound_messages::table)
-                            .values((
-                                pending_inbound_messages::chat.eq(chat),
-                                pending_inbound_messages::sender.eq(sender),
-                                pending_inbound_messages::id.eq(id),
-                                pending_inbound_messages::message.eq(message.as_slice()),
-                                pending_inbound_messages::device_id.eq(device_id),
-                            ))
+                            .values(&values)
                             .execute(conn)?;
                     }
                     Ok(())
@@ -3154,6 +3162,9 @@ impl ProtocolStore for SqliteStore {
         self.with_retry("delete_pending_inbound_batch", || {
             let keys = Arc::clone(&keys);
             Box::new(move |conn: &mut SqliteConnection| {
+                // Per-row deletes stay: Diesel's DSL cannot express a composite
+                // `(chat, sender, id) IN (...)` tuple filter, and the single
+                // transaction already amortizes the WAL commit.
                 conn.transaction(|conn| {
                     for (chat, sender, id) in keys.iter() {
                         diesel::delete(

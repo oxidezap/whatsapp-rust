@@ -5533,8 +5533,11 @@ async fn capturing_client(
     // other layers but not on this path.
     *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
     seed_test_pn(&client).await;
-    // Live-path semantics by default; drain tests reset the flag themselves.
+    // Live-path semantics by default (flag, live permit count, batcher live);
+    // drain tests re-enter drain state themselves.
     client.offline_sync_completed.store(true, Ordering::Relaxed);
+    client.swap_message_semaphore(64);
+    client.inbound_commit_batch.deactivate_for_tests();
     (client, transport)
 }
 

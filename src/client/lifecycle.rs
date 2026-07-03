@@ -458,7 +458,7 @@ impl Client {
         self.clear_offline_receipt_buffer();
         // Uncommitted batch entries were never acked; the server redelivers
         // them on this fresh connection.
-        self.inbound_commit_batch.clear();
+        self.inbound_commit_batch.reset();
         self.offline_batch.reset();
         self.outbound_flush.reopen();
 
@@ -579,9 +579,10 @@ impl Client {
         // re-acked fresh.
         //
         // Commit any accumulated drain batch first so its acks land in this
-        // receipt drain; entries that cannot commit stay unacked and the
-        // server redelivers them.
-        self.flush_inbound_commits_acquiring_permit().await;
+        // receipt drain. Bounded like the outbound flush below: on timeout the
+        // entries simply stay unacked and the server redelivers them.
+        self.flush_inbound_commits_bounded(std::time::Duration::from_secs(5))
+            .await;
         self.flush_offline_receipts();
         // Prevent late receipt producers from escaping the drain window.
         self.outbound_flush.close();
@@ -640,7 +641,8 @@ impl Client {
         self.auto_reconnect_errors
             .store(Self::RECONNECT_BACKOFF_STEP, Ordering::Relaxed);
 
-        self.flush_inbound_commits_acquiring_permit().await;
+        self.flush_inbound_commits_bounded(std::time::Duration::from_secs(2))
+            .await;
         self.flush_offline_receipts();
         self.outbound_flush.close();
         self.outbound_flush
@@ -666,7 +668,8 @@ impl Client {
         info!("Reconnecting immediately (expected disconnect).");
         self.expected_disconnect.store(true, Ordering::Relaxed);
 
-        self.flush_inbound_commits_acquiring_permit().await;
+        self.flush_inbound_commits_bounded(std::time::Duration::from_secs(2))
+            .await;
         self.flush_offline_receipts();
         self.outbound_flush.close();
         self.outbound_flush
@@ -764,7 +767,7 @@ impl Client {
         self.clear_offline_receipt_buffer();
         // Same rule as receipts: uncommitted entries drop here and the server
         // redelivers them on the next connect.
-        self.inbound_commit_batch.clear();
+        self.inbound_commit_batch.reset();
         self.offline_batch.reset();
         self.offline_sync_metrics
             .active

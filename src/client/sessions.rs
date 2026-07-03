@@ -36,14 +36,21 @@ impl Client {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            // Commit the tail of the drain batch BEFORE widening the semaphore:
-            // acquiring the still-single permit serializes with the last
-            // in-flight stanza, and post-flip dispatches take the live path, so
-            // the batcher is provably empty from here on. Receipts flush after,
+            // Commit the drain tail and flip the batcher to live mode, both
+            // under the still-single processing permit (see
+            // finish_inbound_commit_drain for the raceless-transition
+            // argument), BEFORE widening the semaphore. Receipts flush after,
             // so every receipt's message is durably committed first (WA Web's
             // createSnapshot ordering).
             if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-                client.flush_inbound_commits_acquiring_permit().await;
+                client.finish_inbound_commit_drain().await;
+            } else {
+                // Practically unreachable (the run loop owns a strong Arc), but
+                // a silent skip here would be exactly the acked-before-committed
+                // bug this ordering exists to prevent — make it loud.
+                log::error!(
+                    "complete_offline_sync: self_weak upgrade failed; skipping drain-tail commit before widening the semaphore"
+                );
             }
 
             // Allow parallel message processing now that offline sync is done.

@@ -678,6 +678,12 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// single-message on live traffic) are fanned out here in arrival order,
     /// awaiting each handler before the next — per-message bots keep their
     /// ergonomics and gain in-batch ordering.
+    ///
+    /// The handler is CALLED for every message in the batch up front and the
+    /// returned futures then run in order (an `async` closure runs no body
+    /// code at call time, so for the typical handler this is unobservable).
+    /// Interleaving call+await instead would hold a `MessageContext` across
+    /// an await, which is not `Send` on wasm32.
     pub fn on_message<F, Fut>(self, handler: F) -> Self
     where
         F: Fn(MessageContext) -> Fut + Send + Sync + 'static,

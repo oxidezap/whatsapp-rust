@@ -35,10 +35,20 @@ struct BatchState {
 
 pub(crate) struct InboundCommitBatcher {
     state: std::sync::Mutex<BatchState>,
+    /// Whether inbound commits accumulate here (offline drain) or commit
+    /// immediately (live). Flipped off ONLY by the end-of-drain flush while it
+    /// holds the single processing permit, so no stanza can straddle the
+    /// transition: gating on `offline_sync_completed` (which flips outside the
+    /// permit) would let an in-flight stanza persist Signal state for an
+    /// uncommitted batch entry, and let queued drain stanzas commit as Live
+    /// ahead of the accumulated batch.
+    active: std::sync::atomic::AtomicBool,
     /// Bumped on every take; a timer that observes a stale epoch stands down.
     epoch: AtomicU64,
-    /// Serializes commit sequences so batches reach the hook in accumulation
-    /// order. The guard doubles as the reusable encode arena.
+    /// Reusable encode arena for drain commits, which the processing permit
+    /// already serializes — so this lock is never contended there. Live
+    /// commits use a local buffer instead: sharing it would serialize
+    /// concurrent live-path hook calls that could previously overlap.
     arena: async_lock::Mutex<Vec<u8>>,
 }
 
@@ -46,6 +56,7 @@ impl Default for InboundCommitBatcher {
     fn default() -> Self {
         Self {
             state: std::sync::Mutex::new(BatchState::default()),
+            active: std::sync::atomic::AtomicBool::new(true),
             epoch: AtomicU64::new(0),
             arena: async_lock::Mutex::new(Vec::new()),
         }
@@ -69,9 +80,20 @@ impl InboundCommitBatcher {
         std::mem::take(&mut state.entries)
     }
 
-    /// Drop accumulated entries without committing (connection teardown).
-    /// Uncommitted messages were never acked, so the server redelivers them.
-    pub(crate) fn clear(&self) {
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Switch to immediate (live) commits. Only the end-of-drain flush calls
+    /// this, while holding the single processing permit.
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    /// Connection teardown/setup: drop uncommitted entries (they were never
+    /// acked, so the server redelivers them) and re-arm accumulation for the
+    /// next connection's drain.
+    pub(crate) fn reset(&self) {
         let dropped = self.take();
         if !dropped.is_empty() {
             log::debug!(
@@ -79,6 +101,13 @@ impl InboundCommitBatcher {
                 dropped.len()
             );
         }
+        self.active.store(true, Ordering::Release);
+    }
+
+    /// Test-only: enter live mode without running a drain flush.
+    #[cfg(test)]
+    pub(crate) fn deactivate_for_tests(&self) {
+        self.deactivate();
     }
 }
 
@@ -102,7 +131,7 @@ impl Client {
     /// Batch a message decrypted while the offline drain is active, or commit
     /// immediately (batch of one) on the live path.
     pub(crate) async fn commit_or_batch_inbound(self: &Arc<Self>, item: InboundMessage) {
-        if self.offline_sync_completed.load(Ordering::Relaxed) {
+        if !self.inbound_commit_batch.is_active() {
             self.commit_inbound_batch(vec![item], BatchOrigin::Live, false)
                 .await;
             return;
@@ -142,22 +171,49 @@ impl Client {
     /// semaphore holds a single permit, so this fully serializes with stanza
     /// processing; after the drain the batcher is empty and this no-ops.
     pub(crate) async fn flush_inbound_commits_acquiring_permit(self: &Arc<Self>) {
-        let _permit = loop {
-            let (generation, semaphore) = self.read_message_semaphore();
-            let permit = semaphore.acquire_arc().await;
-            if generation
-                == self
-                    .message_semaphore_generation
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                break permit;
-            }
-            drop(permit);
-        };
+        let _permit = self.acquire_message_processing_permit().await;
         let batch = self.inbound_commit_batch.take();
         if batch.is_empty() {
             return;
         }
+        self.commit_inbound_batch(batch, BatchOrigin::OfflineDrain, true)
+            .await;
+    }
+
+    /// [`flush_inbound_commits_acquiring_permit`](Self::flush_inbound_commits_acquiring_permit)
+    /// with a deadline, for connection teardown: a stalled permit holder or a
+    /// hung hook must not wedge disconnect/reconnect. On timeout the entries
+    /// stay unacked and the server redelivers them on the next connect.
+    pub(crate) async fn flush_inbound_commits_bounded(
+        self: &Arc<Self>,
+        limit: std::time::Duration,
+    ) {
+        if wacore::runtime::timeout(
+            &*self.runtime,
+            limit,
+            self.flush_inbound_commits_acquiring_permit(),
+        )
+        .await
+        .is_err()
+        {
+            log::warn!(
+                "Timed out committing the inbound drain batch during teardown; leaving entries for redelivery"
+            );
+        }
+    }
+
+    /// End-of-drain transition: commit the tail batch and switch the batcher
+    /// to live mode, all under the single processing permit. Holding the
+    /// permit across BOTH steps is what makes the transition raceless: no
+    /// stanza is mid-flight when the mode flips (so a stanza's enqueue and its
+    /// stanza-end flush always agree), and every stanza still queued behind
+    /// this permit commits as Live strictly AFTER the tail batch — arrival
+    /// order is preserved across the boundary. Runs before the semaphore
+    /// widens to the live permit count.
+    pub(crate) async fn finish_inbound_commit_drain(self: &Arc<Self>) {
+        let _permit = self.acquire_message_processing_permit().await;
+        let batch = self.inbound_commit_batch.take();
+        self.inbound_commit_batch.deactivate();
         self.commit_inbound_batch(batch, BatchOrigin::OfflineDrain, true)
             .await;
     }
@@ -191,37 +247,52 @@ impl Client {
                 })
                 .collect();
 
-            let mut arena = self.inbound_commit_batch.arena.lock().await;
-            arena.clear();
-            let mut ranges = Vec::with_capacity(items.len());
-            for item in &items {
-                let start = arena.len();
-                waproto::codec::message_encode_into(&item.message, &mut arena);
-                ranges.push(start..arena.len());
-            }
-            let rows: Vec<PendingInboundRow<'_>> = items
-                .iter()
-                .zip(&keys)
-                .zip(&ranges)
-                .map(|((item, (chat, sender)), range)| PendingInboundRow {
-                    chat,
-                    sender,
-                    id: &item.info.id,
-                    message: &arena[range.clone()],
-                })
-                .collect();
-
             let backend = self.persistence_manager.backend();
-            // Fail closed: without a durable buffered copy, do not run the hook
-            // and do not ack — the server redelivers once storage recovers.
-            if let Err(e) = backend.store_pending_inbound_batch(&rows).await {
-                log::error!(
-                    "Failed to buffer inbound batch of {}; suppressing acks for redelivery: {e:?}",
-                    items.len()
-                );
-                return;
+            // Encode scope: the buffer lives only through the durable write,
+            // never across the slower flush/hook steps below. Drain reuses the
+            // shared arena (uncontended: the permit serializes drain flushes);
+            // live (batch of one) uses a local buffer so concurrent live
+            // commits never queue on a shared lock while a slow hook runs.
+            {
+                let mut local_arena;
+                let mut shared_arena;
+                let arena: &mut Vec<u8> = if matches!(origin, BatchOrigin::OfflineDrain) {
+                    shared_arena = self.inbound_commit_batch.arena.lock().await;
+                    &mut shared_arena
+                } else {
+                    local_arena = Vec::new();
+                    &mut local_arena
+                };
+                arena.clear();
+                let mut ranges = Vec::with_capacity(items.len());
+                for item in &items {
+                    let start = arena.len();
+                    waproto::codec::message_encode_into(&item.message, arena);
+                    ranges.push(start..arena.len());
+                }
+                let rows: Vec<PendingInboundRow<'_>> = items
+                    .iter()
+                    .zip(&keys)
+                    .zip(&ranges)
+                    .map(|((item, (chat, sender)), range)| PendingInboundRow {
+                        chat,
+                        sender,
+                        id: &item.info.id,
+                        message: &arena[range.clone()],
+                    })
+                    .collect();
+
+                // Fail closed: without a durable buffered copy, do not run the
+                // hook and do not ack — the server redelivers once storage
+                // recovers.
+                if let Err(e) = backend.store_pending_inbound_batch(&rows).await {
+                    log::error!(
+                        "Failed to buffer inbound batch of {}; suppressing acks for redelivery: {e:?}",
+                        items.len()
+                    );
+                    return;
+                }
             }
-            drop(rows);
 
             if flush_signal {
                 self.flush_signal_cache_logged("commit_batch", None).await;
@@ -325,9 +396,7 @@ mod tests {
         let (handler, rx) = ChannelEventHandler::new();
         client.core.event_bus.add_handler(handler);
 
-        client
-            .offline_sync_completed
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        client.inbound_commit_batch.reset();
         for id in ["B1", "B2", "B3"] {
             client.commit_or_batch_inbound(item(id)).await;
         }
@@ -371,10 +440,6 @@ mod tests {
         let _ = client.inbound_durability_hook.set(hook.clone());
         let (handler, rx) = ChannelEventHandler::new();
         client.core.event_bus.add_handler(handler);
-        client
-            .offline_sync_completed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
         client.commit_or_batch_inbound(item("L1")).await;
 
         assert_eq!(
@@ -391,9 +456,7 @@ mod tests {
     #[tokio::test]
     async fn size_trigger_flushes_full_batch() {
         let client = create_test_client_with_failing_http("batch_size").await;
-        client
-            .offline_sync_completed
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        client.inbound_commit_batch.reset();
         let hook = Arc::new(RecordingHook {
             batches: Mutex::new(Vec::new()),
         });
@@ -415,9 +478,7 @@ mod tests {
     #[tokio::test]
     async fn drain_without_hook_batches_events() {
         let client = create_test_client_with_failing_http("batch_no_hook").await;
-        client
-            .offline_sync_completed
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        client.inbound_commit_batch.reset();
         let (handler, rx) = ChannelEventHandler::new();
         client.core.event_bus.add_handler(handler);
 
@@ -435,14 +496,51 @@ mod tests {
         );
     }
 
-    // clear() drops uncommitted entries: no hook call, no event, and the
+    // End-of-drain transition: the tail batch commits first (as OfflineDrain),
+    // the batcher flips to live mode, and anything after commits as Live —
+    // never interleaved ahead of the tail (cubic/codex P1 regression).
+    #[tokio::test]
+    async fn finish_drain_commits_tail_then_switches_to_live() {
+        let client = create_test_client_with_failing_http("batch_transition").await;
+        client.inbound_commit_batch.reset();
+        let hook = Arc::new(RecordingHook {
+            batches: Mutex::new(Vec::new()),
+        });
+        let _ = client.inbound_durability_hook.set(hook.clone());
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
+
+        client.commit_or_batch_inbound(item("T1")).await;
+        client.commit_or_batch_inbound(item("T2")).await;
+        client.finish_inbound_commit_drain().await;
+        assert!(!client.inbound_commit_batch.is_active());
+        // A message arriving after the transition commits immediately as Live.
+        client.commit_or_batch_inbound(item("T3")).await;
+
+        let batches = hook.batches.lock().expect("hook lock").clone();
+        assert_eq!(
+            batches,
+            vec![vec!["T1", "T2"], vec!["T3"]],
+            "tail batch must commit before, and separately from, live traffic"
+        );
+        let first = rx.try_recv().expect("tail event");
+        assert_eq!(
+            first.message_batch().expect("Messages").origin,
+            BatchOrigin::OfflineDrain
+        );
+        let second = rx.try_recv().expect("live event");
+        assert_eq!(
+            second.message_batch().expect("Messages").origin,
+            BatchOrigin::Live
+        );
+    }
+
+    // reset() drops uncommitted entries: no hook call, no event, and the
     // pending buffer was never written (the server redelivers instead).
     #[tokio::test]
     async fn clear_drops_uncommitted_entries() {
         let client = create_test_client_with_failing_http("batch_clear").await;
-        client
-            .offline_sync_completed
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        client.inbound_commit_batch.reset();
         let hook = Arc::new(RecordingHook {
             batches: Mutex::new(Vec::new()),
         });
@@ -451,7 +549,7 @@ mod tests {
         client.core.event_bus.add_handler(handler);
 
         client.commit_or_batch_inbound(item("C1")).await;
-        client.inbound_commit_batch.clear();
+        client.inbound_commit_batch.reset();
         client.flush_inbound_commits_acquiring_permit().await;
 
         assert!(hook.batches.lock().expect("hook lock").is_empty());

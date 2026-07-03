@@ -843,9 +843,19 @@ impl Event {
             .flatten()
     }
 
-    pub fn message_text(&self) -> Option<&str> {
+    /// Every plain-text body in this event, in arrival order. Prefer this
+    /// over [`message_text`](Self::message_text) when a batch can carry more
+    /// than one message (offline drain).
+    pub fn message_texts(&self) -> impl Iterator<Item = &str> {
         self.messages()
-            .find_map(|m| m.message.conversation.as_deref())
+            .filter_map(|m| m.message.conversation.as_deref())
+    }
+
+    /// Convenience: the FIRST plain-text body in this event. A drain batch can
+    /// carry several texts — iterate [`message_texts`](Self::message_texts)
+    /// (or [`messages`](Self::messages)) to see them all.
+    pub fn message_text(&self) -> Option<&str> {
+        self.message_texts().next()
     }
 }
 
