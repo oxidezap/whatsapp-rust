@@ -152,6 +152,21 @@ impl Client {
     pub(crate) async fn should_issue_tc_token(&self, to: &Jid) -> bool {
         use wacore::iq::tctoken::should_send_new_tc_token_with;
 
+        // A self-call must never issue or record a token for our own account
+        // (same guard as maybe_include_tc_token).
+        let snapshot = self.persistence_manager.get_device_snapshot();
+        let is_self = snapshot
+            .pn
+            .as_ref()
+            .is_some_and(|pn| pn.is_same_user_as(to))
+            || snapshot
+                .lid
+                .as_ref()
+                .is_some_and(|lid| lid.is_same_user_as(to));
+        if is_self {
+            return false;
+        }
+
         if to.is_bot() || to.is_status_broadcast() {
             return false;
         }
@@ -483,6 +498,24 @@ mod tests {
         assert!(
             !client.should_issue_tc_token(&jid).await,
             "a fresh issuance in the current bucket must not re-issue"
+        );
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn should_issue_tc_token_false_for_self() {
+        let client = create_test_client().await;
+        let own = Jid::new("999000111", Server::Lid);
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own.clone(),
+            )))
+            .await;
+
+        assert!(
+            !client.should_issue_tc_token(&own).await,
+            "a self-call must never issue a tc token for our own account"
         );
     }
 }
