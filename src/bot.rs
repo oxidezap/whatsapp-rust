@@ -689,6 +689,12 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// allocator-attribution or platform samplers to this client's work.
     /// Default: no hook — the runtime is used untouched.
     ///
+    /// Occupies the same single-instrument slot as
+    /// [`with_alloc_meter`](Self::with_alloc_meter) (last setter wins): calling
+    /// this after `with_alloc_meter` drops the typed alloc-meter handle, so
+    /// [`Client::resource_report`](crate::Client::resource_report)'s `alloc`
+    /// field reverts to `None`.
+    ///
     /// # Example
     /// ```rust,ignore
     /// use std::sync::Arc;
