@@ -532,6 +532,11 @@ pub struct Client {
     /// idempotent). Separate from `offline_sync_completed` because the finish
     /// runs off the read loop and the flag must flip only after its commit.
     pub(crate) offline_sync_finish_started: Arc<AtomicBool>,
+    /// Set when teardown could not flush the Signal cache and retained it
+    /// (committed/acked state that would be lost forever — the server never
+    /// redelivers acked stanzas). The connect-time cache clear skips when
+    /// this is set so the next successful flush can persist that state.
+    pub(crate) signal_cache_retained_dirty: AtomicBool,
     /// Delivery receipts buffered during offline sync, flushed as aggregate
     /// `<receipt>` stanzas at completion (WA Web `sendAggregateOfflineReceipts`).
     /// Empty (zero capacity) outside the offline window.

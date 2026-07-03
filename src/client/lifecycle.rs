@@ -215,6 +215,7 @@ impl Client {
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
             offline_sync_finish_started: Arc::new(AtomicBool::new(false)),
+            signal_cache_retained_dirty: AtomicBool::new(false),
             offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             inbound_commit_batch: Default::default(),
             history_sync_tasks_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -465,8 +466,20 @@ impl Client {
         // cleanup settled the cache, leaving dirty ratchet advances whose
         // entries are dropped right here — flushing those later would make
         // their redeliveries ackable duplicates. Committed state was flushed
-        // by its commit, so this only drops rowless advances.
-        self.signal_cache.clear().await;
+        // by its commit, so this normally only drops rowless advances — the
+        // exception is a teardown whose flush FAILED and retained
+        // committed/acked state (never redelivered): keep that for the next
+        // successful flush instead of destroying it.
+        if self
+            .signal_cache_retained_dirty
+            .swap(false, Ordering::AcqRel)
+        {
+            log::warn!(
+                "connect: keeping Signal cache retained by a failed teardown flush; the next flush persists it"
+            );
+        } else {
+            self.signal_cache.clear().await;
+        }
         self.inbound_commit_batch.reset();
         self.offline_batch.reset();
         self.outbound_flush.reopen();
