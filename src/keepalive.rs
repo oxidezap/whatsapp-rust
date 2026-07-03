@@ -123,10 +123,10 @@ impl Client {
         }
     }
 
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(name = "wa.conn.keepalive", level = "debug", skip_all)
-    )]
+    // Deliberately NOT instrumented: a span here would live for the whole
+    // connection (tens of minutes), polluting duration/throughput metrics and
+    // only reporting at disconnect. Per-ping visibility comes from
+    // `wa.conn.keepalive.ping` on send_keepalive.
     pub(crate) async fn keepalive_loop(self: Arc<Self>) {
         let mut error_count = 0u32;
         let mut cleanup_counter = 0u32;
