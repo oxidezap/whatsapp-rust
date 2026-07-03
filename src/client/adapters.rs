@@ -111,33 +111,27 @@ impl Client {
     /// Must NOT be called while holding the processing permit (it acquires
     /// it); permit-holding paths commit via the batcher directly.
     pub(crate) async fn flush_signal_cache_batch_safe(&self) -> Result<(), anyhow::Error> {
-        if self.inbound_commit_batch.is_active() {
-            if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-                if !client
-                    .flush_inbound_commits_under_permit(false, None, None)
-                    .await
-                {
-                    return Err(anyhow::anyhow!(
-                        "inbound drain batch commit failed; Signal cache left unflushed so the server redelivers"
-                    ));
-                }
-                // The is_active() check above races the drain finisher: if the
-                // batcher deactivated while we waited for the permit, the commit
-                // took an empty batch in live mode and reported durable WITHOUT
-                // flushing (it had no drain rows to tie an advance to). We are
-                // now live with no uncommitted drain entries, so fall through to
-                // the raw flush to persist our out-of-band advance — the same
-                // path a caller that found the batcher already inactive takes.
-                // While still draining, the commit already flushed under the
-                // permit, so return.
-                if self.inbound_commit_batch.is_active() {
-                    return Ok(());
-                }
-            } else if self.inbound_commit_batch.has_entries() {
-                return Err(anyhow::anyhow!(
-                    "client dropping with uncommitted drain entries; skipping Signal flush"
-                ));
-            }
+        // Under the permit the commit ALWAYS flushes the Signal cache (an empty
+        // batch still flushes — see flush_inbound_commits_under_permit), so a
+        // successful call is proof the out-of-band advance is persisted; no
+        // stale is_active() re-check needed even if the drain finisher
+        // deactivated while we waited for the permit.
+        let drain_active = self.inbound_commit_batch.is_active();
+        if drain_active && let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
+            return if client
+                .flush_inbound_commits_under_permit(false, None, None)
+                .await
+            {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "inbound drain batch commit failed; Signal cache left unflushed so the server redelivers"
+                ))
+            };
+        } else if drain_active && self.inbound_commit_batch.has_entries() {
+            return Err(anyhow::anyhow!(
+                "client dropping with uncommitted drain entries; skipping Signal flush"
+            ));
         }
         self.flush_signal_cache().await
     }

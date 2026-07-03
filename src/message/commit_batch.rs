@@ -342,17 +342,18 @@ impl Client {
         let was_draining = self.inbound_commit_batch.is_active();
         let batch = self.inbound_commit_batch.take();
         let durable = if batch.is_empty() {
-            // Even with nothing to commit, a drain-mode flush must persist the
-            // Signal cache: SKDM-only stanzas mutate Signal state without
-            // enqueueing a message, and their buffered receipts flush right
-            // after the teardown/drain-end call sites of this function — so a
-            // failed flush must report not-durable to hold those receipts
-            // back (the cache keeps its dirty entries for a later retry).
-            if was_draining {
-                self.drain_signal_flush_reporting().await
-            } else {
-                true
-            }
+            // Even with nothing to commit, flush the Signal cache under the
+            // permit. While draining this persists SKDM-only advances (stanzas
+            // that mutate Signal state without enqueueing a message), whose
+            // buffered receipts flush right after this function's
+            // drain-end/teardown call sites — a failed flush reports
+            // not-durable to hold them back (the cache keeps its dirty entries
+            // for a later retry). When the batcher deactivated between an
+            // out-of-band batch-safe caller's is_active() check and this
+            // permit, the SAME flush persists that caller's advance instead of
+            // silently no-oping, so is_active() never has to stand in for "was
+            // flushed". Idempotent and cheap when the cache is already clean.
+            self.drain_signal_flush_reporting().await
         } else {
             self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
                 .await
@@ -1222,6 +1223,42 @@ mod tests {
         assert_eq!(
             hook.batches.lock().expect("hook lock").clone(),
             vec![vec!["B1"]]
+        );
+    }
+
+    // An empty commit must still flush the Signal cache under the permit —
+    // this is what lets flush_signal_cache_batch_safe persist an out-of-band
+    // advance when the drain finisher deactivated the batcher between its
+    // is_active() check and the permit. Observable via the injected flush
+    // failure: skipping the flush would wrongly report durable (the pre-fix
+    // empty+live path returned true without flushing).
+    #[tokio::test]
+    async fn empty_commit_still_flushes_under_permit() {
+        let client = create_test_client_with_failing_http("batch_empty_flush").await;
+        // Live mode, empty batcher: was_draining is false under the permit.
+        assert!(!client.inbound_commit_batch.is_active());
+        assert!(!client.inbound_commit_batch.has_entries());
+
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(true, Ordering::Release);
+        assert!(
+            !client
+                .flush_inbound_commits_under_permit(false, None, None)
+                .await,
+            "an empty commit must still hit the Signal cache and surface its failure"
+        );
+
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(false, Ordering::Release);
+        assert!(
+            client
+                .flush_inbound_commits_under_permit(false, None, None)
+                .await,
+            "with the flush succeeding the empty commit reports durable"
         );
     }
 
