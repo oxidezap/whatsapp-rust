@@ -582,6 +582,23 @@ pub trait DeviceStore: Send + Sync {
     async fn snapshot_db(&self, _name: &str, _extra_content: Option<&[u8]>) -> Result<()> {
         Ok(())
     }
+
+    /// Best-effort process-local memory this backend attributes to the session
+    /// (e.g. a SQLite page cache — often the single largest per-session chunk,
+    /// living entirely outside the `Client`). Defaults to an all-`None`
+    /// [`StorageResourceReport`] ("not reported"); backends that can introspect
+    /// their memory override it, and remote/store-backed backends report
+    /// `memory_bytes: Some(0)` (their data isn't process memory).
+    ///
+    /// This is a defaulted method on `DeviceStore` — an already-implemented,
+    /// non-blanket sub-trait of `Backend` — rather than an inherent method
+    /// (which wouldn't compose through the `Arc<dyn Backend>` the client holds)
+    /// or a new `Backend` supertrait (which would force *every* backend,
+    /// including external ones, to add an impl). The default keeps it fully
+    /// non-breaking, exactly like [`Self::snapshot_db`].
+    async fn resource_report(&self) -> crate::stats::StorageResourceReport {
+        crate::stats::StorageResourceReport::default()
+    }
 }
 
 /// Per-outbound-message secret storage for addon-style decryption.

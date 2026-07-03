@@ -245,6 +245,88 @@ impl CollectionStats {
     }
 }
 
+// ── Out-of-client resource reports ───────────────────────────────────────────
+//
+// `MemoryReport` (in the client crate) accounts only for the client's own
+// in-process collections. The dominant per-session RAM lives *outside* the
+// client — the storage backend's page cache, the transport buffers, the HTTP
+// pool. These small structs let each of those components report what it can
+// introspect, so a consumer can compose a realistic per-session estimate.
+//
+// Every field is `Option`: a component fills only what it knows. All-`None`
+// means "not reported" — distinct from a positive `Some(0)` ("holds none",
+// e.g. a remote/store-backed backend whose data isn't process memory, matching
+// `CollectionStats { bytes: 0 }`). The structs are plain (not `#[non_exhaustive]`)
+// because they are built in the backend/transport/HTTP crates, which need
+// struct-literal construction; add future fields with a `..Default::default()`
+// tail to stay non-breaking.
+
+/// Process-local resource footprint a storage backend attributes to one
+/// session. Returned by `store::traits::DeviceStore::resource_report`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageResourceReport {
+    /// Estimated process-local bytes the backend holds for this session (e.g. a
+    /// SQLite page cache). `Some(0)` for backends whose data lives outside this
+    /// process (Redis, other network stores).
+    pub memory_bytes: Option<u64>,
+    /// Pages/entries currently backing the store, when known (SQLite: database
+    /// page count). A size indicator, not part of the memory total.
+    pub pages: Option<u64>,
+    /// Bytes read from the backing store this session, if the backend counts it.
+    pub io_read_bytes: Option<u64>,
+    /// Bytes written to the backing store this session, if the backend counts it.
+    pub io_write_bytes: Option<u64>,
+}
+
+impl StorageResourceReport {
+    /// Retained process memory this backend reports (0 when unknown). Excludes
+    /// the cumulative I/O counters, which are throughput, not residency.
+    pub fn total_bytes(&self) -> u64 {
+        self.memory_bytes.unwrap_or(0)
+    }
+}
+
+/// Per-session footprint of a [`crate::net::Transport`]: read/write framing
+/// buffers plus a best-effort TLS/noise session-state estimate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportResourceReport {
+    pub read_buffer_bytes: Option<u64>,
+    pub write_buffer_bytes: Option<u64>,
+    /// Best-effort estimate of TLS/noise session state (record buffers, key
+    /// schedule). Transports that can't introspect their TLS stack leave it
+    /// `None`.
+    pub tls_state_bytes: Option<u64>,
+}
+
+impl TransportResourceReport {
+    /// Sum of the present byte fields.
+    pub fn total_bytes(&self) -> u64 {
+        self.read_buffer_bytes.unwrap_or(0)
+            + self.write_buffer_bytes.unwrap_or(0)
+            + self.tls_state_bytes.unwrap_or(0)
+    }
+}
+
+/// Per-session footprint of a [`crate::net::HttpClient`]: idle connection-pool
+/// buffers plus any in-flight download/media buffering the impl can see.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HttpResourceReport {
+    /// Idle connections the pool may retain (a cap/estimate, not a live count
+    /// when the client can't introspect the pool).
+    pub pool_connections: Option<u64>,
+    /// Bytes held by the pool's per-connection read/write buffers.
+    pub pool_buffer_bytes: Option<u64>,
+    /// Bytes buffered for in-flight requests/responses right now, when known.
+    pub inflight_bytes: Option<u64>,
+}
+
+impl HttpResourceReport {
+    /// Sum of the present byte fields (excludes the connection count).
+    pub fn total_bytes(&self) -> u64 {
+        self.pool_buffer_bytes.unwrap_or(0) + self.inflight_bytes.unwrap_or(0)
+    }
+}
+
 // ── Task instrumentation ─────────────────────────────────────────────────────
 
 /// Runtime-agnostic hook called around every poll of the client's internal
@@ -349,6 +431,143 @@ impl TaskInstrument for CpuMeter {
                 .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             self.polls.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+// ── Allocator attribution ────────────────────────────────────────────────────
+
+std::thread_local! {
+    /// Meters active on this thread, innermost last. `on_poll_start` pushes,
+    /// `on_poll_end` pops; the host's global allocator charges the innermost.
+    /// A stack (not a slot) for the same reason as `POLL_START`: metered poll
+    /// scopes nest and several meters can share a thread.
+    static ACTIVE_ALLOC_METER: core::cell::RefCell<Vec<*const AllocMeter>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Built-in [`TaskInstrument`] that attributes heap bytes **allocated and
+/// freed** to one client, the churn/transient counterpart to the point-in-time
+/// retained figures in `Client::memory_report`. It captures task futures,
+/// decode arenas and media buffers — anything the client's instrumented tasks
+/// allocate — that no named collection holds.
+///
+/// The library never sees the allocator. The host installs a `#[global_allocator]`
+/// that calls [`AllocMeter::on_alloc`] / [`AllocMeter::on_dealloc`] on every
+/// (de)allocation; this meter — installed via `with_task_instrument` (or the
+/// `with_alloc_meter` convenience) — marks, per thread, *which* client's task is
+/// being polled, so those calls charge the right meter. `examples/alloc_tracking.rs`
+/// shows the ~20 lines of glue.
+///
+/// # Attribution boundary (honest limits)
+/// Only allocations made *inside an instrumented poll or blocking closure* are
+/// counted: every task spawned through the `Runtime` trait, plus the main run
+/// loop (metered since the client meters its own future). Work spawned raw on
+/// the executor — some voip/media paths — and the caller's own
+/// `send_message`-side code are **not** counted. Deallocations are charged to
+/// whichever meter is active when the free happens, not the one that allocated
+/// the block, so `freed` (and `net`) drift when a buffer outlives the poll that
+/// made it; the cumulative `allocated` total is the reliable signal.
+///
+/// Agnostic: the hook is the same wasm/ESP32-safe [`TaskInstrument`] surface as
+/// [`CpuMeter`]. Expect a measurable overhead while a counting allocator is
+/// installed (~10-20% for this design); it is a diagnostics tool, not an
+/// always-on meter.
+#[derive(Debug, Default)]
+pub struct AllocMeter {
+    allocated: AtomicU64,
+    freed: AtomicU64,
+    allocations: AtomicU64,
+}
+
+/// Point-in-time copy of an [`AllocMeter`]. Counters are cumulative over the
+/// meter's lifetime.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllocSnapshot {
+    /// Total bytes allocated while this meter was the active one.
+    pub allocated_bytes: u64,
+    /// Total bytes freed while this meter was active (see the drift caveat on
+    /// [`AllocMeter`]).
+    pub freed_bytes: u64,
+    /// Number of allocations charged.
+    pub allocations: u64,
+}
+
+impl AllocSnapshot {
+    /// Net bytes still attributed (`allocated - freed`), saturating at 0. A
+    /// lower bound on live churn: blocks freed under a different active meter
+    /// aren't subtracted here.
+    pub fn net_bytes(&self) -> u64 {
+        self.allocated_bytes.saturating_sub(self.freed_bytes)
+    }
+}
+
+impl AllocMeter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Charge `bytes` of allocation to the meter currently active on this
+    /// thread, if any. Call from a global allocator's `alloc`. Allocation-free
+    /// (only a thread-local read + relaxed atomics), so it is safe to call from
+    /// inside the allocator without recursing.
+    #[inline]
+    pub fn on_alloc(bytes: usize) {
+        Self::with_active(|m| {
+            m.allocated.fetch_add(bytes as u64, Ordering::Relaxed);
+            m.allocations.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    /// Charge `bytes` of deallocation to the meter currently active on this
+    /// thread, if any. Call from a global allocator's `dealloc`.
+    #[inline]
+    pub fn on_dealloc(bytes: usize) {
+        Self::with_active(|m| {
+            m.freed.fetch_add(bytes as u64, Ordering::Relaxed);
+        });
+    }
+
+    #[inline]
+    fn with_active(f: impl FnOnce(&AllocMeter)) {
+        // `try_with` guards TLS-destroyed-on-exit; `try_borrow` guards the
+        // reentrancy where `on_poll_start`'s own `push` reallocates the stack
+        // and lands back here — in that window the borrow fails and we skip
+        // (charging that tiny bookkeeping allocation to no one).
+        let _ = ACTIVE_ALLOC_METER.try_with(|cell| {
+            if let Ok(stack) = cell.try_borrow()
+                && let Some(&ptr) = stack.last()
+            {
+                // SAFETY: `ptr` was pushed by `on_poll_start` on this thread and
+                // is popped by its matching `on_poll_end` on this same thread
+                // (the `TaskInstrument` contract). Between those calls the meter
+                // is borrowed and thus alive, and allocations only reach here on
+                // that thread within that window, so the pointer is live.
+                f(unsafe { &*ptr });
+            }
+        });
+    }
+
+    pub fn snapshot(&self) -> AllocSnapshot {
+        AllocSnapshot {
+            allocated_bytes: self.allocated.load(Ordering::Relaxed),
+            freed_bytes: self.freed.load(Ordering::Relaxed),
+            allocations: self.allocations.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl TaskInstrument for AllocMeter {
+    fn on_poll_start(&self) {
+        // `borrow_mut` while pushing: a reentrant `on_alloc` from the push's own
+        // reallocation sees the active borrow and skips (see `with_active`).
+        let _ = ACTIVE_ALLOC_METER.try_with(|cell| cell.borrow_mut().push(self as *const Self));
+    }
+
+    fn on_poll_end(&self) {
+        let _ = ACTIVE_ALLOC_METER.try_with(|cell| {
+            cell.borrow_mut().pop();
+        });
     }
 }
 
@@ -496,5 +715,62 @@ mod tests {
 
         let snap = meter.snapshot();
         assert_eq!(snap.polls, 1);
+    }
+
+    #[test]
+    fn alloc_meter_charges_only_the_active_scope() {
+        let meter = AllocMeter::new();
+
+        // Outside any poll scope: charged to no one.
+        AllocMeter::on_alloc(9999);
+
+        meter.on_poll_start();
+        AllocMeter::on_alloc(1000);
+        AllocMeter::on_alloc(500);
+        AllocMeter::on_dealloc(200);
+        meter.on_poll_end();
+
+        // After the scope closes: charged to no one again.
+        AllocMeter::on_alloc(7777);
+        AllocMeter::on_dealloc(7777);
+
+        let snap = meter.snapshot();
+        assert_eq!(snap.allocated_bytes, 1500);
+        assert_eq!(snap.freed_bytes, 200);
+        assert_eq!(snap.allocations, 2);
+        assert_eq!(snap.net_bytes(), 1300);
+    }
+
+    #[test]
+    fn alloc_meter_attributes_nested_scopes_to_the_innermost() {
+        let outer = AllocMeter::new();
+        let inner = AllocMeter::new();
+
+        outer.on_poll_start();
+        AllocMeter::on_alloc(100); // -> outer
+        inner.on_poll_start();
+        AllocMeter::on_alloc(30); // -> inner (innermost)
+        inner.on_poll_end();
+        AllocMeter::on_alloc(70); // -> outer again
+        outer.on_poll_end();
+
+        assert_eq!(outer.snapshot().allocated_bytes, 170);
+        assert_eq!(inner.snapshot().allocated_bytes, 30);
+    }
+
+    #[test]
+    fn alloc_meter_survives_realloc_reentrancy_during_poll_start() {
+        // Force the thread-local stack to grow inside `on_poll_start` while its
+        // own `borrow_mut` is held: a reentrant `on_alloc` must skip, not panic.
+        let meters: Vec<AllocMeter> = (0..64).map(|_| AllocMeter::new()).collect();
+        for m in &meters {
+            m.on_poll_start();
+            AllocMeter::on_alloc(1);
+        }
+        for m in meters.iter().rev() {
+            m.on_poll_end();
+        }
+        // Innermost meter got its own charge; no panic reaching here is the test.
+        assert_eq!(meters.last().unwrap().snapshot().allocations, 1);
     }
 }

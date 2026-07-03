@@ -173,7 +173,10 @@ const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;
 /// DGW `connectTimeoutMs` defaults to `20000ms`.
 const TRANSPORT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-pub use wacore::stats::{CollectionStats, StatsSnapshot};
+pub use wacore::stats::{
+    AllocSnapshot, CollectionStats, HttpResourceReport, StatsSnapshot, StorageResourceReport,
+    TransportResourceReport,
+};
 
 /// On-demand report of the client's internal collections: entry counts plus
 /// estimated retained heap bytes for the memory-dominant caches.
@@ -309,6 +312,93 @@ impl std::fmt::Display for MemoryReport {
         writeln!(
             f,
             "  total estimated:        {} B",
+            self.total_estimated_bytes()
+        )?;
+        Ok(())
+    }
+}
+
+/// Unified per-session resource estimate: the client's own collections plus the
+/// components that live *outside* the `Client` and dominate real per-session
+/// RAM — the storage backend, transport, and HTTP client — and an optional
+/// allocation-churn snapshot.
+///
+/// Obtain one from [`Client::resource_report`]. Each out-of-client component
+/// fills only what it can introspect (see the per-field types), so absent
+/// figures mean "not reported", not "zero".
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct ResourceReport {
+    /// The client's own in-process collections — identical to
+    /// [`Client::memory_report`].
+    pub client: MemoryReport,
+    /// Storage-backend footprint (SQLite page cache, etc.). All-`None` for
+    /// backends that don't report.
+    pub storage: StorageResourceReport,
+    /// Transport buffers + TLS/noise state, if the transport reports them.
+    pub transport: Option<TransportResourceReport>,
+    /// HTTP connection-pool + in-flight footprint, if the client reports it.
+    pub http: Option<HttpResourceReport>,
+    /// Allocation churn attributed to this client's instrumented work, present
+    /// only when an [`AllocMeter`](wacore::stats::AllocMeter) was installed via
+    /// `BotBuilder::with_alloc_meter`. It is a churn/attribution signal, not a
+    /// retained figure, so it is deliberately excluded from
+    /// [`Self::total_estimated_bytes`].
+    pub alloc: Option<AllocSnapshot>,
+}
+
+impl ResourceReport {
+    /// Best-effort sum of **retained** bytes across the present point-in-time
+    /// components (client collections + storage + transport + HTTP).
+    ///
+    /// Exactness varies by component and this is a **lower bound** overall:
+    /// - client collections and transport/HTTP buffers are honest estimates;
+    /// - storage `memory_bytes` is an upper bound on the SQLite page cache
+    ///   (`min(cache cap, db size)`), 0 for remote backends;
+    /// - components reporting `None` contribute 0 (absent, not zero);
+    /// - `alloc` (churn, not residency) is excluded.
+    pub fn total_estimated_bytes(&self) -> u64 {
+        self.client.total_estimated_bytes()
+            + self.storage.total_bytes()
+            + self.transport.map_or(0, |t| t.total_bytes())
+            + self.http.map_or(0, |h| h.total_bytes())
+    }
+}
+
+impl std::fmt::Display for ResourceReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "=== Resource Report ===")?;
+        writeln!(
+            f,
+            "  client collections:     {:>10} B",
+            self.client.total_estimated_bytes()
+        )?;
+        writeln!(
+            f,
+            "  storage backend:        {:>10} B (pages: {:?})",
+            self.storage.total_bytes(),
+            self.storage.pages
+        )?;
+        writeln!(
+            f,
+            "  transport:              {:>10} B",
+            self.transport.map_or(0, |t| t.total_bytes())
+        )?;
+        writeln!(
+            f,
+            "  http client:            {:>10} B",
+            self.http.map_or(0, |h| h.total_bytes())
+        )?;
+        if let Some(alloc) = self.alloc {
+            writeln!(
+                f,
+                "  alloc churn:            {:>10} B allocated / {:>10} B freed ({} allocs)",
+                alloc.allocated_bytes, alloc.freed_bytes, alloc.allocations
+            )?;
+        }
+        writeln!(
+            f,
+            "  total retained (lower bound): {} B",
             self.total_estimated_bytes()
         )?;
         Ok(())
@@ -702,6 +792,11 @@ pub struct Client {
     /// `Bot::build`; on Client drop (last Arc), the handle drops and the saver
     /// is aborted.
     pub(crate) saver_handle: std::sync::OnceLock<wacore::runtime::AbortHandle>,
+
+    /// Typed handle to an [`AllocMeter`](wacore::stats::AllocMeter) installed via
+    /// `BotBuilder::with_alloc_meter`, so [`Client::resource_report`] can fold in
+    /// its allocation-churn snapshot. Unset unless that builder method was used.
+    pub(crate) alloc_meter: std::sync::OnceLock<Arc<wacore::stats::AllocMeter>>,
 
     /// When true, emit `Event::RawNode` for every decoded stanza before router dispatch.
     /// Default false — only enable when external consumers need raw protocol access.

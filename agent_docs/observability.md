@@ -85,6 +85,68 @@ awaiting `send_message`) belongs to the caller — instrument that side
 yourself if you need it. The `voip` feature's media tasks (call driver,
 relay I/O) currently spawn directly on Tokio and are not instrumented.
 
+## `Client::resource_report()` — out-of-client resource attribution (on demand)
+
+`memory_report()` accounts only for the **client's own** in-process
+collections (tens of KiB). Profiling a many-session process shows the real
+per-session ~1 MiB is dominated by memory that lives **outside** the `Client`:
+the storage backend's SQLite page cache (the single largest chunk), transport
+buffers + TLS/noise state, the HTTP pool, and transient heap. `resource_report()`
+(`ResourceReport`) composes all of these into one estimate. Same design rules:
+runtime/platform-agnostic, zero cost when unused (LTO drops it), no PII.
+
+The pieces (each an `Option`-only struct in `wacore::stats`, filled only with
+what a component can introspect — absent means "not reported", not zero):
+
+- **Storage** — `DeviceStore::resource_report() -> StorageResourceReport`. A
+  **defaulted method on the existing `DeviceStore` sub-trait** (next to
+  `snapshot_db`), NOT a new `Backend` supertrait: `Backend` is blanket-impl'd,
+  so a new supertrait would force every backend (incl. external) to add an impl,
+  and an inherent method wouldn't compose through the `Arc<dyn Backend>` the
+  client holds. A default on an already-implemented sub-trait gives both —
+  composable *and* non-breaking. SQLite reports `min(cache cap, db size)` (an
+  upper bound on the page cache; Diesel doesn't expose the raw handle needed for
+  `sqlite3_db_status`), plus the DB page count. Remote backends report
+  `memory_bytes: Some(0)`.
+- **Transport** — `Transport::resource_report() -> Option<TransportResourceReport>`,
+  a defaulted method (clean here — `Transport` isn't blanket-impl'd). The Tokio
+  WebSocket transport fills best-effort static estimates (tokio-websockets and
+  rustls don't surface live buffer sizes).
+- **HTTP** — `HttpClient::resource_report() -> Option<HttpResourceReport>`,
+  defaulted. The `ureq` client reports its idle-pool buffer estimate (`None`
+  when built from a custom agent whose config is opaque).
+- **Alloc churn** — an `AllocSnapshot` from an `AllocMeter` (below), when one is
+  installed.
+
+`ResourceReport::total_estimated_bytes()` sums the **retained** components
+(client + storage + transport + HTTP) and is documented as a **lower bound**;
+`alloc` is churn, not residency, and is excluded. The future is `Send` (compile
+guard in `accessors.rs`, per #964) so multi-session consumers can await it off a
+worker.
+
+### `AllocMeter` — per-client allocation attribution (opt-in)
+
+`wacore::stats::AllocMeter` is a first-class `TaskInstrument` (sibling of
+`CpuMeter`) that attributes bytes allocated/freed to a client — the churn
+counterpart to the point-in-time retained reports. The host installs a
+`#[global_allocator]` that calls `AllocMeter::on_alloc`/`on_dealloc`; the meter,
+installed via `BotBuilder::with_alloc_meter` (or `with_task_instrument`), marks
+per thread which client's poll is running so the charge lands correctly.
+`examples/alloc_tracking.rs` is the ~20-line reference.
+
+Attribution boundary (documented honestly on the type): only allocations inside
+instrumented polls/tasks are counted (the run loop is covered since #963; work
+spawned raw on the runtime — some voip/media paths — is not). Deallocations are
+charged to whichever meter is active at free time, so `allocated` (churn) is the
+reliable signal and `freed`/`net` drift for buffers that outlive their poll.
+
+### `SqliteStoreConfig::mmap_size` — page-cache tuning knob
+
+`mmap_size` (new optional field, default `None` = current behavior; builder
+`with_mmap_size`) emits `PRAGMA mmap_size`, moving reads to reclaimable,
+file-backed pages — useful for a process holding many small per-session DBs. WAL
+caveat: mmap covers reads of the main DB file; writes still go through the WAL.
+
 ## Relation to the `metrics`/`tracing` features
 
 `wacore::telemetry` (cargo feature `metrics`) emits process-global counters

@@ -2954,6 +2954,57 @@ async fn memory_report_on_fresh_client() {
     let _ = report.to_string();
 }
 
+/// resource_report (workstream F) composes the client's own memory_report with
+/// the out-of-client components, folds in an AllocMeter snapshot when installed,
+/// and is Display-able.
+#[tokio::test]
+async fn resource_report_composes_client_and_out_of_client_components() {
+    use wacore::stats::{AllocMeter, TaskInstrument};
+
+    let client = crate::test_utils::create_test_client().await;
+
+    let report = client.resource_report().await;
+
+    // The client sub-report equals memory_report's total.
+    let mem = client.memory_report().await;
+    assert_eq!(
+        report.client.total_estimated_bytes(),
+        mem.total_estimated_bytes()
+    );
+
+    // The SQLite backend reports its page-cache estimate — proving the storage
+    // report (workstream A) composes through `dyn Backend`.
+    assert!(
+        report.storage.memory_bytes.is_some(),
+        "SQLite backend reports storage memory"
+    );
+    assert!(report.storage.pages.is_some());
+
+    // No transport is connected and the mock HTTP client reports nothing.
+    assert!(report.transport.is_none());
+    assert!(report.http.is_none());
+    assert!(report.alloc.is_none(), "no alloc meter installed yet");
+
+    // The total includes the storage estimate on top of client collections.
+    assert!(report.total_estimated_bytes() >= report.storage.total_bytes());
+    let _ = report.to_string();
+
+    // Install an alloc meter and charge a known allocation inside a poll scope;
+    // the next report folds in its snapshot.
+    let meter = std::sync::Arc::new(AllocMeter::new());
+    meter.on_poll_start();
+    AllocMeter::on_alloc(4096);
+    meter.on_poll_end();
+    let _ = client.alloc_meter.set(meter);
+
+    let report = client.resource_report().await;
+    let alloc = report
+        .alloc
+        .expect("alloc snapshot folded in once installed");
+    assert_eq!(alloc.allocated_bytes, 4096);
+    assert_eq!(alloc.allocations, 1);
+}
+
 /// InstrumentedRuntime must invoke the TaskInstrument around polls of spawned
 /// futures and blocking closures, and CpuMeter must accumulate them.
 #[tokio::test]

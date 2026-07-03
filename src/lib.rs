@@ -61,8 +61,11 @@ pub use client::Client;
 /// types embed it.
 pub use client::ClientError;
 pub use client::NodeFilter;
+pub use client::{
+    AllocSnapshot, CollectionStats, HttpResourceReport, MemoryReport, ResourceReport,
+    StatsSnapshot, StorageResourceReport, TransportResourceReport,
+};
 pub use client::{CallError, Voip};
-pub use client::{CollectionStats, MemoryReport, StatsSnapshot};
 pub use types::durability_hook::InboundDurabilityHook;
 pub mod download;
 pub mod handlers;

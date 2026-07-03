@@ -265,6 +265,7 @@ impl Client {
             cache_config,
             self_weak: std::sync::OnceLock::new(),
             saver_handle: std::sync::OnceLock::new(),
+            alloc_meter: std::sync::OnceLock::new(),
             raw_node_forwarding: AtomicBool::new(false),
             #[cfg(feature = "voip")]
             call_registry: std::sync::Arc::new(wacore::voip::CallRegistry::new()),

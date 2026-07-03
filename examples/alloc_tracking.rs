@@ -1,4 +1,4 @@
-//! Per-session ALLOCATOR attribution through the `TaskInstrument` hook.
+//! Per-session ALLOCATOR attribution with the built-in [`AllocMeter`].
 //!
 //! Run with:
 //!     cargo run --example alloc_tracking
@@ -6,99 +6,50 @@
 //! [`Client::memory_report`] answers "how many bytes do this session's
 //! structures retain right now". This example answers the complementary
 //! question — "how many bytes does this session's work allocate, including
-//! transients" — by combining:
+//! transients" — using [`AllocMeter`], the first-class helper that attributes
+//! allocations to a client through the `TaskInstrument` hook.
 //!
-//! 1. a hand-rolled counting global allocator (no external crates), and
-//! 2. a [`TaskInstrument`] that marks, per thread, which session's task is
-//!    currently being polled, so the allocator knows whom to charge.
+//! The library still knows nothing about allocators. The host provides:
 //!
-//! The library knows nothing about allocators: the hook is just enter/exit
-//! around every poll of a client's internal tasks. The same pattern plugs in
-//! `tracking-allocator`, dhat, or ESP-IDF `heap_caps` sampling instead of
-//! this toy allocator. Expect a measurable overhead while enabled (Vector
-//! reports ~10-20% for the equivalent design); it is a diagnostics tool, not
-//! an always-on meter. Allocations outside instrumented tasks (your own
-//! caller-side code, other libraries) land in the "untracked" bucket.
+//! 1. a global allocator that calls `AllocMeter::on_alloc` / `on_dealloc` on
+//!    every (de)allocation (below — no external crates), and
+//! 2. the meter itself, installed with `with_alloc_meter`, which marks per
+//!    thread *which* client's task is being polled so the charge lands on it.
+//!
+//! Everything else — the thread-local routing, the nesting-safe stack — lives
+//! in `AllocMeter`. Compare the ~20 lines here to hand-rolling the bucket
+//! logic. The same allocator pattern plugs in `tracking-allocator`, dhat, or
+//! ESP-IDF `heap_caps` sampling. Expect a measurable overhead while enabled; it
+//! is a diagnostics tool, not an always-on meter. Allocations outside
+//! instrumented tasks (your caller-side code, other libraries) are uncounted.
 
-use portable_atomic::{AtomicI64, Ordering};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Duration;
 
 use log::{error, info};
-use wacore::stats::TaskInstrument;
+use wacore::stats::AllocMeter;
 use whatsapp_rust::prelude::*;
 
-/// Live allocation counters for one attribution bucket.
-#[derive(Default)]
-struct Bucket {
-    current_bytes: AtomicI64,
-    total_allocs: AtomicI64,
-}
-
-static SESSION_A: Bucket = Bucket {
-    current_bytes: AtomicI64::new(0),
-    total_allocs: AtomicI64::new(0),
-};
-static UNTRACKED: Bucket = Bucket {
-    current_bytes: AtomicI64::new(0),
-    total_allocs: AtomicI64::new(0),
-};
-
-thread_local! {
-    /// Which bucket the currently-polled task belongs to. `None` = untracked.
-    static CURRENT: Cell<Option<&'static Bucket>> = const { Cell::new(None) };
-}
-
+/// A global allocator that forwards every (de)allocation size to whichever
+/// `AllocMeter` is active on the current thread. `AllocMeter::on_alloc` is
+/// allocation-free, so this does not recurse.
 struct AttributingAllocator;
 
-impl AttributingAllocator {
-    fn bucket() -> &'static Bucket {
-        CURRENT
-            .try_with(|c| c.get())
-            .ok()
-            .flatten()
-            .unwrap_or(&UNTRACKED)
-    }
-}
-
-// SAFETY-adjacent caveat: deallocations are charged to the CURRENT bucket,
-// not the allocating one, so a buffer allocated inside session A but freed
-// elsewhere skews both buckets. Fine for a demo; real deployments use a
-// tracker that stores the group per allocation (e.g. tracking-allocator).
 unsafe impl GlobalAlloc for AttributingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let bucket = Self::bucket();
-        bucket
-            .current_bytes
-            .fetch_add(layout.size() as i64, Ordering::Relaxed);
-        bucket.total_allocs.fetch_add(1, Ordering::Relaxed);
+        AllocMeter::on_alloc(layout.size());
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        Self::bucket()
-            .current_bytes
-            .fetch_sub(layout.size() as i64, Ordering::Relaxed);
+        AllocMeter::on_dealloc(layout.size());
         unsafe { System.dealloc(ptr, layout) }
     }
 }
 
 #[global_allocator]
 static GLOBAL: AttributingAllocator = AttributingAllocator;
-
-/// TaskInstrument that scopes the thread to a bucket for the poll's duration.
-struct SessionAllocScope(&'static Bucket);
-
-impl TaskInstrument for SessionAllocScope {
-    fn on_poll_start(&self) {
-        CURRENT.with(|c| c.set(Some(self.0)));
-    }
-    fn on_poll_end(&self) {
-        CURRENT.with(|c| c.set(None));
-    }
-}
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -117,9 +68,14 @@ fn main() {
             }
         };
 
+        // One meter per session. `with_alloc_meter` installs it as the task
+        // instrument AND keeps a handle so `client.resource_report()` folds in
+        // its snapshot; we keep our own clone to read it directly here.
+        let meter = Arc::new(AllocMeter::new());
+
         let bot = Bot::builder()
             .with_backend(store)
-            .with_task_instrument(Arc::new(SessionAllocScope(&SESSION_A)))
+            .with_alloc_meter(meter.clone())
             .on_qr_code(|code, timeout| async move {
                 info!("QR code (valid {}s):\n{code}", timeout.as_secs());
             })
@@ -141,12 +97,14 @@ fn main() {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    let snap = meter.snapshot();
                     info!(
-                        "session A: {}B live across {} allocs | untracked: {}B live",
-                        SESSION_A.current_bytes.load(Ordering::Relaxed),
-                        SESSION_A.total_allocs.load(Ordering::Relaxed),
-                        UNTRACKED.current_bytes.load(Ordering::Relaxed),
+                        "session A alloc churn: {}B allocated / {}B freed across {} allocs (net {}B)",
+                        snap.allocated_bytes, snap.freed_bytes, snap.allocations, snap.net_bytes(),
                     );
+                    // The unified view: client collections + storage + transport
+                    // + http + this alloc snapshot, in one report.
+                    info!("\n{}", client.resource_report().await);
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutting down...");

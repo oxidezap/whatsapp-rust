@@ -132,6 +132,16 @@ pub struct SqliteStoreConfig {
     pub pool_size: u32,
     /// `PRAGMA cache_size`, in KiB per connection.
     pub cache_size_kib: u32,
+    /// `PRAGMA mmap_size`, in bytes. `None` (default) leaves mmap off — the
+    /// current behavior. When set, pages are read through a reclaimable,
+    /// file-backed memory map instead of the heap page cache, which helps a
+    /// process holding many small per-session DBs (the mapped pages are
+    /// OS-reclaimable, unlike heap cache bytes).
+    ///
+    /// Caveat: mmap I/O covers *reads* of the main database file; in WAL mode
+    /// (this store's default) writes still go through the WAL, and a checkpoint
+    /// briefly falls back to non-mmap I/O. `0` disables mmap the same as `None`.
+    pub mmap_size: Option<u64>,
     /// `PRAGMA busy_timeout`.
     pub busy_timeout: Duration,
     /// `PRAGMA synchronous`.
@@ -146,6 +156,7 @@ impl Default for SqliteStoreConfig {
         Self {
             pool_size: 1,
             cache_size_kib: 512,
+            mmap_size: None,
             busy_timeout: Duration::from_secs(30),
             synchronous: Synchronous::Normal,
             thread_pool: None,
@@ -153,9 +164,20 @@ impl Default for SqliteStoreConfig {
     }
 }
 
+impl SqliteStoreConfig {
+    /// Set `PRAGMA mmap_size` (bytes), enabling file-backed memory-mapped reads.
+    /// Builder-style so new optional knobs don't force struct-literal churn;
+    /// pass `0` to keep mmap off. See the [`SqliteStoreConfig::mmap_size`] caveat.
+    pub fn with_mmap_size(mut self, bytes: u64) -> Self {
+        self.mmap_size = Some(bytes);
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ConnectionOptions {
     cache_size_kib: u32,
+    mmap_size: Option<u64>,
     busy_timeout_ms: u64,
     synchronous: Synchronous,
 }
@@ -169,13 +191,19 @@ impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
     ) -> std::result::Result<(), diesel::r2d2::Error> {
         // cache_size negative = KiB (page-size independent). temp_store/foreign_keys are
         // fixed: they guard correctness, not memory, so they're not user-tunable.
-        for pragma in [
+        let mut pragmas = vec![
             format!("PRAGMA busy_timeout = {};", self.busy_timeout_ms),
             format!("PRAGMA synchronous = {};", self.synchronous.as_pragma()),
             format!("PRAGMA cache_size = -{};", self.cache_size_kib),
             "PRAGMA temp_store = memory;".to_string(),
             "PRAGMA foreign_keys = ON;".to_string(),
-        ] {
+        ];
+        // Opt-in: emit mmap_size only for a non-zero value, so the default keeps
+        // SQLite's mmap off (current behavior).
+        if let Some(mmap_size) = self.mmap_size.filter(|&n| n > 0) {
+            pragmas.push(format!("PRAGMA mmap_size = {mmap_size};"));
+        }
+        for pragma in pragmas {
             diesel::sql_query(pragma)
                 .execute(conn)
                 .map_err(diesel::r2d2::Error::QueryError)?;
@@ -275,6 +303,7 @@ impl SqliteStore {
 
         let options = ConnectionOptions {
             cache_size_kib: config.cache_size_kib,
+            mmap_size: config.mmap_size,
             // Clamp a non-zero timeout up to >=1ms (and to SQLite's signed-int ms range):
             // as_millis() would truncate a sub-millisecond Duration to 0, which disables the
             // busy handler instead of keeping a short timeout.
@@ -3446,6 +3475,62 @@ impl DeviceStore for SqliteStore {
 
         Ok(())
     }
+
+    /// Per-session storage memory, the largest per-session chunk in the
+    /// profiling that motivated this (the default 512 KiB page cache).
+    ///
+    /// SQLite's exact cache-in-use (`sqlite3_db_status(SQLITE_DBSTATUS_CACHE_USED)`)
+    /// needs the raw `sqlite3*` handle, which Diesel does not expose through a
+    /// safe API. Instead we bound it with PRAGMAs: the page cache never holds
+    /// more than the database's own pages, nor more than the configured cap, so
+    /// `memory_bytes = min(cache cap, db size)` is a tight upper bound for the
+    /// target workload — a fresh per-session DB whose file is far smaller than
+    /// the 512 KiB cap. `pages` is the database page count (a size indicator).
+    async fn resource_report(&self) -> wacore::stats::StorageResourceReport {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = match pool.get() {
+                Ok(conn) => conn,
+                // Best-effort: a report is never load-bearing, so a pool hiccup
+                // yields "not reported" rather than an error.
+                Err(_) => return wacore::stats::StorageResourceReport::default(),
+            };
+            let page_size = pragma_i64(&mut conn, "page_size").unwrap_or(0).max(0) as u64;
+            let page_count = pragma_i64(&mut conn, "page_count").unwrap_or(0).max(0) as u64;
+            // `PRAGMA cache_size`: negative = KiB, positive = pages.
+            let cache_size = pragma_i64(&mut conn, "cache_size").unwrap_or(0);
+            let cache_cap_bytes = if cache_size < 0 {
+                cache_size.unsigned_abs() * 1024
+            } else {
+                cache_size as u64 * page_size
+            };
+            let db_bytes = page_count * page_size;
+            wacore::stats::StorageResourceReport {
+                memory_bytes: Some(cache_cap_bytes.min(db_bytes)),
+                pages: Some(page_count),
+                ..Default::default()
+            }
+        })
+        .await
+        .unwrap_or_default()
+    }
+}
+
+/// Read a single-integer `PRAGMA` off a connection. Returns `None` on any
+/// error so callers degrade to "not reported" instead of failing.
+fn pragma_i64(conn: &mut SqliteConnection, pragma: &str) -> Option<i64> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        value: i64,
+    }
+    // The table-valued `pragma_*` function exposes the value in a column named
+    // after the pragma; alias it to a stable name so one struct maps them all.
+    let sql = format!("SELECT {pragma} AS value FROM pragma_{pragma}()");
+    diesel::sql_query(sql)
+        .get_result::<Row>(conn)
+        .ok()
+        .map(|r| r.value)
 }
 
 #[cfg(test)]
@@ -3489,6 +3574,7 @@ mod tests {
         let config = SqliteStoreConfig {
             pool_size: 2,
             cache_size_kib: 4096,
+            mmap_size: None,
             busy_timeout: Duration::from_secs(7),
             synchronous: Synchronous::Full,
             thread_pool: Some(Arc::new(
@@ -4846,5 +4932,127 @@ mod tests {
             vec![7u8; 32],
             "device_a still sees its own write"
         );
+    }
+
+    /// Workstream A: the storage report bounds the page cache by the actual DB
+    /// size and never exceeds the configured cap.
+    #[tokio::test]
+    async fn resource_report_bounds_cache_by_db_size_and_cap() {
+        let store = create_test_store().await; // default: 512 KiB cache cap
+        let device_id = 1;
+
+        // Seed enough rows to grow the DB past its bare schema pages.
+        let macs: Vec<AppStateMutationMAC> = (0..500u32)
+            .map(|i| {
+                let mut index_mac = vec![0u8; 32];
+                index_mac[..4].copy_from_slice(&i.to_le_bytes());
+                AppStateMutationMAC {
+                    index_mac,
+                    value_mac: vec![(i % 251) as u8; 32],
+                }
+            })
+            .collect();
+        store
+            .put_app_state_mutation_macs_for_device("coll", 1, &macs, device_id)
+            .await
+            .unwrap();
+
+        let report = store.resource_report().await;
+
+        let pages = report.pages.expect("SQLite reports a page count");
+        assert!(pages > 0, "a migrated + seeded DB has pages");
+
+        let mem = report
+            .memory_bytes
+            .expect("SQLite reports a cache estimate");
+        assert!(mem > 0, "cache-in-use estimate is non-zero for a seeded DB");
+        // memory_bytes = min(cache cap, db size); the seeded DB is far under the
+        // 512 KiB cap, so the estimate tracks the DB size and stays under the cap.
+        assert!(
+            mem <= 512 * 1024,
+            "estimate never exceeds the configured 512 KiB cap, got {mem}"
+        );
+        assert_eq!(report.total_bytes(), mem, "total_bytes == memory_bytes");
+        // I/O counters aren't tracked by this backend.
+        assert_eq!(report.io_read_bytes, None);
+        assert_eq!(report.io_write_bytes, None);
+    }
+
+    /// Workstream E: `mmap_size` is an opt-in field + builder — the default is
+    /// `None` (no mmap pragma emitted), and setting it wires `PRAGMA mmap_size`
+    /// through to the connection without breaking the store.
+    #[test]
+    fn mmap_size_config_is_opt_in() {
+        assert_eq!(
+            SqliteStoreConfig::default().mmap_size,
+            None,
+            "default leaves mmap off (current behavior)"
+        );
+        assert_eq!(
+            SqliteStoreConfig::default()
+                .with_mmap_size(64 * 1024 * 1024)
+                .mmap_size,
+            Some(64 * 1024 * 1024),
+            "builder sets the field"
+        );
+    }
+
+    #[tokio::test]
+    async fn mmap_size_applies_pragma_and_store_operates() {
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // A real file DB — memory DBs ignore mmap.
+        let path =
+            std::env::temp_dir().join(format!("wa_mmap_test_{}_{}.db", std::process::id(), id));
+        let url = path.to_str().unwrap().to_string();
+
+        // `PRAGMA mmap_size` statement form: unlike page_count/page_size/cache_size,
+        // SQLite exposes no `pragma_mmap_size()` table-valued function, so read it
+        // directly (its result column is named `mmap_size`).
+        let read_mmap = |store: &SqliteStore| -> i64 {
+            #[derive(diesel::QueryableByName)]
+            struct M {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                mmap_size: i64,
+            }
+            let mut conn = store.pool.get().unwrap();
+            diesel::sql_query("PRAGMA mmap_size")
+                .get_result::<M>(&mut conn)
+                .map(|m| m.mmap_size)
+                .unwrap_or(-1)
+        };
+
+        // Default config emits no mmap pragma, and SQLITE_DEFAULT_MMAP_SIZE is 0,
+        // so mmap reads back off. Deterministic across environments.
+        let def_store = SqliteStore::new(&url).await.expect("default store");
+        assert_eq!(read_mmap(&def_store), 0, "default keeps mmap off");
+        drop(def_store);
+
+        // Opt-in: the store builds with the pragma applied (on_acquire didn't
+        // error) and stays fully operational.
+        const MMAP: u64 = 64 * 1024 * 1024;
+        let cfg = SqliteStoreConfig::default().with_mmap_size(MMAP);
+        let store = SqliteStore::with_config(&url, cfg)
+            .await
+            .expect("mmap store builds");
+        store
+            .put_identity("559980000001@s.whatsapp.net", [9u8; 32])
+            .await
+            .expect("store operates with mmap set");
+        // The read-back is the configured limit where the VFS supports mmap, or
+        // 0 where it doesn't (some container filesystems) — never a wiring error.
+        let applied = read_mmap(&store);
+        assert!(
+            applied == MMAP as i64 || applied == 0,
+            "mmap_size is applied when the VFS supports it, got {applied}"
+        );
+        drop(store);
+
+        // Best-effort cleanup of the DB and its WAL sidecars.
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{url}{suffix}"));
+        }
     }
 }

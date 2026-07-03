@@ -566,6 +566,7 @@ pub struct BotBuilder<
     wanted_pre_key_count: Option<usize>,
     resend_rate_limit: Option<(u32, u32)>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
+    alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
     _marker: PhantomData<(B, T, H, R)>,
 }
 
@@ -589,6 +590,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             wanted_pre_key_count: None,
             resend_rate_limit: None,
             task_instrument: None,
+            alloc_meter: None,
             _marker: PhantomData,
         }
     }
@@ -616,6 +618,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             wanted_pre_key_count: self.wanted_pre_key_count,
             resend_rate_limit: self.resend_rate_limit,
             task_instrument: self.task_instrument,
+            alloc_meter: self.alloc_meter,
             _marker: PhantomData,
         }
     }
@@ -704,6 +707,24 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         instrument: Arc<dyn wacore::stats::TaskInstrument>,
     ) -> Self {
         self.task_instrument = Some(instrument);
+        self
+    }
+
+    /// Install an [`AllocMeter`](wacore::stats::AllocMeter) as this client's
+    /// task instrument and keep a typed handle so [`Client::resource_report`]
+    /// folds in its allocation-churn snapshot.
+    ///
+    /// Sugar over [`with_task_instrument`](Self::with_task_instrument): it
+    /// occupies the single instrument slot (so it's mutually exclusive with a
+    /// `CpuMeter` or another hook — last setter wins). The host still installs a
+    /// `#[global_allocator]` that calls [`AllocMeter::on_alloc`] /
+    /// [`AllocMeter::on_dealloc`]; see `examples/alloc_tracking.rs`.
+    ///
+    /// [`AllocMeter::on_alloc`]: wacore::stats::AllocMeter::on_alloc
+    /// [`AllocMeter::on_dealloc`]: wacore::stats::AllocMeter::on_dealloc
+    pub fn with_alloc_meter(mut self, meter: Arc<wacore::stats::AllocMeter>) -> Self {
+        self.task_instrument = Some(meter.clone());
+        self.alloc_meter = Some(meter);
         self
     }
 
@@ -1073,6 +1094,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         // Default (None): the original runtime is used untouched. The Bot
         // keeps its own copy for the `run()` path (see the field doc).
         let task_instrument = self.task_instrument;
+        let alloc_meter = self.alloc_meter;
         let runtime: Arc<dyn Runtime> = match task_instrument.clone() {
             Some(instrument) => {
                 Arc::new(wacore::stats::InstrumentedRuntime::new(runtime, instrument))
@@ -1120,6 +1142,12 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         // Bot keeps periodic persistence alive. Client::drop on the last Arc
         // drops the AbortHandle and aborts the task.
         let _ = client.saver_handle.set(saver_handle);
+
+        // Typed alloc-meter handle for resource_report (its poll hooks are
+        // already wired via task_instrument above).
+        if let Some(meter) = alloc_meter {
+            let _ = client.alloc_meter.set(meter);
+        }
 
         // Register custom enc handlers. Immutable after build, so set the whole
         // map once; the receive hot path then reads it lock-free.

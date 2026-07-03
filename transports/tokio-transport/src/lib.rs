@@ -19,6 +19,27 @@ pub use tokio_websockets::Connector;
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
+// Best-effort per-session footprint estimates for `Transport::resource_report`.
+// tokio-websockets and rustls don't expose their live buffer sizes, so these
+// are documented static estimates of steady-state cost, not measurements: a
+// WebSocket read + write framing buffer, plus rustls record buffers and key
+// schedule for one TLS session. They exist to give a consumer a realistic
+// order-of-magnitude for the transport's ~tens-of-KiB-per-session contribution.
+const EST_READ_BUFFER_BYTES: u64 = 16 * 1024;
+const EST_WRITE_BUFFER_BYTES: u64 = 16 * 1024;
+const EST_TLS_STATE_BYTES: u64 = 32 * 1024;
+
+/// The static per-session footprint estimate reported by every WebSocket
+/// transport. Factored out so its numbers are unit-testable without a live
+/// socket.
+fn transport_resource_estimate() -> wacore::stats::TransportResourceReport {
+    wacore::stats::TransportResourceReport {
+        read_buffer_bytes: Some(EST_READ_BUFFER_BYTES),
+        write_buffer_bytes: Some(EST_WRITE_BUFFER_BYTES),
+        tls_state_bytes: Some(EST_TLS_STATE_BYTES),
+    }
+}
+
 static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
 /// Returns the default TLS connector used by [`TokioWebSocketTransportFactory`].
@@ -155,6 +176,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for WsTranspo
                 ))
                 .await;
         }
+    }
+
+    fn resource_report(&self) -> Option<wacore::stats::TransportResourceReport> {
+        // Static best-effort estimates (see the constants): tokio-websockets and
+        // rustls don't surface their live buffer sizes.
+        Some(transport_resource_estimate())
     }
 }
 
@@ -307,5 +334,24 @@ impl TransportFactory for TokioWebSocketTransportFactory {
             .map_err(|e| anyhow::anyhow!("WebSocket connect failed: {e}"))?;
 
         Ok(from_websocket(ws))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Workstream C: the transport's reported footprint is the sum of its
+    /// read/write framing buffers and the TLS state estimate.
+    #[test]
+    fn resource_estimate_totals_present_fields() {
+        let report = transport_resource_estimate();
+        assert_eq!(report.read_buffer_bytes, Some(EST_READ_BUFFER_BYTES));
+        assert_eq!(report.write_buffer_bytes, Some(EST_WRITE_BUFFER_BYTES));
+        assert_eq!(report.tls_state_bytes, Some(EST_TLS_STATE_BYTES));
+        assert_eq!(
+            report.total_bytes(),
+            EST_READ_BUFFER_BYTES + EST_WRITE_BUFFER_BYTES + EST_TLS_STATE_BYTES
+        );
     }
 }

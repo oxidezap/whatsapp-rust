@@ -89,6 +89,15 @@ pub trait Transport: crate::sync_marker::MaybeSendSync {
 
     /// Closes the connection.
     async fn disconnect(&self);
+
+    /// Best-effort per-session footprint of this transport: read/write framing
+    /// buffers plus a TLS/noise session-state estimate. `None` by default;
+    /// concrete transports (e.g. the Tokio WebSocket transport) fill in what
+    /// they can. Not blanket-impl'd, so a defaulted method here is cleanly
+    /// overridable — no `Backend`-style wrinkle.
+    fn resource_report(&self) -> Option<crate::stats::TransportResourceReport> {
+        None
+    }
 }
 
 /// A factory responsible for creating new transport instances.
@@ -203,6 +212,15 @@ pub trait HttpClient: crate::sync_marker::MaybeSendSync {
         Err(anyhow::anyhow!(
             "Upload streaming not supported by this HTTP client"
         ))
+    }
+
+    /// Best-effort per-session footprint of this client: idle connection-pool
+    /// buffers plus any in-flight download/media buffering the impl can see.
+    /// `None` by default; `ureq`/`reqwest`-backed clients report what their
+    /// (limited) introspection allows. Media downloads are a real transient-RAM
+    /// source, so a coarse estimate is still worth reporting.
+    fn resource_report(&self) -> Option<crate::stats::HttpResourceReport> {
+        None
     }
 }
 

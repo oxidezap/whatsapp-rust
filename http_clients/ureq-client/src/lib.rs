@@ -5,10 +5,18 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use wacore::net::{HttpClient, HttpRequest, HttpResponse, StreamingHttpResponse, UploadBody};
+use wacore::stats::HttpResourceReport;
 
 /// Matches `MAX_FILE_SIZE_BYTES` in `WAWebServerPropConstants` (2 GiB).
 /// Overrides ureq's 10 MiB default on `read_to_vec()`.
 pub const DEFAULT_MAX_BODY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Per-buffer size for the default agent (16 KiB vs ureq's 128 KiB default):
+/// WA API payloads are small JSON; media uses streaming I/O.
+const INPUT_BUFFER_BYTES: u64 = 16 * 1024;
+const OUTPUT_BUFFER_BYTES: u64 = 16 * 1024;
+/// Idle connections the default agent's pool may retain.
+const MAX_IDLE_CONNECTIONS: u64 = 3;
 
 /// HTTP client implementation using `ureq` for synchronous HTTP requests.
 /// Since `ureq` is blocking, all requests are wrapped in `tokio::task::spawn_blocking`.
@@ -18,6 +26,20 @@ pub struct UreqHttpClient {
     /// Cap for [`UreqHttpClient::execute`]. Streaming is unbounded — the
     /// caller owns the sink.
     max_body_bytes: u64,
+    /// Best-effort pool footprint for `resource_report`. `None` when a custom
+    /// agent is supplied (its buffer/pool config is opaque to us).
+    pool_report: Option<HttpResourceReport>,
+}
+
+/// Pool footprint of the default agent: each idle connection keeps an input and
+/// an output buffer. ureq exposes neither the live pool size nor in-flight
+/// buffering, so this is an upper-bound estimate, not a measurement.
+fn default_pool_report() -> HttpResourceReport {
+    HttpResourceReport {
+        pool_connections: Some(MAX_IDLE_CONNECTIONS),
+        pool_buffer_bytes: Some(MAX_IDLE_CONNECTIONS * (INPUT_BUFFER_BYTES + OUTPUT_BUFFER_BYTES)),
+        inflight_bytes: None,
+    }
 }
 
 impl UreqHttpClient {
@@ -25,6 +47,7 @@ impl UreqHttpClient {
         Self {
             agent: build_agent(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            pool_report: Some(default_pool_report()),
         }
     }
 
@@ -36,6 +59,8 @@ impl UreqHttpClient {
         Self {
             agent,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            // A custom agent's buffer/pool sizes are opaque — don't guess.
+            pool_report: None,
         }
     }
 
@@ -60,9 +85,9 @@ fn build_agent() -> ureq::Agent {
     let mut builder = Config::builder()
         // 16 KB per buffer instead of the 128 KB default.
         // WA API payloads are small JSON; media uses streaming I/O.
-        .input_buffer_size(16 * 1024)
-        .output_buffer_size(16 * 1024)
-        .max_idle_connections(3)
+        .input_buffer_size(INPUT_BUFFER_BYTES as usize)
+        .output_buffer_size(OUTPUT_BUFFER_BYTES as usize)
+        .max_idle_connections(MAX_IDLE_CONNECTIONS as usize)
         .max_idle_connections_per_host(2);
 
     #[cfg(feature = "danger-skip-tls-verify")]
@@ -196,6 +221,10 @@ impl HttpClient for UreqHttpClient {
             status_code,
             body: body_bytes,
         })
+    }
+
+    fn resource_report(&self) -> Option<HttpResourceReport> {
+        self.pool_report
     }
 }
 
@@ -392,6 +421,38 @@ mod tests {
             .expect("server should capture the request");
         assert_eq!(parsed_content_length(&headers), Some(payload.len()));
         assert_eq!(body, payload);
+    }
+
+    /// Workstream D: the default agent reports its idle-pool buffer estimate;
+    /// a custom agent (opaque config) reports nothing.
+    #[test]
+    fn resource_report_estimates_default_pool() {
+        let report = UreqHttpClient::new()
+            .resource_report()
+            .expect("default agent reports a pool estimate");
+        assert_eq!(report.pool_connections, Some(MAX_IDLE_CONNECTIONS));
+        assert_eq!(
+            report.pool_buffer_bytes,
+            Some(MAX_IDLE_CONNECTIONS * (INPUT_BUFFER_BYTES + OUTPUT_BUFFER_BYTES))
+        );
+        assert_eq!(report.inflight_bytes, None);
+        assert!(report.total_bytes() > 0);
+
+        // A custom agent's buffer/pool config is opaque — don't guess.
+        assert!(
+            UreqHttpClient::with_agent(build_agent())
+                .resource_report()
+                .is_none(),
+            "custom-agent client reports no estimate"
+        );
+
+        // with_max_body_bytes preserves the pool estimate.
+        assert!(
+            UreqHttpClient::new()
+                .with_max_body_bytes(1024)
+                .resource_report()
+                .is_some()
+        );
     }
 
     #[test]

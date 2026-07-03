@@ -175,6 +175,36 @@ impl Client {
         }
     }
 
+    /// Unified per-session resource estimate: the client's own collections
+    /// ([`Client::memory_report`]) **plus** the components that live outside the
+    /// `Client` and dominate real per-session RAM — the storage backend's page
+    /// cache, the transport's buffers + TLS/noise state, the HTTP client's pool
+    /// — and, when a [`AllocMeter`](wacore::stats::AllocMeter) is installed
+    /// (`with_alloc_meter`), an allocation-churn snapshot.
+    ///
+    /// On-demand only, no hot-path cost. Each out-of-client figure is best
+    /// effort: a component reports only what it can introspect, so
+    /// [`ResourceReport::total_estimated_bytes`] is a **lower bound** (see its
+    /// docs for which parts are exact vs. estimated). No PII — sizes and counts
+    /// only. `Send`, so multi-session consumers can await it off a worker.
+    pub async fn resource_report(&self) -> ResourceReport {
+        let client = self.memory_report().await;
+        let storage = self.persistence_manager.backend().resource_report().await;
+        let transport = {
+            let guard = self.transport.lock().await;
+            guard.as_ref().and_then(|t| t.resource_report())
+        };
+        let http = self.http_client.resource_report();
+        let alloc = self.alloc_meter.get().map(|m| m.snapshot());
+        ResourceReport {
+            client,
+            storage,
+            transport,
+            http,
+            alloc,
+        }
+    }
+
     /// Get access to the PersistenceManager for this client.
     /// This is useful for multi-account scenarios to get the device ID.
     pub fn persistence_manager(&self) -> Arc<PersistenceManager> {
@@ -445,12 +475,21 @@ impl Client {
 
 #[cfg(test)]
 mod send_checks {
+    fn assert_send<T: Send>(_: &T) {}
+
     /// Compile-time guard that `memory_report()` stays `Send`: a `!Send` value held
     /// across an `.await` (e.g. a raw-pointer dedup set) would silently break
     /// `tokio::spawn` / axum callers. Built for its type only, never polled.
     #[allow(dead_code)]
     fn memory_report_future_is_send(c: &super::Client) {
-        fn assert_send<T: Send>(_: &T) {}
         assert_send(&c.memory_report());
+    }
+
+    /// Same guard for `resource_report()` — it awaits the backend's async report
+    /// and locks the transport, so a `!Send` future here would break the same
+    /// multi-threaded consumers (per #964).
+    #[allow(dead_code)]
+    fn resource_report_future_is_send(c: &super::Client) {
+        assert_send(&c.resource_report());
     }
 }
