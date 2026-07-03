@@ -7,7 +7,26 @@ impl Client {
         feature = "tracing",
         tracing::instrument(name = "wa.recv.incoming", level = "debug", skip_all)
     )]
+    /// Test convenience: scope to the current generation. Production inbound
+    /// traffic always goes through the chat-lane worker, which passes its own
+    /// spawn generation.
+    #[cfg(test)]
     pub(crate) async fn handle_incoming_message(self: Arc<Self>, node: Arc<OwnedNodeRef>) {
+        let generation = self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        self.handle_incoming_message_scoped(node, generation).await
+    }
+
+    /// `lane_generation` is the generation the CALLER validated (the chat-lane
+    /// worker's spawn generation) — not re-read here, so a teardown bump that
+    /// lands mid-classification still trips the post-permit re-check instead
+    /// of being absorbed into a fresher capture.
+    pub(crate) async fn handle_incoming_message_scoped(
+        self: Arc<Self>,
+        node: Arc<OwnedNodeRef>,
+        lane_generation: u64,
+    ) {
         // Phase 1: classify borrows the node tree, extracts owned payloads, returns quickly.
         // Phase 2: process_classified_message holds no node borrows across heavy .await points,
         // keeping the async state machine small.
@@ -17,7 +36,8 @@ impl Client {
         };
         // node is no longer borrowed here -- drop it before the heavy phase
         drop(node);
-        self.process_classified_message(classified).await;
+        self.process_classified_message(classified, lane_generation)
+            .await;
     }
 
     #[cfg_attr(
@@ -305,7 +325,11 @@ impl Client {
         feature = "tracing",
         tracing::instrument(name = "wa.recv.process", level = "debug", skip_all)
     )]
-    pub(crate) async fn process_classified_message(self: Arc<Self>, msg: ClassifiedMessage) {
+    pub(crate) async fn process_classified_message(
+        self: Arc<Self>,
+        msg: ClassifiedMessage,
+        lane_generation: u64,
+    ) {
         let ClassifiedMessage {
             info,
             sender_encryption_jid,
@@ -344,14 +368,11 @@ impl Client {
         // can lose pkmsg messages carrying SKDM (sender key distribution). If the
         // SKDM is lost, ALL subsequent skmsg messages from that sender will fail
         // with "No sender key state".
-        let generation = self
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire);
         let _global_permit = self.acquire_message_processing_permit().await;
         if self
             .connection_generation
             .load(std::sync::atomic::Ordering::Acquire)
-            != generation
+            != lane_generation
         {
             // Teardown bumped the generation while this stanza waited for the
             // permit; its cache settle must be the LAST Signal-cache activity

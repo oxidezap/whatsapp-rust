@@ -6210,15 +6210,20 @@ async fn process_session_ct(
     });
     client
         .clone()
-        .process_classified_message(ClassifiedMessage {
-            info,
-            sender_encryption_jid: sender.clone(),
-            session_payloads: vec![payload],
-            group_payloads: vec![],
-            bot_payloads: vec![],
-            max_sender_retry_count: 0,
-            decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
-        })
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads: vec![payload],
+                group_payloads: vec![],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+            },
+            client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
         .await;
 }
 
@@ -6310,15 +6315,20 @@ async fn process_group_classified_with_payloads(
 ) {
     client
         .clone()
-        .process_classified_message(ClassifiedMessage {
-            info,
-            sender_encryption_jid: sender.clone(),
-            session_payloads,
-            group_payloads,
-            bot_payloads,
-            max_sender_retry_count: 0,
-            decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
-        })
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads,
+                group_payloads,
+                bot_payloads,
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+            },
+            client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
         .await;
 }
 
