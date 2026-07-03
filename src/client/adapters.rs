@@ -85,13 +85,81 @@ impl Client {
     }
 
     /// [`flush_signal_cache`](Self::flush_signal_cache) with error logging instead of propagation.
+    ///
+    /// Both of these are safe only when the caller holds the message
+    /// processing permit or the batcher is known inactive: they persist the
+    /// WHOLE cache, including ratchet advances of drain entries that may not
+    /// have a durable buffered row yet. Everything else must go through the
+    /// `_batch_safe` variants below.
     pub(crate) async fn flush_signal_cache_logged(&self, context: &str, id: Option<&str>) {
         if let Err(e) = self.flush_signal_cache().await {
-            if let Some(id) = id {
-                log::error!("Failed to flush signal cache ({context} {id}): {e:?}");
-            } else {
-                log::error!("Failed to flush signal cache ({context}): {e:?}");
-            }
+            log_signal_flush_error(context, id, &e);
         }
+    }
+
+    /// Signal-cache flush that is safe while the offline drain is active.
+    ///
+    /// During the drain, decrypted messages accumulate in the commit batcher
+    /// with no durable buffered copy; flushing the cache from an unrelated
+    /// path (a retry receipt, a send, an identity change) would persist their
+    /// ratchet advances, and a crash/teardown that then drops the entries
+    /// turns each redelivery into an ackable duplicate — silent loss for hook
+    /// consumers. So in drain mode this routes through the batcher: commit
+    /// the pending entries (rows first) and flush under the processing
+    /// permit. Outside the drain it is exactly [`Self::flush_signal_cache`].
+    ///
+    /// Must NOT be called while holding the processing permit (it acquires
+    /// it); permit-holding paths commit via the batcher directly.
+    pub(crate) async fn flush_signal_cache_batch_safe(&self) -> Result<(), anyhow::Error> {
+        // Under the permit the commit ALWAYS flushes the Signal cache (an empty
+        // batch still flushes — see flush_inbound_commits_under_permit), so a
+        // successful call is proof the out-of-band advance is persisted; no
+        // stale is_active() re-check needed even if the drain finisher
+        // deactivated while we waited for the permit.
+        let drain_active = self.inbound_commit_batch.is_active();
+        if drain_active && let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
+            return if client
+                .flush_inbound_commits_under_permit(false, None, None)
+                .await
+            {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "inbound drain batch commit failed; Signal cache left unflushed so the server redelivers"
+                ))
+            };
+        } else if drain_active {
+            // Drain active but no live client to route the permit-held flush
+            // through (practically unreachable — the run loop holds a strong
+            // Arc). Fail closed regardless of has_entries(): an empty drain can
+            // still carry dirty SKDM-only advances with no rows, and a raw
+            // flush here would persist them rowless — the exact loss this
+            // batch-safe path exists to prevent. Leaving the cache unflushed
+            // makes the server redeliver.
+            return Err(anyhow::anyhow!(
+                "client dropping while inbound drain is active; skipping Signal flush"
+            ));
+        }
+        self.flush_signal_cache().await
+    }
+
+    /// [`flush_signal_cache_batch_safe`](Self::flush_signal_cache_batch_safe)
+    /// with error logging instead of propagation.
+    pub(crate) async fn flush_signal_cache_batch_safe_logged(
+        &self,
+        context: &str,
+        id: Option<&str>,
+    ) {
+        if let Err(e) = self.flush_signal_cache_batch_safe().await {
+            log_signal_flush_error(context, id, &e);
+        }
+    }
+}
+
+fn log_signal_flush_error(context: &str, id: Option<&str>, e: &anyhow::Error) {
+    if let Some(id) = id {
+        log::error!("Failed to flush signal cache ({context} {id}): {e:?}");
+    } else {
+        log::error!("Failed to flush signal cache ({context}): {e:?}");
     }
 }

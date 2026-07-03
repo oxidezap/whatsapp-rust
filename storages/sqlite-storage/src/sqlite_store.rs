@@ -2156,6 +2156,46 @@ impl AppSyncStore for SqliteStore {
     }
 }
 
+/// Single source of the pending-inbound row insert, shared by the single-row
+/// and batch write paths so a schema or conflict-strategy change cannot
+/// silently diverge between them.
+fn insert_pending_inbound_row(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    sender: &str,
+    id: &str,
+    message: &[u8],
+) -> diesel::QueryResult<usize> {
+    diesel::replace_into(pending_inbound_messages::table)
+        .values((
+            pending_inbound_messages::chat.eq(chat),
+            pending_inbound_messages::sender.eq(sender),
+            pending_inbound_messages::id.eq(id),
+            pending_inbound_messages::message.eq(message),
+            pending_inbound_messages::device_id.eq(device_id),
+        ))
+        .execute(conn)
+}
+
+/// Batch/single-row shared delete; see [`insert_pending_inbound_row`].
+fn delete_pending_inbound_row(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    sender: &str,
+    id: &str,
+) -> diesel::QueryResult<usize> {
+    diesel::delete(
+        pending_inbound_messages::table
+            .filter(pending_inbound_messages::chat.eq(chat))
+            .filter(pending_inbound_messages::sender.eq(sender))
+            .filter(pending_inbound_messages::id.eq(id))
+            .filter(pending_inbound_messages::device_id.eq(device_id)),
+    )
+    .execute(conn)
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ProtocolStore for SqliteStore {
@@ -2992,6 +3032,8 @@ impl ProtocolStore for SqliteStore {
         id: &str,
         message: &[u8],
     ) -> Result<()> {
+        // Row statement shared with store_pending_inbound_batch via
+        // insert_pending_inbound_row, so the two write paths cannot diverge.
         let chat = chat.to_string();
         let sender = sender.to_string();
         let id = id.to_string();
@@ -3004,15 +3046,7 @@ impl ProtocolStore for SqliteStore {
             let id = id.clone();
             let message = Arc::clone(&message);
             Box::new(move |conn: &mut SqliteConnection| {
-                diesel::replace_into(pending_inbound_messages::table)
-                    .values((
-                        pending_inbound_messages::chat.eq(&chat),
-                        pending_inbound_messages::sender.eq(&sender),
-                        pending_inbound_messages::id.eq(&id),
-                        pending_inbound_messages::message.eq(message.as_slice()),
-                        pending_inbound_messages::device_id.eq(device_id),
-                    ))
-                    .execute(conn)?;
+                insert_pending_inbound_row(conn, device_id, &chat, &sender, &id, &message)?;
                 Ok(())
             })
         })
@@ -3060,14 +3094,7 @@ impl ProtocolStore for SqliteStore {
             let sender = sender.clone();
             let id = id.clone();
             Box::new(move |conn: &mut SqliteConnection| {
-                diesel::delete(
-                    pending_inbound_messages::table
-                        .filter(pending_inbound_messages::chat.eq(&chat))
-                        .filter(pending_inbound_messages::sender.eq(&sender))
-                        .filter(pending_inbound_messages::id.eq(&id))
-                        .filter(pending_inbound_messages::device_id.eq(device_id)),
-                )
-                .execute(conn)?;
+                delete_pending_inbound_row(conn, device_id, &chat, &sender, &id)?;
                 Ok(())
             })
         })
@@ -3092,6 +3119,77 @@ impl ProtocolStore for SqliteStore {
         })
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))?
+    }
+
+    async fn store_pending_inbound_batch(
+        &self,
+        rows: &[wacore::store::traits::PendingInboundRow<'_>],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // One owned copy shared across retry attempts; a single transaction
+        // amortizes the WAL commit over the whole batch.
+        let rows: Arc<Vec<(String, String, String, Vec<u8>)>> = Arc::new(
+            rows.iter()
+                .map(|r| {
+                    (
+                        r.chat.to_string(),
+                        r.sender.to_string(),
+                        r.id.to_string(),
+                        r.message.to_vec(),
+                    )
+                })
+                .collect(),
+        );
+        let device_id = self.device_id;
+        self.with_retry("store_pending_inbound_batch", || {
+            let rows = Arc::clone(&rows);
+            Box::new(move |conn: &mut SqliteConnection| {
+                // Per-row statements inside ONE transaction: the WAL commit is
+                // the real per-message cost and it is already amortized. A
+                // multi-row VALUES insert was measurably faster per statement
+                // but cost ~4 KiB of extra monomorphized .text against a
+                // 32 KiB per-PR budget — not worth it for microseconds.
+                conn.transaction(|conn| {
+                    for (chat, sender, id, message) in rows.iter() {
+                        insert_pending_inbound_row(conn, device_id, chat, sender, id, message)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
+    }
+
+    async fn delete_pending_inbound_batch(
+        &self,
+        keys: &[wacore::store::traits::PendingInboundKey<'_>],
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let keys: Arc<Vec<(String, String, String)>> = Arc::new(
+            keys.iter()
+                .map(|k| (k.chat.to_string(), k.sender.to_string(), k.id.to_string()))
+                .collect(),
+        );
+        let device_id = self.device_id;
+        self.with_retry("delete_pending_inbound_batch", || {
+            let keys = Arc::clone(&keys);
+            Box::new(move |conn: &mut SqliteConnection| {
+                // Per-row deletes stay: Diesel's DSL cannot express a composite
+                // `(chat, sender, id) IN (...)` tuple filter, and the single
+                // transaction already amortizes the WAL commit.
+                conn.transaction(|conn| {
+                    for (chat, sender, id) in keys.iter() {
+                        delete_pending_inbound_row(conn, device_id, chat, sender, id)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
     }
 }
 

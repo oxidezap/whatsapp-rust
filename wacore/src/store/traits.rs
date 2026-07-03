@@ -517,6 +517,47 @@ pub trait ProtocolStore: Send + Sync {
     async fn delete_expired_pending_inbound(&self, _cutoff_timestamp: i64) -> Result<u32> {
         Ok(0)
     }
+
+    /// Batched [`store_pending_inbound`](Self::store_pending_inbound): the
+    /// offline drain buffers one commit-batch of messages per call, so backends
+    /// should override this with a single transaction (the bundled SqliteStore
+    /// does). The default iterates the single-row method, preserving behavior
+    /// for third-party backends.
+    async fn store_pending_inbound_batch(&self, rows: &[PendingInboundRow<'_>]) -> Result<()> {
+        for row in rows {
+            self.store_pending_inbound(row.chat, row.sender, row.id, row.message)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Batched [`delete_pending_inbound`](Self::delete_pending_inbound); same
+    /// override guidance as [`store_pending_inbound_batch`](Self::store_pending_inbound_batch).
+    async fn delete_pending_inbound_batch(&self, keys: &[PendingInboundKey<'_>]) -> Result<()> {
+        for key in keys {
+            self.delete_pending_inbound(key.chat, key.sender, key.id)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// One row of a pending-inbound batch write. Fields borrow from the in-flight
+/// commit batch so building a batch allocates nothing per row.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingInboundRow<'a> {
+    pub chat: &'a str,
+    pub sender: &'a str,
+    pub id: &'a str,
+    pub message: &'a [u8],
+}
+
+/// Key of a buffered pending-inbound row, for batched deletes.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingInboundKey<'a> {
+    pub chat: &'a str,
+    pub sender: &'a str,
+    pub id: &'a str,
 }
 
 /// Device data persistence operations.

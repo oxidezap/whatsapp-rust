@@ -1,6 +1,5 @@
 use e2e_tests::{TestClient, text_msg};
 use log::info;
-use wacore::types::events::Event;
 use whatsapp_rust::waproto::whatsapp as wa;
 
 #[tokio::test]
@@ -91,14 +90,16 @@ async fn test_message_revoke() -> anyhow::Result<()> {
 
     // B should receive the revoke as a protocol message
     let event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(msg, _) if msg.protocol_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.protocol_message.is_set())
+        })
         .await?;
 
-    if let Event::Message(msg, _) = &*event {
-        let proto = msg.protocol_message.as_option().unwrap();
+    if let Some(m) = event
+        .messages()
+        .find(|m| m.message.protocol_message.is_set())
+    {
+        let proto = m.message.protocol_message.as_option().unwrap();
         assert_eq!(
             proto.r#type,
             Some(wa::message::protocol_message::Type::REVOKE),
@@ -139,9 +140,12 @@ async fn test_message_has_push_name() -> anyhow::Result<()> {
 
     // Assert the push_name field on the received event
     let event = client_b.wait_for_text(text, 15).await?;
-    if let Event::Message(_, info) = &*event {
+    if let Some(m) = event
+        .messages()
+        .find(|m| m.message.conversation.as_deref() == Some(text))
+    {
         assert_eq!(
-            info.push_name, push_name,
+            m.info.push_name, push_name,
             "Received message push_name should match the sender's display name"
         );
     }

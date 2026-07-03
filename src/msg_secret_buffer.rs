@@ -1,7 +1,7 @@
 //! Write-behind buffer for inbound `messageSecret` persistence.
 //!
 //! Capturing a secret used to upsert SQLite synchronously inside the per-chat
-//! receive lane, before the ack and the `Event::Message` dispatch. The buffer
+//! receive lane, before the ack and the `Event::Messages` dispatch. The buffer
 //! splits visibility from durability: an insert is immediately readable
 //! through [`MsgSecretWriteBuffer::lookup`] (so an add-on referencing the
 //! secret of the stanza just processed always finds it), while the backend

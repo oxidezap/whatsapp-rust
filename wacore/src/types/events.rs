@@ -218,7 +218,7 @@ pub enum EventKind {
     PairingCode,
     QrScannedWithoutMultidevice,
     ClientOutdated,
-    Message,
+    Messages,
     Receipt,
     UndecryptableMessage,
     Notification,
@@ -624,7 +624,21 @@ pub enum Event {
     QrScannedWithoutMultidevice(QrScannedWithoutMultidevice),
     ClientOutdated(ClientOutdated),
 
-    Message(Arc<wa::Message>, Arc<MessageInfo>),
+    /// One or more decrypted inbound messages, in arrival order (Baileys'
+    /// `messages.upsert` shape). Live traffic arrives as single-message
+    /// batches; an offline drain delivers one batch per durable commit, so a
+    /// consumer never sees a message that a registered durability hook has
+    /// not committed. The `Arc` slice is shared with the hook call — same
+    /// items, same order, no copies.
+    ///
+    /// With a hook registered this event is at-least-once, like the hook: a
+    /// redelivery whose buffered copy survived (e.g. the post-commit cleanup
+    /// failed and the ack was lost) replays through the same commit and
+    /// dispatches again. Exceptions that bypass the hook: newsletter
+    /// messages (plaintext, acked on their own path, never redelivered) and
+    /// PDO placeholder recoveries (identified by
+    /// `info.unavailable_request_id`) dispatch event-only.
+    Messages(MessageBatch),
     Receipt(Receipt),
     UndecryptableMessage(UndecryptableMessage),
     #[serde(skip)]
@@ -771,7 +785,7 @@ impl Event {
             Event::PairingCode { .. } => EventKind::PairingCode,
             Event::QrScannedWithoutMultidevice(_) => EventKind::QrScannedWithoutMultidevice,
             Event::ClientOutdated(_) => EventKind::ClientOutdated,
-            Event::Message(_, _) => EventKind::Message,
+            Event::Messages(_) => EventKind::Messages,
             Event::Receipt(_) => EventKind::Receipt,
             Event::UndecryptableMessage(_) => EventKind::UndecryptableMessage,
             Event::Notification(_) => EventKind::Notification,
@@ -820,17 +834,81 @@ impl Event {
         }
     }
 
-    pub fn as_message(&self) -> Option<(&Arc<wa::Message>, &MessageInfo)> {
-        if let Event::Message(msg, info) = self {
-            Some((msg, &**info))
-        } else {
-            None
+    /// This event as its [`MessageBatch`], or `None` for any other event kind.
+    /// Use this when you need the batch's [`origin`](MessageBatch::origin) or
+    /// want to treat the messages as a whole; to just iterate the messages,
+    /// prefer [`messages`](Self::messages).
+    pub fn as_messages(&self) -> Option<&MessageBatch> {
+        match self {
+            Event::Messages(batch) => Some(batch),
+            _ => None,
         }
     }
 
-    pub fn message_text(&self) -> Option<&str> {
-        let (msg, _) = self.as_message()?;
-        msg.conversation.as_deref()
+    /// The inbound messages carried by this event, in arrival order; an empty
+    /// iterator for every other event kind (so it drops cleanly into a
+    /// `for msg in event.messages()` scan over a mixed event stream).
+    pub fn messages(&self) -> impl Iterator<Item = &InboundMessage> {
+        self.as_messages().into_iter().flatten()
+    }
+}
+
+/// One decrypted inbound message. The same items (and order) back both
+/// consumer surfaces: the durability hook's batch and [`Event::Messages`].
+#[derive(Debug, Clone, Serialize)]
+pub struct InboundMessage {
+    pub message: Arc<wa::Message>,
+    pub info: Arc<MessageInfo>,
+}
+
+/// How a [`MessageBatch`] was delivered. Mirrors Baileys' `messages.upsert`
+/// `type` field (`notify` / `append`). This describes the delivery shape,
+/// not a message's provenance: whether a stanza came from the offline queue
+/// is `info.is_offline` on each [`InboundMessage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BatchOrigin {
+    /// Delivered immediately as a batch of one: live traffic, and redelivery
+    /// replays that commit outside an accumulated batch.
+    Live,
+    /// An accumulated batch from the offline drain, one per durable commit
+    /// (WA Web's MessageProcessorCache snapshot granularity).
+    OfflineDrain,
+}
+
+/// Payload of [`Event::Messages`]: the decrypted messages of one durable
+/// commit, in arrival order. Behaves as a collection of its messages —
+/// `for msg in &batch`, `batch.iter()`, `batch.len()` — with `origin`
+/// carrying the delivery shape alongside.
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageBatch {
+    pub messages: Arc<[InboundMessage]>,
+    pub origin: BatchOrigin,
+}
+
+impl MessageBatch {
+    pub fn iter(&self) -> std::slice::Iter<'_, InboundMessage> {
+        self.messages.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    pub fn first(&self) -> Option<&InboundMessage> {
+        self.messages.first()
+    }
+}
+
+impl<'a> IntoIterator for &'a MessageBatch {
+    type Item = &'a InboundMessage;
+    type IntoIter = std::slice::Iter<'a, InboundMessage>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.messages.iter()
     }
 }
 
@@ -1664,7 +1742,7 @@ mod tests {
         let bus = CoreEventBus::new();
         let only_msg = Arc::new(Recorder {
             kinds: Mutex::new(Vec::new()),
-            interest: EventInterest::of(&[EventKind::Message]),
+            interest: EventInterest::of(&[EventKind::Messages]),
         });
         let all = Arc::new(Recorder {
             kinds: Mutex::new(Vec::new()),
@@ -1688,7 +1766,7 @@ mod tests {
                 CALLS.fetch_add(1, Ordering::SeqCst);
             }
             fn interest(&self) -> EventInterest {
-                EventInterest::of(&[EventKind::Message])
+                EventInterest::of(&[EventKind::Messages])
             }
         }
         let bus2 = CoreEventBus::new();
@@ -1720,7 +1798,7 @@ mod tests {
 
         let bus = CoreEventBus::new();
         let h = Arc::new(Dynamic {
-            interest: Mutex::new(EventInterest::of(&[EventKind::Message])),
+            interest: Mutex::new(EventInterest::of(&[EventKind::Messages])),
             hits: AtomicUsize::new(0),
         });
         bus.add_handler(h.clone());
@@ -1754,17 +1832,17 @@ mod tests {
         let bus = CoreEventBus::new();
         // Empty bus: nothing is wanted and there are no handlers.
         assert!(!bus.has_handlers());
-        assert!(!bus.has_handler_for(EventKind::Message));
+        assert!(!bus.has_handler_for(EventKind::Messages));
         assert!(!bus.has_handler_for(EventKind::Receipt));
 
-        bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Message]))));
+        bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Messages]))));
         assert!(bus.has_handlers());
-        assert!(bus.has_handler_for(EventKind::Message));
+        assert!(bus.has_handler_for(EventKind::Messages));
         assert!(!bus.has_handler_for(EventKind::Receipt));
 
         // has_handler_for is true once any registered handler wants the kind.
         bus.add_handler(Arc::new(Narrow(EventInterest::of(&[EventKind::Receipt]))));
-        assert!(bus.has_handler_for(EventKind::Message));
+        assert!(bus.has_handler_for(EventKind::Messages));
         assert!(bus.has_handler_for(EventKind::Receipt));
         assert!(!bus.has_handler_for(EventKind::Connected));
     }

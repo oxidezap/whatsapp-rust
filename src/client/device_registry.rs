@@ -683,7 +683,7 @@ impl Client {
                 }
             }
         }
-        self.flush_signal_cache_logged("delete_sessions_for_devices", None)
+        self.flush_signal_cache_batch_safe_logged("delete_sessions_for_devices", None)
             .await;
     }
 

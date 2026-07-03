@@ -382,6 +382,9 @@ pub struct Client {
     /// Write-behind buffer for inbound messageSecret captures; readers check
     /// it before the backend so the durable write can leave the receive lane.
     pub(crate) msg_secret_buffer: Arc<crate::msg_secret_buffer::MsgSecretWriteBuffer>,
+    /// Accumulates decrypted messages during the offline drain for per-batch
+    /// commit (WA Web MessageProcessorCache parity).
+    pub(crate) inbound_commit_batch: crate::message::commit_batch::InboundCommitBatcher,
     pub(crate) media_conn: Arc<RwLock<Option<crate::mediaconn::MediaConn>>>,
 
     pub(crate) is_logged_in: Arc<AtomicBool>,
@@ -544,7 +547,13 @@ pub struct Client {
     /// WhatsApp Web waits for this before sending passive tasks (prekey upload, active IQ, presence).
     pub(crate) offline_sync_notifier: Arc<event_listener::Event>,
     /// Flag indicating offline sync has completed (received ib offline stanza).
+    /// Flips only AFTER the drain-tail commit, so the tail's acks still join
+    /// the aggregate offline-receipt drain.
     pub(crate) offline_sync_completed: Arc<AtomicBool>,
+    /// Once-guard for the drain finisher (the semaphore swap is not
+    /// idempotent). Separate from `offline_sync_completed` because the finish
+    /// runs off the read loop and the flag must flip only after its commit.
+    pub(crate) offline_sync_finish_started: Arc<AtomicBool>,
     /// Delivery receipts buffered during offline sync, flushed as aggregate
     /// `<receipt>` stanzas at completion (WA Web `sendAggregateOfflineReceipts`).
     /// Empty (zero capacity) outside the offline window.

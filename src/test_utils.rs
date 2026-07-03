@@ -109,6 +109,12 @@ pub async fn create_test_client_with_config(
     )
     .await;
 
+    // Tests exercise live-path semantics by default (a fresh client starts in
+    // drain mode: 1-permit semaphore, inbound commits batch instead of
+    // dispatching immediately). Drain-specific tests re-enter drain state
+    // themselves.
+    client.enter_live_mode_for_tests();
+
     client
 }
 

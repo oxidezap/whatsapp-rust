@@ -554,18 +554,25 @@ impl Client {
     /// flush at offline-sync completion (WA Web `sendAggregateOfflineReceipts`).
     /// Returns `false` when the sync already completed, so the caller falls
     /// back to the live 1:1 receipt. The completed flag is re-checked under
-    /// the buffer lock: `complete_offline_sync` flips the flag before
-    /// draining, so a push that wins the lock either lands before the drain
-    /// (and is included) or observes the flag and goes 1:1 — a receipt can
-    /// never strand in the buffer.
+    /// the buffer lock: the drain finisher (`finish_offline_sync`) flips the
+    /// flag before draining, so a push that wins the lock either lands before
+    /// the drain (and is included) or observes the flag and goes 1:1 — a
+    /// receipt can never strand in the buffer.
     pub(crate) fn try_buffer_offline_receipt(&self, info: &Arc<MessageInfo>) -> bool {
         let mut buffer = self
             .offline_receipt_buffer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Batcher still active covers the deferred drain→live window: the
+        // completion flag is already set there, but SKDM-only stanzas keep
+        // mutating cache-only sender-key state, and a 1:1 receipt for one of
+        // them before the deferred retry flushes would trade a redeliverable
+        // failure for a crash-permanent one. Completion of the deferred
+        // transition flushes this buffer (after its durable flush).
         if self
             .offline_sync_completed
             .load(std::sync::atomic::Ordering::Acquire)
+            && !self.inbound_commit_batch.is_active()
         {
             return false;
         }
@@ -2436,11 +2443,28 @@ mod tests {
             2
         );
 
-        // Once the completion flag flips, late offline receipts fall back to
-        // 1:1 instead of stranding in the buffer (the exact race this guards).
+        // The completion flag alone is NOT enough to go 1:1: during a
+        // deferred drain-to-live transition the flag is set while the batcher
+        // stays active, and receipts must keep buffering (their SKDM state
+        // may still be cache-only until the deferred flush).
         client
             .offline_sync_completed
             .store(true, std::sync::atomic::Ordering::Release);
+        let deferred = offline_info(
+            "OFF2B",
+            "5511999990000@s.whatsapp.net",
+            "5511999990000@s.whatsapp.net",
+            false,
+        );
+        assert!(client.try_buffer_offline_receipt(&deferred));
+        assert_eq!(
+            client.offline_receipt_buffer.lock().expect("buffer").len(),
+            3
+        );
+
+        // Once the batcher goes live too, late offline receipts fall back to
+        // 1:1 instead of stranding in the buffer (the exact race this guards).
+        client.enter_live_mode_for_tests();
         let late = offline_info(
             "OFF3",
             "5511999990000@s.whatsapp.net",
@@ -2450,7 +2474,7 @@ mod tests {
         assert!(!client.try_buffer_offline_receipt(&late));
         assert_eq!(
             client.offline_receipt_buffer.lock().expect("buffer").len(),
-            2
+            3
         );
 
         // Flush drains everything and releases the backing capacity, so no

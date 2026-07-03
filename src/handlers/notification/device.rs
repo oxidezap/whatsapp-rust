@@ -278,7 +278,7 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
         }
 
         client
-            .flush_signal_cache_logged("identity change", None)
+            .flush_signal_cache_batch_safe_logged("identity change", None)
             .await;
     }
 

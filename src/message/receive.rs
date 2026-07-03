@@ -3,11 +3,44 @@
 use super::*;
 
 impl Client {
+    /// Test convenience: scope to the current generation. Production inbound
+    /// traffic always goes through the chat-lane worker, which passes its own
+    /// spawn generation.
+    #[cfg(test)]
+    pub(crate) async fn handle_incoming_message(self: Arc<Self>, node: Arc<OwnedNodeRef>) {
+        let generation = self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        self.handle_incoming_message_scoped(node, generation).await
+    }
+
+    /// `lane_generation` is the generation the CALLER validated (the chat-lane
+    /// worker's spawn generation) — not re-read here, so a teardown bump that
+    /// lands mid-classification still trips the post-permit re-check instead
+    /// of being absorbed into a fresher capture.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.recv.incoming", level = "debug", skip_all)
     )]
-    pub(crate) async fn handle_incoming_message(self: Arc<Self>, node: Arc<OwnedNodeRef>) {
+    pub(crate) async fn handle_incoming_message_scoped(
+        self: Arc<Self>,
+        node: Arc<OwnedNodeRef>,
+        lane_generation: u64,
+    ) {
+        // Classification is not side-effect-free (newsletter dispatch,
+        // unavailable-only acks, PDO scheduling), so a stale stanza must be
+        // dropped BEFORE it — this pairs with the post-permit re-check, which
+        // covers a bump landing between here and the decrypt.
+        if self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != lane_generation
+        {
+            log::debug!(
+                "Connection torn down before classification; leaving the stanza for redelivery"
+            );
+            return;
+        }
         // Phase 1: classify borrows the node tree, extracts owned payloads, returns quickly.
         // Phase 2: process_classified_message holds no node borrows across heavy .await points,
         // keeping the async state machine small.
@@ -17,7 +50,8 @@ impl Client {
         };
         // node is no longer borrowed here -- drop it before the heavy phase
         drop(node);
-        self.process_classified_message(classified).await;
+        self.process_classified_message(classified, lane_generation)
+            .await;
     }
 
     #[cfg_attr(
@@ -305,7 +339,11 @@ impl Client {
         feature = "tracing",
         tracing::instrument(name = "wa.recv.process", level = "debug", skip_all)
     )]
-    pub(crate) async fn process_classified_message(self: Arc<Self>, msg: ClassifiedMessage) {
+    pub(crate) async fn process_classified_message(
+        self: Arc<Self>,
+        msg: ClassifiedMessage,
+        lane_generation: u64,
+    ) {
         let ClassifiedMessage {
             info,
             sender_encryption_jid,
@@ -335,33 +373,28 @@ impl Client {
             );
         }
 
-        // Acquire global processing permit (1 during offline sync, N after).
-        // Read generation + clone Arc under the same mutex so the pair is consistent.
-        //
-        // When the semaphore transitions from 1→N (offline→online), tasks waiting on
-        // the old 1-permit semaphore must re-acquire from the new N-permit semaphore.
-        // Without this re-acquire loop, those tasks would be silently dropped, which
-        // can lose pkmsg messages carrying SKDM (sender key distribution). If the
-        // SKDM is lost, ALL subsequent skmsg messages from that sender will fail
-        // with "No sender key state".
-        let _global_permit = loop {
-            let (generation, semaphore) = self.read_message_semaphore();
-            let permit = semaphore.acquire_arc().await;
-            if generation
-                == self
-                    .message_semaphore_generation
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                break permit;
-            }
-            // Generation changed while waiting (e.g. offline→online transition).
-            // Drop the stale permit and retry with the new semaphore, which has
-            // more permits and will grant access quickly.
+        // Acquire the global processing permit (1 during offline sync, N after).
+        // The helper re-acquires across a 1→N semaphore swap (offline→online):
+        // without that, a task waiting on the old 1-permit semaphore would be
+        // silently dropped, losing pkmsg messages carrying SKDM (sender key
+        // distribution) — and a lost SKDM fails ALL subsequent skmsg from that
+        // sender with "No sender key state".
+        let _global_permit = self.acquire_message_processing_permit().await;
+        if self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != lane_generation
+        {
+            // Teardown bumped the generation while this stanza waited for the
+            // permit; its cache settle must be the LAST Signal-cache activity
+            // of the connection. Decrypting now would advance ratchets with
+            // no committable entry — bail unacked, the server redelivers.
             log::debug!(
-                "Semaphore generation changed during acquire, re-acquiring from new semaphore"
+                "Connection torn down while awaiting the processing permit; leaving message {} for redelivery",
+                info.id
             );
-            drop(permit);
-        };
+            return;
+        }
 
         log::debug!(
             "Starting PASS 1: Processing {} session establishment messages (pkmsg/msg)",
@@ -528,9 +561,17 @@ impl Client {
             self.handle_msmsg_payload(&info, payload).await;
         }
 
-        // Flush cached Signal state to DB (matches WA Web's flushBufferToDiskIfNotMemOnlyMode)
-        self.flush_signal_cache_logged("message", Some(&info.id))
-            .await;
+        // Live: flush cached Signal state per stanza (WA Web's
+        // flushBufferToDiskIfNotMemOnlyMode). During the offline drain the
+        // commit batcher owns the flush — one per batch, before any ack (WA
+        // Web's bulk signal-store snapshot) — so here only the batch size/byte
+        // triggers are checked, while the global permit is still held.
+        if self.inbound_commit_batch.is_active() {
+            self.maybe_flush_inbound_commits().await;
+        } else {
+            self.flush_signal_cache_logged("message", Some(&info.id))
+                .await;
+        }
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.session_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %sender_encryption_jid.observe(), msg_id = %info.id)))]
@@ -750,6 +791,23 @@ impl Client {
                         // archived (not deleted) when the new PreKeySignalMessage is processed,
                         // allowing decryption of any in-flight messages encrypted with the old session.
                         self.signal_cache.delete_identity(address).await;
+                        // This stanza's processing permit is held here, and the
+                        // full-cache flush below would otherwise persist ratchet
+                        // advances for accumulated drain entries that have no
+                        // durable row yet — commit them first. A failed commit
+                        // restores the entries, so the flush must be skipped
+                        // too: the retry then fails and the message is
+                        // redelivered, instead of stranding those ratchets.
+                        if self.inbound_commit_batch.is_active()
+                            && !self.commit_inbound_batch_holding_permit().await
+                        {
+                            log::warn!(
+                                "Deferring identity-change flush for {}: the drain batch commit failed and its entries must stay unflushed",
+                                wacore::types::jid::observe_protocol_address(address)
+                            );
+                            outcome.had_failure = true;
+                            continue;
+                        }
                         // Flush immediately so the backend is updated BEFORE the retry decrypt below.
                         // Device::is_trusted_identity reads from backend, not cache.
                         if let Err(e) = self.flush_signal_cache().await {

@@ -143,7 +143,7 @@ pub struct MessageContext {
 
 impl MessageContext {
     /// Builds a context from borrowed parts, deep-cloning `message`. Prefer
-    /// [`MessageContext::from_arc`]/[`MessageContext::from_event`] when an
+    /// [`MessageContext::from_arc`]/[`MessageContext::from_inbound`] when an
     /// `Arc<wa::Message>` is already at hand (the event bus always has one).
     pub fn from_parts(message: &wa::Message, info: &MessageInfo, client: Arc<Client>) -> Self {
         Self::from_arc(Arc::new(message.clone()), info, client)
@@ -157,9 +157,11 @@ impl MessageContext {
         }
     }
 
-    pub fn from_event(event: &Event, client: Arc<Client>) -> Option<Self> {
-        let (msg, info) = event.as_message()?;
-        Some(Self::from_arc(Arc::clone(msg), info, client))
+    pub fn from_inbound(
+        inbound: &wacore::types::events::InboundMessage,
+        client: Arc<Client>,
+    ) -> Self {
+        Self::from_arc(Arc::clone(&inbound.message), &inbound.info, client)
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.send_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
@@ -731,16 +733,34 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
 
     /// Run `handler` for every incoming message, with a ready
     /// [`MessageContext`] (reply/react/edit helpers included).
+    ///
+    /// [`Event::Messages`] batches (one per commit during an offline drain,
+    /// single-message on live traffic) are fanned out here in arrival order,
+    /// awaiting each handler before the next — per-message bots keep their
+    /// ergonomics and gain in-batch ordering.
+    ///
+    /// The handler is CALLED for every message in the batch up front and the
+    /// returned futures then run in order (an `async` closure runs no body
+    /// code at call time, so for the typical handler this is unobservable).
+    /// Interleaving call+await instead would hold a `MessageContext` across
+    /// an await, which is not `Send` on wasm32.
     pub fn on_message<F, Fut>(self, handler: F) -> Self
     where
         F: Fn(MessageContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.on_event_for(&[EventKind::Message], move |event, client| {
-            let fut = MessageContext::from_event(&event, client).map(&handler);
+        self.on_event_for(&[EventKind::Messages], move |event, client| {
+            // Futures are built before the async block: `MessageContext` is
+            // not `Send` on wasm32 (the Client's trait objects aren't), so it
+            // must never be held across an await — only the handler futures
+            // (which the `Fut: Send` bound covers) may cross one.
+            let futures: Vec<Fut> = event
+                .messages()
+                .map(|m| handler(MessageContext::from_inbound(m, Arc::clone(&client))))
+                .collect();
             async move {
-                if let Some(fut) = fut {
-                    fut.await
+                for future in futures {
+                    future.await;
                 }
             }
         })
@@ -1568,7 +1588,7 @@ mod tests {
         let handlers = vec![
             RegisteredHandler {
                 callback: noop.clone(),
-                interest: EventInterest::of(&[EventKind::Message]),
+                interest: EventInterest::of(&[EventKind::Messages]),
             },
             RegisteredHandler {
                 callback: noop,
@@ -1577,7 +1597,7 @@ mod tests {
         ];
 
         let interest = combined_interest(&handlers);
-        assert!(interest.wants(EventKind::Message));
+        assert!(interest.wants(EventKind::Messages));
         assert!(interest.wants(EventKind::PairingQrCode));
         assert!(!interest.wants(EventKind::Receipt));
     }

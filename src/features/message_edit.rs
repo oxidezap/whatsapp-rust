@@ -12,7 +12,7 @@
 //! doing so requires a callback into the consumer's message store to
 //! fetch the parent's `messageContextInfo.messageSecret`. Consumers:
 //!
-//! 1. Observe `Event::Message` for messages whose
+//! 1. Observe `Event::Messages` for messages whose
 //!    `message.secret_encrypted_message.secret_enc_type == MessageEdit`.
 //! 2. Detect the envelope with [`extract_envelope`].
 //! 3. Look up the targeted message via `target_message_key`.

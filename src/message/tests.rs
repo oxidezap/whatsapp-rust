@@ -5533,6 +5533,9 @@ async fn capturing_client(
     // other layers but not on this path.
     *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
     seed_test_pn(&client).await;
+    // Live-path semantics by default; drain tests re-enter drain state
+    // themselves.
+    client.enter_live_mode_for_tests();
     (client, transport)
 }
 
@@ -6207,15 +6210,20 @@ async fn process_session_ct(
     });
     client
         .clone()
-        .process_classified_message(ClassifiedMessage {
-            info,
-            sender_encryption_jid: sender.clone(),
-            session_payloads: vec![payload],
-            group_payloads: vec![],
-            bot_payloads: vec![],
-            max_sender_retry_count: 0,
-            decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
-        })
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads: vec![payload],
+                group_payloads: vec![],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+            },
+            client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
         .await;
 }
 
@@ -6307,15 +6315,20 @@ async fn process_group_classified_with_payloads(
 ) {
     client
         .clone()
-        .process_classified_message(ClassifiedMessage {
-            info,
-            sender_encryption_jid: sender.clone(),
-            session_payloads,
-            group_payloads,
-            bot_payloads,
-            max_sender_retry_count: 0,
-            decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
-        })
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads,
+                group_payloads,
+                bot_payloads,
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+            },
+            client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
         .await;
 }
 
@@ -6323,11 +6336,9 @@ fn message_events_for_id(rx: &async_channel::Receiver<Arc<Event>>, id: &str) -> 
     let mut count = 0;
     let mut visible_content = 0;
     while let Ok(event) = rx.try_recv() {
-        if let Event::Message(msg, info) = event.as_ref()
-            && info.id == id
-        {
+        for m in event.messages().filter(|m| m.info.id == id) {
             count += 1;
-            if msg.conversation.is_some() {
+            if m.message.conversation.is_some() {
                 visible_content += 1;
             }
         }
@@ -6338,11 +6349,10 @@ fn message_events_for_id(rx: &async_channel::Receiver<Arc<Event>>, id: &str) -> 
 fn message_texts_for_id(rx: &async_channel::Receiver<Arc<Event>>, id: &str) -> Vec<String> {
     let mut texts = Vec::new();
     while let Ok(event) = rx.try_recv() {
-        if let Event::Message(msg, info) = event.as_ref()
-            && info.id == id
-            && let Some(text) = &msg.conversation
-        {
-            texts.push(text.clone());
+        for m in event.messages().filter(|m| m.info.id == id) {
+            if let Some(text) = &m.message.conversation {
+                texts.push(text.clone());
+            }
         }
     }
     texts
@@ -6407,7 +6417,7 @@ async fn skdm_only_group_session_acknowledged_once_without_message_event() {
     assert_eq!(
         message_events_for_id(&rx, id),
         (0, 0),
-        "SKDM-only messages must not surface Event::Message"
+        "SKDM-only messages must not surface Event::Messages"
     );
 }
 
@@ -6457,7 +6467,7 @@ async fn session_plaintext_decode_error_is_not_acked_as_skdm_only() {
     assert_eq!(
         message_events_for_id(&rx, id),
         (0, 0),
-        "invalid plaintext must not surface Event::Message"
+        "invalid plaintext must not surface Event::Messages"
     );
     let mut nack_code = None;
     for _ in 0..80 {
@@ -6762,7 +6772,7 @@ async fn status_skdm_only_session_uses_one_status_receipt() {
     assert_eq!(
         message_events_for_id(&rx, id),
         (0, 0),
-        "status SKDM-only messages must not surface Event::Message"
+        "status SKDM-only messages must not surface Event::Messages"
     );
 }
 
@@ -7687,10 +7697,12 @@ async fn secret_encrypted_message_edit_dispatches_legacy_edit() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == edit_id
-                        && legacy_edit_text(msg.as_ref()) == Some("edited")
-                        && msg.secret_encrypted_message.is_unset())
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == edit_id
+                    && legacy_edit_text(msg.as_ref()) == Some("edited")
+                    && msg.secret_encrypted_message.is_unset()
+            })
         },
         500,
     )
@@ -7748,10 +7760,12 @@ async fn secret_encrypted_peer_edit_resolves_sender_from_envelope() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == edit_id
-                        && legacy_edit_text(msg.as_ref()) == Some("edited")
-                        && msg.secret_encrypted_message.is_unset())
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == edit_id
+                    && legacy_edit_text(msg.as_ref()) == Some("edited")
+                    && msg.secret_encrypted_message.is_unset()
+            })
         },
         500,
     )
@@ -7812,10 +7826,12 @@ async fn run_secret_edit_with_window(test_id: &str, parent_ts: i64, edit_offset:
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == edit_id
-                        && legacy_edit_text(msg.as_ref()) == Some("edited")
-                        && msg.secret_encrypted_message.is_unset())
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == edit_id
+                    && legacy_edit_text(msg.as_ref()) == Some("edited")
+                    && msg.secret_encrypted_message.is_unset()
+            })
         },
         500,
     )
@@ -7945,10 +7961,12 @@ async fn secret_encrypted_edit_decrypts_via_resolver_when_store_empty() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == edit_id
-                        && legacy_edit_text(msg.as_ref()) == Some("edited via resolver")
-                        && msg.secret_encrypted_message.is_unset())
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == edit_id
+                    && legacy_edit_text(msg.as_ref()) == Some("edited via resolver")
+                    && msg.secret_encrypted_message.is_unset()
+            })
         },
         500,
     )
@@ -8037,9 +8055,10 @@ async fn decrypted_message_edit_recaptures_secret_for_next_edit() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == "EDIT_CHAIN_2"
-                        && legacy_edit_text(msg.as_ref()) == Some("second"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == "EDIT_CHAIN_2" && legacy_edit_text(msg.as_ref()) == Some("second")
+            })
         },
         500,
     )
@@ -8113,9 +8132,10 @@ async fn secret_encrypted_message_edit_uses_lid_pn_fallback_in_group() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == "GROUP_EDIT_1"
-                        && legacy_edit_text(msg.as_ref()) == Some("group edited"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == "GROUP_EDIT_1" && legacy_edit_text(msg.as_ref()) == Some("group edited")
+            })
         },
         500,
     )
@@ -8235,9 +8255,11 @@ async fn decrypted_message_edit_refreshes_alternate_secret_alias() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == "GROUP_EDIT_REFRESH_2"
-                        && legacy_edit_text(msg.as_ref()) == Some("second"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == "GROUP_EDIT_REFRESH_2"
+                    && legacy_edit_text(msg.as_ref()) == Some("second")
+            })
         },
         500,
     )
@@ -8313,16 +8335,17 @@ async fn msmsg_decrypts_when_secret_is_stored() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == bot_reply_id
-                        && msg.conversation.as_deref() == Some("hi from bot"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == bot_reply_id && msg.conversation.as_deref() == Some("hi from bot")
+            })
         },
         1500,
     )
     .await;
     assert!(
         got.is_some(),
-        "msmsg decryption + dispatch must surface Event::Message"
+        "msmsg decryption + dispatch must surface Event::Messages"
     );
 }
 
@@ -8371,12 +8394,12 @@ async fn msmsg_without_stored_secret_nacks_495() {
         "missing messageSecret must nack with code 495"
     );
     assert!(
-            collector
-                .events()
-                .iter()
-                .all(|e| !matches!(e.as_ref(), wacore::types::events::Event::Message(_, info) if info.id == bot_reply_id)),
-            "no Message event must be dispatched when decryption failed"
-        );
+        collector
+            .events()
+            .iter()
+            .all(|e| !e.messages().any(|m| m.info.id == bot_reply_id)),
+        "no Message event must be dispatched when decryption failed"
+    );
 }
 
 /// Tampered ciphertext → GCM tag fails → nack 495.
@@ -8511,9 +8534,10 @@ async fn msmsg_bot_edit_uses_edit_target_id_for_hkdf() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == edit_reply_id
-                        && msg.conversation.as_deref() == Some("edited content"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == edit_reply_id && msg.conversation.as_deref() == Some("edited content")
+            })
         },
         1500,
     )
@@ -8651,7 +8675,7 @@ async fn msmsg_bot_edit_first_keeps_info_id() {
     let got = collect_event(
         &client,
         collector,
-        |e| matches!(e, wacore::types::events::Event::Message(_, info) if info.id == stanza_id),
+        |e| e.messages().any(|m| m.info.id == stanza_id),
         1500,
     )
     .await;
@@ -8730,9 +8754,10 @@ async fn msmsg_falls_back_to_info_id_when_primary_uses_edit_target() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == stanza_id
-                        && msg.conversation.as_deref() == Some("fallback ok"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == stanza_id && msg.conversation.as_deref() == Some("fallback ok")
+            })
         },
         1500,
     )
@@ -8816,9 +8841,10 @@ async fn msmsg_falls_back_to_edit_target_when_primary_uses_info_id() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == stanza_id
-                        && msg.conversation.as_deref() == Some("inverse fallback"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == stanza_id && msg.conversation.as_deref() == Some("inverse fallback")
+            })
         },
         1500,
     )
@@ -9493,9 +9519,10 @@ async fn mixed_msmsg_and_unknown_enc_still_decrypts_msmsg() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == bot_reply_id
-                        && msg.conversation.as_deref() == Some("mixed ok"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == bot_reply_id && msg.conversation.as_deref() == Some("mixed ok")
+            })
         },
         1500,
     )
@@ -9591,9 +9618,10 @@ async fn msmsg_alternate_lookup_resolves_lid_to_stored_pn() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == bot_reply_id
-                        && msg.conversation.as_deref() == Some("alt ok"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == bot_reply_id && msg.conversation.as_deref() == Some("alt ok")
+            })
         },
         1500,
     )
@@ -9607,7 +9635,7 @@ async fn msmsg_alternate_lookup_resolves_lid_to_stored_pn() {
 /// End-to-end: phone fanout dispatches a wa::Message carrying the
 /// outbound `messageSecret`; later the Meta AI bot replies via msmsg
 /// referencing the same id. The captured secret must let the reply
-/// decrypt and surface `Event::Message`.
+/// decrypt and surface `Event::Messages`.
 #[tokio::test]
 async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
     use crate::store::commands::DeviceCommand;
@@ -9712,9 +9740,10 @@ async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == bot_reply_id
-                        && msg.conversation.as_deref() == Some("bot reply"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == bot_reply_id && msg.conversation.as_deref() == Some("bot reply")
+            })
         },
         1500,
     )
@@ -9808,9 +9837,10 @@ async fn msmsg_outbound_put_and_inbound_get_match_for_lid_bot() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == bot_reply_id
-                        && msg.conversation.as_deref() == Some("lid coherent"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == bot_reply_id && msg.conversation.as_deref() == Some("lid coherent")
+            })
         },
         1500,
     )
@@ -9885,9 +9915,10 @@ async fn msmsg_with_bot_device_suffix_round_trips() {
         &client,
         collector,
         |e| {
-            matches!(e, wacore::types::events::Event::Message(msg, info)
-                    if info.id == bot_reply_id
-                        && msg.conversation.as_deref() == Some("with device"))
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.id == bot_reply_id && msg.conversation.as_deref() == Some("with device")
+            })
         },
         1500,
     )
@@ -10108,9 +10139,8 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     'outer: while tokio::time::Instant::now() < deadline {
         while let Ok(event) = rx.try_recv() {
-            if let Event::Message(msg, info) = event.as_ref()
-                && info.id == COMMENT_ID
-            {
+            if let Some(m) = event.messages().find(|m| m.info.id == COMMENT_ID) {
+                let (msg, info) = (&m.message, &m.info);
                 seen = true;
                 assert_eq!(
                     msg.extended_text_message

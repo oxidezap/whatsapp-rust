@@ -171,7 +171,7 @@ async fn test_group_remove_member() -> anyhow::Result<()> {
     client_b
         .assert_no_event(
             3,
-            |e| matches!(e, Event::Message(_, _)),
+            |e| matches!(e, Event::Messages(_)),
             "B should NOT receive messages after being removed",
         )
         .await?;
@@ -187,7 +187,7 @@ async fn test_group_remove_member() -> anyhow::Result<()> {
     client_b
         .assert_no_event(
             3,
-            |e| matches!(e, Event::Message(_, _)),
+            |e| matches!(e, Event::Messages(_)),
             "B should NOT receive messages sent by C after being removed",
         )
         .await?;
@@ -584,7 +584,7 @@ async fn test_group_leave() -> anyhow::Result<()> {
     client_b
         .assert_no_event(
             3,
-            |e| matches!(e, Event::Message(_, _)),
+            |e| matches!(e, Event::Messages(_)),
             "B should NOT receive messages after leaving",
         )
         .await?;
@@ -600,7 +600,7 @@ async fn test_group_leave() -> anyhow::Result<()> {
     client_b
         .assert_no_event(
             3,
-            |e| matches!(e, Event::Message(_, _)),
+            |e| matches!(e, Event::Messages(_)),
             "B should NOT receive messages sent by C after leaving",
         )
         .await?;

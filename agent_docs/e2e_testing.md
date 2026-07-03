@@ -38,7 +38,7 @@ Use `wait_for_event()` with predicates instead of arbitrary sleeps. This is both
 ```rust
 // GOOD: event-driven — returns as soon as the event arrives
 let event = client_b
-    .wait_for_event(15, |e| matches!(e, Event::Message(msg, _) if msg.conversation.as_deref() == Some("hello")))
+    .wait_for_event(15, |e| e.messages().any(|m| m.message.conversation.as_deref() == Some("hello")))
     .await?;
 
 // BAD: arbitrary sleep — wastes time or causes flaky failures
@@ -60,7 +60,7 @@ tokio::time::sleep(Duration::from_millis(100)).await;
 client_a.client.send_message(jid_b.clone(), message).await?;
 
 // Client reconnects automatically and receives from offline queue
-let event = client_b.wait_for_event(30, |e| matches!(e, Event::Message(..))).await?;
+let event = client_b.wait_for_event(30, |e| matches!(e, Event::Messages(_))).await?;
 ```
 
 For full disconnects (no auto-reconnect):

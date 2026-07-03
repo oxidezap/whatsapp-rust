@@ -503,17 +503,27 @@ async fn test_wait_for_offline_delivery_end_times_out_when_flag_not_set() {
         .await;
 
     let elapsed = start.elapsed();
-    // Count available permits by trying to acquire non-blockingly
-    let semaphore = match client.message_processing_semaphore.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
-    let mut guards = Vec::new();
-    while let Some(guard) = semaphore.try_acquire() {
-        guards.push(guard);
+    // The drain finisher runs as a spawned task (off the read loop) and flips
+    // the flag BEFORE swapping the semaphore, so neither the flag nor the
+    // notifier alone proves the swap landed. Poll until the 64-permit
+    // semaphore is observable (counting by non-blocking acquire).
+    let mut permits = 0;
+    for _ in 0..100 {
+        let semaphore = match client.message_processing_semaphore.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let mut guards = Vec::new();
+        while let Some(guard) = semaphore.try_acquire() {
+            guards.push(guard);
+        }
+        permits = guards.len();
+        drop(guards);
+        if permits == 64 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let permits = guards.len();
-    drop(guards);
 
     assert!(
         elapsed.as_millis() >= 45, // Allow small timing variance

@@ -145,16 +145,19 @@ async fn test_mixed_offline_event_ordering() -> anyhow::Result<()> {
     for _ in 0..5 {
         let result = client_c
             .wait_for_event(10, |e| {
-                matches!(e, Event::Message(msg, _) if msg.conversation.is_some())
+                e.messages().any(|m| m.message.conversation.is_some())
                     || matches!(e, Event::Notification(node) if node.get_attr("type").is_some_and(|v| v.as_str() == "w:gp2"))
             })
             .await;
 
         match result {
-            Ok(ref event) if let Some((msg, _)) = event.as_message() => {
-                let text = msg.conversation.clone().unwrap_or_default();
-                info!("C received message: {text}");
-                messages_received.push(text);
+            Ok(ref event) if event.as_messages().is_some() => {
+                for m in event.messages() {
+                    if let Some(text) = &m.message.conversation {
+                        info!("C received message: {text}");
+                        messages_received.push(text.clone());
+                    }
+                }
             }
             Ok(ref event) if matches!(**event, Event::Notification(_)) => {
                 info!("C received group notification");
@@ -242,7 +245,11 @@ async fn test_offline_group_message_delivery() -> anyhow::Result<()> {
 
     // C should receive it after reconnecting (from offline queue)
     let event = client_c.wait_for_text(text, 30).await?;
-    if let Event::Message(msg, info) = &*event {
+    if let Some(m) = event
+        .messages()
+        .find(|m| m.message.conversation.as_deref() == Some(text))
+    {
+        let (msg, info) = (&m.message, &m.info);
         assert_eq!(msg.conversation.as_deref(), Some(text));
         assert!(info.source.is_group);
         assert_eq!(info.source.chat, group_jid);
@@ -410,16 +417,20 @@ async fn test_offline_multi_sender_group_messages() -> anyhow::Result<()> {
 
     // Verify B receives all messages (sanity check that sends worked)
     let mut b_received = 0;
-    for _ in 0..expected_messages.len() {
-        if client_b
-            .wait_for_event(
-                10,
-                |e| matches!(e, Event::Message(msg, _) if msg.conversation.is_some()),
-            )
+    while b_received < expected_messages.len() {
+        match client_b
+            .wait_for_event(10, |e| {
+                e.messages().any(|m| m.message.conversation.is_some())
+            })
             .await
-            .is_ok()
         {
-            b_received += 1;
+            Ok(ref event) => {
+                b_received += event
+                    .messages()
+                    .filter(|m| m.message.conversation.is_some())
+                    .count();
+            }
+            Err(_) => break,
         }
     }
     info!("B received {b_received} messages (online observer)");
@@ -437,16 +448,18 @@ async fn test_offline_multi_sender_group_messages() -> anyhow::Result<()> {
 
         let result = client_c
             .wait_for_event(timeout_secs, |e| {
-                matches!(e, Event::Message(msg, _) if msg.conversation.is_some())
+                e.messages().any(|m| m.message.conversation.is_some())
                     || matches!(e, Event::Notification(node) if node.get_attr("type").is_some_and(|v| v.as_str() == "w:gp2"))
             })
             .await;
 
         match result {
-            Ok(ref event) if let Some((msg, _)) = event.as_message() => {
-                if let Some(text) = &msg.conversation {
-                    info!("C received: {text}");
-                    received_texts.insert(text.clone());
+            Ok(ref event) if event.as_messages().is_some() => {
+                for m in event.messages() {
+                    if let Some(text) = &m.message.conversation {
+                        info!("C received: {text}");
+                        received_texts.insert(text.clone());
+                    }
                 }
             }
             Ok(ref event) if matches!(**event, Event::Notification(_)) => {}

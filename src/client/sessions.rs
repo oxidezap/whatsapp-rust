@@ -1,6 +1,7 @@
 //! E2E Session management for Client.
 
 use anyhow::Result;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use wacore::libsignal::store::SessionStore;
@@ -14,7 +15,7 @@ impl Client {
     /// WA Web: `WAWebOfflineResumeConst.OFFLINE_STANZA_TIMEOUT_MS = 60000`
     pub(crate) const DEFAULT_OFFLINE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
-    pub(crate) fn complete_offline_sync(&self, count: i32) {
+    pub(crate) async fn complete_offline_sync(&self, count: i32) {
         self.offline_sync_metrics
             .active
             .store(false, Ordering::Release);
@@ -23,36 +24,114 @@ impl Client {
             Err(poison) => *poison.into_inner() = None,
         }
 
-        // Signal that offline sync is complete - post-login tasks are waiting for this.
-        // This mimics WhatsApp Web's offlineDeliveryEnd event.
-        // Use compare_exchange to ensure we only run this once (add_permits is NOT idempotent).
-        // Readers that observe offline_sync_completed=true short-circuit without touching
-        // the semaphore (wait_for_offline_delivery_end returns early), so the ordering of
-        // flag flip vs. semaphore swap below is not observable: any in-flight worker keeps
-        // using its old 1-permit Arc and drains normally; newly-spawned workers pick up the
-        // 64-permit semaphore via read_message_semaphore().
+        // Run the finisher once (the semaphore swap is not idempotent). The
+        // guard is a dedicated flag, NOT offline_sync_completed: that one only
+        // flips after the tail commit so the tail's acks still observe it as
+        // false and join the aggregate offline-receipt drain (WA Web
+        // `sendAggregateOfflineReceipts`) instead of going out 1:1.
         if self
-            .offline_sync_completed
+            .offline_sync_finish_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_err()
         {
-            // Allow parallel message processing now that offline sync is done.
-            // During offline sync, permits=1 serialized all message processing.
-            // Replace with a new semaphore with 64 permits for concurrent processing.
-            // Old workers holding the previous semaphore Arc will finish normally.
-            self.swap_message_semaphore(64);
-
-            // The flag flip above happens-before this drain takes the buffer
-            // lock, so late offline receipts either land in this flush or
-            // observe the flag and send 1:1 (see try_buffer_offline_receipt).
-            self.flush_offline_receipts();
-
-            self.offline_sync_notifier.notify(usize::MAX);
-
-            self.core
-                .event_bus
-                .dispatch(Event::OfflineSyncCompleted(OfflineSyncCompleted { count }));
+            return;
         }
+
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            // Practically unreachable (the run loop owns a strong Arc), but a
+            // silent skip would leave the client batching forever with a
+            // widened semaphore — leave consistent live state behind instead.
+            log::error!(
+                "complete_offline_sync: self_weak upgrade failed; dropping the drain tail and switching to live mode"
+            );
+            self.inbound_commit_batch.force_live_dropping_entries();
+            self.publish_offline_sync_live_state(count, None);
+            return;
+        };
+
+        // The `ib` offline end marker is processed INLINE on the read loop, and
+        // the tail commit awaits the processing permit plus the durable write,
+        // Signal flush and the consumer's durability hook. Parking the read
+        // loop on that would starve IQ responses and pongs — a hook awaiting
+        // any server round-trip would deadlock, and a merely slow hook would
+        // trip the keepalive at the end of every drain. Ordering does not need
+        // the inline await: the single permit already serializes the finisher
+        // against stanza processing, so run it off-loop.
+        let generation = self.connection_generation.load(Ordering::Acquire);
+        self.runtime
+            .spawn(Box::pin(async move {
+                client.finish_offline_sync(count, generation).await;
+            }))
+            .detach();
+    }
+
+    /// Off-read-loop tail of [`complete_offline_sync`]: commit the drain tail,
+    /// then flip the completed flag, widen the semaphore and flush the
+    /// aggregate receipts. `generation` guards against a reconnect racing this
+    /// task — the new connection resets the drain state and must not have its
+    /// flag/semaphore/batcher touched by the old connection's finisher.
+    async fn finish_offline_sync(self: &Arc<Self>, count: i32, generation: u64) {
+        // Commit the drain tail and flip the batcher to live mode under the
+        // still-single processing permit (see flush_inbound_commits_under_permit
+        // for the raceless-transition argument), BEFORE widening the semaphore.
+        // Receipts flush after, so every receipt's message is durably committed
+        // first (WA Web's createSnapshot ordering).
+        let durable = self.finish_inbound_commit_drain(generation).await;
+
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            log::debug!(
+                "finish_offline_sync: connection generation changed during the tail commit; leaving the new connection's state alone"
+            );
+            return;
+        }
+
+        self.publish_offline_sync_live_state(count, Some(durable));
+    }
+
+    /// The drain→live state publication, shared by the finisher and its
+    /// upgrade-failure fallback (non-async so the codegen stays out of their
+    /// state machines).
+    ///
+    /// Readers that observe offline_sync_completed=true short-circuit without
+    /// touching the semaphore (wait_for_offline_delivery_end returns early),
+    /// so the ordering of flag flip vs. semaphore swap is not observable: any
+    /// in-flight worker keeps using its old 1-permit Arc and drains normally;
+    /// newly-spawned workers pick up the 64-permit semaphore via
+    /// read_message_semaphore(). The flag flip happens-before the receipt
+    /// drain takes the buffer lock, so late offline receipts either land in
+    /// the flush or observe the flag and send 1:1
+    /// (see try_buffer_offline_receipt).
+    ///
+    /// `durable`: `Some(true)` flushes the buffered offline receipts;
+    /// `Some(false)` drops them — the tail's durable write failed, its entries
+    /// are back in the batcher unacked, and receipting SKDM/session state that
+    /// never became durable would trade a redeliverable failure for a
+    /// crash-permanent one. In that case the batcher stays in drain mode AND
+    /// the semaphore stays at one permit: the whole-cache flush inside a
+    /// retry commit is only safe while no other stanza can be mid-decrypt
+    /// with unenqueued ratchet advances. The first durable flush completes
+    /// the deferred transition (see `complete_deferred_live_transition`) and
+    /// widens the semaphore then. `None` (upgrade-failure fallback) leaves
+    /// the buffer alone for the connection-state reset to clear.
+    fn publish_offline_sync_live_state(&self, count: i32, durable: Option<bool>) {
+        self.offline_sync_completed.store(true, Ordering::Release);
+        if durable != Some(false) {
+            self.swap_message_semaphore(64);
+        }
+        match durable {
+            Some(true) => self.flush_offline_receipts(),
+            Some(false) => {
+                log::warn!(
+                    "finish_offline_sync: tail commit not durable; dropping buffered offline receipts so the server redelivers"
+                );
+                self.clear_offline_receipt_buffer();
+            }
+            None => {}
+        }
+        self.offline_sync_notifier.notify(usize::MAX);
+        self.core
+            .event_bus
+            .dispatch(Event::OfflineSyncCompleted(OfflineSyncCompleted { count }));
     }
 
     /// Wait for offline message delivery to complete (with timeout).
@@ -100,7 +179,37 @@ impl Client {
                 processed,
                 expected,
             );
-            self.complete_offline_sync(i32::try_from(processed).unwrap_or(i32::MAX));
+            self.complete_offline_sync(i32::try_from(processed).unwrap_or(i32::MAX))
+                .await;
+            // The finisher runs as a spawned task; keep this helper's contract
+            // that live state is in place when it returns (callers start
+            // session/send work right after). Ticked so a reconnect or
+            // shutdown mid-commit cannot strand this waiter, and bounded by a
+            // second `timeout` window: when the marker-triggered finisher was
+            // ALREADY running and its tail commit/hook is stuck, the
+            // complete_offline_sync above started nothing, and an unbounded
+            // wait here would defeat this helper's whole point — callers
+            // proceed and the finisher keeps running in the background.
+            let deadline = wacore::time::Instant::now() + timeout;
+            loop {
+                let listener = self.offline_sync_notifier.listen();
+                if self.offline_sync_completed.load(Ordering::Acquire)
+                    || self.connection_generation.load(Ordering::Acquire) != wait_generation
+                    || self.expected_disconnect.load(Ordering::Relaxed)
+                {
+                    return;
+                }
+                if wacore::time::Instant::now() >= deadline {
+                    log::warn!(
+                        target: "Client/OfflineSync",
+                        "Drain finisher still running {:?} after the offline sync timeout; proceeding without it",
+                        timeout,
+                    );
+                    return;
+                }
+                let _ = wacore::runtime::timeout(&*self.runtime, Duration::from_secs(1), listener)
+                    .await;
+            }
         }
     }
 
@@ -282,9 +391,12 @@ impl Client {
             );
         }
 
-        // Flush after all sessions established
+        // Flush after all sessions established. Batch-safe: retry receipts
+        // reach here mid-drain, and post-timeout senders reach here during a
+        // deferred live transition — in both windows a raw whole-cache flush
+        // would persist rowless drain entries' ratchet advances.
         if success_count > 0 {
-            self.flush_signal_cache().await?;
+            self.flush_signal_cache_batch_safe().await?;
         }
 
         Ok(success_count)

@@ -264,16 +264,16 @@ async fn send_and_recv(
     sender.client.send_message(to.clone(), msg).await?;
     let t = expected_text.to_string();
     receiver
-        .wait_for_event(30, move |e| match e {
-            Event::Message(msg, _) => {
+        .wait_for_event(30, move |e| {
+            e.messages().any(|m| {
+                let msg = &m.message;
                 msg.conversation.as_deref() == Some(t.as_str())
                     || msg
                         .extended_text_message
                         .as_option()
                         .and_then(|ext| ext.text.as_deref())
                         .is_some_and(|txt| txt.starts_with(&t))
-            }
-            _ => false,
+            })
         })
         .await?;
     Ok(())
@@ -287,16 +287,17 @@ async fn wait_for_group_msg(
     let gid = group_jid.clone();
     let text = expected_text.to_string();
     client
-        .wait_for_event(30, move |e| match e {
-            Event::Message(msg, info) if info.source.chat == gid => {
-                msg.conversation.as_deref() == Some(text.as_str())
-                    || msg
-                        .extended_text_message
-                        .as_option()
-                        .and_then(|ext| ext.text.as_deref())
-                        .is_some_and(|txt| txt.starts_with(&text))
-            }
-            _ => false,
+        .wait_for_event(30, move |e| {
+            e.messages().any(|m| {
+                let (msg, info) = (&m.message, &m.info);
+                info.source.chat == gid
+                    && (msg.conversation.as_deref() == Some(text.as_str())
+                        || msg
+                            .extended_text_message
+                            .as_option()
+                            .and_then(|ext| ext.text.as_deref())
+                            .is_some_and(|txt| txt.starts_with(&text)))
+            })
         })
         .await?;
     Ok(())

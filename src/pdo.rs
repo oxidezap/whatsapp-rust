@@ -417,11 +417,18 @@ impl Client {
             request_id
         );
 
+        // PDO recovery is event-only (its ack runs on the PDO path, not the
+        // message pipeline), so this bypasses the commit batcher on purpose.
         self.core
             .event_bus
-            .dispatch(wacore::types::events::Event::Message(
-                Arc::from(message),
-                message_info,
+            .dispatch(wacore::types::events::Event::Messages(
+                wacore::types::events::MessageBatch {
+                    messages: std::sync::Arc::from([wacore::types::events::InboundMessage {
+                        message: Arc::from(message),
+                        info: message_info,
+                    }]),
+                    origin: wacore::types::events::BatchOrigin::Live,
+                },
             ));
     }
 
