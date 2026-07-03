@@ -442,3 +442,17 @@ impl Client {
         router
     }
 }
+
+#[cfg(test)]
+mod send_checks {
+    /// `Client::memory_report()` must stay `Send`: Veloz awaits it from a multi-threaded
+    /// sampler and it can run inside any `tokio::spawn` / axum handler. This is the regression
+    /// guard for the lid-pn dedup set — once a `HashSet<*const LidPnEntry>` (a raw-pointer set
+    /// is `!Send`) held across the report's `.await`, which silently made the whole future
+    /// `!Send`. Compile-time only: the future is constructed for its type, never polled.
+    #[allow(dead_code)]
+    fn memory_report_future_is_send(c: &super::Client) {
+        fn assert_send<T: Send>(_: &T) {}
+        assert_send(&c.memory_report());
+    }
+}
