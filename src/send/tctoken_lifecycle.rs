@@ -59,7 +59,7 @@ impl Client {
         let existing = match backend.get_tc_token(token_key).await {
             Ok(entry) => entry,
             Err(e) => {
-                log::warn!(target: "Client/TcToken", "Failed to get tc_token for {}: {e}", token_key);
+                log::warn!(target: "Client/TcToken", "Failed to get tc_token for {}: {e}", to.observe());
                 None
             }
         };
@@ -71,11 +71,19 @@ impl Client {
             &tc_config,
         );
 
-        let has_valid_tc_token = existing.as_ref().is_some_and(|entry| {
-            !entry.token.is_empty() && !is_tc_token_expired_with(entry.token_timestamp, &tc_config)
+        // Bind the token payloads up front so the match arms encode the choice
+        // without re-checking invariants that choose_privacy_token already proved.
+        let valid_tc_token: Option<&[u8]> = existing.as_ref().and_then(|entry| {
+            (!entry.token.is_empty()
+                && !is_tc_token_expired_with(entry.token_timestamp, &tc_config))
+            .then_some(entry.token.as_slice())
         });
         // cstoken needs both the NCT salt and a resolved account LID (WA Web `D`).
-        let can_build_cs_token = snapshot.nct_salt.is_some() && resolved_lid.is_some();
+        let cs_token_inputs: Option<(&[u8], &wacore_binary::CompactString)> =
+            match (&snapshot.nct_salt, &resolved_lid) {
+                (Some(salt), Some(lid)) => Some((salt.as_slice(), lid)),
+                _ => None,
+            };
 
         let tc_send_enabled = self
             .ab_props
@@ -86,45 +94,38 @@ impl Client {
             .is_enabled(web::WA_NCT_TOKEN_SEND_ENABLED)
             .await;
 
-        match choose_privacy_token(
+        let choice = choose_privacy_token(
             tc_send_enabled,
             nct_send_enabled,
-            has_valid_tc_token,
-            can_build_cs_token,
-        ) {
+            valid_tc_token.is_some(),
+            cs_token_inputs.is_some(),
+        );
+        match choice {
             PrivacyTokenChoice::TcToken => {
-                // `has_valid_tc_token` guarantees a non-empty, non-expired entry.
-                if let Some(entry) = &existing {
-                    extra_nodes.push(build_tc_token_node(&entry.token));
-                }
+                extra_nodes.extend(valid_tc_token.map(build_tc_token_node))
             }
             PrivacyTokenChoice::CsToken => {
-                if let (Some(salt), Some(lid_user)) = (&snapshot.nct_salt, &resolved_lid) {
+                extra_nodes.extend(cs_token_inputs.map(|(salt, lid_user)| {
                     // HMAC input is "user@lid" (account LID without device suffix),
                     // matching WA Web's accountLid.toString().
-                    let recipient_lid =
-                        wacore_binary::Jid::new(lid_user.as_str(), Server::Lid).to_string();
-                    let cs_token = compute_cs_token(salt, &recipient_lid);
-                    extra_nodes.push(build_cs_token_node(&cs_token));
-                    log::debug!(target: "Client/CsToken", "Attached cstoken for {} (NCT fallback)", to.observe());
-                }
+                    let recipient_lid = Jid::new(lid_user.as_str(), Server::Lid).to_string();
+                    build_cs_token_node(&compute_cs_token(salt, &recipient_lid))
+                }));
             }
-            PrivacyTokenChoice::None => {
-                log::debug!(target: "Client/CsToken", "No tctoken or NCT cstoken available for {}", to.observe());
-            }
+            PrivacyTokenChoice::None => {}
         }
+        log::debug!(target: "Client/TcToken", "privacy token for {}: {choice:?}", to.observe());
 
         should_issue_after_send
     }
 
-    /// Returns `true` if the issuance IQ succeeded.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.issue_tc_token", level = "debug", skip_all, fields(to = %to.observe())))]
-    pub(super) async fn issue_tc_token_after_send(&self, to: &Jid) -> bool {
+    pub(super) async fn issue_tc_token_after_send(&self, to: &Jid) {
         use wacore::iq::tctoken::IssuePrivacyTokensSpec;
 
         // Bots and status broadcast don't participate in the privacy token system.
         if to.is_bot() || to.is_status_broadcast() {
-            return false;
+            return;
         }
 
         let issuance_jid = self.resolve_issuance_jid(to).await;
@@ -135,17 +136,14 @@ impl Client {
             .await
         else {
             log::debug!(target: "Client/TcToken", "Failed to issue tc_token for {}", issuance_jid.observe());
-            return false;
+            return;
         };
 
         // Persist any echoed tokens (forward-compatible; the real `set privacy`
         // response carries none — WA Web ingests tokens only from the
         // privacy_token notification).
         self.store_issued_tc_tokens(&response.tokens).await;
-        // Advance the issuance rate-limit on IQ success regardless of echoed
-        // tokens — WA Web's sendTcToken persists tcTokenSenderTimestamp here.
         self.record_tc_token_sender_timestamp(to).await;
-        true
     }
 
     /// Returns true if at least one token was persisted.
@@ -208,37 +206,25 @@ impl Client {
         }
     }
 
-    /// Record that we issued a trusted-contact token to `to` at the current time.
+    /// Advance the issuance rate-limit on IQ success, independent of any tokens
+    /// echoed in the response.
     ///
-    /// WA Web's `sendTcToken` persists `tcTokenSenderTimestamp` on IQ success,
-    /// independent of any token echoed in the response — the real `set privacy`
-    /// response carries no token bytes. Deriving this update from echoed tokens
-    /// would leave the sender bucket permanently unset and re-issue a privacy IQ
-    /// on every 1:1 message. When no token is stored yet, a byte-less placeholder
-    /// carries the timestamp until the contact's token arrives via notification.
+    /// WA Web's `sendTcToken` persists `tcTokenSenderTimestamp` unconditionally
+    /// on success; the real `set privacy` response echoes no bytes, so deriving
+    /// the update from it would leave the sender bucket unset and re-issue on
+    /// every 1:1 message — hence the byte-less placeholder when no entry exists.
     async fn record_tc_token_sender_timestamp(&self, to: &Jid) {
-        use wacore::store::traits::TcTokenEntry;
-
         let key = self.resolve_tc_token_key(to).await;
-        let backend = self.persistence_manager.backend();
         let now = wacore::time::now_secs();
-        let entry = match backend.get_tc_token(&key).await {
-            Ok(Some(existing)) => TcTokenEntry {
-                sender_timestamp: Some(now),
-                ..existing
-            },
-            Ok(None) => TcTokenEntry {
-                token: Vec::new(),
-                token_timestamp: now,
-                sender_timestamp: Some(now),
-            },
-            Err(e) => {
-                log::warn!(target: "Client/TcToken", "Failed to load tc_token for {key}: {e}");
-                return;
-            }
-        };
-        if let Err(e) = backend.put_tc_token(&key, &entry).await {
-            log::warn!(target: "Client/TcToken", "Failed to record tc_token sender_timestamp for {key}: {e}");
+        // Atomic merge so a concurrent privacy_token notification writing the real
+        // token isn't clobbered by this placeholder's read-modify-write.
+        if let Err(e) = self
+            .persistence_manager
+            .backend()
+            .touch_tc_token_sender_timestamp(&key, now)
+            .await
+        {
+            log::warn!(target: "Client/TcToken", "Failed to record tc_token sender_timestamp for {}: {e}", to.observe());
         }
     }
 
@@ -321,7 +307,7 @@ impl Client {
             }
             Ok(_) => None,
             Err(e) => {
-                log::warn!(target: "Client/TcToken", "Failed to get tc_token for {}: {e}", token_key);
+                log::warn!(target: "Client/TcToken", "Failed to get tc_token for {}: {e}", jid.observe());
                 None
             }
         }

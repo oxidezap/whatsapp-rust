@@ -2942,6 +2942,45 @@ impl ProtocolStore for SqliteStore {
         .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
+    async fn touch_tc_token_sender_timestamp(
+        &self,
+        jid: &str,
+        sender_timestamp: i64,
+    ) -> Result<()> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let jid = jid.to_string();
+        let now = wacore::time::now_secs();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            // On conflict touch only sender_timestamp so a concurrently stored
+            // real token (bytes + token_timestamp) is never overwritten.
+            diesel::insert_into(tc_tokens::table)
+                .values((
+                    tc_tokens::jid.eq(&jid),
+                    tc_tokens::token.eq(Vec::<u8>::new()),
+                    tc_tokens::token_timestamp.eq(sender_timestamp),
+                    tc_tokens::sender_timestamp.eq(Some(sender_timestamp)),
+                    tc_tokens::device_id.eq(device_id),
+                    tc_tokens::updated_at.eq(now),
+                ))
+                .on_conflict((tc_tokens::jid, tc_tokens::device_id))
+                .do_update()
+                .set((
+                    tc_tokens::sender_timestamp.eq(Some(sender_timestamp)),
+                    tc_tokens::updated_at.eq(now),
+                ))
+                .execute(&mut conn)
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))??;
+        Ok(())
+    }
+
     async fn store_sent_message(
         &self,
         chat_jid: &str,

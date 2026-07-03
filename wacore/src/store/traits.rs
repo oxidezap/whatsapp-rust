@@ -454,6 +454,33 @@ pub trait ProtocolStore: Send + Sync {
     /// Delete tc tokens with token_timestamp older than cutoff. Returns count deleted.
     async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64) -> Result<u32>;
 
+    /// Set `sender_timestamp` for a contact, inserting a byte-less placeholder
+    /// when absent and preserving any existing token bytes.
+    ///
+    /// Must be atomic w.r.t. [`put_tc_token`](Self::put_tc_token): the sender-side
+    /// issuance path and the notification writer both touch the same row, so a
+    /// non-atomic read-modify-write could drop a real token for a placeholder.
+    /// The default is a read-modify-write for third-party backends; the built-in
+    /// stores override it with a single atomic upsert.
+    async fn touch_tc_token_sender_timestamp(
+        &self,
+        jid: &str,
+        sender_timestamp: i64,
+    ) -> Result<()> {
+        let entry = match self.get_tc_token(jid).await? {
+            Some(existing) => TcTokenEntry {
+                sender_timestamp: Some(sender_timestamp),
+                ..existing
+            },
+            None => TcTokenEntry {
+                token: Vec::new(),
+                token_timestamp: sender_timestamp,
+                sender_timestamp: Some(sender_timestamp),
+            },
+        };
+        self.put_tc_token(jid, &entry).await
+    }
+
     // --- Sent Message Store (retry support, matches WA Web's getMessageTable) ---
 
     /// Store a sent message's serialized payload for retry handling.

@@ -572,6 +572,28 @@ impl ProtocolStore for InMemoryBackend {
         Ok((before - s.tc_tokens.len()) as u32)
     }
 
+    async fn touch_tc_token_sender_timestamp(
+        &self,
+        jid: &str,
+        sender_timestamp: i64,
+    ) -> Result<()> {
+        let mut s = self.state.lock().await;
+        match s.tc_tokens.get_mut(jid) {
+            Some(entry) => entry.sender_timestamp = Some(sender_timestamp),
+            None => {
+                s.tc_tokens.insert(
+                    jid.to_string(),
+                    TcTokenEntry {
+                        token: Vec::new(),
+                        token_timestamp: sender_timestamp,
+                        sender_timestamp: Some(sender_timestamp),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     // --- Sent Message Store ---
 
     async fn store_sent_message(
@@ -1090,5 +1112,44 @@ mod tests {
             vec![9u8; 32],
             "last write wins for the same composite key"
         );
+    }
+
+    #[tokio::test]
+    async fn touch_tc_token_creates_placeholder_then_preserves_real_token() {
+        let backend = InMemoryBackend::new();
+
+        backend
+            .touch_tc_token_sender_timestamp("u1", 1000)
+            .await
+            .unwrap();
+        let placeholder = backend.get_tc_token("u1").await.unwrap().unwrap();
+        assert!(placeholder.token.is_empty());
+        assert_eq!(placeholder.sender_timestamp, Some(1000));
+
+        // A real token stored by the notification path must survive a later touch.
+        backend
+            .put_tc_token(
+                "u1",
+                &TcTokenEntry {
+                    token: vec![7, 8, 9],
+                    token_timestamp: 2000,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+        backend
+            .touch_tc_token_sender_timestamp("u1", 3000)
+            .await
+            .unwrap();
+
+        let merged = backend.get_tc_token("u1").await.unwrap().unwrap();
+        assert_eq!(
+            merged.token,
+            vec![7, 8, 9],
+            "touch must not clobber the real token"
+        );
+        assert_eq!(merged.token_timestamp, 2000);
+        assert_eq!(merged.sender_timestamp, Some(3000));
     }
 }
