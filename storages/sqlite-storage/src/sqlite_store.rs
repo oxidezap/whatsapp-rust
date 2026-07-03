@@ -2922,21 +2922,30 @@ impl ProtocolStore for SqliteStore {
         .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
-    async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64) -> Result<u32> {
+    async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
         tokio::task::spawn_blocking(move || -> Result<u32> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            // Placeholder rows (empty token) carry only a sender_timestamp; their
-            // token_timestamp is a sender epoch, not a receiver one, so the
-            // receiver cutoff must not prune them (matches WA Web never pruning
-            // tcTokenSenderTimestamp).
+            // Remove a row only when its received token is expired-or-absent AND
+            // its sender bucket is expired-or-absent, so recent sender state
+            // survives an expired received token (and vice versa). COALESCE
+            // treats a null sender_timestamp as stale.
             let deleted = diesel::delete(
                 tc_tokens::table
-                    .filter(tc_tokens::token_timestamp.lt(cutoff_timestamp))
-                    .filter(tc_tokens::token.ne(Vec::<u8>::new()))
+                    .filter(
+                        tc_tokens::token
+                            .eq(Vec::<u8>::new())
+                            .or(tc_tokens::token_timestamp.lt(token_cutoff)),
+                    )
+                    .filter(
+                        diesel::dsl::sql::<diesel::sql_types::Bool>(
+                            "COALESCE(sender_timestamp, 0) < ",
+                        )
+                        .bind::<diesel::sql_types::BigInt, _>(sender_cutoff),
+                    )
                     .filter(tc_tokens::device_id.eq(device_id)),
             )
             .execute(&mut conn)
@@ -4110,17 +4119,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_expired_keeps_byteless_placeholder() {
+    async fn test_delete_expired_two_window_pruning() {
         let store = create_test_store().await;
+        // token_cutoff = 1000, sender_cutoff = 2000.
+
+        // Recent placeholder: sender bucket live → kept.
         store
-            .touch_tc_token_sender_timestamp("placeholder@lid", 1)
+            .touch_tc_token_sender_timestamp("recent_ph@lid", 2500)
             .await
             .unwrap();
+        // Stale placeholder: both windows passed → pruned.
+        store
+            .touch_tc_token_sender_timestamp("stale_ph@lid", 100)
+            .await
+            .unwrap();
+        // Expired received token but recent sender bucket → kept.
         store
             .put_tc_token(
-                "real@lid",
+                "expired_live_sender@lid",
                 &TcTokenEntry {
                     token: vec![1],
+                    token_timestamp: 1,
+                    sender_timestamp: Some(2500),
+                },
+            )
+            .await
+            .unwrap();
+        // Expired token, no sender state → pruned.
+        store
+            .put_tc_token(
+                "orphan_expired@lid",
+                &TcTokenEntry {
+                    token: vec![2],
                     token_timestamp: 1,
                     sender_timestamp: None,
                 },
@@ -4128,16 +4158,24 @@ mod tests {
             .await
             .unwrap();
 
-        let removed = store.delete_expired_tc_tokens(1000).await.unwrap();
-        assert_eq!(removed, 1);
+        let removed = store.delete_expired_tc_tokens(1000, 2000).await.unwrap();
+        assert_eq!(removed, 2);
+        assert!(store.get_tc_token("recent_ph@lid").await.unwrap().is_some());
+        assert!(store.get_tc_token("stale_ph@lid").await.unwrap().is_none());
         assert!(
             store
-                .get_tc_token("placeholder@lid")
+                .get_tc_token("expired_live_sender@lid")
                 .await
                 .unwrap()
                 .is_some()
         );
-        assert!(store.get_tc_token("real@lid").await.unwrap().is_none());
+        assert!(
+            store
+                .get_tc_token("orphan_expired@lid")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4175,7 +4213,8 @@ mod tests {
         store.put_tc_token("old@lid", &old).await.unwrap();
         store.put_tc_token("recent@lid", &recent).await.unwrap();
 
-        let deleted = store.delete_expired_tc_tokens(3000).await.unwrap();
+        // Both lack sender state, so the token window alone decides.
+        let deleted = store.delete_expired_tc_tokens(3000, 3000).await.unwrap();
         assert_eq!(deleted, 1);
 
         assert!(store.get_tc_token("old@lid").await.unwrap().is_none());

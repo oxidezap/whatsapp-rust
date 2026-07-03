@@ -254,7 +254,7 @@ mod tests {
         async fn get_all_tc_token_jids(&self) -> StoreResult<Vec<String>> {
             Ok(vec![])
         }
-        async fn delete_expired_tc_tokens(&self, _: i64) -> StoreResult<u32> {
+        async fn delete_expired_tc_tokens(&self, _: i64, _: i64) -> StoreResult<u32> {
             Ok(0)
         }
         async fn store_sent_message(&self, _: &str, _: &str, _: &[u8]) -> StoreResult<()> {

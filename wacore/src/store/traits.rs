@@ -451,8 +451,12 @@ pub trait ProtocolStore: Send + Sync {
     /// Get all JIDs that have stored tc tokens.
     async fn get_all_tc_token_jids(&self) -> Result<Vec<String>>;
 
-    /// Delete tc tokens with token_timestamp older than cutoff. Returns count deleted.
-    async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64) -> Result<u32>;
+    /// Delete tc tokens that have no live state left. A row is removed only when
+    /// its received token is expired-or-absent (`token_timestamp < token_cutoff`
+    /// or empty) **and** its sender bucket is expired-or-absent
+    /// (`sender_timestamp < sender_cutoff` or null), so recent sender state is
+    /// never dropped just because the received token expired. Returns count deleted.
+    async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32>;
 
     /// Set `sender_timestamp` for a contact, inserting a byte-less placeholder
     /// when absent and preserving any existing token bytes.

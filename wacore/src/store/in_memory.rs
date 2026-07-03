@@ -564,13 +564,16 @@ impl ProtocolStore for InMemoryBackend {
         Ok(self.state.lock().await.tc_tokens.keys().cloned().collect())
     }
 
-    async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64) -> Result<u32> {
+    async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32> {
         let mut s = self.state.lock().await;
         let before = s.tc_tokens.len();
-        // Keep placeholder rows (empty token): their token_timestamp is a sender
-        // epoch, not a receiver one, so the receiver cutoff must not prune them.
-        s.tc_tokens
-            .retain(|_, entry| entry.token.is_empty() || entry.token_timestamp >= cutoff_timestamp);
+        // Keep a row while either window is still live: the received token or the
+        // sender bucket. A row is dropped only when both are stale.
+        s.tc_tokens.retain(|_, entry| {
+            let token_live = !entry.token.is_empty() && entry.token_timestamp >= token_cutoff;
+            let sender_live = entry.sender_timestamp.is_some_and(|ts| ts >= sender_cutoff);
+            token_live || sender_live
+        });
         Ok((before - s.tc_tokens.len()) as u32)
     }
 
@@ -1216,29 +1219,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_keeps_byteless_placeholder() {
+    async fn prune_respects_sender_and_token_windows() {
         let backend = InMemoryBackend::new();
+        // token_cutoff = 1000, sender_cutoff = 2000 (wider sender window).
+
+        // Recent placeholder: sender bucket still live → kept.
         backend
-            .touch_tc_token_sender_timestamp("u4", 1)
+            .touch_tc_token_sender_timestamp("recent_ph", 2500)
             .await
             .unwrap();
+        // Stale placeholder: both windows passed → pruned.
+        backend
+            .touch_tc_token_sender_timestamp("stale_ph", 100)
+            .await
+            .unwrap();
+        // Expired token but recent sender bucket → kept (issuance state survives).
         backend
             .put_tc_token(
-                "u5",
+                "expired_tok_live_sender",
                 &TcTokenEntry {
                     token: vec![1],
+                    token_timestamp: 1,
+                    sender_timestamp: Some(2500),
+                },
+            )
+            .await
+            .unwrap();
+        // Expired token, no sender state → pruned.
+        backend
+            .put_tc_token(
+                "orphan_expired",
+                &TcTokenEntry {
+                    token: vec![2],
                     token_timestamp: 1,
                     sender_timestamp: None,
                 },
             )
             .await
             .unwrap();
+        // Fresh received token → kept.
+        backend
+            .put_tc_token(
+                "fresh_tok",
+                &TcTokenEntry {
+                    token: vec![3],
+                    token_timestamp: 5000,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
 
-        // Cutoff above both timestamps: the real token is pruned, the placeholder
-        // (empty token) is kept — its token_timestamp is a sender epoch.
-        let removed = backend.delete_expired_tc_tokens(1000).await.unwrap();
-        assert_eq!(removed, 1);
-        assert!(backend.get_tc_token("u4").await.unwrap().is_some());
-        assert!(backend.get_tc_token("u5").await.unwrap().is_none());
+        let removed = backend.delete_expired_tc_tokens(1000, 2000).await.unwrap();
+        assert_eq!(removed, 2, "only fully-stale rows are pruned");
+        assert!(backend.get_tc_token("recent_ph").await.unwrap().is_some());
+        assert!(backend.get_tc_token("stale_ph").await.unwrap().is_none());
+        assert!(
+            backend
+                .get_tc_token("expired_tok_live_sender")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .get_tc_token("orphan_expired")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(backend.get_tc_token("fresh_tok").await.unwrap().is_some());
     }
 }

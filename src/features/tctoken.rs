@@ -66,13 +66,22 @@ impl<'a> TcToken<'a> {
 
     /// Prune expired tc tokens from the store.
     ///
-    /// Cutoff is AB-prop-aware via [`Client::tc_token_config()`] — the server
-    /// may override the default 28-day window (e.g. 26 buckets = 182 days).
+    /// Cutoffs are AB-prop-aware via [`Client::tc_token_config()`] — the server
+    /// may override the default 28-day window (e.g. 26 buckets = 182 days). The
+    /// received token and the sender bucket expire on independent windows, so a
+    /// row is dropped only when both are stale.
     pub async fn prune_expired(&self) -> Result<u32, TcTokenError> {
+        use wacore::iq::tctoken::{
+            sender_tc_token_expiration_cutoff_with, tc_token_expiration_cutoff_with,
+        };
+
         let backend = self.client.persistence_manager.backend();
         let tc_config = self.client.tc_token_config().await;
-        let cutoff = wacore::iq::tctoken::tc_token_expiration_cutoff_with(&tc_config);
-        let deleted = backend.delete_expired_tc_tokens(cutoff).await?;
+        let token_cutoff = tc_token_expiration_cutoff_with(&tc_config);
+        let sender_cutoff = sender_tc_token_expiration_cutoff_with(&tc_config);
+        let deleted = backend
+            .delete_expired_tc_tokens(token_cutoff, sender_cutoff)
+            .await?;
 
         if deleted > 0 {
             log::info!(target: "Client/TcToken", "Pruned {} expired tc_tokens", deleted);
