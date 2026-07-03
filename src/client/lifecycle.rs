@@ -215,7 +215,6 @@ impl Client {
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
             offline_sync_finish_started: Arc::new(AtomicBool::new(false)),
-            signal_cache_retained_dirty: AtomicBool::new(false),
             offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             inbound_commit_batch: Default::default(),
             history_sync_tasks_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -461,25 +460,12 @@ impl Client {
             .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Uncommitted batch entries were never acked; the server redelivers
-        // them on this fresh connection. The cache clear pairs with it: a
-        // late lane worker from the previous connection can decrypt AFTER
-        // cleanup settled the cache, leaving dirty ratchet advances whose
-        // entries are dropped right here — flushing those later would make
-        // their redeliveries ackable duplicates. Committed state was flushed
-        // by its commit, so this normally only drops rowless advances — the
-        // exception is a teardown whose flush FAILED and retained
-        // committed/acked state (never redelivered): keep that for the next
-        // successful flush instead of destroying it.
-        // load(), not swap(): a connect attempt that fails before any flush
-        // must not consume the flag, or the NEXT attempt would clear the
-        // retained cache. Only a successful flush_signal_cache resets it.
-        if self.signal_cache_retained_dirty.load(Ordering::Acquire) {
-            log::warn!(
-                "connect: keeping Signal cache retained by a failed teardown flush; the next flush persists it"
-            );
-        } else {
-            self.signal_cache.clear().await;
-        }
+        // them on this fresh connection. The Signal cache needs no clear
+        // here: teardown settled it under the permit, and its generation
+        // bump plus the post-permit re-check guarantee no late lane worker
+        // dirtied it afterwards. Anything still resident is state a failed
+        // teardown flush deliberately retained (committed/acked, never
+        // redelivered) for the next successful flush to persist.
         self.inbound_commit_batch.reset();
         self.offline_batch.reset();
         self.outbound_flush.reopen();
@@ -723,6 +709,15 @@ impl Client {
         tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all)
     )]
     pub(crate) async fn cleanup_connection_state(&self) {
+        // Bump the generation FIRST: it is the "this connection is over"
+        // signal every per-connection loop already polls. Chat-lane workers
+        // stop draining their queues (their remaining stanzas were never
+        // acked and redeliver), stale finishers/timers stand down, and —
+        // combined with the post-permit generation re-check in
+        // process_classified_message — no decrypt can START after the
+        // permit-held cache settle below, so no rowless ratchet advances can
+        // dirty the cache behind teardown's back.
+        self.connection_generation.fetch_add(1, Ordering::SeqCst);
         // Note: node_waiters are intentionally NOT cleared here — they are
         // cross-connection (callers may register a waiter before an action that
         // completes on a subsequent connection, e.g. after 515 reconnect).

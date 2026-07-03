@@ -344,7 +344,25 @@ impl Client {
         // can lose pkmsg messages carrying SKDM (sender key distribution). If the
         // SKDM is lost, ALL subsequent skmsg messages from that sender will fail
         // with "No sender key state".
+        let generation = self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let _global_permit = self.acquire_message_processing_permit().await;
+        if self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != generation
+        {
+            // Teardown bumped the generation while this stanza waited for the
+            // permit; its cache settle must be the LAST Signal-cache activity
+            // of the connection. Decrypting now would advance ratchets with
+            // no committable entry — bail unacked, the server redelivers.
+            log::debug!(
+                "Connection torn down while awaiting the processing permit; leaving message {} for redelivery",
+                info.id
+            );
+            return;
+        }
 
         log::debug!(
             "Starting PASS 1: Processing {} session establishment messages (pkmsg/msg)",

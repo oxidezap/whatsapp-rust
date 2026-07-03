@@ -455,23 +455,19 @@ impl Client {
             if durable && !self.inbound_commit_batch.has_entries() {
                 match self.flush_signal_cache().await {
                     Ok(()) => self.signal_cache.clear().await,
-                    Err(e) => {
-                        // Committed/acked state the server never redelivers:
-                        // keep it resident and tell the connect-time clear to
-                        // stand down so the next successful flush persists it.
-                        self.signal_cache_retained_dirty
-                            .store(true, Ordering::Release);
-                        log::error!(
-                            "cleanup_connection_state: signal cache flush failed, keeping cache to avoid dropping Signal state: {e:?}"
-                        );
-                    }
+                    // Committed/acked state the server never redelivers: keep
+                    // it resident so the next successful flush persists it.
+                    // Safe to carry across the reconnect — the teardown
+                    // generation bump plus the post-permit re-check mean no
+                    // late decrypt can mix rowless advances into it.
+                    Err(e) => log::error!(
+                        "cleanup_connection_state: signal cache flush failed, keeping cache to avoid dropping Signal state: {e:?}"
+                    ),
                 }
             } else {
                 log::warn!(
                     "cleanup_connection_state: dropping unflushed Signal state for uncommitted drain entries; the server redelivers them"
                 );
-                self.signal_cache_retained_dirty
-                    .store(false, Ordering::Release);
                 self.signal_cache.clear().await;
             }
         };
@@ -482,8 +478,6 @@ impl Client {
             log::warn!(
                 "Timed out committing the inbound drain batch during teardown; dropping unflushed Signal state so redelivery stays consistent"
             );
-            self.signal_cache_retained_dirty
-                .store(false, Ordering::Release);
             self.signal_cache.clear().await;
         }
     }

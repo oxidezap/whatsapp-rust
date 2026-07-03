@@ -81,13 +81,7 @@ impl Client {
         self.signal_cache
             .flush(&*backend)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to flush signal cache: {e}"))?;
-        // Single choke point every flush goes through: state retained by a
-        // failed teardown flush is persisted now, so the connect-time clear
-        // may resume on future connections.
-        self.signal_cache_retained_dirty
-            .store(false, std::sync::atomic::Ordering::Release);
-        Ok(())
+            .map_err(|e| anyhow::anyhow!("Failed to flush signal cache: {e}"))
     }
 
     /// [`flush_signal_cache`](Self::flush_signal_cache) with error logging instead of propagation.
