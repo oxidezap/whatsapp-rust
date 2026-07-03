@@ -357,6 +357,16 @@ impl Client {
             self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
                 .await
         };
+        if let Some(generation) = expected_generation
+            && self.connection_generation.load(Ordering::Acquire) != generation
+        {
+            // The pre-take check only covers up to the take: a teardown can
+            // time out around the awaited commit above and reset the batcher,
+            // so mutating the mode now would deactivate (or defer) the NEW
+            // connection's drain. The commit itself was still sound — its
+            // entries were taken before the reset and its rows are durable.
+            return durable;
+        }
         if deactivate {
             if durable {
                 self.inbound_commit_batch.deactivate();
@@ -573,13 +583,15 @@ impl Client {
         if batch.is_empty() {
             return true;
         }
-        let durable = self
-            .commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
-            .await;
-        if durable && self.inbound_commit_batch.live_transition_pending() {
-            self.complete_deferred_live_transition();
-        }
-        durable
+        // Deliberately NOT completing a pending deferred transition here even
+        // on a durable commit: the caller holds a permit from the old
+        // single-permit semaphore and follows up with a raw whole-cache
+        // flush, which is only safe while that permit excludes every other
+        // stanza — widening to 64 permits first would let new workers be
+        // mid-decrypt under it. The deferred-retry loop completes the
+        // transition moments later, outside any raw-flush window.
+        self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
+            .await
     }
 
     /// Commit one batch: durable buffer → Signal flush → hook → clear buffer →
