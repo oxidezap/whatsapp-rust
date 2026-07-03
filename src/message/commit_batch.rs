@@ -392,6 +392,10 @@ impl Client {
     fn arm_deferred_transition_retry(self: &Arc<Self>) {
         let client = Arc::downgrade(self);
         let runtime = self.runtime.clone();
+        // Generation-scoped like the finisher: after a reconnect this stale
+        // task stands down (a re-deferring new connection arms its own retry)
+        // instead of flushing the new connection's state.
+        let generation = self.connection_generation.load(Ordering::Acquire);
         self.runtime
             .spawn(Box::pin(async move {
                 loop {
@@ -399,11 +403,13 @@ impl Client {
                     let Some(client) = client.upgrade() else {
                         return;
                     };
-                    if !client.inbound_commit_batch.live_transition_pending() {
+                    if !client.inbound_commit_batch.live_transition_pending()
+                        || client.connection_generation.load(Ordering::Acquire) != generation
+                    {
                         return;
                     }
                     let _ = client
-                        .flush_inbound_commits_under_permit(false, None, None)
+                        .flush_inbound_commits_under_permit(false, None, Some(generation))
                         .await;
                 }
             }))
