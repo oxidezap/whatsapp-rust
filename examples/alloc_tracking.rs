@@ -20,10 +20,10 @@
 //! an always-on meter. Allocations outside instrumented tasks (your own
 //! caller-side code, other libraries) land in the "untracked" bucket.
 
+use portable_atomic::{AtomicI64, Ordering};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use log::{error, info};

@@ -29,6 +29,10 @@ impl crate::stats::HeapSize for ResolvedGroupDevices {
     fn heap_bytes(&self) -> usize {
         self.devices.capacity() * size_of::<Jid>()
             + self.devices.iter().map(|j| j.heap_bytes()).sum::<usize>()
+            + self
+                .phash
+                .get()
+                .map_or(0, |(jid, p)| jid.heap_bytes() + p.heap_bytes())
     }
 }
 

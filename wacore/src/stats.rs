@@ -263,15 +263,24 @@ impl<F> MeteredFuture<F> {
     }
 }
 
+/// Calls `on_poll_end` on drop, so a panicking poll (or blocking closure)
+/// still closes the instrument scope — implementors that scope allocator
+/// attribution would otherwise leak it across the unwind.
+struct PollGuard<'a>(&'a dyn TaskInstrument);
+impl Drop for PollGuard<'_> {
+    fn drop(&mut self) {
+        self.0.on_poll_end();
+    }
+}
+
 impl<F: Future + Unpin> Future for MeteredFuture<F> {
     type Output = F::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.instrument.on_poll_start();
-        let result = Pin::new(&mut this.inner).poll(cx);
-        this.instrument.on_poll_end();
-        result
+        let _guard = PollGuard(&*this.instrument);
+        Pin::new(&mut this.inner).poll(cx)
     }
 }
 
@@ -377,8 +386,8 @@ impl Runtime for InstrumentedRuntime {
         let instrument = self.instrument.clone();
         self.inner.spawn_blocking(Box::new(move || {
             instrument.on_poll_start();
+            let _guard = PollGuard(&*instrument);
             f();
-            instrument.on_poll_end();
         }))
     }
 
@@ -409,8 +418,8 @@ impl Runtime for InstrumentedRuntime {
         let instrument = self.instrument.clone();
         self.inner.spawn_blocking(Box::new(move || {
             instrument.on_poll_start();
+            let _guard = PollGuard(&*instrument);
             f();
-            instrument.on_poll_end();
         }))
     }
 

@@ -118,16 +118,10 @@ impl Client {
 
         let group_cache = match self.group_cache.lock().await.as_ref() {
             Some(cache) => {
+                // Arc<T>'s HeapSize already includes size_of::<GroupInfo>().
                 let bytes: usize = cache
                     .iter_local()
-                    .map(|iter| {
-                        iter.map(|(k, v)| {
-                            k.heap_bytes()
-                                + std::mem::size_of::<wacore::client::context::GroupInfo>()
-                                + v.heap_bytes()
-                        })
-                        .sum()
-                    })
+                    .map(|iter| iter.map(|(k, v)| k.heap_bytes() + v.heap_bytes()).sum())
                     .unwrap_or(0);
                 CollectionStats::new(cache.entry_count(), bytes as u64)
             }
@@ -150,7 +144,7 @@ impl Client {
                 .map(|(k, v)| {
                     k.heap_bytes()
                         + v.members.iter().map(|m| m.heap_bytes()).sum::<usize>()
-                        + v.members.len() * std::mem::size_of::<wacore_binary::CompactString>()
+                        + v.members.capacity() * std::mem::size_of::<wacore_binary::CompactString>()
                         + v.devices.heap_bytes()
                 })
                 .sum();

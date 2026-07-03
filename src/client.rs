@@ -187,12 +187,16 @@ pub use wacore::stats::{CollectionStats, StatsSnapshot};
 ///
 /// Call [`Client::memory_report`] to obtain one. Nothing is computed unless
 /// called.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct MemoryReport {
     // -- TTL/capacity-bounded caches --
     pub group_cache: CollectionStats,
     pub device_registry_cache: CollectionStats,
     pub lid_pn_lid_entries: CollectionStats,
+    /// Entry count of the PN-direction map. Always `bytes: 0`: both maps
+    /// share the same `Arc<LidPnEntry>` payloads, attributed entirely to
+    /// [`Self::lid_pn_lid_entries`] so the total counts them once.
     pub lid_pn_pn_entries: CollectionStats,
     pub recent_messages: CollectionStats,
     pub sender_key_device_cache: CollectionStats,
