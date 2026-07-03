@@ -209,6 +209,8 @@ env_logger = { workspace = true }
 flate2 = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
+# Raises real SIGINT/SIGTERM at the current process in the shutdown-signal test.
+libc = "0.2"
 metrics-exporter-prometheus = "0.18"
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

@@ -4281,6 +4281,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "itoa",
+ "libc",
  "log",
  "metrics-exporter-prometheus",
  "opus",

@@ -127,8 +127,11 @@ fn main() {
             let mut handle = bot.spawn();
             tokio::select! {
                 _ = &mut handle => {}
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received Ctrl+C, shutting down...");
+                // SIGINT (Ctrl+C) or SIGTERM (`docker stop`, k8s, systemd). Watching
+                // only Ctrl+C left `docker stop` to time out and SIGKILL the PID-1
+                // container, skipping the graceful flush below.
+                _ = whatsapp_rust::shutdown_signal() => {
+                    info!("Received shutdown signal, shutting down...");
                     handle.shutdown().await;
                 }
             }
