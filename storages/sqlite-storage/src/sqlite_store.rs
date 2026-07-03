@@ -2931,8 +2931,8 @@ impl ProtocolStore for SqliteStore {
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
             // Remove a row only when its received token is expired-or-absent AND
             // its sender bucket is expired-or-absent, so recent sender state
-            // survives an expired received token (and vice versa). COALESCE
-            // treats a null sender_timestamp as stale.
+            // survives an expired received token (and vice versa). A null
+            // sender_timestamp counts as stale.
             let deleted = diesel::delete(
                 tc_tokens::table
                     .filter(
@@ -2941,10 +2941,9 @@ impl ProtocolStore for SqliteStore {
                             .or(tc_tokens::token_timestamp.lt(token_cutoff)),
                     )
                     .filter(
-                        diesel::dsl::sql::<diesel::sql_types::Bool>(
-                            "COALESCE(sender_timestamp, 0) < ",
-                        )
-                        .bind::<diesel::sql_types::BigInt, _>(sender_cutoff),
+                        tc_tokens::sender_timestamp
+                            .is_null()
+                            .or(tc_tokens::sender_timestamp.lt(sender_cutoff)),
                     )
                     .filter(tc_tokens::device_id.eq(device_id)),
             )
