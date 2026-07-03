@@ -2929,9 +2929,14 @@ impl ProtocolStore for SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            // Placeholder rows (empty token) carry only a sender_timestamp; their
+            // token_timestamp is a sender epoch, not a receiver one, so the
+            // receiver cutoff must not prune them (matches WA Web never pruning
+            // tcTokenSenderTimestamp).
             let deleted = diesel::delete(
                 tc_tokens::table
                     .filter(tc_tokens::token_timestamp.lt(cutoff_timestamp))
+                    .filter(tc_tokens::token.ne(Vec::<u8>::new()))
                     .filter(tc_tokens::device_id.eq(device_id)),
             )
             .execute(&mut conn)
@@ -2940,6 +2945,48 @@ impl ProtocolStore for SqliteStore {
         })
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))?
+    }
+
+    async fn store_received_tc_token(
+        &self,
+        jid: &str,
+        token: &[u8],
+        token_timestamp: i64,
+    ) -> Result<()> {
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let jid = jid.to_string();
+        let token = token.to_vec();
+        let now = wacore::time::now_secs();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            // On conflict update only the token fields so a sender_timestamp
+            // written concurrently by the issuance path survives.
+            diesel::insert_into(tc_tokens::table)
+                .values((
+                    tc_tokens::jid.eq(&jid),
+                    tc_tokens::token.eq(&token),
+                    tc_tokens::token_timestamp.eq(token_timestamp),
+                    tc_tokens::sender_timestamp.eq(None::<i64>),
+                    tc_tokens::device_id.eq(device_id),
+                    tc_tokens::updated_at.eq(now),
+                ))
+                .on_conflict((tc_tokens::jid, tc_tokens::device_id))
+                .do_update()
+                .set((
+                    tc_tokens::token.eq(&token),
+                    tc_tokens::token_timestamp.eq(token_timestamp),
+                    tc_tokens::updated_at.eq(now),
+                ))
+                .execute(&mut conn)
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| StoreError::Database(Box::new(e)))??;
+        Ok(())
     }
 
     async fn touch_tc_token_sender_timestamp(
@@ -4031,6 +4078,66 @@ mod tests {
 
         let result = store.get_tc_token("user@lid").await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_touch_and_store_received_preserve_each_others_field() {
+        let store = create_test_store().await;
+
+        // Issuance writes a placeholder; the notification then stores the real
+        // token. Neither write may clobber the other's field.
+        store
+            .touch_tc_token_sender_timestamp("user@lid", 5000)
+            .await
+            .unwrap();
+        store
+            .store_received_tc_token("user@lid", &[7, 8, 9], 4000)
+            .await
+            .unwrap();
+        let a = store.get_tc_token("user@lid").await.unwrap().unwrap();
+        assert_eq!(a.token, vec![7, 8, 9]);
+        assert_eq!(a.token_timestamp, 4000);
+        assert_eq!(a.sender_timestamp, Some(5000));
+
+        // A later touch advances only the sender bucket.
+        store
+            .touch_tc_token_sender_timestamp("user@lid", 6000)
+            .await
+            .unwrap();
+        let b = store.get_tc_token("user@lid").await.unwrap().unwrap();
+        assert_eq!(b.token, vec![7, 8, 9], "touch must keep the real token");
+        assert_eq!(b.sender_timestamp, Some(6000));
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_keeps_byteless_placeholder() {
+        let store = create_test_store().await;
+        store
+            .touch_tc_token_sender_timestamp("placeholder@lid", 1)
+            .await
+            .unwrap();
+        store
+            .put_tc_token(
+                "real@lid",
+                &TcTokenEntry {
+                    token: vec![1],
+                    token_timestamp: 1,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let removed = store.delete_expired_tc_tokens(1000).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            store
+                .get_tc_token("placeholder@lid")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.get_tc_token("real@lid").await.unwrap().is_none());
     }
 
     #[tokio::test]

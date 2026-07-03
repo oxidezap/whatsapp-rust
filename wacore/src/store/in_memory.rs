@@ -567,8 +567,10 @@ impl ProtocolStore for InMemoryBackend {
     async fn delete_expired_tc_tokens(&self, cutoff_timestamp: i64) -> Result<u32> {
         let mut s = self.state.lock().await;
         let before = s.tc_tokens.len();
+        // Keep placeholder rows (empty token): their token_timestamp is a sender
+        // epoch, not a receiver one, so the receiver cutoff must not prune them.
         s.tc_tokens
-            .retain(|_, entry| entry.token_timestamp >= cutoff_timestamp);
+            .retain(|_, entry| entry.token.is_empty() || entry.token_timestamp >= cutoff_timestamp);
         Ok((before - s.tc_tokens.len()) as u32)
     }
 
@@ -587,6 +589,33 @@ impl ProtocolStore for InMemoryBackend {
                         token: Vec::new(),
                         token_timestamp: sender_timestamp,
                         sender_timestamp: Some(sender_timestamp),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn store_received_tc_token(
+        &self,
+        jid: &str,
+        token: &[u8],
+        token_timestamp: i64,
+    ) -> Result<()> {
+        let mut s = self.state.lock().await;
+        match s.tc_tokens.get_mut(jid) {
+            Some(entry) => {
+                entry.token = token.to_vec();
+                entry.token_timestamp = token_timestamp;
+                // sender_timestamp left untouched
+            }
+            None => {
+                s.tc_tokens.insert(
+                    jid.to_string(),
+                    TcTokenEntry {
+                        token: token.to_vec(),
+                        token_timestamp,
+                        sender_timestamp: None,
                     },
                 );
             }
@@ -1151,5 +1180,65 @@ mod tests {
         );
         assert_eq!(merged.token_timestamp, 2000);
         assert_eq!(merged.sender_timestamp, Some(3000));
+    }
+
+    #[tokio::test]
+    async fn store_received_tc_token_preserves_sender_timestamp() {
+        let backend = InMemoryBackend::new();
+        // Placeholder from the issuance path.
+        backend
+            .touch_tc_token_sender_timestamp("u2", 5000)
+            .await
+            .unwrap();
+
+        // Notification stores the real token; the sender bucket must survive.
+        backend
+            .store_received_tc_token("u2", &[1, 2, 3], 4000)
+            .await
+            .unwrap();
+
+        let entry = backend.get_tc_token("u2").await.unwrap().unwrap();
+        assert_eq!(entry.token, vec![1, 2, 3]);
+        assert_eq!(entry.token_timestamp, 4000);
+        assert_eq!(
+            entry.sender_timestamp,
+            Some(5000),
+            "store_received_tc_token must not drop the sender bucket"
+        );
+
+        // No prior entry: sender_timestamp starts unset.
+        backend
+            .store_received_tc_token("u3", &[9], 4000)
+            .await
+            .unwrap();
+        let fresh = backend.get_tc_token("u3").await.unwrap().unwrap();
+        assert_eq!(fresh.sender_timestamp, None);
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_byteless_placeholder() {
+        let backend = InMemoryBackend::new();
+        backend
+            .touch_tc_token_sender_timestamp("u4", 1)
+            .await
+            .unwrap();
+        backend
+            .put_tc_token(
+                "u5",
+                &TcTokenEntry {
+                    token: vec![1],
+                    token_timestamp: 1,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Cutoff above both timestamps: the real token is pruned, the placeholder
+        // (empty token) is kept — its token_timestamp is a sender epoch.
+        let removed = backend.delete_expired_tc_tokens(1000).await.unwrap();
+        assert_eq!(removed, 1);
+        assert!(backend.get_tc_token("u4").await.unwrap().is_some());
+        assert!(backend.get_tc_token("u5").await.unwrap().is_none());
     }
 }

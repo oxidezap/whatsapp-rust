@@ -25,7 +25,6 @@ use wacore_binary::NodeRef;
 )]
 pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
     use wacore::iq::tctoken::parse_privacy_token_notification;
-    use wacore::store::traits::TcTokenEntry;
 
     let from_jid = node.attrs().optional_jid("from");
 
@@ -86,68 +85,50 @@ pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node
     let mut token_stored = false;
 
     for received in &received_tokens {
-        match backend.get_tc_token(sender_lid).await {
-            Ok(Some(existing)) => {
-                // Skip if token bytes are identical and timestamp hasn't advanced
-                if existing.token == received.token {
-                    if received.timestamp > existing.token_timestamp {
-                        // Same bytes but newer timestamp — refresh to prevent premature pruning
-                        let refreshed = TcTokenEntry {
-                            token_timestamp: received.timestamp,
-                            ..existing
-                        };
-                        if let Err(e) = backend.put_tc_token(sender_lid, &refreshed).await {
-                            warn!(target: "Client/TcToken", "Failed to refresh tc_token timestamp for {}: {e}", sender_lid);
-                        }
-                    }
-                    continue;
-                }
-
-                // Timestamp monotonicity guard: only store if incoming >= existing.
-                // A byte-less placeholder (written by sender-side issuance to carry
-                // sender_timestamp) has no real token yet, so always accept the
-                // contact's first real token regardless of its timestamp.
-                if !existing.token.is_empty() && received.timestamp < existing.token_timestamp {
-                    debug!(
-                        target: "Client/TcToken",
-                        "Skipping older token for {} (incoming={}, existing={})",
-                        sender_lid, received.timestamp, existing.token_timestamp
-                    );
-                    continue;
-                }
-
-                // Preserve existing sender_timestamp when updating token
-                let entry = TcTokenEntry {
-                    token: received.token.clone(),
-                    token_timestamp: received.timestamp,
-                    sender_timestamp: existing.sender_timestamp,
-                };
-
-                if let Err(e) = backend.put_tc_token(sender_lid, &entry).await {
-                    warn!(target: "Client/TcToken", "Failed to update tc_token for {}: {e}", sender_lid);
-                } else {
-                    debug!(target: "Client/TcToken", "Updated tc_token for {} (t={})", sender_lid, received.timestamp);
-                    token_stored = true;
-                }
-            }
-            Ok(None) => {
-                // New token — no existing entry
-                let entry = TcTokenEntry {
-                    token: received.token.clone(),
-                    token_timestamp: received.timestamp,
-                    sender_timestamp: None,
-                };
-
-                if let Err(e) = backend.put_tc_token(sender_lid, &entry).await {
-                    warn!(target: "Client/TcToken", "Failed to store tc_token for {}: {e}", sender_lid);
-                } else {
-                    debug!(target: "Client/TcToken", "Stored new tc_token for {} (t={})", sender_lid, received.timestamp);
-                    token_stored = true;
-                }
-            }
+        let existing = match backend.get_tc_token(sender_lid).await {
+            Ok(entry) => entry,
             Err(e) => {
                 warn!(target: "Client/TcToken", "Failed to read tc_token for {}: {e}, skipping", sender_lid);
+                continue;
             }
+        };
+
+        if let Some(existing) = &existing {
+            // Same bytes: only advance the timestamp forward.
+            if existing.token == received.token {
+                if received.timestamp > existing.token_timestamp
+                    && let Err(e) = backend
+                        .store_received_tc_token(sender_lid, &received.token, received.timestamp)
+                        .await
+                {
+                    warn!(target: "Client/TcToken", "Failed to refresh tc_token timestamp for {}: {e}", sender_lid);
+                }
+                continue;
+            }
+
+            // Don't replace a real token with an older one. A byte-less
+            // placeholder (written by sender-side issuance) has no real token
+            // yet, so always accept the contact's first real token.
+            if !existing.token.is_empty() && received.timestamp < existing.token_timestamp {
+                debug!(
+                    target: "Client/TcToken",
+                    "Skipping older token for {} (incoming={}, existing={})",
+                    sender_lid, received.timestamp, existing.token_timestamp
+                );
+                continue;
+            }
+        }
+
+        // store_received_tc_token preserves any sender_timestamp written
+        // concurrently by the issuance path.
+        if let Err(e) = backend
+            .store_received_tc_token(sender_lid, &received.token, received.timestamp)
+            .await
+        {
+            warn!(target: "Client/TcToken", "Failed to store tc_token for {}: {e}", sender_lid);
+        } else {
+            debug!(target: "Client/TcToken", "Stored tc_token for {} (t={})", sender_lid, received.timestamp);
+            token_stored = true;
         }
     }
 

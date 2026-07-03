@@ -481,6 +481,33 @@ pub trait ProtocolStore: Send + Sync {
         self.put_tc_token(jid, &entry).await
     }
 
+    /// Store a token received from a contact, preserving any existing
+    /// `sender_timestamp`. The symmetric counterpart of
+    /// [`touch_tc_token_sender_timestamp`](Self::touch_tc_token_sender_timestamp):
+    /// each writer owns its own field, so the notification path never drops a
+    /// sender bucket that the issuance path wrote concurrently. Same atomicity
+    /// requirement — the default read-modify-write is for third-party backends.
+    async fn store_received_tc_token(
+        &self,
+        jid: &str,
+        token: &[u8],
+        token_timestamp: i64,
+    ) -> Result<()> {
+        let sender_timestamp = self
+            .get_tc_token(jid)
+            .await?
+            .and_then(|existing| existing.sender_timestamp);
+        self.put_tc_token(
+            jid,
+            &TcTokenEntry {
+                token: token.to_vec(),
+                token_timestamp,
+                sender_timestamp,
+            },
+        )
+        .await
+    }
+
     // --- Sent Message Store (retry support, matches WA Web's getMessageTable) ---
 
     /// Store a sent message's serialized payload for retry handling.
