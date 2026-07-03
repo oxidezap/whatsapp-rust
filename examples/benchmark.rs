@@ -79,7 +79,7 @@ fn main() {
         let bot = builder
             .on_event_for(
                 &[
-                    EventKind::Message,
+                    EventKind::Messages,
                     EventKind::PairingQrCode,
                     EventKind::Connected,
                     EventKind::LoggedOut,
@@ -88,12 +88,12 @@ fn main() {
                     let admin_scan_url = admin_scan_url.clone();
                     async move {
                         match &*event {
-                            Event::Message(msg, info) => {
-                                if let Some(text) = msg.text_content()
-                                    && text == "ping"
-                                {
-                                    let ctx =
-                                        MessageContext::from_arc(Arc::clone(msg), info, client);
+                            Event::Messages(batch) => {
+                                for m in batch.messages.iter() {
+                                    if m.message.text_content() != Some("ping") {
+                                        continue;
+                                    }
+                                    let ctx = MessageContext::from_inbound(m, Arc::clone(&client));
                                     info!("Received text ping, sending pong...");
 
                                     let pong_text = format!("pong {}", ctx.info.id);

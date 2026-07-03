@@ -398,12 +398,10 @@ impl TestClient {
         let gid = group_jid.clone();
         let text = text.to_string();
         self.wait_for_event(timeout_secs, move |e| {
-            matches!(
-                e,
-                Event::Message(msg, info)
-                if info.source.chat == gid
-                    && msg.conversation.as_deref() == Some(text.as_str())
-            )
+            e.messages().any(|m| {
+                m.info.source.chat == gid
+                    && m.message.conversation.as_deref() == Some(text.as_str())
+            })
         })
         .await
     }

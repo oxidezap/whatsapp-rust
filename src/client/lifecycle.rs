@@ -215,6 +215,7 @@ impl Client {
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
             offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
+            inbound_commit_batch: Default::default(),
             history_sync_tasks_in_flight: Arc::new(AtomicUsize::new(0)),
             history_sync_idle_notifier: Arc::new(event_listener::Event::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
@@ -455,6 +456,9 @@ impl Client {
         self.is_connected.store(false, Ordering::Relaxed);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
+        // Uncommitted batch entries were never acked; the server redelivers
+        // them on this fresh connection.
+        self.inbound_commit_batch.clear();
         self.offline_batch.reset();
         self.outbound_flush.reopen();
 
@@ -573,6 +577,11 @@ impl Client {
         // connection-state reset (clear_offline_receipt_buffer) and the server
         // redelivers their messages on the next connect, where they are
         // re-acked fresh.
+        //
+        // Commit any accumulated drain batch first so its acks land in this
+        // receipt drain; entries that cannot commit stay unacked and the
+        // server redelivers them.
+        self.flush_inbound_commits_acquiring_permit().await;
         self.flush_offline_receipts();
         // Prevent late receipt producers from escaping the drain window.
         self.outbound_flush.close();
@@ -631,6 +640,7 @@ impl Client {
         self.auto_reconnect_errors
             .store(Self::RECONNECT_BACKOFF_STEP, Ordering::Relaxed);
 
+        self.flush_inbound_commits_acquiring_permit().await;
         self.flush_offline_receipts();
         self.outbound_flush.close();
         self.outbound_flush
@@ -656,6 +666,7 @@ impl Client {
         info!("Reconnecting immediately (expected disconnect).");
         self.expected_disconnect.store(true, Ordering::Relaxed);
 
+        self.flush_inbound_commits_acquiring_permit().await;
         self.flush_offline_receipts();
         self.outbound_flush.close();
         self.outbound_flush
@@ -751,6 +762,9 @@ impl Client {
         // Reset offline sync state for next connection
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
+        // Same rule as receipts: uncommitted entries drop here and the server
+        // redelivers them on the next connect.
+        self.inbound_commit_batch.clear();
         self.offline_batch.reset();
         self.offline_sync_metrics
             .active

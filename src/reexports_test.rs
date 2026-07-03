@@ -41,11 +41,10 @@ struct NoopHook;
 
 #[whatsapp_rust::async_trait]
 impl whatsapp_rust::InboundDurabilityHook for NoopHook {
-    async fn on_message(
+    async fn on_messages(
         &self,
         _client: std::sync::Arc<whatsapp_rust::Client>,
-        _info: &whatsapp_rust::types::message::MessageInfo,
-        _message: &wa::Message,
+        _batch: &[whatsapp_rust::types::events::InboundMessage],
     ) -> whatsapp_rust::anyhow::Result<()> {
         Ok(())
     }

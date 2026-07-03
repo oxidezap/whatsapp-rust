@@ -358,6 +358,9 @@ pub struct Client {
     /// Write-behind buffer for inbound messageSecret captures; readers check
     /// it before the backend so the durable write can leave the receive lane.
     pub(crate) msg_secret_buffer: Arc<crate::msg_secret_buffer::MsgSecretWriteBuffer>,
+    /// Accumulates decrypted messages during the offline drain for per-batch
+    /// commit (WA Web MessageProcessorCache parity).
+    pub(crate) inbound_commit_batch: crate::message::commit_batch::InboundCommitBatcher,
     pub(crate) media_conn: Arc<RwLock<Option<crate::mediaconn::MediaConn>>>,
 
     pub(crate) is_logged_in: Arc<AtomicBool>,

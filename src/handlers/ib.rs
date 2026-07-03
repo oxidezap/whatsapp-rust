@@ -184,7 +184,7 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                 let count = attrs.optional_u64("count").unwrap_or(0) as i32;
 
                 debug!(target: "Client/OfflineSync", "Offline sync completed, received {} items", count);
-                client.complete_offline_sync(count);
+                client.complete_offline_sync(count).await;
 
                 let client_clone = Arc::clone(&client);
                 // Per-connection: the offline flush is tied to THIS connection.

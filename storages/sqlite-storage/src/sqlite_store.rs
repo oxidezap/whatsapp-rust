@@ -3093,6 +3093,84 @@ impl ProtocolStore for SqliteStore {
         .await
         .map_err(|e| StoreError::Database(Box::new(e)))?
     }
+
+    async fn store_pending_inbound_batch(
+        &self,
+        rows: &[wacore::store::traits::PendingInboundRow<'_>],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // One owned copy shared across retry attempts; a single transaction
+        // amortizes the WAL commit over the whole batch.
+        let rows: Arc<Vec<(String, String, String, Vec<u8>)>> = Arc::new(
+            rows.iter()
+                .map(|r| {
+                    (
+                        r.chat.to_string(),
+                        r.sender.to_string(),
+                        r.id.to_string(),
+                        r.message.to_vec(),
+                    )
+                })
+                .collect(),
+        );
+        let device_id = self.device_id;
+        self.with_retry("store_pending_inbound_batch", || {
+            let rows = Arc::clone(&rows);
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for (chat, sender, id, message) in rows.iter() {
+                        diesel::replace_into(pending_inbound_messages::table)
+                            .values((
+                                pending_inbound_messages::chat.eq(chat),
+                                pending_inbound_messages::sender.eq(sender),
+                                pending_inbound_messages::id.eq(id),
+                                pending_inbound_messages::message.eq(message.as_slice()),
+                                pending_inbound_messages::device_id.eq(device_id),
+                            ))
+                            .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
+    }
+
+    async fn delete_pending_inbound_batch(
+        &self,
+        keys: &[wacore::store::traits::PendingInboundKey<'_>],
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let keys: Arc<Vec<(String, String, String)>> = Arc::new(
+            keys.iter()
+                .map(|k| (k.chat.to_string(), k.sender.to_string(), k.id.to_string()))
+                .collect(),
+        );
+        let device_id = self.device_id;
+        self.with_retry("delete_pending_inbound_batch", || {
+            let keys = Arc::clone(&keys);
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for (chat, sender, id) in keys.iter() {
+                        diesel::delete(
+                            pending_inbound_messages::table
+                                .filter(pending_inbound_messages::chat.eq(chat))
+                                .filter(pending_inbound_messages::sender.eq(sender))
+                                .filter(pending_inbound_messages::id.eq(id))
+                                .filter(pending_inbound_messages::device_id.eq(device_id)),
+                        )
+                        .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]

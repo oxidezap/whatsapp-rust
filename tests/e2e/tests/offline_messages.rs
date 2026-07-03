@@ -1,6 +1,5 @@
 use e2e_tests::{TestClient, text_msg};
 use log::info;
-use wacore::types::events::Event;
 
 #[tokio::test]
 async fn test_offline_message_delivery_on_reconnect() -> anyhow::Result<()> {
@@ -56,20 +55,21 @@ async fn test_offline_message_ordering() -> anyhow::Result<()> {
         info!("Sent: {text}");
     }
 
-    // Verify messages arrive in send order
+    // Verify messages arrive in send order. During offline drain a single
+    // event can carry several messages, so iterate each batch.
     let mut received = Vec::new();
-    for _ in 0..messages.len() {
+    while received.len() < messages.len() {
         let event = client_b
-            .wait_for_event(
-                30,
-                |e| matches!(e, Event::Message(msg, _) if msg.conversation.is_some()),
-            )
+            .wait_for_event(30, |e| {
+                e.messages().any(|m| m.message.conversation.is_some())
+            })
             .await?;
 
-        if let Event::Message(msg, _) = &*event {
-            let text = msg.conversation.clone().unwrap();
-            info!("Received: {text}");
-            received.push(text);
+        for m in event.messages() {
+            if let Some(text) = &m.message.conversation {
+                info!("Received: {text}");
+                received.push(text.clone());
+            }
         }
     }
 

@@ -4050,7 +4050,7 @@ mod tests {
 
         // The test client never connects, so the send's `ensure_e2e_sessions`
         // would otherwise block on `wait_for_offline_delivery_end` until timeout.
-        client.complete_offline_sync(0);
+        client.complete_offline_sync(0).await;
 
         // Seed a Signal session for the peer's LID device so the offline fanout
         // can encrypt without fetching prekeys over the (absent) socket. The

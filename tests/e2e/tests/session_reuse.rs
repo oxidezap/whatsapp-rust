@@ -3,7 +3,6 @@
 use e2e_tests::{TestClient, send_and_expect_text};
 use log::info;
 use wacore::libsignal::protocol::SessionRecord;
-use wacore::types::events::Event;
 
 /// Scan backend for sessions matching a user across device IDs 0..=5.
 /// Returns Vec<(address, has_pending_pre_key)> for all found sessions.
@@ -370,7 +369,11 @@ async fn test_message_info_fields() -> anyhow::Result<()> {
 
     let event = client_b.wait_for_text(text_ab, 30).await?;
 
-    if let Event::Message(msg, info) = &*event {
+    if let Some(m) = event
+        .messages()
+        .find(|m| m.message.conversation.as_deref() == Some(text_ab))
+    {
+        let (msg, info) = (&m.message, &m.info);
         assert_eq!(msg.conversation.as_deref(), Some(text_ab));
         assert!(!info.id.is_empty(), "Message ID must not be empty");
         assert!(
@@ -406,7 +409,11 @@ async fn test_message_info_fields() -> anyhow::Result<()> {
 
     let event = client_a.wait_for_text(text_ba, 30).await?;
 
-    if let Event::Message(_, info) = &*event {
+    if let Some(m) = event
+        .messages()
+        .find(|m| m.message.conversation.as_deref() == Some(text_ba))
+    {
+        let info = &m.info;
         assert!(!info.source.is_from_me);
         assert!(!info.source.is_group);
         assert_eq!(info.source.sender.user, jid_b.user);

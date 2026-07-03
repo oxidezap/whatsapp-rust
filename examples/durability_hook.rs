@@ -95,57 +95,73 @@ impl InboxArchiver {
 
 #[async_trait::async_trait]
 impl InboundDurabilityHook for InboxArchiver {
-    async fn on_message(
+    async fn on_messages(
         &self,
         _client: Arc<Client>,
-        info: &MessageInfo,
-        message: &wa::Message,
+        batch: &[whatsapp_rust::types::events::InboundMessage],
     ) -> anyhow::Result<()> {
-        let key: CommitKey = (
-            info.source.chat.to_string(),
-            info.source.sender.to_string(),
-            info.id.clone(),
-        );
-
-        // Idempotency: a redelivery (or a replay after a crash between commit and
-        // ack) can hand us the same key more than once. Check, but only record it
-        // as committed AFTER the durable write below succeeds.
-        if self
-            .seen
-            .lock()
-            .map_err(|_| anyhow::anyhow!("seen lock poisoned"))?
-            .contains(&key)
+        // Live traffic arrives one message at a time; an offline drain hands
+        // over a whole batch. Either way the commit below is a single append +
+        // fsync, so the durability cost amortizes over the batch.
+        let mut lines = String::new();
+        let mut keys: Vec<CommitKey> = Vec::with_capacity(batch.len());
         {
-            info!("[{}] already committed, skipping (dedup)", info.id);
-            return Ok(());
+            // Idempotency: a redelivery (or a replay after a crash between
+            // commit and ack) can hand us the same keys more than once. Check,
+            // but only record them as committed AFTER the durable write below
+            // succeeds.
+            let seen = self
+                .seen
+                .lock()
+                .map_err(|_| anyhow::anyhow!("seen lock poisoned"))?;
+            for m in batch {
+                let key: CommitKey = (
+                    m.info.source.chat.to_string(),
+                    m.info.source.sender.to_string(),
+                    m.info.id.clone(),
+                );
+                if seen.contains(&key) {
+                    info!("[{}] already committed, skipping (dedup)", m.info.id);
+                    continue;
+                }
+                // Sanitize so the tab-delimited archive stays parseable on restart.
+                let preview = m
+                    .message
+                    .conversation
+                    .as_deref()
+                    .unwrap_or("<non-text>")
+                    .replace(['\t', '\n'], " ");
+                lines.push_str(&format!("{}\t{}\t{}\t{preview}\n", key.0, key.1, key.2));
+                keys.push(key);
+            }
         }
 
-        // Sanitize so the tab-delimited archive stays parseable on restart.
-        let preview = message
-            .conversation
-            .as_deref()
-            .unwrap_or("<non-text>")
-            .replace(['\t', '\n'], " ");
-        let line = format!("{}\t{}\t{}\t{preview}\n", key.0, key.1, key.2);
+        if !keys.is_empty() {
+            // Durable commit on a blocking thread: append then fsync — all-or-
+            // nothing for the batch. Returning Ok only after sync_all means
+            // "safe to ack every message"; any error returns Err, so the acks
+            // are suppressed and the server redelivers the batch later. The
+            // hook is awaited on the receive path, so disk I/O goes to
+            // spawn_blocking.
+            let file = Arc::clone(&self.file);
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                let mut file = file.lock().expect("file lock poisoned");
+                file.write_all(lines.as_bytes())?;
+                file.sync_all()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("archive write task failed: {e}"))??;
 
-        // Durable commit on a blocking thread: append then fsync. Returning Ok
-        // only after sync_all means "safe to ack"; any error returns Err, so the
-        // ack is suppressed and the server redelivers the message later. The hook
-        // is awaited on the receive path, so the disk I/O goes to spawn_blocking.
-        let file = Arc::clone(&self.file);
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            let mut file = file.lock().expect("file lock poisoned");
-            file.write_all(line.as_bytes())?;
-            file.sync_all()
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("archive write task failed: {e}"))??;
-
-        self.seen
-            .lock()
-            .map_err(|_| anyhow::anyhow!("seen lock poisoned"))?
-            .insert(key);
-        info!("[{}] committed durably: {preview}", info.id);
+            let mut seen = self
+                .seen
+                .lock()
+                .map_err(|_| anyhow::anyhow!("seen lock poisoned"))?;
+            let count = keys.len();
+            for key in keys {
+                seen.insert(key);
+            }
+            info!("committed {count} message(s) durably in one fsync");
+        }
         Ok(())
     }
 }

@@ -63,10 +63,8 @@ async fn test_prekey_collision_regression() -> anyhow::Result<()> {
             .await?;
         recipient
             .wait_for_event(30, |e| {
-                matches!(
-                    e,
-                    Event::Message(msg, _) if msg.conversation.as_deref() == Some(text.as_str())
-                )
+                e.messages()
+                    .any(|m| m.message.conversation.as_deref() == Some(text.as_str()))
             })
             .await?;
         sender.disconnect().await;

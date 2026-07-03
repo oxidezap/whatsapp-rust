@@ -1,6 +1,5 @@
 use e2e_tests::TestClient;
 use log::info;
-use wacore::types::events::Event;
 use whatsapp_rust::download::{DownloadParams, Downloadable, MediaType};
 use whatsapp_rust::upload::UploadResponse;
 use whatsapp_rust::waproto::whatsapp as wa;
@@ -413,13 +412,13 @@ async fn test_send_image_message() -> anyhow::Result<()> {
 
     // B receives the image message
     let event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(m, _) if m.image_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.image_message.is_set())
+        })
         .await?;
 
-    if let Event::Message(msg, info) = &*event {
+    if let Some(m) = event.messages().find(|m| m.message.image_message.is_set()) {
+        let (msg, info) = (&m.message, &m.info);
         let img = msg.image_message.as_option().unwrap();
         assert_eq!(img.caption.as_deref(), Some(caption));
         assert_eq!(img.mimetype.as_deref(), Some("image/jpeg"));
@@ -467,13 +466,13 @@ async fn test_send_video_message() -> anyhow::Result<()> {
     client_a.client.send_message(jid_b.clone(), msg).await?;
 
     let event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(m, _) if m.video_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.video_message.is_set())
+        })
         .await?;
 
-    if let Event::Message(msg, _) = &*event {
+    if let Some(m) = event.messages().find(|m| m.message.video_message.is_set()) {
+        let msg = &m.message;
         let vid = msg.video_message.as_option().unwrap();
         assert_eq!(vid.caption.as_deref(), Some("Cool video"));
         assert_eq!(vid.seconds, Some(15));
@@ -513,13 +512,16 @@ async fn test_send_document_message() -> anyhow::Result<()> {
     client_a.client.send_message(jid_b.clone(), msg).await?;
 
     let event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(m, _) if m.document_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.document_message.is_set())
+        })
         .await?;
 
-    if let Event::Message(msg, _) = &*event {
+    if let Some(m) = event
+        .messages()
+        .find(|m| m.message.document_message.is_set())
+    {
+        let msg = &m.message;
         let doc = msg.document_message.as_option().unwrap();
         assert_eq!(doc.file_name.as_deref(), Some("report.pdf"));
         assert_eq!(doc.mimetype.as_deref(), Some("application/pdf"));
@@ -558,13 +560,13 @@ async fn test_send_audio_message() -> anyhow::Result<()> {
     client_a.client.send_message(jid_b.clone(), msg).await?;
 
     let event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(m, _) if m.audio_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.audio_message.is_set())
+        })
         .await?;
 
-    if let Event::Message(msg, _) = &*event {
+    if let Some(m) = event.messages().find(|m| m.message.audio_message.is_set()) {
+        let msg = &m.message;
         let audio = msg.audio_message.as_option().unwrap();
         assert_eq!(audio.seconds, Some(30));
         assert_eq!(audio.ptt, Some(false));
@@ -603,13 +605,13 @@ async fn test_send_ptt_voice_message() -> anyhow::Result<()> {
     client_a.client.send_message(jid_b.clone(), msg).await?;
 
     let event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(m, _) if m.audio_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.audio_message.is_set())
+        })
         .await?;
 
-    if let Event::Message(msg, _) = &*event {
+    if let Some(m) = event.messages().find(|m| m.message.audio_message.is_set()) {
+        let msg = &m.message;
         let audio = msg.audio_message.as_option().unwrap();
         assert_eq!(audio.ptt, Some(true));
         assert_eq!(audio.seconds, Some(5));
@@ -657,12 +659,12 @@ async fn test_send_image_bidirectional() -> anyhow::Result<()> {
 
     // B receives
     let event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(m, _) if m.image_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.image_message.is_set())
+        })
         .await?;
-    if let Event::Message(msg, _) = &*event {
+    if let Some(m) = event.messages().find(|m| m.message.image_message.is_set()) {
+        let msg = &m.message;
         let img = msg.image_message.as_option().unwrap();
         assert_eq!(img.caption.as_deref(), Some("From A"));
         let downloaded = client_b.client.download(img as &dyn Downloadable).await?;
@@ -680,12 +682,12 @@ async fn test_send_image_bidirectional() -> anyhow::Result<()> {
 
     // A receives
     let event = client_a
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(m, _) if m.image_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.image_message.is_set())
+        })
         .await?;
-    if let Event::Message(msg, _) = &*event {
+    if let Some(m) = event.messages().find(|m| m.message.image_message.is_set()) {
+        let msg = &m.message;
         let img = msg.image_message.as_option().unwrap();
         assert_eq!(img.caption.as_deref(), Some("From B"));
         let downloaded = client_a.client.download(img as &dyn Downloadable).await?;
@@ -722,12 +724,12 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
     client_a.client.send_message(jid_b.clone(), img_msg).await?;
 
     let event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(m, _) if m.image_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.image_message.is_set())
+        })
         .await?;
-    if let Event::Message(msg, _) = &*event {
+    if let Some(m) = event.messages().find(|m| m.message.image_message.is_set()) {
+        let msg = &m.message;
         let img = msg.image_message.as_option().unwrap();
         let dl = client_b.client.download(img as &dyn Downloadable).await?;
         assert_eq!(dl, img_data);
@@ -743,12 +745,15 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
     client_a.client.send_message(jid_b.clone(), doc_msg).await?;
 
     let event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(m, _) if m.document_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.document_message.is_set())
+        })
         .await?;
-    if let Event::Message(msg, _) = &*event {
+    if let Some(m) = event
+        .messages()
+        .find(|m| m.message.document_message.is_set())
+    {
+        let msg = &m.message;
         let doc = msg.document_message.as_option().unwrap();
         let dl = client_b.client.download(doc as &dyn Downloadable).await?;
         assert_eq!(dl, doc_data);
@@ -764,12 +769,12 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
     client_a.client.send_message(jid_b.clone(), aud_msg).await?;
 
     let event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(m, _) if m.audio_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.audio_message.is_set())
+        })
         .await?;
-    if let Event::Message(msg, _) = &*event {
+    if let Some(m) = event.messages().find(|m| m.message.audio_message.is_set()) {
+        let msg = &m.message;
         let audio = msg.audio_message.as_option().unwrap();
         let dl = client_b.client.download(audio as &dyn Downloadable).await?;
         assert_eq!(dl, aud_data);
@@ -876,13 +881,13 @@ async fn test_send_image_no_caption() -> anyhow::Result<()> {
     client_a.client.send_message(jid_b.clone(), msg).await?;
 
     let event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(m, _) if m.image_message.is_set()),
-        )
+        .wait_for_event(30, |e| {
+            e.messages().any(|m| m.message.image_message.is_set())
+        })
         .await?;
 
-    if let Event::Message(msg, _) = &*event {
+    if let Some(m) = event.messages().find(|m| m.message.image_message.is_set()) {
+        let msg = &m.message;
         let img = msg.image_message.as_option().unwrap();
         assert!(
             img.caption.is_none() || img.caption.as_deref() == Some(""),

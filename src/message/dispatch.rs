@@ -38,21 +38,15 @@ impl Client {
         }
         let dispatch_msg = Arc::new(decrypted.unwrap_or(msg));
 
-        if let Some(hook) = self.inbound_durability_hook() {
-            // At-least-once: in-process handlers still fire, but the transport
-            // ack is deferred until the hook durably commits the message.
-            self.core
-                .event_bus
-                .dispatch(Event::Message(Arc::clone(&dispatch_msg), Arc::clone(&info)));
-            self.run_inbound_durability_hook(hook, &info, &dispatch_msg)
-                .await;
-        } else {
-            // Default at-most-once path (unchanged): ack, then dispatch.
-            self.ack_received_message(&info);
-            self.core
-                .event_bus
-                .dispatch(Event::Message(dispatch_msg, info));
-        }
+        // Live traffic commits (and acks) as a batch of one; during the
+        // offline drain the message joins the accumulating commit batch and
+        // the event/ack fire only after its batch commits. Either way the
+        // hook (when registered) gates everything observable.
+        self.commit_or_batch_inbound(wacore::types::events::InboundMessage {
+            message: dispatch_msg,
+            info,
+        })
+        .await;
     }
 
     /// Acknowledge a received message so the server drops it from the offline

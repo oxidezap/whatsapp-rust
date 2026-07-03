@@ -18,7 +18,6 @@ use std::time::Duration;
 use wacore::time::Instant;
 
 use e2e_tests::{TestClient, text_msg};
-use wacore::types::events::Event;
 
 /// Baseline: 2 clients, multi-thread runtime. Should complete nearly
 /// instantly (the race window is microseconds in practice), so a generous
@@ -125,13 +124,15 @@ async fn concurrent_disconnect_with_pending_receipts() -> anyhow::Result<()> {
     for i in 0..N {
         let expected_ab = format!("a->b #{i}");
         bob.wait_for_event(10, |e| {
-            matches!(e, Event::Message(m, _) if m.conversation.as_deref() == Some(expected_ab.as_str()))
+            e.messages()
+                .any(|m| m.message.conversation.as_deref() == Some(expected_ab.as_str()))
         })
         .await?;
         let expected_ba = format!("b->a #{i}");
         alice
             .wait_for_event(10, |e| {
-                matches!(e, Event::Message(m, _) if m.conversation.as_deref() == Some(expected_ba.as_str()))
+                e.messages()
+                    .any(|m| m.message.conversation.as_deref() == Some(expected_ba.as_str()))
             })
             .await?;
     }

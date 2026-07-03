@@ -14,7 +14,7 @@ impl Client {
     /// WA Web: `WAWebOfflineResumeConst.OFFLINE_STANZA_TIMEOUT_MS = 60000`
     pub(crate) const DEFAULT_OFFLINE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
-    pub(crate) fn complete_offline_sync(&self, count: i32) {
+    pub(crate) async fn complete_offline_sync(&self, count: i32) {
         self.offline_sync_metrics
             .active
             .store(false, Ordering::Release);
@@ -36,6 +36,16 @@ impl Client {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            // Commit the tail of the drain batch BEFORE widening the semaphore:
+            // acquiring the still-single permit serializes with the last
+            // in-flight stanza, and post-flip dispatches take the live path, so
+            // the batcher is provably empty from here on. Receipts flush after,
+            // so every receipt's message is durably committed first (WA Web's
+            // createSnapshot ordering).
+            if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
+                client.flush_inbound_commits_acquiring_permit().await;
+            }
+
             // Allow parallel message processing now that offline sync is done.
             // During offline sync, permits=1 serialized all message processing.
             // Replace with a new semaphore with 64 permits for concurrent processing.
@@ -100,7 +110,8 @@ impl Client {
                 processed,
                 expected,
             );
-            self.complete_offline_sync(i32::try_from(processed).unwrap_or(i32::MAX));
+            self.complete_offline_sync(i32::try_from(processed).unwrap_or(i32::MAX))
+                .await;
         }
     }
 

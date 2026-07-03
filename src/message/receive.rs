@@ -528,9 +528,20 @@ impl Client {
             self.handle_msmsg_payload(&info, payload).await;
         }
 
-        // Flush cached Signal state to DB (matches WA Web's flushBufferToDiskIfNotMemOnlyMode)
-        self.flush_signal_cache_logged("message", Some(&info.id))
-            .await;
+        // Live: flush cached Signal state per stanza (WA Web's
+        // flushBufferToDiskIfNotMemOnlyMode). During the offline drain the
+        // commit batcher owns the flush — one per batch, before any ack (WA
+        // Web's bulk signal-store snapshot) — so here only the batch size/byte
+        // triggers are checked, while the global permit is still held.
+        if self
+            .offline_sync_completed
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.flush_signal_cache_logged("message", Some(&info.id))
+                .await;
+        } else {
+            self.maybe_flush_inbound_commits().await;
+        }
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.session_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %sender_encryption_jid.observe(), msg_id = %info.id)))]

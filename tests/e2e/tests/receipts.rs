@@ -403,22 +403,26 @@ async fn test_delivery_receipts_flushed_on_disconnect() -> anyhow::Result<()> {
     while seen.len() < N {
         let event = client_b
             .wait_for_event(15, |e| {
-                matches!(e, Event::Message(m, _) if m
-                    .conversation
-                    .as_deref()
-                    .and_then(|c| c.strip_prefix("flush burst "))
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .is_some_and(|i| i < N))
+                e.messages().any(|m| {
+                    m.message
+                        .conversation
+                        .as_deref()
+                        .and_then(|c| c.strip_prefix("flush burst "))
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .is_some_and(|i| i < N)
+                })
             })
             .await?;
-        if let Event::Message(m, _) = &*event
-            && let Some(i) = m
+        for m in event.messages() {
+            if let Some(i) = m
+                .message
                 .conversation
                 .as_deref()
                 .and_then(|c| c.strip_prefix("flush burst "))
                 .and_then(|s| s.parse::<usize>().ok())
-        {
-            seen.insert(i);
+            {
+                seen.insert(i);
+            }
         }
     }
     info!("B saw all {N} message events");

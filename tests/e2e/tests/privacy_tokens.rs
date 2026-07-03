@@ -78,7 +78,10 @@ async fn send_message_and_expect_463_with_id(
     recipient
         .assert_no_event(
             5,
-            move |e| matches!(e, wacore::types::events::Event::Message(msg, _) if msg.conversation.as_deref() == Some(expected_text.as_str())),
+            move |e| {
+                e.messages()
+                    .any(|m| m.message.conversation.as_deref() == Some(expected_text.as_str()))
+            },
             "restricted recipient should not receive first-contact message without privacy token",
         )
         .await?;

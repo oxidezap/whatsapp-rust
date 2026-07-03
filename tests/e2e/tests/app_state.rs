@@ -213,12 +213,16 @@ async fn test_star_received_message() -> anyhow::Result<()> {
     // B receives the message and extracts msg_id
     let event = client_b
         .wait_for_event(15, |e| {
-            matches!(e, Event::Message(msg, _) if msg.conversation.as_deref() == Some("Star me from the other side!"))
+            e.messages()
+                .any(|m| m.message.conversation.as_deref() == Some("Star me from the other side!"))
         })
         .await?;
 
-    let msg_id = if let Event::Message(_, info) = &*event {
-        info.id.clone()
+    let msg_id = if let Some(m) = event
+        .messages()
+        .find(|m| m.message.conversation.as_deref() == Some("Star me from the other side!"))
+    {
+        m.info.id.clone()
     } else {
         panic!("Expected Message event");
     };
