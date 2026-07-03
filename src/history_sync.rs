@@ -410,7 +410,12 @@ impl Client {
         // Avoid clobbering a newer local sender_timestamp from post-send issuance
         let incoming_sender_ts = candidate.tc_token_sender_timestamp.map(|ts| ts as i64);
         let merged_sender_ts = if let Ok(Some(existing)) = backend.get_tc_token(token_key).await {
-            if (existing.token_timestamp as u64) > candidate.tc_token_timestamp {
+            // A byte-less placeholder stamps token_timestamp with a sender epoch,
+            // so it must never block a real token from history sync — only skip
+            // when an existing real token is newer.
+            if !existing.token.is_empty()
+                && (existing.token_timestamp as u64) > candidate.tc_token_timestamp
+            {
                 return;
             }
             match (existing.sender_timestamp, incoming_sender_ts) {
@@ -1063,6 +1068,41 @@ mod tests {
                 .unwrap(),
             None,
             "BotOnly must skip a plain group message"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_sync_tctoken_replaces_byteless_placeholder() {
+        let client = crate::test_utils::create_test_client_with_name("history_tctoken_ph").await;
+        let backend = client.persistence_manager.backend();
+
+        // Post-send issuance wrote a placeholder: no bytes, token_timestamp is a
+        // recent sender epoch (newer than the real token minted earlier).
+        backend
+            .touch_tc_token_sender_timestamp("555000999", 2000)
+            .await
+            .unwrap();
+
+        client
+            .store_tc_token_candidate(TcTokenCandidate {
+                id: "555000999@lid".to_string(),
+                tc_token: vec![0xAB, 0xCD],
+                tc_token_timestamp: 1000,
+                tc_token_sender_timestamp: None,
+            })
+            .await;
+
+        let stored = backend.get_tc_token("555000999").await.unwrap().unwrap();
+        assert_eq!(
+            stored.token,
+            vec![0xAB, 0xCD],
+            "history-sync token must replace the placeholder despite its older timestamp"
+        );
+        assert_eq!(stored.token_timestamp, 1000);
+        assert_eq!(
+            stored.sender_timestamp,
+            Some(2000),
+            "the placeholder's sender bucket must be preserved"
         );
     }
 }
