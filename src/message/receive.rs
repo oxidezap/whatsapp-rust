@@ -3,10 +3,6 @@
 use super::*;
 
 impl Client {
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(name = "wa.recv.incoming", level = "debug", skip_all)
-    )]
     /// Test convenience: scope to the current generation. Production inbound
     /// traffic always goes through the chat-lane worker, which passes its own
     /// spawn generation.
@@ -22,11 +18,29 @@ impl Client {
     /// worker's spawn generation) — not re-read here, so a teardown bump that
     /// lands mid-classification still trips the post-permit re-check instead
     /// of being absorbed into a fresher capture.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.recv.incoming", level = "debug", skip_all)
+    )]
     pub(crate) async fn handle_incoming_message_scoped(
         self: Arc<Self>,
         node: Arc<OwnedNodeRef>,
         lane_generation: u64,
     ) {
+        // Classification is not side-effect-free (newsletter dispatch,
+        // unavailable-only acks, PDO scheduling), so a stale stanza must be
+        // dropped BEFORE it — this pairs with the post-permit re-check, which
+        // covers a bump landing between here and the decrypt.
+        if self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != lane_generation
+        {
+            log::debug!(
+                "Connection torn down before classification; leaving the stanza for redelivery"
+            );
+            return;
+        }
         // Phase 1: classify borrows the node tree, extracts owned payloads, returns quickly.
         // Phase 2: process_classified_message holds no node borrows across heavy .await points,
         // keeping the async state machine small.
