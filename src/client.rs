@@ -194,9 +194,10 @@ pub struct MemoryReport {
     pub group_cache: CollectionStats,
     pub device_registry_cache: CollectionStats,
     pub lid_pn_lid_entries: CollectionStats,
-    /// Entry count of the PN-direction map. Always `bytes: 0`: both maps
-    /// share the same `Arc<LidPnEntry>` payloads, attributed entirely to
-    /// [`Self::lid_pn_lid_entries`] so the total counts them once.
+    /// Entry count of the PN-direction map. Both maps share the same
+    /// `Arc<LidPnEntry>` payloads, attributed to
+    /// [`Self::lid_pn_lid_entries`]; bytes here cover only entries the LID
+    /// map no longer holds (normally 0), so the total counts each once.
     pub lid_pn_pn_entries: CollectionStats,
     pub recent_messages: CollectionStats,
     pub sender_key_device_cache: CollectionStats,

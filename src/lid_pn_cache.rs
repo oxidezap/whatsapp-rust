@@ -115,11 +115,11 @@ impl LidPnCache {
     /// PN maps. Bytes are `0` when backed by a custom store (entries live
     /// outside this process).
     ///
-    /// The payload is attributed entirely to the LID map: `add()` stores the
-    /// same `Arc<LidPnEntry>` under both directions (and the `Arc<str>` keys
-    /// share the entry's own strings), so the PN map retains only map slots —
-    /// counting it again would double the report. The PN side therefore
-    /// carries its entry count with `bytes: 0`.
+    /// `add()` stores the same `Arc<LidPnEntry>` under both directions, so the
+    /// payload is attributed to the LID map; the PN side counts only entries
+    /// the LID map no longer holds (transient eviction asymmetry), keeping
+    /// every entry counted exactly once. `Arc<T>`'s `HeapSize` already
+    /// includes `size_of::<LidPnEntry>()`.
     pub fn memory_stats(
         &self,
     ) -> (
@@ -127,15 +127,30 @@ impl LidPnCache {
         wacore::stats::CollectionStats,
     ) {
         use wacore::stats::{CollectionStats, HeapSize};
-        // Arc<T>'s HeapSize already includes size_of::<LidPnEntry>().
+        let mut lid_ptrs = std::collections::HashSet::new();
         let lid_bytes: usize = self
             .lid_to_entry
             .iter_local()
-            .map(|iter| iter.map(|(_, v)| v.heap_bytes()).sum())
+            .map(|iter| {
+                iter.map(|(_, v)| {
+                    lid_ptrs.insert(Arc::as_ptr(&v));
+                    v.heap_bytes()
+                })
+                .sum()
+            })
+            .unwrap_or(0);
+        let pn_bytes: usize = self
+            .pn_to_entry
+            .iter_local()
+            .map(|iter| {
+                iter.filter(|(_, v)| !lid_ptrs.contains(&Arc::as_ptr(v)))
+                    .map(|(_, v)| v.heap_bytes())
+                    .sum()
+            })
             .unwrap_or(0);
         (
             CollectionStats::new(self.lid_to_entry.entry_count(), lid_bytes as u64),
-            CollectionStats::new(self.pn_to_entry.entry_count(), 0),
+            CollectionStats::new(self.pn_to_entry.entry_count(), pn_bytes as u64),
         )
     }
 
