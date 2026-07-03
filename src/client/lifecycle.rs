@@ -756,6 +756,12 @@ impl Client {
             client
                 .flush_inbound_commits_bounded(std::time::Duration::from_secs(5))
                 .await;
+        } else {
+            // Same class of bug as the complete_offline_sync twin: a silent
+            // skip here is the acked-before-committed loss — make it loud.
+            log::error!(
+                "cleanup_connection_state: self_weak upgrade failed; skipping drain-batch commit before Signal flush — uncommitted entries will be dropped"
+            );
         }
         // Flush before clear: clear() drops dirty entries, so a disconnect
         // racing an in-flight encrypt would lose the just-advanced sender-key
