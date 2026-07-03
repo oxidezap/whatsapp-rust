@@ -156,16 +156,16 @@ mod tests {
         async fn get_mutation_macs(
             &self,
             name: &str,
-            index_macs: &[Vec<u8>],
-        ) -> StoreResult<HashMap<Vec<u8>, Vec<u8>>> {
+            index_macs: &[[u8; 32]],
+        ) -> StoreResult<HashMap<[u8; 32], Vec<u8>>> {
             self.batch_mac_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let macs = self.macs.lock().await;
             Ok(index_macs
                 .iter()
                 .filter_map(|index_mac| {
-                    macs.get(&(name.to_string(), index_mac.clone()))
-                        .map(|mac| (index_mac.clone(), mac.clone()))
+                    macs.get(&(name.to_string(), index_mac.to_vec()))
+                        .map(|mac| (*index_mac, mac.clone()))
                 })
                 .collect())
         }

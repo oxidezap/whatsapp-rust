@@ -3012,6 +3012,7 @@ mod mark_full_distribution_list {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("prepare_group_stanza should succeed even when a device fails to encrypt");
@@ -3096,6 +3097,7 @@ mod mark_full_distribution_list {
                 None,
                 None,
                 &[],
+                None,
             )
             .await
             .expect("prepare_group_stanza should succeed");
@@ -3238,6 +3240,7 @@ mod mark_full_distribution_list {
             None,
             None,
             &[],
+            None,
         )
         .await
         .expect("prepare_group_stanza should succeed");

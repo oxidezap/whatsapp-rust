@@ -409,17 +409,40 @@ impl<'a> HistorySyncStream<'a> {
     /// LENIENT: a conversation that fails to decode is skipped and counted
     /// in [`HistorySyncStream::skipped_conversations`], not fatal — one
     /// corrupt entry doesn't void the rest of the blob.
+    ///
+    /// Allocates a fresh `Conversation` per call; a loop draining thousands of
+    /// entries should prefer [`HistorySyncStream::next_conversation_into`],
+    /// which reuses one struct's allocations across iterations.
     pub fn next_conversation(&mut self) -> Result<Option<wa::Conversation>, HistorySyncError> {
+        let mut conversation = wa::Conversation::default();
+        Ok(self
+            .next_conversation_into(&mut conversation)?
+            .then_some(conversation))
+    }
+
+    /// In-place variant of [`HistorySyncStream::next_conversation`]: decodes
+    /// the next entry into `conversation`, returning `Ok(false)` at clean EOF.
+    /// Same per-entry decode leniency.
+    ///
+    /// buffa's `clear()` retains `Vec` capacity, so reusing one struct across a
+    /// drain loop skips the per-conversation message-spine reallocations. After
+    /// `Ok(false)` (or an error) the struct contents are unspecified.
+    pub fn next_conversation_into(
+        &mut self,
+        conversation: &mut wa::Conversation,
+    ) -> Result<bool, HistorySyncError> {
         loop {
             match self.next_conversation_bytes()? {
-                None => return Ok(None),
-                Some(bytes) => match waproto::codec::conversation_decode(bytes) {
-                    Ok(conversation) => return Ok(Some(conversation)),
-                    Err(e) => {
-                        log::debug!("Skipping undecodable history-sync conversation: {e}");
-                        self.skipped_conversations += 1;
+                None => return Ok(false),
+                Some(bytes) => {
+                    match waproto::codec::conversation_merge_from_slice(conversation, bytes) {
+                        Ok(()) => return Ok(true),
+                        Err(e) => {
+                            log::debug!("Skipping undecodable history-sync conversation: {e}");
+                            self.skipped_conversations += 1;
+                        }
                     }
-                },
+                }
             }
         }
     }

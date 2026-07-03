@@ -133,21 +133,24 @@ pub async fn prepare_group_stanza(
     all_devices_for_phash: Option<std::sync::Arc<super::ResolvedGroupDevices>>,
     edit: Option<crate::types::message::EditAttribute>,
     extra_stanza_nodes: &[Node],
+    // Avoids a second full encode when the caller already serialized the message;
+    // ignored on the mci-hoist path (see `shared_content`).
+    pre_encoded: Option<std::sync::Arc<Vec<u8>>>,
 ) -> Result<PreparedGroupStanza> {
     let (own_sending_jid, _) = match group_info.addressing_mode {
         crate::types::message::AddressingMode::Lid => (own_lid.clone(), "lid"),
         crate::types::message::AddressingMode::Pn => (own_jid.clone(), "pn"),
     };
 
-    // Encode the message once and thread those bytes through both the reporting token
-    // (whitelisted-field extraction) and the skmsg wire plaintext below, instead of
-    // encoding it twice per send. The rare mci-hoist path (message carries a top-level
-    // message_context_info) can't share: its plaintext folds the reporting secret into the
-    // existing mci, diverging from the bytes the token is computed over, so it re-encodes.
-    let shared_content = message
-        .message_context_info
-        .is_unset()
-        .then(|| waproto::codec::message_to_vec(message));
+    // Encode the message at most once (reusing the caller's `pre_encoded` bytes when
+    // provided) and thread those bytes through both the reporting token
+    // (whitelisted-field extraction) and the skmsg wire plaintext below. The rare
+    // mci-hoist path (message carries a top-level message_context_info) can't share:
+    // its plaintext folds the reporting secret into the existing mci, diverging from
+    // the bytes the token is computed over, so it re-encodes.
+    let shared_content = message.message_context_info.is_unset().then(|| {
+        pre_encoded.unwrap_or_else(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)))
+    });
 
     // Generate reporting token if the message type supports it.
     // For groups, both sender_jid and remote_jid are the group JID (to_jid) per Baileys implementation.

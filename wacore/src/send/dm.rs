@@ -60,16 +60,19 @@ pub async fn prepare_dm_stanza(
     edit: Option<crate::types::message::EditAttribute>,
     extra_stanza_nodes: &[Node],
     all_devices: Vec<Jid>,
+    // Avoids a second full encode when the caller already serialized the message;
+    // ignored on the mci-hoist path (see `shared_content`).
+    pre_encoded: Option<std::sync::Arc<Vec<u8>>>,
 ) -> Result<PreparedDmStanza> {
-    // Encode the message once and thread those bytes through both the reporting token
-    // (whitelisted-field extraction) and the wire plaintext below, instead of encoding it
-    // twice per send. The rare mci-hoist path (message carries a top-level
-    // message_context_info) can't share: its plaintext folds the reporting secret into the
-    // existing mci, diverging from the bytes the token is computed over, so it re-encodes.
-    let shared_content = message
-        .message_context_info
-        .is_unset()
-        .then(|| waproto::codec::message_to_vec(message));
+    // Encode the message at most once (reusing the caller's `pre_encoded` bytes when
+    // provided) and thread those bytes through both the reporting token
+    // (whitelisted-field extraction) and the wire plaintext below. The rare mci-hoist
+    // path (message carries a top-level message_context_info) can't share: its
+    // plaintext folds the reporting secret into the existing mci, diverging from the
+    // bytes the token is computed over, so it re-encodes.
+    let shared_content = message.message_context_info.is_unset().then(|| {
+        pre_encoded.unwrap_or_else(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)))
+    });
 
     // sender is the author's own jid, remote is the chat jid (WAWebReportingTokenUtils:
     // getSender vs e.to). Both previously used to_jid, conflating sender with remote.
