@@ -60,9 +60,8 @@ pub async fn prepare_dm_stanza(
     edit: Option<crate::types::message::EditAttribute>,
     extra_stanza_nodes: &[Node],
     all_devices: Vec<Jid>,
-    // The plain `message_to_vec(message)` encoding when the caller already
-    // computed it (e.g. for the retry cache), so this send encodes at most once.
-    // Ignored on the mci-hoist path, which must re-encode (see `shared_content`).
+    // Avoids a second full encode when the caller already serialized the message;
+    // ignored on the mci-hoist path (see `shared_content`).
     pre_encoded: Option<std::sync::Arc<Vec<u8>>>,
 ) -> Result<PreparedDmStanza> {
     // Encode the message at most once (reusing the caller's `pre_encoded` bytes when

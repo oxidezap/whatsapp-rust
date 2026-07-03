@@ -309,9 +309,7 @@ impl Client {
         to: &Jid,
         id: &str,
         msg: &wa::Message,
-        // The plain `message_to_vec(msg)` bytes when the send path already
-        // encoded them (the same buffer feeds the wire plaintext), so caching
-        // for retry doesn't re-encode the whole message.
+        // Avoids re-encoding when the send path already serialized `msg`.
         encoded: Option<std::sync::Arc<Vec<u8>>>,
     ) {
         let key = self.make_chat_message_id(to, id).await;

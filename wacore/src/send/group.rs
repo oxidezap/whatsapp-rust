@@ -133,9 +133,8 @@ pub async fn prepare_group_stanza(
     all_devices_for_phash: Option<std::sync::Arc<super::ResolvedGroupDevices>>,
     edit: Option<crate::types::message::EditAttribute>,
     extra_stanza_nodes: &[Node],
-    // The plain `message_to_vec(message)` encoding when the caller already
-    // computed it (e.g. for the retry cache), so this send encodes at most once.
-    // Ignored on the mci-hoist path, which must re-encode (see `shared_content`).
+    // Avoids a second full encode when the caller already serialized the message;
+    // ignored on the mci-hoist path (see `shared_content`).
     pre_encoded: Option<std::sync::Arc<Vec<u8>>>,
 ) -> Result<PreparedGroupStanza> {
     let (own_sending_jid, _) = match group_info.addressing_mode {

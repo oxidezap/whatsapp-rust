@@ -754,10 +754,7 @@ impl Client {
         let mut group_info =
             GroupInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn_map);
 
-        // Encode once: the same bytes feed the retry cache here and the wire
-        // plaintext inside prepare_* (via `pre_encoded`), instead of two full
-        // Message encodes per send. `None` on the rare mci-hoist path, where
-        // prepare_* must re-encode with the folded context.
+        // One encode feeds retry cache and wire; mci-hoist re-encodes (folded context).
         let shared_content = message
             .message_context_info
             .is_unset()
@@ -1402,10 +1399,7 @@ impl Client {
                 .as_ref()
                 .ok_or_else(|| anyhow!("LID not set, cannot send to group"))?;
 
-            // Encode once: the same bytes feed the retry cache here and the wire
-            // plaintext inside prepare_* (via `pre_encoded`), instead of two full
-            // Message encodes per send. `None` on the rare mci-hoist path, where
-            // prepare_* must re-encode with the folded context.
+            // One encode feeds retry cache and wire; mci-hoist re-encodes (folded context).
             let shared_content = message
                 .message_context_info
                 .is_unset()
@@ -1678,10 +1672,7 @@ impl Client {
             // Per-device locking to match decrypt path (message.rs:684),
             // preventing ratchet desync on concurrent send/receive.
 
-            // Encode once: the same bytes feed the retry cache here and the wire
-            // plaintext inside prepare_* (via `pre_encoded`), instead of two full
-            // Message encodes per send. `None` on the rare mci-hoist path, where
-            // prepare_* must re-encode with the folded context.
+            // One encode feeds retry cache and wire; mci-hoist re-encodes (folded context).
             let shared_content = message
                 .message_context_info
                 .is_unset()
