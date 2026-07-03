@@ -821,6 +821,9 @@ impl Client {
         // entries (rowless advances — including a timed-out settle's restored
         // batch); with nothing dropped it survives for the next flush.
         if self.inbound_commit_batch.reset() {
+            log::warn!(
+                "cleanup_connection_state: dropping unflushed Signal state along with late uncommitted drain entries"
+            );
             self.signal_cache.clear().await;
         }
         self.offline_batch.reset();

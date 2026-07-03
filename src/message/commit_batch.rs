@@ -1168,6 +1168,63 @@ mod tests {
         );
     }
 
+    // The batch-safe wrapper enters on an is_active() check that the drain
+    // finisher can invalidate before it acquires the permit. When the
+    // under-permit commit deactivates the batcher (here, by completing a
+    // deferred transition), the wrapper must fall through to the raw Signal
+    // flush instead of returning Ok on the stale check — otherwise the
+    // caller's out-of-band advance is silently skipped. This drives that
+    // completion through the wrapper and asserts it lands in live mode.
+    #[tokio::test]
+    async fn batch_safe_flush_completes_deferred_transition() {
+        let client = create_test_client_with_failing_http("batch_safe_defer").await;
+        client.inbound_commit_batch.reset();
+        client.swap_message_semaphore(1);
+        let hook = Arc::new(RecordingHook {
+            batches: Mutex::new(Vec::new()),
+        });
+        let _ = client.inbound_durability_hook.set(hook.clone());
+
+        client.commit_or_batch_inbound(item("B1")).await;
+        client
+            .inbound_commit_batch
+            .fail_commits
+            .store(true, Ordering::Release);
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(!client.finish_inbound_commit_drain(generation).await);
+        assert!(
+            client.inbound_commit_batch.is_active() && client.inbound_commit_batch.has_entries(),
+            "failed tail defers the transition and restores the batch"
+        );
+        client
+            .inbound_commit_batch
+            .fail_commits
+            .store(false, Ordering::Release);
+
+        // Enters on is_active()==true, commits the restored tail under the
+        // permit, completes the deferred transition (deactivates), then falls
+        // through to the raw flush.
+        client
+            .flush_signal_cache_batch_safe()
+            .await
+            .expect("batch-safe flush must succeed once the tail commits");
+
+        assert!(
+            !client.inbound_commit_batch.is_active(),
+            "the batch-safe flush must complete the deferred transition"
+        );
+        assert!(!client.inbound_commit_batch.has_entries());
+        assert_eq!(
+            available_permits(&client),
+            64,
+            "completing the transition widens the semaphore"
+        );
+        assert_eq!(
+            hook.batches.lock().expect("hook lock").clone(),
+            vec![vec!["B1"]]
+        );
+    }
+
     fn available_permits(client: &Client) -> usize {
         let semaphore = match client.message_processing_semaphore.lock() {
             Ok(guard) => guard.clone(),
