@@ -1,0 +1,1 @@
+ALTER TABLE device ADD COLUMN read_receipts_disabled BOOLEAN NOT NULL DEFAULT 0;

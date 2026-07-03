@@ -56,6 +56,9 @@ pub enum DeviceCommand {
     /// the first rotation is scheduled a full interval out rather than firing
     /// immediately on the next connect.
     SetSignedPreKeyRotationBaseline(i64),
+    /// Set whether `readreceipts` privacy is `none`. `true` routes DM
+    /// read/played receipts through the `*-self` types.
+    SetReadReceiptsDisabled(bool),
 }
 
 impl std::fmt::Debug for DeviceCommand {
@@ -98,6 +101,9 @@ impl std::fmt::Debug for DeviceCommand {
                 .debug_tuple("SetSignedPreKeyRotationBaseline")
                 .field(v)
                 .finish(),
+            Self::SetReadReceiptsDisabled(v) => {
+                f.debug_tuple("SetReadReceiptsDisabled").field(v).finish()
+            }
         }
     }
 }
@@ -175,6 +181,9 @@ pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
         }
         DeviceCommand::SetSignedPreKeyRotationBaseline(rotation_ms) => {
             device.last_signed_pre_key_rotation_ms = rotation_ms;
+        }
+        DeviceCommand::SetReadReceiptsDisabled(v) => {
+            device.read_receipts_disabled = v;
         }
     }
 }
@@ -370,6 +379,18 @@ mod tests {
         );
         assert_eq!(device.signed_pre_key_id, id_before);
         assert_eq!(device.signed_pre_key_signature, sig_before);
+    }
+
+    #[test]
+    fn set_read_receipts_disabled_flips_field() {
+        let mut device = Device::new();
+        assert!(!device.read_receipts_disabled);
+
+        apply_command_to_device(&mut device, DeviceCommand::SetReadReceiptsDisabled(true));
+        assert!(device.read_receipts_disabled);
+
+        apply_command_to_device(&mut device, DeviceCommand::SetReadReceiptsDisabled(false));
+        assert!(!device.read_receipts_disabled);
     }
 
     #[test]

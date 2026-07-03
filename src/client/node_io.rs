@@ -846,8 +846,39 @@ impl Client {
                     if let Err(e) = r_block {
                         warn!("Background init: Failed to fetch blocklist: {e:?}");
                     }
-                    if let Err(e) = r_priv {
-                        warn!("Background init: Failed to fetch privacy settings: {e:?}");
+                    match r_priv {
+                        Ok(settings) => {
+                            use wacore::iq::privacy::{PrivacyCategory, PrivacyValue};
+                            // WA Web reads readreceipts from local prefs; we mirror it by
+                            // persisting the fetched value so DM read/played receipts gate to
+                            // `*-self` before the next connect's fetch even runs. This is the
+                            // refresh path: a change on another device is picked up here.
+                            let disabled = matches!(
+                                settings.get_value(&PrivacyCategory::ReadReceipts),
+                                Some(PrivacyValue::None)
+                            );
+                            if disabled
+                                != bg_client
+                                    .persistence_manager
+                                    .get_device_snapshot()
+                                    .read_receipts_disabled
+                            {
+                                bg_client
+                                    .persistence_manager
+                                    .process_command(DeviceCommand::SetReadReceiptsDisabled(
+                                        disabled,
+                                    ))
+                                    .await;
+                                if let Err(e) = bg_client.persistence_manager.flush().await {
+                                    warn!(
+                                        "Background init: Failed to persist readreceipts privacy: {e:?}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Background init: Failed to fetch privacy settings: {e:?}");
+                        }
                     }
                     if let Err(e) = r_digest {
                         warn!("Background init: Failed to validate digest key: {e:?}");

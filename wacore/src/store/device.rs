@@ -297,6 +297,12 @@ pub struct Device {
     /// rotation path treats as "seed the baseline, don't rotate yet".
     #[serde(default)]
     pub last_signed_pre_key_rotation_ms: i64,
+    /// true means the account's `readreceipts` privacy is `none`, so DM
+    /// read/played receipts go out as `*-self` (which don't notify the sender).
+    /// Persisted so the value is known on reconnect before the privacy fetch
+    /// completes; `false` (WA default `all`) sends plain `read`/`played`.
+    #[serde(default)]
+    pub read_receipts_disabled: bool,
 }
 
 /// Minimal cached form of a Noise certificate. Mirrors the JSON shape WA Web
@@ -395,6 +401,7 @@ impl Device {
             login_counter: 0,
             lid_migrated: false,
             last_signed_pre_key_rotation_ms: crate::time::now_millis(),
+            read_receipts_disabled: false,
         }
     }
 
