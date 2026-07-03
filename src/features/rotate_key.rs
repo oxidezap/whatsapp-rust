@@ -48,6 +48,13 @@ impl Client {
     /// Rotate the signed pre-key if the cadence has elapsed. Seeds the cadence
     /// baseline (without rotating) for devices upgraded in with the field at 0.
     pub(crate) async fn maybe_rotate_signed_pre_key(&self) -> Result<(), anyhow::Error> {
+        // Single-flight: a concurrent rotation (e.g. an older post-login task
+        // racing a newer one across reconnect churn) already covers this cadence,
+        // so skip rather than run the rotate/upload/prune flow twice.
+        let Some(_guard) = self.signed_pre_key_rotation_lock.try_lock() else {
+            return Ok(());
+        };
+
         let last = self
             .persistence_manager
             .get_device_snapshot()
@@ -75,14 +82,16 @@ impl Client {
     /// acceptance promote it locally: retain the outgoing key, advance the
     /// current key + cadence, and prune to [`SIGNED_PRE_KEY_RETENTION`].
     ///
-    /// The candidate is written to the backend table *before* upload and reused
-    /// verbatim on retry. This makes every partial failure safe: whatever the
-    /// server ends up advertising, we hold its private key. An ambiguous
-    /// transport error (the server may have accepted `new_id`) leaves the staged
-    /// key decryptable via the load fallback; a post-acceptance persistence
-    /// failure likewise cannot strand it; and a definitive rejection just leaves
-    /// the current key in place to retry — never advancing the cadence or
-    /// pruning the key the server still hands out.
+    /// Both the new candidate and the outgoing key are written to the backend
+    /// table *before* upload (the candidate reused verbatim on retry), so every
+    /// partial failure is safe: whatever the server ends up advertising, we hold
+    /// its private key, and the old id's decrypt window survives regardless. An
+    /// ambiguous transport error (the server may have accepted `new_id`) leaves
+    /// the staged key decryptable via the load fallback; a definitive rejection
+    /// just leaves the current key in place to retry — never advancing the
+    /// cadence or pruning the key the server still hands out. A single-flight
+    /// lock ([`maybe_rotate_signed_pre_key`]) keeps overlapping tasks from
+    /// racing this sequence.
     pub(crate) async fn rotate_signed_pre_key(&self) -> Result<(), anyhow::Error> {
         let snapshot = self.persistence_manager.get_device_snapshot();
         let now = wacore::time::now_millis();
@@ -141,6 +150,21 @@ impl Client {
             }
         };
 
+        // Retain the outgoing key BEFORE upload, so once the server accepts the
+        // new key the old id's decrypt window is already durable — no
+        // post-acceptance write can strand it. Required: on failure we abort
+        // before sending anything, leaving the current key fully intact to retry.
+        let old_record = new_signed_pre_key_record(
+            old_id,
+            &snapshot.signed_pre_key,
+            snapshot.signed_pre_key_signature,
+            wacore::time::now_utc(),
+        );
+        backend
+            .store_signed_prekey(old_id, &old_record.encode_to_vec())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to retain old signed pre-key: {e}"))?;
+
         // WA Web reads 406 = bad key, 409 = server validation fail, >=500 =
         // transient; none warrant hard-failing login or advancing local state.
         // On any failure the staged candidate stays put for the next retry.
@@ -169,26 +193,8 @@ impl Client {
             }
         }
 
-        // Server accepted new_id. Retain the outgoing key (best-effort) so prekey
-        // messages naming the old id still decrypt, then promote + stamp. The
-        // staged new_id is already durable in the backend, so even a promotion or
-        // flush failure below leaves the accepted key decryptable via the fallback.
-        let old_record = new_signed_pre_key_record(
-            old_id,
-            &snapshot.signed_pre_key,
-            snapshot.signed_pre_key_signature,
-            wacore::time::now_utc(),
-        );
-        if let Err(e) = backend
-            .store_signed_prekey(old_id, &old_record.encode_to_vec())
-            .await
-        {
-            log::warn!(
-                "failed to retain old signed pre-key {old_id}: {e}; \
-                 continuing with server-accepted signed pre-key {new_id}"
-            );
-        }
-
+        // Server accepted new_id, and both the old (retained) and new (staged)
+        // keys are already durable, so promotion cannot strand either.
         self.persistence_manager
             .process_command(DeviceCommand::SetSignedPreKey {
                 key_pair: new_kp,

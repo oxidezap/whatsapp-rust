@@ -550,6 +550,9 @@ pub struct Client {
 
     /// Prevents concurrent prekey upload operations (matches WA Web's dedup set in `handlePreKeyLow`).
     pub(crate) prekey_upload_lock: Arc<async_lock::Mutex<()>>,
+    /// Single-flights signed pre-key rotation so overlapping post-login tasks
+    /// (from reconnect churn) can't run the rotate/upload/prune flow concurrently.
+    pub(crate) signed_pre_key_rotation_lock: Arc<async_lock::Mutex<()>>,
     /// Notifier for when offline sync (ib offline stanza) is received.
     /// WhatsApp Web waits for this before sending passive tasks (prekey upload, active IQ, presence).
     pub(crate) offline_sync_notifier: Arc<event_listener::Event>,
