@@ -353,8 +353,7 @@ impl std::future::Future for BotHandle {
     }
 }
 
-/// Meter `fut` with `instrument` when set. `Bot::run` polls the client's main
-/// run loop (connect, handshake, read loop) on the caller's task, so the
+/// `Bot::run` polls the client's main run loop on the caller's task, so the
 /// instrumented runtime never sees that future — without this, the most
 /// CPU-relevant work of a session would be missing from the hook on the
 /// common `bot.run().await` launch path. `Bot::spawn` needs no equivalent:
@@ -389,6 +388,7 @@ impl std::fmt::Debug for Bot {
             .field("event_handlers", &self.event_handlers.len())
             .field("raw_handlers", &self.raw_handlers.len())
             .field("pair_code_options", &self.pair_code_options.is_some())
+            .field("task_instrument", &self.task_instrument.is_some())
             .finish()
     }
 }
