@@ -683,16 +683,18 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         F: Fn(MessageContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let handler = Arc::new(handler);
         self.on_event_for(&[EventKind::Messages], move |event, client| {
-            let contexts: Vec<MessageContext> = event
+            // Futures are built before the async block: `MessageContext` is
+            // not `Send` on wasm32 (the Client's trait objects aren't), so it
+            // must never be held across an await — only the handler futures
+            // (which the `Fut: Send` bound covers) may cross one.
+            let futures: Vec<Fut> = event
                 .messages()
-                .map(|m| MessageContext::from_inbound(m, Arc::clone(&client)))
+                .map(|m| handler(MessageContext::from_inbound(m, Arc::clone(&client))))
                 .collect();
-            let handler = Arc::clone(&handler);
             async move {
-                for context in contexts {
-                    handler(context).await;
+                for future in futures {
+                    future.await;
                 }
             }
         })
