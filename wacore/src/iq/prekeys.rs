@@ -495,6 +495,61 @@ impl IqSpec for PreKeyUploadSpec {
     }
 }
 
+/// Signed Pre-Key Rotation Wire Format (WA Web `RotateKeyJob`)
+/// ```xml
+/// <iq xmlns="encrypt" type="set" to="s.whatsapp.net" id="...">
+///   <rotate>
+///     <skey>
+///       <id>[3-byte BE signed pre-key ID]</id>
+///       <value>[32-byte signed pre-key public]</value>
+///       <signature>[64-byte signature]</signature>
+///     </skey>
+///   </rotate>
+/// </iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct RotateSignedPreKeySpec {
+    pub id: u32,
+    pub public: PublicKey,
+    pub signature: Vec<u8>,
+}
+
+impl RotateSignedPreKeySpec {
+    pub fn new(id: u32, public: PublicKey, signature: Vec<u8>) -> Self {
+        Self {
+            id,
+            public,
+            signature,
+        }
+    }
+}
+
+impl IqSpec for RotateSignedPreKeySpec {
+    type Response = ();
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        // Reuse the upload path's <skey> shape (id 3-byte BE, value 32-byte,
+        // signature 64-byte) so the two wire encoders can never drift.
+        let skey = SignedPreKeyNode::new(
+            self.id,
+            self.public.public_key_bytes().to_vec(),
+            self.signature.clone(),
+        )
+        .into_node();
+        let rotate_node = NodeBuilder::new("rotate").children([skey]).build();
+
+        InfoQuery::set(
+            "encrypt",
+            Jid::new("", Server::Pn),
+            Some(NodeContent::Nodes(vec![rotate_node])),
+        )
+    }
+
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+        Ok(())
+    }
+}
+
 // ============================================================================
 // Bidirectional ProtocolNode Types for PreKey Responses
 // ============================================================================
@@ -1234,6 +1289,40 @@ mod tests {
             direct_buf, marshal_buf,
             "encode_iq_direct must match build_iq + marshal for {num_prekeys} prekeys"
         );
+    }
+
+    #[test]
+    fn test_rotate_signed_pre_key_spec_node_shape() {
+        let public = PublicKey::from_djb_public_key_bytes(&[0x42; 32]).unwrap();
+        let spec = RotateSignedPreKeySpec::new(0x00AB_CDEF, public, vec![0x11; 64]);
+        let iq = spec.build_iq();
+
+        assert_eq!(iq.namespace, "encrypt");
+        assert_eq!(iq.query_type, crate::request::InfoQueryType::Set);
+
+        let nodes = match &iq.content {
+            Some(NodeContent::Nodes(n)) => n,
+            _ => panic!("expected NodeContent::Nodes"),
+        };
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].tag, "rotate");
+
+        let rotate_children = nodes[0].children().expect("rotate has children");
+        assert_eq!(rotate_children.len(), 1);
+        let skey = &rotate_children[0];
+        assert_eq!(skey.tag, "skey");
+
+        let bytes_of = |tag: &str| -> Vec<u8> {
+            let child = skey.get_optional_child(tag).expect("skey child present");
+            match child.content.as_ref() {
+                Some(NodeContent::Bytes(b)) => b.clone(),
+                _ => panic!("{tag} must be bytes"),
+            }
+        };
+        assert_eq!(bytes_of("id").len(), 3);
+        assert_eq!(bytes_of("id"), vec![0xAB, 0xCD, 0xEF]);
+        assert_eq!(bytes_of("value").len(), 32);
+        assert_eq!(bytes_of("signature").len(), 64);
     }
 
     #[test]

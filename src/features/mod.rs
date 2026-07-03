@@ -15,6 +15,7 @@ mod polls;
 mod presence;
 mod profile;
 mod reaction;
+mod rotate_key;
 mod signal;
 pub(crate) mod status;
 mod tctoken;

@@ -87,6 +87,7 @@ struct DeviceRow {
     login_counter: i32,
     first_unupload_pre_key_id: i32,
     lid_migrated: bool,
+    last_signed_pre_key_rotation_ms: i64,
 }
 
 /// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
@@ -473,6 +474,7 @@ impl SqliteStore {
             .map(|chain| Arc::from(crate::wire::encode_server_cert_chain(chain)));
         let login_counter = device_data.login_counter;
         let lid_migrated = device_data.lid_migrated;
+        let last_signed_pre_key_rotation_ms = device_data.last_signed_pre_key_rotation_ms;
         let new_lid: Arc<str> = Arc::from(
             device_data
                 .lid
@@ -533,6 +535,7 @@ impl SqliteStore {
                         device::server_cert_chain.eq(server_cert_chain.as_deref()),
                         device::login_counter.eq(login_counter),
                         device::lid_migrated.eq(lid_migrated),
+                        device::last_signed_pre_key_rotation_ms.eq(last_signed_pre_key_rotation_ms),
                     ))
                     .on_conflict(device::id)
                     .do_update()
@@ -564,6 +567,8 @@ impl SqliteStore {
                         device::server_cert_chain.eq(excluded(device::server_cert_chain)),
                         device::login_counter.eq(excluded(device::login_counter)),
                         device::lid_migrated.eq(excluded(device::lid_migrated)),
+                        device::last_signed_pre_key_rotation_ms
+                            .eq(excluded(device::last_signed_pre_key_rotation_ms)),
                     ))
                     .execute(conn)
                     .map(|_| ())
@@ -593,6 +598,7 @@ impl SqliteStore {
         let next_pre_key_id = new_device.next_pre_key_id as i32;
         let first_unupload_pre_key_id = new_device.first_unupload_pre_key_id as i32;
         let server_has_prekeys = new_device.server_has_prekeys;
+        let last_signed_pre_key_rotation_ms = new_device.last_signed_pre_key_rotation_ms;
 
         self.with_retry("create_new_device", || {
             let noise_key_data = Arc::clone(&noise_key_data);
@@ -630,6 +636,7 @@ impl SqliteStore {
                         device::server_cert_chain.eq(None::<&[u8]>),
                         device::login_counter.eq(0i32),
                         device::lid_migrated.eq(false),
+                        device::last_signed_pre_key_rotation_ms.eq(last_signed_pre_key_rotation_ms),
                     ))
                     .execute(conn)
                     .map(|_| device_id)
@@ -760,6 +767,7 @@ impl SqliteStore {
                     }),
                 login_counter: row.login_counter,
                 lid_migrated: row.lid_migrated,
+                last_signed_pre_key_rotation_ms: row.last_signed_pre_key_rotation_ms,
             }))
         } else {
             Ok(None)

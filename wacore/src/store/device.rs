@@ -291,6 +291,12 @@ pub struct Device {
     /// like the WA Web pref.
     #[serde(default)]
     pub lid_migrated: bool,
+    /// Wall-clock ms of the last signed-pre-key rotation, driving WA Web's
+    /// `RotateKeyJob` cadence. Fresh devices baseline off creation; devices
+    /// persisted before this field existed deserialize to `0`, which the
+    /// rotation path treats as "seed the baseline, don't rotate yet".
+    #[serde(default)]
+    pub last_signed_pre_key_rotation_ms: i64,
 }
 
 /// Minimal cached form of a Noise certificate. Mirrors the JSON shape WA Web
@@ -388,6 +394,7 @@ impl Device {
             server_cert_chain: None,
             login_counter: 0,
             lid_migrated: false,
+            last_signed_pre_key_rotation_ms: crate::time::now_millis(),
         }
     }
 

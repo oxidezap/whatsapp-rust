@@ -1,10 +1,13 @@
 use crate::client_profile::ClientProfile;
+use crate::libsignal::protocol::KeyPair;
 use crate::store::Device;
 use crate::store::device::{CachedServerCertChain, DevicePropsOverride};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
-#[derive(Debug, Clone)]
+// Debug is hand-written below: `KeyPair` deliberately omits `Debug` (its
+// private key must never format into logs), so the enum cannot derive it.
+#[derive(Clone)]
 pub enum DeviceCommand {
     SetId(Option<Jid>),
     SetLid(Option<Jid>),
@@ -39,6 +42,64 @@ pub enum DeviceCommand {
     /// reserved for pair-success, where a fresh pairing must not inherit the
     /// previous account's migration state.
     SetLidMigrated(bool),
+    /// Install a freshly rotated signed pre-key (WA Web `RotateKeyJob`). Sets
+    /// the current key trio and stamps the rotation clock in one command so the
+    /// key and its cadence baseline can never be observed split.
+    SetSignedPreKey {
+        key_pair: KeyPair,
+        id: u32,
+        signature: [u8; 64],
+        rotation_ms: i64,
+    },
+    /// Seed the rotation cadence baseline without touching the key. Used once
+    /// for devices upgraded in with `last_signed_pre_key_rotation_ms == 0`, so
+    /// the first rotation is scheduled a full interval out rather than firing
+    /// immediately on the next connect.
+    SetSignedPreKeyRotationBaseline(i64),
+}
+
+impl std::fmt::Debug for DeviceCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SetId(v) => f.debug_tuple("SetId").field(v).finish(),
+            Self::SetLid(v) => f.debug_tuple("SetLid").field(v).finish(),
+            Self::SetPushName(v) => f.debug_tuple("SetPushName").field(v).finish(),
+            Self::SetAccount(v) => f.debug_tuple("SetAccount").field(v).finish(),
+            Self::SetAppVersion(v) => f.debug_tuple("SetAppVersion").field(v).finish(),
+            Self::SetDeviceProps(v) => f.debug_tuple("SetDeviceProps").field(v).finish(),
+            Self::SetClientProfile(v) => f.debug_tuple("SetClientProfile").field(v).finish(),
+            Self::SetPropsHash(v) => f.debug_tuple("SetPropsHash").field(v).finish(),
+            Self::SetPreKeyWatermarks {
+                next_pre_key_id,
+                first_unupload_pre_key_id,
+            } => f
+                .debug_struct("SetPreKeyWatermarks")
+                .field("next_pre_key_id", next_pre_key_id)
+                .field("first_unupload_pre_key_id", first_unupload_pre_key_id)
+                .finish(),
+            Self::SetAdvSecretKey(_) => f.write_str("SetAdvSecretKey(..)"),
+            Self::SetNctSalt(v) => f.debug_tuple("SetNctSalt").field(v).finish(),
+            Self::SetNctSaltFromHistorySync(v) => {
+                f.debug_tuple("SetNctSaltFromHistorySync").field(v).finish()
+            }
+            Self::SetServerCertChain(v) => f.debug_tuple("SetServerCertChain").field(v).finish(),
+            Self::ClearServerCertChain => f.write_str("ClearServerCertChain"),
+            Self::IncrementLoginCounter => f.write_str("IncrementLoginCounter"),
+            Self::SetLidMigrated(v) => f.debug_tuple("SetLidMigrated").field(v).finish(),
+            // Redact key material; only the id and cadence stamp are logged.
+            Self::SetSignedPreKey {
+                id, rotation_ms, ..
+            } => f
+                .debug_struct("SetSignedPreKey")
+                .field("id", id)
+                .field("rotation_ms", rotation_ms)
+                .finish_non_exhaustive(),
+            Self::SetSignedPreKeyRotationBaseline(v) => f
+                .debug_tuple("SetSignedPreKeyRotationBaseline")
+                .field(v)
+                .finish(),
+        }
+    }
 }
 
 pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
@@ -100,6 +161,20 @@ pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
         }
         DeviceCommand::SetLidMigrated(migrated) => {
             device.lid_migrated = migrated;
+        }
+        DeviceCommand::SetSignedPreKey {
+            key_pair,
+            id,
+            signature,
+            rotation_ms,
+        } => {
+            device.signed_pre_key = key_pair;
+            device.signed_pre_key_id = id;
+            device.signed_pre_key_signature = signature;
+            device.last_signed_pre_key_rotation_ms = rotation_ms;
+        }
+        DeviceCommand::SetSignedPreKeyRotationBaseline(rotation_ms) => {
+            device.last_signed_pre_key_rotation_ms = rotation_ms;
         }
     }
 }
@@ -239,6 +314,62 @@ mod tests {
         // inherit the previous account's migration state.
         apply_command_to_device(&mut device, DeviceCommand::SetLidMigrated(false));
         assert!(!device.lid_migrated);
+    }
+
+    #[test]
+    fn set_signed_pre_key_rotates_trio_and_stamps_clock() {
+        use crate::libsignal::protocol::KeyPair;
+
+        let mut device = Device::new();
+        let old_kp_bytes = device.signed_pre_key.public_key.public_key_bytes().to_vec();
+        let old_id = device.signed_pre_key_id;
+
+        let new_kp = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let new_pub = new_kp.public_key.public_key_bytes().to_vec();
+        let sig = [7u8; 64];
+
+        apply_command_to_device(
+            &mut device,
+            DeviceCommand::SetSignedPreKey {
+                key_pair: new_kp,
+                id: old_id + 1,
+                signature: sig,
+                rotation_ms: 1_234,
+            },
+        );
+
+        assert_ne!(
+            device.signed_pre_key.public_key.public_key_bytes().to_vec(),
+            old_kp_bytes
+        );
+        assert_eq!(
+            device.signed_pre_key.public_key.public_key_bytes(),
+            &new_pub[..]
+        );
+        assert_eq!(device.signed_pre_key_id, old_id + 1);
+        assert_eq!(device.signed_pre_key_signature, sig);
+        assert_eq!(device.last_signed_pre_key_rotation_ms, 1_234);
+    }
+
+    #[test]
+    fn set_rotation_baseline_leaves_key_untouched() {
+        let mut device = Device::new();
+        let key_before = device.signed_pre_key.public_key.public_key_bytes().to_vec();
+        let id_before = device.signed_pre_key_id;
+        let sig_before = device.signed_pre_key_signature;
+
+        apply_command_to_device(
+            &mut device,
+            DeviceCommand::SetSignedPreKeyRotationBaseline(9_999),
+        );
+
+        assert_eq!(device.last_signed_pre_key_rotation_ms, 9_999);
+        assert_eq!(
+            device.signed_pre_key.public_key.public_key_bytes().to_vec(),
+            key_before
+        );
+        assert_eq!(device.signed_pre_key_id, id_before);
+        assert_eq!(device.signed_pre_key_signature, sig_before);
     }
 
     #[test]

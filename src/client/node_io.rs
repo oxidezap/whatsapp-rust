@@ -749,6 +749,22 @@ impl Client {
                 warn!("Failed to upload pre-keys during startup: {e:?}");
             }
 
+            // WA Web RotateKeyJob: rotate the signed pre-key on its cadence.
+            // Spawned so a slow or failing encrypt IQ never delays the rest of
+            // post-login init.
+            check_generation!();
+            let rotate_client = client_clone.clone();
+            client_clone
+                .runtime
+                .spawn(Box::pin(async move {
+                    if let Err(e) = rotate_client.maybe_rotate_signed_pre_key().await
+                        && !rotate_client.is_shutting_down()
+                    {
+                        warn!("Signed pre-key rotation check failed: {e:?}");
+                    }
+                }))
+                .detach();
+
             // === Send active IQ ===
             // The server sends <ib><offline count="X"/></ib> AFTER we exit passive mode.
             // This matches WhatsApp Web's behavior: executePassiveTasks() -> sendPassiveModeProtocol("active")

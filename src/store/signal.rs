@@ -339,7 +339,22 @@ impl SignedPreKeyStore for Device {
             );
             return Ok(Some(record));
         }
-        Ok(None)
+        // Rotated-out key: a prekey message minted against a previous signed
+        // pre-key still names its old id, so fall back to the retained records.
+        use buffa::Message;
+        match self
+            .backend
+            .load_signed_prekey(signed_prekey_id)
+            .await
+            .map_err(|e| Box::new(e) as StoreError)?
+        {
+            Some(bytes) => {
+                let record = SignedPreKeyRecordStructure::decode_from_slice(&bytes)
+                    .map_err(|e| Box::new(e) as StoreError)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
     }
 
     async fn load_signed_prekeys(&self) -> Result<Vec<SignedPreKeyRecordStructure>, StoreError> {
@@ -498,5 +513,53 @@ impl SenderKeyStore for Device {
             }
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A rotated-out signed pre-key (id != current field) must load from the
+    // backend table so delayed prekey messages naming the old id still decrypt.
+    #[tokio::test]
+    async fn load_signed_prekey_falls_back_to_backend_for_rotated_out_id() {
+        use buffa::Message;
+
+        let backend = crate::test_utils::create_test_backend().await;
+        let device = Device::new(backend.clone());
+
+        let current = device.signed_pre_key_id;
+        let old_id = current + 7; // any non-current id
+
+        let kp = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
+            rand::rngs::StdRng,
+        >());
+        let record = wacore::libsignal::store::record_helpers::new_signed_pre_key_record(
+            old_id,
+            &kp,
+            [9u8; 64],
+            wacore::time::now_utc(),
+        );
+        backend
+            .store_signed_prekey(old_id, &record.encode_to_vec())
+            .await
+            .expect("store retained signed pre-key");
+
+        let loaded = SignedPreKeyStore::load_signed_prekey(&device, old_id)
+            .await
+            .expect("load must not error")
+            .expect("rotated-out key must load from backend");
+        assert_eq!(loaded.id, Some(old_id));
+        assert_eq!(
+            loaded.public_key.as_deref(),
+            Some(kp.public_key.public_key_bytes())
+        );
+
+        // A truly-unknown id still returns None.
+        let missing = SignedPreKeyStore::load_signed_prekey(&device, current + 999)
+            .await
+            .expect("load must not error");
+        assert!(missing.is_none());
     }
 }

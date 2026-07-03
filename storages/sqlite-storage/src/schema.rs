@@ -84,6 +84,7 @@ diesel::table! {
         login_counter -> Integer,
         first_unupload_pre_key_id -> Integer,
         lid_migrated -> Bool,
+        last_signed_pre_key_rotation_ms -> BigInt,
     }
 }
 
