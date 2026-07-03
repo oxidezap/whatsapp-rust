@@ -151,7 +151,7 @@ async fn test_mixed_offline_event_ordering() -> anyhow::Result<()> {
             .await;
 
         match result {
-            Ok(ref event) if event.message_batch().is_some() => {
+            Ok(ref event) if event.as_messages().is_some() => {
                 for m in event.messages() {
                     if let Some(text) = &m.message.conversation {
                         info!("C received message: {text}");
@@ -454,7 +454,7 @@ async fn test_offline_multi_sender_group_messages() -> anyhow::Result<()> {
             .await;
 
         match result {
-            Ok(ref event) if event.message_batch().is_some() => {
+            Ok(ref event) if event.as_messages().is_some() => {
                 for m in event.messages() {
                     if let Some(text) = &m.message.conversation {
                         info!("C received: {text}");

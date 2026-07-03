@@ -834,21 +834,22 @@ impl Event {
         }
     }
 
-    pub fn message_batch(&self) -> Option<&MessageBatch> {
-        if let Event::Messages(batch) = self {
-            Some(batch)
-        } else {
-            None
+    /// This event as its [`MessageBatch`], or `None` for any other event kind.
+    /// Use this when you need the batch's [`origin`](MessageBatch::origin) or
+    /// want to treat the messages as a whole; to just iterate the messages,
+    /// prefer [`messages`](Self::messages).
+    pub fn as_messages(&self) -> Option<&MessageBatch> {
+        match self {
+            Event::Messages(batch) => Some(batch),
+            _ => None,
         }
     }
 
-    /// The inbound messages carried by this event, in arrival order; empty for
-    /// every other event kind.
+    /// The inbound messages carried by this event, in arrival order; an empty
+    /// iterator for every other event kind (so it drops cleanly into a
+    /// `for msg in event.messages()` scan over a mixed event stream).
     pub fn messages(&self) -> impl Iterator<Item = &InboundMessage> {
-        self.message_batch()
-            .map(|b| b.messages.iter())
-            .into_iter()
-            .flatten()
+        self.as_messages().into_iter().flatten()
     }
 }
 
@@ -874,11 +875,41 @@ pub enum BatchOrigin {
     OfflineDrain,
 }
 
-/// Payload of [`Event::Messages`].
+/// Payload of [`Event::Messages`]: the decrypted messages of one durable
+/// commit, in arrival order. Behaves as a collection of its messages —
+/// `for msg in &batch`, `batch.iter()`, `batch.len()` — with `origin`
+/// carrying the delivery shape alongside.
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageBatch {
     pub messages: Arc<[InboundMessage]>,
     pub origin: BatchOrigin,
+}
+
+impl MessageBatch {
+    pub fn iter(&self) -> std::slice::Iter<'_, InboundMessage> {
+        self.messages.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    pub fn first(&self) -> Option<&InboundMessage> {
+        self.messages.first()
+    }
+}
+
+impl<'a> IntoIterator for &'a MessageBatch {
+    type Item = &'a InboundMessage;
+    type IntoIter = std::slice::Iter<'a, InboundMessage>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.messages.iter()
+    }
 }
 
 /// A newsletter live update notification, typically containing updated

@@ -845,9 +845,9 @@ mod tests {
         assert_eq!(batches, vec![vec!["B1", "B2", "B3"]]);
 
         let event = rx.try_recv().expect("one batch event");
-        let batch = event.message_batch().expect("Messages event");
+        let batch = event.as_messages().expect("Messages event");
         assert_eq!(batch.origin, BatchOrigin::OfflineDrain);
-        let ids: Vec<&str> = batch.messages.iter().map(|m| m.info.id.as_str()).collect();
+        let ids: Vec<&str> = batch.iter().map(|m| m.info.id.as_str()).collect();
         assert_eq!(ids, ["B1", "B2", "B3"]);
         assert!(rx.try_recv().is_err(), "exactly one event for the batch");
 
@@ -881,9 +881,9 @@ mod tests {
             vec![vec!["L1"]]
         );
         let event = rx.try_recv().expect("live event");
-        let batch = event.message_batch().expect("Messages event");
+        let batch = event.as_messages().expect("Messages event");
         assert_eq!(batch.origin, BatchOrigin::Live);
-        assert_eq!(batch.messages.len(), 1);
+        assert_eq!(batch.len(), 1);
     }
 
     // The size trigger commits a full batch from the stanza-end check.
@@ -962,12 +962,12 @@ mod tests {
         );
         let first = rx.try_recv().expect("tail event");
         assert_eq!(
-            first.message_batch().expect("Messages").origin,
+            first.as_messages().expect("Messages").origin,
             BatchOrigin::OfflineDrain
         );
         let second = rx.try_recv().expect("live event");
         assert_eq!(
-            second.message_batch().expect("Messages").origin,
+            second.as_messages().expect("Messages").origin,
             BatchOrigin::Live
         );
     }

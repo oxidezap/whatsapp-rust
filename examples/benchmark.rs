@@ -89,7 +89,7 @@ fn main() {
                     async move {
                         match &*event {
                             Event::Messages(batch) => {
-                                for m in batch.messages.iter() {
+                                for m in batch {
                                     if m.message.text_content() != Some("ping") {
                                         continue;
                                     }
