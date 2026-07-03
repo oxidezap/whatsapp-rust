@@ -178,24 +178,30 @@ impl Client {
         {
             Ok(()) => {}
             Err(IqError::ServerError { code, text, .. }) => {
-                // A 4xx (WA Web 406 = bad key, 409 = validation fail) is a
-                // deterministic rejection of THIS key: the server did not accept
-                // it, so reusing the staged candidate would wedge rotation
-                // forever. Drop it so the next attempt mints a fresh one. A 5xx
-                // is transient — keep the staged key and reuse it later.
-                let discard = code < 500;
-                if discard && let Err(e) = backend.remove_signed_prekey(new_id).await {
-                    log::warn!("failed to drop rejected staged signed pre-key {new_id}: {e}");
+                // WA Web treats 406 (bad key) and 409 (validation fail) as
+                // deterministic rejections of THIS key; reusing the staged
+                // candidate on retry would then wedge rotation forever (old_id
+                // never advances, so new_id is recomputed the same). Drop it to
+                // force a fresh mint — and REQUIRE the cleanup: if the remove
+                // fails, propagate so we never silently leave the rejected key
+                // staged. Every other code (rate limits, transient 5xx, …) is
+                // retryable, so keep the staged key for a plain retry.
+                if code == 406 || code == 409 {
+                    backend.remove_signed_prekey(new_id).await.map_err(|e| {
+                        anyhow::anyhow!(
+                            "failed to drop rejected staged signed pre-key {new_id}: {e}"
+                        )
+                    })?;
+                    log::warn!(
+                        "signed pre-key rotation rejected (code={code}, text='{text}'); \
+                         discarded the rejected key, will remint on a later connect"
+                    );
+                } else {
+                    log::warn!(
+                        "signed pre-key rotation upload rejected (code={code}, text='{text}'); \
+                         keeping the staged key, will retry on a later connect"
+                    );
                 }
-                log::warn!(
-                    "signed pre-key rotation upload rejected (code={code}, text='{text}'); \
-                     {}, will retry on a later connect",
-                    if discard {
-                        "discarded the rejected key"
-                    } else {
-                        "keeping the staged key"
-                    }
-                );
                 return Ok(());
             }
             Err(e) => {
