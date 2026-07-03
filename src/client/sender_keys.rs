@@ -304,9 +304,19 @@ impl Client {
     /// In DB-only mode (capacity = 0), the DB write is awaited to guarantee persistence.
     /// With L1 cache, the DB write is backgrounded since the cache serves reads immediately.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.add_recent_message", level = "debug", skip_all, fields(peer = %to.observe())))]
-    pub(crate) async fn add_recent_message(&self, to: &Jid, id: &str, msg: &wa::Message) {
+    pub(crate) async fn add_recent_message(
+        &self,
+        to: &Jid,
+        id: &str,
+        msg: &wa::Message,
+        // The plain `message_to_vec(msg)` bytes when the send path already
+        // encoded them (the same buffer feeds the wire plaintext), so caching
+        // for retry doesn't re-encode the whole message.
+        encoded: Option<std::sync::Arc<Vec<u8>>>,
+    ) {
         let key = self.make_chat_message_id(to, id).await;
-        let bytes = waproto::codec::message_to_vec(msg);
+        let shared =
+            encoded.unwrap_or_else(|| std::sync::Arc::new(waproto::codec::message_to_vec(msg)));
         let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
 
         if has_l1_cache {
@@ -315,7 +325,6 @@ impl Client {
             // hold the same buffer instead of memcpy-ing the whole message.
             let chat_str = key.chat.to_string();
             let msg_id = key.id.clone();
-            let shared = std::sync::Arc::new(bytes);
             self.recent_messages
                 .insert(key, std::sync::Arc::clone(&shared))
                 .await;
@@ -336,7 +345,7 @@ impl Client {
             if let Err(e) = self
                 .persistence_manager
                 .backend()
-                .store_sent_message(&chat_str, &key.id, &bytes)
+                .store_sent_message(&chat_str, &key.id, &shared)
                 .await
             {
                 log::warn!("Failed to store sent message to DB: {e}");

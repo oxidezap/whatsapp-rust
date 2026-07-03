@@ -28,35 +28,46 @@ fn mutation_index_mac(m: &wa::SyncdMutation) -> Option<&[u8]> {
     m.record.as_option()?.index.as_option()?.blob.as_deref()
 }
 
+/// A mutation's index MAC as the fixed-size HMAC-SHA256 array; `None` for a
+/// missing OR malformed (non-32-byte) blob. A malformed MAC could never match a
+/// stored row, so dropping it from the batch lookup is equivalent to the miss
+/// the lookup would return anyway.
+fn mutation_index_mac_array(m: &wa::SyncdMutation) -> Option<IndexMac> {
+    mutation_index_mac(m).and_then(|b| b.try_into().ok())
+}
+
+/// An appstate mutation index MAC: a full HMAC-SHA256 output, so always 32
+/// bytes. Inline (`Copy`) so batch lookups sort/hash flat arrays with zero
+/// per-MAC heap allocations.
+pub type IndexMac = [u8; 32];
+
 /// Distinct index MACs of a patch's mutations, feeding the batched
 /// previous-value-MAC backend lookup. Both callers pass the result straight to a
 /// `get_mutation_macs` HashMap fetch, so the order is unspecified.
 ///
-/// Small patches dedup with a linear scan that allocates only the keepers,
-/// cheaper than a sort at small N. Larger patches sort + dedup borrowed MAC
-/// slices and only then materialize the keepers with an exact-sized `Vec`: the
-/// comparator works on borrows walked once (never re-walking the boxed
-/// record/index/blob `MessageField` chain, the part buffa makes pricier than
-/// prost's `Option` derefs), duplicates are dropped before ever owning bytes,
-/// and the pre-dedup scratch holds 16-byte slices instead of `Vec` headers.
-pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<Vec<u8>> {
+/// Small patches dedup with a linear scan; larger patches sort + dedup the
+/// inline arrays in place. Either way the only allocation is the returned `Vec`
+/// itself: the comparator touches contiguous 32-byte elements (never re-walking
+/// the boxed record/index/blob `MessageField` chain, the part buffa makes
+/// pricier than prost's `Option` derefs).
+pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<IndexMac> {
     if mutations.len() <= MAC_DEDUP_SCAN_LIMIT {
-        let mut out: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
+        let mut out: Vec<IndexMac> = Vec::with_capacity(mutations.len());
         for m in mutations {
-            if let Some(mac) = mutation_index_mac(m)
-                && !out.iter().any(|v| v.as_slice() == mac)
+            if let Some(mac) = mutation_index_mac_array(m)
+                && !out.contains(&mac)
             {
-                out.push(mac.to_vec());
+                out.push(mac);
             }
         }
         return out;
     }
 
-    let mut macs: Vec<&[u8]> = Vec::with_capacity(mutations.len());
-    macs.extend(mutations.iter().filter_map(mutation_index_mac));
+    let mut macs: Vec<IndexMac> = Vec::with_capacity(mutations.len());
+    macs.extend(mutations.iter().filter_map(mutation_index_mac_array));
     macs.sort_unstable();
     macs.dedup();
-    macs.into_iter().map(<[u8]>::to_vec).collect()
+    macs
 }
 
 /// Mutation count at or below which [`collect_unique_index_macs`] dedups with a
@@ -438,7 +449,7 @@ impl AppStateProcessor {
 
             // Fetch previous value MACs in one backend round-trip instead of a
             // spawn_blocking + query per mutation (N+1).
-            let db_prev: HashMap<Vec<u8>, Vec<u8>> = self
+            let db_prev: HashMap<IndexMac, Vec<u8>> = self
                 .backend
                 .get_mutation_macs(collection_name, &need_db_lookup)
                 .await?;
@@ -449,10 +460,13 @@ impl AppStateProcessor {
 
             // Offload CPU-intensive patch processing to a blocking thread
             let (result, patch) = crate::runtime::blocking(&*self.runtime, move || {
-                let get_prev_value_mac = |index_mac: &[u8]| -> Result<
-                    Option<Vec<u8>>,
-                    crate::appstate::AppStateError,
-                > { Ok(db_prev.get(index_mac).cloned()) };
+                let get_prev_value_mac =
+                    |index_mac: &[u8]| -> Result<Option<Vec<u8>>, crate::appstate::AppStateError> {
+                        Ok(<&IndexMac>::try_from(index_mac)
+                            .ok()
+                            .and_then(|k| db_prev.get(k))
+                            .cloned())
+                    };
 
                 let mut state = state_clone;
                 let result = process_patch(
@@ -537,14 +551,17 @@ impl AppStateProcessor {
         // the inbound patch path: one batched query instead of a
         // spawn_blocking + single-row SELECT per mutation.
         let need_db_lookup = collect_unique_index_macs(&mutations);
-        let db_prev: std::collections::HashMap<Vec<u8>, Vec<u8>> = self
+        let db_prev: std::collections::HashMap<IndexMac, Vec<u8>> = self
             .backend
             .get_mutation_macs(collection_name, &need_db_lookup)
             .await?;
 
         // Update hash state
         let (_, hash_result) = state.update_hash(&mutations, |index_mac, _| {
-            Ok(db_prev.get(index_mac).cloned())
+            Ok(<&IndexMac>::try_from(index_mac)
+                .ok()
+                .and_then(|k| db_prev.get(k))
+                .cloned())
         });
         hash_result?;
 
@@ -790,13 +807,13 @@ mod dedup_tests {
             .collect()
     }
 
-    fn mac_bytes(i: usize) -> Vec<u8> {
-        let mut mac = vec![0u8; 32];
+    fn mac_bytes(i: usize) -> IndexMac {
+        let mut mac = [0u8; 32];
         mac[..8].copy_from_slice(&(i as u64).to_le_bytes());
         mac
     }
 
-    fn expected(distinct: usize) -> Vec<Vec<u8>> {
+    fn expected(distinct: usize) -> Vec<IndexMac> {
         (0..distinct).map(mac_bytes).collect()
     }
 
@@ -828,8 +845,8 @@ mod dedup_tests {
         assert_eq!(
             macs,
             vec![
-                b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec(),
-                b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_vec()
+                *b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                *b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ]
         );
     }

@@ -754,7 +754,16 @@ impl Client {
         let mut group_info =
             GroupInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn_map);
 
-        self.add_recent_message(&to, &request_id, &message).await;
+        // Encode once: the same bytes feed the retry cache here and the wire
+        // plaintext inside prepare_* (via `pre_encoded`), instead of two full
+        // Message encodes per send. `None` on the rare mci-hoist path, where
+        // prepare_* must re-encode with the folded context.
+        let shared_content = message
+            .message_context_info
+            .is_unset()
+            .then(|| std::sync::Arc::new(waproto::codec::message_to_vec(&message)));
+        self.add_recent_message(&to, &request_id, &message, shared_content.clone())
+            .await;
 
         let device_store_arc = self.persistence_manager.get_device_arc().await;
         let to_str = to.to_string();
@@ -835,6 +844,7 @@ impl Client {
             None,
             None,
             &extra_stanza_nodes,
+            shared_content.clone(),
         )
         .await
         {
@@ -878,6 +888,7 @@ impl Client {
                         None,
                         None,
                         &extra_stanza_nodes,
+                        shared_content.clone(),
                     )
                     .await?
                 } else {
@@ -1391,8 +1402,17 @@ impl Client {
                 .as_ref()
                 .ok_or_else(|| anyhow!("LID not set, cannot send to group"))?;
 
+            // Encode once: the same bytes feed the retry cache here and the wire
+            // plaintext inside prepare_* (via `pre_encoded`), instead of two full
+            // Message encodes per send. `None` on the rare mci-hoist path, where
+            // prepare_* must re-encode with the folded context.
+            let shared_content = message
+                .message_context_info
+                .is_unset()
+                .then(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)));
             // Store serialized message bytes for retry (lightweight)
-            self.add_recent_message(&to, &request_id, message).await;
+            self.add_recent_message(&to, &request_id, message, shared_content.clone())
+                .await;
 
             let device_store_arc = self.persistence_manager.get_device_arc().await;
             let to_str = to.to_string();
@@ -1555,6 +1575,7 @@ impl Client {
                 all_devices_for_phash,
                 edit.clone(),
                 &extra_stanza_nodes,
+                shared_content.clone(),
             )
             .await
             {
@@ -1636,6 +1657,7 @@ impl Client {
                             retry_all,
                             edit.clone(),
                             &extra_stanza_nodes,
+                            shared_content.clone(),
                         )
                         .await?;
 
@@ -1656,13 +1678,27 @@ impl Client {
             // Per-device locking to match decrypt path (message.rs:684),
             // preventing ratchet desync on concurrent send/receive.
 
+            // Encode once: the same bytes feed the retry cache here and the wire
+            // plaintext inside prepare_* (via `pre_encoded`), instead of two full
+            // Message encodes per send. `None` on the rare mci-hoist path, where
+            // prepare_* must re-encode with the folded context.
+            let shared_content = message
+                .message_context_info
+                .is_unset()
+                .then(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)));
             // Status reaction retries arrive with `from=status@broadcast`;
             // cache under the broadcast chat so take_recent_message hits.
             if is_status_addon {
-                self.add_recent_message(&Jid::status_broadcast(), &request_id, message)
-                    .await;
+                self.add_recent_message(
+                    &Jid::status_broadcast(),
+                    &request_id,
+                    message,
+                    shared_content.clone(),
+                )
+                .await;
             } else {
-                self.add_recent_message(&to, &request_id, message).await;
+                self.add_recent_message(&to, &request_id, message, shared_content.clone())
+                    .await;
             }
 
             let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -1828,6 +1864,7 @@ impl Client {
                 edit,
                 &extra_stanza_nodes,
                 all_dm_jids,
+                shared_content,
             )
             .await?;
             dm_phash = prepared.phash;

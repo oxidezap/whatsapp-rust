@@ -129,7 +129,8 @@ fn bench_history_sync_stream_drain(bencher: divan::Bencher) {
                 wacore::history_sync::MAX_DECOMPRESSED,
             );
             let mut messages = 0usize;
-            while let Some(conversation) = stream.next_conversation().unwrap() {
+            let mut conversation = waproto::whatsapp::Conversation::default();
+            while stream.next_conversation_into(&mut conversation).unwrap() {
                 messages += conversation.messages.len();
             }
             black_box((messages, stream.remainder().unwrap()))

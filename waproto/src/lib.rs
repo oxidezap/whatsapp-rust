@@ -115,6 +115,20 @@ pub mod codec {
         whatsapp::Conversation::decode_from_slice(bytes)
     }
 
+    /// [`conversation_decode`] into an existing struct. buffa's `clear()`
+    /// retains `Vec` capacity, so a caller draining thousands of conversations
+    /// through one reused struct skips the per-entry message-spine reallocs.
+    /// On error the struct is left cleared-then-partially-merged; callers must
+    /// treat it as garbage until the next successful merge.
+    #[inline(never)]
+    pub fn conversation_merge_from_slice(
+        conv: &mut whatsapp::Conversation,
+        bytes: &[u8],
+    ) -> Result<(), buffa::DecodeError> {
+        conv.clear();
+        conv.merge_from_slice(bytes)
+    }
+
     #[inline(never)]
     pub fn message_context_info_encoded_len(mci: &whatsapp::MessageContextInfo) -> usize {
         mci.encoded_len() as usize

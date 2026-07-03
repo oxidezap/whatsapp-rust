@@ -1385,34 +1385,39 @@ impl SqliteStore {
     pub async fn get_app_state_mutation_macs_batch_for_device(
         &self,
         name: &str,
-        index_macs: &[Vec<u8>],
+        index_macs: &[[u8; 32]],
         device_id: i32,
-    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+    ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>> {
         if index_macs.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
         let pool = self.pool.clone();
         let name = name.to_string();
-        let index_macs: Vec<Vec<u8>> = index_macs.to_vec();
+        let index_macs: Vec<[u8; 32]> = index_macs.to_vec();
         tokio::task::spawn_blocking(
-            move || -> Result<std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+            move || -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>> {
                 let mut conn = pool
                     .get()
                     .map_err(|e| StoreError::Connection(Box::new(e)))?;
                 let mut out = std::collections::HashMap::with_capacity(index_macs.len());
                 const CHUNK_SIZE: usize = 500;
                 for chunk in index_macs.chunks(CHUNK_SIZE) {
+                    let chunk_slices: Vec<&[u8]> = chunk.iter().map(|m| m.as_slice()).collect();
                     let rows: Vec<(Vec<u8>, Vec<u8>)> = app_state_mutation_macs::table
                         .select((
                             app_state_mutation_macs::index_mac,
                             app_state_mutation_macs::value_mac,
                         ))
                         .filter(app_state_mutation_macs::name.eq(&name))
-                        .filter(app_state_mutation_macs::index_mac.eq_any(chunk))
+                        .filter(app_state_mutation_macs::index_mac.eq_any(chunk_slices))
                         .filter(app_state_mutation_macs::device_id.eq(device_id))
                         .load(&mut conn)
                         .map_err(|e| StoreError::Database(Box::new(e)))?;
-                    out.extend(rows);
+                    // Rows with a non-32-byte index_mac cannot have come from the
+                    // 32-byte keys we just queried; skip defensively.
+                    out.extend(rows.into_iter().filter_map(|(k, v)| {
+                        <[u8; 32]>::try_from(k.as_slice()).ok().map(|k| (k, v))
+                    }));
                 }
                 Ok(out)
             },
@@ -2116,8 +2121,8 @@ impl AppSyncStore for SqliteStore {
     async fn get_mutation_macs(
         &self,
         name: &str,
-        index_macs: &[Vec<u8>],
-    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+        index_macs: &[[u8; 32]],
+    ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>> {
         self.get_app_state_mutation_macs_batch_for_device(name, index_macs, self.device_id)
             .await
     }
@@ -3462,9 +3467,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut index_macs: Vec<Vec<u8>> = macs.iter().map(|m| m.index_mac.clone()).collect();
+        let mut index_macs: Vec<[u8; 32]> = macs
+            .iter()
+            .map(|m| m.index_mac.as_slice().try_into().unwrap())
+            .collect();
         // an index that was never stored must be absent from the batch result
-        index_macs.push(vec![0xFF; 32]);
+        index_macs.push([0xFF; 32]);
 
         let batch = store
             .get_app_state_mutation_macs_batch_for_device(name, &index_macs, device_id)
@@ -3472,15 +3480,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(batch.len(), macs.len());
-        assert!(!batch.contains_key(&vec![0xFF; 32]));
+        assert!(!batch.contains_key(&[0xFF; 32]));
         for m in &macs {
+            let key: [u8; 32] = m.index_mac.as_slice().try_into().unwrap();
             // parity with the per-item path it replaces
             let per_item = store
                 .get_app_state_mutation_mac_for_device(name, &m.index_mac, device_id)
                 .await
                 .unwrap();
-            assert_eq!(per_item.as_ref(), batch.get(&m.index_mac));
-            assert_eq!(batch.get(&m.index_mac), Some(&m.value_mac));
+            assert_eq!(per_item.as_ref(), batch.get(&key));
+            assert_eq!(batch.get(&key), Some(&m.value_mac));
         }
 
         // empty input short-circuits to an empty map

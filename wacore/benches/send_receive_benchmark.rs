@@ -746,6 +746,7 @@ fn setup_group_recv() -> GrpRecvData {
         None,
         None,
         &[],
+        None,
     ))
     .unwrap();
 
@@ -833,6 +834,7 @@ fn run_group_send(d: &mut GrpSendData) {
         all_devices_for_phash,
         None,
         &[],
+        None,
     ))
     .unwrap();
 

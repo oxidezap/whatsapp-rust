@@ -273,7 +273,7 @@ impl Client {
             Some(result) => result,
             None => match self.take_recent_message(&info.chat, &message_id).await {
                 Some(result) => {
-                    self.add_recent_message(&info.chat, &message_id, &result.0)
+                    self.add_recent_message(&info.chat, &message_id, &result.0, None)
                         .await;
                     result
                 }
@@ -1299,7 +1299,7 @@ mod tests {
         };
 
         // Insert via the new async API
-        client.add_recent_message(&chat, &msg_id, &msg).await;
+        client.add_recent_message(&chat, &msg_id, &msg, None).await;
 
         // First take should return and remove it from cache
         let taken = client.take_recent_message(&chat, &msg_id).await;
@@ -1341,7 +1341,7 @@ mod tests {
             conversation: Some("hi".into()),
             ..Default::default()
         };
-        client.add_recent_message(&chat, &msg_id, &msg).await;
+        client.add_recent_message(&chat, &msg_id, &msg, None).await;
 
         // Peeking twice both return the message and leave it in the cache...
         for _ in 0..2 {
@@ -2265,6 +2265,7 @@ mod tests {
                     conversation: Some("hi".into()),
                     ..Default::default()
                 },
+                None,
             )
             .await;
 
@@ -3094,13 +3095,15 @@ mod tests {
             (Jid::status_broadcast(), "STATUS_MSG_001".to_string()),
             (Jid::pn("559911112222"), "DM_MSG_001".to_string()),
         ] {
-            client.add_recent_message(&chat, &msg_id, &msg).await;
+            client.add_recent_message(&chat, &msg_id, &msg, None).await;
 
             let taken = client.take_recent_message(&chat, &msg_id).await;
             assert!(taken.is_some(), "First take should succeed for {chat}");
 
             let (taken_msg, _) = taken.unwrap();
-            client.add_recent_message(&chat, &msg_id, &taken_msg).await;
+            client
+                .add_recent_message(&chat, &msg_id, &taken_msg, None)
+                .await;
 
             let taken2 = client.take_recent_message(&chat, &msg_id).await;
             assert!(
@@ -3153,7 +3156,9 @@ mod tests {
         };
 
         // Store under bare JID (how send_message stores it)
-        client.add_recent_message(&bare_jid, msg_id, &msg).await;
+        client
+            .add_recent_message(&bare_jid, msg_id, &msg, None)
+            .await;
 
         // Lookup via bare JID should succeed (this is what info.chat provides)
         let taken = client.take_recent_message(&bare_jid, msg_id).await;
@@ -3162,7 +3167,9 @@ mod tests {
         assert!(alt_chat.is_none(), "primary key should match for bare JID");
 
         // Re-add under bare JID
-        client.add_recent_message(&bare_jid, msg_id, &msg_out).await;
+        client
+            .add_recent_message(&bare_jid, msg_id, &msg_out, None)
+            .await;
 
         // Second take should also work
         let taken2 = client.take_recent_message(&bare_jid, msg_id).await;
@@ -3206,7 +3213,7 @@ mod tests {
         };
 
         // Store under PN (no LID mapping existed at send time)
-        client.add_recent_message(&pn_jid, msg_id, &msg).await;
+        client.add_recent_message(&pn_jid, msg_id, &msg, None).await;
 
         // Now add a LID mapping (simulates mapping arriving between send and retry)
         client
@@ -3323,7 +3330,7 @@ mod tests {
         };
 
         // Store under PN (no mapping at send time)
-        client.add_recent_message(&pn_jid, msg_id, &msg).await;
+        client.add_recent_message(&pn_jid, msg_id, &msg, None).await;
 
         // Add LID mapping
         client
@@ -3384,7 +3391,9 @@ mod tests {
         };
 
         // Store under LID, no PN mapping exists
-        client.add_recent_message(&lid_jid, msg_id, &msg).await;
+        client
+            .add_recent_message(&lid_jid, msg_id, &msg, None)
+            .await;
 
         // Lookup via LID: primary hits directly (same namespace)
         let taken = client.take_recent_message(&lid_jid, msg_id).await;
