@@ -426,12 +426,12 @@ impl Client {
         // wrapped low watermark so the next window is empty ([next_first,
         // next_first)). Keying on NEXT alone would wrongly discard a non-terminal
         // high-end window whose head sits just below MAX.
-        let next_pre_key_id = if id >= MAX_PREKEY_ID && device_snapshot.next_pre_key_id > MAX_PREKEY_ID
-        {
-            next_first
-        } else {
-            device_snapshot.next_pre_key_id
-        };
+        let next_pre_key_id =
+            if id >= MAX_PREKEY_ID && device_snapshot.next_pre_key_id > MAX_PREKEY_ID {
+                next_first
+            } else {
+                device_snapshot.next_pre_key_id
+            };
         self.persistence_manager
             .process_command(DeviceCommand::SetPreKeyWatermarks {
                 next_pre_key_id,
@@ -1213,7 +1213,11 @@ mod window_tests {
         drop(guard);
 
         let (next, first) = snapshot(&client);
-        assert_eq!(first, super::MAX_PREKEY_ID, "head advances onto the surviving key");
+        assert_eq!(
+            first,
+            super::MAX_PREKEY_ID,
+            "head advances onto the surviving key"
+        );
         assert_eq!(
             next,
             super::MAX_PREKEY_ID + 1,
@@ -1227,8 +1231,7 @@ mod window_tests {
     async fn marking_terminal_head_collapses_wrapped_window() {
         use wacore::store::commands::DeviceCommand;
 
-        let client =
-            crate::test_utils::create_test_client_with_name("prekey_mark_terminal").await;
+        let client = crate::test_utils::create_test_client_with_name("prekey_mark_terminal").await;
         client
             .persistence_manager
             .process_command(DeviceCommand::SetPreKeyWatermarks {
@@ -1246,7 +1249,10 @@ mod window_tests {
 
         let (next, first) = snapshot(&client);
         assert_eq!(first, 1, "head wraps to the low watermark");
-        assert_eq!(next, 1, "NEXT collapses onto the wrapped head: window empty");
+        assert_eq!(
+            next, 1,
+            "NEXT collapses onto the wrapped head: window empty"
+        );
     }
 
     /// A consumed window head must not abandon the live keys behind it: the
