@@ -2362,23 +2362,26 @@ fn test_fibonacci_backoff_first_attempt_is_1s() {
 // ── connection stability / backoff reset (WA Web resetDelay) ────────
 
 #[test]
-fn connection_was_stable_requires_uptime_window() {
-    // Never authenticated this cycle → not stable, whatever the clock says.
-    assert!(!connection_was_stable(0, 1_000_000));
-    // Authenticated but dropped inside the 30s window → keep escalating.
+fn should_reset_backoff_requires_uptime_window_and_no_penalty() {
     let start = 1_000_000i64;
-    assert!(!connection_was_stable(
+    let stable = start + Client::STABLE_CONNECTION_RESET_MS;
+    // Never authenticated this cycle → not stable, whatever the clock says.
+    assert!(!should_reset_backoff(0, 1_000_000, false));
+    // Authenticated but dropped inside the 30s window → keep escalating.
+    assert!(!should_reset_backoff(
         start,
-        start + Client::STABLE_CONNECTION_RESET_MS - 1
+        start + Client::STABLE_CONNECTION_RESET_MS - 1,
+        false
     ));
-    // Survived the full window → eligible to reset the backoff.
-    assert!(connection_was_stable(
-        start,
-        start + Client::STABLE_CONNECTION_RESET_MS
-    ));
-    assert!(connection_was_stable(start, start + 60_000));
+    // Survived the full window with no penalty → reset the backoff.
+    assert!(should_reset_backoff(start, stable, false));
+    assert!(should_reset_backoff(start, start + 60_000, false));
+    // An explicit penalty (429 / manual reconnect) survives even a stable
+    // connection (WA Web cancelReset).
+    assert!(!should_reset_backoff(start, stable, true));
+    assert!(!should_reset_backoff(start, start + 60_000, true));
     // A backwards clock jump must not underflow into a spurious reset.
-    assert!(!connection_was_stable(start, start - 5_000));
+    assert!(!should_reset_backoff(start, start - 5_000, false));
 }
 
 // ── stream error tests ─────────────────────────────────────────────

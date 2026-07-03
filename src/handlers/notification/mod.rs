@@ -789,13 +789,26 @@ mod tests {
         use wacore::types::jid::JidExt;
 
         let client = create_test_client().await;
-        let own_jid: Jid = "5511777777777@s.whatsapp.net".parse().unwrap();
+        let own_jid: Jid = "12025550101@s.whatsapp.net".parse().unwrap();
         client
             .persistence_manager
             .modify_device(|d| d.pn = Some(own_jid.clone()))
             .await;
 
         let group = "120363000000000000@g.us";
+        // Seed has_key tracking for the migrating device so we can assert the
+        // rotation clears it (not just the cached sender key).
+        let migrated_jid: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
+        client
+            .set_sender_key_status_for_devices(
+                group,
+                std::slice::from_ref(&migrated_jid),
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+
         let sk_name = SenderKeyName::from_parts(group, own_jid.to_protocol_address().as_str());
         client
             .signal_cache
@@ -812,7 +825,7 @@ mod tests {
             .attr("t", "1773519041")
             .children([NodeBuilder::new("modify")
                 .children([NodeBuilder::new("participant")
-                    .attr("jid", "5511888888888@s.whatsapp.net")
+                    .attr("jid", "12025550102@s.whatsapp.net")
                     .build()])
                 .build()])
             .build();
@@ -827,6 +840,15 @@ mod tests {
         assert!(
             sk.is_none(),
             "group <modify> must rotate (delete) the own group sender key"
+        );
+        assert!(
+            client
+                .persistence_manager
+                .get_sender_key_devices(group)
+                .await
+                .unwrap()
+                .is_empty(),
+            "group <modify> must clear stale sender_key_devices tracking"
         );
     }
 

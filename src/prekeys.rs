@@ -405,23 +405,33 @@ impl Client {
         Ok((id, key_pair.public_key))
     }
 
-    /// WA Web `markKeyAsUploaded`: exclude a one-time prekey that was handed out
-    /// directly (a retry-receipt `<keys>` bundle) from the next batch upload's
-    /// server offer, so the same id is never both direct-distributed AND pooled.
-    /// [`get_or_gen_single_pre_key`](Self::get_or_gen_single_pre_key) always
-    /// returns the current window head (`first_unupload_pre_key_id`), so marking
-    /// advances the low watermark one id past it (wrapping at the 24-bit edge
-    /// like the planner). Idempotent: a no-op if the head already moved (e.g. a
-    /// concurrent batch upload). Caller must hold `prekey_upload_lock`.
-    pub(crate) async fn mark_single_prekey_uploaded(&self, id: u32) -> Result<(), anyhow::Error> {
+    /// WA Web `markKeyAsUploaded`: exclude a retry-distributed one-time prekey
+    /// from the next batch upload's server offer, so the same id is never both
+    /// direct-distributed AND pooled. The `_guard` proof makes holding
+    /// `prekey_upload_lock` a compile-time requirement: the snapshot read and
+    /// the watermark write must be atomic against the batch upload path, or a
+    /// stale `next_pre_key_id` could roll the upper watermark back. Idempotent.
+    pub(crate) async fn mark_single_prekey_uploaded(
+        &self,
+        _guard: &async_lock::MutexGuard<'_, ()>,
+        id: u32,
+    ) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         if device_snapshot.first_unupload_pre_key_id != id {
             return Ok(());
         }
         let next_first = if id >= MAX_PREKEY_ID { 1 } else { id + 1 };
+        // At the 24-bit edge a preceding allocation leaves NEXT at MAX+1 (out of
+        // range); collapse it onto the wrapped low watermark so the next window
+        // is empty ([next_first, next_first)) instead of a ~16M range.
+        let next_pre_key_id = if device_snapshot.next_pre_key_id > MAX_PREKEY_ID {
+            next_first
+        } else {
+            device_snapshot.next_pre_key_id
+        };
         self.persistence_manager
             .process_command(DeviceCommand::SetPreKeyWatermarks {
-                next_pre_key_id: device_snapshot.next_pre_key_id,
+                next_pre_key_id,
                 first_unupload_pre_key_id: next_first,
             })
             .await;
@@ -1143,7 +1153,12 @@ mod window_tests {
         assert_eq!(first, id1);
         assert_eq!(next, id1 + 1);
 
-        client.mark_single_prekey_uploaded(id1).await.expect("mark");
+        let guard = client.prekey_upload_lock.lock().await;
+        client
+            .mark_single_prekey_uploaded(&guard, id1)
+            .await
+            .expect("mark");
+        drop(guard);
         let (next2, first2) = snapshot(&client);
         assert_eq!(
             first2,
@@ -1157,7 +1172,12 @@ mod window_tests {
         assert_ne!(id2, id1, "marked key must not be reused");
 
         // Marking with a now-stale id is a no-op (idempotent, head already moved).
-        client.mark_single_prekey_uploaded(id1).await.expect("noop");
+        let guard = client.prekey_upload_lock.lock().await;
+        client
+            .mark_single_prekey_uploaded(&guard, id1)
+            .await
+            .expect("noop");
+        drop(guard);
         let (_, first3) = snapshot(&client);
         assert_eq!(first3, id2, "stale mark leaves the current head untouched");
     }

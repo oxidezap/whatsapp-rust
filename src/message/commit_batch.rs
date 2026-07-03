@@ -14,20 +14,15 @@ use std::sync::atomic::Ordering;
 use wacore::store::traits::{PendingInboundKey, PendingInboundRow};
 use wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
 
-/// WA Web's message-processor cache flushes a snapshot every
-/// `web_message_processing_cache_size` messages (AB prop default 400). This is
-/// distinct from the offline *pull* size (`DEFAULT_MAX_BATCH_SIZE` = 200, the
-/// `<offline_batch count>` request); the snapshot granularity is 400.
+/// WA Web `web_message_processing_cache_size` (400) — the snapshot flush
+/// granularity, distinct from the 200-msg offline *pull* size.
 const MAX_BATCH_MESSAGES: usize = 400;
-/// Byte cap so a media-heavy backlog cannot hold multi-MB protos in memory;
-/// WA Web caps by count only, we are stricter.
+/// Byte cap so a media-heavy backlog cannot hold multi-MB protos in memory
+/// (WA Web caps by count only; we are stricter).
 const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
-/// Deliberate safety-net timeout so a slow trickle still commits durably
-/// instead of sitting uncommitted until the size cap or end-of-drain. This is
-/// a divergence from WA Web on purpose: WA Web's message-cache timeout
-/// (`web_offline_message_processor_timeout_seconds`) defaults to 0/disabled
-/// because its cache flushes on the end-of-drain snapshot regardless; we keep a
-/// bounded window because our durability hook must not lag arbitrarily.
+/// Safety-net so a slow trickle still commits durably instead of waiting for
+/// the size cap or end-of-drain. Deliberately stricter than WA Web (whose cache
+/// timeout defaults to 0) because our durability hook must not lag.
 const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Default)]

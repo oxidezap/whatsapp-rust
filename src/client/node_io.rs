@@ -633,6 +633,9 @@ impl Client {
         // The run loop does the stability-gated reset on the next disconnect.
         self.connected_at_ms
             .store(wacore::time::now_millis(), Ordering::Relaxed);
+        // Fresh connection starts un-penalized (see backoff_reset_suppressed).
+        self.backoff_reset_suppressed
+            .store(false, Ordering::Relaxed);
 
         self.update_server_time_offset(node);
 
@@ -1159,6 +1162,9 @@ impl Client {
                     );
                     self.is_logged_in.store(false, Ordering::Relaxed);
                     self.auto_reconnect_errors.fetch_add(5, Ordering::Relaxed);
+                    // Deliberate rate-limit backoff: the stability reset must
+                    // not erase it even if the connection had been up >= 30s.
+                    self.backoff_reset_suppressed.store(true, Ordering::Relaxed);
                 }
                 "503" => {
                     // Server is going down/restarting: mark logged-out so sends fail
