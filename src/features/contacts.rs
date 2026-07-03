@@ -240,12 +240,17 @@ impl<'a> Contacts<'a> {
             .is_enabled(wacore::iq::abprops::web::PROFILE_SCRAPING_PRIVACY_TOKEN_IN_ABOUT_USYNC)
             .await
         {
-            let mut tc_tokens = std::collections::HashMap::new();
-            for jid in jids {
-                if let Some(token) = self.client.lookup_tc_token_for_jid(jid).await {
-                    tc_tokens.insert(jid.user.to_string(), token);
-                }
-            }
+            let lookups = futures::future::join_all(jids.iter().map(|jid| async move {
+                (
+                    jid.to_non_ad().to_string(),
+                    self.client.lookup_tc_token_for_jid(jid).await,
+                )
+            }))
+            .await;
+            let tc_tokens: HashMap<String, Vec<u8>> = lookups
+                .into_iter()
+                .filter_map(|(key, token)| token.map(|t| (key, t)))
+                .collect();
             if !tc_tokens.is_empty() {
                 spec = spec.with_tc_tokens(tc_tokens);
             }

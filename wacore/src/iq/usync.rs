@@ -501,8 +501,9 @@ impl IqSpec for IsOnWhatsAppSpec {
 pub struct UserInfoSpec {
     pub jids: Vec<Jid>,
     pub sid: String,
-    /// Per-user (bare user string) trusted-contact token, attached to the
-    /// matching `<user>` node for privacy-gated subprotocols (status/about),
+    /// Per-user trusted-contact token, keyed by the query JID's non-ad string
+    /// form (domain-qualified, so PN and LID forms don't collide), attached to
+    /// the matching `<user>` node for privacy-gated subprotocols (status/about),
     /// matching WA Web's `USyncStatusProtocol.getUserElement` /
     /// `USyncUser.withTcToken`.
     pub tc_tokens: HashMap<String, Vec<u8>>,
@@ -517,7 +518,8 @@ impl UserInfoSpec {
         }
     }
 
-    /// Attach per-user trusted-contact tokens keyed by the query JID's user part.
+    /// Attach per-user trusted-contact tokens keyed by the query JID's non-ad
+    /// string form (see [`UserInfoSpec::tc_tokens`]).
     pub fn with_tc_tokens(mut self, tc_tokens: HashMap<String, Vec<u8>>) -> Self {
         self.tc_tokens = tc_tokens;
         self
@@ -544,8 +546,9 @@ impl IqSpec for UserInfoSpec {
             .jids
             .iter()
             .map(|jid| {
-                let mut builder = NodeBuilder::new("user").attr("jid", jid.to_non_ad());
-                if let Some(token) = self.tc_tokens.get(jid.user.as_str()) {
+                let key = jid.to_non_ad().to_string();
+                let mut builder = NodeBuilder::new("user").attr("jid", key.clone());
+                if let Some(token) = self.tc_tokens.get(&key) {
                     builder = builder.children([build_tc_token_node(token)]);
                 }
                 builder.build()
@@ -1374,7 +1377,7 @@ mod tests {
     fn user_info_attaches_per_user_tctoken() {
         let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
         let mut tokens = HashMap::new();
-        tokens.insert("1234567890".to_string(), vec![0xDE, 0xAD]);
+        tokens.insert(jid.to_non_ad().to_string(), vec![0xDE, 0xAD]);
         let spec = UserInfoSpec::new(vec![jid], "sid").with_tc_tokens(tokens);
 
         let iq = spec.build_iq();
