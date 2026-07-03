@@ -69,6 +69,19 @@ impl Client {
         self.wanted_pre_key_count.load(Ordering::Relaxed)
     }
 
+    /// Set how long the initial critical app-state sync waits for the encrypted
+    /// app-state key-share before attempting the snapshot. Read once when the
+    /// initial sync starts, so set it before connecting.
+    pub fn set_app_state_key_wait(&self, wait: Duration) {
+        self.app_state_key_wait_ms
+            .store(wait.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// The configured initial app-state key-share wait.
+    pub fn app_state_key_wait(&self) -> Duration {
+        Duration::from_millis(self.app_state_key_wait_ms.load(Ordering::Relaxed))
+    }
+
     /// Retune the per-chat outbound resend rate limiter live (no reconnect).
     ///
     /// Outbound resends to a chat are bounded by a token bucket: `burst` is the

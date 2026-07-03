@@ -269,6 +269,7 @@ impl Client {
             override_version,
             skip_history_sync: AtomicBool::new(false),
             wanted_pre_key_count: AtomicUsize::new(crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT),
+            app_state_key_wait_ms: AtomicU64::new(5_000),
             cache_config,
             self_weak: std::sync::OnceLock::new(),
             saver_handle: std::sync::OnceLock::new(),

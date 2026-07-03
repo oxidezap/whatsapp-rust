@@ -792,6 +792,14 @@ pub struct Client {
     /// Clamped to the protocol-safe range at upload time.
     pub(crate) wanted_pre_key_count: AtomicUsize,
 
+    /// How long the initial critical app-state sync waits for the encrypted
+    /// app-state key-share before attempting the snapshot fetch. Default 5s; set
+    /// via [`BotBuilder::with_app_state_key_wait`] or [`Client::set_app_state_key_wait`].
+    /// Raise it when a large concurrent history sync can delay the key-share past
+    /// the default, which otherwise fails critical sync with "didn't find app
+    /// state key" and drops the account's saved contact names.
+    pub(crate) app_state_key_wait_ms: AtomicU64,
+
     /// Cache configuration for TTL and capacity of all caches.
     /// Stored for use by lazily-initialized caches (group_cache).
     pub(crate) cache_config: CacheConfig,

@@ -918,13 +918,14 @@ impl Client {
                     .initial_app_state_keys_received
                     .load(Ordering::Relaxed)
                 {
+                    let key_wait = client_clone.app_state_key_wait();
                     debug!(
                         target: "Client/AppState",
-                        "Waiting up to 5s for app state keys..."
+                        "Waiting up to {key_wait:?} for app state keys..."
                     );
                     let _ = rt_timeout(
                         &*client_clone.runtime,
-                        Duration::from_secs(5),
+                        key_wait,
                         client_clone.initial_keys_synced_notifier.listen(),
                     )
                     .await;

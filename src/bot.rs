@@ -15,6 +15,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use wacore::proto_helpers::MessageBuilderExt;
 use wacore::runtime::Runtime;
@@ -565,6 +566,7 @@ pub struct BotBuilder<
     cache_config: CacheConfig,
     wanted_pre_key_count: Option<usize>,
     resend_rate_limit: Option<(u32, u32)>,
+    app_state_key_wait: Option<Duration>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
     alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
     _marker: PhantomData<(B, T, H, R)>,
@@ -589,6 +591,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             cache_config: CacheConfig::default(),
             wanted_pre_key_count: None,
             resend_rate_limit: None,
+            app_state_key_wait: None,
             task_instrument: None,
             alloc_meter: None,
             _marker: PhantomData,
@@ -617,6 +620,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             cache_config: self.cache_config,
             wanted_pre_key_count: self.wanted_pre_key_count,
             resend_rate_limit: self.resend_rate_limit,
+            app_state_key_wait: self.app_state_key_wait,
             task_instrument: self.task_instrument,
             alloc_meter: self.alloc_meter,
             _marker: PhantomData,
@@ -1031,6 +1035,16 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Override how long the initial critical app-state sync waits for the
+    /// encrypted app-state key-share before attempting the snapshot (default 5s).
+    /// Raise it when a large concurrent history sync can delay the key-share past
+    /// the default, which otherwise fails critical sync with "didn't find app
+    /// state key" and drops the account's saved contact names.
+    pub fn with_app_state_key_wait(mut self, wait: Duration) -> Self {
+        self.app_state_key_wait = Some(wait);
+        self
+    }
+
     /// Set an initial push name on the device before connecting.
     ///
     /// This is included in the `ClientPayload` during registration, allowing the
@@ -1183,6 +1197,10 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
 
         if let Some((burst, refill_per_min)) = self.resend_rate_limit {
             client.set_resend_rate_limit(burst, refill_per_min);
+        }
+
+        if let Some(wait) = self.app_state_key_wait {
+            client.set_app_state_key_wait(wait);
         }
 
         Ok(Bot {
@@ -1634,6 +1652,37 @@ mod tests {
             bot.client().wanted_pre_key_count(),
             crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT
         );
+    }
+
+    #[tokio::test]
+    async fn test_bot_builder_app_state_key_wait() {
+        let backend = create_test_sqlite_backend().await;
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_app_state_key_wait(Duration::from_secs(30))
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot with custom app-state key wait");
+
+        assert_eq!(bot.client().app_state_key_wait(), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn test_bot_builder_default_app_state_key_wait() {
+        let backend = create_test_sqlite_backend().await;
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+
+        assert_eq!(bot.client().app_state_key_wait(), Duration::from_secs(5));
     }
 
     #[tokio::test]
