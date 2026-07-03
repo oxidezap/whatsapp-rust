@@ -112,15 +112,16 @@ impl SenderKeyDeviceCache {
 
     /// Approximate entry count plus estimated retained bytes.
     pub(crate) async fn memory_stats(&self) -> wacore::stats::CollectionStats {
+        // Slot allocations use capacity() (outer and inner maps alike);
+        // per-entry heap is summed by iteration.
         self.inner
             .memory_stats(|k, v| {
                 k.capacity()
+                    + v.devices.capacity() * std::mem::size_of::<(Arc<str>, HashMap<u16, bool>)>()
                     + v.devices
                         .iter()
                         .map(|(user, by_device)| {
-                            user.len()
-                                + std::mem::size_of::<(Arc<str>, HashMap<u16, bool>)>()
-                                + by_device.capacity() * std::mem::size_of::<(u16, bool)>()
+                            user.len() + by_device.capacity() * std::mem::size_of::<(u16, bool)>()
                         })
                         .sum::<usize>()
             })
