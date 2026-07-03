@@ -494,18 +494,25 @@ impl Client {
             .await
             .is_err()
         {
-            // Keep the cache: the decision is owned by the reset-coupled
-            // clear (cleanup's and connect's batcher resets drop the cache
-            // whenever they drop entries). Deciding here would race the
-            // permit holder we timed out on — it may still be mid-decrypt
-            // with unenqueued advances that has_entries() cannot see, and it
-            // may enqueue after any clear done here. Whatever is dirty when
-            // the resets find NO entries is redeliverable SKDM residue or
-            // retained committed state, which the next successful flush
-            // persists.
+            // Drop the whole dirty cache — do NOT sample has_entries() (it
+            // races the permit holder we timed out on, per the earlier
+            // review). A hook-timeout is the common case: the settle held
+            // the permit and its ReinsertGuard has restored the entries by
+            // now, and clearing drops their rowless advances safely (rows
+            // never persisted → server redelivers). The rare case is a
+            // worker hung mid-decrypt holding the permit; it may have
+            // advanced a ratchet WITHOUT enqueueing an entry (SKDM-only),
+            // which the reset-coupled clear cannot see — so the only
+            // rowless-safe action is to clear unconditionally here. The one
+            // thing this can drop is committed state a PRIOR connection's
+            // failed flush retained AND no flush since re-persisted: a
+            // total-storage-outage corner where the system is already
+            // degraded, and losing redeliverable-on-reauth state beats
+            // silently acking a rowless duplicate.
             log::warn!(
-                "Timed out settling the inbound drain during teardown; deferring the Signal-cache decision to the batcher reset"
+                "Timed out settling the inbound drain during teardown; dropping the dirty Signal cache so no rowless ratchet advance can persist"
             );
+            self.signal_cache.clear().await;
         }
     }
 
