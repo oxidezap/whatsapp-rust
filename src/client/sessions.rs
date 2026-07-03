@@ -104,10 +104,12 @@ impl Client {
     ///
     /// `durable`: `Some(true)` flushes the buffered offline receipts;
     /// `Some(false)` drops them — the tail's durable write failed, its entries
-    /// are back in the batcher unacked, and receipting SKDM/session state that
-    /// never became durable would trade a redeliverable failure for a
-    /// crash-permanent one. `None` (upgrade-failure fallback) leaves the
-    /// buffer alone for the connection-state reset to clear.
+    /// are back in the batcher unacked (which stays in drain mode until a
+    /// later durable flush completes the deferred live transition), and
+    /// receipting SKDM/session state that never became durable would trade a
+    /// redeliverable failure for a crash-permanent one. `None`
+    /// (upgrade-failure fallback) leaves the buffer alone for the
+    /// connection-state reset to clear.
     fn publish_offline_sync_live_state(&self, count: i32, durable: Option<bool>) {
         self.offline_sync_completed.store(true, Ordering::Release);
         self.swap_message_semaphore(64);

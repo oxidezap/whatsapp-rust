@@ -43,8 +43,21 @@ pub(crate) struct InboundCommitBatcher {
     /// uncommitted batch entry, and let queued drain stanzas commit as Live
     /// ahead of the accumulated batch.
     active: std::sync::atomic::AtomicBool,
+    /// Set when the end-of-drain flush could not commit its tail: the guard
+    /// restored the entries, and switching to live mode anyway would let the
+    /// per-stanza full-cache Signal flush persist their ratchet advances with
+    /// no durable rows — redelivery would then be acked as duplicates. The
+    /// batcher stays in drain mode instead (entries keep batching, the flush
+    /// timer retries the commit) and the next durable flush completes the
+    /// deferred transition.
+    pending_live: std::sync::atomic::AtomicBool,
     /// Bumped on every take; a timer that observes a stale epoch stands down.
     epoch: AtomicU64,
+    /// Test-only injection: fail the next drain commits before their durable
+    /// point, exercising the ReinsertGuard/deferred-transition paths (no
+    /// backend failure can be injected through the real store).
+    #[cfg(test)]
+    pub(crate) fail_commits: std::sync::atomic::AtomicBool,
     /// Reusable encode arena for drain commits, which the processing permit
     /// already serializes — so this lock is never contended there. Live
     /// commits use a local buffer instead: sharing it would serialize
@@ -57,8 +70,11 @@ impl Default for InboundCommitBatcher {
         Self {
             state: std::sync::Mutex::new(BatchState::default()),
             active: std::sync::atomic::AtomicBool::new(true),
+            pending_live: std::sync::atomic::AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             arena: async_lock::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            fail_commits: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -92,10 +108,22 @@ impl InboundCommitBatcher {
         !self.lock().entries.is_empty()
     }
 
-    /// Switch to immediate (live) commits. Only the end-of-drain flush calls
-    /// this, while holding the single processing permit.
+    /// Switch to immediate (live) commits. Only the end-of-drain flush (or a
+    /// later flush completing a deferred transition) calls this, while
+    /// holding the processing permit.
     fn deactivate(&self) {
+        self.pending_live.store(false, Ordering::Release);
         self.active.store(false, Ordering::Release);
+    }
+
+    /// Record that the end-of-drain flush failed before its durable point;
+    /// see the `pending_live` field docs.
+    fn defer_live_transition(&self) {
+        self.pending_live.store(true, Ordering::Release);
+    }
+
+    fn live_transition_pending(&self) -> bool {
+        self.pending_live.load(Ordering::Acquire)
     }
 
     /// Last-resort drain exit for the unreachable-in-practice case where the
@@ -125,6 +153,7 @@ impl InboundCommitBatcher {
                 dropped.len()
             );
         }
+        self.pending_live.store(false, Ordering::Release);
         self.active.store(true, Ordering::Release);
     }
 }
@@ -249,9 +278,15 @@ impl Client {
         };
         if over {
             let batch = self.inbound_commit_batch.take();
-            let _ = self
+            let durable = self
                 .commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
                 .await;
+            // A durable commit may be the retry that clears a deferred
+            // drain→live transition (failed end-of-drain tail); the permit is
+            // held, so the flip is as raceless as the end-of-drain one.
+            if durable && self.inbound_commit_batch.live_transition_pending() {
+                self.inbound_commit_batch.deactivate();
+            }
         }
     }
 
@@ -313,8 +348,21 @@ impl Client {
             self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
                 .await
         };
-        if deactivate {
-            self.inbound_commit_batch.deactivate();
+        if deactivate || (was_draining && self.inbound_commit_batch.live_transition_pending()) {
+            if durable {
+                self.inbound_commit_batch.deactivate();
+            } else if was_draining {
+                // The guard restored the entries; switching to live mode now
+                // would let per-stanza full-cache flushes persist their
+                // ratchet advances with no durable rows (acked-duplicate loss
+                // on redelivery). Keep batching — the flush timer and later
+                // flushes retry the commit, and the first durable one
+                // completes this transition.
+                self.inbound_commit_batch.defer_live_transition();
+                log::warn!(
+                    "End-of-drain commit failed; staying in drain mode until a durable flush completes the live transition"
+                );
+            }
         }
         durable
     }
@@ -385,8 +433,13 @@ impl Client {
         if batch.is_empty() {
             return true;
         }
-        self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
-            .await
+        let durable = self
+            .commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
+            .await;
+        if durable && self.inbound_commit_batch.live_transition_pending() {
+            self.inbound_commit_batch.deactivate();
+        }
+        durable
     }
 
     /// Commit one batch: durable buffer → Signal flush → hook → clear buffer →
@@ -423,6 +476,14 @@ impl Client {
             batcher: &self.inbound_commit_batch,
             items: is_drain.then(|| std::sync::Arc::clone(&items)),
         };
+        #[cfg(test)]
+        if self
+            .inbound_commit_batch
+            .fail_commits
+            .load(Ordering::Acquire)
+        {
+            return false;
+        }
 
         if let Some(hook) = self.inbound_durability_hook() {
             // Key strings live for the whole commit; rows borrow them and the
@@ -769,5 +830,65 @@ mod tests {
 
         assert!(hook.batches.lock().expect("hook lock").is_empty());
         assert!(rx.try_recv().is_err());
+    }
+
+    // A failed end-of-drain tail must NOT switch to live mode: the restored
+    // entries would sit in an inactive batcher while per-stanza full-cache
+    // flushes persist their ratchet advances rowless, turning redelivery into
+    // acked duplicates. The transition defers until a durable flush.
+    #[tokio::test]
+    async fn failed_tail_defers_live_transition_until_durable_flush() {
+        let client = create_test_client_with_failing_http("batch_defer").await;
+        client.inbound_commit_batch.reset();
+        let hook = Arc::new(RecordingHook {
+            batches: Mutex::new(Vec::new()),
+        });
+        let _ = client.inbound_durability_hook.set(hook.clone());
+
+        client.commit_or_batch_inbound(item("T1")).await;
+
+        client
+            .inbound_commit_batch
+            .fail_commits
+            .store(true, Ordering::Release);
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        let durable = client.finish_inbound_commit_drain(generation).await;
+        assert!(!durable, "injected failure must report not-durable");
+        assert!(
+            client.inbound_commit_batch.is_active(),
+            "failed tail must keep the batcher in drain mode"
+        );
+        assert!(
+            client.inbound_commit_batch.has_entries(),
+            "the guard must restore the taken entries"
+        );
+
+        // With the transition deferred, later traffic keeps batching instead
+        // of committing rowless around the restored tail.
+        client
+            .inbound_commit_batch
+            .fail_commits
+            .store(false, Ordering::Release);
+        client.commit_or_batch_inbound(item("T2")).await;
+        assert!(
+            hook.batches.lock().expect("hook lock").is_empty(),
+            "deferred mode must accumulate, not commit live"
+        );
+
+        let durable = client
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await;
+        assert!(durable);
+        assert!(
+            !client.inbound_commit_batch.is_active(),
+            "the first durable flush completes the deferred transition"
+        );
+        assert!(!client.inbound_commit_batch.has_entries());
+        let batches = hook.batches.lock().expect("hook lock").clone();
+        assert_eq!(
+            batches,
+            vec![vec!["T1", "T2"]],
+            "restored tail commits first, in arrival order"
+        );
     }
 }
