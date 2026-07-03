@@ -340,19 +340,22 @@ impl Client {
             } else {
                 wacore::telemetry::connect("ok");
                 let loop_result = self.read_messages_loop().await;
+                // Consume intentional_reconnect on EVERY exit, reading it AFTER the loop
+                // ends (reconnect() sets it while the loop runs, then tears down via the
+                // shutdown signal — the Expected path). Consuming it only on some paths
+                // left it stale for the next connection, misclassifying the next genuine
+                // disconnect as intentional and swallowing its Disconnected event.
+                let intentional = self.intentional_reconnect.swap(false, Ordering::Relaxed);
                 // Some(reason) = unexpected disconnect worth a `Disconnected` event; the
                 // reason distinguishes a routine server recycle from a real failure so
-                // consumers don't have to. Check intentional_reconnect AFTER the read
-                // loop exits — reconnect() sets this flag while the loop is running.
+                // consumers don't have to.
                 let unexpected_disconnect = match loop_result {
                     Ok(super::node_io::ReadLoopExit::Expected) => {
                         debug!("Message loop exited gracefully (expected disconnect).");
                         None
                     }
                     Ok(super::node_io::ReadLoopExit::ServerRecycle(reason)) => {
-                        if self.expected_disconnect.load(Ordering::Relaxed)
-                            || self.intentional_reconnect.swap(false, Ordering::Relaxed)
-                        {
+                        if self.expected_disconnect.load(Ordering::Relaxed) || intentional {
                             debug!("Message loop exited during expected disconnect.");
                             None
                         } else {
@@ -362,9 +365,7 @@ impl Client {
                         }
                     }
                     Err(e) => {
-                        if self.expected_disconnect.load(Ordering::Relaxed)
-                            || self.intentional_reconnect.swap(false, Ordering::Relaxed)
-                        {
+                        if self.expected_disconnect.load(Ordering::Relaxed) || intentional {
                             debug!("Message loop exited during expected disconnect.");
                             None
                         } else {

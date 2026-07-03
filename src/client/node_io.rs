@@ -3,21 +3,18 @@
 use super::*;
 use wacore::net::DisconnectReason;
 
-/// Non-error exits of [`Client::read_messages_loop`]. A routine server stream
-/// recycle used to be an `Err`, which forced every severity consumer (logs,
-/// tracing `err(...)` capture, error trackers) to re-derive "was this actually
-/// a problem?" on its own — encoding it in the type does that once.
+/// Non-error exits of [`Client::read_messages_loop`] — `ServerRecycle` keeps the
+/// routine reconnect path out of `Err`, so severity consumers (logs, the span's
+/// `err(...)` capture, error trackers) only fire for genuine failures.
 pub(crate) enum ReadLoopExit {
-    /// Local, intentional teardown: shutdown signal or an expected disconnect.
+    /// Shutdown signal or an expected disconnect.
     Expected,
-    /// The server ended the stream cleanly while we did not expect it — the
-    /// routine WhatsApp reconnect path. Callers reconnect and notify consumers,
-    /// but nothing is wrong.
+    /// Server ended the stream cleanly (the routine WhatsApp reconnect path).
     ServerRecycle(DisconnectReason),
 }
 
-/// Genuine failures of [`Client::read_messages_loop`] — everything here is
-/// anomalous and worth reporting loudly, unlike [`ReadLoopExit`].
+/// Genuine failures of [`Client::read_messages_loop`] — everything here is worth
+/// reporting loudly, unlike [`ReadLoopExit`].
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReadLoopError {
     #[error("cannot start message loop: {0}")]
