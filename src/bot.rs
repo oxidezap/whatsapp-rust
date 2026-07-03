@@ -659,6 +659,20 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// (keep a clone to read snapshots), or a custom hook to scope
     /// allocator-attribution or platform samplers to this client's work.
     /// Default: no hook — the runtime is used untouched.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use wacore::stats::CpuMeter;
+    ///
+    /// let cpu = Arc::new(CpuMeter::new());
+    /// let bot = Bot::builder()
+    ///     .with_backend(backend)
+    ///     .with_task_instrument(cpu.clone())
+    ///     .build()
+    ///     .await?;
+    /// // later: cpu.snapshot().busy
+    /// ```
     pub fn with_task_instrument(
         mut self,
         instrument: Arc<dyn wacore::stats::TaskInstrument>,

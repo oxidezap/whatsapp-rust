@@ -259,10 +259,13 @@ impl std::fmt::Display for MemoryReport {
         ) -> std::fmt::Result {
             writeln!(f, "  {name:<22} {:>7} entries {:>10} B", c.entries, c.bytes)
         }
+        // First TTL_BOUNDED entries of collections() are the TTL-bounded
+        // caches; the rest are the Signal store caches.
+        const TTL_BOUNDED: usize = 7;
         let collections = self.collections();
         writeln!(f, "=== Memory Report ===")?;
         writeln!(f, "--- TTL-bounded caches ---")?;
-        for (name, c) in &collections[..7] {
+        for (name, c) in &collections[..TTL_BOUNDED] {
             line(f, name, c)?;
         }
         writeln!(f, "  message_retry_counts:   {}", self.message_retry_counts)?;
@@ -296,7 +299,8 @@ impl std::fmt::Display for MemoryReport {
             self.app_state_key_requests
         )?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
-        for (name, c) in &collections[7..] {
+        writeln!(f, "--- Signal store caches ---")?;
+        for (name, c) in &collections[TTL_BOUNDED..] {
             line(f, name, c)?;
         }
         writeln!(f, "--- Misc ---")?;
