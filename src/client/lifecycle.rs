@@ -460,7 +460,13 @@ impl Client {
             .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Uncommitted batch entries were never acked; the server redelivers
-        // them on this fresh connection.
+        // them on this fresh connection. The cache clear pairs with it: a
+        // late lane worker from the previous connection can decrypt AFTER
+        // cleanup settled the cache, leaving dirty ratchet advances whose
+        // entries are dropped right here — flushing those later would make
+        // their redeliveries ackable duplicates. Committed state was flushed
+        // by its commit, so this only drops rowless advances.
+        self.signal_cache.clear().await;
         self.inbound_commit_batch.reset();
         self.offline_batch.reset();
         self.outbound_flush.reopen();
@@ -761,50 +767,27 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
-        // Commit any accumulated drain batch BEFORE the Signal flush below:
+        // Commit any accumulated drain batch and settle the Signal cache in
+        // ONE permit-held section (see teardown_inbound_commits_bounded):
         // persisting ratchet advances while dropping their uncommitted batch
-        // entries would turn each redelivery into an ackable duplicate with no
-        // buffered copy — silent loss for hook consumers. Acks/events from
-        // this commit are best-effort (the socket is gone); the durable hook
-        // commit is what matters. Reached on every teardown path, including
-        // the run loop's unexpected read-loop exit, which never goes through
-        // disconnect().
+        // entries — or while an old lane worker is mid-decrypt — would turn
+        // redeliveries into ackable duplicates with no buffered copy.
+        // Acks/events from this commit are best-effort (the socket is gone);
+        // the durable hook commit is what matters. Reached on every teardown
+        // path, including the run loop's unexpected read-loop exit, which
+        // never goes through disconnect().
         if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
             client
-                .flush_inbound_commits_bounded(std::time::Duration::from_secs(5))
+                .teardown_inbound_commits_bounded(std::time::Duration::from_secs(5))
                 .await;
         } else {
             // Same class of bug as the complete_offline_sync twin: a silent
-            // skip here is the acked-before-committed loss — make it loud.
+            // skip here is the acked-before-committed loss — make it loud,
+            // and drop the dirty cache with the entries it covers.
             log::error!(
-                "cleanup_connection_state: self_weak upgrade failed; skipping drain-batch commit before Signal flush — uncommitted entries will be dropped"
-            );
-        }
-        // Flush before clear: clear() drops dirty entries, so a disconnect
-        // racing an in-flight encrypt would lose the just-advanced sender-key
-        // chain and force a full SKDM re-fanout. A disconnect is not a logout.
-        // Only clear on a successful flush; on a backend error keep the cache so
-        // the dirty state isn't dropped and the next operation can persist it.
-        //
-        // Exception: if the bounded commit above left entries in the batcher
-        // (timed out or its durable write failed), the cache holds their
-        // ratchet advances. Persisting those would make each redelivery an
-        // ackable duplicate; keeping them cached would make it decrypt as one
-        // in-process. Clearing WITHOUT flushing un-advances them instead —
-        // everything they cover is unacked and redelivers fresh. Committed
-        // state is not at risk: every earlier commit flushed the cache itself.
-        if self.inbound_commit_batch.has_entries() {
-            log::warn!(
-                "cleanup_connection_state: dropping unflushed Signal state for uncommitted drain entries; the server redelivers them"
+                "cleanup_connection_state: self_weak upgrade failed; dropping uncommitted drain entries and their unflushed Signal state"
             );
             self.signal_cache.clear().await;
-        } else {
-            match self.flush_signal_cache().await {
-                Ok(()) => self.signal_cache.clear().await,
-                Err(e) => log::error!(
-                    "cleanup_connection_state: signal cache flush failed, keeping cache to avoid dropping Signal state: {e:?}"
-                ),
-            }
         }
         // Reset semaphore to 1 permit for next offline sync.
         self.swap_message_semaphore(1);

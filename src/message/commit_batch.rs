@@ -422,12 +422,67 @@ impl Client {
             .detach();
     }
 
+    /// Teardown twin of [`flush_inbound_commits_bounded`]: commit the batch
+    /// AND settle the Signal cache (flush-or-drop, then clear) in ONE
+    /// permit-held section. Doing these as separate steps released the permit
+    /// in between, and an old chat-lane worker (they drain until the
+    /// connection generation changes) could grab it and be mid-decrypt —
+    /// ratchets advanced, entry not yet enqueued — while the raw flush
+    /// persisted its rowless advances; the reset then dropped the entry and
+    /// its redelivery was acked as a duplicate.
+    ///
+    /// On timeout (stalled permit holder / hung hook) the cache is cleared
+    /// WITHOUT flushing: everything dirty then belongs to uncommitted
+    /// entries, and dropping both sides keeps redelivery consistent.
+    pub(crate) async fn teardown_inbound_commits_bounded(
+        self: &Arc<Self>,
+        limit: std::time::Duration,
+    ) {
+        let settle = async {
+            let _permit = self.acquire_message_processing_permit().await;
+            let batch = self.inbound_commit_batch.take();
+            let durable = if batch.is_empty() {
+                true
+            } else {
+                self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
+                    .await
+            };
+            // Permit still held: no stanza can be mid-decrypt while the cache
+            // is settled. Flush-before-clear preserves in-flight sender-key
+            // advances (a disconnect is not a logout); a failed or
+            // non-durable commit leaves entries restored, whose ratchets must
+            // drop with them instead of persisting rowless.
+            if durable && !self.inbound_commit_batch.has_entries() {
+                match self.flush_signal_cache().await {
+                    Ok(()) => self.signal_cache.clear().await,
+                    Err(e) => log::error!(
+                        "cleanup_connection_state: signal cache flush failed, keeping cache to avoid dropping Signal state: {e:?}"
+                    ),
+                }
+            } else {
+                log::warn!(
+                    "cleanup_connection_state: dropping unflushed Signal state for uncommitted drain entries; the server redelivers them"
+                );
+                self.signal_cache.clear().await;
+            }
+        };
+        if wacore::runtime::timeout(&*self.runtime, limit, settle)
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "Timed out committing the inbound drain batch during teardown; dropping unflushed Signal state so redelivery stays consistent"
+            );
+            self.signal_cache.clear().await;
+        }
+    }
+
     /// [`flush_inbound_commits_under_permit`](Self::flush_inbound_commits_under_permit)
-    /// with a deadline, for connection teardown: a stalled permit holder or a
-    /// hung hook must not wedge disconnect/reconnect. On timeout (or a failed
-    /// durable write) the entries stay in the batcher unacked — the caller
-    /// must not flush buffered receipts or persist the Signal cache for them,
-    /// and the server redelivers them on the next connect.
+    /// with a deadline, for pre-close receipt gating: a stalled permit holder
+    /// or a hung hook must not wedge disconnect/reconnect. On timeout (or a
+    /// failed durable write) the entries stay in the batcher unacked — the
+    /// caller must not flush buffered receipts or persist the Signal cache
+    /// for them, and the server redelivers them on the next connect.
     pub(crate) async fn flush_inbound_commits_bounded(
         self: &Arc<Self>,
         limit: std::time::Duration,
