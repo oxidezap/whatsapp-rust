@@ -3119,24 +3119,21 @@ impl ProtocolStore for SqliteStore {
         self.with_retry("store_pending_inbound_batch", || {
             let rows = Arc::clone(&rows);
             Box::new(move |conn: &mut SqliteConnection| {
+                // Per-row statements inside ONE transaction: the WAL commit is
+                // the real per-message cost and it is already amortized. A
+                // multi-row VALUES insert was measurably faster per statement
+                // but cost ~4 KiB of extra monomorphized .text against a
+                // 32 KiB per-PR budget — not worth it for microseconds.
                 conn.transaction(|conn| {
-                    // Multi-row VALUES per statement; chunked so binds stay far
-                    // under SQLite's variable limit (5 columns × 100 rows).
-                    for chunk in rows.chunks(100) {
-                        let values: Vec<_> = chunk
-                            .iter()
-                            .map(|(chat, sender, id, message)| {
-                                (
-                                    pending_inbound_messages::chat.eq(chat),
-                                    pending_inbound_messages::sender.eq(sender),
-                                    pending_inbound_messages::id.eq(id),
-                                    pending_inbound_messages::message.eq(message.as_slice()),
-                                    pending_inbound_messages::device_id.eq(device_id),
-                                )
-                            })
-                            .collect();
+                    for (chat, sender, id, message) in rows.iter() {
                         diesel::replace_into(pending_inbound_messages::table)
-                            .values(&values)
+                            .values((
+                                pending_inbound_messages::chat.eq(chat),
+                                pending_inbound_messages::sender.eq(sender),
+                                pending_inbound_messages::id.eq(id),
+                                pending_inbound_messages::message.eq(message.as_slice()),
+                                pending_inbound_messages::device_id.eq(device_id),
+                            ))
                             .execute(conn)?;
                     }
                     Ok(())

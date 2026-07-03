@@ -867,14 +867,17 @@ pub struct InboundMessage {
     pub info: Arc<MessageInfo>,
 }
 
-/// Where a [`MessageBatch`] came from. Mirrors Baileys' `messages.upsert`
-/// `type` field (`notify` / `append`).
+/// How a [`MessageBatch`] was delivered. Mirrors Baileys' `messages.upsert`
+/// `type` field (`notify` / `append`). This describes the delivery shape,
+/// not a message's provenance: whether a stanza came from the offline queue
+/// is `info.is_offline` on each [`InboundMessage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BatchOrigin {
-    /// A message received while connected; always a batch of one.
+    /// Delivered immediately as a batch of one: live traffic, and redelivery
+    /// replays that commit outside an accumulated batch.
     Live,
-    /// Part of the offline backlog drained on (re)connect; batched per
-    /// durable commit (WA Web's MessageProcessorCache snapshot granularity).
+    /// An accumulated batch from the offline drain, one per durable commit
+    /// (WA Web's MessageProcessorCache snapshot granularity).
     OfflineDrain,
 }
 

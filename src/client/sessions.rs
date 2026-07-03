@@ -41,7 +41,11 @@ impl Client {
             // finish_inbound_commit_drain for the raceless-transition
             // argument), BEFORE widening the semaphore. Receipts flush after,
             // so every receipt's message is durably committed first (WA Web's
-            // createSnapshot ordering).
+            // createSnapshot ordering). Flag-gated waiters can unblock while
+            // this tail commit runs — the same window in-flight stanzas always
+            // had across the flip — but everything they unblock is safe to run
+            // concurrently, and OfflineSyncCompleted only dispatches below,
+            // after the commit.
             if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
                 client.finish_inbound_commit_drain().await;
             } else {

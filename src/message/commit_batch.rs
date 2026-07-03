@@ -175,8 +175,16 @@ impl Client {
     /// processing; after the drain the batcher is empty and this no-ops.
     pub(crate) async fn flush_inbound_commits_acquiring_permit(self: &Arc<Self>) {
         let _permit = self.acquire_message_processing_permit().await;
+        let was_draining = self.inbound_commit_batch.is_active();
         let batch = self.inbound_commit_batch.take();
         if batch.is_empty() {
+            // Even with nothing to commit, a drain-mode flush must persist the
+            // Signal cache: SKDM-only stanzas mutate Signal state without
+            // enqueueing a message, and their buffered receipts flush right
+            // after the teardown/drain-end call sites of this function.
+            if was_draining {
+                self.flush_signal_cache_logged("commit_batch", None).await;
+            }
             return;
         }
         self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain, true)
@@ -218,6 +226,11 @@ impl Client {
         let batch = self.inbound_commit_batch.take();
         self.inbound_commit_batch.deactivate();
         if batch.is_empty() {
+            // Same rule as flush_inbound_commits_acquiring_permit: SKDM-only
+            // drain stanzas leave Signal state in the cache with their
+            // receipts buffered; those receipts flush right after this, so
+            // the state must be durable first.
+            self.flush_signal_cache_logged("commit_batch", None).await;
             return;
         }
         self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain, true)
@@ -225,9 +238,13 @@ impl Client {
     }
 
     /// Commit one batch: durable buffer → Signal flush → hook → clear buffer →
-    /// event → acks. WA Web ordering (`createSnapshot`), so nothing is acked or
-    /// observable before it is durable. On any commit failure everything stays
-    /// unacked and the server redelivers the whole batch.
+    /// acks → event. Nothing is acked or observable before it is durable (WA
+    /// Web's `createSnapshot` ordering); acks precede the event dispatch so a
+    /// misbehaving synchronous handler cannot suppress them — the contract the
+    /// pre-batch at-most-once path had. A crash between ack and event trades
+    /// exactly like that old path: the consumer's durable copy is the hook
+    /// commit, not the event. On any commit failure everything stays unacked
+    /// and the server redelivers the whole batch.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.commit_batch", level = "debug", skip_all, fields(count = items.len())))]
     pub(crate) async fn commit_inbound_batch(
         self: &Arc<Self>,
