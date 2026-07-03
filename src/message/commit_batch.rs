@@ -282,10 +282,9 @@ impl Client {
                 .commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
                 .await;
             // A durable commit may be the retry that clears a deferred
-            // drain→live transition (failed end-of-drain tail); the permit is
-            // held, so the flip is as raceless as the end-of-drain one.
+            // drain→live transition (failed end-of-drain tail).
             if durable && self.inbound_commit_batch.live_transition_pending() {
-                self.inbound_commit_batch.deactivate();
+                self.complete_deferred_live_transition();
             }
         }
     }
@@ -348,7 +347,7 @@ impl Client {
             self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
                 .await
         };
-        if deactivate || (was_draining && self.inbound_commit_batch.live_transition_pending()) {
+        if deactivate {
             if durable {
                 self.inbound_commit_batch.deactivate();
             } else if was_draining {
@@ -360,11 +359,26 @@ impl Client {
                 // completes this transition.
                 self.inbound_commit_batch.defer_live_transition();
                 log::warn!(
-                    "End-of-drain commit failed; staying in drain mode until a durable flush completes the live transition"
+                    "End-of-drain commit failed; staying in drain mode (single permit) until a durable flush completes the live transition"
                 );
             }
+        } else if durable && was_draining && self.inbound_commit_batch.live_transition_pending() {
+            self.complete_deferred_live_transition();
         }
         durable
+    }
+
+    /// Finish a drain→live transition that a failed end-of-drain tail commit
+    /// deferred: the finisher already published completion but left the
+    /// batcher in drain mode AND the semaphore at one permit — the flush
+    /// invariant (no stanza mid-decrypt while the whole Signal cache is
+    /// persisted) only holds while stanzas are serialized. Called with the
+    /// permit held and a durable commit just done, so the flip is as raceless
+    /// as the normal end-of-drain one.
+    pub(crate) fn complete_deferred_live_transition(&self) {
+        self.inbound_commit_batch.deactivate();
+        self.swap_message_semaphore(64);
+        log::info!("Deferred drain-to-live transition completed after a durable flush");
     }
 
     /// [`flush_inbound_commits_under_permit`](Self::flush_inbound_commits_under_permit)
@@ -437,7 +451,7 @@ impl Client {
             .commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
             .await;
         if durable && self.inbound_commit_batch.live_transition_pending() {
-            self.inbound_commit_batch.deactivate();
+            self.complete_deferred_live_transition();
         }
         durable
     }
@@ -839,7 +853,10 @@ mod tests {
     #[tokio::test]
     async fn failed_tail_defers_live_transition_until_durable_flush() {
         let client = create_test_client_with_failing_http("batch_defer").await;
+        // Full drain state: batching AND the single-permit semaphore (the
+        // test client starts in live mode with 64 permits).
         client.inbound_commit_batch.reset();
+        client.swap_message_semaphore(1);
         let hook = Arc::new(RecordingHook {
             batches: Mutex::new(Vec::new()),
         });
@@ -875,6 +892,12 @@ mod tests {
             "deferred mode must accumulate, not commit live"
         );
 
+        assert_eq!(
+            available_permits(&client),
+            1,
+            "the deferred transition must keep stanzas serialized"
+        );
+
         let durable = client
             .flush_inbound_commits_under_permit(false, None, None)
             .await;
@@ -884,11 +907,28 @@ mod tests {
             "the first durable flush completes the deferred transition"
         );
         assert!(!client.inbound_commit_batch.has_entries());
+        assert_eq!(
+            available_permits(&client),
+            64,
+            "completing the deferred transition widens the semaphore"
+        );
         let batches = hook.batches.lock().expect("hook lock").clone();
         assert_eq!(
             batches,
             vec![vec!["T1", "T2"]],
             "restored tail commits first, in arrival order"
         );
+    }
+
+    fn available_permits(client: &Client) -> usize {
+        let semaphore = match client.message_processing_semaphore.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let mut guards = Vec::new();
+        while let Some(guard) = semaphore.try_acquire() {
+            guards.push(guard);
+        }
+        guards.len()
     }
 }
