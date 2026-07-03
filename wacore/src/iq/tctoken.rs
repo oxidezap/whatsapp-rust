@@ -388,6 +388,40 @@ pub fn build_tc_token_node_with_timestamp(token: &[u8], timestamp: i64) -> Node 
         .build()
 }
 
+/// Which privacy token (if any) to attach to an outgoing 1:1 message stanza.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivacyTokenChoice {
+    /// Attach the stored trusted-contact token bytes.
+    TcToken,
+    /// Attach an NCT `cstoken` fallback.
+    CsToken,
+    /// Attach nothing.
+    None,
+}
+
+/// Decide which privacy token to attach, mirroring WA Web's
+/// `Re = R(te) ?? D(te, s)` in `MsgCreateFanoutStanza.js`.
+///
+/// `tc_send_enabled` (`privacy_token_sending_on_all_1_on_1_messages`) gates the
+/// tctoken only — WA Web's `R`. The cstoken is gated independently on
+/// `nct_send_enabled` (`wa_nct_token_send_enabled`) — WA Web's `D` — and is NOT
+/// nested behind the 1:1 prop: when `R` yields nothing (prop off, or token
+/// missing/expired), `D` still runs.
+pub fn choose_privacy_token(
+    tc_send_enabled: bool,
+    nct_send_enabled: bool,
+    has_valid_tc_token: bool,
+    can_build_cs_token: bool,
+) -> PrivacyTokenChoice {
+    if tc_send_enabled && has_valid_tc_token {
+        PrivacyTokenChoice::TcToken
+    } else if nct_send_enabled && can_build_cs_token {
+        PrivacyTokenChoice::CsToken
+    } else {
+        PrivacyTokenChoice::None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,5 +745,57 @@ mod tests {
             Some(NodeContent::Bytes(data)) => assert_eq!(data, &[0xAA, 0xBB, 0xCC]),
             _ => panic!("Expected binary content"),
         }
+    }
+
+    #[test]
+    fn choose_prefers_valid_tc_token() {
+        assert_eq!(
+            choose_privacy_token(true, true, true, true),
+            PrivacyTokenChoice::TcToken
+        );
+    }
+
+    #[test]
+    fn choose_falls_back_to_cs_token_when_tc_missing() {
+        // tctoken prop on, but no valid token → cstoken fallback runs.
+        assert_eq!(
+            choose_privacy_token(true, true, false, true),
+            PrivacyTokenChoice::CsToken
+        );
+    }
+
+    #[test]
+    fn choose_cs_token_when_tc_send_disabled() {
+        // Regression: the cstoken is gated only on nct_send_enabled and must be
+        // attached even when privacy_token_sending_on_all_1_on_1_messages is off.
+        assert_eq!(
+            choose_privacy_token(false, true, false, true),
+            PrivacyTokenChoice::CsToken
+        );
+        // A valid tc token is ignored while its own prop is off; cstoken still wins.
+        assert_eq!(
+            choose_privacy_token(false, true, true, true),
+            PrivacyTokenChoice::CsToken
+        );
+    }
+
+    #[test]
+    fn choose_none_when_cs_token_unbuildable() {
+        assert_eq!(
+            choose_privacy_token(true, true, false, false),
+            PrivacyTokenChoice::None
+        );
+        assert_eq!(
+            choose_privacy_token(false, true, false, false),
+            PrivacyTokenChoice::None
+        );
+    }
+
+    #[test]
+    fn choose_none_when_all_disabled() {
+        assert_eq!(
+            choose_privacy_token(false, false, true, true),
+            PrivacyTokenChoice::None
+        );
     }
 }

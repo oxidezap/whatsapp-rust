@@ -103,8 +103,11 @@ pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node
                     continue;
                 }
 
-                // Timestamp monotonicity guard: only store if incoming >= existing
-                if received.timestamp < existing.token_timestamp {
+                // Timestamp monotonicity guard: only store if incoming >= existing.
+                // A byte-less placeholder (written by sender-side issuance to carry
+                // sender_timestamp) has no real token yet, so always accept the
+                // contact's first real token regardless of its timestamp.
+                if !existing.token.is_empty() && received.timestamp < existing.token_timestamp {
                     debug!(
                         target: "Client/TcToken",
                         "Skipping older token for {} (incoming={}, existing={})",
@@ -230,4 +233,84 @@ pub(crate) async fn handle_business_notification(client: &Arc<Client>, node: &No
     }
 
     client.core.event_bus.dispatch(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::create_test_client;
+    use wacore::store::traits::TcTokenEntry;
+    use wacore_binary::builder::NodeBuilder;
+
+    fn privacy_token_notification(from_lid: &str, t: i64, bytes: Vec<u8>) -> wacore_binary::Node {
+        NodeBuilder::new("notification")
+            .attr("type", "privacy_token")
+            .attr("from", from_lid)
+            .children([NodeBuilder::new("tokens")
+                .children([NodeBuilder::new("token")
+                    .attr("type", "trusted_contact")
+                    .attr("t", t.to_string())
+                    .bytes(bytes)
+                    .build()])
+                .build()])
+            .build()
+    }
+
+    #[tokio::test]
+    async fn stores_new_token_with_no_sender_timestamp() {
+        let client = create_test_client().await;
+        let node = privacy_token_notification("880000001@lid", 1_700_000_000, vec![0xAA, 0xBB]);
+
+        handle_privacy_token_notification(&client, &node.as_node_ref()).await;
+
+        let stored = client
+            .persistence_manager
+            .backend()
+            .get_tc_token("880000001")
+            .await
+            .unwrap()
+            .expect("token should be stored");
+        assert_eq!(stored.token, vec![0xAA, 0xBB]);
+        assert_eq!(stored.token_timestamp, 1_700_000_000);
+        assert_eq!(stored.sender_timestamp, None);
+    }
+
+    #[tokio::test]
+    async fn real_token_replaces_byteless_placeholder_and_keeps_sender_timestamp() {
+        let client = create_test_client().await;
+        let backend = client.persistence_manager.backend();
+
+        // Placeholder written by sender-side issuance: no bytes yet, but a
+        // sender_timestamp that is newer than the contact's incoming token.
+        backend
+            .put_tc_token(
+                "880000002",
+                &TcTokenEntry {
+                    token: Vec::new(),
+                    token_timestamp: 1_700_000_500,
+                    sender_timestamp: Some(1_700_000_500),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Incoming real token has an OLDER timestamp than the placeholder — the
+        // monotonicity guard must not drop it.
+        let node =
+            privacy_token_notification("880000002@lid", 1_700_000_000, vec![0x01, 0x02, 0x03]);
+        handle_privacy_token_notification(&client, &node.as_node_ref()).await;
+
+        let stored = backend.get_tc_token("880000002").await.unwrap().unwrap();
+        assert_eq!(
+            stored.token,
+            vec![0x01, 0x02, 0x03],
+            "real token must replace the placeholder even with an older timestamp"
+        );
+        assert_eq!(stored.token_timestamp, 1_700_000_000);
+        assert_eq!(
+            stored.sender_timestamp,
+            Some(1_700_000_500),
+            "sender_timestamp must survive the first real token"
+        );
+    }
 }

@@ -1358,7 +1358,6 @@ impl Client {
         // instead of redoing the full per-member fan-out. None on warm sends.
         let mut distribution_guard: Option<async_lock::MutexGuardArc<()>> = None;
         let mut should_issue_tc_token_after_send = false;
-        let mut used_cached_tc_token_key: Option<String> = None;
         let tc_issue_target = to.clone();
 
         let mut dm_phash: Option<String> = None;
@@ -1821,13 +1820,9 @@ impl Client {
             // tctoken applies to 1:1 chats; status reactions share the fanout
             // path but WA Web does not attach tctokens to them.
             if !to.is_group() && !to.is_newsletter() && !is_status_addon {
-                let (should_issue_after_send, cached_token_key) = self
+                should_issue_tc_token_after_send = self
                     .maybe_include_tc_token(&to, &mut extra_stanza_nodes)
                     .await;
-                should_issue_tc_token_after_send = should_issue_after_send;
-                if should_issue_after_send {
-                    used_cached_tc_token_key = cached_token_key;
-                }
             }
             if should_issue_tc_token_after_send {
                 debug!(target: "Client/TcToken", "Scheduled tc token issuance after send for {}", to.observe());
@@ -1945,13 +1940,9 @@ impl Client {
         if should_issue_tc_token_after_send {
             if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
                 let target = tc_issue_target;
-                let cached_key = used_cached_tc_token_key;
                 self.runtime
                     .spawn(Box::pin(async move {
-                        let issued_ok = client.issue_tc_token_after_send(&target).await;
-                        if issued_ok && let Some(token_key) = cached_key {
-                            client.mark_tc_token_used_after_send(&token_key).await;
-                        }
+                        client.issue_tc_token_after_send(&target).await;
                     }))
                     .detach();
             } else {
