@@ -512,9 +512,7 @@ async fn place_call(
         Err(_) => return Err(CallError::MissingDeviceIdentity),
     };
 
-    // Attach the callee's stored trusted-contact token to the offer's `<privacy>` node so a
-    // privacy-restricted callee accepts the offer -- the same token the 1:1 message and presence
-    // paths attach. Absent when we hold no valid token for them.
+    // A privacy-restricted callee rejects the offer unless it carries our stored token for them.
     let privacy_token = client.lookup_tc_token_for_jid(peer).await;
 
     // The offer needs a stanza id so the server can ack-correlate it: the initiator's relay rides
@@ -612,9 +610,7 @@ async fn place_call(
         return Err(e.into());
     }
 
-    // Issue our token to the callee after the offer, mirroring WA Web's `sendTcToken` in
-    // StartCall.js: rate-limited by the sender bucket and fire-and-forget so call setup isn't
-    // blocked on the IQ round-trip. Prevents 463 nacks on later offers to this contact.
+    // Prevents 463 nacks on later offers to this contact (WA Web's post-offer sendTcToken).
     spawn_call_tc_token_issuance(client, peer);
 
     // The relay arrives in the `<ack type=offer>` reply to the offer's stanza id (live-only, needs a
@@ -1914,9 +1910,8 @@ mod tests {
         );
     }
 
-    // A stored, non-expired trusted-contact token for the callee must ride on the offer as the
-    // leading `<privacy>` child (WA Web's tctoken-on-call-offer), so a privacy-restricted callee
-    // accepts it. Without a token the offer carries no `<privacy>` (asserted above).
+    // A stored token must ride on the offer as the leading `<privacy>` child, or a
+    // privacy-restricted callee rejects the call (the no-token case is covered above).
     #[tokio::test]
     async fn place_call_attaches_stored_tctoken_as_privacy_node() {
         use wacore::store::traits::TcTokenEntry;

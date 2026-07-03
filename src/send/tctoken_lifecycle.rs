@@ -148,10 +148,6 @@ impl Client {
     /// sender bucket. Independent of the 1:1 message AB props — WA Web schedules
     /// `sendTcToken` on its own cadence (`MsgJob`, `StartCall`) regardless of
     /// whether a token was attached to the outgoing stanza.
-    ///
-    /// The 1:1 message path inlines this decision in `maybe_include_tc_token`
-    /// (it already reads the entry for the token bytes); this standalone form
-    /// serves the call path, which only needs the issuance decision.
     #[cfg(feature = "voip")]
     pub(crate) async fn should_issue_tc_token(&self, to: &Jid) -> bool {
         use wacore::iq::tctoken::should_send_new_tc_token_with;
