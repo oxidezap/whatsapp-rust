@@ -1703,8 +1703,10 @@ mod tests {
             Some(meter.clone()),
         )
         .await;
-        // yield_now forces Pending once, so the wrapper must see >= 2 polls.
+        // yield_now forces Pending once, so the wrapper must see >= 2 polls,
+        // and the busy-time attribution path must have accumulated something.
         assert!(meter.snapshot().polls >= 2);
+        assert!(meter.snapshot().busy > std::time::Duration::ZERO);
 
         // No instrument: plain passthrough must still drive to completion.
         run_metered(async {}, None).await;
