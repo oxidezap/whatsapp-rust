@@ -458,8 +458,11 @@ pub trait ProtocolStore: Send + Sync {
     /// never dropped just because the received token expired. Returns count deleted.
     async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32>;
 
-    /// Set `sender_timestamp` for a contact, inserting a byte-less placeholder
-    /// when absent and preserving any existing token bytes.
+    /// Advance `sender_timestamp` toward `sender_timestamp` for a contact,
+    /// inserting a byte-less placeholder when absent and preserving any existing
+    /// token bytes. The stored value only ever moves forward (max), so
+    /// concurrent writers (post-send issuance, history sync) converge regardless
+    /// of ordering and never regress the sender bucket.
     ///
     /// Must be atomic w.r.t. [`put_tc_token`](Self::put_tc_token): the sender-side
     /// issuance path and the notification writer both touch the same row, so a
@@ -473,7 +476,11 @@ pub trait ProtocolStore: Send + Sync {
     ) -> Result<()> {
         let entry = match self.get_tc_token(jid).await? {
             Some(existing) => TcTokenEntry {
-                sender_timestamp: Some(sender_timestamp),
+                sender_timestamp: Some(
+                    existing
+                        .sender_timestamp
+                        .map_or(sender_timestamp, |e| e.max(sender_timestamp)),
+                ),
                 ..existing
             },
             None => TcTokenEntry {

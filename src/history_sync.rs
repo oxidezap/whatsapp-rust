@@ -1,7 +1,7 @@
 use crate::types::events::{Event, LazyHistorySync};
 use std::sync::Arc;
 use wacore::history_sync::{HistoryMsgSecretRecord, TcTokenCandidate, process_history_sync};
-use wacore::store::traits::{MsgSecretEntry, TcTokenEntry};
+use wacore::store::traits::MsgSecretEntry;
 use wacore_binary::{Jid, JidExt as _};
 use waproto::whatsapp::message::HistorySyncNotification;
 
@@ -407,46 +407,37 @@ impl Client {
 
         let backend = self.persistence_manager.backend();
 
-        // Avoid clobbering a newer local sender_timestamp from post-send issuance
-        let incoming_sender_ts = candidate.tc_token_sender_timestamp.map(|ts| ts as i64);
-        let merged_sender_ts = if let Ok(Some(existing)) = backend.get_tc_token(token_key).await {
-            // A byte-less placeholder stamps token_timestamp with a sender epoch,
-            // so it must never block a real token from history sync — only skip
-            // when an existing real token is newer.
-            if !existing.token.is_empty()
-                && (existing.token_timestamp as u64) > candidate.tc_token_timestamp
-            {
-                return;
-            }
-            match (existing.sender_timestamp, incoming_sender_ts) {
-                (Some(e), Some(i)) => Some(e.max(i)),
-                (Some(e), None) => Some(e),
-                (None, i) => i,
-            }
-        } else {
-            incoming_sender_ts
-        };
-
-        let entry = TcTokenEntry {
-            token: candidate.tc_token,
-            token_timestamp: candidate.tc_token_timestamp as i64,
-            sender_timestamp: merged_sender_ts,
-        };
-
-        if let Err(e) = backend.put_tc_token(token_key, &entry).await {
-            log::warn!(
-                target: "Client/TcToken",
-                "Failed to store history sync tctoken for {}: {e}",
-                token_key
-            );
-        } else {
-            log::debug!(
-                target: "Client/TcToken",
-                "Stored tctoken from history sync for {} (t={})",
-                token_key,
-                candidate.tc_token_timestamp
-            );
+        // Skip only when an existing *real* token is newer than this candidate; a
+        // byte-less placeholder stamps token_timestamp with a sender epoch and
+        // must never block the first real token from history sync.
+        if let Ok(Some(existing)) = backend.get_tc_token(token_key).await
+            && !existing.token.is_empty()
+            && (existing.token_timestamp as u64) > candidate.tc_token_timestamp
+        {
+            return;
         }
+
+        // Two atomic upserts — token fields, then the sender bucket (advance-only)
+        // — so a concurrent post-send issuance is never clobbered by this write.
+        if let Err(e) = backend
+            .store_received_tc_token(
+                token_key,
+                &candidate.tc_token,
+                candidate.tc_token_timestamp as i64,
+            )
+            .await
+        {
+            log::warn!(target: "Client/TcToken", "Failed to store history sync tctoken for {}: {e}", jid.observe());
+            return;
+        }
+        if let Some(sender_ts) = candidate.tc_token_sender_timestamp
+            && let Err(e) = backend
+                .touch_tc_token_sender_timestamp(token_key, sender_ts as i64)
+                .await
+        {
+            log::warn!(target: "Client/TcToken", "Failed to record history sync sender_timestamp for {}: {e}", jid.observe());
+        }
+        log::debug!(target: "Client/TcToken", "Stored tctoken from history sync for {} (t={})", jid.observe(), candidate.tc_token_timestamp);
     }
 }
 
@@ -1104,5 +1095,25 @@ mod tests {
             Some(2000),
             "the placeholder's sender bucket must be preserved"
         );
+    }
+
+    #[tokio::test]
+    async fn history_sync_tctoken_seeds_sender_bucket() {
+        let client = crate::test_utils::create_test_client_with_name("history_tctoken_seed").await;
+        let backend = client.persistence_manager.backend();
+
+        // No prior local state — the candidate's own sender timestamp seeds it.
+        client
+            .store_tc_token_candidate(TcTokenCandidate {
+                id: "555000998@lid".to_string(),
+                tc_token: vec![0x01],
+                tc_token_timestamp: 1000,
+                tc_token_sender_timestamp: Some(1500),
+            })
+            .await;
+
+        let stored = backend.get_tc_token("555000998").await.unwrap().unwrap();
+        assert_eq!(stored.token, vec![0x01]);
+        assert_eq!(stored.sender_timestamp, Some(1500));
     }
 }

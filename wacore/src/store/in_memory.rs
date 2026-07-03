@@ -584,7 +584,13 @@ impl ProtocolStore for InMemoryBackend {
     ) -> Result<()> {
         let mut s = self.state.lock().await;
         match s.tc_tokens.get_mut(jid) {
-            Some(entry) => entry.sender_timestamp = Some(sender_timestamp),
+            Some(entry) => {
+                entry.sender_timestamp = Some(
+                    entry
+                        .sender_timestamp
+                        .map_or(sender_timestamp, |e| e.max(sender_timestamp)),
+                );
+            }
             None => {
                 s.tc_tokens.insert(
                     jid.to_string(),
@@ -1183,6 +1189,29 @@ mod tests {
         );
         assert_eq!(merged.token_timestamp, 2000);
         assert_eq!(merged.sender_timestamp, Some(3000));
+    }
+
+    #[tokio::test]
+    async fn touch_sender_timestamp_only_advances() {
+        let backend = InMemoryBackend::new();
+        backend
+            .touch_tc_token_sender_timestamp("uadv", 5000)
+            .await
+            .unwrap();
+        // An older touch (e.g. a stale history-sync sender epoch) must not regress.
+        backend
+            .touch_tc_token_sender_timestamp("uadv", 3000)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_tc_token("uadv")
+                .await
+                .unwrap()
+                .unwrap()
+                .sender_timestamp,
+            Some(5000)
+        );
     }
 
     #[tokio::test]

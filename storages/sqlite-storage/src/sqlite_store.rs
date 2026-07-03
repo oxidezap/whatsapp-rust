@@ -3010,8 +3010,9 @@ impl ProtocolStore for SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            // On conflict touch only sender_timestamp so a concurrently stored
-            // real token (bytes + token_timestamp) is never overwritten.
+            // On conflict touch only sender_timestamp, and only to advance it,
+            // so a concurrently stored real token is never overwritten and the
+            // sender bucket never regresses.
             diesel::insert_into(tc_tokens::table)
                 .values((
                     tc_tokens::jid.eq(&jid),
@@ -3024,7 +3025,18 @@ impl ProtocolStore for SqliteStore {
                 .on_conflict((tc_tokens::jid, tc_tokens::device_id))
                 .do_update()
                 .set((
-                    tc_tokens::sender_timestamp.eq(Some(sender_timestamp)),
+                    // MAX(...) keeps the sender bucket advance-only; there is no
+                    // typed Diesel form for a scalar MAX, and `ON CONFLICT ...
+                    // WHERE` isn't expressible via the query builder.
+                    tc_tokens::sender_timestamp.eq(diesel::dsl::sql::<
+                        diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+                    >(
+                        "MAX(COALESCE(sender_timestamp, "
+                    )
+                    .bind::<diesel::sql_types::BigInt, _>(sender_timestamp)
+                    .sql("), ")
+                    .bind::<diesel::sql_types::BigInt, _>(sender_timestamp)
+                    .sql(")")),
                     tc_tokens::updated_at.eq(now),
                 ))
                 .execute(&mut conn)
@@ -4115,6 +4127,14 @@ mod tests {
         let b = store.get_tc_token("user@lid").await.unwrap().unwrap();
         assert_eq!(b.token, vec![7, 8, 9], "touch must keep the real token");
         assert_eq!(b.sender_timestamp, Some(6000));
+
+        // An older touch must not regress the sender bucket.
+        store
+            .touch_tc_token_sender_timestamp("user@lid", 1000)
+            .await
+            .unwrap();
+        let c = store.get_tc_token("user@lid").await.unwrap().unwrap();
+        assert_eq!(c.sender_timestamp, Some(6000), "touch is advance-only");
     }
 
     #[tokio::test]
