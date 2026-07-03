@@ -128,9 +128,16 @@ impl Client {
                     "inbound drain batch commit failed; Signal cache left unflushed so the server redelivers"
                 ))
             };
-        } else if drain_active && self.inbound_commit_batch.has_entries() {
+        } else if drain_active {
+            // Drain active but no live client to route the permit-held flush
+            // through (practically unreachable — the run loop holds a strong
+            // Arc). Fail closed regardless of has_entries(): an empty drain can
+            // still carry dirty SKDM-only advances with no rows, and a raw
+            // flush here would persist them rowless — the exact loss this
+            // batch-safe path exists to prevent. Leaving the cache unflushed
+            // makes the server redeliver.
             return Err(anyhow::anyhow!(
-                "client dropping with uncommitted drain entries; skipping Signal flush"
+                "client dropping while inbound drain is active; skipping Signal flush"
             ));
         }
         self.flush_signal_cache().await

@@ -304,7 +304,10 @@ impl Client {
     /// persist a ratchet advance for a message no batch has committed, turning
     /// its redelivery into an unrecoverable duplicate. During the drain the
     /// semaphore holds a single permit, so this fully serializes with stanza
-    /// processing; after the drain the batcher is empty and this no-ops.
+    /// processing. An empty batch is NOT a no-op: it still flushes the Signal
+    /// cache under the permit (idempotent when the cache is already clean), so
+    /// an out-of-band batch-safe caller that raced the drain finisher still
+    /// gets its advance persisted rather than silently skipped.
     ///
     /// With `deactivate`, this is the end-of-drain transition: commit the tail
     /// batch and switch the batcher to live mode under the same permit hold.
