@@ -760,7 +760,8 @@ impl SignalStoreCache {
     /// caches under their locks.
     ///
     /// Session entry counts include negative (`Absent`) and checked-out slots
-    /// — they occupy the map — while bytes cover present records only.
+    /// — they occupy the map. Byte totals include the key length for every
+    /// slot, but the estimated record payload only for `Present` entries.
     pub async fn memory_stats(
         &self,
     ) -> (
