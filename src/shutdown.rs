@@ -1,27 +1,13 @@
-//! Process shutdown-signal handling for the bundled binaries.
+//! Graceful-shutdown signal for the bundled binaries.
 //!
-//! Container/service supervisors stop a process by sending **SIGTERM** and only
-//! escalate to an unblockable SIGKILL after a grace period (`docker stop`
-//! defaults to 10s). Watching only SIGINT (`Ctrl+C`) means SIGTERM goes
-//! unhandled, so the process burns the whole grace period and is hard-killed —
-//! skipping the flush/disconnect that graceful shutdown performs.
-//!
-//! This bites hardest under this project's Docker image: the static binary is
-//! the `scratch` entrypoint, so it runs as **PID 1**, and the kernel drops any
-//! signal for which PID 1 has no handler installed. An unhandled SIGTERM is
-//! therefore silently ignored rather than terminating the process, guaranteeing
-//! the 10s timeout on every `docker stop`.
-//!
-//! [`shutdown_signal`] resolves on the first of SIGINT or SIGTERM (Ctrl+C only
-//! on non-Unix, the sole portable stop signal Tokio exposes there), so wiring it
-//! into a `tokio::select!` is enough to make `docker stop` graceful.
+//! Watches SIGINT *and* SIGTERM (Ctrl+C only on non-Unix): supervisors like
+//! `docker stop` send SIGTERM, and as PID 1 in a `scratch` image the kernel
+//! silently drops any signal without an installed handler — so a `ctrl_c()`-only
+//! wait never runs cleanup and is SIGKILLed after the stop timeout.
 
-/// Resolves when the process is asked to stop (SIGINT or SIGTERM on Unix,
-/// Ctrl+C elsewhere).
-///
-/// Both signal handlers are installed synchronously before the returned future
-/// first suspends, so a signal that arrives afterwards is delivered rather than
-/// lost. Compose it with the run loop:
+/// Resolves on the first stop signal: SIGINT or SIGTERM on Unix, Ctrl+C
+/// elsewhere. Both handlers are armed before the future first suspends, so a
+/// signal arriving afterwards is delivered, not missed.
 ///
 /// ```no_run
 /// # async fn f(mut handle: whatsapp_rust::bot::BotHandle) {
@@ -35,23 +21,27 @@
 pub async fn shutdown_signal() {
     use tokio::signal::unix::{Signal, SignalKind, signal};
 
+    // Realistically unreachable for SIGINT/SIGTERM (only uncatchable signals
+    // fail to register); degrade to whichever installs instead of panicking in
+    // a top-level shutdown path.
     fn install(kind: SignalKind, name: &str) -> Option<Signal> {
-        match signal(kind) {
-            Ok(sig) => Some(sig),
-            // Realistically unreachable for SIGINT/SIGTERM (only uncatchable
-            // signals fail to register). Degrade to whichever handler did
-            // install instead of panicking in a top-level shutdown path.
-            Err(e) => {
-                log::error!("shutdown_signal: failed to install {name} handler: {e}");
-                None
-            }
-        }
+        signal(kind)
+            .inspect_err(|e| log::error!("shutdown_signal: cannot watch {name}: {e}"))
+            .ok()
     }
 
     // Registered up front (before the first await) so both are armed by the
     // time either can fire.
     let mut sigint = install(SignalKind::interrupt(), "SIGINT");
     let mut sigterm = install(SignalKind::terminate(), "SIGTERM");
+
+    if sigint.is_none() && sigterm.is_none() {
+        // Neither installed: the future below can never resolve, so graceful
+        // stop is off. Say so loudly rather than parking silently forever.
+        log::error!(
+            "shutdown_signal: no stop signal could be installed; graceful shutdown disabled"
+        );
+    }
 
     async fn wait(sig: &mut Option<Signal>) {
         match sig {
