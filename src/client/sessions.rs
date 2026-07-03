@@ -45,12 +45,7 @@ impl Client {
                 "complete_offline_sync: self_weak upgrade failed; dropping the drain tail and switching to live mode"
             );
             self.inbound_commit_batch.force_live_dropping_entries();
-            self.offline_sync_completed.store(true, Ordering::Release);
-            self.swap_message_semaphore(64);
-            self.offline_sync_notifier.notify(usize::MAX);
-            self.core
-                .event_bus
-                .dispatch(Event::OfflineSyncCompleted(OfflineSyncCompleted { count }));
+            self.publish_offline_sync_live_state(count, None);
             return;
         };
 
@@ -90,36 +85,43 @@ impl Client {
             return;
         }
 
-        // Readers that observe offline_sync_completed=true short-circuit
-        // without touching the semaphore (wait_for_offline_delivery_end
-        // returns early), so the ordering of flag flip vs. semaphore swap is
-        // not observable: any in-flight worker keeps using its old 1-permit
-        // Arc and drains normally; newly-spawned workers pick up the 64-permit
-        // semaphore via read_message_semaphore().
+        self.publish_offline_sync_live_state(count, Some(durable));
+    }
+
+    /// The drain→live state publication, shared by the finisher and its
+    /// upgrade-failure fallback (non-async so the codegen stays out of their
+    /// state machines).
+    ///
+    /// Readers that observe offline_sync_completed=true short-circuit without
+    /// touching the semaphore (wait_for_offline_delivery_end returns early),
+    /// so the ordering of flag flip vs. semaphore swap is not observable: any
+    /// in-flight worker keeps using its old 1-permit Arc and drains normally;
+    /// newly-spawned workers pick up the 64-permit semaphore via
+    /// read_message_semaphore(). The flag flip happens-before the receipt
+    /// drain takes the buffer lock, so late offline receipts either land in
+    /// the flush or observe the flag and send 1:1
+    /// (see try_buffer_offline_receipt).
+    ///
+    /// `durable`: `Some(true)` flushes the buffered offline receipts;
+    /// `Some(false)` drops them — the tail's durable write failed, its entries
+    /// are back in the batcher unacked, and receipting SKDM/session state that
+    /// never became durable would trade a redeliverable failure for a
+    /// crash-permanent one. `None` (upgrade-failure fallback) leaves the
+    /// buffer alone for the connection-state reset to clear.
+    fn publish_offline_sync_live_state(&self, count: i32, durable: Option<bool>) {
         self.offline_sync_completed.store(true, Ordering::Release);
-
-        // Allow parallel message processing now that offline sync is done.
         self.swap_message_semaphore(64);
-
-        if durable {
-            // The flag flip above happens-before this drain takes the buffer
-            // lock, so late offline receipts either land in this flush or
-            // observe the flag and send 1:1 (see try_buffer_offline_receipt).
-            self.flush_offline_receipts();
-        } else {
-            // The tail's durable write failed: its entries are back in the
-            // batcher, unacked. Buffered receipts must not go out either —
-            // they may cover SKDM/session state that never became durable, and
-            // receipting those would trade a redeliverable failure for a
-            // crash-permanent one. Everything unacked redelivers next connect.
-            log::warn!(
-                "finish_offline_sync: tail commit not durable; dropping buffered offline receipts so the server redelivers"
-            );
-            self.clear_offline_receipt_buffer();
+        match durable {
+            Some(true) => self.flush_offline_receipts(),
+            Some(false) => {
+                log::warn!(
+                    "finish_offline_sync: tail commit not durable; dropping buffered offline receipts so the server redelivers"
+                );
+                self.clear_offline_receipt_buffer();
+            }
+            None => {}
         }
-
         self.offline_sync_notifier.notify(usize::MAX);
-
         self.core
             .event_bus
             .dispatch(Event::OfflineSyncCompleted(OfflineSyncCompleted { count }));

@@ -379,6 +379,7 @@ impl Client {
     /// advances for entries without a durable buffered row. Returns whether
     /// that follow-up flush is safe: on a failed commit the entries are back
     /// in the batcher (unbuffered), and the caller must skip its flush.
+    #[must_use = "a false result means the entries are back in the batcher and the follow-up Signal flush must be skipped"]
     pub(crate) async fn commit_inbound_batch_holding_permit(self: &Arc<Self>) -> bool {
         let batch = self.inbound_commit_batch.take();
         if batch.is_empty() {
