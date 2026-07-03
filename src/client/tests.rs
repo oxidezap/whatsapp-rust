@@ -2359,6 +2359,28 @@ fn test_fibonacci_backoff_first_attempt_is_1s() {
     );
 }
 
+// ── connection stability / backoff reset (WA Web resetDelay) ────────
+
+#[test]
+fn connection_was_stable_requires_uptime_window() {
+    // Never authenticated this cycle → not stable, whatever the clock says.
+    assert!(!connection_was_stable(0, 1_000_000));
+    // Authenticated but dropped inside the 30s window → keep escalating.
+    let start = 1_000_000i64;
+    assert!(!connection_was_stable(
+        start,
+        start + Client::STABLE_CONNECTION_RESET_MS - 1
+    ));
+    // Survived the full window → eligible to reset the backoff.
+    assert!(connection_was_stable(
+        start,
+        start + Client::STABLE_CONNECTION_RESET_MS
+    ));
+    assert!(connection_was_stable(start, start + 60_000));
+    // A backwards clock jump must not underflow into a spurious reset.
+    assert!(!connection_was_stable(start, start - 5_000));
+}
+
 // ── stream error tests ─────────────────────────────────────────────
 
 #[tokio::test]

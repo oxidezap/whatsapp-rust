@@ -626,7 +626,13 @@ impl Client {
             "Successfully authenticated with WhatsApp servers! (gen={})",
             current_generation
         );
-        self.auto_reconnect_errors.store(0, Ordering::Relaxed);
+        // Record the auth time but DON'T reset the backoff counter yet: WA Web
+        // resets only after the connection has been stable for ~30s
+        // (`resetDelay`). Resetting on <success> alone lets a server that
+        // authenticates then immediately drops keep us in a 1s reconnect storm.
+        // The run loop does the stability-gated reset on the next disconnect.
+        self.connected_at_ms
+            .store(wacore::time::now_millis(), Ordering::Relaxed);
 
         self.update_server_time_offset(node);
 
@@ -1170,7 +1176,19 @@ impl Client {
                     // WA Web (StreamError.js) knows <stream:error><ack/> (type "ack");
                     // name it instead of "Unknown". Root cause is usually an un-acked
                     // offline stanza; the server's <xmlstreamend/> drives the reconnect.
-                    if let Some(ack) = node.get_optional_child("ack") {
+                    if node.get_optional_child("xml-not-well-formed").is_some() {
+                        // WA Web (Handle/StreamError.js): "bad xml, closing socket"
+                        // → CLOSE_SOCKET. A malformed frame desyncs the stream, so
+                        // recycle the socket proactively instead of keeping the
+                        // broken connection and waiting for the server to end it.
+                        // Counts toward the reconnect backoff (not an expected
+                        // disconnect); is_logged_in clears so sends bail fast.
+                        warn!(
+                            "Stream error <xml-not-well-formed>: closing socket to recycle the stream"
+                        );
+                        self.is_logged_in.store(false, Ordering::Relaxed);
+                        should_disconnect = true;
+                    } else if let Some(ack) = node.get_optional_child("ack") {
                         let id = ack
                             .get_attr("id")
                             .map(|v| v.as_str().to_string())

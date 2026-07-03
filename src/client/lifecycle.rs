@@ -7,6 +7,10 @@ use super::*;
 const GROUP_DEVICES_MEMO_CAPACITY: u64 = 64;
 
 impl Client {
+    /// WA Web `resetDelay: 30000` — only after a connection has stayed up this
+    /// long is the reconnect backoff counter reset to its base.
+    pub(crate) const STABLE_CONNECTION_RESET_MS: i64 = 30_000;
+
     pub fn shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
         self.shutdown_notifier.subscribe()
     }
@@ -202,6 +206,7 @@ impl Client {
 
             enable_auto_reconnect: Arc::new(AtomicBool::new(true)),
             auto_reconnect_errors: Arc::new(AtomicU32::new(0)),
+            connected_at_ms: Arc::new(portable_atomic::AtomicI64::new(0)),
 
             needs_initial_full_sync: Arc::new(AtomicBool::new(false)),
 
@@ -394,6 +399,15 @@ impl Client {
                 self.auto_reconnect_errors.store(0, Ordering::Relaxed);
                 info!("Expected disconnect (e.g., 515), reconnecting immediately...");
                 continue;
+            }
+
+            // Reset the backoff only after a stable connection (WA Web
+            // `resetDelay`): a socket that authenticated and then survived
+            // >= STABLE_CONNECTION_RESET_MS is healthy. A flapping server that
+            // authenticates then drops within the window keeps escalating.
+            let connected_at = self.connected_at_ms.swap(0, Ordering::Relaxed);
+            if connection_was_stable(connected_at, wacore::time::now_millis()) {
+                self.auto_reconnect_errors.store(0, Ordering::Relaxed);
             }
 
             let error_count = self.auto_reconnect_errors.fetch_add(1, Ordering::SeqCst);

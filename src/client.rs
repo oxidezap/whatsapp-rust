@@ -46,7 +46,7 @@ use rand::{Rng, RngExt};
 use scopeguard;
 use wacore_binary::Jid;
 
-use portable_atomic::AtomicU64;
+use portable_atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -530,6 +530,12 @@ pub struct Client {
     /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
     /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
     pub(crate) auto_reconnect_errors: Arc<AtomicU32>,
+    /// Wall-clock ms of the last successful authentication (`<success>`), or 0.
+    /// The Fibonacci backoff counter is reset only after a connection has been
+    /// stable for [`STABLE_CONNECTION_RESET_MS`](Self::STABLE_CONNECTION_RESET_MS)
+    /// — mirroring WA Web's `resetDelay: 30000` — so a server that authenticates
+    /// then immediately drops cannot defeat the exponential backoff.
+    pub(crate) connected_at_ms: Arc<AtomicI64>,
 
     pub(crate) needs_initial_full_sync: Arc<AtomicBool>,
 
@@ -936,6 +942,16 @@ fn is_encrypt_identity_notification(node: &wacore_binary::NodeRef<'_>) -> bool {
             .get_attr("type")
             .is_some_and(|v| v.as_str() == "encrypt")
         && node.get_optional_child("identity").is_some()
+}
+
+/// Whether a connection that authenticated at `connected_at_ms` (0 = never
+/// authenticated this cycle) and dropped at `now_ms` stayed up long enough to
+/// reset the reconnect backoff — WA Web's `resetDelay` (30s) semantics. A
+/// server that authenticates then drops inside the window keeps the backoff
+/// escalating instead of snapping back to the 1s base.
+pub(crate) fn connection_was_stable(connected_at_ms: i64, now_ms: i64) -> bool {
+    connected_at_ms != 0
+        && now_ms.saturating_sub(connected_at_ms) >= Client::STABLE_CONNECTION_RESET_MS
 }
 
 /// Computes a reconnect delay matching WhatsApp Web's Fibonacci backoff:

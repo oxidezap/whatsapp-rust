@@ -405,6 +405,33 @@ impl Client {
         Ok((id, key_pair.public_key))
     }
 
+    /// WA Web `markKeyAsUploaded`: exclude a one-time prekey that was handed out
+    /// directly (a retry-receipt `<keys>` bundle) from the next batch upload's
+    /// server offer, so the same id is never both direct-distributed AND pooled.
+    /// [`get_or_gen_single_pre_key`](Self::get_or_gen_single_pre_key) always
+    /// returns the current window head (`first_unupload_pre_key_id`), so marking
+    /// advances the low watermark one id past it (wrapping at the 24-bit edge
+    /// like the planner). Idempotent: a no-op if the head already moved (e.g. a
+    /// concurrent batch upload). Caller must hold `prekey_upload_lock`.
+    pub(crate) async fn mark_single_prekey_uploaded(&self, id: u32) -> Result<(), anyhow::Error> {
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        if device_snapshot.first_unupload_pre_key_id != id {
+            return Ok(());
+        }
+        let next_first = if id >= MAX_PREKEY_ID { 1 } else { id + 1 };
+        self.persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: device_snapshot.next_pre_key_id,
+                first_unupload_pre_key_id: next_first,
+            })
+            .await;
+        self.persistence_manager
+            .flush()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to flush prekey watermark after mark: {e:?}"))?;
+        Ok(())
+    }
+
     /// Generate and upload the configured number of pre-keys (see
     /// [`Client::set_wanted_pre_key_count`]). Shared by `upload_pre_keys` and
     /// `upload_pre_keys_at_login` to avoid redundant server count queries.
@@ -1102,6 +1129,37 @@ mod window_tests {
         let (next, first) = snapshot(&client);
         assert_eq!(first, id3);
         assert_eq!(next, id3 + 1);
+    }
+
+    /// WA Web `markKeyAsUploaded`: a retry-distributed prekey must leave the
+    /// unuploaded window so the next batch upload does not re-offer it (which
+    /// would let a third party consume the same one-time id).
+    #[tokio::test]
+    async fn marking_retry_prekey_uploaded_excludes_it_from_reuse() {
+        let client = crate::test_utils::create_test_client_with_name("prekey_mark_uploaded").await;
+
+        let (id1, _) = client.get_or_gen_single_pre_key().await.expect("gen");
+        let (next, first) = snapshot(&client);
+        assert_eq!(first, id1);
+        assert_eq!(next, id1 + 1);
+
+        client.mark_single_prekey_uploaded(id1).await.expect("mark");
+        let (next2, first2) = snapshot(&client);
+        assert_eq!(
+            first2,
+            id1 + 1,
+            "low watermark advances past the marked key"
+        );
+        assert_eq!(next2, id1 + 1, "window is now empty");
+
+        // The next retry key is a fresh id, not a reuse of the marked one.
+        let (id2, _) = client.get_or_gen_single_pre_key().await.expect("fresh");
+        assert_ne!(id2, id1, "marked key must not be reused");
+
+        // Marking with a now-stale id is a no-op (idempotent, head already moved).
+        client.mark_single_prekey_uploaded(id1).await.expect("noop");
+        let (_, first3) = snapshot(&client);
+        assert_eq!(first3, id2, "stale mark leaves the current head untouched");
     }
 
     /// A consumed window head must not abandon the live keys behind it: the

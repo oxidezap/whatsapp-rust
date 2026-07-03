@@ -1111,13 +1111,18 @@ impl Client {
             .build();
 
         let keys_node = if wacore::protocol::retry::should_include_keys(retry_count, reason) {
-            // WA Web's getOrGenSinglePreKey = getOrGenPreKeys(1): the retry
-            // prekey is the first unuploaded window key (reused when one is
-            // left over, freshly generated and stored otherwise) and the next
-            // batch upload re-offers it to the server pool. Hold
-            // prekey_upload_lock to serialize the watermark math with uploads.
+            // WA Web's getOrGenSinglePreKey = getOrGenPreKeys(1) followed by
+            // markKeyAsUploaded + markPreKeyAsDirectDistribution: the retry
+            // prekey is handed directly to the peer, so it must NOT also be
+            // re-offered to the server pool — otherwise a third party could
+            // fetch and consume the same one-time id, and one of the two pkmsgs
+            // then fails to decrypt (we delete the private key on first use),
+            // forcing that party into its own retry cycle. Hold
+            // prekey_upload_lock so get-or-gen and the mark-uploaded watermark
+            // advance are one atomic step against the batch upload path.
             let prekey_guard = self.prekey_upload_lock.lock().await;
             let (new_prekey_id, new_prekey_public) = self.get_or_gen_single_pre_key().await?;
+            self.mark_single_prekey_uploaded(new_prekey_id).await?;
             drop(prekey_guard);
             let device_snapshot = self.persistence_manager.get_device_snapshot();
 
