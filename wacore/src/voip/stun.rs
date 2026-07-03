@@ -237,28 +237,42 @@ pub fn is_whatsapp_pong(data: &[u8], transaction_id: Option<&[u8]>) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StunAttribute {
+pub struct StunAttribute<'a> {
     pub attr_type: u16,
-    pub value: Vec<u8>,
+    /// Borrows the packet: parsing a handshake's attributes no longer copies
+    /// each value out (it was one heap `Vec` per attribute).
+    pub value: &'a [u8],
 }
 
-/// Parse the STUN attributes after the 20-byte header.
-pub fn parse_stun_attributes(data: &[u8]) -> Vec<StunAttribute> {
+/// The 4-byte STUN attribute TLV header (type, length), as a typed view so the
+/// walk reads fields instead of doing index math per attribute.
+#[derive(zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable, zerocopy::Unaligned)]
+#[repr(C)]
+struct StunAttrHeader {
+    attr_type: zerocopy::big_endian::U16,
+    length: zerocopy::big_endian::U16,
+}
+
+/// Parse the STUN attributes after the 20-byte header, borrowing each value.
+pub fn parse_stun_attributes(data: &[u8]) -> Vec<StunAttribute<'_>> {
     if !is_stun_packet(data) || data.len() < 20 {
         return Vec::new();
     }
     let mut attrs = Vec::new();
     let mut off = 20;
-    while off + 4 <= data.len() {
-        let attr_type = ((data[off] as u16) << 8) | data[off + 1] as u16;
-        let len = ((data[off + 2] as usize) << 8) | data[off + 3] as usize;
+    // `data.get(off..)` not `&data[off..]`: a truncated final padding can push
+    // `off` past the end, and a bare slice there panics on an untrusted packet.
+    while let Some(rest) = data.get(off..)
+        && let Ok((hdr, _)) = zerocopy::Ref::<_, StunAttrHeader>::from_prefix(rest)
+    {
+        let len = hdr.length.get() as usize;
         off += 4;
         if off + len > data.len() {
             break;
         }
         attrs.push(StunAttribute {
-            attr_type,
-            value: data[off..off + len].to_vec(),
+            attr_type: hdr.attr_type.get(),
+            value: &data[off..off + len],
         });
         off += len + pad4(len);
     }
@@ -524,6 +538,22 @@ mod tests {
         assert_eq!(attrs[0].value, hexd(&k, &["stun", "relayToken"]));
         assert_eq!(attrs[1].attr_type, ATTR_MESSAGE_INTEGRITY);
         assert_eq!(attrs[1].value.len(), 20);
+    }
+
+    /// A truncated final padding pushes the cursor past the packet end; the walk
+    /// must stop, not panic slicing `data[off..]` on an untrusted relay packet.
+    #[test]
+    fn parse_attributes_truncated_padding_does_not_panic() {
+        // 20-byte STUN header + one attribute: type, length=1, one value byte,
+        // and no padding bytes at all. Consuming it advances off to 28 with only
+        // 25 bytes present.
+        let mut p = vec![0u8; 20];
+        p[0] = 0x00; // STUN-looking first byte
+        p.extend_from_slice(&[0x40, 0x00, 0x00, 0x01, 0xAB]);
+        assert_eq!(p.len(), 25);
+        let attrs = parse_stun_attributes(&p);
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].value, [0xAB]);
     }
 
     #[test]

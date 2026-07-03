@@ -35,7 +35,7 @@ js = ["getrandom/wasm_js"]
 # VoIP/calls media crypto (SRTP, SFrame, WAHKDF). Pure, no-Tokio. Off by default:
 # the media plane is opt-in and pulls aes-gcm into the non-dev build. The MLow codec's
 # runtime constant tables are zlib-compressed protobuf (buffa, see tables.proto).
-voip = ["dep:aes-gcm"]
+voip = ["dep:aes-gcm", "dep:zerocopy"]
 # Heap profiling of the codec hot paths via the `voip_profile` example (dhat as global allocator).
 # Dev/profiling only; off by default and not pulled into normal builds.
 dhat-heap = ["dep:dhat"]
@@ -43,6 +43,7 @@ dhat-heap = ["dep:dhat"]
 [dependencies]
 aes = { workspace = true }
 aes-gcm = { workspace = true, optional = true }
+zerocopy = { workspace = true, optional = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
 async-lock = { workspace = true }
