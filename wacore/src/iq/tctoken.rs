@@ -380,14 +380,6 @@ pub fn build_tc_token_node(token: &[u8]) -> Node {
     NodeBuilder::new("tctoken").bytes(token.to_vec()).build()
 }
 
-/// Build a `<tctoken>` stanza child with timestamp attribute.
-pub fn build_tc_token_node_with_timestamp(token: &[u8], timestamp: i64) -> Node {
-    NodeBuilder::new("tctoken")
-        .attr("t", timestamp)
-        .bytes(token.to_vec())
-        .build()
-}
-
 /// Which privacy token (if any) to attach to an outgoing 1:1 message stanza.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivacyTokenChoice {
@@ -661,16 +653,6 @@ mod tests {
             Some(NodeContent::Bytes(data)) => assert_eq!(data, &[0x01, 0x02, 0x03]),
             _ => panic!("Expected binary content"),
         }
-    }
-
-    #[test]
-    fn test_build_tc_token_node_with_timestamp() {
-        let node = build_tc_token_node_with_timestamp(&[0x01], 1707000000);
-        assert_eq!(node.tag, "tctoken");
-        assert_eq!(
-            node.attrs().optional_string("t").as_deref(),
-            Some("1707000000")
-        );
     }
 
     #[test]

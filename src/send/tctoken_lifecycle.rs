@@ -129,37 +129,30 @@ impl Client {
         }
 
         let issuance_jid = self.resolve_issuance_jid(to).await;
-        let Ok(response) = self
+        // WA Web's sendTcToken ignores the response body — the echoed token, if
+        // any, is not the one we attach (that comes from the privacy_token
+        // notification). Only the sender-side timestamp is recorded on success.
+        if let Err(e) = self
             .execute(IssuePrivacyTokensSpec::new(std::slice::from_ref(
                 &issuance_jid,
             )))
             .await
-        else {
-            log::debug!(target: "Client/TcToken", "Failed to issue tc_token for {}", issuance_jid.observe());
+        {
+            log::debug!(target: "Client/TcToken", "Failed to issue tc_token for {}: {e}", issuance_jid.observe());
             return;
-        };
-
-        // Persist any echoed tokens (forward-compatible; the real `set privacy`
-        // response carries none — WA Web ingests tokens only from the
-        // privacy_token notification).
-        self.store_issued_tc_tokens(&response.tokens).await;
+        }
         self.record_tc_token_sender_timestamp(to).await;
     }
 
-    /// Returns true if at least one token was persisted.
+    /// Persist tokens returned by the explicit `tc_token().issue_tokens()` API.
     pub(crate) async fn store_issued_tc_tokens(
         &self,
         tokens: &[wacore::iq::tctoken::ReceivedTcToken],
-    ) -> bool {
+    ) {
         use wacore::store::traits::TcTokenEntry;
-
-        if tokens.is_empty() {
-            return false;
-        }
 
         let backend = self.persistence_manager.backend();
         let now = wacore::time::now_secs();
-        let mut any_stored = false;
         for received in tokens {
             if received.token.is_empty() {
                 log::warn!(target: "Client/TcToken", "Server returned empty tc_token for {}, skipping", received.jid.observe());
@@ -174,11 +167,8 @@ impl Client {
 
             if let Err(e) = backend.put_tc_token(&received.jid.user, &entry).await {
                 log::warn!(target: "Client/TcToken", "Failed to store issued tc_token: {e}");
-            } else {
-                any_stored = true;
             }
         }
-        any_stored
     }
 
     /// Variant of [`store_issued_tc_tokens`] that preserves the original

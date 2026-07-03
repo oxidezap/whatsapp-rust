@@ -980,9 +980,15 @@ impl Client {
                             }
                         }
 
-                        // Re-issue tctoken so the contact still has a valid token for us
+                        // Re-issue tctoken so the contact still has a valid token for us.
+                        // WA Web ties re-issuance to a primary-device (device 0) identity
+                        // change (sendTcTokenWhenDeviceIdentityChange); companion-device
+                        // changes don't trigger it.
                         let sender_jid = info.source.sender.clone();
-                        if !sender_jid.is_bot() && !sender_jid.is_status_broadcast() {
+                        if sender_jid.device == 0
+                            && !sender_jid.is_bot()
+                            && !sender_jid.is_status_broadcast()
+                        {
                             let client = self.clone();
                             self.runtime
                                 .spawn(Box::pin(async move {
