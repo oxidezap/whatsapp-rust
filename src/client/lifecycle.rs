@@ -460,13 +460,20 @@ impl Client {
             .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Uncommitted batch entries were never acked; the server redelivers
-        // them on this fresh connection. The Signal cache needs no clear
-        // here: teardown settled it under the permit, and its generation
-        // bump plus the post-permit re-check guarantee no late lane worker
-        // dirtied it afterwards. Anything still resident is state a failed
-        // teardown flush deliberately retained (committed/acked, never
-        // redelivered) for the next successful flush to persist.
-        self.inbound_commit_batch.reset();
+        // them on this fresh connection. The cache decision is coupled to the
+        // drop: entries present here mean their cache-only ratchet advances
+        // have no rows (e.g. a stanza that outlived the teardown settle and
+        // enqueued late), and flushing those later would make each redelivery
+        // an ackable duplicate — so the cache falls with them. With nothing
+        // dropped, anything resident is state a failed teardown flush
+        // deliberately retained (committed/acked, never redelivered) for the
+        // next successful flush to persist.
+        if self.inbound_commit_batch.reset() {
+            log::warn!(
+                "connect: dropping unflushed Signal state along with late uncommitted drain entries"
+            );
+            self.signal_cache.clear().await;
+        }
         self.offline_batch.reset();
         self.outbound_flush.reopen();
 
@@ -810,8 +817,12 @@ impl Client {
             .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Same rule as receipts: uncommitted entries drop here and the server
-        // redelivers them on the next connect.
-        self.inbound_commit_batch.reset();
+        // redelivers them on the next connect. The cache falls with dropped
+        // entries (rowless advances — including a timed-out settle's restored
+        // batch); with nothing dropped it survives for the next flush.
+        if self.inbound_commit_batch.reset() {
+            self.signal_cache.clear().await;
+        }
         self.offline_batch.reset();
         self.offline_sync_metrics
             .active

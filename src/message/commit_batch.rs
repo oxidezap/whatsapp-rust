@@ -150,8 +150,11 @@ impl InboundCommitBatcher {
 
     /// Connection teardown/setup: drop uncommitted entries (they were never
     /// acked, so the server redelivers them) and re-arm accumulation for the
-    /// next connection's drain.
-    pub(crate) fn reset(&self) {
+    /// next connection's drain. Returns whether entries were dropped — the
+    /// caller must drop the Signal cache with them (their cache-only ratchet
+    /// advances have no rows; flushing them later would make each redelivery
+    /// an ackable duplicate).
+    pub(crate) fn reset(&self) -> bool {
         let dropped = self.take();
         if !dropped.is_empty() {
             log::debug!(
@@ -161,6 +164,7 @@ impl InboundCommitBatcher {
         }
         self.pending_live.store(false, Ordering::Release);
         self.active.store(true, Ordering::Release);
+        !dropped.is_empty()
     }
 }
 
@@ -480,25 +484,18 @@ impl Client {
             .await
             .is_err()
         {
-            // Cancellation is synchronous: a commit cut down mid-durable-write
-            // has already restored its entries via the guard by the time the
-            // timeout returns, so has_entries() accurately distinguishes the
-            // two kinds of dirty state. With entries, the cache holds their
-            // rowless ratchet advances — drop both sides so redelivery stays
-            // consistent. Without entries, everything dirty is either
-            // redeliverable SKDM residue or committed state a failed earlier
-            // flush retained (never redelivered) — keep it for the next
-            // successful flush instead of destroying it.
-            if self.inbound_commit_batch.has_entries() {
-                log::warn!(
-                    "Timed out committing the inbound drain batch during teardown; dropping unflushed Signal state so redelivery stays consistent"
-                );
-                self.signal_cache.clear().await;
-            } else {
-                log::warn!(
-                    "Timed out settling the Signal cache during teardown; keeping it (no uncommitted entries) for the next successful flush"
-                );
-            }
+            // Keep the cache: the decision is owned by the reset-coupled
+            // clear (cleanup's and connect's batcher resets drop the cache
+            // whenever they drop entries). Deciding here would race the
+            // permit holder we timed out on — it may still be mid-decrypt
+            // with unenqueued advances that has_entries() cannot see, and it
+            // may enqueue after any clear done here. Whatever is dirty when
+            // the resets find NO entries is redeliverable SKDM residue or
+            // retained committed state, which the next successful flush
+            // persists.
+            log::warn!(
+                "Timed out settling the inbound drain during teardown; deferring the Signal-cache decision to the batcher reset"
+            );
         }
     }
 
