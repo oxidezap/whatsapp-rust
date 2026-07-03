@@ -563,9 +563,16 @@ impl Client {
             .offline_receipt_buffer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Batcher still active covers the deferred drain→live window: the
+        // completion flag is already set there, but SKDM-only stanzas keep
+        // mutating cache-only sender-key state, and a 1:1 receipt for one of
+        // them before the deferred retry flushes would trade a redeliverable
+        // failure for a crash-permanent one. Completion of the deferred
+        // transition flushes this buffer (after its durable flush).
         if self
             .offline_sync_completed
             .load(std::sync::atomic::Ordering::Acquire)
+            && !self.inbound_commit_batch.is_active()
         {
             return false;
         }

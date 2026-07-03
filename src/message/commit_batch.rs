@@ -385,6 +385,11 @@ impl Client {
     pub(crate) fn complete_deferred_live_transition(&self) {
         self.inbound_commit_batch.deactivate();
         self.swap_message_semaphore(64);
+        // Receipts buffered during the deferred window (SKDM-only stanzas
+        // keep buffering while the batcher is active) are safe to send now:
+        // the durable flush that triggered this completion persisted their
+        // Signal state.
+        self.flush_offline_receipts();
         log::info!("Deferred drain-to-live transition completed after a durable flush");
     }
 
@@ -475,10 +480,25 @@ impl Client {
             .await
             .is_err()
         {
-            log::warn!(
-                "Timed out committing the inbound drain batch during teardown; dropping unflushed Signal state so redelivery stays consistent"
-            );
-            self.signal_cache.clear().await;
+            // Cancellation is synchronous: a commit cut down mid-durable-write
+            // has already restored its entries via the guard by the time the
+            // timeout returns, so has_entries() accurately distinguishes the
+            // two kinds of dirty state. With entries, the cache holds their
+            // rowless ratchet advances — drop both sides so redelivery stays
+            // consistent. Without entries, everything dirty is either
+            // redeliverable SKDM residue or committed state a failed earlier
+            // flush retained (never redelivered) — keep it for the next
+            // successful flush instead of destroying it.
+            if self.inbound_commit_batch.has_entries() {
+                log::warn!(
+                    "Timed out committing the inbound drain batch during teardown; dropping unflushed Signal state so redelivery stays consistent"
+                );
+                self.signal_cache.clear().await;
+            } else {
+                log::warn!(
+                    "Timed out settling the Signal cache during teardown; keeping it (no uncommitted entries) for the next successful flush"
+                );
+            }
         }
     }
 
