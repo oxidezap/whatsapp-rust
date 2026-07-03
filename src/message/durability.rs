@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::types::durability_hook::InboundDurabilityHook;
-use wacore::types::events::InboundMessage;
+use wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
 
 impl Client {
     /// The registered inbound durability hook, if any. `None` (default) keeps
@@ -51,6 +51,19 @@ impl Client {
                                         );
                                     }
                                     self.ack_received_message(info);
+                                    // First successful commit of this message:
+                                    // its original batch never dispatched (the
+                                    // hook failed then), so consumers see it
+                                    // here or never.
+                                    let origin = if self.inbound_commit_batch.is_active() {
+                                        BatchOrigin::OfflineDrain
+                                    } else {
+                                        BatchOrigin::Live
+                                    };
+                                    self.core.event_bus.dispatch(Event::Messages(MessageBatch {
+                                        messages: Arc::from([item]),
+                                        origin,
+                                    }));
                                 }
                                 Err(e) => {
                                     log::warn!(
@@ -95,7 +108,6 @@ mod tests {
     use crate::test_utils::create_test_client_with_failing_http;
     use crate::types::message::MessageInfo;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use wacore::types::events::BatchOrigin;
 
     struct CountingHook {
         calls: AtomicUsize,
@@ -158,10 +170,11 @@ mod tests {
         let hook = counting_hook(true);
         let _ = client.inbound_durability_hook.set(hook.clone());
 
-        let items = vec![test_item("MSG_OK_1"), test_item("MSG_OK_2")];
+        let items: Arc<[InboundMessage]> =
+            Arc::from([test_item("MSG_OK_1"), test_item("MSG_OK_2")]);
         let infos: Vec<_> = items.iter().map(|i| Arc::clone(&i.info)).collect();
         client
-            .commit_inbound_batch(items, BatchOrigin::OfflineDrain, false)
+            .commit_inbound_batch(Arc::clone(&items), BatchOrigin::OfflineDrain, false)
             .await;
 
         assert_eq!(hook.calls.load(Ordering::SeqCst), 1, "one commit per batch");
@@ -196,13 +209,13 @@ mod tests {
         let info = test_info("MSG_ERR");
         client
             .commit_inbound_batch(
-                vec![InboundMessage {
+                Arc::from([InboundMessage {
                     message: Arc::new(wa::Message {
                         conversation: Some("hello".to_string()),
                         ..Default::default()
                     }),
                     info: Arc::clone(&info),
-                }],
+                }]),
                 BatchOrigin::OfflineDrain,
                 false,
             )
@@ -242,10 +255,22 @@ mod tests {
             "a still-failing hook keeps the buffered copy"
         );
 
-        // Redelivery once the commit succeeds clears the buffer.
+        // Redelivery once the commit succeeds clears the buffer AND finally
+        // dispatches the event (the original batch never did).
+        let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
+        client.core.event_bus.add_handler(handler);
         hook.succeed.store(true, Ordering::SeqCst);
         client.ack_or_replay_to_hook(&info).await;
         assert_eq!(hook.calls.load(Ordering::SeqCst), 3);
+        let event = rx.try_recv().expect("successful replay must dispatch");
+        assert_eq!(
+            event
+                .messages()
+                .map(|m| m.info.id.as_str())
+                .collect::<Vec<_>>(),
+            ["MSG_ERR"],
+            "consumers must observe a message whose hook only succeeded on replay"
+        );
         assert!(
             backend
                 .get_pending_inbound(

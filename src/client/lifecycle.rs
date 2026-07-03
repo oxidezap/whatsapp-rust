@@ -744,6 +744,19 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        // Commit any accumulated drain batch BEFORE the Signal flush below:
+        // persisting ratchet advances while dropping their uncommitted batch
+        // entries would turn each redelivery into an ackable duplicate with no
+        // buffered copy — silent loss for hook consumers. Acks/events from
+        // this commit are best-effort (the socket is gone); the durable hook
+        // commit is what matters. Reached on every teardown path, including
+        // the run loop's unexpected read-loop exit, which never goes through
+        // disconnect().
+        if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
+            client
+                .flush_inbound_commits_bounded(std::time::Duration::from_secs(5))
+                .await;
+        }
         // Flush before clear: clear() drops dirty entries, so a disconnect
         // racing an in-flight encrypt would lose the just-advanced sender-key
         // chain and force a full SKDM re-fanout. A disconnect is not a logout.
