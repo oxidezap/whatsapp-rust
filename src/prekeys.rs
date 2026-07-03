@@ -421,10 +421,13 @@ impl Client {
             return Ok(());
         }
         let next_first = if id >= MAX_PREKEY_ID { 1 } else { id + 1 };
-        // At the 24-bit edge a preceding allocation leaves NEXT at MAX+1 (out of
-        // range); collapse it onto the wrapped low watermark so the next window
-        // is empty ([next_first, next_first)) instead of a ~16M range.
-        let next_pre_key_id = if device_snapshot.next_pre_key_id > MAX_PREKEY_ID {
+        // Only when marking the terminal id itself (id == MAX) does a preceding
+        // allocation leave NEXT at MAX+1 (out of range); collapse it onto the
+        // wrapped low watermark so the next window is empty ([next_first,
+        // next_first)). Keying on NEXT alone would wrongly discard a non-terminal
+        // high-end window whose head sits just below MAX.
+        let next_pre_key_id = if id >= MAX_PREKEY_ID && device_snapshot.next_pre_key_id > MAX_PREKEY_ID
+        {
             next_first
         } else {
             device_snapshot.next_pre_key_id
@@ -1180,6 +1183,70 @@ mod window_tests {
         drop(guard);
         let (_, first3) = snapshot(&client);
         assert_eq!(first3, id2, "stale mark leaves the current head untouched");
+    }
+
+    /// Marking a non-terminal head near the 24-bit edge must NOT collapse NEXT:
+    /// only advancing past MAX itself wraps. Here the head sits at MAX-1 while
+    /// the window still holds MAX; keying the collapse on NEXT alone would drop
+    /// the surviving terminal key.
+    #[tokio::test]
+    async fn marking_near_boundary_head_preserves_terminal_window_key() {
+        use wacore::store::commands::DeviceCommand;
+
+        let client =
+            crate::test_utils::create_test_client_with_name("prekey_mark_near_boundary").await;
+        // Window [MAX-1, MAX+1): holds ids MAX-1 and MAX. NEXT is legitimately
+        // out of range (exclusive upper bound past the terminal id).
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: super::MAX_PREKEY_ID + 1,
+                first_unupload_pre_key_id: super::MAX_PREKEY_ID - 1,
+            })
+            .await;
+
+        let guard = client.prekey_upload_lock.lock().await;
+        client
+            .mark_single_prekey_uploaded(&guard, super::MAX_PREKEY_ID - 1)
+            .await
+            .expect("mark");
+        drop(guard);
+
+        let (next, first) = snapshot(&client);
+        assert_eq!(first, super::MAX_PREKEY_ID, "head advances onto the surviving key");
+        assert_eq!(
+            next,
+            super::MAX_PREKEY_ID + 1,
+            "NEXT untouched: terminal key MAX is still in the window"
+        );
+    }
+
+    /// Marking the terminal id itself DOES collapse: with NEXT already pinned at
+    /// MAX+1, the window must wrap to an empty low range, not a ~16M span.
+    #[tokio::test]
+    async fn marking_terminal_head_collapses_wrapped_window() {
+        use wacore::store::commands::DeviceCommand;
+
+        let client =
+            crate::test_utils::create_test_client_with_name("prekey_mark_terminal").await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: super::MAX_PREKEY_ID + 1,
+                first_unupload_pre_key_id: super::MAX_PREKEY_ID,
+            })
+            .await;
+
+        let guard = client.prekey_upload_lock.lock().await;
+        client
+            .mark_single_prekey_uploaded(&guard, super::MAX_PREKEY_ID)
+            .await
+            .expect("mark");
+        drop(guard);
+
+        let (next, first) = snapshot(&client);
+        assert_eq!(first, 1, "head wraps to the low watermark");
+        assert_eq!(next, 1, "NEXT collapses onto the wrapped head: window empty");
     }
 
     /// A consumed window head must not abandon the live keys behind it: the
