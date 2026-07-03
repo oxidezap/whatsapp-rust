@@ -135,10 +135,19 @@ impl Client {
             snapshot.signed_pre_key_signature,
             wacore::time::now_utc(),
         );
-        backend
+        // Best-effort: the server already accepted new_id, so promotion must
+        // proceed even if retaining the old key fails — otherwise local state
+        // stays on a key the server no longer advertises and new prekey sessions
+        // break. A failed retain only shortens the old key's decrypt window.
+        if let Err(e) = backend
             .store_signed_prekey(old_id, &old_record.encode_to_vec())
             .await
-            .map_err(|e| anyhow::anyhow!("failed to retain old signed pre-key: {e}"))?;
+        {
+            log::warn!(
+                "failed to retain old signed pre-key {old_id}: {e}; \
+                 continuing with server-accepted signed pre-key {new_id}"
+            );
+        }
 
         self.persistence_manager
             .process_command(DeviceCommand::SetSignedPreKey {
