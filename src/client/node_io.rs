@@ -662,12 +662,6 @@ impl Client {
                 // Don't fail login - PDO will retry via ensure_e2e_sessions fallback
             }
 
-            // Sync own device list so DM fan-out includes all companions
-            check_generation!();
-            if let Err(e) = client_clone.sync_own_device_list().await {
-                client_clone.log_sync_error("sync own device list", &e);
-            }
-
             check_generation!();
             if !client_clone.is_connected() {
                 debug!("Skipping passive tasks: connection closed");
@@ -722,7 +716,7 @@ impl Client {
                 }
 
                 debug!(
-                    "Sending background initialization queries (Props, Blocklist, Privacy, Digest)..."
+                    "Sending background initialization queries (Props, Blocklist, Privacy, Digest, Devices)..."
                 );
 
                 let props_fut = bg_client.fetch_props();
@@ -730,9 +724,19 @@ impl Client {
                 let blocklist_fut = binding.get_blocklist();
                 let privacy_fut = bg_client.fetch_privacy_settings();
                 let digest_fut = bg_client.validate_digest_key();
+                // Off the pre-active critical path: WA Web's passive tasks don't
+                // include an own-device usync (it resolves device lists on demand
+                // at send time), so syncing here instead of before the active IQ
+                // starts offline delivery one round-trip sooner.
+                let device_list_fut = bg_client.sync_own_device_list();
 
-                let (r_props, r_block, r_priv, r_digest) =
-                    futures::join!(props_fut, blocklist_fut, privacy_fut, digest_fut);
+                let (r_props, r_block, r_priv, r_digest, r_devices) = futures::join!(
+                    props_fut,
+                    blocklist_fut,
+                    privacy_fut,
+                    digest_fut,
+                    device_list_fut
+                );
 
                 // Suppress warnings if connection closed while queries were in-flight
                 if !bg_client.is_shutting_down() {
@@ -747,6 +751,9 @@ impl Client {
                     }
                     if let Err(e) = r_digest {
                         warn!("Background init: Failed to validate digest key: {e:?}");
+                    }
+                    if let Err(e) = r_devices {
+                        bg_client.log_sync_error("sync own device list", &e);
                     }
                 }
 
