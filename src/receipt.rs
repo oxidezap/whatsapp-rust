@@ -34,9 +34,9 @@ const MAX_RECEIPT_IDS_PER_STANZA: usize = 256;
 /// mirroring WA Web `WAWebSendPlayedReceiptJob`: newsletters use `played-self`,
 /// everything else `played`. The `participant` attr is set only for
 /// group/broadcast chats; in DMs WA Web drops it (`r.isUser() ? null : author`).
-/// `read_receipts_disabled` is the `readreceipts==none` privacy gate: a DM (not
-/// group, not status) then uses `played-self` (does not notify the sender),
-/// matching WA Web `PlayedReceiptJob.js`; groups are exempt.
+/// `read_receipts_disabled` is the `readreceipts==none` privacy gate: only a DM
+/// (not group, status, or broadcast list) then uses `played-self` (does not
+/// notify the sender), matching WA Web `PlayedReceiptJob.js`.
 fn build_played_receipt_node(
     chat: &Jid,
     sender: Option<&Jid>,
@@ -44,7 +44,8 @@ fn build_played_receipt_node(
     timestamp: &str,
     read_receipts_disabled: bool,
 ) -> wacore_binary::Node {
-    let is_private_dm = !chat.is_group() && !chat.is_status_broadcast();
+    let is_private_dm =
+        !chat.is_group() && !chat.is_status_broadcast() && !chat.is_broadcast_list();
     let receipt_type = if chat.is_newsletter() || (read_receipts_disabled && is_private_dm) {
         ReceiptType::PlayedSelf
     } else {
@@ -78,9 +79,9 @@ fn build_played_receipt_node(
 /// `WAWebSendReadReceiptJob` + `sendAggregateReceipts`: newsletters use
 /// `read-self`, everything else `read`; status reads carry `context="status"`
 /// and, for a LID author, `peer_participant_pn` (the resolved LID->PN).
-/// `read_receipts_disabled` is the `readreceipts==none` privacy gate: a DM (not
-/// group, not status) then uses `read-self` (does not notify the sender),
-/// matching WA Web `ReadReceiptJob.js`; groups are exempt.
+/// `read_receipts_disabled` is the `readreceipts==none` privacy gate: only a DM
+/// (not group, status, or broadcast list) then uses `read-self` (does not notify
+/// the sender), matching WA Web `ReadReceiptJob.js`.
 fn build_read_receipt_node(
     chat: &Jid,
     sender: Option<&Jid>,
@@ -89,7 +90,8 @@ fn build_read_receipt_node(
     peer_participant_pn: Option<&Jid>,
     read_receipts_disabled: bool,
 ) -> wacore_binary::Node {
-    let is_private_dm = !chat.is_group() && !chat.is_status_broadcast();
+    let is_private_dm =
+        !chat.is_group() && !chat.is_status_broadcast() && !chat.is_broadcast_list();
     let receipt_type = if chat.is_newsletter() || (read_receipts_disabled && is_private_dm) {
         ReceiptType::ReadSelf
     } else {
@@ -1217,6 +1219,20 @@ mod tests {
     fn group_receipts_ignore_privacy_gate() {
         // Privacy does not apply to groups: still `read`/`played` even when disabled.
         let chat: Jid = "120363021033254949@g.us".parse().expect("group jid");
+        let sender: Jid = "12025550143@s.whatsapp.net".parse().expect("sender jid");
+        let read = build_read_receipt_node(&chat, Some(&sender), &["MID"], "1", None, true);
+        assert_eq!(type_of(&read).as_deref(), Some("read"));
+        let played = build_played_receipt_node(&chat, Some(&sender), &["MID"], "1", true);
+        assert_eq!(type_of(&played).as_deref(), Some("played"));
+    }
+
+    #[test]
+    fn broadcast_list_receipts_ignore_privacy_gate() {
+        // Broadcast lists are group-adjacent (they carry `participant`), so the
+        // privacy gate must not downgrade them to `*-self` — matching WA Web.
+        let chat: Jid = "120363000000000001@broadcast"
+            .parse()
+            .expect("broadcast list jid");
         let sender: Jid = "12025550143@s.whatsapp.net".parse().expect("sender jid");
         let read = build_read_receipt_node(&chat, Some(&sender), &["MID"], "1", None, true);
         assert_eq!(type_of(&read).as_deref(), Some("read"));

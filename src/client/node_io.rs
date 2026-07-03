@@ -849,19 +849,23 @@ impl Client {
                     match r_priv {
                         Ok(settings) => {
                             use wacore::iq::privacy::{PrivacyCategory, PrivacyValue};
-                            // WA Web reads readreceipts from local prefs; we mirror it by
-                            // persisting the fetched value so DM read/played receipts gate to
-                            // `*-self` before the next connect's fetch even runs. This is the
-                            // refresh path: a change on another device is picked up here.
+                            // Persist so the gate is correct on reconnect before the next fetch
+                            // runs; this is also the cross-device refresh path (WA Web reads
+                            // readreceipts from local prefs).
                             let disabled = matches!(
                                 settings.get_value(&PrivacyCategory::ReadReceipts),
                                 Some(PrivacyValue::None)
                             );
-                            if disabled
-                                != bg_client
-                                    .persistence_manager
-                                    .get_device_snapshot()
-                                    .read_receipts_disabled
+                            // Re-check generation: after the fetch's round-trip a superseded
+                            // connection must not persist its now-stale privacy value.
+                            let stale = bg_client.connection_generation.load(Ordering::SeqCst)
+                                != bg_generation;
+                            if !stale
+                                && disabled
+                                    != bg_client
+                                        .persistence_manager
+                                        .get_device_snapshot()
+                                        .read_receipts_disabled
                             {
                                 bg_client
                                     .persistence_manager
