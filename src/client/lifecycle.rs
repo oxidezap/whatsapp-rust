@@ -470,10 +470,10 @@ impl Client {
         // exception is a teardown whose flush FAILED and retained
         // committed/acked state (never redelivered): keep that for the next
         // successful flush instead of destroying it.
-        if self
-            .signal_cache_retained_dirty
-            .swap(false, Ordering::AcqRel)
-        {
+        // load(), not swap(): a connect attempt that fails before any flush
+        // must not consume the flag, or the NEXT attempt would clear the
+        // retained cache. Only a successful flush_signal_cache resets it.
+        if self.signal_cache_retained_dirty.load(Ordering::Acquire) {
             log::warn!(
                 "connect: keeping Signal cache retained by a failed teardown flush; the next flush persists it"
             );

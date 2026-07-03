@@ -470,6 +470,8 @@ impl Client {
                 log::warn!(
                     "cleanup_connection_state: dropping unflushed Signal state for uncommitted drain entries; the server redelivers them"
                 );
+                self.signal_cache_retained_dirty
+                    .store(false, Ordering::Release);
                 self.signal_cache.clear().await;
             }
         };
