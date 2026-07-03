@@ -358,6 +358,7 @@ impl Client {
                 // flushes retry the commit, and the first durable one
                 // completes this transition.
                 self.inbound_commit_batch.defer_live_transition();
+                self.arm_deferred_transition_retry();
                 log::warn!(
                     "End-of-drain commit failed; staying in drain mode (single permit) until a durable flush completes the live transition"
                 );
@@ -379,6 +380,34 @@ impl Client {
         self.inbound_commit_batch.deactivate();
         self.swap_message_semaphore(64);
         log::info!("Deferred drain-to-live transition completed after a durable flush");
+    }
+
+    /// Retry loop for a deferred transition, armed once at defer time: the
+    /// guard restored the entries with their timer disarmed and the drain-end
+    /// flush has already run, so on an idle connection NOTHING else would
+    /// retry the commit — the tail (or dirty SKDM-only state) would sit
+    /// uncommitted until teardown. Exits as soon as the transition completes
+    /// (here or via any other durable flush) or a reconnect resets the
+    /// batcher.
+    fn arm_deferred_transition_retry(self: &Arc<Self>) {
+        let client = Arc::downgrade(self);
+        let runtime = self.runtime.clone();
+        self.runtime
+            .spawn(Box::pin(async move {
+                loop {
+                    runtime.sleep(FLUSH_TIMEOUT).await;
+                    let Some(client) = client.upgrade() else {
+                        return;
+                    };
+                    if !client.inbound_commit_batch.live_transition_pending() {
+                        return;
+                    }
+                    let _ = client
+                        .flush_inbound_commits_under_permit(false, None, None)
+                        .await;
+                }
+            }))
+            .detach();
     }
 
     /// [`flush_inbound_commits_under_permit`](Self::flush_inbound_commits_under_permit)
@@ -918,6 +947,45 @@ mod tests {
             vec![vec!["T1", "T2"]],
             "restored tail commits first, in arrival order"
         );
+    }
+
+    // With no further inbound traffic, the retry loop armed at defer time
+    // must commit the restored tail and complete the transition on its own.
+    #[tokio::test]
+    async fn deferred_transition_retries_automatically() {
+        let client = create_test_client_with_failing_http("batch_defer_retry").await;
+        client.inbound_commit_batch.reset();
+        client.swap_message_semaphore(1);
+        let hook = Arc::new(RecordingHook {
+            batches: Mutex::new(Vec::new()),
+        });
+        let _ = client.inbound_durability_hook.set(hook.clone());
+
+        client.commit_or_batch_inbound(item("R1")).await;
+        client
+            .inbound_commit_batch
+            .fail_commits
+            .store(true, Ordering::Release);
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(!client.finish_inbound_commit_drain(generation).await);
+        client
+            .inbound_commit_batch
+            .fail_commits
+            .store(false, Ordering::Release);
+
+        for _ in 0..100 {
+            if !client.inbound_commit_batch.is_active() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            !client.inbound_commit_batch.is_active(),
+            "the armed retry must complete the transition without new traffic"
+        );
+        assert_eq!(available_permits(&client), 64);
+        let batches = hook.batches.lock().expect("hook lock").clone();
+        assert_eq!(batches, vec![vec!["R1"]]);
     }
 
     fn available_permits(client: &Client) -> usize {
