@@ -301,30 +301,16 @@ impl Client {
         (arc, rx)
     }
 
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            name = "wa.conn.run",
-            level = "info",
-            skip_all,
-            fields(lid = tracing::field::Empty, pn = tracing::field::Empty)
-        )
-    )]
+    // Deliberately NOT instrumented: this span would live for the entire client
+    // lifetime, distorting duration/throughput metrics just like the removed
+    // keepalive-loop span. Identity (lid/pn) attribution comes from the
+    // per-operation spans (send/request), which record it themselves.
     pub async fn run(self: &Arc<Self>) {
         if self.is_running.swap(true, Ordering::SeqCst) {
             warn!("Client `run` method called while already running.");
             return;
         }
         while self.is_running.load(Ordering::Relaxed) {
-            // Re-record every iteration, not just once before the loop: a freshly-paired
-            // device has no lid/pn yet on the first pass, and dispatch_connected() (where
-            // pairing actually resolves them) runs in a detached spawned task with no
-            // ambient span to record onto. The next reconnect iteration — which happens
-            // routinely (server-initiated stream-end, network blips) — picks up the
-            // by-then-known identity on this same span instead.
-            #[cfg(feature = "tracing")]
-            self.record_identity_on_span(&tracing::Span::current());
-
             self.expected_disconnect.store(false, Ordering::Relaxed);
 
             if let Err(connect_err) = self.connect().await {
