@@ -208,6 +208,10 @@ impl<'a> Signal<'a> {
         )
         .await?;
 
+        // Chain mutation done; the batch-safe flush acquires the processing
+        // permit, and a permit holder can need this sender-key lock — release
+        // it first.
+        drop(_chain_guard);
         self.client.flush_signal_cache_batch_safe().await?;
 
         Ok((skdm_bytes, ciphertext.into_serialized().into_vec()))

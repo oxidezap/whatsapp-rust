@@ -744,9 +744,19 @@ impl Client {
                         // This stanza's processing permit is held here, and the
                         // full-cache flush below would otherwise persist ratchet
                         // advances for accumulated drain entries that have no
-                        // durable row yet — commit them first.
-                        if self.inbound_commit_batch.is_active() {
-                            self.commit_inbound_batch_holding_permit().await;
+                        // durable row yet — commit them first. A failed commit
+                        // restores the entries, so the flush must be skipped
+                        // too: the retry then fails and the message is
+                        // redelivered, instead of stranding those ratchets.
+                        if self.inbound_commit_batch.is_active()
+                            && !self.commit_inbound_batch_holding_permit().await
+                        {
+                            log::warn!(
+                                "Deferring identity-change flush for {}: the drain batch commit failed and its entries must stay unflushed",
+                                wacore::types::jid::observe_protocol_address(address)
+                            );
+                            outcome.had_failure = true;
+                            continue;
                         }
                         // Flush immediately so the backend is updated BEFORE the retry decrypt below.
                         // Device::is_trusted_identity reads from backend, not cache.

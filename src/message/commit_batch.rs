@@ -231,7 +231,7 @@ impl Client {
                         // size-trigger flush racing this sleeper must not let
                         // it commit a batch that is only milliseconds old.
                         let _ = client
-                            .flush_inbound_commits_under_permit(false, Some(epoch))
+                            .flush_inbound_commits_under_permit(false, Some(epoch), None)
                             .await;
                     }
                 }))
@@ -277,8 +277,17 @@ impl Client {
         self: &Arc<Self>,
         deactivate: bool,
         expected_epoch: Option<u64>,
+        expected_generation: Option<u64>,
     ) -> bool {
         let _permit = self.acquire_message_processing_permit().await;
+        if let Some(generation) = expected_generation
+            && self.connection_generation.load(Ordering::Acquire) != generation
+        {
+            // A reconnect reset the batcher while this (drain-finisher) call
+            // waited for the permit; the new connection owns the state now, so
+            // touching it here would take/deactivate the NEW drain.
+            return true;
+        }
         if let Some(epoch) = expected_epoch
             && self.inbound_commit_batch.epoch.load(Ordering::Acquire) != epoch
         {
@@ -323,7 +332,7 @@ impl Client {
         match wacore::runtime::timeout(
             &*self.runtime,
             limit,
-            self.flush_inbound_commits_under_permit(false, None),
+            self.flush_inbound_commits_under_permit(false, None, None),
         )
         .await
         {
@@ -339,8 +348,12 @@ impl Client {
 
     /// End-of-drain transition; see
     /// [`flush_inbound_commits_under_permit`](Self::flush_inbound_commits_under_permit).
-    pub(crate) async fn finish_inbound_commit_drain(self: &Arc<Self>) -> bool {
-        self.flush_inbound_commits_under_permit(true, None).await
+    /// `generation` scopes it to the connection whose drain is ending, so a
+    /// stale finisher that only gets the permit after a reconnect stands down
+    /// instead of taking or deactivating the new connection's drain.
+    pub(crate) async fn finish_inbound_commit_drain(self: &Arc<Self>, generation: u64) -> bool {
+        self.flush_inbound_commits_under_permit(true, None, Some(generation))
+            .await
     }
 
     /// Drain-mode Signal flush that reports success instead of swallowing it:
@@ -363,14 +376,16 @@ impl Client {
     /// Commit any accumulated entries while the caller ALREADY HOLDS the
     /// processing permit (mid-stanza recovery paths like UntrustedIdentity),
     /// so a full-cache Signal flush that follows cannot persist ratchet
-    /// advances for entries without a durable buffered row.
-    pub(crate) async fn commit_inbound_batch_holding_permit(self: &Arc<Self>) {
+    /// advances for entries without a durable buffered row. Returns whether
+    /// that follow-up flush is safe: on a failed commit the entries are back
+    /// in the batcher (unbuffered), and the caller must skip its flush.
+    pub(crate) async fn commit_inbound_batch_holding_permit(self: &Arc<Self>) -> bool {
         let batch = self.inbound_commit_batch.take();
-        if !batch.is_empty() {
-            let _ = self
-                .commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
-                .await;
+        if batch.is_empty() {
+            return true;
         }
+        self.commit_inbound_batch(batch.into(), BatchOrigin::OfflineDrain)
+            .await
     }
 
     /// Commit one batch: durable buffer → Signal flush → hook → clear buffer →
@@ -597,7 +612,9 @@ mod tests {
             "sub-threshold entries must accumulate, not commit"
         );
 
-        client.flush_inbound_commits_under_permit(false, None).await;
+        client
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await;
 
         let batches = hook.batches.lock().expect("hook lock").clone();
         assert_eq!(batches, vec![vec!["B1", "B2", "B3"]]);
@@ -676,7 +693,9 @@ mod tests {
 
         client.commit_or_batch_inbound(item("N1")).await;
         client.commit_or_batch_inbound(item("N2")).await;
-        client.flush_inbound_commits_under_permit(false, None).await;
+        client
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await;
 
         let event = rx.try_recv().expect("one batch event");
         assert_eq!(
@@ -704,7 +723,8 @@ mod tests {
 
         client.commit_or_batch_inbound(item("T1")).await;
         client.commit_or_batch_inbound(item("T2")).await;
-        client.finish_inbound_commit_drain().await;
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        client.finish_inbound_commit_drain(generation).await;
         assert!(!client.inbound_commit_batch.is_active());
         // A message arriving after the transition commits immediately as Live.
         client.commit_or_batch_inbound(item("T3")).await;
@@ -742,7 +762,9 @@ mod tests {
 
         client.commit_or_batch_inbound(item("C1")).await;
         client.inbound_commit_batch.reset();
-        client.flush_inbound_commits_under_permit(false, None).await;
+        client
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await;
 
         assert!(hook.batches.lock().expect("hook lock").is_empty());
         assert!(rx.try_recv().is_err());

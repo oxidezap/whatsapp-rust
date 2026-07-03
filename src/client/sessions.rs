@@ -81,7 +81,7 @@ impl Client {
         // for the raceless-transition argument), BEFORE widening the semaphore.
         // Receipts flush after, so every receipt's message is durably committed
         // first (WA Web's createSnapshot ordering).
-        let durable = self.finish_inbound_commit_drain().await;
+        let durable = self.finish_inbound_commit_drain(generation).await;
 
         if self.connection_generation.load(Ordering::Acquire) != generation {
             log::debug!(
@@ -172,6 +172,22 @@ impl Client {
             );
             self.complete_offline_sync(i32::try_from(processed).unwrap_or(i32::MAX))
                 .await;
+            // The finisher runs as a spawned task; keep this helper's contract
+            // that live state is in place when it returns (callers start
+            // session/send work right after). Ticked so a reconnect or
+            // shutdown mid-commit cannot strand this waiter: the stale
+            // finisher stands down without notifying.
+            loop {
+                let listener = self.offline_sync_notifier.listen();
+                if self.offline_sync_completed.load(Ordering::Acquire)
+                    || self.connection_generation.load(Ordering::Acquire) != wait_generation
+                    || self.expected_disconnect.load(Ordering::Relaxed)
+                {
+                    return;
+                }
+                let _ = wacore::runtime::timeout(&*self.runtime, Duration::from_secs(1), listener)
+                    .await;
+            }
         }
     }
 

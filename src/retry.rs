@@ -533,6 +533,10 @@ impl Client {
             )
             .await?;
 
+            // The Signal mutation is done; the batch-safe flush acquires the
+            // processing permit, and inbound processing holds that permit
+            // while taking this same session lock — release it first.
+            drop(_session_guard);
             self.send_node(stanza).await?;
             self.flush_signal_cache_batch_safe().await?;
         } else {
@@ -568,6 +572,8 @@ impl Client {
             )
             .await?;
 
+            // Same lock-ordering rule as the group branch above.
+            drop(_session_guard);
             self.send_node(stanza).await?;
             self.flush_signal_cache_batch_safe().await?;
         }
@@ -1026,7 +1032,10 @@ impl Client {
         )
         .await?;
 
-        // Flush after session establishment
+        // Flush after session establishment; release the session lock first
+        // (the batch-safe flush acquires the processing permit, whose holder
+        // may need this same lock).
+        drop(_session_guard);
         self.flush_signal_cache_batch_safe().await?;
 
         if identity_change == wacore::libsignal::protocol::IdentityChange::ReplacedExisting {

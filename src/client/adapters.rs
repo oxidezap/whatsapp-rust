@@ -93,11 +93,7 @@ impl Client {
     /// `_batch_safe` variants below.
     pub(crate) async fn flush_signal_cache_logged(&self, context: &str, id: Option<&str>) {
         if let Err(e) = self.flush_signal_cache().await {
-            if let Some(id) = id {
-                log::error!("Failed to flush signal cache ({context} {id}): {e:?}");
-            } else {
-                log::error!("Failed to flush signal cache ({context}): {e:?}");
-            }
+            log_signal_flush_error(context, id, &e);
         }
     }
 
@@ -117,7 +113,10 @@ impl Client {
     pub(crate) async fn flush_signal_cache_batch_safe(&self) -> Result<(), anyhow::Error> {
         if self.inbound_commit_batch.is_active() {
             if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-                return if client.flush_inbound_commits_under_permit(false, None).await {
+                return if client
+                    .flush_inbound_commits_under_permit(false, None, None)
+                    .await
+                {
                     Ok(())
                 } else {
                     Err(anyhow::anyhow!(
@@ -142,11 +141,15 @@ impl Client {
         id: Option<&str>,
     ) {
         if let Err(e) = self.flush_signal_cache_batch_safe().await {
-            if let Some(id) = id {
-                log::error!("Failed to flush signal cache ({context} {id}): {e:?}");
-            } else {
-                log::error!("Failed to flush signal cache ({context}): {e:?}");
-            }
+            log_signal_flush_error(context, id, &e);
         }
+    }
+}
+
+fn log_signal_flush_error(context: &str, id: Option<&str>, e: &anyhow::Error) {
+    if let Some(id) = id {
+        log::error!("Failed to flush signal cache ({context} {id}): {e:?}");
+    } else {
+        log::error!("Failed to flush signal cache ({context}): {e:?}");
     }
 }
