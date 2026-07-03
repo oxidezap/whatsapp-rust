@@ -758,6 +758,9 @@ impl SignalStoreCache {
     /// (sessions, identities, sender_keys). Sizes use the records' encoded-size
     /// proxy (see `SessionRecord::estimated_size`); on-demand only — walks the
     /// caches under their locks.
+    ///
+    /// Session entry counts include negative (`Absent`) and checked-out slots
+    /// — they occupy the map — while bytes cover present records only.
     pub async fn memory_stats(
         &self,
     ) -> (
