@@ -127,14 +127,10 @@ impl LidPnCache {
         wacore::stats::CollectionStats,
     ) {
         use wacore::stats::HeapSize;
-        // Dedup shared entries by their heap ADDRESS as a `usize`, not the raw
-        // `*const LidPnEntry`. A set of raw pointers is `!Send` (raw pointers are
-        // `!Send`/`!Sync`), which would infect this future — held across the two
-        // `.await`s below — and make `Client::memory_report()` `!Send`, unusable from
-        // a multi-threaded runtime. `usize` is `Send` on every target (wasm32 and the
-        // 32-bit MCUs included: `LidPnEntry` is `Sized`, so the pointer is thin and the
-        // `as usize` cast is a plain address on all of them). Address identity is exactly
-        // what we want — the same `Arc` payload counted once.
+        // Dedup by heap address as `usize`, not `*const LidPnEntry`: a raw-pointer
+        // set is `!Send`, and held across the two `.await`s below it would make
+        // `Client::memory_report()` `!Send` (unusable off a single thread). The cast
+        // is a plain address on every target (`LidPnEntry: Sized` → thin pointer).
         let mut lid_ptrs: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let lid = self
             .lid_to_entry
