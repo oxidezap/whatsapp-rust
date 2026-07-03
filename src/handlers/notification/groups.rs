@@ -219,6 +219,15 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                 client
                     .invalidate_persisted_group_metadata(&notification.group_jid)
                     .await;
+                // Also drop the in-memory blob: query_info() checks group_cache
+                // before storage, so a stale Arc<GroupInfo> here would let the
+                // next send rebuild the sender key against the old participant
+                // list (missing the migrated JID, still targeting the old one).
+                client
+                    .get_group_cache()
+                    .await
+                    .invalidate(&notification.group_jid)
+                    .await;
                 client
                     .force_rotate_own_sender_key(&notification.group_jid.to_string())
                     .await;
