@@ -415,6 +415,9 @@ mod framing {
         push_attr(0x4000, &[0x11; 16]);
         push_attr(0x0008, &[0x22; 20]);
         push_attr(0x000D, &[0x00, 0x00, 0x02, 0x58]);
+        // Odd-length (username-shaped) so the pad4 alignment skip is exercised,
+        // matching a real relay response rather than only 4-aligned values.
+        push_attr(0x0006, b"whatsapp-relay-user");
         let body = (p.len() - 20) as u16;
         p[2..4].copy_from_slice(&body.to_be_bytes());
         p

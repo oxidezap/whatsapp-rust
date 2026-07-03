@@ -131,9 +131,8 @@ pub fn is_rtp_version2(data: &[u8]) -> bool {
     data.len() >= RTP_FIXED_HEADER_LEN && (data[0] >> 6) & 0x03 == RTP_VERSION
 }
 
-/// The fixed 12-byte RTP header as a typed view, so field reads are struct
-/// accesses with a single structural bounds check (`Ref::from_prefix`) instead
-/// of scattered index math. `Unaligned` + big-endian ints keep it wire-exact.
+/// Typed view of the fixed 12-byte RTP header: one structural bounds check via
+/// `Ref::from_prefix` replaces the scattered index math.
 #[derive(zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable, zerocopy::Unaligned)]
 #[repr(C)]
 struct RtpFixed {
@@ -160,11 +159,10 @@ pub fn parse_rtp_header(data: &[u8]) -> Option<RtpHeader> {
     })
 }
 
-/// Append the encoded header to `out` (no intermediate allocation). The
-/// outbound media path reuses one packet buffer via this; `encode_rtp_header`
-/// is the owned-`Vec` convenience over it. Written by index into a stack array
-/// then extended once: zerocopy loses on a 16-byte header (measured +12%
-/// instructions), the direct writes the compiler already optimizes win.
+/// Append the encoded header to `out`, so the outbound path reuses one packet
+/// buffer instead of allocating a throwaway header `Vec`. Direct writes, not
+/// zerocopy `IntoBytes`: the latter measured +12% instructions on this 16-byte
+/// header.
 pub fn encode_rtp_header_into(header: &RtpHeader, out: &mut Vec<u8>) {
     let size = header.byte_size();
     let mut b = [0u8; WHATSAPP_RTP_HEADER_DTX_SIZE];
