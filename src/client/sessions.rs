@@ -184,14 +184,27 @@ impl Client {
             // The finisher runs as a spawned task; keep this helper's contract
             // that live state is in place when it returns (callers start
             // session/send work right after). Ticked so a reconnect or
-            // shutdown mid-commit cannot strand this waiter: the stale
-            // finisher stands down without notifying.
+            // shutdown mid-commit cannot strand this waiter, and bounded by a
+            // second `timeout` window: when the marker-triggered finisher was
+            // ALREADY running and its tail commit/hook is stuck, the
+            // complete_offline_sync above started nothing, and an unbounded
+            // wait here would defeat this helper's whole point — callers
+            // proceed and the finisher keeps running in the background.
+            let deadline = wacore::time::Instant::now() + timeout;
             loop {
                 let listener = self.offline_sync_notifier.listen();
                 if self.offline_sync_completed.load(Ordering::Acquire)
                     || self.connection_generation.load(Ordering::Acquire) != wait_generation
                     || self.expected_disconnect.load(Ordering::Relaxed)
                 {
+                    return;
+                }
+                if wacore::time::Instant::now() >= deadline {
+                    log::warn!(
+                        target: "Client/OfflineSync",
+                        "Drain finisher still running {:?} after the offline sync timeout; proceeding without it",
+                        timeout,
+                    );
                     return;
                 }
                 let _ = wacore::runtime::timeout(&*self.runtime, Duration::from_secs(1), listener)
