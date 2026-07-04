@@ -171,7 +171,12 @@ impl CompanionOs {
             Some(Self::Windows)
         } else if os.contains("mac") || os.contains("osx") || os.contains("darwin") {
             Some(Self::MacOs)
-        } else if os.contains("ipad") || os.contains("iphone") || os.contains("ios") {
+        } else if os.contains("ipad")
+            || os.contains("iphone")
+            // Whole-word "ios" only, so "KaiOS" etc. don't false-match the substring.
+            || os.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|tok| tok == "ios")
+        {
             Some(Self::Ios)
         } else if os.contains("android") {
             Some(Self::Android)
@@ -460,6 +465,7 @@ mod tests {
             ("Android", O::Android),
             ("android 14", O::Android),
             ("iOS", O::Ios),
+            ("iOS 17", O::Ios),
             ("iPhone", O::Ios),
             ("iPad", O::Ios),
             ("iPadOS", O::Ios),
@@ -470,7 +476,8 @@ mod tests {
 
     #[test]
     fn companion_os_branding_and_empty_are_unclassified_and_default_linux() {
-        for hint in ["Veloz", "Foobar123", "", "   "] {
+        // "KaiOS" must NOT substring-match "ios" -> it is unrecognized -> Linux.
+        for hint in ["Veloz", "Foobar123", "KaiOS", "", "   "] {
             assert_eq!(CompanionOs::classify(hint), None, "{hint:?}");
             assert_eq!(CompanionOs::from_hint(hint), CompanionOs::Linux, "{hint:?}");
         }

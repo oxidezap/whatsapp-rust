@@ -203,14 +203,20 @@ impl Client {
         // bad-request (QR pairing never sends this field, so it tolerates arbitrary
         // branding). If `DeviceProps::os` was a branding string it is coerced to
         // "Linux"; warn so a consumer sees why their branding didn't ride through.
+        // Gated to fire once per process: a rate-limited caller may retry
+        // pair_with_code repeatedly (see PairError::RequestFailed) with the same
+        // unchanged os, and an identical warning per retry is just noise.
+        static OS_COERCE_WARNED: std::sync::Once = std::sync::Once::new();
         if let Some(os) = device_snapshot.device_props.os.as_deref()
             && !os.trim().is_empty()
             && CompanionOs::classify(os).is_none()
         {
-            warn!(
-                target: "Client/PairCode",
-                "companion_platform_display OS {os:?} is not a recognized OS; coerced to \"Linux\" for pair-code (the server would reject a non-OS display with bad-request)"
-            );
+            OS_COERCE_WARNED.call_once(|| {
+                warn!(
+                    target: "Client/PairCode",
+                    "companion_platform_display OS {os:?} is not a recognized OS; coerced to \"Linux\" for pair-code (the server would reject a non-OS display with bad-request)"
+                );
+            });
         }
 
         let req_id = self.generate_request_id();
