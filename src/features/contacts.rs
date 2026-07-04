@@ -145,19 +145,39 @@ impl<'a> Contacts<'a> {
             }
         }
 
-        let mut results = Vec::new();
-
-        if !pn_users.is_empty() {
-            let sid = self.client.generate_request_id();
-            let spec = IsOnWhatsAppSpec::new(pn_users, sid, IsOnWhatsAppQueryType::Pn);
-            results.extend(self.client.execute(spec).await?);
-        }
-
-        if !lid_users.is_empty() {
-            let sid = self.client.generate_request_id();
-            let spec = IsOnWhatsAppSpec::new(lid_users, sid, IsOnWhatsAppQueryType::Lid);
-            results.extend(self.client.execute(spec).await?);
-        }
+        // PN and LID existence use different protocols (two independent IQs), so
+        // when a mixed input produces both, run them concurrently.
+        let pn_fut = async {
+            if pn_users.is_empty() {
+                Ok(Vec::new())
+            } else {
+                let sid = self.client.generate_request_id();
+                self.client
+                    .execute(IsOnWhatsAppSpec::new(
+                        pn_users,
+                        sid,
+                        IsOnWhatsAppQueryType::Pn,
+                    ))
+                    .await
+            }
+        };
+        let lid_fut = async {
+            if lid_users.is_empty() {
+                Ok(Vec::new())
+            } else {
+                let sid = self.client.generate_request_id();
+                self.client
+                    .execute(IsOnWhatsAppSpec::new(
+                        lid_users,
+                        sid,
+                        IsOnWhatsAppQueryType::Lid,
+                    ))
+                    .await
+            }
+        };
+        let (pn_results, lid_results) = futures::join!(pn_fut, lid_fut);
+        let mut results = pn_results?;
+        results.extend(lid_results?);
 
         self.persist_lid_mappings(results.iter().map(forward_lid_pair))
             .await;
