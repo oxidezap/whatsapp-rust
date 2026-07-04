@@ -302,10 +302,19 @@ impl Client {
         }
 
         let (tx, rx) = futures::channel::oneshot::channel();
-        self.response_waiters
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(req_id.clone(), tx);
+        {
+            let mut waiters = self.response_waiters_guard();
+            // req_ids come from the monotonic generate_request_id(), so a given
+            // id is never in flight twice — the invariant that makes the guard's
+            // remove-by-id unambiguous (an overwrite could otherwise let an older
+            // guard evict a newer waiter). Assert it so a future caller passing a
+            // duplicate id is caught in tests instead of silently.
+            debug_assert!(
+                !waiters.contains_key(&req_id),
+                "duplicate in-flight IQ request id: {req_id}"
+            );
+            waiters.insert(req_id.clone(), tx);
+        }
         // RAII cleanup covers every exit below — including this future being
         // dropped mid-await (cancellation), which the explicit paths can't
         // catch. So the send-fail / timeout / shutdown arms no longer remove

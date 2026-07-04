@@ -599,11 +599,7 @@ async fn place_call(
         let removed = take_pending_if_current(&client.pending_outgoing_calls, &call_id, generation);
         registry.remove_if_current(&call_id, generation);
         // No ack will ever arrive for the failed offer; drop the waiter so it can't leak.
-        client
-            .response_waiters
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&offer_stanza_id);
+        client.response_waiters_guard().remove(&offer_stanza_id);
         if removed.is_some() {
             ended.notify();
         }
@@ -676,11 +672,7 @@ fn spawn_outgoing_relay_waiter(
                     // handle_ack_response never ran, so our still-registered waiter entry must be dropped
                     // here or send_keepalive suppresses pings for the life of the connection.
                     Ok(Err(_)) | Err(_) => {
-                        client
-                            .response_waiters
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .remove(&offer_stanza_id);
+                        client.response_waiters_guard().remove(&offer_stanza_id);
                         None
                     }
                 };
@@ -2729,9 +2721,7 @@ mod tests {
         let ack_rx = client.register_ack_waiter(&offer_stanza_id);
         assert!(
             client
-                .response_waiters
-                .lock()
-                .unwrap()
+                .response_waiters_guard()
                 .contains_key(&offer_stanza_id),
             "the ack-waiter must be registered"
         );
@@ -2753,9 +2743,7 @@ mod tests {
         // The spawned task drops the now-dangling waiter on the no-ack path.
         for _ in 0..200 {
             if !client
-                .response_waiters
-                .lock()
-                .unwrap()
+                .response_waiters_guard()
                 .contains_key(&offer_stanza_id)
             {
                 break;
@@ -2764,9 +2752,7 @@ mod tests {
         }
         assert!(
             !client
-                .response_waiters
-                .lock()
-                .unwrap()
+                .response_waiters_guard()
                 .contains_key(&offer_stanza_id),
             "a no-ack relay-waiter must drop its response_waiters entry so keepalive isn't suppressed"
         );

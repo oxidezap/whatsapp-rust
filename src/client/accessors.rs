@@ -140,11 +140,7 @@ impl Client {
             .await;
 
         // Each count read into a local so no two guards are ever held at once.
-        let response_waiters = self
-            .response_waiters
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .len();
+        let response_waiters = self.response_waiters_guard().len();
         let presence_subscriptions = self.presence_subscriptions.lock().await.len();
         let app_state_key_requests = self.app_state_key_requests.lock().await.len();
         let app_state_syncing = self.app_state_syncing.lock().await.len();
@@ -376,6 +372,19 @@ impl Client {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         waiters.push(SentNodeWaiter { filter, tx });
         rx
+    }
+
+    /// Poison-recovering lock of the `response_waiters` map. Centralizes the
+    /// `unwrap_or_else(into_inner)` so no call site reaches for a bare
+    /// `.lock().unwrap()` that would panic if a holder ever paniced. The critical
+    /// section is a trivial map op, never held across an `.await`.
+    #[inline]
+    pub(crate) fn response_waiters_guard(
+        &self,
+    ) -> std::sync::MutexGuard<'_, crate::client::ResponseWaiterMap> {
+        self.response_waiters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Check pending node waiters against an incoming node.

@@ -237,9 +237,7 @@ impl Client {
         message_id: &str,
     ) -> futures::channel::oneshot::Receiver<std::sync::Arc<wacore_binary::OwnedNodeRef>> {
         let (tx, rx) = futures::channel::oneshot::channel();
-        self.response_waiters
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        self.response_waiters_guard()
             .insert(message_id.to_string(), tx);
         rx
     }

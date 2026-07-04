@@ -922,10 +922,7 @@ impl Client {
 
         if let Err(e) = self.send_node(stanza).await {
             if ack.is_some() {
-                self.response_waiters
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&request_id);
+                self.response_waiters_guard().remove(&request_id);
             }
             return Err(e.into());
         }
@@ -1196,11 +1193,7 @@ impl Client {
                     Ok(Ok(node)) => node,
                     _ => {
                         // Remove leaked waiter to prevent keepalive suppression
-                        client
-                            .response_waiters
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .remove(&message_id);
+                        client.response_waiters_guard().remove(&message_id);
                         return;
                     }
                 };
@@ -1900,10 +1893,7 @@ impl Client {
 
         if let Err(e) = self.send_node(stanza_to_send).await {
             if let Some((_, _, ref msg_id)) = ack {
-                self.response_waiters
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(msg_id);
+                self.response_waiters_guard().remove(msg_id);
             }
             return Err(e.into());
         }

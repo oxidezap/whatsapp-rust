@@ -879,10 +879,7 @@ impl Client {
         // Scoped so the sync guard is dropped before the awaits below (a
         // std::sync::MutexGuard held across an await would make this future !Send).
         let waiter_count = {
-            let mut waiters_map = self
-                .response_waiters
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut waiters_map = self.response_waiters_guard();
             let count = waiters_map.len();
             // Replace with new map to release backing storage; old senders drop
             // here, causing receivers to get RecvError → InternalChannelClosed.

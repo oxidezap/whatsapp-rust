@@ -130,17 +130,9 @@ async fn test_ack_waiter_resolves() {
     // 1. Insert a waiter for a specific ID
     let test_id = "ack-test-123".to_string();
     let (tx, rx) = oneshot::channel();
-    client
-        .response_waiters
-        .lock()
-        .unwrap()
-        .insert(test_id.clone(), tx);
+    client.response_waiters_guard().insert(test_id.clone(), tx);
     assert!(
-        client
-            .response_waiters
-            .lock()
-            .unwrap()
-            .contains_key(&test_id),
+        client.response_waiters_guard().contains_key(&test_id),
         "Waiter should be inserted before handling ack"
     );
 
@@ -174,11 +166,7 @@ async fn test_ack_waiter_resolves() {
 
     // 5. Verify the waiter was removed
     assert!(
-        !client
-            .response_waiters
-            .lock()
-            .unwrap()
-            .contains_key(&test_id),
+        !client.response_waiters_guard().contains_key(&test_id),
         "Waiter should be removed after handling"
     );
 
