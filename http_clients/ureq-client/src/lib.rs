@@ -83,8 +83,9 @@ impl Default for UreqHttpClient {
 fn build_agent() -> ureq::Agent {
     use ureq::config::Config;
 
-    #[allow(unused_mut)]
-    let mut builder = Config::builder()
+    use ureq::tls::TlsConfig;
+
+    let builder = Config::builder()
         // 16 KB per buffer instead of the 128 KB default.
         // WA API payloads are small JSON; media uses streaming I/O.
         .input_buffer_size(INPUT_BUFFER_BYTES as usize)
@@ -92,11 +93,16 @@ fn build_agent() -> ureq::Agent {
         .max_idle_connections(MAX_IDLE_CONNECTIONS as usize)
         .max_idle_connections_per_host(2);
 
+    // ureq is built with `rustls-no-provider`, so it has no built-in crypto
+    // backend; inject the pure-Rust RustCrypto provider explicitly (no reliance
+    // on the process-wide default install order).
+    let tls = TlsConfig::builder()
+        .unversioned_rustls_crypto_provider(std::sync::Arc::new(rustls_rustcrypto::provider()));
+
     #[cfg(feature = "danger-skip-tls-verify")]
-    {
-        use ureq::tls::TlsConfig;
-        builder = builder.tls_config(TlsConfig::builder().disable_verification(true).build());
-    }
+    let tls = tls.disable_verification(true);
+
+    let builder = builder.tls_config(tls.build());
 
     builder.build().into()
 }

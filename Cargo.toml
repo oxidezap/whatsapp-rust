@@ -82,6 +82,11 @@ log = "0.4"
 metrics = "0.24"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 rand = "0.10"
+# Pure-Rust rustls CryptoProvider (RustCrypto). Replaces `ring` so the default
+# build carries no C/asm crypto backend and reuses the AES/SHA/curve primitives
+# already linked for the Signal layer. NOTE: experimental (0.0.x); installed by
+# the tokio transport and ureq HTTP client crates.
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["std", "tls12", "zeroize"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
 serde_json = { version = "1.0", default-features = false }
@@ -210,7 +215,10 @@ hkdf = { workspace = true }
 hmac = { workspace = true }
 # Raises real SIGINT/SIGTERM at the current process in the shutdown-signal test.
 libc = "0.2"
-metrics-exporter-prometheus = "0.18"
+# default-features=false drops the http-listener/push-gateway (and their
+# hyper-rustls -> aws-lc-rs pull); the `metrics` example only installs a
+# recorder. Keeps the `demo` size proxy free of a second TLS crypto backend.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -47,11 +47,11 @@ static CRYPTO_PROVIDER_INIT: Once = Once::new();
 /// Useful as a starting point when users need to inspect or replicate the
 /// default TLS configuration before customizing it via [`TokioWebSocketTransportFactory::with_connector`].
 ///
-/// On first call, installs `ring` as the global rustls crypto provider
-/// (no-op if one is already installed).
+/// On first call, installs the pure-Rust RustCrypto provider as the global
+/// rustls crypto provider (no-op if one is already installed).
 pub fn default_tls_connector() -> Connector {
     CRYPTO_PROVIDER_INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls_rustcrypto::provider().install_default();
     });
 
     #[cfg(feature = "danger-skip-tls-verify")]

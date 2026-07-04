@@ -16,7 +16,14 @@ danger-skip-tls-verify = []
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
-ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+# `rustls-no-provider` gives rustls without a built-in crypto backend (the plain
+# `rustls` feature would pull `ring`); the RustCrypto provider is injected in
+# `build_agent`. `rustls-webpki-roots` keeps the bundled Mozilla root store.
+ureq = { version = "3.3.0", default-features = false, features = [
+  "rustls-no-provider",
+  "rustls-webpki-roots",
+] }
+rustls-rustcrypto = { workspace = true }
 wacore = { workspace = true }
 
 [dev-dependencies]

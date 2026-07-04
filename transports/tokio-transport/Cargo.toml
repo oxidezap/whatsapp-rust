@@ -20,14 +20,20 @@ bytes = { workspace = true }
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "alloc", "std"] }
 http = "1.4.2"
 log = { workspace = true }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# No `ring`: the RustCrypto provider (installed at runtime) supplies all TLS
+# crypto, so rustls/tokio-rustls carry no built-in provider and tokio-websockets
+# needs none (we pass our own connector via `rustls-bring-your-own-connector`).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+rustls-rustcrypto = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12"] }
 tokio-websockets = { version = "0.13.3", features = [
   "client",
   "rustls-bring-your-own-connector",
   "rand",
-  "ring",
+  # Pure-Rust SHA-1 for the WebSocket handshake accept-key (replaces `ring`,
+  # which we dropped; this is unrelated to the TLS crypto provider).
+  "sha1_smol",
 ] }
 wacore = { workspace = true }
 webpki-roots = "1.0.8"
