@@ -321,9 +321,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
         }
     };
 
-    // Validate against the outstanding request and snapshot what stage 2 needs.
-    // Bumps the attempt count (WA Web caps at 3 per code) and — unlike a
-    // consuming take — leaves the state in place so the primary can retry.
+    // Kept (not taken) so the primary can retry: WA Web retains the cached hello.
     let (pairing_ref, phone_jid, pair_code, ephemeral_keypair) = {
         let mut state_guard = client.pair_code_state.lock().await;
         match &mut *state_guard {
@@ -335,14 +333,11 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
                 code_generation_ts,
                 primary_hello_attempt_count,
             } => {
-                *primary_hello_attempt_count += 1;
-                if *primary_hello_attempt_count > PairCodeUtils::max_primary_hello_attempts() {
-                    warn!(
-                        target: "Client/PairCode",
-                        "Exceeded max primary_hello attempts for this code; abandoning"
-                    );
-                    return false;
-                }
+                // Validate before counting: only a genuine, in-window attempt
+                // (matching ref, unexpired code) may spend a retry slot, so a
+                // stale/foreign or late notification — neither of which triggers
+                // a companion_finish — can't exhaust the budget. WA Web bumps
+                // first and shares that window; we tighten it.
                 if pairing_ref.as_slice() != notif_ref.as_slice() {
                     warn!(
                         target: "Client/PairCode",
@@ -355,6 +350,14 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
                     warn!(
                         target: "Client/PairCode",
                         "primary_hello arrived for an expired code ({age}s old); ignoring"
+                    );
+                    return false;
+                }
+                *primary_hello_attempt_count += 1;
+                if *primary_hello_attempt_count > PairCodeUtils::max_primary_hello_attempts() {
+                    warn!(
+                        target: "Client/PairCode",
+                        "Exceeded max primary_hello attempts for this code; abandoning"
                     );
                     return false;
                 }
@@ -450,10 +453,8 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
         "Sent companion_finish, waiting for pair-success"
     );
 
-    // Deliberately keep the WaitingForPhoneConfirmation state (with the bumped
-    // attempt count): WA Web retains the cached hello so the primary can retry
-    // primary_hello. The terminal transition to Completed happens when the
-    // standard pair-success handler fires (see `crate::pair`).
+    // State stays WaitingForPhoneConfirmation so a retry can reuse it; only
+    // pair-success (see `crate::pair`) transitions to Completed.
     true
 }
 
@@ -621,9 +622,20 @@ mod tests {
         )
     }
 
+    async fn attempt_count(client: &Arc<Client>) -> Option<u32> {
+        match &*client.pair_code_state.lock().await {
+            PairCodeState::WaitingForPhoneConfirmation {
+                primary_hello_attempt_count,
+                ..
+            } => Some(*primary_hello_attempt_count),
+            _ => None,
+        }
+    }
+
     /// Regression: a `primary_hello` whose ref doesn't match our outstanding
     /// companion_hello must be rejected (WA Web `InvalidRefError`) without
-    /// running stage 2, and must leave the flow intact for a later valid one.
+    /// running stage 2, must leave the flow intact for a later valid one, and
+    /// must NOT consume a retry slot (the ref check precedes the counter bump).
     #[tokio::test]
     async fn primary_hello_rejects_mismatched_ref() {
         let client = create_test_client().await;
@@ -642,6 +654,41 @@ mod tests {
         assert!(
             is_waiting(&client).await,
             "state must be preserved so a later valid primary_hello can complete"
+        );
+        assert_eq!(
+            attempt_count(&client).await,
+            Some(0),
+            "a ref-mismatched notification must not burn a retry slot"
+        );
+    }
+
+    /// Regression: stale/foreign-ref notifications must not exhaust the attempt
+    /// cap. Even after several mismatched hellos, the genuine one still reaches
+    /// stage 2 (adv secret rotates).
+    #[tokio::test]
+    async fn stale_mismatched_hellos_do_not_block_the_valid_one() {
+        let client = create_test_client().await;
+        let pairing_ref = vec![1, 2, 3, 4];
+        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+        let adv_before = adv(&client);
+
+        // More mismatched hellos than the cap would allow if they counted.
+        for _ in 0..(PairCodeUtils::max_primary_hello_attempts() + 2) {
+            let bad = primary_hello_notif(&[9, 9, 9, 9]);
+            let _ = handle_pair_code_notification(&client, &bad.as_node_ref()).await;
+        }
+        assert_eq!(
+            attempt_count(&client).await,
+            Some(0),
+            "mismatched hellos must leave the attempt count untouched"
+        );
+
+        let good = primary_hello_notif(&pairing_ref);
+        let _ = handle_pair_code_notification(&client, &good.as_node_ref()).await;
+        assert_ne!(
+            adv(&client),
+            adv_before,
+            "the genuine primary_hello must still reach stage 2 after stale mismatches"
         );
     }
 
@@ -667,6 +714,11 @@ mod tests {
             adv(&client),
             adv_before,
             "no stage-2 crypto on an expired code"
+        );
+        assert_eq!(
+            attempt_count(&client).await,
+            Some(0),
+            "an expired-code notification must not burn a retry slot"
         );
     }
 

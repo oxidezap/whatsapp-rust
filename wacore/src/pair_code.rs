@@ -349,9 +349,8 @@ impl PairCodeUtils {
                 NodeBuilder::new("companion_platform_display")
                     .bytes(platform_display.as_bytes().to_vec())
                     .build(),
-                // Single zero byte. WA Web sends `new Uint8Array(1)` (see
-                // `Alt/DeviceLinkingIq.js`) and whatsmeow sends `[]byte{0}` — i.e.
-                // byte 0x00, NOT the ASCII character '0' (0x30).
+                // 0x00, not ASCII '0' (0x30): matches WA Web `new Uint8Array(1)`
+                // (`Alt/DeviceLinkingIq.js`) / whatsmeow `[]byte{0}`.
                 NodeBuilder::new("link_code_pairing_nonce")
                     .bytes(vec![0u8])
                     .build(),
