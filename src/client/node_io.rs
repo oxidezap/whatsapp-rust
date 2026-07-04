@@ -914,29 +914,12 @@ impl Client {
                     "Starting Initial App State Sync (flag_set={flag_set}, needs_pushname={needs_pushname_from_sync})"
                 );
 
-                if !client_clone
-                    .initial_app_state_keys_received
-                    .load(Ordering::Relaxed)
-                {
-                    debug!(
-                        target: "Client/AppState",
-                        "Waiting up to 5s for app state keys..."
-                    );
-                    let _ = rt_timeout(
-                        &*client_clone.runtime,
-                        Duration::from_secs(5),
-                        client_clone.initial_keys_synced_notifier.listen(),
-                    )
-                    .await;
-
-                    // Check if connection was replaced while waiting
-                    check_generation!();
-                }
-
-                // Start the critical sync timeout timer matching WhatsApp Web's
-                // WAWebSyncBootstrap.$15 (setSyncDCriticalDataSyncTimeout).
-                // WhatsApp Web uses 180s and calls socketLogout(SyncdTimeout) if
-                // the critical data hasn't synced by then.
+                // Arm the critical sync timeout FIRST so its single 180s deadline
+                // bounds the entire critical path — both the app-state key-share wait
+                // below and the batched IQ sync. Matches WhatsApp Web's
+                // WAWebSyncBootstrap.$15 (setSyncDCriticalDataSyncTimeout): WA Web uses
+                // 180s and calls socketLogout(SyncdTimeout) if critical data hasn't
+                // synced by then.
                 const CRITICAL_SYNC_TIMEOUT_SECS: u64 = 180;
                 let timeout_client = client_clone.clone();
                 let timeout_generation = task_generation;
@@ -969,6 +952,33 @@ impl Client {
                         );
                     }
                 }));
+
+                if !client_clone
+                    .initial_app_state_keys_received
+                    .load(Ordering::Relaxed)
+                {
+                    // Wait for the app-state sync-key-share E2E message the primary sends
+                    // at pairing. This is event-driven: a healthy pairing wakes instantly
+                    // when the key-share is processed. When a heavy history-sync saturates
+                    // the stream and the key-share lands late, we tolerate the delay up to
+                    // the critical deadline instead of racing a fixed 5s window and failing
+                    // the critical snapshot with KeyNotFound. The watchdog armed above still
+                    // bounds the total wait, so a key-share that never arrives forces a
+                    // reconnect rather than hanging.
+                    debug!(
+                        target: "Client/AppState",
+                        "Waiting up to {CRITICAL_SYNC_TIMEOUT_SECS}s for app state keys..."
+                    );
+                    let _ = rt_timeout(
+                        &*client_clone.runtime,
+                        Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS),
+                        client_clone.initial_keys_synced_notifier.listen(),
+                    )
+                    .await;
+
+                    // Check if connection was replaced while waiting
+                    check_generation!();
+                }
 
                 // Await critical collections via batched IQ before dispatching Connected.
                 check_generation!();
