@@ -9,11 +9,18 @@
 //! ];
 //! let zip_result = create_sticker_pack_zip("pack-id", &stickers, &cover_webp)?;
 //!
-//! let zip_upload = client.upload(zip_result.zip_bytes.clone(), MediaType::StickerPack, Default::default()).await?;
-//! let thumb_upload = client.upload(
-//!     thumbnail_jpeg, MediaType::StickerPackThumbnail,
-//!     UploadOptions::new().with_media_key(zip_upload.media_key),
-//! ).await?;
+//! // The pack zip and its thumbnail are independent uploads that share one
+//! // media key. Generate the key up front and upload both concurrently instead
+//! // of chaining the thumbnail behind the zip's result — two CDN round-trips
+//! // collapse into one wall-clock. (`upload` takes `&self`, so concurrent calls
+//! // are fine.)
+//! let media_key: [u8; 32] = rand::random();
+//! let (zip_upload, thumb_upload) = futures::try_join!(
+//!     client.upload(zip_result.zip_bytes.clone(), MediaType::StickerPack,
+//!         UploadOptions::new().with_media_key(media_key)),
+//!     client.upload(thumbnail_jpeg, MediaType::StickerPackThumbnail,
+//!         UploadOptions::new().with_media_key(media_key)),
+//! )?;
 //!
 //! let metadata = StickerPackMetadata::new(pack_id, "My Pack".into(), "Me".into());
 //! let msg = build_sticker_pack_message(&zip_result, &zip_upload.into(), &thumb_upload.into(), metadata)?;
