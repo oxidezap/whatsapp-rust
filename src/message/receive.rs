@@ -593,9 +593,10 @@ impl Client {
         // the SignalProtocolStoreAdapter's per-session locks (prevents ratchet counter races).
         let signal_address = sender_encryption_jid.to_protocol_address();
 
-        // `session_guard` is held across the entire batch but dropped around
-        // calls into `try_pn_to_lid_migration_decrypt` because that function's
-        // migration loop re-enters this same mutex (non-reentrant).
+        // `session_guard` is held across the decrypt loop (and released before the
+        // plaintext drain below); it's also dropped around calls into
+        // `try_pn_to_lid_migration_decrypt` because that function's migration loop
+        // re-enters this same mutex (non-reentrant).
         let session_mutex = self.session_lock_for(signal_address.as_str()).await;
         let mut session_guard: Option<async_lock::MutexGuardArc<()>> =
             Some(session_mutex.lock_arc().await);
