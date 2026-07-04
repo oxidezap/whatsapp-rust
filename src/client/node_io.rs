@@ -748,44 +748,38 @@ impl Client {
             // (the offline backlog uses keys we already hold, and a fresh device's
             // server pool is empty). Awaiting it here just delayed offline delivery,
             // so spawn it like RotateKeyJob below.
+            // Pre-key upload then RotateKeyJob, ordered on ONE detached task.
+            // Both re-declare the signed pre-key to the server — the upload bundles
+            // the CURRENT one with its one-time keys, rotation uploads a freshly
+            // promoted one. Run as two independent tasks they can overlap, and if
+            // rotation lands first, the upload (built from a pre-rotation snapshot)
+            // reverts the server to the stale signed pre-key; once that key is
+            // pruned, pkmsg sessions the server hands out become undecryptable.
+            // Ordering them here keeps set_passive un-gated (still detached) while
+            // making rotation read the upload's persisted state.
             check_generation!();
-            let prekey_client = client_clone.clone();
-            let prekey_generation = task_generation;
+            let key_client = client_clone.clone();
+            let key_generation = task_generation;
             client_clone
                 .runtime
                 .spawn(Box::pin(async move {
                     // A newer connection may have taken over between spawn and now.
-                    if prekey_client.connection_generation.load(Ordering::SeqCst)
-                        != prekey_generation
-                    {
+                    if key_client.connection_generation.load(Ordering::SeqCst) != key_generation {
                         return;
                     }
-                    if let Err(e) = prekey_client.upload_pre_keys_at_login().await
-                        && !prekey_client.is_shutting_down()
+                    if let Err(e) = key_client.upload_pre_keys_at_login().await
+                        && !key_client.is_shutting_down()
                     {
                         warn!("Failed to upload pre-keys during startup: {e:?}");
                     }
-                }))
-                .detach();
 
-            // WA Web RotateKeyJob: rotate the signed pre-key on its cadence.
-            // Spawned so a slow or failing encrypt IQ never delays the rest of
-            // post-login init.
-            check_generation!();
-            let rotate_client = client_clone.clone();
-            let rotate_generation = task_generation;
-            client_clone
-                .runtime
-                .spawn(Box::pin(async move {
-                    // A newer connection may have taken over between spawn and now;
-                    // rotating on a stale generation would upload a duplicate key.
-                    if rotate_client.connection_generation.load(Ordering::SeqCst)
-                        != rotate_generation
-                    {
+                    // The upload awaited network I/O; re-check before rotating so a
+                    // stale generation doesn't upload a duplicate signed pre-key.
+                    if key_client.connection_generation.load(Ordering::SeqCst) != key_generation {
                         return;
                     }
-                    if let Err(e) = rotate_client.maybe_rotate_signed_pre_key().await
-                        && !rotate_client.is_shutting_down()
+                    if let Err(e) = key_client.maybe_rotate_signed_pre_key().await
+                        && !key_client.is_shutting_down()
                     {
                         warn!("Signed pre-key rotation check failed: {e:?}");
                     }
