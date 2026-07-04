@@ -914,7 +914,7 @@ impl Client {
             .optional_string("phash")
             .map(|s| s.into_owned())
         {
-            let rx = self.register_ack_waiter(&request_id).await;
+            let rx = self.register_ack_waiter(&request_id);
             Some((rx, phash))
         } else {
             None
@@ -1882,7 +1882,7 @@ impl Client {
                 .optional_string("id")
                 .map(|s| s.into_owned())
         {
-            let rx = self.register_ack_waiter(&msg_id).await;
+            let rx = self.register_ack_waiter(&msg_id);
             Some((rx, phash, msg_id))
         } else {
             None

@@ -535,7 +535,7 @@ async fn place_call(
     // Register the ack-waiter for the offer's stanza id BEFORE send_node so a fast server reply can't
     // arrive before we are listening. The ack carries the relay; the spawned task below attaches the
     // engine when it resolves.
-    let ack_rx = client.register_ack_waiter(&offer_stanza_id).await;
+    let ack_rx = client.register_ack_waiter(&offer_stanza_id);
 
     // Register the outgoing call AND park the relay-attach material BEFORE send_node, mirroring the
     // incoming register-before-connect ordering. The handle starts dormant; the ack-waiter task
@@ -2726,7 +2726,7 @@ mod tests {
         let client = make_client().await;
 
         let offer_stanza_id = "OFFER-STANZA-J".to_string();
-        let ack_rx = client.register_ack_waiter(&offer_stanza_id).await;
+        let ack_rx = client.register_ack_waiter(&offer_stanza_id);
         assert!(
             client
                 .response_waiters
@@ -2738,7 +2738,7 @@ mod tests {
         // Drop the sender (re-register a NEW waiter under the same id) so ack_rx closes immediately and
         // the task takes the no-ack closed-channel branch without waiting out the full timeout. The new
         // waiter is what the cleanup must then remove.
-        let _shadow_rx = client.register_ack_waiter(&offer_stanza_id).await;
+        let _shadow_rx = client.register_ack_waiter(&offer_stanza_id);
 
         // No matching pending entry: the task's attach is a harmless no-op, but the response_waiters
         // cleanup must still run.

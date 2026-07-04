@@ -231,7 +231,8 @@ impl Client {
 
     /// Register a oneshot waiter for a server ack by message ID.
     /// Returns the receiver — caller sends the node separately and awaits this in background.
-    pub(crate) async fn register_ack_waiter(
+    /// Sync: registration is just a `std::sync::Mutex` insert (no await).
+    pub(crate) fn register_ack_waiter(
         &self,
         message_id: &str,
     ) -> futures::channel::oneshot::Receiver<std::sync::Arc<wacore_binary::OwnedNodeRef>> {
