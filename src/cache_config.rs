@@ -213,6 +213,15 @@ pub struct CacheConfig {
     /// Default: 4096.
     pub resend_rate_limiter_capacity: u64,
 
+    /// Max (chat, requester) pairs tracked by the inbound retry-receipt
+    /// quarantine. Unlike the resend limiter (one entry per chat), the
+    /// quarantine keyspace is O(groups x broken members) — a single storming
+    /// 1012-participant group holds ~470 pairs — and evicting an ACTIVE pair
+    /// refunds its full burst on the next receipt, weakening the budget. Pairs
+    /// are tiny (two short strings + one bucket), so size generously.
+    /// Default: 32768.
+    pub retry_mark_quarantine_capacity: u64,
+
     // --- Sent message DB cleanup ---
     /// TTL in seconds for sent messages in DB before periodic cleanup. Must
     /// outlive retry receipts (which can arrive well after a send) or the retry
@@ -292,6 +301,10 @@ impl std::fmt::Debug for CacheConfig {
                 "resend_rate_limiter_capacity",
                 &self.resend_rate_limiter_capacity,
             )
+            .field(
+                "retry_mark_quarantine_capacity",
+                &self.retry_mark_quarantine_capacity,
+            )
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
             .field("msg_secret_policy", &self.msg_secret_policy)
             .field("msg_secret_retention", &self.msg_secret_retention)
@@ -350,6 +363,7 @@ impl Default for CacheConfig {
             chat_lanes_capacity: 5_000,
             group_distribution_locks_capacity: 512,
             resend_rate_limiter_capacity: 4_096,
+            retry_mark_quarantine_capacity: 32_768,
             sent_message_ttl_secs: 7200,
             // Bounded by default: seed only the still-relevant slice of history
             // and prune by per-add-on-kind event-time horizons, so the store no

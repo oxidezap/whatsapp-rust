@@ -195,7 +195,7 @@ impl Client {
             ),
 
             retry_mark_quarantine: crate::resend_rate_limiter::RetryMarkQuarantine::new(
-                cache_config.resend_rate_limiter_capacity,
+                cache_config.retry_mark_quarantine_capacity,
                 crate::resend_rate_limiter::DEFAULT_RETRY_MARK_BURST,
                 crate::resend_rate_limiter::DEFAULT_RETRY_MARK_REFILL_PER_DAY,
             ),

@@ -331,6 +331,30 @@ impl Client {
                 .as_ref()
                 .is_some_and(|our_lid| info.requester.is_same_user_as(our_lid));
 
+        // Quarantine members whose sessions never establish: past a small
+        // burst, each further receipt from the same (chat, requester) pair is
+        // dropped BEFORE all repair work — the group-info fetch, the rotateKey
+        // path (own sender-key deletion + whole-group cache invalidation for
+        // unknown senders) and markForgetSenderKey (a DB write + whole-group
+        // sender-key cache invalidation) all run per receipt otherwise, even
+        // when the per-chat cap later drops the resend. Placed after the
+        // message-cache lookup so receipts for already-expired messages (a
+        // cheap no-op) don't burn the pair's repair budget. The bucket refills
+        // (default 2/day) so genuine recovery still works.
+        if is_group_or_status
+            && !self
+                .retry_mark_quarantine
+                .try_acquire(&info.chat, &info.requester)
+                .await
+        {
+            debug!(
+                "Quarantining retry receipt from {} in {}: repeated undeliverable SKDM (pair budget spent)",
+                info.requester.observe(),
+                info.chat.observe()
+            );
+            return Ok(());
+        }
+
         // Fetch group info (cache-first, server on miss) — used for SKDM rotation + addressing_mode.
         // Without this, a cold cache would silently default to PN semantics for LID groups.
         let cached_group_info = if info.chat.is_group() {
@@ -407,26 +431,6 @@ impl Client {
                 }
                 self.sender_key_device_cache.invalidate(&group_jid).await;
             }
-        }
-
-        // Quarantine members whose sessions never establish: past a small
-        // burst, each further receipt from the same (chat, requester) pair is
-        // dropped BEFORE the repair work below — markForgetSenderKey is a DB
-        // write + a whole-group sender-key cache invalidation, and it runs on
-        // every receipt even when the per-chat cap later drops the resend.
-        // The bucket refills (default 2/day) so genuine recovery still works.
-        if is_group_or_status
-            && !self
-                .retry_mark_quarantine
-                .try_acquire(&info.chat, &info.requester)
-                .await
-        {
-            debug!(
-                "Quarantining retry receipt from {} in {}: repeated undeliverable SKDM (pair budget spent)",
-                info.requester.observe(),
-                info.chat.observe()
-            );
-            return Ok(());
         }
 
         // Mirror WAWebUpdateLocalSignalSession for all chat types: markForgetSenderKey

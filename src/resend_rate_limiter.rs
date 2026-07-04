@@ -199,6 +199,10 @@ impl RetryMarkQuarantine {
         let burst = burst as f64;
         let refill_per_sec = self.refill_per_day.load(Ordering::Relaxed) as f64 / 86_400.0;
 
+        // The owned key allocates two small strings per receipt (no
+        // Borrow<(&str, &str)> for (String, String)); acceptable here — this
+        // runs once per retry receipt, not per message, and replaces a DB
+        // write + whole-group cache invalidation when it quarantines.
         let key = (chat.user.to_string(), requester.user.to_string());
         let bucket = self
             .buckets
