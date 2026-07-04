@@ -142,7 +142,6 @@ pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node
 }
 
 /// Handle business notification (WhatsApp Web: `WAWebHandleBusinessNotification`).
-#[inline(never)] // single call site; keep out-of-line (see device::handle_encrypt_notification)
 pub(crate) async fn handle_business_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
     let notification = match BusinessNotification::try_parse(node) {
         Ok(n) => n,
