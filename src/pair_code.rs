@@ -235,10 +235,19 @@ impl Client {
             primary_hello_attempt_count: 0,
         };
 
-        // Dispatch event for user to display the code
+        // Dispatch event for the user to display the code. The validity clock
+        // started at `code_generation_ts` (before stage 1), so advertise the
+        // *remaining* window — otherwise a consumer's countdown would outlast the
+        // server's (and our own `handle_primary_hello`) expiry by the stage-1
+        // elapsed time.
+        let elapsed = wacore::time::now_secs()
+            .saturating_sub(code_generation_ts)
+            .max(0) as u64;
+        let remaining =
+            PairCodeUtils::code_validity().saturating_sub(std::time::Duration::from_secs(elapsed));
         self.core.event_bus.dispatch(Event::PairingCode {
             code: code.clone(),
-            timeout: PairCodeUtils::code_validity(),
+            timeout: remaining,
         });
 
         Ok(code)
