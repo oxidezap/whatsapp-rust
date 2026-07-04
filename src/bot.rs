@@ -311,10 +311,8 @@ enum Delivery {
 }
 
 struct CallbackBusAdapter {
-    // Weak so the bus → adapter → client reference cycle doesn't pin the client
-    // for its whole lifetime (the bus lives inside `client.core`). Upgraded per
-    // dispatch — the client is always live while events flow — and a dropped
-    // client lets the ordered drainer's upgrade fail so it exits cleanly.
+    // Weak: the bus lives inside `client.core`, so a strong ref here would pin
+    // the client for its whole lifetime. Upgraded per dispatch.
     client: Weak<Client>,
     delivery: Delivery,
     interest: EventInterest,
@@ -330,11 +328,9 @@ impl CallbackBusAdapter {
             EventDelivery::Ordered { capacity } => {
                 let (tx, rx) = async_channel::bounded::<Arc<Event>>(capacity.max(1));
                 let handlers: Arc<[RegisteredHandler]> = handlers.into();
-                // One drainer preserves arrival order across events; within an
-                // event the interested callbacks run in registration order. Holds
-                // a Weak so a dropped client makes the per-event upgrade fail and
-                // the task exits (the sender also drops with the adapter, closing
-                // the channel).
+                // Single drainer preserves arrival order; within an event the
+                // callbacks run in registration order. Weak so a dropped client
+                // exits the loop.
                 let drain_client = Arc::downgrade(&client);
                 let drain_handlers = Arc::clone(&handlers);
                 client
@@ -1453,7 +1449,12 @@ mod tests {
 
         let mut seen = Vec::with_capacity(n);
         for _ in 0..n {
-            seen.push(order_rx.recv().await.expect("callback ran"));
+            seen.push(
+                tokio::time::timeout(std::time::Duration::from_secs(5), order_rx.recv())
+                    .await
+                    .expect("timed out waiting for ordered callback")
+                    .expect("callback ran"),
+            );
         }
         let expected: Vec<String> = (0..n).map(|i| i.to_string()).collect();
         assert_eq!(
@@ -1495,7 +1496,10 @@ mod tests {
         // #0 is pulled by the drainer, which then parks on `release`; the mailbox
         // is now empty and the drainer won't take another until released.
         adapter.handle_event(pairing_code_event("0"));
-        started_rx.recv().await.expect("drainer entered callback");
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("timed out waiting for drainer to start")
+            .expect("drainer entered callback");
 
         adapter.handle_event(pairing_code_event("1")); // fills capacity-1 mailbox
         adapter.handle_event(pairing_code_event("2")); // dropped
