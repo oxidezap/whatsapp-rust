@@ -707,6 +707,139 @@ mod tests {
         assert!(seen_urls[1].contains("auth=fresh-auth"));
     }
 
+    // A generic (non-auth, non-404) error on one host must fall through to the
+    // next host within the SAME attempt — no media-conn refresh — and succeed.
+    #[tokio::test]
+    async fn download_fails_over_to_next_host_without_refresh() {
+        let body = b"failover me".to_vec();
+        let downloadable = PlaintextDownloadable {
+            direct_path: "/v/t62.7118-24/failover".to_string(),
+            file_sha256: plaintext_sha256(&body),
+        };
+        let conn = media_conn(
+            "auth-tok",
+            &["bad-host.example.com", "good-host.example.com"],
+        );
+        let refresh_calls = Arc::new(Mutex::new(Vec::new()));
+        let invalidations = Arc::new(Mutex::new(0usize));
+        let seen_urls = Arc::new(Mutex::new(Vec::new()));
+
+        let downloaded = download_media_with_retry(
+            {
+                let refresh_calls = Arc::clone(&refresh_calls);
+                let downloadable = &downloadable;
+                let conn = conn.clone();
+                move |force| {
+                    let refresh_calls = Arc::clone(&refresh_calls);
+                    let conn = conn.clone();
+                    async move {
+                        refresh_calls.lock().await.push(force);
+                        DownloadUtils::prepare_download_requests(
+                            downloadable,
+                            &wacore::download::MediaConnection::from(&conn),
+                        )
+                    }
+                }
+            },
+            {
+                let invalidations = Arc::clone(&invalidations);
+                move || {
+                    let invalidations = Arc::clone(&invalidations);
+                    async move {
+                        *invalidations.lock().await += 1;
+                    }
+                }
+            },
+            {
+                let seen_urls = Arc::clone(&seen_urls);
+                let body = body.clone();
+                move |request| {
+                    let seen_urls = Arc::clone(&seen_urls);
+                    let body = body.clone();
+                    let url = request.url.clone();
+                    async move {
+                        seen_urls.lock().await.push(url.clone());
+                        if url.contains("bad-host") {
+                            Err(DownloadRequestError::other(anyhow!("connection reset")))
+                        } else {
+                            Ok(body)
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        .expect("download should fail over to the healthy host");
+
+        assert_eq!(downloaded, body);
+        // Single attempt, no refresh: a generic error doesn't invalidate the media conn.
+        assert_eq!(*refresh_calls.lock().await, vec![false]);
+        assert_eq!(*invalidations.lock().await, 0);
+        let seen_urls = seen_urls.lock().await.clone();
+        assert_eq!(seen_urls.len(), 2);
+        assert!(seen_urls[0].contains("bad-host"));
+        assert!(seen_urls[1].contains("good-host"));
+    }
+
+    // When every host fails with a generic error, the accumulated `last_err`
+    // is surfaced (not the fallback "all hosts" message) and no refresh happens.
+    #[tokio::test]
+    async fn download_propagates_last_error_when_all_hosts_fail() {
+        let body = b"never arrives".to_vec();
+        let downloadable = PlaintextDownloadable {
+            direct_path: "/v/t62.7118-24/allfail".to_string(),
+            file_sha256: plaintext_sha256(&body),
+        };
+        let conn = media_conn("auth-tok", &["host-a.example.com", "host-b.example.com"]);
+        let invalidations = Arc::new(Mutex::new(0usize));
+        let seen_urls = Arc::new(Mutex::new(Vec::new()));
+
+        let err = download_media_with_retry(
+            {
+                let downloadable = &downloadable;
+                let conn = conn.clone();
+                move |_force| {
+                    let conn = conn.clone();
+                    async move {
+                        DownloadUtils::prepare_download_requests(
+                            downloadable,
+                            &wacore::download::MediaConnection::from(&conn),
+                        )
+                    }
+                }
+            },
+            {
+                let invalidations = Arc::clone(&invalidations);
+                move || {
+                    let invalidations = Arc::clone(&invalidations);
+                    async move {
+                        *invalidations.lock().await += 1;
+                    }
+                }
+            },
+            {
+                let seen_urls = Arc::clone(&seen_urls);
+                move |request| {
+                    let seen_urls = Arc::clone(&seen_urls);
+                    let url = request.url.clone();
+                    async move {
+                        seen_urls.lock().await.push(url.clone());
+                        Err::<Vec<u8>, _>(DownloadRequestError::other(anyhow!("host {url} down")))
+                    }
+                }
+            },
+        )
+        .await
+        .expect_err("all hosts failing must surface an error");
+
+        assert!(
+            err.to_string().contains("down"),
+            "expected the propagated last_err, got: {err}"
+        );
+        assert_eq!(*invalidations.lock().await, 0);
+        assert_eq!(seen_urls.lock().await.len(), 2);
+    }
+
     #[tokio::test]
     async fn download_to_writer_retries_with_forced_media_conn_refresh_after_auth_error() {
         let body = b"stream me".to_vec();
