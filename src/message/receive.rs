@@ -574,7 +574,6 @@ impl Client {
         }
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.session_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %sender_encryption_jid.observe(), msg_id = %info.id)))]
     /// Dispatch one decrypted session plaintext (decode, SKDM/key-share, commit,
     /// hook, event) and fold the result into `outcome`. None of this touches the
     /// pairwise ratchet, so it runs without the per-sender session lock.
@@ -610,6 +609,7 @@ impl Client {
         }
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.session_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %sender_encryption_jid.observe(), msg_id = %info.id)))]
     pub(crate) async fn process_session_enc_batch(
         self: Arc<Self>,
         payloads: &[EncPayload],
