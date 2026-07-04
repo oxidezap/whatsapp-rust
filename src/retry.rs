@@ -409,6 +409,26 @@ impl Client {
             }
         }
 
+        // Quarantine members whose sessions never establish: past a small
+        // burst, each further receipt from the same (chat, requester) pair is
+        // dropped BEFORE the repair work below — markForgetSenderKey is a DB
+        // write + a whole-group sender-key cache invalidation, and it runs on
+        // every receipt even when the per-chat cap later drops the resend.
+        // The bucket refills (default 2/day) so genuine recovery still works.
+        if is_group_or_status
+            && !self
+                .retry_mark_quarantine
+                .try_acquire(&info.chat, &info.requester)
+                .await
+        {
+            debug!(
+                "Quarantining retry receipt from {} in {}: repeated undeliverable SKDM (pair budget spent)",
+                info.requester.observe(),
+                info.chat.observe()
+            );
+            return Ok(());
+        }
+
         // Mirror WAWebUpdateLocalSignalSession for all chat types: markForgetSenderKey
         // (group/status) + processKeyBundle + regId-mismatch delete + base-key logic.
         // Must run before ensureE2ESessions so any session deletion here is rebuilt there.

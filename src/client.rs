@@ -213,6 +213,7 @@ pub struct MemoryReport {
     pub session_locks: u64,
     pub chat_lanes: u64,
     pub resend_rate_limiter_chats: u64,
+    pub retry_mark_quarantine_pairs: u64,
     // -- Unbounded collections --
     pub response_waiters: usize,
     pub node_waiters: usize,
@@ -286,6 +287,11 @@ impl std::fmt::Display for MemoryReport {
             f,
             "  resend_rl_chats:        {}",
             self.resend_rate_limiter_chats
+        )?;
+        writeln!(
+            f,
+            "  retry_quarantine_pairs: {}",
+            self.retry_mark_quarantine_pairs
         )?;
         writeln!(f, "--- Unbounded collections ---")?;
         writeln!(f, "  response_waiters:       {}", self.response_waiters)?;
@@ -612,6 +618,7 @@ pub struct Client {
     /// to a chat (the anti-abuse signal) so a PN to LID fan-out cannot storm into
     /// AccountLocked. Throttled devices still recover via the fresh-SKDM mark.
     pub(crate) resend_rate_limiter: crate::resend_rate_limiter::ResendRateLimiter,
+    pub(crate) retry_mark_quarantine: crate::resend_rate_limiter::RetryMarkQuarantine,
 
     /// Dispatch-once gate for `UndecryptableMessage`: a server resend of a
     /// failed id re-enters the failure path and would otherwise fire a

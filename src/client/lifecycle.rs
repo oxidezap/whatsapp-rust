@@ -194,6 +194,12 @@ impl Client {
                 crate::resend_rate_limiter::DEFAULT_RESEND_REFILL_PER_MIN,
             ),
 
+            retry_mark_quarantine: crate::resend_rate_limiter::RetryMarkQuarantine::new(
+                cache_config.resend_rate_limiter_capacity,
+                crate::resend_rate_limiter::DEFAULT_RETRY_MARK_BURST,
+                crate::resend_rate_limiter::DEFAULT_RETRY_MARK_REFILL_PER_DAY,
+            ),
+
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
 
             offline_sync_metrics: Arc::new(OfflineSyncMetrics {

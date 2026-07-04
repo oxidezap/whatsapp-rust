@@ -137,10 +137,119 @@ impl ResendRateLimiter {
     }
 }
 
+/// Default burst for the per-(chat, requester) retry-receipt quarantine: how
+/// many "fresh SKDM" repair attempts one member gets at full speed. One mark
+/// is enough to repair a healthy member (the next send carries the SKDM), so
+/// anything past a small burst is a member whose session never establishes.
+pub(crate) const DEFAULT_RETRY_MARK_BURST: u32 = 2;
+
+/// Sustained repair attempts per day per (chat, requester) once the burst is
+/// spent. Keeps a genuinely-recovering member repairable (a fresh attempt
+/// every ~12h) while bounding a permanently-broken member to O(1)/day instead
+/// of O(group messages)/day.
+pub(crate) const DEFAULT_RETRY_MARK_REFILL_PER_DAY: u32 = 2;
+
+/// Per-(chat, requester) quarantine for inbound group retry receipts.
+///
+/// In large groups a cohort of members whose pairwise sessions never
+/// establish (dead registrations, exhausted prekeys, re-registered LIDs)
+/// sends a retry receipt for every single group message. Each receipt pays
+/// `markForgetSenderKey` (a DB write plus a sender-key cache invalidation for
+/// the whole group), bundle processing and possibly a resend — all upstream
+/// of the per-chat resend cap, which only bounds the resend itself. Observed
+/// in production at ~58k marks per 3.5 days from 468 members of a single
+/// 1012-participant group. This bounds the whole repair path per member:
+/// past the burst, further receipts from the same (chat, requester) are
+/// dropped before any work happens; the bucket refills so real recovery is
+/// still possible.
+pub(crate) struct RetryMarkQuarantine {
+    /// One bucket per (chat user, requester user). Capacity-only: evicting an
+    /// idle pair only forgives rate (it recreates full), never over-restricts.
+    buckets: Cache<(String, String), Arc<Mutex<TokenBucket>>>,
+    burst: AtomicU32,
+    refill_per_day: AtomicU32,
+    throttled_total: AtomicU64,
+}
+
+impl RetryMarkQuarantine {
+    pub(crate) fn new(capacity: u64, burst: u32, refill_per_day: u32) -> Self {
+        Self {
+            buckets: Cache::builder().max_capacity(capacity.max(1)).build(),
+            burst: AtomicU32::new(burst),
+            refill_per_day: AtomicU32::new(refill_per_day),
+            throttled_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Retune the rate live. A `burst` of 0 disables the quarantine.
+    pub(crate) fn set_rate(&self, burst: u32, refill_per_day: u32) {
+        self.burst.store(burst, Ordering::Relaxed);
+        self.refill_per_day.store(refill_per_day, Ordering::Relaxed);
+    }
+
+    /// Try to consume one repair token for (chat, requester). `true` lets the
+    /// retry receipt through; `false` quarantines it. Device is intentionally
+    /// excluded from the key so all devices of a broken account share one
+    /// budget (WA Web re-targets the whole user when the primary goes cold).
+    pub(crate) async fn try_acquire(&self, chat: &Jid, requester: &Jid) -> bool {
+        let burst = self.burst.load(Ordering::Relaxed);
+        if burst == 0 {
+            return true;
+        }
+        let burst = burst as f64;
+        let refill_per_sec = self.refill_per_day.load(Ordering::Relaxed) as f64 / 86_400.0;
+
+        let key = (chat.user.to_string(), requester.user.to_string());
+        let bucket = self
+            .buckets
+            .get_with(key, async move {
+                Arc::new(Mutex::new(TokenBucket::new(burst, Instant::now())))
+            })
+            .await;
+
+        let allowed = bucket
+            .lock()
+            .await
+            .try_take(Instant::now(), burst, refill_per_sec);
+        if !allowed {
+            self.throttled_total.fetch_add(1, Ordering::Relaxed);
+        }
+        allowed
+    }
+
+    /// Total receipts quarantined since start (observability).
+    pub(crate) fn throttled_total(&self) -> u64 {
+        self.throttled_total.load(Ordering::Relaxed)
+    }
+
+    /// Number of (chat, requester) pairs holding a live bucket (diagnostics).
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.buckets.entry_count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn quarantine_bounds_per_pair_and_isolates_pairs() {
+        // burst 2, refill 0: two repair attempts then quarantined.
+        let q = RetryMarkQuarantine::new(100, 2, 0);
+        let g: Jid = "123-456@g.us".parse().unwrap();
+        let a: Jid = "111@lid".parse().unwrap();
+        let b: Jid = "222@lid".parse().unwrap();
+        assert!(q.try_acquire(&g, &a).await);
+        assert!(q.try_acquire(&g, &a).await);
+        assert!(!q.try_acquire(&g, &a).await, "third receipt quarantined");
+        // Another requester in the same chat has its own budget.
+        assert!(q.try_acquire(&g, &b).await);
+        assert_eq!(q.throttled_total(), 1);
+        // burst 0 disables.
+        let off = RetryMarkQuarantine::new(100, 0, 0);
+        assert!(off.try_acquire(&g, &a).await);
+    }
 
     fn chat(s: &str) -> Jid {
         s.parse().unwrap()

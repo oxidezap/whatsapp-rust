@@ -71,6 +71,9 @@ pub struct StatsSnapshot {
     /// Outbound resends dropped by the per-chat rate limiter. Surfaces storm
     /// chats.
     pub resends_throttled: u64,
+    /// Inbound group retry receipts dropped by the per-(chat, requester)
+    /// quarantine (client-side counter, filled by the owner).
+    pub retry_receipts_quarantined: u64,
     pub last_data_sent_ms: u64,
     pub last_data_received_ms: u64,
 }
@@ -169,6 +172,7 @@ impl SessionStats {
             reconnects: self.reconnects.load(Ordering::Relaxed),
             reconnect_errors: 0,
             resends_throttled: 0,
+            retry_receipts_quarantined: 0,
             last_data_sent_ms: self.last_data_sent_ms.load(Ordering::Relaxed),
             last_data_received_ms: self.last_data_received_ms.load(Ordering::Relaxed),
         }

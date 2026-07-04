@@ -83,6 +83,12 @@ impl Client {
         self.resend_rate_limiter.set_rate(burst, refill_per_min);
     }
 
+    /// Retune the per-(chat, requester) retry-receipt quarantine live.
+    /// `burst` 0 disables it. See `RetryMarkQuarantine` for rationale.
+    pub fn set_retry_mark_quarantine(&self, burst: u32, refill_per_day: u32) {
+        self.retry_mark_quarantine.set_rate(burst, refill_per_day);
+    }
+
     /// Cumulative wire I/O and activity counters for this client session.
     ///
     /// Always available, no feature gate: recording costs one relaxed atomic
@@ -93,6 +99,7 @@ impl Client {
         let mut snapshot = self.stats.snapshot();
         snapshot.reconnect_errors = self.auto_reconnect_errors.load(Ordering::Relaxed);
         snapshot.resends_throttled = self.resend_rate_limiter.throttled_total();
+        snapshot.retry_receipts_quarantined = self.retry_mark_quarantine.throttled_total();
         snapshot
     }
 
@@ -161,6 +168,7 @@ impl Client {
             session_locks: self.session_locks.entry_count(),
             chat_lanes: self.chat_lanes.entry_count(),
             resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
+            retry_mark_quarantine_pairs: self.retry_mark_quarantine.entry_count(),
             response_waiters,
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,
