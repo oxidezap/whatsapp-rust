@@ -338,9 +338,11 @@ impl PairCodeUtils {
                 NodeBuilder::new("companion_platform_display")
                     .bytes(platform_display.as_bytes().to_vec())
                     .build(),
-                // Nonce is sent as string "0" (matching whatsmeow/baileys)
+                // Single zero byte. WA Web sends `new Uint8Array(1)` (see
+                // `Alt/DeviceLinkingIq.js`) and whatsmeow sends `[]byte{0}` — i.e.
+                // byte 0x00, NOT the ASCII character '0' (0x30).
                 NodeBuilder::new("link_code_pairing_nonce")
-                    .bytes(b"0".to_vec())
+                    .bytes(vec![0u8])
                     .build(),
             ])
             .build();
@@ -1072,8 +1074,9 @@ mod tests {
             Some("true")
         );
 
-        // Nonce is the string "0", per whatsmeow/baileys parity.
-        assert_eq!(child_bytes(reg, "link_code_pairing_nonce"), b"0");
+        // Nonce is a single zero byte (0x00), matching WA Web's
+        // `new Uint8Array(1)` and whatsmeow's `[]byte{0}` — not ASCII '0'.
+        assert_eq!(child_bytes(reg, "link_code_pairing_nonce"), &[0u8]);
     }
 
     #[test]
