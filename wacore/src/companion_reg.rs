@@ -122,15 +122,89 @@ pub fn companion_web_client_type_for_props(props: &wa::DeviceProps) -> Companion
         .unwrap_or(CompanionWebClientType::OtherWebClient)
 }
 
-/// `companion_platform_display` body. Server validates only length
-/// 1..=100; there is no browser whitelist. Web variants emit
-/// `<Browser> (<OS>)`, mirroring `WAWebAltDeviceLinkingIq`; Android
-/// variants emit `Android (<OS>)`, matching the official Android client.
-/// Empty OS substitutes `Linux`.
+/// Canonical OS label for the pair-code `companion_platform_display`.
+///
+/// WA Web only ever emits a real OS name from its UA parser
+/// (`WAWebBrowserInfo().os` → `ua-parser-js` `getOS().name`). Unlike QR pairing —
+/// which never sends this field and therefore tolerates an arbitrary branding
+/// string in `DeviceProps::os` — the pair-code `companion_hello` server
+/// **rejects a non-OS display with `bad-request`**. So the OS component must come
+/// from a closed set of real OS names, never the free-form branding string.
+///
+/// The set is deliberately small and conservative: the server is lenient toward
+/// real OS names today (it also accepts `Ubuntu`, `Fedora`, `Mac`, …), but
+/// collapsing everything to a guaranteed-accepted canonical value is robust
+/// against that leniency changing. Anything unrecognized coerces to
+/// [`Self::Linux`] (see [`Self::from_hint`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompanionOs {
+    Windows,
+    MacOs,
+    Linux,
+    Android,
+    Ios,
+}
+
+impl CompanionOs {
+    /// The exact wire string, matching `ua-parser-js` `getOS().name` (what WA Web
+    /// sends) — note the `"Mac OS"` and `"iOS"` spellings.
+    pub const fn wire_str(self) -> &'static str {
+        match self {
+            Self::Windows => "Windows",
+            Self::MacOs => "Mac OS",
+            Self::Linux => "Linux",
+            Self::Android => "Android",
+            Self::Ios => "iOS",
+        }
+    }
+
+    /// Classify a free-form OS hint into a known canonical OS, or `None` when it
+    /// is not recognizably an OS (empty, or a branding label such as `"Veloz"`).
+    /// Case-insensitive. iPad folds to [`Self::Ios`]: older UA parsers report iPad
+    /// as `"iOS"`, so `"iPadOS"` is not a confirmed server-accepted value. Chrome
+    /// OS and Linux distros fold to [`Self::Linux`].
+    pub fn classify(os: &str) -> Option<Self> {
+        let os = os.trim().to_ascii_lowercase();
+        if os.is_empty() {
+            None
+        } else if os.contains("windows") {
+            Some(Self::Windows)
+        } else if os.contains("mac") || os.contains("osx") || os.contains("darwin") {
+            Some(Self::MacOs)
+        } else if os.contains("ipad") || os.contains("iphone") || os.contains("ios") {
+            Some(Self::Ios)
+        } else if os.contains("android") {
+            Some(Self::Android)
+        } else if os.contains("linux")
+            || os.contains("ubuntu")
+            || os.contains("debian")
+            || os.contains("fedora")
+            || os.contains("arch")
+            || os.contains("chrome os")
+            || os.contains("chromium")
+            || os.contains("cros")
+        {
+            Some(Self::Linux)
+        } else {
+            None
+        }
+    }
+
+    /// Coerce a free-form `DeviceProps::os` into a server-safe canonical OS,
+    /// defaulting an unrecognized/branding value to [`Self::Linux`].
+    pub fn from_hint(os: &str) -> Self {
+        Self::classify(os).unwrap_or(Self::Linux)
+    }
+}
+
+/// `companion_platform_display` body: `<Browser> (<OS>)` (Android client types
+/// emit `Android (<OS>)`), mirroring `WAWebAltDeviceLinkingIq`. The OS is
+/// canonicalized through [`CompanionOs`] because the pair-code server rejects a
+/// non-OS string here with `bad-request`; an unrecognized/branding `os` (or an
+/// empty one) becomes `Linux`.
 pub fn companion_platform_display(ct: CompanionWebClientType, os: &str) -> String {
     use CompanionWebClientType as C;
-    let os = os.trim();
-    let os = if os.is_empty() { "Linux" } else { os };
+    let os = CompanionOs::from_hint(os).wire_str();
     match ct {
         C::AndroidPhone | C::AndroidTablet | C::AndroidAmbiguous => {
             format!("Android ({os})")
@@ -324,9 +398,10 @@ mod tests {
             companion_platform_display(CompanionWebClientType::Chrome, "Linux"),
             "Chrome (Linux)"
         );
+        // "Mac" canonicalizes to the ua-parser name WA Web actually sends.
         assert_eq!(
             companion_platform_display(CompanionWebClientType::Firefox, "Mac"),
-            "Firefox (Mac)"
+            "Firefox (Mac OS)"
         );
     }
 
@@ -350,7 +425,73 @@ mod tests {
         );
         assert_eq!(
             companion_platform_display(CompanionWebClientType::Electron, "Mac"),
-            "Chrome (Mac)"
+            "Chrome (Mac OS)"
         );
+    }
+
+    #[test]
+    fn companion_os_wire_str_matches_ua_parser_names() {
+        assert_eq!(CompanionOs::Windows.wire_str(), "Windows");
+        assert_eq!(CompanionOs::MacOs.wire_str(), "Mac OS");
+        assert_eq!(CompanionOs::Linux.wire_str(), "Linux");
+        assert_eq!(CompanionOs::Android.wire_str(), "Android");
+        assert_eq!(CompanionOs::Ios.wire_str(), "iOS");
+    }
+
+    #[test]
+    fn companion_os_classify_known_aliases() {
+        use CompanionOs as O;
+        for (hint, want) in [
+            ("Windows", O::Windows),
+            ("windows 11", O::Windows),
+            ("Mac", O::MacOs),
+            ("macOS", O::MacOs),
+            ("Mac OS", O::MacOs),
+            ("Mac OS X", O::MacOs),
+            ("darwin", O::MacOs),
+            ("Linux", O::Linux),
+            ("Ubuntu", O::Linux),
+            ("Fedora", O::Linux),
+            ("Arch Linux", O::Linux),
+            ("Chrome OS", O::Linux),
+            ("Chromium OS", O::Linux),
+            ("Android", O::Android),
+            ("android 14", O::Android),
+            ("iOS", O::Ios),
+            ("iPhone", O::Ios),
+            ("iPad", O::Ios),
+            ("iPadOS", O::Ios),
+        ] {
+            assert_eq!(CompanionOs::classify(hint), Some(want), "{hint:?}");
+        }
+    }
+
+    #[test]
+    fn companion_os_branding_and_empty_are_unclassified_and_default_linux() {
+        for hint in ["Veloz", "Foobar123", "", "   "] {
+            assert_eq!(CompanionOs::classify(hint), None, "{hint:?}");
+            assert_eq!(CompanionOs::from_hint(hint), CompanionOs::Linux, "{hint:?}");
+        }
+    }
+
+    /// The regression this whole enum exists for: a branding `os` must never ride
+    /// through to the wire (the pair-code server rejects it with `bad-request`).
+    #[test]
+    fn platform_display_coerces_branding_os_to_linux() {
+        assert_eq!(
+            companion_platform_display(CompanionWebClientType::Chrome, "Veloz"),
+            "Chrome (Linux)"
+        );
+    }
+
+    #[test]
+    fn platform_display_canonicalizes_mac_aliases() {
+        for os in ["Mac", "macOS", "Mac OS", "Mac OS X", "darwin"] {
+            assert_eq!(
+                companion_platform_display(CompanionWebClientType::Chrome, os),
+                "Chrome (Mac OS)",
+                "{os:?}"
+            );
+        }
     }
 }

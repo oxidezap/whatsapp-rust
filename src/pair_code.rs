@@ -56,7 +56,7 @@ use wacore::pair_code::{PairCodeState, PairCodeUtils, resolve_companion_platform
 use wacore_binary::Jid;
 use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 
-pub use wacore::companion_reg::CompanionWebClientType;
+pub use wacore::companion_reg::{CompanionOs, CompanionWebClientType};
 pub use wacore::pair_code::{PairCodeError, PairCodeOptions};
 
 /// Errors raised by the high-level pair-code flow.
@@ -69,6 +69,16 @@ pub enum PairError {
     #[error(transparent)]
     PairCode(#[from] PairCodeError),
 
+    /// The pair-code IQ was rejected by the server.
+    ///
+    /// Note the server returns `bad-request` (400) **both** for genuinely invalid
+    /// content and for **rate-limiting** — it throttles pair-code requests per
+    /// phone number and reuses the same error. So a 400 here is not necessarily a
+    /// permanent/invalid-input failure: back off and retry rather than treating
+    /// every 400 as fatal. (The lib canonicalizes the `companion_platform_display`
+    /// OS, so a display-shaped rejection is already ruled out — see
+    /// [`wacore::companion_reg::CompanionOs`].) Any server `backoff` hint is
+    /// preserved on the wrapped [`IqError`].
     #[error("pair-code IQ request failed")]
     RequestFailed(#[from] IqError),
 }
@@ -89,7 +99,9 @@ impl Client {
     /// # Returns
     ///
     /// * `Ok(String)` - The 8-character pairing code to display
-    /// * `Err` - If validation fails, not connected, or server error
+    /// * `Err` - If validation fails, not connected, or server error. A
+    ///   [`PairError::RequestFailed`] carrying `bad-request` may be **rate-limiting**
+    ///   (throttled per phone number), not invalid input — back off and retry.
     ///
     /// # Example
     ///
@@ -186,6 +198,20 @@ impl Client {
         let (platform_id, platform_display) =
             resolve_companion_platform(&options, &device_snapshot.device_props);
         let platform_id_str = platform_id.to_string();
+
+        // The pair-code server rejects a non-OS `companion_platform_display` with
+        // bad-request (QR pairing never sends this field, so it tolerates arbitrary
+        // branding). If `DeviceProps::os` was a branding string it is coerced to
+        // "Linux"; warn so a consumer sees why their branding didn't ride through.
+        if let Some(os) = device_snapshot.device_props.os.as_deref()
+            && !os.trim().is_empty()
+            && CompanionOs::classify(os).is_none()
+        {
+            warn!(
+                target: "Client/PairCode",
+                "companion_platform_display OS {os:?} is not a recognized OS; coerced to \"Linux\" for pair-code (the server would reject a non-OS display with bad-request)"
+            );
+        }
 
         let req_id = self.generate_request_id();
         let iq_content = PairCodeUtils::build_companion_hello_iq(
