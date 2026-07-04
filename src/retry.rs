@@ -341,7 +341,14 @@ impl Client {
         // message-cache lookup so receipts for already-expired messages (a
         // cheap no-op) don't burn the pair's repair budget. The bucket refills
         // (default 2/day) so genuine recovery still works.
+        //
+        // Own companion devices (`is_peer`) are exempt: a secondary of our own
+        // account that was offline for a while or rotated keys can legitimately
+        // need many repair cycles to rebuild its group session, and dropping
+        // those would block group decryption on that device. The storm this
+        // guards is third-party members, never our own devices.
         if is_group_or_status
+            && !is_peer
             && !self
                 .retry_mark_quarantine
                 .try_acquire(&info.chat, &info.requester)
