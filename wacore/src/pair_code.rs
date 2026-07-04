@@ -83,6 +83,10 @@ fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], rounds: u32, output: &mut [u
 /// Validity duration for pair codes (approximately).
 const PAIR_CODE_VALIDITY_SECS: u64 = 180;
 
+/// Max `primary_hello` notifications processed per code before the flow is
+/// abandoned. Matches WA Web `DeviceLinkingApi` (`T = 3`, `MaxPrimaryHelloError`).
+const PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS: u32 = 3;
+
 fn build_id_and_display(
     id: CompanionWebClientType,
     props: &wa::DeviceProps,
@@ -160,6 +164,13 @@ pub enum PairCodeState {
         pair_code: String,
         /// Ephemeral keypair generated for this session.
         ephemeral_keypair: Box<KeyPair>,
+        /// Unix seconds when the code was generated. Enforces the ~180s validity
+        /// window: a `primary_hello` arriving later is rejected (WA Web `OldCodeError`).
+        code_generation_ts: i64,
+        /// Count of `primary_hello` notifications processed for this code. WA Web
+        /// (`DeviceLinkingApi`) caps this at 3 per code (`MaxPrimaryHelloError`);
+        /// the primary may retry, re-deriving fresh key material each time.
+        primary_hello_attempt_count: u32,
     },
     /// Pairing completed (success or failure).
     Completed,
@@ -338,9 +349,10 @@ impl PairCodeUtils {
                 NodeBuilder::new("companion_platform_display")
                     .bytes(platform_display.as_bytes().to_vec())
                     .build(),
-                // Nonce is sent as string "0" (matching whatsmeow/baileys)
+                // 0x00, not ASCII '0' (0x30): matches WA Web `new Uint8Array(1)`
+                // (`Alt/DeviceLinkingIq.js`) / whatsmeow `[]byte{0}`.
                 NodeBuilder::new("link_code_pairing_nonce")
-                    .bytes(b"0".to_vec())
+                    .bytes(vec![0u8])
                     .build(),
             ])
             .build();
@@ -487,6 +499,11 @@ impl PairCodeUtils {
     /// Returns the pair code validity duration.
     pub fn code_validity() -> std::time::Duration {
         std::time::Duration::from_secs(PAIR_CODE_VALIDITY_SECS)
+    }
+
+    /// Max number of `primary_hello` notifications processed per code (WA Web `T`).
+    pub fn max_primary_hello_attempts() -> u32 {
+        PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS
     }
 }
 
@@ -1072,8 +1089,9 @@ mod tests {
             Some("true")
         );
 
-        // Nonce is the string "0", per whatsmeow/baileys parity.
-        assert_eq!(child_bytes(reg, "link_code_pairing_nonce"), b"0");
+        // Nonce is a single zero byte (0x00), matching WA Web's
+        // `new Uint8Array(1)` and whatsmeow's `[]byte{0}` — not ASCII '0'.
+        assert_eq!(child_bytes(reg, "link_code_pairing_nonce"), &[0u8]);
     }
 
     #[test]
