@@ -496,18 +496,30 @@ pub trait ProtocolStore: Send + Sync {
     /// `sender_timestamp`. The symmetric counterpart of
     /// [`touch_tc_token_sender_timestamp`](Self::touch_tc_token_sender_timestamp):
     /// each writer owns its own field, so the notification path never drops a
-    /// sender bucket that the issuance path wrote concurrently. Same atomicity
-    /// requirement — the default read-modify-write is for third-party backends.
+    /// sender bucket that the issuance path wrote concurrently.
+    ///
+    /// **Newer-wins**: the token pair is overwritten only when the stored token
+    /// is a byte-less placeholder or the incoming `token_timestamp` is at least
+    /// as new — a stale write must not clobber a fresher real token. Doing this
+    /// in the store (atomically for the built-in backends) is what lets the
+    /// concurrent history-sync and privacy-notification writers converge without
+    /// a lock. Same atomicity requirement as the sender bucket — the default
+    /// read-modify-write here is a best-effort for third-party backends.
     async fn store_received_tc_token(
         &self,
         jid: &str,
         token: &[u8],
         token_timestamp: i64,
     ) -> Result<()> {
-        let sender_timestamp = self
-            .get_tc_token(jid)
-            .await?
-            .and_then(|existing| existing.sender_timestamp);
+        let existing = self.get_tc_token(jid).await?;
+        // Keep a fresher real token; a placeholder never blocks the first real one.
+        if let Some(existing) = &existing
+            && !existing.token.is_empty()
+            && token_timestamp < existing.token_timestamp
+        {
+            return Ok(());
+        }
+        let sender_timestamp = existing.and_then(|existing| existing.sender_timestamp);
         self.put_tc_token(
             jid,
             &TcTokenEntry {

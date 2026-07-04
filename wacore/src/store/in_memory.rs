@@ -614,9 +614,14 @@ impl ProtocolStore for InMemoryBackend {
         let mut s = self.state.lock().await;
         match s.tc_tokens.get_mut(jid) {
             Some(entry) => {
-                entry.token = token.to_vec();
-                entry.token_timestamp = token_timestamp;
-                // sender_timestamp left untouched
+                // Atomic newer-wins (see the trait doc): overwrite only when the
+                // stored token is a placeholder or the incoming timestamp is at
+                // least as new, so a stale write can't clobber a fresher token.
+                if entry.token.is_empty() || token_timestamp >= entry.token_timestamp {
+                    entry.token = token.to_vec();
+                    entry.token_timestamp = token_timestamp;
+                    // sender_timestamp left untouched
+                }
             }
             None => {
                 s.tc_tokens.insert(
@@ -1245,6 +1250,55 @@ mod tests {
             .unwrap();
         let fresh = backend.get_tc_token("u3").await.unwrap().unwrap();
         assert_eq!(fresh.sender_timestamp, None);
+    }
+
+    #[tokio::test]
+    async fn store_received_tc_token_is_newer_wins() {
+        let backend = InMemoryBackend::new();
+
+        // First real token at t=5000.
+        backend
+            .store_received_tc_token("c", &[1, 1, 1], 5000)
+            .await
+            .unwrap();
+
+        // A stale write (older timestamp) must not clobber the fresher token —
+        // this is what lets concurrent history-sync chunks converge lock-free.
+        backend
+            .store_received_tc_token("c", &[2, 2, 2], 3000)
+            .await
+            .unwrap();
+        let e = backend.get_tc_token("c").await.unwrap().unwrap();
+        assert_eq!(e.token, vec![1, 1, 1], "older write must not overwrite");
+        assert_eq!(e.token_timestamp, 5000);
+
+        // A newer write wins.
+        backend
+            .store_received_tc_token("c", &[3, 3, 3], 7000)
+            .await
+            .unwrap();
+        let e = backend.get_tc_token("c").await.unwrap().unwrap();
+        assert_eq!(e.token, vec![3, 3, 3]);
+        assert_eq!(e.token_timestamp, 7000);
+
+        // A byte-less placeholder (sender epoch t=9000) never blocks a real token,
+        // even when the real token's timestamp is older than the placeholder's.
+        backend
+            .touch_tc_token_sender_timestamp("p", 9000)
+            .await
+            .unwrap();
+        backend
+            .store_received_tc_token("p", &[4, 4, 4], 6000)
+            .await
+            .unwrap();
+        let e = backend.get_tc_token("p").await.unwrap().unwrap();
+        assert_eq!(
+            e.token,
+            vec![4, 4, 4],
+            "placeholder must accept first real token"
+        );
+        assert_eq!(e.token_timestamp, 6000);
+        assert_eq!(e.sender_timestamp, Some(9000), "sender bucket preserved");
     }
 
     #[tokio::test]

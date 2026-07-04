@@ -654,11 +654,6 @@ pub struct Client {
     /// Single-flights signed pre-key rotation so overlapping post-login tasks
     /// (from reconnect churn) can't run the rotate/upload/prune flow concurrently.
     pub(crate) signed_pre_key_rotation_lock: Arc<async_lock::Mutex<()>>,
-    /// Serializes the history-sync tc-token get-then-store: chunks ingest
-    /// concurrently, but the newer-wins guard is a non-atomic read-then-write,
-    /// so without this two same-contact candidates could interleave and let an
-    /// older privacy token overwrite a fresher one.
-    pub(crate) tc_token_lock: Arc<async_lock::Mutex<()>>,
     /// Notifier for when offline sync (ib offline stanza) is received.
     /// WhatsApp Web waits for this before sending passive tasks (prekey upload, active IQ, presence).
     pub(crate) offline_sync_notifier: Arc<event_listener::Event>,
