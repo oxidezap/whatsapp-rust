@@ -181,6 +181,7 @@ impl CompanionOs {
             || os.contains("fedora")
             || os.contains("arch")
             || os.contains("chrome os")
+            || os.contains("chromeos")
             || os.contains("chromium")
             || os.contains("cros")
         {
@@ -454,6 +455,7 @@ mod tests {
             ("Fedora", O::Linux),
             ("Arch Linux", O::Linux),
             ("Chrome OS", O::Linux),
+            ("ChromeOS", O::Linux),
             ("Chromium OS", O::Linux),
             ("Android", O::Android),
             ("android 14", O::Android),
