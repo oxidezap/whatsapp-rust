@@ -3013,14 +3013,10 @@ impl ProtocolStore for SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            // Atomic newer-wins: read the stored token pair and overwrite it only
-            // when it's a byte-less placeholder or the incoming timestamp is at
-            // least as new. Run IMMEDIATE so the read+write can't lose to a
-            // concurrent writer (WAL + busy_timeout serializes them), which lets
-            // concurrent history-sync chunks and the privacy-notification path
-            // converge without a lock and never clobber a fresher token. The
-            // conflict update touches only the token fields, so a sender_timestamp
-            // written concurrently by the issuance path survives.
+            // IMMEDIATE so the read + conditional write is atomic against
+            // concurrent writers (WAL + busy_timeout serialize them): this is the
+            // lock-free newer-wins that lets history-sync and the privacy path
+            // converge without clobbering a fresher token.
             conn.immediate_transaction(|conn| -> QueryResult<()> {
                 let existing: Option<(Vec<u8>, i64)> = tc_tokens::table
                     .filter(tc_tokens::jid.eq(&jid))

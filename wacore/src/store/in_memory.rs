@@ -614,9 +614,8 @@ impl ProtocolStore for InMemoryBackend {
         let mut s = self.state.lock().await;
         match s.tc_tokens.get_mut(jid) {
             Some(entry) => {
-                // Atomic newer-wins (see the trait doc): overwrite only when the
-                // stored token is a placeholder or the incoming timestamp is at
-                // least as new, so a stale write can't clobber a fresher token.
+                // Newer-wins (see the trait doc): don't let a stale write
+                // clobber a fresher token.
                 if entry.token.is_empty() || token_timestamp >= entry.token_timestamp {
                     entry.token = token.to_vec();
                     entry.token_timestamp = token_timestamp;

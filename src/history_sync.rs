@@ -407,11 +407,9 @@ impl Client {
 
         let backend = self.persistence_manager.backend();
 
-        // store_received_tc_token is an atomic newer-wins upsert (won't clobber a
-        // fresher real token; a byte-less placeholder never blocks the first real
-        // one), so concurrent history-sync chunks and the privacy-notification path
-        // converge without a get-then-store or a lock. The sender bucket is an
-        // independent advance-only upsert, so neither write clobbers the other.
+        // Newer-wins lives in the store now (atomic, lock-free), so concurrent
+        // history-sync chunks and the privacy path converge without a
+        // get-then-store or a lock.
         if let Err(e) = backend
             .store_received_tc_token(
                 token_key,
