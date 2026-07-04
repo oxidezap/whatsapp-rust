@@ -199,14 +199,11 @@ impl Client {
             resolve_companion_platform(&options, &device_snapshot.device_props);
         let platform_id_str = platform_id.to_string();
 
-        // The pair-code server rejects a non-OS `companion_platform_display` with
-        // bad-request (QR pairing never sends this field, so it tolerates arbitrary
-        // branding). If `DeviceProps::os` was a branding string it is coerced to
-        // "Linux"; warn so a consumer sees why their branding didn't ride through.
-        // Skipped when `display_os` overrides the OS (then props.os isn't coerced).
-        // Gated to fire once per process: a rate-limited caller may retry
-        // pair_with_code repeatedly (see PairError::RequestFailed) with the same
-        // unchanged os, and an identical warning per retry is just noise.
+        // Warn when a branding `DeviceProps::os` gets coerced to "Linux", so a
+        // consumer sees why it didn't ride through (the pair-code server rejects a
+        // non-OS display with bad-request; QR never sends this field). Skipped under
+        // a `display_os` override. Once-per-process: retries (PairError::RequestFailed
+        // is rate-limitable) reuse the same os, so repeating the warning is just noise.
         static OS_COERCE_WARNED: std::sync::Once = std::sync::Once::new();
         let os_overridden = options
             .display_os
