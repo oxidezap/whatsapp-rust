@@ -155,32 +155,60 @@ impl<'a> MediaReupload<'a> {
 
     /// Request reupload for several messages at once, concurrently.
     ///
-    /// Each request registers its own notification waiter (keyed by the unique
-    /// message id) and awaits it independently, so a bulk recovery — e.g. many
-    /// expired-URL media after a long offline period — is bounded by roughly one
-    /// [`MEDIA_RETRY_TIMEOUT`] instead of the serial sum of per-item waits.
-    /// Results are returned in the same order as `reqs`; each entry carries that
-    /// item's success or error (one item failing never aborts the others).
+    /// Each request registers its own notification waiter and awaits it
+    /// independently, so a bulk recovery — e.g. many expired-URL media after a
+    /// long offline period — is bounded by roughly one [`MEDIA_RETRY_TIMEOUT`]
+    /// instead of the serial sum of per-item waits. Results are returned in the
+    /// same order as `reqs`; each entry carries that item's success or error
+    /// (one item failing never aborts the others).
+    ///
+    /// The `mediaretry` waiter filters on message id alone, and `resolve_waiters`
+    /// wakes *every* matching waiter with the same notification node — so two
+    /// items sharing a `msg_id` would cross-resolve (the second decrypts the
+    /// first's payload with the wrong key). Items are therefore grouped by
+    /// `msg_id`: same-id items run sequentially (their waiters never coexist)
+    /// while distinct ids still fan out concurrently. In the normal case (all
+    /// ids unique) every item gets its own lane and this is a plain fan-out.
     pub async fn request_many(
         &self,
         reqs: &[MediaReuploadRequest<'_>],
     ) -> Vec<Result<MediaRetryResult, MediaReuploadError>> {
         use futures::StreamExt;
+        use std::collections::HashMap;
         if reqs.is_empty() {
             return Vec::new();
         }
 
-        // Stream over owned indices (not a borrow of `reqs` through the
-        // combinator) and index inside each task, so the fan-out future stays
-        // Send; collect (index, result) then restore input order.
-        let mut indexed: Vec<(usize, Result<MediaRetryResult, MediaReuploadError>)> =
-            futures::stream::iter(0..reqs.len())
-                .map(|i| async move { (i, self.request(&reqs[i]).await) })
+        let mut lanes: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, req) in reqs.iter().enumerate() {
+            lanes.entry(req.msg_id).or_default().push(i);
+        }
+
+        // Each lane owns its index list (not a borrow of `reqs` through the
+        // combinator) and indexes `reqs` inside the task, keeping the fan-out
+        // future Send. Lanes run concurrently; indices within a lane run in order.
+        let lane_results: Vec<Vec<(usize, Result<MediaRetryResult, MediaReuploadError>)>> =
+            futures::stream::iter(lanes.into_values())
+                .map(|indices| async move {
+                    let mut out = Vec::with_capacity(indices.len());
+                    for i in indices {
+                        out.push((i, self.request(&reqs[i]).await));
+                    }
+                    out
+                })
                 .buffer_unordered(MEDIA_REUPLOAD_CONCURRENCY)
                 .collect()
                 .await;
-        indexed.sort_by_key(|(i, _)| *i);
-        indexed.into_iter().map(|(_, res)| res).collect()
+
+        let mut results: Vec<Option<Result<MediaRetryResult, MediaReuploadError>>> =
+            (0..reqs.len()).map(|_| None).collect();
+        for (i, res) in lane_results.into_iter().flatten() {
+            results[i] = Some(res);
+        }
+        results
+            .into_iter()
+            .map(|res| res.expect("every index belongs to exactly one lane"))
+            .collect()
     }
 }
 
