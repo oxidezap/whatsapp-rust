@@ -168,7 +168,21 @@ fn snake_case_descriptor_fields(input: &str, output: &std::path::Path) -> std::i
             snake_case_message_fields(message);
         }
     }
-    std::fs::write(output, fds.encode_to_vec())
+    write_if_changed(output, &fds.encode_to_vec())
+}
+
+/// Skip the write when bytes are unchanged, to keep the file's mtime stable.
+///
+/// buffa_build emits a `cargo:rerun-if-changed` for this OUT_DIR descriptor, so
+/// rewriting it every run would re-invalidate the build script and force a full
+/// waproto rebuild on every `cargo run`.
+fn write_if_changed(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Ok(existing) = std::fs::read(path)
+        && existing == contents
+    {
+        return Ok(());
+    }
+    std::fs::write(path, contents)
 }
 
 fn snake_case_message_fields(message: &mut DescriptorProto) {
