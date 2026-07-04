@@ -634,10 +634,79 @@ mod tests {
         );
     }
 
-    // The buffered `download()` now routes through `download_to_writer`, so its
-    // auth-refresh + host-failover retry behavior is exercised by
-    // `download_to_writer_retries_with_forced_media_conn_refresh_after_auth_error`
-    // below (same `download_to_writer_with_retry` engine).
+    // `download()` uses `download_media_with_retry` (fresh buffer per attempt);
+    // cover its auth-refresh + host-failover retry behavior directly.
+    #[tokio::test]
+    async fn download_retries_with_forced_media_conn_refresh_after_auth_error() {
+        let body = b"download me".to_vec();
+        let downloadable = PlaintextDownloadable {
+            direct_path: "/v/t62.7118-24/123".to_string(),
+            file_sha256: plaintext_sha256(&body),
+        };
+        let first_conn = media_conn("stale-auth", &["cdn1.example.com"]);
+        let refreshed_conn = media_conn("fresh-auth", &["cdn2.example.com"]);
+        let refresh_calls = Arc::new(Mutex::new(Vec::new()));
+        let invalidations = Arc::new(Mutex::new(0usize));
+        let seen_urls = Arc::new(Mutex::new(Vec::new()));
+
+        let downloaded = download_media_with_retry(
+            {
+                let refresh_calls = Arc::clone(&refresh_calls);
+                let downloadable = &downloadable;
+                move |force| {
+                    let refresh_calls = Arc::clone(&refresh_calls);
+                    let first_conn = first_conn.clone();
+                    let refreshed_conn = refreshed_conn.clone();
+                    async move {
+                        refresh_calls.lock().await.push(force);
+                        let media_conn = if force { refreshed_conn } else { first_conn };
+                        DownloadUtils::prepare_download_requests(
+                            downloadable,
+                            &wacore::download::MediaConnection::from(&media_conn),
+                        )
+                    }
+                }
+            },
+            {
+                let invalidations = Arc::clone(&invalidations);
+                move || {
+                    let invalidations = Arc::clone(&invalidations);
+                    async move {
+                        *invalidations.lock().await += 1;
+                    }
+                }
+            },
+            {
+                let seen_urls = Arc::clone(&seen_urls);
+                let body = body.clone();
+                move |request| {
+                    let seen_urls = Arc::clone(&seen_urls);
+                    let body = body.clone();
+                    let url = request.url.clone();
+                    async move {
+                        seen_urls.lock().await.push(url.clone());
+                        if url.contains("stale-auth") {
+                            Err(DownloadRequestError::auth(401))
+                        } else {
+                            Ok(body)
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        .expect("download should succeed after refreshing media auth");
+
+        assert_eq!(downloaded, body);
+        assert_eq!(*refresh_calls.lock().await, vec![false, true]);
+        assert_eq!(*invalidations.lock().await, 1);
+
+        let seen_urls = seen_urls.lock().await.clone();
+        assert_eq!(seen_urls.len(), 2);
+        assert!(seen_urls[0].contains("auth=stale-auth"));
+        assert!(seen_urls[1].contains("auth=fresh-auth"));
+    }
+
     #[tokio::test]
     async fn download_to_writer_retries_with_forced_media_conn_refresh_after_auth_error() {
         let body = b"stream me".to_vec();
