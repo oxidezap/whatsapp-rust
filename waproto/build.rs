@@ -168,7 +168,25 @@ fn snake_case_descriptor_fields(input: &str, output: &std::path::Path) -> std::i
             snake_case_message_fields(message);
         }
     }
-    std::fs::write(output, fds.encode_to_vec())
+    write_if_changed(output, &fds.encode_to_vec())
+}
+
+/// Write `contents` to `path` only when they differ from what is already there.
+///
+/// buffa_build::compile() emits a `cargo:rerun-if-changed` for the descriptor it
+/// is handed, which lives in OUT_DIR. Rewriting that file every run bumps its
+/// mtime past the build-script `output` stamp, so cargo marks the build script
+/// stale and recompiles waproto (and everything above it) on every `cargo run`
+/// even with no source change. The transform is a deterministic function of the
+/// committed descriptor, so skipping the write when bytes are unchanged keeps
+/// the mtime stable and breaks that self-invalidation loop.
+fn write_if_changed(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    if let Ok(existing) = std::fs::read(path)
+        && existing == contents
+    {
+        return Ok(());
+    }
+    std::fs::write(path, contents)
 }
 
 fn snake_case_message_fields(message: &mut DescriptorProto) {
