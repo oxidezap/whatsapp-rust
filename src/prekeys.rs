@@ -177,13 +177,23 @@ impl Client {
         &self,
         jids: &[Jid],
     ) -> std::collections::HashMap<Jid, [u8; 32]> {
-        let mut map = std::collections::HashMap::new();
-        for jid in jids.iter().filter(|j| j.device != 0) {
-            if let Some(id) = self.load_account_identity(jid).await {
-                map.insert(jid.normalize_for_prekey_bundle(), id);
-            }
-        }
-        map
+        use futures::StreamExt;
+        // Materialize the companion (device != 0) subset so the stream owns its
+        // items (borrowing `jids` through buffer_unordered trips the future's Send
+        // bound). Each load is an independent signal-cache/DB read; on a cold group
+        // send the keyless-companion set can be large, so fan them out instead of
+        // serializing before the (already batched) prekey fetch IQ.
+        let companions: Vec<Jid> = jids.iter().filter(|j| j.device != 0).cloned().collect();
+        futures::stream::iter(companions)
+            .map(|jid| async move {
+                self.load_account_identity(&jid)
+                    .await
+                    .map(|id| (jid.normalize_for_prekey_bundle(), id))
+            })
+            .buffer_unordered(16)
+            .filter_map(|entry| async move { entry })
+            .collect()
+            .await
     }
 
     /// Load a companion's account (device 0) identity from the store, for use as
