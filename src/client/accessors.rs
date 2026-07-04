@@ -376,7 +376,7 @@ impl Client {
 
     /// Poison-recovering lock of the `response_waiters` map. Centralizes the
     /// `unwrap_or_else(into_inner)` so no call site reaches for a bare
-    /// `.lock().unwrap()` that would panic if a holder ever paniced. The critical
+    /// `.lock().unwrap()` that would panic if a holder ever panicked. The critical
     /// section is a trivial map op, never held across an `.await`.
     #[inline]
     pub(crate) fn response_waiters_guard(
