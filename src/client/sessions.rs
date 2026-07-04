@@ -288,21 +288,34 @@ impl Client {
         use wacore::types::jid::JidExt;
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
-        let mut jids_needing_sessions = Vec::with_capacity(jids.len());
 
-        for jid in jids {
-            let signal_addr = jid.to_protocol_address();
-            // Check cache first (includes unflushed sessions), fall back to backend
-            match self
-                .signal_cache
-                .has_session(&signal_addr, &*device_snapshot.backend)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => jids_needing_sessions.push(jid),
-                Err(e) => log::warn!("Failed to check session for {}: {}", jid.observe(), e),
-            }
-        }
+        // Check each session concurrently. Warm hits serialize on the signal
+        // cache's mutex regardless, but a cold-cache multi-recipient ensure (e.g.
+        // status / group session setup over many devices) would otherwise
+        // serialize the per-device DB reads. Each probe is independent and the
+        // resulting order is irrelevant (the misses are chunked for the fetch).
+        use futures::StreamExt;
+        let backend = device_snapshot.backend.clone();
+        let jids_needing_sessions: Vec<Jid> = futures::stream::iter(jids)
+            .map(|jid| {
+                let backend = backend.clone();
+                async move {
+                    let signal_addr = jid.to_protocol_address();
+                    // Check cache first (includes unflushed sessions), fall back to backend.
+                    match self.signal_cache.has_session(&signal_addr, &*backend).await {
+                        Ok(true) => None,
+                        Ok(false) => Some(jid),
+                        Err(e) => {
+                            log::warn!("Failed to check session for {}: {}", jid.observe(), e);
+                            None
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(16)
+            .filter_map(|needed| async move { needed })
+            .collect()
+            .await;
 
         if jids_needing_sessions.is_empty() {
             return Ok(());
