@@ -914,12 +914,9 @@ impl Client {
                     "Starting Initial App State Sync (flag_set={flag_set}, needs_pushname={needs_pushname_from_sync})"
                 );
 
-                // Arm the critical sync timeout FIRST so its single 180s deadline
-                // bounds the entire critical path — both the app-state key-share wait
-                // below and the batched IQ sync. Matches WhatsApp Web's
-                // WAWebSyncBootstrap.$15 (setSyncDCriticalDataSyncTimeout): WA Web uses
-                // 180s and calls socketLogout(SyncdTimeout) if critical data hasn't
-                // synced by then.
+                // Arm before the key-share wait so this single deadline bounds the
+                // whole critical path (key-share wait + batched IQ), not just the IQ.
+                // Matches WhatsApp Web's WAWebSyncBootstrap 180s critical-data deadline.
                 const CRITICAL_SYNC_TIMEOUT_SECS: u64 = 180;
                 let timeout_client = client_clone.clone();
                 let timeout_generation = task_generation;
@@ -957,14 +954,9 @@ impl Client {
                     .initial_app_state_keys_received
                     .load(Ordering::Relaxed)
                 {
-                    // Wait for the app-state sync-key-share E2E message the primary sends
-                    // at pairing. This is event-driven: a healthy pairing wakes instantly
-                    // when the key-share is processed. When a heavy history-sync saturates
-                    // the stream and the key-share lands late, we tolerate the delay up to
-                    // the critical deadline instead of racing a fixed 5s window and failing
-                    // the critical snapshot with KeyNotFound. The watchdog armed above still
-                    // bounds the total wait, so a key-share that never arrives forces a
-                    // reconnect rather than hanging.
+                    // Bounded by the critical deadline, not a fixed 5s window: a late
+                    // key-share (under heavy history sync) would otherwise lose the race
+                    // and fail the critical snapshot with KeyNotFound.
                     debug!(
                         target: "Client/AppState",
                         "Waiting up to {CRITICAL_SYNC_TIMEOUT_SECS}s for app state keys..."
