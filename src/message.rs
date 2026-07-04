@@ -99,6 +99,14 @@ pub(crate) struct PlaintextHandleOutcome {
     skdm_only: bool,
 }
 
+/// A decrypted session plaintext buffered during the locked decrypt loop and
+/// handled after the per-sender session lock is released.
+struct DeferredPlaintext {
+    enc_type: &'static str,
+    plaintext: Vec<u8>,
+    padding_version: u8,
+}
+
 fn should_process_skmsg_after_session(
     session_payloads_empty: bool,
     session_outcome: SessionBatchOutcome,

@@ -606,14 +606,9 @@ impl Client {
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let mut outcome = SessionBatchOutcome::default();
-        // Decrypted plaintexts are handled only AFTER the per-sender ratchet lock
-        // is released below: the Signal decrypt is the sole session-ratchet
-        // mutation, while handle_decrypted_plaintext touches only
-        // sender-key/app-state stores and app dispatch. Buffering keeps handling
-        // ordered and lets a concurrent same-sender stanza start decrypting
-        // sooner (whatsmeow holds the per-sender lock only around libsignal
-        // decrypt). Elements: (enc_type, padded_plaintext, padding_version).
-        let mut deferred: Vec<(&'static str, Vec<u8>, u8)> = Vec::new();
+        // Buffer plaintexts to handle after the ratchet lock drops (see the drain
+        // below for why that's safe).
+        let mut deferred: Vec<DeferredPlaintext> = Vec::new();
         // Local identity-change detection fires once per batch: the first pkmsg
         // saves the new key (ReplacedExisting); the rest are NewOrUnchanged.
         let mut local_identity_reacted = false;
@@ -741,7 +736,11 @@ impl Client {
                     // Decrypt succeeded (the ratchet advanced); defer the
                     // plaintext handling until the lock is dropped.
                     outcome.decrypted = true;
-                    deferred.push((enc_type, decrypted.plaintext, padding_version));
+                    deferred.push(DeferredPlaintext {
+                        enc_type,
+                        plaintext: decrypted.plaintext,
+                        padding_version,
+                    });
                 }
                 Err(e) => {
                     // Handle DuplicatedMessage: This is expected when messages are redelivered during reconnection
@@ -851,7 +850,11 @@ impl Client {
                                 // Decrypt succeeded after the identity retry;
                                 // defer plaintext handling until the lock drops.
                                 outcome.decrypted = true;
-                                deferred.push((enc_type, decrypted.plaintext, padding_version));
+                                deferred.push(DeferredPlaintext {
+                                    enc_type,
+                                    plaintext: decrypted.plaintext,
+                                    padding_version,
+                                });
                             }
                             Err(retry_err) => {
                                 // Handle DuplicatedMessage in retry path: This commonly happens during reconnection
@@ -1123,16 +1126,20 @@ impl Client {
             }
         }
 
-        // Ratchet work is done. Release the per-sender session lock BEFORE handling
-        // plaintext: handle_decrypted_plaintext touches only sender-key/app-state
-        // stores and app dispatch — never this session's ratchet — so a concurrent
-        // same-sender stanza can start decrypting while this one dispatches.
-        // Ordering holds: the buffer drains before we return (so SKDM still precedes
-        // PASS 2's group decrypt), and per-chat delivery order is owned by the serial
-        // chat-lane worker, not this guard.
+        // Release the per-sender session lock before handling plaintext:
+        // handle_decrypted_plaintext never touches this session's ratchet (only the
+        // decrypt above does), so a concurrent same-sender stanza can decrypt while
+        // this one dispatches. Safe because the buffer drains before we return (SKDM
+        // still precedes PASS 2's group decrypt) and per-chat order is owned by the
+        // serial chat-lane worker, not this guard. Matches whatsmeow.
         drop(session_guard);
 
-        for (enc_type, plaintext, padding_version) in deferred {
+        for DeferredPlaintext {
+            enc_type,
+            plaintext,
+            padding_version,
+        } in deferred
+        {
             match self
                 .clone()
                 .handle_decrypted_plaintext(enc_type, &plaintext, padding_version, info)
@@ -1527,7 +1534,7 @@ impl Client {
         info: &Arc<MessageInfo>,
         session_mutex: &Arc<async_lock::Mutex<()>>,
         session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
-        deferred: &mut Vec<(&'static str, Vec<u8>, u8)>,
+        deferred: &mut Vec<DeferredPlaintext>,
     ) -> MigrationDecryptResult {
         use wacore::libsignal::protocol::{UsePQRatchet, message_decrypt};
 
@@ -1590,7 +1597,11 @@ impl Client {
                 }
                 // Buffer for post-lock handling, keeping the same ordering as the
                 // batch's main path.
-                deferred.push((enc_type, decrypted.plaintext, padding_version));
+                deferred.push(DeferredPlaintext {
+                    enc_type,
+                    plaintext: decrypted.plaintext,
+                    padding_version,
+                });
                 MigrationDecryptResult::Decrypted
             }
             Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
