@@ -609,6 +609,12 @@ impl Client {
         // Local identity-change detection fires once per batch: the first pkmsg
         // saves the new key (ReplacedExisting); the rest are NewOrUnchanged.
         let mut local_identity_reacted = false;
+        // Successfully decrypted plaintexts, dispatched AFTER the session lock is
+        // released (see the post-loop dispatch): decode + SKDM/key-share handling
+        // + durable commit + durability hook + event dispatch don't touch the
+        // pairwise ratchet the lock guards, so they must not hold it. `enc_type`
+        // is a `&'static` wire string; the plaintext is owned.
+        let mut pending_dispatch: Vec<(&'static str, Vec<u8>, u8)> = Vec::new();
 
         for payload in payloads {
             let ciphertext = &payload.ciphertext[..];
@@ -730,35 +736,11 @@ impl Client {
                         local_identity_reacted = true;
                         self.react_to_local_identity_change(sender_encryption_jid);
                     }
-                    let padded_plaintext = decrypted.plaintext;
-                    match self
-                        .clone()
-                        .handle_decrypted_plaintext(
-                            enc_type,
-                            &padded_plaintext,
-                            padding_version,
-                            info,
-                        )
-                        .await
-                    {
-                        Ok(plaintext_outcome) => {
-                            outcome.decrypted = true;
-                            outcome.dispatched |= plaintext_outcome.dispatched;
-                            outcome.skdm_only |= plaintext_outcome.skdm_only;
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "[msg:{}] Failed processing plaintext from {}: {e:?}",
-                                info.id,
-                                info.source.sender.observe()
-                            );
-                            outcome.decrypted = true;
-                            outcome.plaintext_failed = true;
-                            outcome.had_failure = true;
-                            outcome.undecryptable |=
-                                self.handle_plaintext_failure(info, decrypt_fail_mode).await;
-                        }
-                    }
+                    // The ratchet mutation the session lock guards is done;
+                    // defer dispatch (decode, SKDM/key-share, commit, hook, event)
+                    // to the post-loop pass that runs without the lock.
+                    outcome.decrypted = true;
+                    pending_dispatch.push((enc_type, decrypted.plaintext, padding_version));
                 }
                 Err(e) => {
                     // Handle DuplicatedMessage: This is expected when messages are redelivered during reconnection
@@ -865,34 +847,14 @@ impl Client {
                                     local_identity_reacted = true;
                                     self.react_to_local_identity_change(sender_encryption_jid);
                                 }
-                                let padded_plaintext = decrypted.plaintext;
-                                match self
-                                    .clone()
-                                    .handle_decrypted_plaintext(
-                                        enc_type,
-                                        &padded_plaintext,
-                                        padding_version,
-                                        info,
-                                    )
-                                    .await
-                                {
-                                    Ok(plaintext_outcome) => {
-                                        outcome.decrypted = true;
-                                        outcome.dispatched |= plaintext_outcome.dispatched;
-                                        outcome.skdm_only |= plaintext_outcome.skdm_only;
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "Failed processing plaintext after identity retry: {e:?}"
-                                        );
-                                        outcome.decrypted = true;
-                                        outcome.plaintext_failed = true;
-                                        outcome.had_failure = true;
-                                        outcome.undecryptable |= self
-                                            .handle_plaintext_failure(info, decrypt_fail_mode)
-                                            .await;
-                                    }
-                                }
+                                // Same deferral as the main success path: the
+                                // decrypt is done; dispatch after releasing the lock.
+                                outcome.decrypted = true;
+                                pending_dispatch.push((
+                                    enc_type,
+                                    decrypted.plaintext,
+                                    padding_version,
+                                ));
                             }
                             Err(retry_err) => {
                                 // Handle DuplicatedMessage in retry path: This commonly happens during reconnection
@@ -1179,6 +1141,42 @@ impl Client {
                         self.spawn_nack(info, NackReason::UnhandledError, None);
                         continue;
                     }
+                }
+            }
+        }
+
+        // All pairwise ratchet mutations are done. Release the per-sender session
+        // lock BEFORE dispatching the decrypted plaintext: dispatch (decode,
+        // SKDM/key-share handling, durable commit, durability hook, synchronous
+        // event handlers) does not touch the session ratchet the lock guards —
+        // PASS 2's group path already runs handle_decrypted_plaintext with no
+        // session lock. Releasing here means a concurrent same-sender op (a
+        // retry-receipt session rebuild, a reg-id / base-key session reset) no
+        // longer waits behind this batch's commit + app-controlled durability hook
+        // + event dispatch. The batch held the lock continuously across every
+        // decrypt, so no new inter-payload interleaving is introduced. (The crypto
+        // timer `_t` drops with the function, spanning dispatch as it did before.)
+        drop(session_guard.take());
+        for (enc_type, padded_plaintext, padding_version) in pending_dispatch {
+            match self
+                .clone()
+                .handle_decrypted_plaintext(enc_type, &padded_plaintext, padding_version, info)
+                .await
+            {
+                Ok(plaintext_outcome) => {
+                    outcome.dispatched |= plaintext_outcome.dispatched;
+                    outcome.skdm_only |= plaintext_outcome.skdm_only;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[msg:{}] Failed processing plaintext from {}: {e:?}",
+                        info.id,
+                        info.source.sender.observe()
+                    );
+                    outcome.plaintext_failed = true;
+                    outcome.had_failure = true;
+                    outcome.undecryptable |=
+                        self.handle_plaintext_failure(info, decrypt_fail_mode).await;
                 }
             }
         }
