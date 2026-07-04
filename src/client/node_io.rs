@@ -914,10 +914,13 @@ impl Client {
                     "Starting Initial App State Sync (flag_set={flag_set}, needs_pushname={needs_pushname_from_sync})"
                 );
 
-                // Arm before the key-share wait so this single deadline bounds the
-                // whole critical path (key-share wait + batched IQ), not just the IQ.
-                // Matches WhatsApp Web's WAWebSyncBootstrap 180s critical-data deadline.
+                // Single deadline for the whole critical path (key-share grace + batched
+                // IQ + missing-key fallback). Matches WhatsApp Web's WAWebSyncBootstrap
+                // 180s critical-data deadline. Armed before the wait so every step below
+                // is bounded by the same clock.
                 const CRITICAL_SYNC_TIMEOUT_SECS: u64 = 180;
+                let critical_deadline = wacore::time::Instant::now()
+                    + Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS);
                 let timeout_client = client_clone.clone();
                 let timeout_generation = task_generation;
                 let timeout_rt = client_clone.runtime.clone();
@@ -950,25 +953,28 @@ impl Client {
                     }
                 }));
 
-                // Register the listener before the flag check: the notifier is not
-                // sticky, so a key-share landing between the load and listen() would
-                // otherwise lose the wake and burn the full deadline. Mirrors
-                // request_keys_and_wait.
+                // Brief grace for the auto-shared key that the primary sends at pairing
+                // (the WA Web primary path). The listener is registered before the flag
+                // check because the notifier is not sticky — a key-share landing in the
+                // load→listen gap would otherwise be missed. This wait is only an
+                // optimization to avoid a redundant explicit key request in the common
+                // fast case; if the key is late (heavy history sync) or never
+                // auto-shared, the batched sync below falls back to an explicit
+                // AppStateSyncKeyRequest bounded by `critical_deadline`, so correctness
+                // does not depend on this grace.
+                const KEY_SHARE_GRACE_SECS: u64 = 10;
                 let key_share_listener = client_clone.initial_keys_synced_notifier.listen();
                 if !client_clone
                     .initial_app_state_keys_received
                     .load(Ordering::Relaxed)
                 {
-                    // Bounded by the critical deadline, not a fixed 5s window: a late
-                    // key-share (under heavy history sync) would otherwise lose the race
-                    // and fail the critical snapshot with KeyNotFound.
                     debug!(
                         target: "Client/AppState",
-                        "Waiting up to {CRITICAL_SYNC_TIMEOUT_SECS}s for app state keys..."
+                        "Waiting up to {KEY_SHARE_GRACE_SECS}s for the auto-shared app state key..."
                     );
                     let _ = rt_timeout(
                         &*client_clone.runtime,
-                        Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS),
+                        Duration::from_secs(KEY_SHARE_GRACE_SECS),
                         key_share_listener,
                     )
                     .await;
@@ -978,12 +984,14 @@ impl Client {
                 }
 
                 // Await critical collections via batched IQ before dispatching Connected.
+                // The deadline lets the missing-key fallback recover a late/never-shared
+                // key on this connection instead of stalling to the watchdog.
                 check_generation!();
                 match client_clone
-                    .sync_collections_batched(vec![
-                        WAPatchName::CriticalBlock,
-                        WAPatchName::CriticalUnblockLow,
-                    ])
+                    .sync_collections_batched(
+                        vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+                        Some(critical_deadline),
+                    )
                     .await
                 {
                     Ok(()) => {
@@ -1023,11 +1031,14 @@ impl Client {
                     }
 
                     if let Err(e) = sync_client
-                        .sync_collections_batched(vec![
-                            WAPatchName::RegularLow,
-                            WAPatchName::RegularHigh,
-                            WAPatchName::Regular,
-                        ])
+                        .sync_collections_batched(
+                            vec![
+                                WAPatchName::RegularLow,
+                                WAPatchName::RegularHigh,
+                                WAPatchName::Regular,
+                            ],
+                            None,
+                        )
                         .await
                     {
                         sync_client.log_sync_error("non-critical app state sync", &e);

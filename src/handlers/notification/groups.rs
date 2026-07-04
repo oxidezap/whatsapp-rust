@@ -91,7 +91,7 @@ pub(crate) fn handle_server_sync_notification(
                         log::debug!(target: "Client/AppState", "server_sync task cancelled: connection generation changed during version check");
                         return;
                     }
-                    if let Err(e) = client_clone.sync_collections_batched(to_sync).await
+                    if let Err(e) = client_clone.sync_collections_batched(to_sync, None).await
                         && !client_clone.is_shutting_down()
                     {
                         warn!(

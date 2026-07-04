@@ -123,10 +123,17 @@ impl Client {
     /// Sync multiple collections in a single IQ request, re-fetching those with `has_more_patches`.
     /// Matches WA Web's `serverSync()` outer loop (`3JJWKHeu5-P.js:54278-54305`).
     /// Max 5 iterations (WA Web's `C=5` constant).
+    ///
+    /// `key_wait_deadline` bounds how long a missing app-state decode key may be
+    /// awaited. The initial critical bootstrap passes the shared 180s critical-sync
+    /// deadline so the explicit `AppStateSyncKeyRequest` fallback can recover a
+    /// late/never-auto-shared key on the same connection; other callers pass `None`
+    /// for the fixed short default.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_batched", level = "debug", skip_all, fields(count = collections.len()), err(Debug)))]
     pub(crate) async fn sync_collections_batched(
         &self,
         collections: Vec<WAPatchName>,
+        key_wait_deadline: Option<wacore::time::Instant>,
     ) -> anyhow::Result<()> {
         if collections.is_empty() {
             return Ok(());
@@ -153,7 +160,9 @@ impl Client {
         // Track all collections for cleanup
         let all_collections: Vec<WAPatchName> = pending.clone();
 
-        let result = self.sync_collections_batched_inner(pending).await;
+        let result = self
+            .sync_collections_batched_inner(pending, key_wait_deadline)
+            .await;
 
         // Always clean up in-flight set
         {
@@ -169,6 +178,7 @@ impl Client {
     async fn sync_collections_batched_inner(
         &self,
         mut pending: Vec<WAPatchName>,
+        key_wait_deadline: Option<wacore::time::Instant>,
     ) -> anyhow::Result<()> {
         use wacore::appstate::patch_decode::CollectionSyncError;
         const MAX_ITERATIONS: usize = 5;
@@ -300,7 +310,14 @@ impl Client {
                     missing_all.extend(m);
                 }
             }
-            if !missing_all.is_empty() && !self.request_keys_and_wait(missing_all).await {
+            // Bound the key wait by the critical-sync deadline when one was given
+            // (initial bootstrap), so a late/never-auto-shared key still recovers via
+            // the explicit request on this connection; otherwise a fixed short wait.
+            let key_wait = match key_wait_deadline {
+                Some(deadline) => deadline.saturating_duration_since(wacore::time::Instant::now()),
+                None => Duration::from_secs(10),
+            };
+            if !missing_all.is_empty() && !self.request_keys_and_wait(missing_all, key_wait).await {
                 // The re-shared key didn't land in time. Report failure rather than a
                 // false success: the initial critical-sync path treats Ok as permission
                 // to cancel its retry watchdog and dispatch Connected, which would leave
@@ -547,7 +564,11 @@ impl Client {
                 .missing_key_ids_after_inline(&mut pl, &download)
                 .await
                 .unwrap_or_default();
-            if !missing.is_empty() && !self.request_keys_and_wait(missing).await {
+            if !missing.is_empty()
+                && !self
+                    .request_keys_and_wait(missing, Duration::from_secs(10))
+                    .await
+            {
                 // Report failure (not a partial success) so the caller retries instead of
                 // treating the collection as synced; it re-syncs once the share lands.
                 // Pages already decoded this run have their version persisted.
@@ -605,15 +626,15 @@ impl Client {
     /// request means an earlier one is still in flight, so the key may yet land here,
     /// and a re-verify that fails can't be masked by treating "request sent" as success
     /// or by a wake from an unrelated key share.
-    async fn request_keys_and_wait(&self, missing: Vec<Vec<u8>>) -> bool {
+    async fn request_keys_and_wait(&self, missing: Vec<Vec<u8>>, timeout: Duration) -> bool {
         if missing.is_empty() {
             return true;
         }
         let count = missing.len();
         let listener = self.initial_keys_synced_notifier.listen();
         self.request_missing_keys_with_dedup(missing.clone()).await;
-        debug!(target: "Client/AppState", "Requested {count} missing app-state key(s); waiting up to 10s for the re-share");
-        let _ = rt_timeout(&*self.runtime, Duration::from_secs(10), listener).await;
+        debug!(target: "Client/AppState", "Requested {count} missing app-state key(s); waiting up to {timeout:?} for the re-share");
+        let _ = rt_timeout(&*self.runtime, timeout, listener).await;
         let backend = self.persistence_manager.backend();
         for id in &missing {
             if backend.get_sync_key(id).await.ok().flatten().is_none() {
