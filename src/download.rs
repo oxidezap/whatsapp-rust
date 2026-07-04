@@ -123,6 +123,74 @@ impl DownloadRequestError {
     }
 }
 
+/// Auth-refresh + host-failover retry loop that returns the decrypted bytes.
+/// Unlike [`download_to_writer_with_retry`] each attempt gets a FRESH buffer
+/// (the executor allocates its own), so a failed host that wrote a longer body
+/// (e.g. a CDN error page that decrypts to more bytes before its MAC fails)
+/// can't leave a stale tail behind a shorter successful retry.
+async fn download_media_with_retry<
+    PrepareRequests,
+    PrepareRequestsFut,
+    InvalidateMediaConn,
+    InvalidateMediaConnFut,
+    ExecuteRequest,
+    ExecuteRequestFut,
+>(
+    mut prepare_requests: PrepareRequests,
+    mut invalidate_media_conn: InvalidateMediaConn,
+    mut execute_request: ExecuteRequest,
+) -> Result<Vec<u8>>
+where
+    PrepareRequests: FnMut(bool) -> PrepareRequestsFut,
+    PrepareRequestsFut:
+        std::future::Future<Output = Result<Vec<wacore::download::DownloadRequest>>>,
+    InvalidateMediaConn: FnMut() -> InvalidateMediaConnFut,
+    InvalidateMediaConnFut: std::future::Future<Output = ()>,
+    ExecuteRequest: FnMut(wacore::download::DownloadRequest) -> ExecuteRequestFut,
+    ExecuteRequestFut:
+        std::future::Future<Output = std::result::Result<Vec<u8>, DownloadRequestError>>,
+{
+    let mut force_refresh = false;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 0..=MEDIA_AUTH_REFRESH_RETRY_ATTEMPTS {
+        let requests = prepare_requests(force_refresh).await?;
+        let mut retry_with_fresh_auth = false;
+
+        for request in requests {
+            match execute_request(request.clone()).await {
+                Ok(data) => return Ok(data),
+                Err(err) if (err.is_auth() || err.is_not_found()) && attempt == 0 => {
+                    // Auth error or 404/410 (expired URL): refresh media conn and re-derive URLs.
+                    invalidate_media_conn().await;
+                    force_refresh = true;
+                    retry_with_fresh_auth = true;
+                    break;
+                }
+                Err(err) if err.is_auth() || err.is_not_found() => return Err(err.into_anyhow()),
+                Err(err) => {
+                    let err = err.into_anyhow();
+                    log::warn!(
+                        "Failed to download from URL {}: {:?}. Trying next host.",
+                        request.url,
+                        err
+                    );
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        if !retry_with_fresh_auth {
+            break;
+        }
+    }
+
+    match last_err {
+        Some(err) => Err(err),
+        None => Err(anyhow!("Failed to download from all available media hosts")),
+    }
+}
+
 async fn download_to_writer_with_retry<
     W,
     PrepareRequests,
@@ -202,25 +270,30 @@ impl Client {
         tracing::instrument(name = "wa.media.download", level = "debug", skip_all, err(Debug))
     )]
     pub async fn download(&self, downloadable: &dyn Downloadable) -> Result<Vec<u8>> {
-        // Route through the streaming writer path (into an in-memory buffer)
-        // instead of "fetch the whole ciphertext, then decrypt it in a second
-        // pass". The streaming path interleaves the CDN read with the AES/HMAC
-        // decrypt in a single blocking pass, overlapping network with CPU and
-        // roughly halving peak memory (no full-ciphertext buffer resident
-        // alongside the plaintext). `download_to_writer` falls back to a buffered
-        // fetch+decrypt automatically for non-streaming HTTP clients, so this is
-        // strictly >= the previous behavior. Pre-size the buffer to the plaintext
-        // length (the decrypted output size) when known, capped so a bogus
-        // server-declared length can't drive a huge speculative allocation.
+        // Stream each attempt into a FRESH in-memory buffer: the CDN read and the
+        // AES/HMAC decrypt interleave in one blocking pass (overlapping network
+        // with CPU, ~halving peak memory vs. fetch-whole-then-decrypt), and a new
+        // buffer per attempt means a failed host that wrote a longer body can't
+        // leave a stale tail behind a shorter successful retry. Pre-size to the
+        // declared plaintext length, capped so a bogus length can't drive a huge
+        // speculative allocation.
         let cap = downloadable
             .file_length()
             .unwrap_or(0)
             .min(DOWNLOAD_PREALLOC_CAP) as usize;
-        let writer = std::io::Cursor::new(Vec::with_capacity(cap));
-        Ok(self
-            .download_to_writer(downloadable, writer)
-            .await?
-            .into_inner())
+        download_media_with_retry(
+            |force| self.prepare_requests(downloadable, force),
+            || async { self.invalidate_media_conn().await },
+            |request| async move {
+                let writer = std::io::Cursor::new(Vec::with_capacity(cap));
+                match self.streaming_download_and_decrypt(&request, writer).await {
+                    Ok((writer, Ok(()))) => Ok(writer.into_inner()),
+                    Ok((_, Err(e))) => Err(e),
+                    Err(e) => Err(DownloadRequestError::other(e)),
+                }
+            },
+        )
+        .await
     }
 
     /// Fetch a first-party sticker pack's metadata and sticker list from the CDN.
@@ -277,6 +350,12 @@ impl Client {
     ///
     /// The entire HTTP download, decryption, and file write happen in a single
     /// blocking thread. The writer is seeked back to position 0 before returning.
+    ///
+    /// The `writer` MUST start empty. Retries/host-failover seek back to 0 and
+    /// rewrite but do NOT truncate, so a writer that already held more bytes than
+    /// the decrypted payload would keep a stale tail past the valid data. (The
+    /// in-memory [`Self::download`] gives every attempt a fresh buffer for exactly
+    /// this reason.)
     ///
     /// Memory usage: ~40KB regardless of file size (8KB read buffer + decrypt state).
     #[cfg_attr(
