@@ -590,6 +590,77 @@ mod tests {
         assert!(matches!(err, AppStateError::SnapshotMACMismatch));
     }
 
+    /// Deterministic reproduction of the fresh-pairing race that PR #972 works
+    /// around. The critical `critical_unblock_low` snapshot (the account's saved
+    /// contacts + push name) can arrive before the encrypted app-state key-share
+    /// has been processed, when a heavy history sync saturates the stream at
+    /// pairing time. The SAME snapshot fails to decode with `KeyNotFound` while
+    /// the key is still in flight, and decodes cleanly the instant the key lands
+    /// — proving the failure is purely a key-ORDERING race, not a bad snapshot.
+    ///
+    /// Mirrors the field symptom: `critical_unblock_low v3: N records` failing
+    /// with "didn't find app state key" (`AppStateProcessor::get_app_state_key`
+    /// -> `backend.get_sync_key` returning `None` -> this `get_keys` closure
+    /// returning `KeyNotFound`).
+    #[test]
+    fn critical_snapshot_fails_key_not_found_until_key_share_lands() {
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let key_id = b"appstate-sync-key-1".to_vec();
+
+        // A critical_unblock_low-style snapshot carrying a contact record.
+        let record = create_encrypted_record(
+            wa::syncd_mutation::SyncdOperation::SET,
+            &[1u8; 32],
+            &keys,
+            &key_id,
+            1_700_000_000,
+        );
+        let snapshot = wa::SyncdSnapshot {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(3) }),
+            records: vec![record],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(key_id.clone()),
+            }),
+            ..Default::default()
+        };
+
+        // Leg 1 — key-share NOT yet processed: the decode fails with KeyNotFound,
+        // exactly the "didn't find app state key" the paired companion hits.
+        let key_missing = |_: &[u8]| -> Result<Arc<ExpandedAppStateKeys>, AppStateError> {
+            Err(AppStateError::KeyNotFound)
+        };
+        let mut state = HashState::default();
+        let err = process_snapshot(
+            &snapshot,
+            &mut state,
+            key_missing,
+            false,
+            "critical_unblock_low",
+        )
+        .expect_err("must fail while the key-share is still in flight");
+        assert!(
+            matches!(err, AppStateError::KeyNotFound),
+            "expected KeyNotFound (the 'didn't find app state key' failure), got {err:?}"
+        );
+
+        // Leg 2 — key-share lands: the SAME snapshot decodes cleanly. The failure
+        // was ordering, not the snapshot — so the fix is about ensuring the key is
+        // present (event-driven), never about the snapshot or a longer fixed wait.
+        let key_present = |_: &[u8]| Ok(Arc::new(keys.clone()));
+        let mut state2 = HashState::default();
+        let result = process_snapshot(
+            &snapshot,
+            &mut state2,
+            key_present,
+            false,
+            "critical_unblock_low",
+        )
+        .expect("the same snapshot must decode once the key is present");
+        assert_eq!(result.state.version, 3);
+        assert_eq!(result.mutations.len(), 1, "the contact record must apply");
+    }
+
     #[test]
     fn test_process_patch_basic() {
         let master_key = [7u8; 32];
