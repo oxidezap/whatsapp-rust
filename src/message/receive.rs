@@ -1553,9 +1553,15 @@ impl Client {
         let migrated = self
             .migrate_signal_sessions_on_lid_discovery(&pn, &sender_jid.user)
             .await;
-        // Re-acquire for the retry decrypt and hand the guard back to the
-        // caller for subsequent payloads in the batch.
+        // Re-acquire for the retry decrypt and hand the guard back to the caller
+        // for subsequent payloads in the batch. Every return below is past this
+        // point, so the guard is always Some on the way out — losing that would
+        // silently drop same-sender serialization.
         *session_guard = Some(session_mutex.lock_arc().await);
+        debug_assert!(
+            session_guard.is_some(),
+            "PN→LID migration must hand the session guard back to the caller"
+        );
 
         // Nothing moved namespaces, so the retry would hit the exact same
         // state, fail identically, and log a second decrypt failure for
