@@ -154,8 +154,11 @@ impl Client {
         msg_id: &str,
         sender: &Jid,
     ) -> String {
-        let chat = self.resolve_encryption_jid(chat).await;
-        let sender = self.resolve_encryption_jid(sender).await;
+        // Two independent LID/PN resolves for different JIDs — run concurrently.
+        let (chat, sender) = futures::join!(
+            self.resolve_encryption_jid(chat),
+            self.resolve_encryption_jid(sender),
+        );
         // +40 covers @server suffixes, :device, separators for two JIDs
         let mut key =
             String::with_capacity(chat.user.len() + msg_id.len() + sender.user.len() + 40);
