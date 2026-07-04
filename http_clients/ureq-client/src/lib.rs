@@ -23,8 +23,9 @@ const MAX_IDLE_CONNECTIONS: u64 = 3;
 #[derive(Debug, Clone)]
 pub struct UreqHttpClient {
     agent: ureq::Agent,
-    /// Cap for [`UreqHttpClient::execute`]. Streaming is unbounded — the
-    /// caller owns the sink.
+    /// Total-bytes cap for both [`UreqHttpClient::execute`] and the reader from
+    /// [`UreqHttpClient::execute_streaming`]. Bounds an in-memory sink so a
+    /// hostile CDN can't drive it to OOM; defaults to WA's 2 GiB max file size.
     max_body_bytes: u64,
     /// Best-effort pool footprint for `resource_report`. `None` when a custom
     /// agent is supplied (its buffer/pool config is opaque to us).
@@ -64,8 +65,9 @@ impl UreqHttpClient {
         }
     }
 
-    /// Override the per-response cap for [`UreqHttpClient::execute`]. Set to
-    /// `u64::MAX` to disable; a hostile server can then exhaust memory.
+    /// Override the per-response cap for [`UreqHttpClient::execute`] and
+    /// [`UreqHttpClient::execute_streaming`]. Set to `u64::MAX` to disable; a
+    /// hostile server can then exhaust memory.
     pub fn with_max_body_bytes(mut self, max_body_bytes: u64) -> Self {
         self.max_body_bytes = max_body_bytes;
         self
@@ -172,7 +174,13 @@ impl HttpClient for UreqHttpClient {
         };
 
         let status_code = response.status().as_u16();
-        let reader = response.into_body().into_reader();
+        // Bound the streaming reader to the same cap `execute` enforces: an
+        // in-memory sink (`Client::download` buffers into a `Vec`) must not be
+        // driveable to OOM by a CDN that streams past the declared length. Over
+        // the cap the reader hits EOF and the downstream MAC/SHA check fails,
+        // rather than growing the sink unbounded. `DOWNLOAD_PREALLOC_CAP` only
+        // sizes the initial allocation, not the total read.
+        let reader = std::io::Read::take(response.into_body().into_reader(), self.max_body_bytes);
 
         Ok(StreamingHttpResponse {
             status_code,
@@ -300,6 +308,32 @@ mod tests {
             })
             .await
             .expect_err("1 KiB cap must reject a 4 MiB body");
+    }
+
+    // The streaming reader must honor the same cap: an over-cap body is
+    // truncated at EOF (the caller's decrypt/MAC check then rejects it) instead
+    // of growing an in-memory sink to OOM.
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_streaming_bounds_body_at_cap() {
+        const SIZE: usize = 4 * 1024 * 1024;
+        const CAP: u64 = 1024;
+        let url = spawn_fixed_size_server(SIZE);
+        let read = tokio::task::spawn_blocking(move || {
+            let mut resp = UreqHttpClient::new()
+                .with_max_body_bytes(CAP)
+                .execute_streaming(HttpRequest {
+                    method: "GET".into(),
+                    url,
+                    headers: std::collections::HashMap::new(),
+                    body: None,
+                })
+                .expect("streaming GET should start");
+            let mut sink = std::io::sink();
+            std::io::copy(&mut resp.body, &mut sink).expect("draining the reader should not error")
+        })
+        .await
+        .unwrap();
+        assert_eq!(read, CAP, "streaming body must stop at the cap");
     }
 
     /// Captures the raw request headers and body of a single POST, then replies 200.
