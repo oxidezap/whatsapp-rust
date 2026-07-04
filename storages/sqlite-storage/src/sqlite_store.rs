@@ -3004,59 +3004,55 @@ impl ProtocolStore for SqliteStore {
         token: &[u8],
         token_timestamp: i64,
     ) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
         let jid = jid.to_string();
         let token = token.to_vec();
         let now = wacore::time::now_secs();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            // IMMEDIATE so the read + conditional write is atomic against
-            // concurrent writers (WAL + busy_timeout serialize them): this is the
-            // lock-free newer-wins that lets history-sync and the privacy path
-            // converge without clobbering a fresher token.
-            conn.immediate_transaction(|conn| -> QueryResult<()> {
-                let existing: Option<(Vec<u8>, i64)> = tc_tokens::table
-                    .filter(tc_tokens::jid.eq(&jid))
-                    .filter(tc_tokens::device_id.eq(device_id))
-                    .select((tc_tokens::token, tc_tokens::token_timestamp))
-                    .first(conn)
-                    .optional()?;
-                let write = match &existing {
-                    Some((existing_token, existing_ts)) => {
-                        existing_token.is_empty() || token_timestamp >= *existing_ts
+        // IMMEDIATE so the read + conditional write is atomic against concurrent
+        // writers (WAL + busy_timeout serialize them): this is the lock-free
+        // newer-wins that lets history-sync and the privacy path converge without
+        // clobbering a fresher token. with_retry rides out transient SQLITE_BUSY.
+        self.with_retry("store_received_tc_token", || {
+            let jid = jid.clone();
+            let token = token.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.immediate_transaction(|conn| -> QueryResult<()> {
+                    let existing: Option<(Vec<u8>, i64)> = tc_tokens::table
+                        .filter(tc_tokens::jid.eq(&jid))
+                        .filter(tc_tokens::device_id.eq(device_id))
+                        .select((tc_tokens::token, tc_tokens::token_timestamp))
+                        .first(conn)
+                        .optional()?;
+                    let write = match &existing {
+                        Some((existing_token, existing_ts)) => {
+                            existing_token.is_empty() || token_timestamp >= *existing_ts
+                        }
+                        None => true,
+                    };
+                    if write {
+                        diesel::insert_into(tc_tokens::table)
+                            .values((
+                                tc_tokens::jid.eq(&jid),
+                                tc_tokens::token.eq(&token),
+                                tc_tokens::token_timestamp.eq(token_timestamp),
+                                tc_tokens::sender_timestamp.eq(None::<i64>),
+                                tc_tokens::device_id.eq(device_id),
+                                tc_tokens::updated_at.eq(now),
+                            ))
+                            .on_conflict((tc_tokens::jid, tc_tokens::device_id))
+                            .do_update()
+                            .set((
+                                tc_tokens::token.eq(&token),
+                                tc_tokens::token_timestamp.eq(token_timestamp),
+                                tc_tokens::updated_at.eq(now),
+                            ))
+                            .execute(conn)?;
                     }
-                    None => true,
-                };
-                if write {
-                    diesel::insert_into(tc_tokens::table)
-                        .values((
-                            tc_tokens::jid.eq(&jid),
-                            tc_tokens::token.eq(&token),
-                            tc_tokens::token_timestamp.eq(token_timestamp),
-                            tc_tokens::sender_timestamp.eq(None::<i64>),
-                            tc_tokens::device_id.eq(device_id),
-                            tc_tokens::updated_at.eq(now),
-                        ))
-                        .on_conflict((tc_tokens::jid, tc_tokens::device_id))
-                        .do_update()
-                        .set((
-                            tc_tokens::token.eq(&token),
-                            tc_tokens::token_timestamp.eq(token_timestamp),
-                            tc_tokens::updated_at.eq(now),
-                        ))
-                        .execute(conn)?;
-                }
-                Ok(())
+                    Ok(())
+                })
             })
-            .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(())
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn touch_tc_token_sender_timestamp(
