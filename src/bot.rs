@@ -837,6 +837,28 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         })
     }
 
+    /// Run `handler` when the server asks the companion to refresh an
+    /// in-progress pairing code ([`Event::PairingCodeRefresh`]). The `bool` is
+    /// `force_manual`. The typical reaction is to request a fresh code via
+    /// [`Client::pair_with_code`] with the same phone number.
+    pub fn on_pair_code_refresh<F, Fut>(self, handler: F) -> Self
+    where
+        F: Fn(bool, Arc<Client>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on_event_for(&[EventKind::PairingCodeRefresh], move |event, client| {
+            let fut = match &*event {
+                Event::PairingCodeRefresh { force_manual } => Some(handler(*force_manual, client)),
+                _ => None,
+            };
+            async move {
+                if let Some(fut) = fut {
+                    fut.await
+                }
+            }
+        })
+    }
+
     /// Run `handler` once the client is connected and authenticated.
     pub fn on_connected<F, Fut>(self, handler: F) -> Self
     where

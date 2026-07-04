@@ -226,6 +226,8 @@ impl Client {
             phone_jid: phone_number,
             pair_code: code.clone(),
             ephemeral_keypair: Box::new(ephemeral_keypair),
+            code_generation_ts: wacore::time::now_secs(),
+            primary_hello_attempt_count: 0,
         };
 
         // Dispatch event for user to display the code
@@ -238,10 +240,10 @@ impl Client {
     }
 }
 
-/// Handles the `link_code_companion_reg` notification (stage 2 trigger).
-///
-/// This is called when the user enters the code on their phone. The notification
-/// contains the primary device's encrypted ephemeral public key and identity public key.
+/// Handles a `link_code_companion_reg` notification. Dispatches on the child's
+/// `stage` attribute, mirroring WA Web `handleAltDeviceLinkingNotification`:
+/// `primary_hello` completes stage 2; `refresh_code` asks the companion to
+/// regenerate the code it is displaying.
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(name = "wa.pair.code_notification", level = "debug", skip_all)
@@ -250,11 +252,26 @@ pub(crate) async fn handle_pair_code_notification(
     client: &Arc<Client>,
     node: &NodeRef<'_>,
 ) -> bool {
-    // Check if this is a link_code_companion_reg notification
     let Some(reg_node) = node.get_optional_child_by_tag(&["link_code_companion_reg"]) else {
         return false;
     };
 
+    match reg_node.get_attr("stage").map(|v| v.as_str()).as_deref() {
+        Some("primary_hello") => handle_primary_hello(client, reg_node).await,
+        Some("refresh_code") => handle_refresh_code(client, reg_node).await,
+        other => {
+            warn!(
+                target: "Client/PairCode",
+                "Ignoring link_code_companion_reg notification with stage {other:?}"
+            );
+            false
+        }
+    }
+}
+
+/// Stage 2: the user entered the code on their phone. The notification carries
+/// the primary's encrypted ephemeral public key and identity public key.
+async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> bool {
     // Extract primary's wrapped ephemeral public key (80 bytes: salt + iv + encrypted key)
     let primary_wrapped_ephemeral = match reg_node
         .get_optional_child_by_tag(&["link_code_pairing_wrapped_primary_ephemeral_pub"])
@@ -289,24 +306,72 @@ pub(crate) async fn handle_pair_code_notification(
         }
     };
 
-    // Get current pair code state
-    let mut state_guard = client.pair_code_state.lock().await;
-    let state = std::mem::take(&mut *state_guard);
-    drop(state_guard);
-
-    let (pairing_ref, phone_jid, pair_code, ephemeral_keypair) = match state {
-        PairCodeState::WaitingForPhoneConfirmation {
-            pairing_ref,
-            phone_jid,
-            pair_code,
-            ephemeral_keypair,
-        } => (pairing_ref, phone_jid, pair_code, ephemeral_keypair),
-        _ => {
-            warn!(
-                target: "Client/PairCode",
-                "Received pair code notification but not in waiting state"
-            );
+    // Ref echoed by the primary. WA Web (`InvalidRefError`) rejects a
+    // primary_hello whose ref doesn't match the one from our companion_hello.
+    let notif_ref = match reg_node
+        .get_optional_child_by_tag(&["link_code_pairing_ref"])
+        .and_then(|n| match n.content.as_deref() {
+            Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
+            _ => None,
+        }) {
+        Some(r) => r,
+        None => {
+            warn!(target: "Client/PairCode", "primary_hello missing link_code_pairing_ref");
             return false;
+        }
+    };
+
+    // Validate against the outstanding request and snapshot what stage 2 needs.
+    // Bumps the attempt count (WA Web caps at 3 per code) and — unlike a
+    // consuming take — leaves the state in place so the primary can retry.
+    let (pairing_ref, phone_jid, pair_code, ephemeral_keypair) = {
+        let mut state_guard = client.pair_code_state.lock().await;
+        match &mut *state_guard {
+            PairCodeState::WaitingForPhoneConfirmation {
+                pairing_ref,
+                phone_jid,
+                pair_code,
+                ephemeral_keypair,
+                code_generation_ts,
+                primary_hello_attempt_count,
+            } => {
+                *primary_hello_attempt_count += 1;
+                if *primary_hello_attempt_count > PairCodeUtils::max_primary_hello_attempts() {
+                    warn!(
+                        target: "Client/PairCode",
+                        "Exceeded max primary_hello attempts for this code; abandoning"
+                    );
+                    return false;
+                }
+                if pairing_ref.as_slice() != notif_ref.as_slice() {
+                    warn!(
+                        target: "Client/PairCode",
+                        "primary_hello ref does not match the outstanding request; ignoring"
+                    );
+                    return false;
+                }
+                let age = wacore::time::now_secs() - *code_generation_ts;
+                if age > PairCodeUtils::code_validity().as_secs() as i64 {
+                    warn!(
+                        target: "Client/PairCode",
+                        "primary_hello arrived for an expired code ({age}s old); ignoring"
+                    );
+                    return false;
+                }
+                (
+                    pairing_ref.clone(),
+                    phone_jid.clone(),
+                    pair_code.clone(),
+                    (**ephemeral_keypair).clone(),
+                )
+            }
+            _ => {
+                warn!(
+                    target: "Client/PairCode",
+                    "Received primary_hello but not in waiting state"
+                );
+                return false;
+            }
         }
     };
 
@@ -385,9 +450,62 @@ pub(crate) async fn handle_pair_code_notification(
         "Sent companion_finish, waiting for pair-success"
     );
 
-    // Mark state as completed
-    *client.pair_code_state.lock().await = PairCodeState::Completed;
+    // Deliberately keep the WaitingForPhoneConfirmation state (with the bumped
+    // attempt count): WA Web retains the cached hello so the primary can retry
+    // primary_hello. The terminal transition to Completed happens when the
+    // standard pair-success handler fires (see `crate::pair`).
+    true
+}
 
+/// The server asked us to refresh the code we are displaying (WA Web
+/// `refreshAltLinkingCode` / `forceManualRefresh`). Surfaces a
+/// [`Event::PairingCodeRefresh`] so the consumer re-requests a code, but only
+/// when the notification's ref matches the flow currently in progress.
+async fn handle_refresh_code(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> bool {
+    let notif_ref = match reg_node
+        .get_optional_child_by_tag(&["link_code_pairing_ref"])
+        .and_then(|n| match n.content.as_deref() {
+            Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
+            _ => None,
+        }) {
+        Some(r) => r,
+        None => {
+            warn!(target: "Client/PairCode", "refresh_code missing link_code_pairing_ref");
+            return false;
+        }
+    };
+
+    let force_manual = reg_node
+        .get_attr("force_manual_refresh")
+        .map(|v| v.as_str().as_ref() == "true")
+        .unwrap_or(false);
+
+    // Ignore a refresh whose ref doesn't match the outstanding code — matches
+    // WA Web's `getCurrentRef()` guard.
+    let matches_current = {
+        let state_guard = client.pair_code_state.lock().await;
+        matches!(
+            &*state_guard,
+            PairCodeState::WaitingForPhoneConfirmation { pairing_ref, .. }
+                if pairing_ref.as_slice() == notif_ref.as_slice()
+        )
+    };
+    if !matches_current {
+        warn!(
+            target: "Client/PairCode",
+            "refresh_code ref does not match the outstanding request; ignoring"
+        );
+        return false;
+    }
+
+    info!(
+        target: "Client/PairCode",
+        "Server requested pair-code refresh (force_manual={force_manual})"
+    );
+    client
+        .core
+        .event_bus
+        .dispatch(Event::PairingCodeRefresh { force_manual });
     true
 }
 
@@ -423,5 +541,247 @@ mod tests {
             .downcast_ref::<CurveError>()
             .expect("downcasts to CurveError through transparent wrapper");
         assert!(matches!(curve, CurveError::NoKeyTypeIdentifier));
+    }
+
+    // ── Stage-2 notification handling (WA Web parity guards) ─────────────────
+    //
+    // All tests drive the top-level `handle_pair_code_notification`, so the
+    // `stage` dispatch is exercised end-to-end. The guard-reject paths bail
+    // before any stage-2 crypto, so "the adv secret is unchanged" is a reliable
+    // proxy for "we did not process the notification"; conversely a valid
+    // primary_hello rotates it (via `SetAdvSecretKey`) before the socket send.
+
+    use crate::test_utils::create_test_client;
+    use wacore::libsignal::protocol::KeyPair;
+    use wacore_binary::Node;
+    use wacore_binary::builder::NodeBuilder;
+
+    fn primary_hello_notif(reg_ref: &[u8]) -> Node {
+        NodeBuilder::new("notification")
+            .attr("type", "link_code_companion_reg")
+            .attr("from", "s.whatsapp.net")
+            .children([NodeBuilder::new("link_code_companion_reg")
+                .attr("stage", "primary_hello")
+                .children([
+                    // Non-zero dummy bytes keep the stage-2 DH well-defined.
+                    NodeBuilder::new("link_code_pairing_wrapped_primary_ephemeral_pub")
+                        .bytes(vec![7u8; 80])
+                        .build(),
+                    NodeBuilder::new("primary_identity_pub")
+                        .bytes(vec![9u8; 32])
+                        .build(),
+                    NodeBuilder::new("link_code_pairing_ref")
+                        .bytes(reg_ref.to_vec())
+                        .build(),
+                ])
+                .build()])
+            .build()
+    }
+
+    fn refresh_code_notif(reg_ref: &[u8], force_manual: Option<bool>) -> Node {
+        let mut reg = NodeBuilder::new("link_code_companion_reg").attr("stage", "refresh_code");
+        if let Some(f) = force_manual {
+            reg = reg.attr("force_manual_refresh", if f { "true" } else { "false" });
+        }
+        NodeBuilder::new("notification")
+            .attr("type", "link_code_companion_reg")
+            .attr("from", "s.whatsapp.net")
+            .children([reg
+                .children([NodeBuilder::new("link_code_pairing_ref")
+                    .bytes(reg_ref.to_vec())
+                    .build()])
+                .build()])
+            .build()
+    }
+
+    async fn set_waiting(client: &Arc<Client>, pairing_ref: Vec<u8>, ts: i64, count: u32) {
+        *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
+            pairing_ref,
+            phone_jid: "15551234567".to_string(),
+            pair_code: "ABCD1234".to_string(),
+            ephemeral_keypair: Box::new(KeyPair::generate(
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )),
+            code_generation_ts: ts,
+            primary_hello_attempt_count: count,
+        };
+    }
+
+    fn adv(client: &Arc<Client>) -> [u8; 32] {
+        client
+            .persistence_manager
+            .get_device_snapshot()
+            .adv_secret_key
+    }
+
+    async fn is_waiting(client: &Arc<Client>) -> bool {
+        matches!(
+            &*client.pair_code_state.lock().await,
+            PairCodeState::WaitingForPhoneConfirmation { .. }
+        )
+    }
+
+    /// Regression: a `primary_hello` whose ref doesn't match our outstanding
+    /// companion_hello must be rejected (WA Web `InvalidRefError`) without
+    /// running stage 2, and must leave the flow intact for a later valid one.
+    #[tokio::test]
+    async fn primary_hello_rejects_mismatched_ref() {
+        let client = create_test_client().await;
+        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+        let adv_before = adv(&client);
+
+        let notif = primary_hello_notif(&[9, 9, 9, 9]);
+        let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
+
+        assert!(!handled, "mismatched ref must be rejected");
+        assert_eq!(
+            adv(&client),
+            adv_before,
+            "no stage-2 crypto on ref mismatch"
+        );
+        assert!(
+            is_waiting(&client).await,
+            "state must be preserved so a later valid primary_hello can complete"
+        );
+    }
+
+    /// Regression: a `primary_hello` for a code older than the ~180s validity
+    /// window must be rejected (WA Web `OldCodeError`).
+    #[tokio::test]
+    async fn primary_hello_rejects_expired_code() {
+        let client = create_test_client().await;
+        let pairing_ref = vec![1, 2, 3, 4];
+        let stale_ts =
+            wacore::time::now_secs() - (PairCodeUtils::code_validity().as_secs() as i64 + 20);
+        set_waiting(&client, pairing_ref.clone(), stale_ts, 0).await;
+        let adv_before = adv(&client);
+
+        let notif = primary_hello_notif(&pairing_ref);
+        let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
+
+        assert!(
+            !handled,
+            "primary_hello for an expired code must be rejected"
+        );
+        assert_eq!(
+            adv(&client),
+            adv_before,
+            "no stage-2 crypto on an expired code"
+        );
+    }
+
+    /// Regression: at most `max_primary_hello_attempts` (WA Web `T = 3`) are
+    /// processed per code; the next one is dropped (`MaxPrimaryHelloError`).
+    #[tokio::test]
+    async fn primary_hello_rejects_beyond_max_attempts() {
+        let client = create_test_client().await;
+        let pairing_ref = vec![1, 2, 3, 4];
+        set_waiting(
+            &client,
+            pairing_ref.clone(),
+            wacore::time::now_secs(),
+            PairCodeUtils::max_primary_hello_attempts(),
+        )
+        .await;
+        let adv_before = adv(&client);
+
+        let notif = primary_hello_notif(&pairing_ref);
+        let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
+
+        assert!(!handled, "the attempt past the cap must be rejected");
+        assert_eq!(
+            adv(&client),
+            adv_before,
+            "no stage-2 crypto once the per-code attempt cap is exhausted"
+        );
+    }
+
+    /// The guards must not over-reject: a valid retry (matching ref, fresh code,
+    /// still under the cap) reaches stage 2 and rotates the adv secret. The
+    /// socket send then fails (no transport in tests), so the call returns
+    /// false, but the rotation proves processing happened.
+    #[tokio::test]
+    async fn primary_hello_valid_retry_reaches_stage2() {
+        let client = create_test_client().await;
+        let pairing_ref = vec![1, 2, 3, 4];
+        // count = 2 → this is the 3rd attempt, still within the cap of 3.
+        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 2).await;
+        let adv_before = adv(&client);
+
+        let notif = primary_hello_notif(&pairing_ref);
+        let _ = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
+
+        assert_ne!(
+            adv(&client),
+            adv_before,
+            "a valid in-window retry must reach stage 2 and rotate the adv secret"
+        );
+    }
+
+    /// A `refresh_code` whose ref matches the outstanding flow surfaces a
+    /// `PairingCodeRefresh` event carrying `force_manual`.
+    #[tokio::test]
+    async fn refresh_code_matching_ref_dispatches_event() {
+        let client = create_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let pairing_ref = vec![5, 6, 7, 8];
+        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+
+        let notif = refresh_code_notif(&pairing_ref, Some(true));
+        let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
+
+        assert!(handled, "a matching refresh_code should be handled");
+        let events = collector.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&**e, Event::PairingCodeRefresh { force_manual: true })),
+            "expected PairingCodeRefresh{{force_manual:true}}, got: {events:?}"
+        );
+    }
+
+    /// A `refresh_code` for a different ref (or with no flow in progress) is
+    /// ignored — no event, matching WA Web's `getCurrentRef()` guard.
+    #[tokio::test]
+    async fn refresh_code_mismatched_ref_is_ignored() {
+        let client = create_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        set_waiting(&client, vec![5, 6, 7, 8], wacore::time::now_secs(), 0).await;
+
+        let notif = refresh_code_notif(&[1, 1, 1, 1], None);
+        let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
+
+        assert!(!handled, "a non-matching refresh_code must be ignored");
+        assert!(
+            collector.events().is_empty(),
+            "no event should fire for a refresh_code with an unknown ref"
+        );
+    }
+
+    /// An unknown `stage` on the notification is ignored without touching the
+    /// in-progress flow.
+    #[tokio::test]
+    async fn unknown_stage_is_ignored_and_preserves_state() {
+        let client = create_test_client().await;
+        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+
+        let notif = NodeBuilder::new("notification")
+            .attr("type", "link_code_companion_reg")
+            .attr("from", "s.whatsapp.net")
+            .children([NodeBuilder::new("link_code_companion_reg")
+                .attr("stage", "some_future_stage")
+                .build()])
+            .build();
+        let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
+
+        assert!(!handled, "unknown stage must not be treated as handled");
+        assert!(
+            is_waiting(&client).await,
+            "unknown stage must leave the outstanding flow untouched"
+        );
     }
 }

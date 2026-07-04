@@ -216,6 +216,7 @@ pub enum EventKind {
     LoggedOut,
     PairingQrCode,
     PairingCode,
+    PairingCodeRefresh,
     QrScannedWithoutMultidevice,
     ClientOutdated,
     Messages,
@@ -621,6 +622,16 @@ pub enum Event {
         /// Approximate validity duration (~180 seconds).
         timeout: std::time::Duration,
     },
+    /// The server asked the companion to refresh an in-progress phone-number
+    /// pairing code (WA Web `refreshAltLinkingCode` / `forceManualRefresh`).
+    /// Only emitted while a pair-code flow is outstanding and the server's ref
+    /// matches it. The consumer should request a fresh code via
+    /// `pair_with_code`; the previous code is no longer guaranteed valid.
+    PairingCodeRefresh {
+        /// `true` when the server set `force_manual_refresh` — the code must be
+        /// re-requested explicitly rather than auto-rotated.
+        force_manual: bool,
+    },
     QrScannedWithoutMultidevice(QrScannedWithoutMultidevice),
     ClientOutdated(ClientOutdated),
 
@@ -783,6 +794,7 @@ impl Event {
             Event::LoggedOut(_) => EventKind::LoggedOut,
             Event::PairingQrCode { .. } => EventKind::PairingQrCode,
             Event::PairingCode { .. } => EventKind::PairingCode,
+            Event::PairingCodeRefresh { .. } => EventKind::PairingCodeRefresh,
             Event::QrScannedWithoutMultidevice(_) => EventKind::QrScannedWithoutMultidevice,
             Event::ClientOutdated(_) => EventKind::ClientOutdated,
             Event::Messages(_) => EventKind::Messages,

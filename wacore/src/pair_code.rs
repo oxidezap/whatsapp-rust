@@ -83,6 +83,10 @@ fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], rounds: u32, output: &mut [u
 /// Validity duration for pair codes (approximately).
 const PAIR_CODE_VALIDITY_SECS: u64 = 180;
 
+/// Max `primary_hello` notifications processed per code before the flow is
+/// abandoned. Matches WA Web `DeviceLinkingApi` (`T = 3`, `MaxPrimaryHelloError`).
+const PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS: u32 = 3;
+
 fn build_id_and_display(
     id: CompanionWebClientType,
     props: &wa::DeviceProps,
@@ -160,6 +164,13 @@ pub enum PairCodeState {
         pair_code: String,
         /// Ephemeral keypair generated for this session.
         ephemeral_keypair: Box<KeyPair>,
+        /// Unix seconds when the code was generated. Enforces the ~180s validity
+        /// window: a `primary_hello` arriving later is rejected (WA Web `OldCodeError`).
+        code_generation_ts: i64,
+        /// Count of `primary_hello` notifications processed for this code. WA Web
+        /// (`DeviceLinkingApi`) caps this at 3 per code (`MaxPrimaryHelloError`);
+        /// the primary may retry, re-deriving fresh key material each time.
+        primary_hello_attempt_count: u32,
     },
     /// Pairing completed (success or failure).
     Completed,
@@ -489,6 +500,11 @@ impl PairCodeUtils {
     /// Returns the pair code validity duration.
     pub fn code_validity() -> std::time::Duration {
         std::time::Duration::from_secs(PAIR_CODE_VALIDITY_SECS)
+    }
+
+    /// Max number of `primary_hello` notifications processed per code (WA Web `T`).
+    pub fn max_primary_hello_attempts() -> u32 {
+        PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS
     }
 }
 
