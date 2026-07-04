@@ -14,16 +14,40 @@ impl Client {
         let mut jids_to_fetch: HashSet<Jid> = HashSet::with_capacity(jids.len());
         let mut all_devices = Vec::with_capacity(jids.len() * 2);
 
-        for jid in jids.iter().map(|j| j.to_non_ad()) {
-            // Device registry (in-memory cache + DB) is the single source of truth.
-            // get_devices_from_registry returns None for an empty record (never a
-            // valid set — WA Web always keeps device 0), so a corrupted empty row
-            // falls through to the network here instead of being trusted.
-            if let Some(devices) = self.get_devices_from_registry(&jid).await {
-                all_devices.extend(devices);
-                continue;
+        // Resolve each user's device list from the registry concurrently. The
+        // network usync is already batched into one IQ below; this is the LOCAL
+        // read scan (in-memory cache, DB fallback per user) that a large group
+        // would otherwise serialize over 256+ members on a cold cache. Each read
+        // takes `&self` and is independent, and the resulting device set order is
+        // irrelevant (the phash sorts, and the encrypt fan-out is order-agnostic),
+        // so a bounded fan-out is safe. Bound (16) matches the send encrypt
+        // fan-out and `groups::fill_participant_pns`.
+        //
+        // get_devices_from_registry returns None for an empty record (never a
+        // valid set — WA Web always keeps device 0), so a corrupted empty row
+        // falls through to the network below instead of being trusted.
+        use futures::StreamExt;
+        // Materialize the non-AD users into an owned Vec so the stream owns its
+        // items (borrowing `jids` through `buffer_unordered` trips the future's
+        // higher-ranked Send bound — same reason `groups::fill_participant_pns`
+        // collects `pending` first).
+        let non_ad: Vec<Jid> = jids.iter().map(|j| j.to_non_ad()).collect();
+        let resolved: Vec<(Jid, Option<Vec<Jid>>)> = futures::stream::iter(non_ad)
+            .map(|jid| async move {
+                let devices = self.get_devices_from_registry(&jid).await;
+                (jid, devices)
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+
+        for (jid, devices) in resolved {
+            match devices {
+                Some(devices) => all_devices.extend(devices),
+                None => {
+                    jids_to_fetch.insert(jid);
+                }
             }
-            jids_to_fetch.insert(jid);
         }
 
         if !jids_to_fetch.is_empty() {
