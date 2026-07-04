@@ -921,9 +921,16 @@ impl Client {
                 const CRITICAL_SYNC_TIMEOUT_SECS: u64 = 180;
                 let critical_deadline = wacore::time::Instant::now()
                     + Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS);
+                // Explicit "critical sync completed" signal for the watchdog. A push_name
+                // check is not a reliable proxy: a business account gets push_name set
+                // from business_name at pairing (src/pair.rs) while still needing the
+                // full sync, so the watchdog would wrongly stand down on a failed sync.
+                let critical_sync_done =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let timeout_client = client_clone.clone();
                 let timeout_generation = task_generation;
                 let timeout_rt = client_clone.runtime.clone();
+                let timeout_done = critical_sync_done.clone();
                 let critical_sync_timeout_handle = timeout_rt.spawn(Box::pin(async move {
                     timeout_client.runtime.sleep(Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS)).await;
                     // Check generation — if connection was replaced, this timeout is stale
@@ -932,24 +939,21 @@ impl Client {
                     {
                         return;
                     }
-                    // Matches WhatsApp Web's $16(): check if SettingPushName was synced.
-                    // If push_name is still empty after 180s, critical sync failed.
-                    let push_name = timeout_client.get_push_name();
-                    if push_name.is_empty() {
+                    if timeout_done.load(Ordering::SeqCst) {
+                        debug!(
+                            target: "Client/AppState",
+                            "Critical sync timeout fired but critical sync already completed"
+                        );
+                    } else {
                         warn!(
                             target: "Client/AppState",
-                            "Critical app state sync timed out after {CRITICAL_SYNC_TIMEOUT_SECS}s \
-                             (push_name not synced). Reconnecting to retry."
+                            "Critical app state sync did not complete within {CRITICAL_SYNC_TIMEOUT_SECS}s. \
+                             Reconnecting to retry."
                         );
                         // WhatsApp Web does socketLogout here which clears device identity.
                         // We reconnect instead — preserving credentials and keeping the
                         // run loop active so auto-reconnect can retry the sync.
                         timeout_client.reconnect_immediately().await;
-                    } else {
-                        debug!(
-                            target: "Client/AppState",
-                            "Critical sync timeout fired but push_name was already synced"
-                        );
                     }
                 }));
 
@@ -995,7 +999,8 @@ impl Client {
                     .await
                 {
                     Ok(()) => {
-                        // Critical sync completed — cancel the timeout timer
+                        // Critical sync completed — signal the watchdog, then cancel it.
+                        critical_sync_done.store(true, Ordering::SeqCst);
                         critical_sync_timeout_handle.abort();
 
                         check_generation!();
