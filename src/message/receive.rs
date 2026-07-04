@@ -1555,13 +1555,9 @@ impl Client {
             .await;
         // Re-acquire for the retry decrypt and hand the guard back to the caller
         // for subsequent payloads in the batch. Every return below is past this
-        // point, so the guard is always Some on the way out — losing that would
-        // silently drop same-sender serialization.
+        // reacquire, so the caller always gets the guard back as `Some`; losing
+        // that would silently drop same-sender serialization.
         *session_guard = Some(session_mutex.lock_arc().await);
-        debug_assert!(
-            session_guard.is_some(),
-            "PN→LID migration must hand the session guard back to the caller"
-        );
 
         // Nothing moved namespaces, so the retry would hit the exact same
         // state, fail identically, and log a second decrypt failure for
