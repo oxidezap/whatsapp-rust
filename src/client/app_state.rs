@@ -631,12 +631,27 @@ impl Client {
             return true;
         }
         let count = missing.len();
+        // Register the listener before touching the store: the notifier is not sticky,
+        // so a key-share persisted between our checks and listen() would be lost.
         let listener = self.initial_keys_synced_notifier.listen();
+
+        // Fast path: a key persisted in the gap before listen() fired a notify we can't
+        // observe. Re-check now so we don't wait the (up to critical-deadline) timeout
+        // for keys already in the store.
+        if self.all_sync_keys_present(&missing).await {
+            return true;
+        }
+
         self.request_missing_keys_with_dedup(missing.clone()).await;
         debug!(target: "Client/AppState", "Requested {count} missing app-state key(s); waiting up to {timeout:?} for the re-share");
         let _ = rt_timeout(&*self.runtime, timeout, listener).await;
+        self.all_sync_keys_present(&missing).await
+    }
+
+    /// True iff every given app-state sync-key id is already stored.
+    async fn all_sync_keys_present(&self, ids: &[Vec<u8>]) -> bool {
         let backend = self.persistence_manager.backend();
-        for id in &missing {
+        for id in ids {
             if backend.get_sync_key(id).await.ok().flatten().is_none() {
                 return false;
             }
