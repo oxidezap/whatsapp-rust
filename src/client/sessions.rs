@@ -289,11 +289,9 @@ impl Client {
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
 
-        // Check each session concurrently. Warm hits serialize on the signal
-        // cache's mutex regardless, but a cold-cache multi-recipient ensure (e.g.
-        // status / group session setup over many devices) would otherwise
-        // serialize the per-device DB reads. Each probe is independent and the
-        // resulting order is irrelevant (the misses are chunked for the fetch).
+        // Probe sessions concurrently: a cold-cache multi-recipient ensure would
+        // otherwise serialize the per-device DB reads (warm hits serialize on the
+        // cache mutex anyway). Order is irrelevant — misses are chunked for the fetch.
         use futures::StreamExt;
         let backend = device_snapshot.backend.clone();
         let jids_needing_sessions: Vec<Jid> = futures::stream::iter(jids)

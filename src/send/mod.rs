@@ -738,13 +738,9 @@ impl Client {
 
         use futures::StreamExt;
         use std::collections::HashMap;
-        // Resolve each recipient's LID concurrently. A status audience can be
-        // hundreds of contacts, and resolve_recipient_to_lid falls back to a DB
-        // read on a cold cache — serializing those was the bottleneck. Each read
-        // is independent; stream over owned indices and index inside the task so
-        // `resolved` can be rebuilt in the original order (assemble_status_
-        // participants is position-sensitive). Bound (16) matches the other
-        // resolution fan-outs.
+        // Resolve recipient LIDs concurrently (a status audience can be hundreds of
+        // contacts, each a cold-cache DB read). Stream over indices and rebuild
+        // `resolved` in order — assemble_status_participants is position-sensitive.
         let resolved_indexed: Vec<(usize, Option<Jid>)> =
             futures::stream::iter(0..recipients.len())
                 .map(|i| async move { (i, self.resolve_recipient_to_lid(&recipients[i]).await) })

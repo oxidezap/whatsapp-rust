@@ -14,23 +14,14 @@ impl Client {
         let mut jids_to_fetch: HashSet<Jid> = HashSet::with_capacity(jids.len());
         let mut all_devices = Vec::with_capacity(jids.len() * 2);
 
-        // Resolve each user's device list from the registry concurrently. The
-        // network usync is already batched into one IQ below; this is the LOCAL
-        // read scan (in-memory cache, DB fallback per user) that a large group
-        // would otherwise serialize over 256+ members on a cold cache. Each read
-        // takes `&self` and is independent, and the resulting device set order is
-        // irrelevant (the phash sorts, and the encrypt fan-out is order-agnostic),
-        // so a bounded fan-out is safe. Bound (16) matches the send encrypt
-        // fan-out and `groups::fill_participant_pns`.
-        //
-        // get_devices_from_registry returns None for an empty record (never a
-        // valid set — WA Web always keeps device 0), so a corrupted empty row
-        // falls through to the network below instead of being trusted.
+        // Resolve the LOCAL registry scan concurrently (the network usync below is
+        // already one batched IQ) — a cold-cache large group would otherwise
+        // serialize 256+ per-user cache/DB reads. Order is irrelevant (phash sorts,
+        // encrypt fan-out is order-agnostic). A None result means an empty/corrupt
+        // record, which falls through to the network below (WA Web always keeps
+        // device 0). Materialize to an owned Vec first so the stream doesn't borrow
+        // `jids` through buffer_unordered (Send bound).
         use futures::StreamExt;
-        // Materialize the non-AD users into an owned Vec so the stream owns its
-        // items (borrowing `jids` through `buffer_unordered` trips the future's
-        // higher-ranked Send bound — same reason `groups::fill_participant_pns`
-        // collects `pending` first).
         let non_ad: Vec<Jid> = jids.iter().map(|j| j.to_non_ad()).collect();
         let resolved: Vec<(Jid, Option<Vec<Jid>>)> = futures::stream::iter(non_ad)
             .map(|jid| async move {

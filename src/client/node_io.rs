@@ -743,14 +743,11 @@ impl Client {
                 debug!("Skipping passive tasks: connection closed");
                 return;
             }
-            // WA Web PassiveTasks: the one-time pre-key upload is a passive task
-            // (`PassiveTaskManager.registerPassiveTask("KeyUpload", ...)`), not a
-            // gate on going active. Uploading publishes pre-keys for peers' FUTURE
-            // sessions; decrypting the offline backlog only needs pre-keys we
-            // already hold locally, and on a fresh device the server has none yet
-            // so no incoming pkmsg can reference them. Awaiting it here only
-            // delayed offline delivery, so spawn it like RotateKeyJob below.
-            // No-op on reconnect via the persisted server_has_prekeys flag.
+            // WA Web PassiveTasks: the pre-key upload is a passive task, not a gate
+            // on going active — it only publishes keys for peers' FUTURE sessions
+            // (the offline backlog uses keys we already hold, and a fresh device's
+            // server pool is empty). Awaiting it here just delayed offline delivery,
+            // so spawn it like RotateKeyJob below.
             check_generation!();
             let prekey_client = client_clone.clone();
             let prekey_generation = task_generation;

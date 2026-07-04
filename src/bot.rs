@@ -467,16 +467,12 @@ impl Bot {
         } = self;
 
         if let Some(receiver) = sync_task_receiver {
-            // History-sync tasks are independent — they upsert message secrets /
-            // tctokens (order-free) and the dispatched event carries chunk_order
-            // for consumers — so they can ingest concurrently. App-state tasks stay
-            // strictly serial and inline: same-collection patch application is
-            // order-sensitive (LTHash). The history cap is deliberately low because
-            // each task transiently holds a decompressed history blob and the
-            // connect path is peak-memory-conscious; WA Web caps history-sync
-            // chunks at histSyncChunk=3, we stay at 2 for headroom. The permit is
-            // taken in the recv loop so a burst applies backpressure instead of
-            // spawning unbounded tasks that each pin a compressed blob.
+            // History-sync chunks are independent (order-free upserts; the event
+            // carries chunk_order), so ingest them concurrently. Bounded low: each
+            // holds a decompressed blob and the connect path is peak-memory-
+            // conscious (WA Web caps at histSyncChunk=3). App-state stays serial
+            // (order-sensitive patch application). The permit is taken in the recv
+            // loop so a burst backpressures instead of piling up blob-pinning tasks.
             const HISTORY_SYNC_CONCURRENCY: usize = 2;
             let worker_client = Arc::downgrade(&client);
             let history_permits = Arc::new(async_lock::Semaphore::new(HISTORY_SYNC_CONCURRENCY));
@@ -503,7 +499,9 @@ impl Bot {
                             worker_client.process_sync_task(task).await;
                         }
                     }
-                    info!("Sync worker shutting down.");
+                    info!(
+                        "Sync worker intake loop finished (detached history-sync tasks may still be running)."
+                    );
                 }))
                 .detach();
         }

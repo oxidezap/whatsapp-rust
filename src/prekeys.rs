@@ -178,11 +178,9 @@ impl Client {
         jids: &[Jid],
     ) -> std::collections::HashMap<Jid, [u8; 32]> {
         use futures::StreamExt;
-        // Materialize the companion (device != 0) subset so the stream owns its
-        // items (borrowing `jids` through buffer_unordered trips the future's Send
-        // bound). Each load is an independent signal-cache/DB read; on a cold group
-        // send the keyless-companion set can be large, so fan them out instead of
-        // serializing before the (already batched) prekey fetch IQ.
+        // Fan out the per-companion identity loads (independent cache/DB reads) —
+        // the keyless-companion set can be large on a cold group send. Owned Vec so
+        // the stream doesn't borrow `jids` through buffer_unordered (Send bound).
         let companions: Vec<Jid> = jids.iter().filter(|j| j.device != 0).cloned().collect();
         futures::stream::iter(companions)
             .map(|jid| async move {
