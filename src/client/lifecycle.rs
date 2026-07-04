@@ -218,6 +218,7 @@ impl Client {
             initial_app_state_keys_received: Arc::new(AtomicBool::new(false)),
             prekey_upload_lock: Arc::new(async_lock::Mutex::new(())),
             signed_pre_key_rotation_lock: Arc::new(async_lock::Mutex::new(())),
+            tc_token_lock: Arc::new(async_lock::Mutex::new(())),
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
             offline_sync_finish_started: Arc::new(AtomicBool::new(false)),
