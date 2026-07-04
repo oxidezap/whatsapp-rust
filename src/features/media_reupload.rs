@@ -162,52 +162,55 @@ impl<'a> MediaReupload<'a> {
     /// same order as `reqs`; each entry carries that item's success or error
     /// (one item failing never aborts the others).
     ///
-    /// The `mediaretry` waiter filters on message id alone, and `resolve_waiters`
-    /// wakes *every* matching waiter with the same notification node — so two
-    /// items sharing a `msg_id` would cross-resolve (the second decrypts the
-    /// first's payload with the wrong key). Items are therefore grouped by
-    /// `msg_id`: same-id items run sequentially (their waiters never coexist)
-    /// while distinct ids still fan out concurrently. In the normal case (all
-    /// ids unique) every item gets its own lane and this is a plain fan-out.
+    /// Duplicate `msg_id`s in one batch are rejected (past the first occurrence)
+    /// with [`MediaReuploadError::InvalidRequest`]. The `mediaretry` waiter
+    /// filters on message id alone and `resolve_waiters` wakes *every* match, so
+    /// two same-id waiters would cross-resolve. Serializing them isn't enough:
+    /// once the first waiter times out it lingers in `node_waiters` (canceled
+    /// waiters are purged only lazily), so its late notification could still
+    /// resolve a same-id retry with the wrong payload. Requiring unique ids means
+    /// no two waiters ever share a filter — a message id is unique per message,
+    /// so a duplicate is a caller mistake, not a real recovery target.
     pub async fn request_many(
         &self,
         reqs: &[MediaReuploadRequest<'_>],
     ) -> Vec<Result<MediaRetryResult, MediaReuploadError>> {
         use futures::StreamExt;
-        use std::collections::HashMap;
+        use std::collections::HashSet;
         if reqs.is_empty() {
             return Vec::new();
         }
 
-        let mut lanes: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut results: Vec<Option<Result<MediaRetryResult, MediaReuploadError>>> =
+            (0..reqs.len()).map(|_| None).collect();
+        let mut seen: HashSet<&str> = HashSet::with_capacity(reqs.len());
+        let mut unique: Vec<usize> = Vec::with_capacity(reqs.len());
         for (i, req) in reqs.iter().enumerate() {
-            lanes.entry(req.msg_id).or_default().push(i);
+            if seen.insert(req.msg_id) {
+                unique.push(i);
+            } else {
+                results[i] = Some(Err(MediaReuploadError::InvalidRequest(format!(
+                    "duplicate msg_id {} in batch",
+                    req.msg_id
+                ))));
+            }
         }
 
-        // Each lane owns its index list (not a borrow of `reqs` through the
-        // combinator) and indexes `reqs` inside the task, keeping the fan-out
-        // future Send. Lanes run concurrently; indices within a lane run in order.
-        let lane_results: Vec<Vec<(usize, Result<MediaRetryResult, MediaReuploadError>)>> =
-            futures::stream::iter(lanes.into_values())
-                .map(|indices| async move {
-                    let mut out = Vec::with_capacity(indices.len());
-                    for i in indices {
-                        out.push((i, self.request(&reqs[i]).await));
-                    }
-                    out
-                })
+        // Stream over owned indices (not a borrow of `reqs` through the
+        // combinator) and index inside each task, so the fan-out future stays
+        // Send. Every id here is unique, so no two waiters share a filter.
+        let done: Vec<(usize, Result<MediaRetryResult, MediaReuploadError>)> =
+            futures::stream::iter(unique)
+                .map(|i| async move { (i, self.request(&reqs[i]).await) })
                 .buffer_unordered(MEDIA_REUPLOAD_CONCURRENCY)
                 .collect()
                 .await;
-
-        let mut results: Vec<Option<Result<MediaRetryResult, MediaReuploadError>>> =
-            (0..reqs.len()).map(|_| None).collect();
-        for (i, res) in lane_results.into_iter().flatten() {
+        for (i, res) in done {
             results[i] = Some(res);
         }
         results
             .into_iter()
-            .map(|res| res.expect("every index belongs to exactly one lane"))
+            .map(|res| res.expect("every index is either a duplicate or fetched"))
             .collect()
     }
 }
