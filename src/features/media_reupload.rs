@@ -18,6 +18,14 @@ use wacore_binary::{Jid, JidExt as _};
 
 const MEDIA_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Max media-reupload requests in flight for [`MediaReupload::request_many`].
+/// The per-item work is I/O-light (send a small receipt, park on a notification
+/// waiter), so a generous window lets the waits overlap — bulk recovery after a
+/// long offline period completes in ~one timeout instead of the sum — while
+/// still bounding how many receipts hit the socket/server at once. WA Web caps
+/// media work at a similar order (its `ConcurrentPriorityPromiseQueue`).
+const MEDIA_REUPLOAD_CONCURRENCY: usize = 32;
+
 /// Error returned by the media reupload request flow.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -143,6 +151,36 @@ impl<'a> MediaReupload<'a> {
             notification_node.get(),
             req.media_key,
         )?)
+    }
+
+    /// Request reupload for several messages at once, concurrently.
+    ///
+    /// Each request registers its own notification waiter (keyed by the unique
+    /// message id) and awaits it independently, so a bulk recovery — e.g. many
+    /// expired-URL media after a long offline period — is bounded by roughly one
+    /// [`MEDIA_RETRY_TIMEOUT`] instead of the serial sum of per-item waits.
+    /// Results are returned in the same order as `reqs`; each entry carries that
+    /// item's success or error (one item failing never aborts the others).
+    pub async fn request_many(
+        &self,
+        reqs: &[MediaReuploadRequest<'_>],
+    ) -> Vec<Result<MediaRetryResult, MediaReuploadError>> {
+        use futures::StreamExt;
+        if reqs.is_empty() {
+            return Vec::new();
+        }
+
+        // Stream over owned indices (not a borrow of `reqs` through the
+        // combinator) and index inside each task, so the fan-out future stays
+        // Send; collect (index, result) then restore input order.
+        let mut indexed: Vec<(usize, Result<MediaRetryResult, MediaReuploadError>)> =
+            futures::stream::iter(0..reqs.len())
+                .map(|i| async move { (i, self.request(&reqs[i]).await) })
+                .buffer_unordered(MEDIA_REUPLOAD_CONCURRENCY)
+                .collect()
+                .await;
+        indexed.sort_by_key(|(i, _)| *i);
+        indexed.into_iter().map(|(_, res)| res).collect()
     }
 }
 
