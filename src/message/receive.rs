@@ -600,12 +600,20 @@ impl Client {
         let mut session_guard: Option<async_lock::MutexGuardArc<()>> =
             Some(session_mutex.lock_arc().await);
 
-        // Started after the lock so the histogram is crypto-only, not lock/queue wait.
+        // Started after the lock so the histogram excludes lock/queue wait.
         let _t = wacore::telemetry::timer(wacore::telemetry::DECRYPT_DURATION);
 
         let mut adapter = self.signal_adapter().await;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let mut outcome = SessionBatchOutcome::default();
+        // Decrypted plaintexts are handled only AFTER the per-sender ratchet lock
+        // is released below: the Signal decrypt is the sole session-ratchet
+        // mutation, while handle_decrypted_plaintext touches only
+        // sender-key/app-state stores and app dispatch. Buffering keeps handling
+        // ordered and lets a concurrent same-sender stanza start decrypting
+        // sooner (whatsmeow holds the per-sender lock only around libsignal
+        // decrypt). Elements: (enc_type, padded_plaintext, padding_version).
+        let mut deferred: Vec<(&'static str, Vec<u8>, u8)> = Vec::new();
         // Local identity-change detection fires once per batch: the first pkmsg
         // saves the new key (ReplacedExisting); the rest are NewOrUnchanged.
         let mut local_identity_reacted = false;
@@ -730,35 +738,10 @@ impl Client {
                         local_identity_reacted = true;
                         self.react_to_local_identity_change(sender_encryption_jid);
                     }
-                    let padded_plaintext = decrypted.plaintext;
-                    match self
-                        .clone()
-                        .handle_decrypted_plaintext(
-                            enc_type,
-                            &padded_plaintext,
-                            padding_version,
-                            info,
-                        )
-                        .await
-                    {
-                        Ok(plaintext_outcome) => {
-                            outcome.decrypted = true;
-                            outcome.dispatched |= plaintext_outcome.dispatched;
-                            outcome.skdm_only |= plaintext_outcome.skdm_only;
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "[msg:{}] Failed processing plaintext from {}: {e:?}",
-                                info.id,
-                                info.source.sender.observe()
-                            );
-                            outcome.decrypted = true;
-                            outcome.plaintext_failed = true;
-                            outcome.had_failure = true;
-                            outcome.undecryptable |=
-                                self.handle_plaintext_failure(info, decrypt_fail_mode).await;
-                        }
-                    }
+                    // Decrypt succeeded (the ratchet advanced); defer the
+                    // plaintext handling until the lock is dropped.
+                    outcome.decrypted = true;
+                    deferred.push((enc_type, decrypted.plaintext, padding_version));
                 }
                 Err(e) => {
                     // Handle DuplicatedMessage: This is expected when messages are redelivered during reconnection
@@ -865,34 +848,10 @@ impl Client {
                                     local_identity_reacted = true;
                                     self.react_to_local_identity_change(sender_encryption_jid);
                                 }
-                                let padded_plaintext = decrypted.plaintext;
-                                match self
-                                    .clone()
-                                    .handle_decrypted_plaintext(
-                                        enc_type,
-                                        &padded_plaintext,
-                                        padding_version,
-                                        info,
-                                    )
-                                    .await
-                                {
-                                    Ok(plaintext_outcome) => {
-                                        outcome.decrypted = true;
-                                        outcome.dispatched |= plaintext_outcome.dispatched;
-                                        outcome.skdm_only |= plaintext_outcome.skdm_only;
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "Failed processing plaintext after identity retry: {e:?}"
-                                        );
-                                        outcome.decrypted = true;
-                                        outcome.plaintext_failed = true;
-                                        outcome.had_failure = true;
-                                        outcome.undecryptable |= self
-                                            .handle_plaintext_failure(info, decrypt_fail_mode)
-                                            .await;
-                                    }
-                                }
+                                // Decrypt succeeded after the identity retry;
+                                // defer plaintext handling until the lock drops.
+                                outcome.decrypted = true;
+                                deferred.push((enc_type, decrypted.plaintext, padding_version));
                             }
                             Err(retry_err) => {
                                 // Handle DuplicatedMessage in retry path: This commonly happens during reconnection
@@ -913,7 +872,7 @@ impl Client {
                                 } else if matches!(retry_err, SignalProtocolError::InvalidPreKeyId)
                                 {
                                     // Session may exist under PN address after identity change
-                                    let migration_outcome = self
+                                    match self
                                         .try_pn_to_lid_migration_decrypt(
                                             sender_encryption_jid,
                                             &signal_address,
@@ -925,39 +884,32 @@ impl Client {
                                             info,
                                             &session_mutex,
                                             &mut session_guard,
+                                            &mut deferred,
                                         )
-                                        .await;
-                                    if migration_outcome.decrypted
-                                        || migration_outcome.duplicate
-                                        || migration_outcome.plaintext_failed
+                                        .await
                                     {
-                                        outcome.decrypted |= migration_outcome.decrypted;
-                                        outcome.duplicate |= migration_outcome.duplicate;
-                                        outcome.dispatched |= migration_outcome.dispatched;
-                                        outcome.skdm_only |= migration_outcome.skdm_only;
-                                        outcome.plaintext_failed |=
-                                            migration_outcome.plaintext_failed;
-                                        outcome.had_failure |= migration_outcome.plaintext_failed;
-                                        if migration_outcome.plaintext_failed {
+                                        MigrationDecryptResult::Decrypted => {
+                                            outcome.decrypted = true;
+                                        }
+                                        MigrationDecryptResult::Duplicate => {
+                                            outcome.duplicate = true;
+                                        }
+                                        MigrationDecryptResult::NotDecrypted => {
+                                            log::debug!(
+                                                "[msg:{}] InvalidPreKeyId after identity change for {}. \
+                                                 Sending retry receipt with fresh keys.",
+                                                info.id,
+                                                address
+                                            );
+                                            outcome.had_failure = true;
                                             outcome.undecryptable |= self
-                                                .handle_plaintext_failure(info, decrypt_fail_mode)
+                                                .handle_decrypt_failure(
+                                                    info,
+                                                    RetryReason::InvalidKeyId,
+                                                    decrypt_fail_mode,
+                                                )
                                                 .await;
                                         }
-                                    } else {
-                                        log::debug!(
-                                            "[msg:{}] InvalidPreKeyId after identity change for {}. \
-                                             Sending retry receipt with fresh keys.",
-                                            info.id,
-                                            address
-                                        );
-                                        outcome.had_failure = true;
-                                        outcome.undecryptable |= self
-                                            .handle_decrypt_failure(
-                                                info,
-                                                RetryReason::InvalidKeyId,
-                                                decrypt_fail_mode,
-                                            )
-                                            .await;
                                     }
                                 } else {
                                     log::error!(
@@ -1003,7 +955,7 @@ impl Client {
                     }
                     // Try PN→LID session migration before sending retry receipt
                     if let SignalProtocolError::SessionNotFound(_) = e {
-                        let migration_outcome = self
+                        match self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1015,23 +967,19 @@ impl Client {
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
+                                &mut deferred,
                             )
-                            .await;
-                        if migration_outcome.decrypted
-                            || migration_outcome.duplicate
-                            || migration_outcome.plaintext_failed
+                            .await
                         {
-                            outcome.decrypted |= migration_outcome.decrypted;
-                            outcome.duplicate |= migration_outcome.duplicate;
-                            outcome.dispatched |= migration_outcome.dispatched;
-                            outcome.skdm_only |= migration_outcome.skdm_only;
-                            outcome.plaintext_failed |= migration_outcome.plaintext_failed;
-                            outcome.had_failure |= migration_outcome.plaintext_failed;
-                            if migration_outcome.plaintext_failed {
-                                outcome.undecryptable |=
-                                    self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                            MigrationDecryptResult::Decrypted => {
+                                outcome.decrypted = true;
+                                continue;
                             }
-                            continue;
+                            MigrationDecryptResult::Duplicate => {
+                                outcome.duplicate = true;
+                                continue;
+                            }
+                            MigrationDecryptResult::NotDecrypted => {}
                         }
 
                         debug!(
@@ -1051,7 +999,7 @@ impl Client {
                     ) {
                         // whatsmeow migrates PN sessions before decrypt; a fresh
                         // LID record can otherwise shadow the sender's PN ratchet.
-                        let migration_outcome = self
+                        match self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1063,23 +1011,19 @@ impl Client {
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
+                                &mut deferred,
                             )
-                            .await;
-                        if migration_outcome.decrypted
-                            || migration_outcome.duplicate
-                            || migration_outcome.plaintext_failed
+                            .await
                         {
-                            outcome.decrypted |= migration_outcome.decrypted;
-                            outcome.duplicate |= migration_outcome.duplicate;
-                            outcome.dispatched |= migration_outcome.dispatched;
-                            outcome.skdm_only |= migration_outcome.skdm_only;
-                            outcome.plaintext_failed |= migration_outcome.plaintext_failed;
-                            outcome.had_failure |= migration_outcome.plaintext_failed;
-                            if migration_outcome.plaintext_failed {
-                                outcome.undecryptable |=
-                                    self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                            MigrationDecryptResult::Decrypted => {
+                                outcome.decrypted = true;
+                                continue;
                             }
-                            continue;
+                            MigrationDecryptResult::Duplicate => {
+                                outcome.duplicate = true;
+                                continue;
+                            }
+                            MigrationDecryptResult::NotDecrypted => {}
                         }
 
                         // WAWebMsgProcessingDecryptionHandler classifies both as
@@ -1108,7 +1052,7 @@ impl Client {
                         // session exists under a PN address (legacy migration).
                         // Migrating lets Signal use the existing ratchet state
                         // instead of looking up the consumed one-time prekey.
-                        let migration_outcome = self
+                        match self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1120,23 +1064,19 @@ impl Client {
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
+                                &mut deferred,
                             )
-                            .await;
-                        if migration_outcome.decrypted
-                            || migration_outcome.duplicate
-                            || migration_outcome.plaintext_failed
+                            .await
                         {
-                            outcome.decrypted |= migration_outcome.decrypted;
-                            outcome.duplicate |= migration_outcome.duplicate;
-                            outcome.dispatched |= migration_outcome.dispatched;
-                            outcome.skdm_only |= migration_outcome.skdm_only;
-                            outcome.plaintext_failed |= migration_outcome.plaintext_failed;
-                            outcome.had_failure |= migration_outcome.plaintext_failed;
-                            if migration_outcome.plaintext_failed {
-                                outcome.undecryptable |=
-                                    self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                            MigrationDecryptResult::Decrypted => {
+                                outcome.decrypted = true;
+                                continue;
                             }
-                            continue;
+                            MigrationDecryptResult::Duplicate => {
+                                outcome.duplicate = true;
+                                continue;
+                            }
+                            MigrationDecryptResult::NotDecrypted => {}
                         }
 
                         log::debug!(
@@ -1182,6 +1122,40 @@ impl Client {
                 }
             }
         }
+
+        // Ratchet work is done. Release the per-sender session lock BEFORE handling
+        // plaintext: handle_decrypted_plaintext touches only sender-key/app-state
+        // stores and app dispatch — never this session's ratchet — so a concurrent
+        // same-sender stanza can start decrypting while this one dispatches.
+        // Ordering holds: the buffer drains before we return (so SKDM still precedes
+        // PASS 2's group decrypt), and per-chat delivery order is owned by the serial
+        // chat-lane worker, not this guard.
+        drop(session_guard);
+
+        for (enc_type, plaintext, padding_version) in deferred {
+            match self
+                .clone()
+                .handle_decrypted_plaintext(enc_type, &plaintext, padding_version, info)
+                .await
+            {
+                Ok(plaintext_outcome) => {
+                    outcome.dispatched |= plaintext_outcome.dispatched;
+                    outcome.skdm_only |= plaintext_outcome.skdm_only;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[msg:{}] Failed processing plaintext from {}: {e:?}",
+                        info.id,
+                        info.source.sender.observe()
+                    );
+                    outcome.plaintext_failed = true;
+                    outcome.had_failure = true;
+                    outcome.undecryptable |=
+                        self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                }
+            }
+        }
+
         outcome
     }
 
@@ -1529,9 +1503,10 @@ impl Client {
         }
     }
 
-    /// Attempt PN→LID session migration and retry decryption.
-    /// Returns whether decryption succeeded after migration and whether it
-    /// reached user dispatch.
+    /// Attempt PN→LID session migration and retry decryption. On success the
+    /// plaintext is pushed onto `deferred` for post-lock handling by the caller
+    /// (see `process_session_enc_batch`), so this returns only the decrypt
+    /// disposition.
     ///
     /// Manages the per-address session lock around the migration loop:
     /// drops the caller's guard (migration re-enters that mutex and
@@ -1547,20 +1522,21 @@ impl Client {
         parsed_message: &wacore::libsignal::protocol::CiphertextMessage,
         adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
         rng: &mut rand::rngs::StdRng,
-        enc_type: &str,
+        enc_type: &'static str,
         padding_version: u8,
         info: &Arc<MessageInfo>,
         session_mutex: &Arc<async_lock::Mutex<()>>,
         session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
-    ) -> MigrationDecryptOutcome {
+        deferred: &mut Vec<(&'static str, Vec<u8>, u8)>,
+    ) -> MigrationDecryptResult {
         use wacore::libsignal::protocol::{UsePQRatchet, message_decrypt};
 
         if !sender_jid.is_lid() {
-            return MigrationDecryptOutcome::default();
+            return MigrationDecryptResult::NotDecrypted;
         }
 
         let Some(pn) = self.lid_pn_cache.get_phone_number(&sender_jid.user).await else {
-            return MigrationDecryptOutcome::default();
+            return MigrationDecryptResult::NotDecrypted;
         };
 
         // Release the address lock so the migration loop can acquire it for
@@ -1582,7 +1558,7 @@ impl Client {
                 info.id,
                 info.source.sender.observe()
             );
-            return MigrationDecryptOutcome::default();
+            return MigrationDecryptResult::NotDecrypted;
         }
 
         match message_decrypt(
@@ -1612,47 +1588,24 @@ impl Client {
                         .buffer_consumed_prekey(prekey_id, signal_address)
                         .await;
                 }
-                let padded_plaintext = decrypted.plaintext;
-                match self
-                    .clone()
-                    .handle_decrypted_plaintext(enc_type, &padded_plaintext, padding_version, info)
-                    .await
-                {
-                    Ok(plaintext_outcome) => MigrationDecryptOutcome {
-                        decrypted: true,
-                        dispatched: plaintext_outcome.dispatched,
-                        skdm_only: plaintext_outcome.skdm_only,
-                        ..Default::default()
-                    },
-                    Err(e) => {
-                        log::warn!(
-                            "[msg:{}] Failed processing plaintext after migration: {e:?}",
-                            info.id
-                        );
-                        MigrationDecryptOutcome {
-                            decrypted: true,
-                            plaintext_failed: true,
-                            ..Default::default()
-                        }
-                    }
-                }
+                // Buffer for post-lock handling, keeping the same ordering as the
+                // batch's main path.
+                deferred.push((enc_type, decrypted.plaintext, padding_version));
+                MigrationDecryptResult::Decrypted
             }
             Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
                 log::debug!(
                     "[msg:{}] Already processed (chain {chain}, counter {counter}) after migration",
                     info.id
                 );
-                MigrationDecryptOutcome {
-                    duplicate: true,
-                    ..Default::default()
-                }
+                MigrationDecryptResult::Duplicate
             }
             Err(retry_err) => {
                 log::warn!(
                     "[msg:{}] Decryption still failed after PN→LID migration: {retry_err:?}",
                     info.id
                 );
-                MigrationDecryptOutcome::default()
+                MigrationDecryptResult::NotDecrypted
             }
         }
     }

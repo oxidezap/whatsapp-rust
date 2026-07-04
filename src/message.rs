@@ -80,13 +80,17 @@ pub(crate) struct SessionBatchOutcome {
     had_failure: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct MigrationDecryptOutcome {
-    decrypted: bool,
-    duplicate: bool,
-    dispatched: bool,
-    skdm_only: bool,
-    plaintext_failed: bool,
+/// Outcome of a PN→LID migration retry decrypt. On `Decrypted` the plaintext
+/// has already been pushed onto the caller's deferred-handling buffer (it runs
+/// after the session lock is released), so no dispatch flags travel back here.
+#[derive(Clone, Copy, Debug)]
+enum MigrationDecryptResult {
+    /// Decrypted; plaintext buffered for post-lock handling.
+    Decrypted,
+    /// Server redelivered an already-processed message.
+    Duplicate,
+    /// Migration didn't apply or still failed; caller sends a retry receipt.
+    NotDecrypted,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
