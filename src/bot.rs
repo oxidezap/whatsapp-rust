@@ -9,6 +9,7 @@ use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
 use crate::types::events::{Event, EventHandler, EventInterest, EventKind};
 use crate::types::message::MessageInfo;
+use futures::FutureExt;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::future::Future;
@@ -343,7 +344,20 @@ impl CallbackBusAdapter {
                             let kind = event.kind();
                             for handler in drain_handlers.iter() {
                                 if handler.interest.wants(kind) {
-                                    (handler.callback)(Arc::clone(&event), client.clone()).await;
+                                    // Isolate panics: the lone drainer must
+                                    // survive a faulty callback, else every later
+                                    // ordered event would stall behind it.
+                                    let fut =
+                                        (handler.callback)(Arc::clone(&event), client.clone());
+                                    if std::panic::AssertUnwindSafe(fut)
+                                        .catch_unwind()
+                                        .await
+                                        .is_err()
+                                    {
+                                        warn!(
+                                            "ordered event delivery callback panicked; continuing"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -384,14 +398,20 @@ impl EventHandler for CallbackBusAdapter {
                 }
             }
             // Non-blocking on purpose: dropping on a full mailbox keeps a slow
-            // consumer from ever backpressuring the receive pipeline.
-            Delivery::Ordered { tx } => {
-                if tx.try_send(event).is_err()
-                    && let Some(client) = self.client.upgrade()
-                {
-                    client.stats.record_event_dropped();
+            // consumer from ever backpressuring the receive pipeline. Only a
+            // full mailbox is a capacity drop; a closed channel means the drainer
+            // is gone (teardown/panic) and must not be masked as one.
+            Delivery::Ordered { tx } => match tx.try_send(event) {
+                Ok(()) => {}
+                Err(async_channel::TrySendError::Full(_)) => {
+                    if let Some(client) = self.client.upgrade() {
+                        client.stats.record_event_dropped();
+                    }
                 }
-            }
+                Err(async_channel::TrySendError::Closed(_)) => {
+                    log::debug!("ordered event delivery channel closed; dropping event");
+                }
+            },
         }
     }
 
@@ -1512,6 +1532,50 @@ mod tests {
         );
 
         let _ = release_tx.send(()).await; // unpark so the drainer can exit cleanly
+    }
+
+    /// A panicking callback must not kill the single ordered drainer — later
+    /// events still get delivered.
+    #[tokio::test]
+    async fn ordered_delivery_survives_a_panicking_callback() {
+        let client = test_client().await;
+        let (tx, rx) = async_channel::unbounded::<String>();
+        let handler = RegisteredHandler {
+            callback: Arc::new(move |event, _client| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    if let Event::PairingCode { code, .. } = &*event {
+                        assert_ne!(code, "boom", "deliberate test panic");
+                        let _ = tx.send(code.clone()).await;
+                    }
+                })
+            }),
+            interest: EventInterest::ALL,
+        };
+        let adapter = CallbackBusAdapter::new(
+            client.clone(),
+            vec![handler],
+            EventDelivery::Ordered { capacity: 16 },
+        );
+
+        adapter.handle_event(pairing_code_event("a"));
+        adapter.handle_event(pairing_code_event("boom")); // callback panics, isolated
+        adapter.handle_event(pairing_code_event("b"));
+
+        let mut seen = Vec::with_capacity(2);
+        for _ in 0..2 {
+            seen.push(
+                tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("timed out waiting for post-panic delivery")
+                    .expect("callback ran"),
+            );
+        }
+        assert_eq!(
+            seen,
+            vec!["a".to_string(), "b".to_string()],
+            "delivery must continue after a callback panic"
+        );
     }
 
     /// Regression: a `with_task_instrument` after `with_alloc_meter` must drop
