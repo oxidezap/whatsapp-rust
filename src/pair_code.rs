@@ -353,14 +353,16 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
                     );
                     return false;
                 }
-                *primary_hello_attempt_count += 1;
-                if *primary_hello_attempt_count > PairCodeUtils::max_primary_hello_attempts() {
+                // Check the cap before bumping so a rejected attempt never
+                // pushes the counter past the limit (keeps it bounded at max).
+                if *primary_hello_attempt_count >= PairCodeUtils::max_primary_hello_attempts() {
                     warn!(
                         target: "Client/PairCode",
                         "Exceeded max primary_hello attempts for this code; abandoning"
                     );
                     return false;
                 }
+                *primary_hello_attempt_count += 1;
                 (
                     pairing_ref.clone(),
                     phone_jid.clone(),
@@ -745,6 +747,11 @@ mod tests {
             adv(&client),
             adv_before,
             "no stage-2 crypto once the per-code attempt cap is exhausted"
+        );
+        assert_eq!(
+            attempt_count(&client).await,
+            Some(PairCodeUtils::max_primary_hello_attempts()),
+            "a rejected over-cap attempt must not push the counter past the max"
         );
     }
 
