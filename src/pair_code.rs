@@ -152,6 +152,11 @@ impl Client {
             phone_number
         );
 
+        // Stamp the validity clock before companion_hello, matching WA Web
+        // (`startAltLinkingFlow` sets codeGenerationTs before sending), so the
+        // ~180s window covers the stage-1 round-trip rather than starting after it.
+        let code_generation_ts = wacore::time::now_secs();
+
         // Generate ephemeral keypair for this pairing session
         let ephemeral_keypair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
 
@@ -226,7 +231,7 @@ impl Client {
             phone_jid: phone_number,
             pair_code: code.clone(),
             ephemeral_keypair: Box::new(ephemeral_keypair),
-            code_generation_ts: wacore::time::now_secs(),
+            code_generation_ts,
             primary_hello_attempt_count: 0,
         };
 
@@ -321,62 +326,67 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
         }
     };
 
-    // Kept (not taken) so the primary can retry: WA Web retains the cached hello.
-    let (pairing_ref, phone_jid, pair_code, ephemeral_keypair) = {
-        let mut state_guard = client.pair_code_state.lock().await;
-        match &mut *state_guard {
-            PairCodeState::WaitingForPhoneConfirmation {
-                pairing_ref,
-                phone_jid,
-                pair_code,
-                ephemeral_keypair,
-                code_generation_ts,
-                primary_hello_attempt_count,
-            } => {
-                // Validate before counting: only a genuine, in-window attempt
-                // (matching ref, unexpired code) may spend a retry slot, so a
-                // stale/foreign or late notification — neither of which triggers
-                // a companion_finish — can't exhaust the budget. WA Web bumps
-                // first and shares that window; we tighten it.
-                if pairing_ref.as_slice() != notif_ref.as_slice() {
-                    warn!(
-                        target: "Client/PairCode",
-                        "primary_hello ref does not match the outstanding request; ignoring"
-                    );
-                    return false;
-                }
-                let age = wacore::time::now_secs() - *code_generation_ts;
-                if age > PairCodeUtils::code_validity().as_secs() as i64 {
-                    warn!(
-                        target: "Client/PairCode",
-                        "primary_hello arrived for an expired code ({age}s old); ignoring"
-                    );
-                    return false;
-                }
-                // Check the cap before bumping so a rejected attempt never
-                // pushes the counter past the limit (keeps it bounded at max).
-                if *primary_hello_attempt_count >= PairCodeUtils::max_primary_hello_attempts() {
-                    warn!(
-                        target: "Client/PairCode",
-                        "Exceeded max primary_hello attempts for this code; abandoning"
-                    );
-                    return false;
-                }
-                *primary_hello_attempt_count += 1;
-                (
-                    pairing_ref.clone(),
-                    phone_jid.clone(),
-                    pair_code.clone(),
-                    (**ephemeral_keypair).clone(),
-                )
-            }
-            _ => {
+    // Serialize the whole of stage 2 under the pair_code_state lock. The
+    // transport dispatches <notification> stanzas on concurrent detached tasks
+    // (see client/node_io.rs), so holding the guard across derive → persist →
+    // send makes two primary_hello for the same code sequential, matching WA
+    // Web's single-threaded model. Without it, both could derive a *different*
+    // random adv_secret and race SetAdvSecretKey (last-write-wins), leaving the
+    // persisted secret out of sync with the companion_finish the server acts on
+    // → pair-success HMAC failure. The state is kept (not taken) so a genuine
+    // retry can reuse it.
+    let mut state_guard = client.pair_code_state.lock().await;
+    let (pairing_ref, phone_jid, pair_code, ephemeral_keypair) = match &mut *state_guard {
+        PairCodeState::WaitingForPhoneConfirmation {
+            pairing_ref,
+            phone_jid,
+            pair_code,
+            ephemeral_keypair,
+            code_generation_ts,
+            primary_hello_attempt_count,
+        } => {
+            // Validate before counting: only a genuine, in-window attempt
+            // (matching ref, unexpired code) may spend a retry slot, so a
+            // stale/foreign or late notification — neither of which triggers
+            // a companion_finish — can't exhaust the budget.
+            if pairing_ref.as_slice() != notif_ref.as_slice() {
                 warn!(
                     target: "Client/PairCode",
-                    "Received primary_hello but not in waiting state"
+                    "primary_hello ref does not match the outstanding request; ignoring"
                 );
                 return false;
             }
+            let age = wacore::time::now_secs() - *code_generation_ts;
+            if age > PairCodeUtils::code_validity().as_secs() as i64 {
+                warn!(
+                    target: "Client/PairCode",
+                    "primary_hello arrived for an expired code ({age}s old); ignoring"
+                );
+                return false;
+            }
+            // Check the cap before bumping so a rejected attempt never pushes the
+            // counter past the limit (keeps it bounded at max).
+            if *primary_hello_attempt_count >= PairCodeUtils::max_primary_hello_attempts() {
+                warn!(
+                    target: "Client/PairCode",
+                    "Exceeded max primary_hello attempts for this code; abandoning"
+                );
+                return false;
+            }
+            *primary_hello_attempt_count += 1;
+            (
+                pairing_ref.clone(),
+                phone_jid.clone(),
+                pair_code.clone(),
+                (**ephemeral_keypair).clone(),
+            )
+        }
+        _ => {
+            warn!(
+                target: "Client/PairCode",
+                "Received primary_hello but not in waiting state"
+            );
+            return false;
         }
     };
 
@@ -456,7 +466,9 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
     );
 
     // State stays WaitingForPhoneConfirmation so a retry can reuse it; only
-    // pair-success (see `crate::pair`) transitions to Completed.
+    // pair-success (see `crate::pair`) transitions to Completed. `state_guard`
+    // (held since the top for serialization) is released here.
+    drop(state_guard);
     true
 }
 
@@ -798,6 +810,33 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&**e, Event::PairingCodeRefresh { force_manual: true })),
             "expected PairingCodeRefresh{{force_manual:true}}, got: {events:?}"
+        );
+    }
+
+    /// An absent `force_manual_refresh` attribute maps to `force_manual: false`
+    /// (WA Web's non-force `refreshAltLinkingCode` branch). Locks down the
+    /// `== "true"` parse against a flip to `!= "false"`.
+    #[tokio::test]
+    async fn refresh_code_without_force_manual_defaults_false() {
+        let client = create_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.register_handler(collector.clone());
+
+        let pairing_ref = vec![5, 6, 7, 8];
+        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+
+        let notif = refresh_code_notif(&pairing_ref, None);
+        let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
+
+        assert!(handled, "a matching refresh_code should be handled");
+        assert!(
+            collector.events().iter().any(|e| matches!(
+                &**e,
+                Event::PairingCodeRefresh {
+                    force_manual: false
+                }
+            )),
+            "absent force_manual_refresh must dispatch force_manual: false"
         );
     }
 
