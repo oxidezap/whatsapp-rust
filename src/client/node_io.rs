@@ -950,6 +950,11 @@ impl Client {
                     }
                 }));
 
+                // Register the listener before the flag check: the notifier is not
+                // sticky, so a key-share landing between the load and listen() would
+                // otherwise lose the wake and burn the full deadline. Mirrors
+                // request_keys_and_wait.
+                let key_share_listener = client_clone.initial_keys_synced_notifier.listen();
                 if !client_clone
                     .initial_app_state_keys_received
                     .load(Ordering::Relaxed)
@@ -964,7 +969,7 @@ impl Client {
                     let _ = rt_timeout(
                         &*client_clone.runtime,
                         Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS),
-                        client_clone.initial_keys_synced_notifier.listen(),
+                        key_share_listener,
                     )
                     .await;
 
