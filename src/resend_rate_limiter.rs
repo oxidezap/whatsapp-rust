@@ -255,6 +255,40 @@ mod tests {
         assert!(off.try_acquire(&g, &a).await);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quarantine_concurrent_acquires_for_one_pair_do_not_exceed_burst() {
+        // Mirrors the ResendRateLimiter contention test: hundreds of members
+        // hammering one group is the exact storm this guards, so burst
+        // enforcement must hold under concurrent receipts for the SAME pair.
+        let q = Arc::new(RetryMarkQuarantine::new(100, 5, 0));
+        let g: Jid = "123-456@g.us".parse().unwrap();
+        let r: Jid = "999@lid".parse().unwrap();
+        let allowed = Arc::new(AtomicU64::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..40 {
+            let q = q.clone();
+            let g = g.clone();
+            let r = r.clone();
+            let allowed = allowed.clone();
+            handles.push(tokio::spawn(async move {
+                if q.try_acquire(&g, &r).await {
+                    allowed.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(
+            allowed.load(Ordering::Relaxed),
+            5,
+            "exactly burst repairs pass under contention, no bypass"
+        );
+        assert_eq!(q.throttled_total(), 35);
+    }
+
     fn chat(s: &str) -> Jid {
         s.parse().unwrap()
     }
