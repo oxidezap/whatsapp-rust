@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// Concurrency cap for pre-downloading app-state external blobs. Each blob is an
+/// independent CDN GET (a collection snapshot or a patch's external mutations),
+/// keyed by directPath, so they carry no ordering dependency (LTHash ordering is
+/// in patch *application*, not blob *fetching*). WA Web downloads them in
+/// parallel — `Syncd/CollectionHandler` fans the per-patch external-mutation
+/// fetches out under `Promise.all`. Bounded (not unbounded `join_all`) because a
+/// snapshot can be multi-MB and a batched response carries several collections;
+/// the cap keeps peak memory in check while still turning `sum(RTT)` into
+/// `~max(RTT)`.
+const APPSTATE_BLOB_DOWNLOAD_CONCURRENCY: usize = 4;
+
 impl Client {
     pub(crate) async fn get_app_state_processor(&self) -> Arc<AppStateProcessor> {
         let mut guard = self.app_state_processor.lock().await;
@@ -15,6 +26,97 @@ impl Client {
         ));
         *guard = Some(proc.clone());
         proc
+    }
+
+    /// Pre-download every external blob (collection snapshots + patch external
+    /// mutations) referenced by `patch_lists`, keyed by directPath. The blobs are
+    /// independent, so the CDN GETs run concurrently (bounded by
+    /// [`APPSTATE_BLOB_DOWNLOAD_CONCURRENCY`]) instead of one RTT at a time. A
+    /// failed download is logged and omitted from the map; the later inline step
+    /// (`missing_key_ids_after_inline` / `process_patch_lists`) surfaces the
+    /// missing blob exactly as the previous serial version did. Mirrors WA Web's
+    /// parallel syncd blob fetch (`Syncd/CollectionHandler` `Promise.all`).
+    async fn pre_download_external_blobs(
+        &self,
+        patch_lists: &[wacore::appstate::patch_decode::PatchList],
+    ) -> std::collections::HashMap<String, Vec<u8>> {
+        use futures::StreamExt;
+
+        // Blob context, kept only so a failed download logs the same message the
+        // serial version did (snapshot name vs. patch version).
+        enum BlobKind {
+            Snapshot(WAPatchName),
+            Mutation(u64),
+        }
+
+        // Collect every (blob, context) to fetch. The blob reference is cloned
+        // (it's small: a directPath + key/hash bytes) so each concurrent task owns
+        // its input and captures only `&self` — mirrors the owned-data fan-out in
+        // `groups::fill_participant_pns` and keeps the future `Send`. Only blobs
+        // with a directPath are enqueued; the directPath is recovered from the
+        // moved `ext` after the fetch (no separate clone for the map key).
+        let mut jobs: Vec<(wa::ExternalBlobReference, BlobKind)> = Vec::new();
+        for pl in patch_lists {
+            if let Some(ext) = &pl.snapshot_ref
+                && ext.direct_path.is_some()
+            {
+                jobs.push((ext.clone(), BlobKind::Snapshot(pl.name)));
+            }
+            for patch in &pl.patches {
+                if let Some(ext) = patch.external_mutations.as_option()
+                    && ext.direct_path.is_some()
+                {
+                    let v = patch
+                        .version
+                        .as_option()
+                        .and_then(|v| v.version)
+                        .unwrap_or(0);
+                    jobs.push((ext.clone(), BlobKind::Mutation(v)));
+                }
+            }
+        }
+
+        if jobs.is_empty() {
+            return std::collections::HashMap::new();
+        }
+
+        let mut pre_downloaded = std::collections::HashMap::with_capacity(jobs.len());
+        let results = futures::stream::iter(jobs.into_iter().map(|(ext, kind)| async move {
+            let bytes = self.download(&ext).await;
+            // directPath presence was checked when the job was built.
+            (ext.direct_path, kind, bytes)
+        }))
+        .buffer_unordered(APPSTATE_BLOB_DOWNLOAD_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        for (path, kind, res) in results {
+            match res {
+                Ok(bytes) => {
+                    if let BlobKind::Mutation(v) = kind {
+                        debug!(target: "Client/AppState", "Downloaded external mutations for patch v{} ({} bytes)", v, bytes.len());
+                    } else {
+                        debug!(target: "Client/AppState", "Downloaded external snapshot ({} bytes)", bytes.len());
+                    }
+                    if let Some(path) = path {
+                        pre_downloaded.insert(path, bytes);
+                    }
+                }
+                Err(e) => match kind {
+                    BlobKind::Snapshot(name) => {
+                        warn!("Failed to download external snapshot for {:?}: {e}", name)
+                    }
+                    BlobKind::Mutation(v) => {
+                        warn!(
+                            "Failed to download external mutations for patch v{}: {e}",
+                            v
+                        )
+                    }
+                },
+            }
+        }
+
+        pre_downloaded
     }
 
     /// Public entry point for processing [`MajorSyncTask`] from the sync channel.
@@ -218,60 +320,15 @@ impl Client {
 
             let resp = self.send_iq(iq).await?;
 
-            // Pre-download all external blobs for all collections in the response
-            let mut pre_downloaded: std::collections::HashMap<String, Vec<u8>> =
-                std::collections::HashMap::new();
-
             // Parse the response once here for pre-download; the same parsed
             // lists are handed to the processor below (no second parse).
             let mut patch_lists =
                 wacore::appstate::patch_decode::parse_patch_lists_ref(resp.get())?;
 
             let proc = self.get_app_state_processor().await;
-            {
-                for pl in &patch_lists {
-                    // Download external snapshot
-                    if let Some(ext) = &pl.snapshot_ref
-                        && let Some(path) = &ext.direct_path
-                    {
-                        match self.download(ext).await {
-                            Ok(bytes) => {
-                                pre_downloaded.insert(path.clone(), bytes);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to download external snapshot for {:?}: {e}",
-                                    pl.name
-                                );
-                            }
-                        }
-                    }
-
-                    // Download external mutations
-                    for patch in &pl.patches {
-                        if let Some(ext) = patch.external_mutations.as_option()
-                            && let Some(path) = &ext.direct_path
-                        {
-                            match self.download(ext).await {
-                                Ok(bytes) => {
-                                    pre_downloaded.insert(path.clone(), bytes);
-                                }
-                                Err(e) => {
-                                    let v = patch
-                                        .version
-                                        .as_option()
-                                        .and_then(|v| v.version)
-                                        .unwrap_or(0);
-                                    warn!(
-                                        "Failed to download external mutations for patch v{}: {e}",
-                                        v
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Pre-download all external blobs for all collections in the response,
+            // concurrently (independent CDN GETs, keyed by directPath).
+            let pre_downloaded = self.pre_download_external_blobs(&patch_lists).await;
 
             let download = |ext: &wa::ExternalBlobReference| -> anyhow::Result<Vec<u8>> {
                 if let Some(path) = &ext.direct_path {
@@ -477,51 +534,11 @@ impl Client {
 
             let proc = self.get_app_state_processor().await;
 
-            // Pre-download all external blobs (snapshot and patch mutations); keyed by
-            // directPath.
-            let mut pre_downloaded: std::collections::HashMap<String, Vec<u8>> =
-                std::collections::HashMap::new();
-            {
-                // Download external snapshot if present
-                if let Some(ext) = &pl.snapshot_ref
-                    && let Some(path) = &ext.direct_path
-                {
-                    match self.download(ext).await {
-                        Ok(bytes) => {
-                            debug!(target: "Client/AppState", "Downloaded external snapshot ({} bytes)", bytes.len());
-                            pre_downloaded.insert(path.clone(), bytes);
-                        }
-                        Err(e) => {
-                            warn!("Failed to download external snapshot: {e}");
-                        }
-                    }
-                }
-
-                // Download external mutations for each patch that has them
-                for patch in &pl.patches {
-                    if let Some(ext) = patch.external_mutations.as_option()
-                        && let Some(path) = &ext.direct_path
-                    {
-                        let patch_version = patch
-                            .version
-                            .as_option()
-                            .and_then(|v| v.version)
-                            .unwrap_or(0);
-                        match self.download(ext).await {
-                            Ok(bytes) => {
-                                debug!(target: "Client/AppState", "Downloaded external mutations for patch v{} ({} bytes)", patch_version, bytes.len());
-                                pre_downloaded.insert(path.clone(), bytes);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to download external mutations for patch v{}: {e}",
-                                    patch_version
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            // Pre-download all external blobs (snapshot and patch mutations),
+            // concurrently, keyed by directPath.
+            let pre_downloaded = self
+                .pre_download_external_blobs(std::slice::from_ref(&pl))
+                .await;
 
             let download = |ext: &wa::ExternalBlobReference| -> anyhow::Result<Vec<u8>> {
                 if let Some(path) = &ext.direct_path {
