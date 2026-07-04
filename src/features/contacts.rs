@@ -175,9 +175,11 @@ impl<'a> Contacts<'a> {
                     .await
             }
         };
-        let (pn_results, lid_results) = futures::join!(pn_fut, lid_fut);
-        let mut results = pn_results?;
-        results.extend(lid_results?);
+        // try_join! fails fast: an error from either query returns immediately and
+        // drops the other in-flight future (the sequential version failed on the
+        // first error too, so join! would have been a latency regression there).
+        let (mut results, lid_results) = futures::try_join!(pn_fut, lid_fut)?;
+        results.extend(lid_results);
 
         self.persist_lid_mappings(results.iter().map(forward_lid_pair))
             .await;
