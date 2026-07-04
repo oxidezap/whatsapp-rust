@@ -9,6 +9,11 @@ use wacore::types::events::{DeviceListUpdate, DeviceNotificationInfo};
 use wacore_binary::NodeRef;
 use wacore_binary::{Jid, JidExt};
 
+// `#[inline(never)]`: single call site in `handle_notification_impl`. Without
+// it the compiler folds this handler into that dispatcher, growing it into an
+// 80+ KiB mega-state-machine. Out-of-lining each handler shrinks the merged
+// suspend/resume/drop dispatch and improves compile time; behaviour unchanged.
+#[inline(never)]
 pub(crate) async fn handle_encrypt_notification(
     client: &Arc<Client>,
     nr: &wacore_binary::NodeRef<'_>,
@@ -30,6 +35,7 @@ pub(crate) async fn handle_encrypt_notification(
     }
 }
 
+#[inline(never)] // single call site; keep out-of-line (see handle_encrypt_notification)
 pub(crate) async fn handle_account_sync_notification(
     client: &Arc<Client>,
     nr: &wacore_binary::NodeRef<'_>,
@@ -421,6 +427,7 @@ pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: J
     feature = "tracing",
     tracing::instrument(name = "wa.notif.devices", level = "debug", skip_all)
 )]
+#[inline(never)] // single call site; keep out-of-line (see handle_encrypt_notification)
 pub(crate) async fn handle_devices_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
     let notification = match DeviceNotification::try_parse(node) {
         Ok(n) => n,

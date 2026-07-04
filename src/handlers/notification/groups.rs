@@ -115,6 +115,7 @@ pub(crate) fn handle_server_sync_notification(
     feature = "tracing",
     tracing::instrument(name = "wa.notif.group", level = "debug", skip_all)
 )]
+#[inline(never)] // single call site; keep out-of-line (see device::handle_encrypt_notification)
 pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
     let notification = match GroupNotification::try_from_node_ref(node.get()) {
         Some(n) => n,

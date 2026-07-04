@@ -149,6 +149,11 @@ fn main() -> std::io::Result<()> {
         .preserve_unknown_fields(false)
         // Generate view types for zero-copy decoding.
         .generate_views(true)
+        // No `with_*` setters: the client builds messages with struct-literal
+        // syntax (`..Default::default()`), never the generated setters. Skipping
+        // them drops ~2k dead `#[inline]` methods worth of MIR/llvm-lines/compile
+        // time (they're already DCE'd from `.text`, so this is a build-time win).
+        .generate_with_setters(false)
         .out_dir(&out_path)
         .compile()
         .map_err(|e| std::io::Error::other(e.to_string()))?;

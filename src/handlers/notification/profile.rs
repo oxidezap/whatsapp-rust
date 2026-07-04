@@ -209,6 +209,7 @@ pub(crate) async fn learn_contact_modify_mappings(
 ///   changed phone number. Creates LID-PN mappings when LID attrs present.
 /// - `<sync after="..."/>` — server requests full contact re-sync.
 /// - `<add .../>` or `<remove .../>` — lightweight roster changes (ACK only).
+#[inline(never)] // single call site; keep out-of-line (see device::handle_encrypt_notification)
 pub(crate) async fn handle_contacts_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
     let timestamp = notification_timestamp(node);
 
