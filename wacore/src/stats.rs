@@ -39,6 +39,10 @@ pub struct SessionStats {
     frames_received: AtomicU64,
     messages_sent: AtomicU64,
     messages_received: AtomicU64,
+    /// Inbound events dropped because a consumer's bounded delivery mailbox was
+    /// full (opt-in `EventDelivery::Ordered`). Non-zero means a slow consumer is
+    /// shedding events; the durability hook is the at-least-once escape hatch.
+    events_dropped: AtomicU64,
     reconnects: AtomicU64,
     /// Timestamp (ms since UNIX epoch) of the last sent WebSocket frame.
     /// WA Web: `callStanza` → `deadSocketTimer.onOrBefore(deadSocketTime)`.
@@ -64,6 +68,9 @@ pub struct StatsSnapshot {
     pub messages_sent: u64,
     /// Incoming messages successfully decrypted and dispatched.
     pub messages_received: u64,
+    /// Inbound events shed because a consumer's bounded delivery mailbox was
+    /// full. A non-zero, growing value flags a consumer that can't keep up.
+    pub events_dropped: u64,
     /// Reconnect attempts started by the auto-reconnect loop.
     pub reconnects: u64,
     /// Consecutive reconnect failures (resets on success).
@@ -137,6 +144,17 @@ impl SessionStats {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One inbound event shed by a full bounded-delivery mailbox.
+    #[inline]
+    pub fn record_event_dropped(&self) {
+        self.events_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn events_dropped(&self) -> u64 {
+        self.events_dropped.load(Ordering::Relaxed)
+    }
+
     /// Zero the activity timestamps on connection teardown so the dead-socket
     /// watchdog never reads a previous connection's values. Traffic counters
     /// are cumulative and survive.
@@ -166,6 +184,7 @@ impl SessionStats {
             frames_received: self.frames_received.load(Ordering::Relaxed),
             messages_sent: self.messages_sent.load(Ordering::Relaxed),
             messages_received: self.messages_received.load(Ordering::Relaxed),
+            events_dropped: self.events_dropped.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
             reconnect_errors: 0,
             resends_throttled: 0,

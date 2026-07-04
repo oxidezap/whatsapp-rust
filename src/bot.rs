@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use thiserror::Error;
 use wacore::proto_helpers::MessageBuilderExt;
 use wacore::runtime::Runtime;
@@ -275,33 +275,127 @@ fn combined_interest(handlers: &[RegisteredHandler]) -> EventInterest {
         .fold(EventInterest::none(), |acc, h| acc.union(h.interest))
 }
 
-/// Bridges the registered closures onto the core event bus. Each interested
-/// callback runs on its own spawned task, so a slow handler stalls neither the
-/// bus nor its sibling handlers; in exchange, ordering across events is not
-/// guaranteed.
+/// How a bot's registered callbacks receive events off the core event bus.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub enum EventDelivery {
+    /// Each event is delivered to each interested callback on its own spawned
+    /// task (default). A slow callback stalls neither the bus nor its siblings,
+    /// but ordering across events is not guaranteed and a persistently slow
+    /// consumer can accumulate unbounded in-flight tasks.
+    #[default]
+    Concurrent,
+    /// Events are delivered to the callbacks strictly in arrival order through a
+    /// single bounded mailbox drained by one task — the ordered `messages.upsert`
+    /// contract of WA Web (`preserveOrder`), whatsmeow and Baileys. Bounds
+    /// memory: when the mailbox is full the event is dropped and counted in
+    /// [`StatsSnapshot::events_dropped`](wacore::stats::StatsSnapshot::events_dropped)
+    /// instead of blocking the receive pipeline or growing without limit.
+    /// Register an inbound durability hook when no drop is acceptable
+    /// (at-least-once via redelivery).
+    Ordered {
+        /// Mailbox capacity — events buffered before drops begin. Clamped to ≥1.
+        capacity: usize,
+    },
+}
+
+/// Bridges the registered closures onto the core event bus per the chosen
+/// [`EventDelivery`] strategy.
+enum Delivery {
+    /// Fan each event out to every interested callback on its own spawned task.
+    Concurrent { handlers: Arc<[RegisteredHandler]> },
+    /// Hand each event to a single ordered drainer via a bounded mailbox.
+    Ordered {
+        tx: async_channel::Sender<Arc<Event>>,
+    },
+}
+
 struct CallbackBusAdapter {
-    client: Arc<Client>,
-    handlers: Vec<RegisteredHandler>,
+    // Weak so the bus → adapter → client reference cycle doesn't pin the client
+    // for its whole lifetime (the bus lives inside `client.core`). Upgraded per
+    // dispatch — the client is always live while events flow — and a dropped
+    // client lets the ordered drainer's upgrade fail so it exits cleanly.
+    client: Weak<Client>,
+    delivery: Delivery,
     interest: EventInterest,
+}
+
+impl CallbackBusAdapter {
+    fn new(client: Arc<Client>, handlers: Vec<RegisteredHandler>, delivery: EventDelivery) -> Self {
+        let interest = combined_interest(&handlers);
+        let delivery = match delivery {
+            EventDelivery::Concurrent => Delivery::Concurrent {
+                handlers: handlers.into(),
+            },
+            EventDelivery::Ordered { capacity } => {
+                let (tx, rx) = async_channel::bounded::<Arc<Event>>(capacity.max(1));
+                let handlers: Arc<[RegisteredHandler]> = handlers.into();
+                // One drainer preserves arrival order across events; within an
+                // event the interested callbacks run in registration order. Holds
+                // a Weak so a dropped client makes the per-event upgrade fail and
+                // the task exits (the sender also drops with the adapter, closing
+                // the channel).
+                let drain_client = Arc::downgrade(&client);
+                let drain_handlers = Arc::clone(&handlers);
+                client
+                    .runtime
+                    .spawn(Box::pin(async move {
+                        while let Ok(event) = rx.recv().await {
+                            let Some(client) = drain_client.upgrade() else {
+                                break;
+                            };
+                            let kind = event.kind();
+                            for handler in drain_handlers.iter() {
+                                if handler.interest.wants(kind) {
+                                    (handler.callback)(Arc::clone(&event), client.clone()).await;
+                                }
+                            }
+                        }
+                    }))
+                    .detach();
+                Delivery::Ordered { tx }
+            }
+        };
+        Self {
+            client: Arc::downgrade(&client),
+            delivery,
+            interest,
+        }
+    }
 }
 
 impl EventHandler for CallbackBusAdapter {
     fn handle_event(&self, event: Arc<Event>) {
-        let kind = event.kind();
-        for handler in &self.handlers {
-            if !handler.interest.wants(kind) {
-                continue;
+        match &self.delivery {
+            Delivery::Concurrent { handlers } => {
+                let Some(client) = self.client.upgrade() else {
+                    return;
+                };
+                let kind = event.kind();
+                for handler in handlers.iter() {
+                    if !handler.interest.wants(kind) {
+                        continue;
+                    }
+                    let callback = handler.callback.clone();
+                    let cb_client = client.clone();
+                    let event = Arc::clone(&event);
+                    client
+                        .runtime
+                        .spawn(Box::pin(async move {
+                            callback(event, cb_client).await;
+                        }))
+                        .detach();
+                }
             }
-            let callback = handler.callback.clone();
-            let client = self.client.clone();
-            let event = Arc::clone(&event);
-
-            self.client
-                .runtime
-                .spawn(Box::pin(async move {
-                    callback(event, client).await;
-                }))
-                .detach();
+            // Non-blocking on purpose: dropping on a full mailbox keeps a slow
+            // consumer from ever backpressuring the receive pipeline.
+            Delivery::Ordered { tx } => {
+                if tx.try_send(event).is_err()
+                    && let Some(client) = self.client.upgrade()
+                {
+                    client.stats.record_event_dropped();
+                }
+            }
         }
     }
 
@@ -374,6 +468,7 @@ pub struct Bot {
     client: Arc<Client>,
     sync_task_receiver: Option<async_channel::Receiver<crate::sync_task::MajorSyncTask>>,
     event_handlers: Vec<RegisteredHandler>,
+    event_delivery: EventDelivery,
     raw_handlers: Vec<Arc<dyn EventHandler>>,
     pair_code_options: Option<PairCodeOptions>,
     /// Kept alongside the instrumented runtime: `Bot::run` polls the main run
@@ -388,6 +483,7 @@ impl std::fmt::Debug for Bot {
             .field("client", &"<Client>")
             .field("sync_task_receiver", &self.sync_task_receiver.is_some())
             .field("event_handlers", &self.event_handlers.len())
+            .field("event_delivery", &self.event_delivery)
             .field("raw_handlers", &self.raw_handlers.len())
             .field("pair_code_options", &self.pair_code_options.is_some())
             .field("task_instrument", &self.task_instrument.is_some())
@@ -461,6 +557,7 @@ impl Bot {
             client,
             sync_task_receiver,
             event_handlers,
+            event_delivery,
             raw_handlers,
             pair_code_options,
             task_instrument: _,
@@ -510,15 +607,14 @@ impl Bot {
         }
 
         if !event_handlers.is_empty() {
-            let interest = combined_interest(&event_handlers);
             client
                 .core
                 .event_bus
-                .add_handler(Arc::new(CallbackBusAdapter {
-                    client: client.clone(),
-                    handlers: event_handlers,
-                    interest,
-                }));
+                .add_handler(Arc::new(CallbackBusAdapter::new(
+                    client.clone(),
+                    event_handlers,
+                    event_delivery,
+                )));
         }
         for handler in raw_handlers {
             client.core.event_bus.add_handler(handler);
@@ -580,6 +676,7 @@ pub struct BotBuilder<
     runtime: Option<Arc<dyn Runtime>>,
     // Optional fields
     event_handlers: Vec<RegisteredHandler>,
+    event_delivery: EventDelivery,
     raw_handlers: Vec<Arc<dyn EventHandler>>,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
@@ -604,6 +701,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             http_client: default_http_client(),
             runtime: default_runtime(),
             event_handlers: Vec::new(),
+            event_delivery: EventDelivery::default(),
             raw_handlers: Vec::new(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
@@ -632,6 +730,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             http_client: self.http_client,
             runtime: self.runtime,
             event_handlers: self.event_handlers,
+            event_delivery: self.event_delivery,
             raw_handlers: self.raw_handlers,
             custom_enc_handlers: self.custom_enc_handlers,
             inbound_durability_hook: self.inbound_durability_hook,
@@ -937,6 +1036,17 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Choose how registered callbacks receive events. Defaults to
+    /// [`EventDelivery::Concurrent`]; use [`EventDelivery::Ordered`] for
+    /// in-arrival-order, bounded delivery (the WA Web / whatsmeow / Baileys
+    /// contract). Only affects the closure-based callbacks, not raw
+    /// [`with_event_handler`](Self::with_event_handler) handlers, which always
+    /// run inline on the dispatch path.
+    pub fn with_event_delivery(mut self, delivery: EventDelivery) -> Self {
+        self.event_delivery = delivery;
+        self
+    }
+
     // ── Optional configuration ─────────────────────────────────────────────
 
     /// Register a custom handler for a specific encrypted message type
@@ -1237,6 +1347,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             client,
             sync_task_receiver: Some(sync_task_receiver),
             event_handlers: self.event_handlers,
+            event_delivery: self.event_delivery,
             raw_handlers: self.raw_handlers,
             pair_code_options: self.pair_code_options,
             task_instrument,
@@ -1290,6 +1401,113 @@ mod tests {
                 .await
                 .expect("Failed to create test SqliteStore"),
         ) as Arc<dyn Backend>
+    }
+
+    async fn test_client() -> Arc<Client> {
+        Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("build")
+            .client()
+    }
+
+    fn pairing_code_event(code: &str) -> Arc<Event> {
+        Arc::new(Event::PairingCode {
+            code: code.to_string(),
+            timeout: std::time::Duration::ZERO,
+        })
+    }
+
+    /// `EventDelivery::Ordered` delivers events to a callback in arrival order —
+    /// the WA Web / whatsmeow / Baileys contract the concurrent default can't
+    /// promise.
+    #[tokio::test]
+    async fn ordered_delivery_preserves_arrival_order() {
+        let client = test_client().await;
+        let (order_tx, order_rx) = async_channel::unbounded::<String>();
+        let handler = RegisteredHandler {
+            callback: Arc::new(move |event, _client| {
+                let order_tx = order_tx.clone();
+                Box::pin(async move {
+                    if let Event::PairingCode { code, .. } = &*event {
+                        let _ = order_tx.send(code.clone()).await;
+                    }
+                })
+            }),
+            interest: EventInterest::ALL,
+        };
+        let adapter = CallbackBusAdapter::new(
+            client.clone(),
+            vec![handler],
+            EventDelivery::Ordered { capacity: 64 },
+        );
+
+        let n = 20;
+        for i in 0..n {
+            adapter.handle_event(pairing_code_event(&i.to_string()));
+        }
+
+        let mut seen = Vec::with_capacity(n);
+        for _ in 0..n {
+            seen.push(order_rx.recv().await.expect("callback ran"));
+        }
+        let expected: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+        assert_eq!(
+            seen, expected,
+            "ordered delivery must preserve arrival order"
+        );
+    }
+
+    /// A full bounded mailbox drops events (counted in `events_dropped`) instead
+    /// of blocking the dispatch path or growing without bound.
+    #[tokio::test]
+    async fn ordered_delivery_drops_and_counts_when_full() {
+        let client = test_client().await;
+        let (started_tx, started_rx) = async_channel::bounded::<()>(1);
+        let (release_tx, release_rx) = async_channel::bounded::<()>(1);
+        let handler = RegisteredHandler {
+            callback: Arc::new(move |event, _client| {
+                let started_tx = started_tx.clone();
+                let release_rx = release_rx.clone();
+                Box::pin(async move {
+                    // Only the first event parks the single drainer, so the
+                    // capacity-1 mailbox is deterministically full for the rest.
+                    if let Event::PairingCode { code, .. } = &*event
+                        && code == "0"
+                    {
+                        let _ = started_tx.send(()).await;
+                        let _ = release_rx.recv().await;
+                    }
+                })
+            }),
+            interest: EventInterest::ALL,
+        };
+        let adapter = CallbackBusAdapter::new(
+            client.clone(),
+            vec![handler],
+            EventDelivery::Ordered { capacity: 1 },
+        );
+
+        // #0 is pulled by the drainer, which then parks on `release`; the mailbox
+        // is now empty and the drainer won't take another until released.
+        adapter.handle_event(pairing_code_event("0"));
+        started_rx.recv().await.expect("drainer entered callback");
+
+        adapter.handle_event(pairing_code_event("1")); // fills capacity-1 mailbox
+        adapter.handle_event(pairing_code_event("2")); // dropped
+        adapter.handle_event(pairing_code_event("3")); // dropped
+
+        assert_eq!(
+            client.stats.events_dropped(),
+            2,
+            "events past a full mailbox must be dropped and counted"
+        );
+
+        let _ = release_tx.send(()).await; // unpark so the drainer can exit cleanly
     }
 
     /// Regression: a `with_task_instrument` after `with_alloc_meter` must drop
