@@ -743,11 +743,33 @@ impl Client {
                 debug!("Skipping passive tasks: connection closed");
                 return;
             }
-            if let Err(e) = client_clone.upload_pre_keys_at_login().await
-                && !client_clone.is_shutting_down()
-            {
-                warn!("Failed to upload pre-keys during startup: {e:?}");
-            }
+            // WA Web PassiveTasks: the one-time pre-key upload is a passive task
+            // (`PassiveTaskManager.registerPassiveTask("KeyUpload", ...)`), not a
+            // gate on going active. Uploading publishes pre-keys for peers' FUTURE
+            // sessions; decrypting the offline backlog only needs pre-keys we
+            // already hold locally, and on a fresh device the server has none yet
+            // so no incoming pkmsg can reference them. Awaiting it here only
+            // delayed offline delivery, so spawn it like RotateKeyJob below.
+            // No-op on reconnect via the persisted server_has_prekeys flag.
+            check_generation!();
+            let prekey_client = client_clone.clone();
+            let prekey_generation = task_generation;
+            client_clone
+                .runtime
+                .spawn(Box::pin(async move {
+                    // A newer connection may have taken over between spawn and now.
+                    if prekey_client.connection_generation.load(Ordering::SeqCst)
+                        != prekey_generation
+                    {
+                        return;
+                    }
+                    if let Err(e) = prekey_client.upload_pre_keys_at_login().await
+                        && !prekey_client.is_shutting_down()
+                    {
+                        warn!("Failed to upload pre-keys during startup: {e:?}");
+                    }
+                }))
+                .detach();
 
             // WA Web RotateKeyJob: rotate the signed pre-key on its cadence.
             // Spawned so a slow or failing encrypt IQ never delays the rest of
