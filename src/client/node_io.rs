@@ -1014,9 +1014,12 @@ impl Client {
                     }
                     Err(e) => {
                         client_clone.log_sync_error("critical app state sync", &e);
-                        // Don't abort the timeout or dispatch Connected — the sync failed,
-                        // so the timeout watchdog should remain active to force a reconnect
-                        // if needed. Return early to avoid emitting a spurious Connected event.
+                        // The sync failed — the watchdog must stay alive to force a reconnect.
+                        // detach() so this early return doesn't abort it on drop (AbortHandle
+                        // aborts the task when dropped); without this the watchdog would be
+                        // cancelled exactly when the deadline-bound wait fails, and no
+                        // reconnect would happen.
+                        critical_sync_timeout_handle.detach();
                         return;
                     }
                 }
