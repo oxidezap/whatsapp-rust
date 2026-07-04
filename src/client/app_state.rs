@@ -612,20 +612,15 @@ impl Client {
         Ok(())
     }
 
-    /// Shared missing-key repair step for both sync paths: request the given keys and,
-    /// only if a fresh request actually went out (the per-key dedup didn't suppress it),
-    /// wait briefly for the primary to re-share. Returns true iff the caller should
-    /// refetch (a request was sent and we waited); false means nothing was requested
-    /// (empty or deduped), so the caller proceeds without stalling.
-    /// Request the missing decode keys, wait briefly for the re-share, then VERIFY they
-    /// actually landed. Returns true only when every requested key is now stored (the
-    /// caller may process); false means the share didn't arrive in time and the caller
-    /// must NOT process -- doing so would abort with KeyNotFound -- and should skip the
-    /// collection so it re-syncs on a later cycle. Empty input returns true (nothing to
-    /// wait for). Waits even when the per-key dedup suppressed the send: a deduped
-    /// request means an earlier one is still in flight, so the key may yet land here,
-    /// and a re-verify that fails can't be masked by treating "request sent" as success
-    /// or by a wake from an unrelated key share.
+    /// Request the missing decode keys, wait up to `timeout` for the re-share, then
+    /// VERIFY they actually landed. Returns true only when every requested key is now
+    /// stored (the caller may process); false means the share didn't arrive in time and
+    /// the caller must NOT process -- doing so would abort with KeyNotFound -- and should
+    /// skip the collection so it re-syncs on a later cycle. Empty input returns true
+    /// (nothing to wait for). Waits even when the per-key dedup suppressed the send: a
+    /// deduped request means an earlier one is still in flight, so the key may yet land
+    /// here, and a re-verify that fails can't be masked by treating "request sent" as
+    /// success or by a wake from an unrelated key share.
     async fn request_keys_and_wait(&self, missing: Vec<Vec<u8>>, timeout: Duration) -> bool {
         if missing.is_empty() {
             return true;
