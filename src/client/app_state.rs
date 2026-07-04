@@ -2,15 +2,10 @@
 
 use super::*;
 
-/// Concurrency cap for pre-downloading app-state external blobs. Each blob is an
-/// independent CDN GET (a collection snapshot or a patch's external mutations),
-/// keyed by directPath, so they carry no ordering dependency (LTHash ordering is
-/// in patch *application*, not blob *fetching*). WA Web downloads them in
-/// parallel — `Syncd/CollectionHandler` fans the per-patch external-mutation
-/// fetches out under `Promise.all`. Bounded (not unbounded `join_all`) because a
-/// snapshot can be multi-MB and a batched response carries several collections;
-/// the cap keeps peak memory in check while still turning `sum(RTT)` into
-/// `~max(RTT)`.
+/// Concurrency cap for pre-downloading app-state external blobs (independent CDN
+/// GETs, keyed by directPath — LTHash ordering is in patch application, not blob
+/// fetching). WA Web fans these out under `Promise.all` (`Syncd/CollectionHandler`);
+/// bounded here because a snapshot can be multi-MB and a batch carries several.
 const APPSTATE_BLOB_DOWNLOAD_CONCURRENCY: usize = 4;
 
 impl Client {
@@ -28,43 +23,40 @@ impl Client {
         proc
     }
 
-    /// Pre-download every external blob (collection snapshots + patch external
-    /// mutations) referenced by `patch_lists`, keyed by directPath. The blobs are
-    /// independent, so the CDN GETs run concurrently (bounded by
-    /// [`APPSTATE_BLOB_DOWNLOAD_CONCURRENCY`]) instead of one RTT at a time. A
-    /// failed download is logged and omitted from the map; the later inline step
-    /// (`missing_key_ids_after_inline` / `process_patch_lists`) surfaces the
-    /// missing blob exactly as the previous serial version did. Mirrors WA Web's
-    /// parallel syncd blob fetch (`Syncd/CollectionHandler` `Promise.all`).
+    /// Pre-download every external blob (snapshots + patch external mutations)
+    /// referenced by `patch_lists`, keyed by directPath, fetching concurrently
+    /// (bounded by [`APPSTATE_BLOB_DOWNLOAD_CONCURRENCY`]). A failed download is
+    /// logged and omitted; the later inline step surfaces the missing blob as
+    /// before. Mirrors WA Web's parallel syncd blob fetch.
     async fn pre_download_external_blobs(
         &self,
         patch_lists: &[wacore::appstate::patch_decode::PatchList],
     ) -> std::collections::HashMap<String, Vec<u8>> {
         use futures::StreamExt;
 
-        // Blob context, kept only so a failed download logs the same message the
-        // serial version did (snapshot name vs. patch version).
+        // Kept only so a failed download logs the right message (snapshot vs patch).
         enum BlobKind {
             Snapshot(WAPatchName),
             Mutation(u64),
         }
 
-        // Collect every (blob, context) to fetch. The blob reference is cloned
-        // (it's small: a directPath + key/hash bytes) so each concurrent task owns
-        // its input and captures only `&self` — mirrors the owned-data fan-out in
-        // `groups::fill_participant_pns` and keeps the future `Send`. Only blobs
-        // with a directPath are enqueued; the directPath is recovered from the
-        // moved `ext` after the fetch (no separate clone for the map key).
+        // Clone the (small) blob ref into each job so the task owns its input and
+        // captures only `&self` (keeps the future Send); the directPath is
+        // recovered from the moved `ext` after the fetch. Dedup by directPath so
+        // patches sharing a blob don't fetch it twice into the same map key.
         let mut jobs: Vec<(wa::ExternalBlobReference, BlobKind)> = Vec::new();
+        let mut seen_paths: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for pl in patch_lists {
             if let Some(ext) = &pl.snapshot_ref
-                && ext.direct_path.is_some()
+                && let Some(path) = ext.direct_path.as_deref()
+                && seen_paths.insert(path)
             {
                 jobs.push((ext.clone(), BlobKind::Snapshot(pl.name)));
             }
             for patch in &pl.patches {
                 if let Some(ext) = patch.external_mutations.as_option()
-                    && ext.direct_path.is_some()
+                    && let Some(path) = ext.direct_path.as_deref()
+                    && seen_paths.insert(path)
                 {
                     let v = patch
                         .version
