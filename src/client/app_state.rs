@@ -626,21 +626,32 @@ impl Client {
             return true;
         }
         let count = missing.len();
-        // Register the listener before touching the store: the notifier is not sticky,
-        // so a key-share persisted between our checks and listen() would be lost.
-        let listener = self.initial_keys_synced_notifier.listen();
-
-        // Fast path: a key persisted in the gap before listen() fired a notify we can't
-        // observe. Re-check now so we don't wait the (up to critical-deadline) timeout
-        // for keys already in the store.
-        if self.all_sync_keys_present(&missing).await {
-            return true;
+        let deadline = wacore::time::Instant::now() + timeout;
+        let mut requested = false;
+        loop {
+            // Register the listener before the store check: the notifier is not sticky,
+            // so a key-share persisted in the check→listen gap would be lost.
+            let listener = self.initial_keys_synced_notifier.listen();
+            if self.all_sync_keys_present(&missing).await {
+                return true;
+            }
+            // Send the explicit re-request once, after confirming the keys are still
+            // missing.
+            if !requested {
+                self.request_missing_keys_with_dedup(missing.clone()).await;
+                requested = true;
+                debug!(target: "Client/AppState", "Requested {count} missing app-state key(s); waiting up to {timeout:?} for the re-share");
+            }
+            let remaining = deadline.saturating_duration_since(wacore::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            // A single share may cover only part of `missing`, and the notifier is global
+            // (an unrelated share wakes us too), so keep re-checking on each wake until
+            // every key lands or the deadline passes — don't give up on the first wake
+            // while budget remains.
+            let _ = rt_timeout(&*self.runtime, remaining, listener).await;
         }
-
-        self.request_missing_keys_with_dedup(missing.clone()).await;
-        debug!(target: "Client/AppState", "Requested {count} missing app-state key(s); waiting up to {timeout:?} for the re-share");
-        let _ = rt_timeout(&*self.runtime, timeout, listener).await;
-        self.all_sync_keys_present(&missing).await
     }
 
     /// True iff every given app-state sync-key id is already stored.
