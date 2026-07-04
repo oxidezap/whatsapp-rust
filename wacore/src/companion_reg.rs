@@ -184,11 +184,14 @@ impl CompanionOs {
             || os.contains("ubuntu")
             || os.contains("debian")
             || os.contains("fedora")
-            || os.contains("arch")
             || os.contains("chrome os")
             || os.contains("chromeos")
             || os.contains("chromium")
-            || os.contains("cros")
+            // Whole-word for the short ambiguous ones so branding like "March"/
+            // "Search"/"across" doesn't false-match (bare "Arch"/"CrOS" still do;
+            // "Arch Linux"/"archlinux" are caught by the "linux" substring above).
+            || os.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|tok| tok == "arch" || tok == "cros")
         {
             Some(Self::Linux)
         } else {
@@ -468,6 +471,9 @@ mod tests {
             ("Ubuntu", O::Linux),
             ("Fedora", O::Linux),
             ("Arch Linux", O::Linux),
+            ("Arch", O::Linux),
+            ("archlinux", O::Linux),
+            ("CrOS", O::Linux),
             ("Chrome OS", O::Linux),
             ("ChromeOS", O::Linux),
             ("Chromium OS", O::Linux),
@@ -485,8 +491,19 @@ mod tests {
 
     #[test]
     fn companion_os_branding_and_empty_are_unclassified_and_default_linux() {
-        // "KaiOS" must NOT substring-match "ios" -> it is unrecognized -> Linux.
-        for hint in ["Veloz", "Foobar123", "KaiOS", "", "   "] {
+        // "KaiOS" must NOT substring-match "ios", and branding containing "arch"/
+        // "cros" as a fragment ("March", "Search", "across") must NOT match Linux
+        // -> all unrecognized -> Linux via fallback (not via classify).
+        for hint in [
+            "Veloz",
+            "Foobar123",
+            "KaiOS",
+            "March",
+            "Search",
+            "across",
+            "",
+            "   ",
+        ] {
             assert_eq!(CompanionOs::classify(hint), None, "{hint:?}");
             assert_eq!(CompanionOs::from_hint(hint), CompanionOs::Linux, "{hint:?}");
         }
