@@ -298,6 +298,7 @@ impl Client {
         // otherwise serialize the per-device DB reads (warm hits serialize on the
         // cache mutex anyway). Order is irrelevant — misses are chunked for the fetch.
         use futures::StreamExt;
+        const SESSION_PROBE_CONCURRENCY: usize = 16;
         let backend = device_snapshot.backend.clone();
         let jids_needing_sessions: Vec<Jid> = futures::stream::iter(jids)
             .map(|jid| {
@@ -315,7 +316,7 @@ impl Client {
                     }
                 }
             })
-            .buffer_unordered(16)
+            .buffer_unordered(SESSION_PROBE_CONCURRENCY)
             .filter_map(|needed| async move { needed })
             .collect()
             .await;

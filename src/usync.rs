@@ -22,13 +22,15 @@ impl Client {
         // device 0). Materialize to an owned Vec first so the stream doesn't borrow
         // `jids` through buffer_unordered (Send bound).
         use futures::StreamExt;
+        // Bounded fan-out over the independent per-user registry reads.
+        const DEVICE_LIST_RESOLVE_CONCURRENCY: usize = 16;
         let non_ad: Vec<Jid> = jids.iter().map(|j| j.to_non_ad()).collect();
         let resolved: Vec<(Jid, Option<Vec<Jid>>)> = futures::stream::iter(non_ad)
             .map(|jid| async move {
                 let devices = self.get_devices_from_registry(&jid).await;
                 (jid, devices)
             })
-            .buffer_unordered(16)
+            .buffer_unordered(DEVICE_LIST_RESOLVE_CONCURRENCY)
             .collect()
             .await;
 

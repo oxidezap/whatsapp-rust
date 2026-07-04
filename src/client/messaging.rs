@@ -238,7 +238,7 @@ impl Client {
         let (tx, rx) = futures::channel::oneshot::channel();
         self.response_waiters
             .lock()
-            .await
+            .unwrap_or_else(|p| p.into_inner())
             .insert(message_id.to_string(), tx);
         rx
     }

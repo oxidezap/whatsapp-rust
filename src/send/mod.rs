@@ -741,10 +741,11 @@ impl Client {
         // Resolve recipient LIDs concurrently (a status audience can be hundreds of
         // contacts, each a cold-cache DB read). Stream over indices and rebuild
         // `resolved` in order — assemble_status_participants is position-sensitive.
+        const STATUS_LID_RESOLVE_CONCURRENCY: usize = 16;
         let resolved_indexed: Vec<(usize, Option<Jid>)> =
             futures::stream::iter(0..recipients.len())
                 .map(|i| async move { (i, self.resolve_recipient_to_lid(&recipients[i]).await) })
-                .buffer_unordered(16)
+                .buffer_unordered(STATUS_LID_RESOLVE_CONCURRENCY)
                 .collect()
                 .await;
         let mut resolved: Vec<Option<Jid>> = vec![None; recipients.len()];
@@ -921,7 +922,10 @@ impl Client {
 
         if let Err(e) = self.send_node(stanza).await {
             if ack.is_some() {
-                self.response_waiters.lock().await.remove(&request_id);
+                self.response_waiters
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&request_id);
             }
             return Err(e.into());
         }
@@ -1192,7 +1196,11 @@ impl Client {
                     Ok(Ok(node)) => node,
                     _ => {
                         // Remove leaked waiter to prevent keepalive suppression
-                        client.response_waiters.lock().await.remove(&message_id);
+                        client
+                            .response_waiters
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&message_id);
                         return;
                     }
                 };
@@ -1892,7 +1900,10 @@ impl Client {
 
         if let Err(e) = self.send_node(stanza_to_send).await {
             if let Some((_, _, ref msg_id)) = ack {
-                self.response_waiters.lock().await.remove(msg_id);
+                self.response_waiters
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(msg_id);
             }
             return Err(e.into());
         }

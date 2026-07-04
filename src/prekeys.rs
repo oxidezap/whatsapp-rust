@@ -181,6 +181,7 @@ impl Client {
         // Fan out the per-companion identity loads (independent cache/DB reads) —
         // the keyless-companion set can be large on a cold group send. Owned Vec so
         // the stream doesn't borrow `jids` through buffer_unordered (Send bound).
+        const COMPANION_IDENTITY_LOAD_CONCURRENCY: usize = 16;
         let companions: Vec<Jid> = jids.iter().filter(|j| j.device != 0).cloned().collect();
         futures::stream::iter(companions)
             .map(|jid| async move {
@@ -188,7 +189,7 @@ impl Client {
                     .await
                     .map(|id| (jid.normalize_for_prekey_bundle(), id))
             })
-            .buffer_unordered(16)
+            .buffer_unordered(COMPANION_IDENTITY_LOAD_CONCURRENCY)
             .filter_map(|entry| async move { entry })
             .collect()
             .await

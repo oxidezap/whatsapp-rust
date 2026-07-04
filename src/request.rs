@@ -22,6 +22,29 @@ type IqSendFuture<'a> =
 type IqSendFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + 'a>>;
 
+/// Removes a pending `response_waiters` entry when dropped.
+///
+/// `send_and_wait_iq` can be cancelled mid-await — e.g. the losing side of a
+/// `futures::try_join!` is dropped the instant its sibling errors. Without this
+/// guard the registered waiter would linger in the map: the explicit cleanups
+/// only fired on the send-fail / timeout / shutdown paths, never on
+/// cancellation-via-drop, and a lingering waiter suppresses keepalives for the
+/// life of the connection. Dropping the guard removes the entry on every exit
+/// path; on success `resolve_waiters` already removed it, so it's a no-op.
+struct ResponseWaiterGuard {
+    waiters: Arc<std::sync::Mutex<crate::client::ResponseWaiterMap>>,
+    req_id: String,
+}
+
+impl Drop for ResponseWaiterGuard {
+    fn drop(&mut self) {
+        self.waiters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.req_id);
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum IqError {
@@ -281,21 +304,27 @@ impl Client {
         let (tx, rx) = futures::channel::oneshot::channel();
         self.response_waiters
             .lock()
-            .await
+            .unwrap_or_else(|p| p.into_inner())
             .insert(req_id.clone(), tx);
+        // RAII cleanup covers every exit below — including this future being
+        // dropped mid-await (cancellation), which the explicit paths can't
+        // catch. So the send-fail / timeout / shutdown arms no longer remove
+        // the waiter by hand; the guard does it on drop.
+        let _waiter_guard = ResponseWaiterGuard {
+            waiters: self.response_waiters.clone(),
+            req_id,
+        };
 
         // Per-connection: pending IQ requests are bound to the current socket;
         // a reconnect aborts them (sender retries on the new connection).
         let shutdown = wacore::runtime::wait_for_shutdown(&self.connection_shutdown_signal());
 
         if !self.is_running.load(Ordering::Acquire) {
-            self.response_waiters.lock().await.remove(&req_id);
             wacore::telemetry::iq("error");
             return Err(IqError::NotConnected);
         }
 
         if let Err(e) = send_fn.await {
-            self.response_waiters.lock().await.remove(&req_id);
             wacore::telemetry::iq("error");
             return match e {
                 ClientError::Socket(s_err) => Err(IqError::Socket(s_err)),
@@ -317,16 +346,10 @@ impl Client {
                         Err(e) => Err(e.into()),
                     },
                     Ok(Err(_)) => Err(IqError::InternalChannelClosed),
-                    Err(_) => {
-                        self.response_waiters.lock().await.remove(&req_id);
-                        Err(IqError::Timeout)
-                    }
+                    Err(_) => Err(IqError::Timeout),
                 }
             }
-            _ = shutdown.fuse() => {
-                self.response_waiters.lock().await.remove(&req_id);
-                Err(IqError::NotConnected)
-            }
+            _ = shutdown.fuse() => Err(IqError::NotConnected),
         };
         wacore::telemetry::iq(match &result {
             Ok(_) => "ok",
@@ -339,7 +362,9 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::IqError;
+    use super::{IqError, ResponseWaiterGuard};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn converts_unexpected_response_type() {
@@ -351,5 +376,44 @@ mod tests {
             IqError::UnexpectedResponseType { got } => assert_eq!(got.as_deref(), Some("get")),
             other => panic!("expected UnexpectedResponseType, got {other:?}"),
         }
+    }
+
+    // Cancellation cleanup: dropping a `send_and_wait_iq` future mid-await (e.g.
+    // the loser of a `try_join!`) must remove its still-pending waiter, or a
+    // leaked entry suppresses keepalives for the life of the connection.
+    #[test]
+    fn waiter_guard_removes_pending_entry_on_drop() {
+        let waiters: Arc<Mutex<crate::client::ResponseWaiterMap>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = futures::channel::oneshot::channel();
+        waiters.lock().unwrap().insert("req-1".to_string(), tx);
+        assert!(waiters.lock().unwrap().contains_key("req-1"));
+
+        {
+            let _guard = ResponseWaiterGuard {
+                waiters: waiters.clone(),
+                req_id: "req-1".to_string(),
+            };
+        }
+        assert!(
+            !waiters.lock().unwrap().contains_key("req-1"),
+            "dropping the guard must remove the pending waiter"
+        );
+    }
+
+    // On the success path the resolver already removed the entry before the
+    // guard drops, so the guard's removal must be a harmless no-op.
+    #[test]
+    fn waiter_guard_drop_is_noop_when_already_resolved() {
+        let waiters: Arc<Mutex<crate::client::ResponseWaiterMap>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        // Map empty = resolver already delivered + removed this request's waiter.
+        {
+            let _guard = ResponseWaiterGuard {
+                waiters: waiters.clone(),
+                req_id: "req-1".to_string(),
+            };
+        }
+        assert!(waiters.lock().unwrap().is_empty());
     }
 }

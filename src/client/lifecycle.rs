@@ -140,7 +140,7 @@ impl Client {
             transport_factory,
             noise_socket: Arc::new(Mutex::new(None)),
 
-            response_waiters: Arc::new(Mutex::new(HashMap::new())),
+            response_waiters: Arc::new(std::sync::Mutex::new(HashMap::new())),
             node_waiters: std::sync::Mutex::new(Vec::new()),
             node_waiter_count: AtomicUsize::new(0),
             sent_node_waiters: std::sync::Mutex::new(Vec::new()),
@@ -876,12 +876,19 @@ impl Client {
         self.history_sync_idle_notifier.notify(usize::MAX);
         // Drain all pending IQ waiters so they fail fast with InternalChannelClosed
         // instead of hanging until the 75s timeout.
-        let mut waiters_map = self.response_waiters.lock().await;
-        let waiter_count = waiters_map.len();
-        // Replace with new map to release backing storage; old senders drop here,
-        // causing receivers to get RecvError → IqError::InternalChannelClosed
-        *waiters_map = HashMap::new();
-        drop(waiters_map);
+        // Scoped so the sync guard is dropped before the awaits below (a
+        // std::sync::MutexGuard held across an await would make this future !Send).
+        let waiter_count = {
+            let mut waiters_map = self
+                .response_waiters
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let count = waiters_map.len();
+            // Replace with new map to release backing storage; old senders drop
+            // here, causing receivers to get RecvError → InternalChannelClosed.
+            *waiters_map = HashMap::new();
+            count
+        };
         if waiter_count > 0 {
             debug!(
                 "Dropping {} orphaned IQ response waiter(s) on disconnect",

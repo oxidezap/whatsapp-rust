@@ -373,6 +373,7 @@ impl<'a> Groups<'a> {
         // Cache hits are in-memory, but a cold cache falls back to the DB and a
         // large group would otherwise serialize those lookups — bounded fan-out.
         use futures::StreamExt;
+        const LID_PN_RESOLVE_CONCURRENCY: usize = 16;
         let resolved: Vec<(usize, Jid)> = futures::stream::iter(pending)
             .map(|(i, jid)| async move {
                 let pn = self
@@ -384,7 +385,7 @@ impl<'a> Groups<'a> {
                     .map(|e| Jid::pn(&*e.phone_number));
                 (i, pn)
             })
-            .buffer_unordered(16)
+            .buffer_unordered(LID_PN_RESOLVE_CONCURRENCY)
             .filter_map(|(i, pn)| async move { pn.map(|pn| (i, pn)) })
             .collect()
             .await;

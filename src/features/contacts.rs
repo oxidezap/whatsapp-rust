@@ -175,14 +175,14 @@ impl<'a> Contacts<'a> {
                     .await
             }
         };
-        // join!, NOT try_join!: a fail-fast try_join! would drop the sibling IQ
-        // future the instant one errored, leaking its `response_waiters` entry —
-        // send_and_wait_iq only removes the waiter on send-failure/timeout/shutdown,
-        // not on cancellation-via-drop, and a lingering waiter suppresses
-        // keepalives. Awaiting both lets each clean up its own waiter.
-        let (pn_results, lid_results) = futures::join!(pn_fut, lid_fut);
-        let mut results = pn_results?;
-        results.extend(lid_results?);
+        // try_join! fails fast: it returns the instant either query errors and
+        // drops the sibling in-flight future. That's now safe — `send_and_wait_iq`
+        // registers a `ResponseWaiterGuard` that removes the waiter on drop, so a
+        // cancelled sibling can't leak its `response_waiters` entry (which would
+        // otherwise suppress keepalives). The old sequential code also failed on
+        // the first error, so fail-fast matches the original latency profile.
+        let (mut results, lid_results) = futures::try_join!(pn_fut, lid_fut)?;
+        results.extend(lid_results);
 
         self.persist_lid_mappings(results.iter().map(forward_lid_pair))
             .await;

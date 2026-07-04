@@ -467,6 +467,10 @@ pub(crate) struct OfflineSyncMetrics {
     pub start_time: std::sync::Mutex<Option<wacore::time::Instant>>,
 }
 
+/// Map of pending IQ/ack response waiters, keyed by request id.
+pub(crate) type ResponseWaiterMap =
+    HashMap<String, futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>>;
+
 pub struct Client {
     pub(crate) runtime: Arc<dyn Runtime>,
     pub(crate) core: wacore::client::CoreClient,
@@ -520,9 +524,13 @@ pub struct Client {
     pub(crate) transport_factory: Arc<dyn crate::transport::TransportFactory>,
     pub(crate) noise_socket: Arc<Mutex<Option<Arc<NoiseSocket>>>>,
 
-    pub(crate) response_waiters: Arc<
-        Mutex<HashMap<String, futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>>>,
-    >,
+    /// Pending IQ/ack response waiters keyed by request id.
+    ///
+    /// A `std::sync::Mutex` (like the `node_waiters` sibling below): the critical
+    /// section is a trivial map op never held across an `.await`, and a sync lock
+    /// is what lets `ResponseWaiterGuard` remove a cancelled waiter from `Drop`
+    /// (an async lock couldn't). See `send_and_wait_iq`.
+    pub(crate) response_waiters: Arc<std::sync::Mutex<ResponseWaiterMap>>,
 
     /// Generic node waiters for waiting on specific stanzas by tag/attributes.
     /// Uses std::sync::Mutex (not tokio) since the critical section is trivial.

@@ -140,7 +140,11 @@ impl Client {
             .await;
 
         // Each count read into a local so no two guards are ever held at once.
-        let response_waiters = self.response_waiters.lock().await.len();
+        let response_waiters = self
+            .response_waiters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
         let presence_subscriptions = self.presence_subscriptions.lock().await.len();
         let app_state_key_requests = self.app_state_key_requests.lock().await.len();
         let app_state_syncing = self.app_state_syncing.lock().await.len();

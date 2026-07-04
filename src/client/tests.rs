@@ -133,10 +133,14 @@ async fn test_ack_waiter_resolves() {
     client
         .response_waiters
         .lock()
-        .await
+        .unwrap()
         .insert(test_id.clone(), tx);
     assert!(
-        client.response_waiters.lock().await.contains_key(&test_id),
+        client
+            .response_waiters
+            .lock()
+            .unwrap()
+            .contains_key(&test_id),
         "Waiter should be inserted before handling ack"
     );
 
@@ -170,7 +174,11 @@ async fn test_ack_waiter_resolves() {
 
     // 5. Verify the waiter was removed
     assert!(
-        !client.response_waiters.lock().await.contains_key(&test_id),
+        !client
+            .response_waiters
+            .lock()
+            .unwrap()
+            .contains_key(&test_id),
         "Waiter should be removed after handling"
     );
 

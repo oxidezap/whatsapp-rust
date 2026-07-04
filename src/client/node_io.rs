@@ -432,7 +432,11 @@ impl Client {
             && let Some(id) = nr.get_attr("id").map(|v| v.as_str())
         {
             // Single lock acquisition: try to remove the waiter directly.
-            let waiter = self.response_waiters.lock().await.remove(id.as_ref());
+            let waiter = self
+                .response_waiters
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(id.as_ref());
             if let Some(waiter) = waiter {
                 if waiter.send(Arc::clone(&node)).is_err() {
                     warn!(target: "Client/IQ", "Failed to send IQ response to waiter. Receiver was likely dropped.");
@@ -1114,7 +1118,11 @@ impl Client {
         }
 
         if let Some(id) = node.get_attr("id").map(|v| v.as_str())
-            && let Some(waiter) = self.response_waiters.lock().await.remove(id.as_ref())
+            && let Some(waiter) = self
+                .response_waiters
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(id.as_ref())
         {
             // ACK responses are infrequent; re-encode into OwnedNodeRef for the channel.
             // marshal_ref prepends a leading 0x00 format byte; OwnedNodeRef::new expects raw

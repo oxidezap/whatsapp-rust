@@ -602,7 +602,7 @@ async fn place_call(
         client
             .response_waiters
             .lock()
-            .await
+            .unwrap_or_else(|p| p.into_inner())
             .remove(&offer_stanza_id);
         if removed.is_some() {
             ended.notify();
@@ -679,7 +679,7 @@ fn spawn_outgoing_relay_waiter(
                         client
                             .response_waiters
                             .lock()
-                            .await
+                            .unwrap_or_else(|p| p.into_inner())
                             .remove(&offer_stanza_id);
                         None
                     }
@@ -2731,7 +2731,7 @@ mod tests {
             client
                 .response_waiters
                 .lock()
-                .await
+                .unwrap()
                 .contains_key(&offer_stanza_id),
             "the ack-waiter must be registered"
         );
@@ -2755,7 +2755,7 @@ mod tests {
             if !client
                 .response_waiters
                 .lock()
-                .await
+                .unwrap()
                 .contains_key(&offer_stanza_id)
             {
                 break;
@@ -2766,7 +2766,7 @@ mod tests {
             !client
                 .response_waiters
                 .lock()
-                .await
+                .unwrap()
                 .contains_key(&offer_stanza_id),
             "a no-ack relay-waiter must drop its response_waiters entry so keepalive isn't suppressed"
         );
