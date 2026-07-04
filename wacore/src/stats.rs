@@ -713,6 +713,8 @@ mod tests {
         stats.record_message_sent();
         stats.record_message_received();
         stats.record_reconnect();
+        stats.record_event_dropped();
+        stats.record_event_dropped();
 
         let snap = stats.snapshot();
         assert_eq!(snap.bytes_sent, 150);
@@ -722,6 +724,7 @@ mod tests {
         assert_eq!(snap.messages_sent, 1);
         assert_eq!(snap.messages_received, 1);
         assert_eq!(snap.reconnects, 1);
+        assert_eq!(snap.events_dropped, 2);
         assert!(snap.last_data_sent_ms > 0);
         assert!(snap.last_data_received_ms > 0);
     }

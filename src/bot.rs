@@ -344,16 +344,21 @@ impl CallbackBusAdapter {
                             let kind = event.kind();
                             for handler in drain_handlers.iter() {
                                 if handler.interest.wants(kind) {
-                                    // Isolate panics: the lone drainer must
-                                    // survive a faulty callback, else every later
-                                    // ordered event would stall behind it.
-                                    let fut =
-                                        (handler.callback)(Arc::clone(&event), client.clone());
-                                    if std::panic::AssertUnwindSafe(fut)
+                                    // Keep the lone drainer alive across a faulty
+                                    // callback. catch_unwind guards only poll, so
+                                    // build the future inside the awaited block
+                                    // too — a panic while creating it is caught as
+                                    // well, not just one while polling.
+                                    let cb = handler.callback.clone();
+                                    let ev = Arc::clone(&event);
+                                    let cl = client.clone();
+                                    let ran =
+                                        std::panic::AssertUnwindSafe(
+                                            async move { cb(ev, cl).await },
+                                        )
                                         .catch_unwind()
-                                        .await
-                                        .is_err()
-                                    {
+                                        .await;
+                                    if ran.is_err() {
                                         warn!(
                                             "ordered event delivery callback panicked; continuing"
                                         );
@@ -1535,17 +1540,20 @@ mod tests {
     }
 
     /// A panicking callback must not kill the single ordered drainer — later
-    /// events still get delivered.
+    /// events still get delivered. The panic fires while *creating* the future
+    /// (before the async block), the case a poll-only guard would miss.
     #[tokio::test]
     async fn ordered_delivery_survives_a_panicking_callback() {
         let client = test_client().await;
         let (tx, rx) = async_channel::unbounded::<String>();
         let handler = RegisteredHandler {
-            callback: Arc::new(move |event, _client| {
+            callback: Arc::new(move |event: Arc<Event>, _client| {
                 let tx = tx.clone();
+                if let Event::PairingCode { code, .. } = &*event {
+                    assert_ne!(code, "boom", "deliberate test panic");
+                }
                 Box::pin(async move {
                     if let Event::PairingCode { code, .. } = &*event {
-                        assert_ne!(code, "boom", "deliberate test panic");
                         let _ = tx.send(code.clone()).await;
                     }
                 })
