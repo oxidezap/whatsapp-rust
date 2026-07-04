@@ -203,20 +203,29 @@ impl CompanionOs {
     }
 }
 
-/// `companion_platform_display` body: `<Browser> (<OS>)` (Android client types
-/// emit `Android (<OS>)`), mirroring `WAWebAltDeviceLinkingIq`. The OS is
-/// canonicalized through [`CompanionOs`] because the pair-code server rejects a
-/// non-OS string here with `bad-request`; an unrecognized/branding `os` (or an
-/// empty one) becomes `Linux`.
-pub fn companion_platform_display(ct: CompanionWebClientType, os: &str) -> String {
+/// Formats `<Browser> (<os>)` (Android client types → `Android (<os>)`),
+/// mirroring `WAWebAltDeviceLinkingIq`, with `os` used **verbatim** — no
+/// canonicalization. This is the escape hatch for an advanced caller that
+/// overrides the display OS (e.g. to keep a real distro name like `"Ubuntu"`
+/// the server accepts); the server validates the OS, so a non-OS string here is
+/// rejected with `bad-request`. Most callers want [`companion_platform_display`].
+pub fn companion_platform_display_raw(ct: CompanionWebClientType, os: &str) -> String {
     use CompanionWebClientType as C;
-    let os = CompanionOs::from_hint(os).wire_str();
     match ct {
         C::AndroidPhone | C::AndroidTablet | C::AndroidAmbiguous => {
             format!("Android ({os})")
         }
         _ => format!("{} ({})", companion_browser_name(ct), os),
     }
+}
+
+/// `companion_platform_display` body: `<Browser> (<OS>)` (Android client types
+/// emit `Android (<OS>)`), mirroring `WAWebAltDeviceLinkingIq`. The OS is
+/// canonicalized through [`CompanionOs`] because the pair-code server rejects a
+/// non-OS string here with `bad-request`; an unrecognized/branding `os` (or an
+/// empty one) becomes `Linux`.
+pub fn companion_platform_display(ct: CompanionWebClientType, os: &str) -> String {
+    companion_platform_display_raw(ct, CompanionOs::from_hint(os).wire_str())
 }
 
 #[cfg(test)]

@@ -20,7 +20,8 @@
 //! - Bundle encryption: AES-256-GCM after HKDF key derivation
 
 use crate::companion_reg::{
-    CompanionWebClientType, companion_platform_display, companion_web_client_type_for_props,
+    CompanionWebClientType, companion_platform_display, companion_platform_display_raw,
+    companion_web_client_type_for_props,
 };
 use crate::libsignal::crypto::{CryptoProviderError, aes_256_gcm_encrypt};
 use crate::libsignal::protocol::{CurveError, KeyPair, PublicKey};
@@ -102,8 +103,9 @@ pub fn derive_companion_platform(props: &wa::DeviceProps) -> (CompanionWebClient
     build_id_and_display(companion_web_client_type_for_props(props), props)
 }
 
-/// Honours `PairCodeOptions::platform_id` override; display is always
-/// derived (no override — WA Web has none, server rejects arbitrary strings).
+/// Honours `PairCodeOptions::platform_id` (browser) and `display_os` (OS)
+/// overrides. By default the OS is canonicalized from `DeviceProps::os`; a
+/// non-empty `display_os` is sent verbatim instead (advanced — see the field).
 pub fn resolve_companion_platform(
     options: &PairCodeOptions,
     props: &wa::DeviceProps,
@@ -111,7 +113,12 @@ pub fn resolve_companion_platform(
     let id = options
         .platform_id
         .unwrap_or_else(|| companion_web_client_type_for_props(props));
-    build_id_and_display(id, props)
+    let display = match options.display_os.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => companion_platform_display_raw(id, raw),
+        // None, or an all-whitespace override, falls back to the safe coercion.
+        _ => build_id_and_display(id, props).1,
+    };
+    (id, display)
 }
 
 /// Options for pair code authentication.
@@ -125,6 +132,13 @@ pub struct PairCodeOptions {
     pub custom_code: Option<String>,
     /// `None` auto-derives from `Device.device_props.platform_type`.
     pub platform_id: Option<CompanionWebClientType>,
+    /// Advanced OS override for `companion_platform_display`. `None` (default)
+    /// canonicalizes `DeviceProps::os` to a small server-safe set (branding →
+    /// `Linux`). `Some(os)` sends `os` **verbatim**, bypassing that coercion — use
+    /// it to keep a real OS name the server accepts but our canonical set drops
+    /// (e.g. `"Ubuntu"`, `"Fedora"`). At your own risk: the server rejects a
+    /// non-OS string with `bad-request`. An all-whitespace value is ignored.
+    pub display_os: Option<String>,
 }
 
 impl Default for PairCodeOptions {
@@ -134,6 +148,7 @@ impl Default for PairCodeOptions {
             show_push_notification: true,
             custom_code: None,
             platform_id: None,
+            display_os: None,
         }
     }
 }
@@ -864,6 +879,48 @@ mod tests {
             resolve_companion_platform(&PairCodeOptions::default(), &p),
             (CompanionWebClientType::Edge, "Edge (Linux)".to_string())
         );
+    }
+
+    /// `display_os` sends the OS verbatim (bypassing canonicalization), so an
+    /// advanced caller can keep a real distro name the server accepts.
+    #[test]
+    fn resolve_display_os_override_is_verbatim() {
+        let p = props(Some("Linux"), Some(wa::device_props::PlatformType::CHROME));
+        let opts = PairCodeOptions {
+            display_os: Some("Ubuntu".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_companion_platform(&opts, &p),
+            (
+                CompanionWebClientType::Chrome,
+                "Chrome (Ubuntu)".to_string()
+            )
+        );
+    }
+
+    /// The override wins even over a branding `DeviceProps::os` that would
+    /// otherwise coerce to Linux.
+    #[test]
+    fn resolve_display_os_override_beats_branding_props_os() {
+        let p = props(Some("Veloz"), Some(wa::device_props::PlatformType::CHROME));
+        let opts = PairCodeOptions {
+            display_os: Some("Fedora".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_companion_platform(&opts, &p).1, "Chrome (Fedora)");
+    }
+
+    /// An all-whitespace override is ignored — it falls back to the safe coercion
+    /// (never emits an empty OS, which the server rejects).
+    #[test]
+    fn resolve_display_os_override_whitespace_falls_back_to_coercion() {
+        let p = props(Some("Veloz"), Some(wa::device_props::PlatformType::CHROME));
+        let opts = PairCodeOptions {
+            display_os: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_companion_platform(&opts, &p).1, "Chrome (Linux)");
     }
 
     #[test]

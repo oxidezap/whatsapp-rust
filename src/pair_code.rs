@@ -203,11 +203,17 @@ impl Client {
         // bad-request (QR pairing never sends this field, so it tolerates arbitrary
         // branding). If `DeviceProps::os` was a branding string it is coerced to
         // "Linux"; warn so a consumer sees why their branding didn't ride through.
+        // Skipped when `display_os` overrides the OS (then props.os isn't coerced).
         // Gated to fire once per process: a rate-limited caller may retry
         // pair_with_code repeatedly (see PairError::RequestFailed) with the same
         // unchanged os, and an identical warning per retry is just noise.
         static OS_COERCE_WARNED: std::sync::Once = std::sync::Once::new();
-        if let Some(os) = device_snapshot.device_props.os.as_deref()
+        let os_overridden = options
+            .display_os
+            .as_deref()
+            .is_some_and(|o| !o.trim().is_empty());
+        if !os_overridden
+            && let Some(os) = device_snapshot.device_props.os.as_deref()
             && !os.trim().is_empty()
             && CompanionOs::classify(os).is_none()
         {
