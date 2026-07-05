@@ -259,6 +259,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mark_forgotten_flips_a_mixed_batch_and_bumps_once() {
+        let c = cache();
+        let group = "120363000000000001@g.us";
+        let map = c
+            .get_or_init(group, async {
+                Arc::new(SenderKeyDeviceMap::from_db_rows(&[
+                    ("111:0@lid".to_string(), true),
+                    ("111:5@lid".to_string(), true),
+                    ("222:0@lid".to_string(), true),
+                ]))
+            })
+            .await;
+        let gen_before = map.generation();
+
+        // One receipt naming two present devices and one the map doesn't hold:
+        // both present flip cold, the absent one is skipped, and the whole batch
+        // advances the generation exactly once (not once per device).
+        let d0: Jid = "111:0@lid".parse().unwrap();
+        let d5: Jid = "111:5@lid".parse().unwrap();
+        let absent: Jid = "333:0@lid".parse().unwrap();
+        c.mark_forgotten(group, &[d0, d5, absent]).await;
+
+        assert_eq!(map.device_has_key("111", 0), Some(false));
+        assert_eq!(map.device_has_key("111", 5), Some(false));
+        assert_eq!(map.device_has_key("222", 0), Some(true));
+        assert_eq!(
+            map.generation(),
+            gen_before + 1,
+            "a batch of flips bumps the generation exactly once"
+        );
+    }
+
+    #[test]
+    fn warm_gate_requires_both_device_and_primary() {
+        // WA Web's ParticipantStore gate: a device is warm only when it AND its
+        // primary (device 0) both hold the key. This is the per-device SKDM
+        // targeting decision, so pin every branch.
+        let m = SenderKeyDeviceMap::from_db_rows(&[
+            ("111:0@lid".to_string(), true),  // primary warm
+            ("111:5@lid".to_string(), true),  // secondary warm
+            ("222:0@lid".to_string(), false), // primary cold
+            ("222:7@lid".to_string(), true),  // secondary warm, primary cold
+            ("333:9@lid".to_string(), true),  // secondary warm, no primary row
+        ]);
+
+        // Device and its primary both warm.
+        assert!(m.device_and_primary_warm("111", 5));
+        assert!(m.device_and_primary_warm("111", 0));
+        // Secondary is warm but the primary is cold: the whole user is cold.
+        assert!(!m.device_and_primary_warm("222", 7));
+        // The primary itself when cold.
+        assert!(!m.device_and_primary_warm("222", 0));
+        // Secondary present but the primary row is absent: absent counts as cold.
+        assert!(!m.device_and_primary_warm("333", 9));
+        // A user the map never saw is cold.
+        assert!(!m.device_and_primary_warm("999", 0));
+    }
+
+    #[test]
+    fn from_db_rows_skips_malformed_and_keeps_valid() {
+        // A corrupt or partially-migrated row must not poison the whole map: bad
+        // JIDs are skipped (logged) and the valid devices still index correctly.
+        let m = SenderKeyDeviceMap::from_db_rows(&[
+            ("111:0@lid".to_string(), true),
+            ("not-a-jid".to_string(), true), // unknown server → skipped
+            ("111:xx@lid".to_string(), true), // non-numeric device → skipped
+            ("222:0@lid".to_string(), false),
+        ]);
+
+        assert_eq!(m.device_has_key("111", 0), Some(true));
+        assert_eq!(m.device_has_key("222", 0), Some(false));
+        // The malformed rows produced no entries at all.
+        assert_eq!(m.device_has_key("not-a-jid", 0), None);
+        assert_eq!(m.device_has_key("111", 1), None);
+    }
+
+    #[tokio::test]
     async fn mark_forgotten_is_noop_on_cache_miss() {
         let c = cache();
         let dev: Jid = "111:0@lid".parse().unwrap();

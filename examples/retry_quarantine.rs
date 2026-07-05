@@ -180,6 +180,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn bounds_per_pair_and_isolates_pairs() {
@@ -218,5 +219,47 @@ mod tests {
         assert!(q.admit(&g, &a, 1));
         assert!(!q.admit(&g, &a, 1), "tracked pair still bounded");
         assert!(q.admit(&g, &b, 1), "new pair fails open past cap");
+    }
+
+    // The bucket is the seam where time matters; `admit` reads the real clock,
+    // so the refill/clamp claims are driven here with explicit `now` values.
+
+    #[test]
+    fn refill_restores_admission_gradually() {
+        // A quarantined pair must recover, but one token at a time — a refill is
+        // not a reset, so a still-broken member cannot immediately storm again.
+        let t0 = Instant::now();
+        let (burst, refill_per_sec) = (2.0, 1.0); // 1 token/sec
+        let mut b = TokenBucket::new(burst, t0);
+
+        assert!(b.try_take(t0, burst, refill_per_sec));
+        assert!(b.try_take(t0, burst, refill_per_sec));
+        assert!(!b.try_take(t0, burst, refill_per_sec), "burst exhausted");
+
+        // One refill period later exactly one token is back.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(b.try_take(t1, burst, refill_per_sec), "one token refilled");
+        assert!(
+            !b.try_take(t1, burst, refill_per_sec),
+            "only one token, not a full reset"
+        );
+    }
+
+    #[test]
+    fn idle_does_not_accrue_beyond_burst() {
+        // An idle pair must not bank an unbounded reserve: after a long quiet
+        // spell it still gets only `burst` immediate attempts, so a member that
+        // was silent for hours cannot burst 3600 retries at once.
+        let t0 = Instant::now();
+        let (burst, refill_per_sec) = (2.0, 1.0);
+        let mut b = TokenBucket::new(burst, t0);
+
+        let much_later = t0 + Duration::from_secs(3600);
+        assert!(b.try_take(much_later, burst, refill_per_sec));
+        assert!(b.try_take(much_later, burst, refill_per_sec));
+        assert!(
+            !b.try_take(much_later, burst, refill_per_sec),
+            "tokens clamp at burst regardless of idle time"
+        );
     }
 }
