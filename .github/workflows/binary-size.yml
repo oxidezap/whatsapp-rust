@@ -21,14 +21,6 @@ env:
   RUSTC_WRAPPER: "sccache"
   CARGO_BLOAT_VERSION: "0.12.1"
   CARGO_LLVM_LINES_VERSION: "0.4.46"
-  # Identical Code Folding: fold byte-identical functions binary-wide at link
-  # time (measured ~-138 KiB stripped / -107 KiB .text on the glibc demo).
-  # Requires lld (installed below). Applied to the size proxy as the adopted
-  # link option; mirror it in the Dockerfile RUSTFLAGS to ship it on the musl
-  # image (kept separate here because musl+lld+build-std needs its own
-  # validation). `--icf=safe` folds nothing (drop-glue takes addresses) and no
-  # code in the tree relies on function-pointer identity, so `all` is used.
-  RUSTFLAGS: "-Clink-arg=-fuse-ld=lld -Clink-arg=-Wl,--icf=all"
 
 jobs:
   binary-size-pr:
@@ -70,6 +62,17 @@ jobs:
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev lld
       - name: Measure binary size
+        env:
+          # Identical Code Folding on the size proxy: fold byte-identical
+          # functions binary-wide at link time (measured ~-138 KiB stripped /
+          # -107 KiB .text on the glibc demo). Scoped to this step so the flags
+          # only apply after lld is installed (the ALSA step above adds it) —
+          # earlier steps (e.g. a cargo-binstall source fallback) must not link
+          # with lld before it exists. To ship it on the musl image, mirror the
+          # flags in the Dockerfile RUSTFLAGS (needs musl+lld+build-std check).
+          # --icf=safe folds nothing (drop-glue takes addresses) and nothing in
+          # the tree relies on function-pointer identity, so --icf=all is used.
+          RUSTFLAGS: "-Clink-arg=-fuse-ld=lld -Clink-arg=-Wl,--icf=all"
         run: python3 scripts/ci/measure_binary_size.py --out-dir size-out
 
       - name: Upload size artifacts
@@ -205,6 +208,17 @@ jobs:
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev lld
       - name: Measure binary size
+        env:
+          # Identical Code Folding on the size proxy: fold byte-identical
+          # functions binary-wide at link time (measured ~-138 KiB stripped /
+          # -107 KiB .text on the glibc demo). Scoped to this step so the flags
+          # only apply after lld is installed (the ALSA step above adds it) —
+          # earlier steps (e.g. a cargo-binstall source fallback) must not link
+          # with lld before it exists. To ship it on the musl image, mirror the
+          # flags in the Dockerfile RUSTFLAGS (needs musl+lld+build-std check).
+          # --icf=safe folds nothing (drop-glue takes addresses) and nothing in
+          # the tree relies on function-pointer identity, so --icf=all is used.
+          RUSTFLAGS: "-Clink-arg=-fuse-ld=lld -Clink-arg=-Wl,--icf=all"
         run: python3 scripts/ci/measure_binary_size.py --out-dir size-out
 
       # This artifact is the comparison baseline for PR runs.
