@@ -1094,19 +1094,26 @@ impl Client {
         own_sending_jid: &Jid,
     ) -> Option<(std::sync::Arc<wacore::send::ResolvedGroupDevices>, Vec<Jid>)> {
         let cached_map = self.skdm_device_map(group_jid).await;
+        // Load BEFORE the filter: a cold flip racing after this stamps the memo
+        // as already stale (its stored generation lags the map's), so the next
+        // read re-runs the filter. Loading after would stamp a racing flip as seen.
+        let cached_map_gen = cached_map.generation();
         match self
             .resolve_group_devices_memoized(group, group_info, own_sending_jid)
             .await
         {
             Ok(all_devices) => {
                 // Skip the O(devices) filter_skdm_targets scan when the same
-                // (devices, sender-key-map) Arc pair was already fully warm. Both
-                // Arcs swap on any warm-state or membership change, so a stale skip
-                // is impossible. Needs the device memo for a stable devices Arc.
+                // (devices, sender-key-map) Arc pair AND generation were already
+                // fully warm. The devices Arc swaps on membership change; the
+                // cached-map Arc swaps on a warm-mark invalidation; the generation
+                // catches an in-place cold flip that keeps the same Arc. So a stale
+                // skip is impossible.
                 if self.group_devices_memo_enabled
-                    && let Some((dw, cw)) = self.skdm_warm_memo.get(group).await
+                    && let Some((dw, cw, memo_gen)) = self.skdm_warm_memo.get(group).await
                     && std::ptr::eq(dw.as_ptr(), std::sync::Arc::as_ptr(&all_devices))
                     && std::ptr::eq(cw.as_ptr(), std::sync::Arc::as_ptr(&cached_map))
+                    && memo_gen == cached_map_gen
                 {
                     return Some((all_devices, Vec::new()));
                 }
@@ -1123,6 +1130,7 @@ impl Client {
                             (
                                 std::sync::Arc::downgrade(&all_devices),
                                 std::sync::Arc::downgrade(&cached_map),
+                                cached_map_gen,
                             ),
                         )
                         .await;

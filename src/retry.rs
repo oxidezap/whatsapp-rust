@@ -165,6 +165,16 @@ fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Ji
 }
 
 impl Client {
+    /// Handle an inbound `<receipt type="retry">`.
+    ///
+    /// WA Web authorizes these through `isRetryEligible` (`WAWebApiMessageInfoStore`).
+    /// We enforce the reject reasons that need no per-recipient state:
+    /// `HIGH_RETRY_COUNT` (the `MAX_RETRY_COUNT` refusal), `MESSAGE_EXPIRED` /
+    /// `RECORD_MISSING` (the recent-message cache miss), and `DEVICE_NOT_IN_DATABASE`
+    /// (`should_drop_unknown_device_retry`); identity changes are handled during
+    /// repair (reg-id mismatch + base-key collision in `update_local_signal_session`).
+    /// `ALREADY_DELIVERED` and `DEVICE_NOT_RECIPIENT` need a per-(message, device)
+    /// receipt store we do not keep, so they are a known parity gap, not enforced here.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.handle_receipt", level = "debug", skip_all, fields(chat = %receipt.source.chat.observe(), sender = %receipt.source.sender.observe(), count = tracing::field::Empty), err(Debug)))]
     pub(crate) async fn handle_retry_receipt(
         self: &Arc<Self>,
@@ -330,6 +340,23 @@ impl Client {
                 .lid
                 .as_ref()
                 .is_some_and(|our_lid| info.requester.is_same_user_as(our_lid));
+
+        // Volume-throttling inbound retries diverges from WA Web (which
+        // processes every receipt), so it is an operator opt-in, gated here
+        // before the expensive repair stages below. Own devices (`is_peer`) and
+        // DMs are never gated: dropping their retries has no safe SKDM fallback.
+        if is_group_or_status
+            && !is_peer
+            && let Some(policy) = self.retry_admission.get()
+            && !policy.admit(&info.chat, &info.requester, retry_count)
+        {
+            debug!(
+                "Retry receipt from {} in {} dropped by RetryAdmission policy",
+                info.requester.observe(),
+                info.chat.observe()
+            );
+            return Ok(());
+        }
 
         // Fetch group info (cache-first, server on miss) — used for SKDM rotation + addressing_mode.
         // Without this, a cold cache would silently default to PN semantics for LID groups.
@@ -620,7 +647,10 @@ impl Client {
                     } else {
                         "group"
                     };
-                    info!(
+                    // debug, not info: one line per retry receipt, and a broken
+                    // cohort in a large group emits tens of thousands per day
+                    // (WA Web logs the same event at its verbose LOG level).
+                    debug!(
                         "Marked {} for fresh SKDM in {} {} due to retry receipt",
                         info.requester.observe(),
                         chat_type,

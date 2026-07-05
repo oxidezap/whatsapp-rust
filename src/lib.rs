@@ -67,6 +67,7 @@ pub use client::{
 };
 pub use client::{CallError, Voip};
 pub use types::durability_hook::InboundDurabilityHook;
+pub use types::retry_admission::RetryAdmission;
 pub mod download;
 pub mod handlers;
 pub use handlers::chatstate::ChatStateEvent;

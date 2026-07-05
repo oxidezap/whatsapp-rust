@@ -30,28 +30,42 @@ impl Client {
             .and_then(|s| s.pn.as_ref())
             .map(|j| j.user.as_str());
 
-        let device_ids: Vec<String> = device_jids
+        let kept: Vec<&Jid> = device_jids
             .iter()
             .filter(|jid| {
                 !exclude_own_devices
                     || !(own_lid_user.is_some_and(|u| u == jid.user)
                         || own_pn_user.is_some_and(|u| u == jid.user))
             })
-            .map(ToString::to_string)
             .collect();
 
-        if device_ids.is_empty() {
+        if kept.is_empty() {
             return Ok(());
         }
 
-        let entries: Vec<(&str, bool)> = device_ids
-            .iter()
-            .map(|jid| (jid.as_str(), has_key))
-            .collect();
+        let device_ids: Vec<String> = kept.iter().map(|jid| jid.to_string()).collect();
+        let entries: Vec<(&str, bool)> = device_ids.iter().map(|s| (s.as_str(), has_key)).collect();
         self.persistence_manager
             .set_sender_key_status(group_jid, &entries)
             .await?;
-        self.sender_key_device_cache.invalidate(group_jid).await;
+
+        if has_key {
+            // Marking devices warm can introduce (user, device) pairs the cached
+            // map doesn't have yet, so drop it and let the next send rebuild from
+            // the DB write above.
+            self.sender_key_device_cache.invalidate(group_jid).await;
+        } else {
+            // Marking cold flips existing entries in place and bumps the map's
+            // generation (no whole-group re-read on the next send), matching WA
+            // Web's per-device markForgetSenderKey. The generation bump is what
+            // the skdm_warm_memo compares, so a warm send re-runs its target
+            // filter and re-sends the now-cold device's SKDM — no separate memo
+            // invalidation, hence no cross-cache ordering window.
+            let jids: Vec<Jid> = kept.into_iter().cloned().collect();
+            self.sender_key_device_cache
+                .mark_forgotten(group_jid, &jids)
+                .await;
+        }
         Ok(())
     }
 
@@ -366,5 +380,150 @@ impl Client {
                 log::warn!("Failed to store sent message to DB: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sender_key_device_cache::SenderKeyDeviceMap;
+    use crate::test_utils::create_test_client;
+    use std::sync::Arc;
+    use wacore_binary::Jid;
+
+    // A cold mark flips has_key in place, keeping the same cached_map Arc, so the
+    // skdm_warm_memo cannot notice via pointer identity. It bumps the map's
+    // generation instead; this asserts the client cold path advances that
+    // generation (and flips the device) so a warm send re-runs its target filter
+    // and re-sends the now-cold device's SKDM.
+    #[tokio::test]
+    async fn cold_mark_bumps_map_generation() {
+        let client = create_test_client().await;
+        let group = "120363000000000001@g.us";
+
+        let map = client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                Arc::new(SenderKeyDeviceMap::from_db_rows(&[(
+                    "111:0@lid".to_string(),
+                    true,
+                )]))
+            })
+            .await;
+        let gen_before = map.generation();
+
+        let device: Jid = "111:0@lid".parse().unwrap();
+        client
+            .mark_forget_sender_key(group, std::slice::from_ref(&device))
+            .await
+            .unwrap();
+
+        // Same Arc (in-place) but a fresh generation, so any memo stamped with
+        // gen_before is now detectably stale.
+        let map_after = client
+            .sender_key_device_cache
+            .get_or_init(group, async { panic!("cache should still hold the group") })
+            .await;
+        assert!(
+            Arc::ptr_eq(&map, &map_after),
+            "in-place flip keeps the same Arc"
+        );
+        assert_ne!(
+            map_after.generation(),
+            gen_before,
+            "cold mark must advance the generation"
+        );
+        assert_eq!(
+            map_after.device_has_key("111", 0),
+            Some(false),
+            "device flipped cold"
+        );
+    }
+
+    // A retry receipt for a group we're in can name our own device alongside the
+    // broken member. WA Web marks fresh SKDM only for other members
+    // (`!isMeDevice`), so the cold mark must flip the member and never our own
+    // device — otherwise an inbound retry could tear down our own group session.
+    #[tokio::test]
+    async fn cold_mark_excludes_own_devices() {
+        let client = create_test_client().await;
+        let own_lid: Jid = "888000888000888:3@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+
+        let group = "120363000000000001@g.us";
+        let map = client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                Arc::new(SenderKeyDeviceMap::from_db_rows(&[
+                    ("888000888000888:3@lid".to_string(), true), // our own device
+                    ("111000111000111:0@lid".to_string(), true), // broken member
+                ]))
+            })
+            .await;
+        let gen_before = map.generation();
+
+        let member: Jid = "111000111000111:0@lid".parse().unwrap();
+        client
+            .mark_forget_sender_key(group, &[own_lid.clone(), member])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            map.device_has_key("111000111000111", 0),
+            Some(false),
+            "the member device is flipped cold"
+        );
+        assert_eq!(
+            map.device_has_key("888000888000888", 3),
+            Some(true),
+            "our own device is excluded, never marked cold"
+        );
+        assert_ne!(
+            map.generation(),
+            gen_before,
+            "the member flip still advances the generation"
+        );
+    }
+
+    // When every named device is our own, nothing is kept: no DB write, no flip,
+    // and (crucially) no generation bump that would churn the warm memo.
+    #[tokio::test]
+    async fn cold_mark_of_only_own_devices_is_noop() {
+        let client = create_test_client().await;
+        let own_lid: Jid = "888000888000888:3@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+
+        let group = "120363000000000001@g.us";
+        let map = client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                Arc::new(SenderKeyDeviceMap::from_db_rows(&[(
+                    "888000888000888:3@lid".to_string(),
+                    true,
+                )]))
+            })
+            .await;
+        let gen_before = map.generation();
+
+        client
+            .mark_forget_sender_key(group, std::slice::from_ref(&own_lid))
+            .await
+            .unwrap();
+
+        assert_eq!(map.device_has_key("888000888000888", 3), Some(true));
+        assert_eq!(
+            map.generation(),
+            gen_before,
+            "excluding all named devices leaves the map untouched"
+        );
     }
 }

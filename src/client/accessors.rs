@@ -83,6 +83,24 @@ impl Client {
         self.resend_rate_limiter.set_rate(burst, refill_per_min);
     }
 
+    /// Register a [`RetryAdmission`] policy: an opt-in gate that can drop inbound
+    /// group/status retry receipts from other accounts before any repair work
+    /// runs. Unset (the default) admits every receipt, matching WhatsApp Web,
+    /// with zero overhead on the receive path.
+    ///
+    /// Set once, before connecting; a later call is ignored and returns `false`
+    /// (the already-registered policy stays in effect). Live tuning belongs
+    /// inside the policy itself (e.g. atomics), not in re-registration. See
+    /// `examples/retry_quarantine.rs`.
+    ///
+    /// [`RetryAdmission`]: crate::types::retry_admission::RetryAdmission
+    pub fn set_retry_admission(
+        &self,
+        policy: Arc<dyn crate::types::retry_admission::RetryAdmission>,
+    ) -> bool {
+        self.retry_admission.set(policy).is_ok()
+    }
+
     /// Cumulative wire I/O and activity counters for this client session.
     ///
     /// Always available, no feature gate: recording costs one relaxed atomic

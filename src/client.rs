@@ -724,6 +724,13 @@ pub struct Client {
     pub(crate) inbound_durability_hook:
         std::sync::OnceLock<Arc<dyn crate::types::durability_hook::InboundDurabilityHook>>,
 
+    /// Optional retry-receipt admission policy (see
+    /// [`crate::types::retry_admission::RetryAdmission`]): an operator opt-in to
+    /// drop some group/status retries. `None` (default) keeps WA Web behavior
+    /// with a single lock-free `OnceLock::get` on the receive path.
+    pub(crate) retry_admission:
+        std::sync::OnceLock<Arc<dyn crate::types::retry_admission::RetryAdmission>>,
+
     /// Chat state (typing indicator) handlers registered by external consumers.
     /// Each handler receives a `ChatStateEvent` describing the chat, optional participant and state.
     pub(crate) chatstate_handlers: Arc<RwLock<Vec<ChatStateHandler>>>,
@@ -768,13 +775,16 @@ pub struct Client {
     pub(crate) group_distribution_locks: Cache<Jid, Arc<async_lock::Mutex<()>>>,
 
     /// Last `(devices, sender-key-device map)` Arc pair with an empty `needs_skdm`,
-    /// so a warm repeat send skips `filter_skdm_targets`. `Weak` keeps the pointer
-    /// comparison ABA-safe, matching `GroupDevicesMemo`.
+    /// plus the map's generation at that point, so a warm repeat send skips
+    /// `filter_skdm_targets`. `Weak` keeps the pointer comparison ABA-safe
+    /// (matching `GroupDevicesMemo`); the generation catches an in-place cold
+    /// flip that leaves the `Arc` pointer unchanged.
     pub(crate) skdm_warm_memo: Cache<
         Jid,
         (
             std::sync::Weak<wacore::send::ResolvedGroupDevices>,
             std::sync::Weak<crate::sender_key_device_cache::SenderKeyDeviceMap>,
+            u64,
         ),
     >,
 
