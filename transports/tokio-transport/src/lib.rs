@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, warn};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio_websockets::{ClientBuilder, Message, WebSocketStream};
@@ -40,20 +40,16 @@ fn transport_resource_estimate() -> wacore::stats::TransportResourceReport {
     }
 }
 
-static CRYPTO_PROVIDER_INIT: Once = Once::new();
-
 /// Returns the default TLS connector used by [`TokioWebSocketTransportFactory`].
 ///
 /// Useful as a starting point when users need to inspect or replicate the
 /// default TLS configuration before customizing it via [`TokioWebSocketTransportFactory::with_connector`].
 ///
-/// On first call, installs the pure-Rust RustCrypto provider as the global
-/// rustls crypto provider (no-op if one is already installed).
+/// Builds the `ClientConfig` with an explicit pure-Rust RustCrypto provider (via
+/// `builder_with_provider`) rather than the process-wide default, so the
+/// transport's crypto backend can't be silently overridden by whatever else
+/// installed a global default first (e.g. the voip DTLS path installs `ring`).
 pub fn default_tls_connector() -> Connector {
-    CRYPTO_PROVIDER_INIT.call_once(|| {
-        let _ = rustls_rustcrypto::provider().install_default();
-    });
-
     #[cfg(feature = "danger-skip-tls-verify")]
     {
         use std::sync::Arc as StdArc;
@@ -112,10 +108,14 @@ pub fn default_tls_connector() -> Connector {
             }
         }
 
-        let config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(StdArc::new(NoVerifier))
-            .with_no_client_auth();
+        let config = rustls::ClientConfig::builder_with_provider(StdArc::new(
+            rustls_rustcrypto::provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("RustCrypto provider supports the default TLS protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(StdArc::new(NoVerifier))
+        .with_no_client_auth();
 
         Connector::Rustls(TlsConnector::from(StdArc::new(config)))
     }
@@ -128,9 +128,13 @@ pub fn default_tls_connector() -> Connector {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let config = rustls::ClientConfig::builder_with_provider(StdArc::new(
+            rustls_rustcrypto::provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("RustCrypto provider supports the default TLS protocol versions")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
 
         Connector::Rustls(TlsConnector::from(StdArc::new(config)))
     }

@@ -82,10 +82,9 @@ log = "0.4"
 metrics = "0.24"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 rand = "0.10"
-# Pure-Rust rustls CryptoProvider (RustCrypto). Replaces `ring` so the default
-# build carries no C/asm crypto backend and reuses the AES/SHA/curve primitives
-# already linked for the Signal layer. NOTE: experimental (0.0.x); installed by
-# the tokio transport and ureq HTTP client crates.
+# rustls CryptoProvider with no C/asm build dependency (unlike `ring`/aws-lc-rs),
+# so the default build stays pure-Rust and cross-compiles cleanly (notably wasm).
+# Pinned to a pre-release; the real-server TLS handshake is not yet validated.
 rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["std", "tls12", "zeroize"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
