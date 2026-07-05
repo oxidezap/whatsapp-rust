@@ -165,6 +165,16 @@ fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Ji
 }
 
 impl Client {
+    /// Handle an inbound `<receipt type="retry">`.
+    ///
+    /// WA Web authorizes these through `isRetryEligible` (`WAWebApiMessageInfoStore`).
+    /// We enforce the reject reasons that need no per-recipient state:
+    /// `HIGH_RETRY_COUNT` (the `MAX_RETRY_COUNT` refusal), `MESSAGE_EXPIRED` /
+    /// `RECORD_MISSING` (the recent-message cache miss), and `DEVICE_NOT_IN_DATABASE`
+    /// (`should_drop_unknown_device_retry`); identity changes are handled during
+    /// repair (reg-id mismatch + base-key collision in `update_local_signal_session`).
+    /// `ALREADY_DELIVERED` and `DEVICE_NOT_RECIPIENT` need a per-(message, device)
+    /// receipt store we do not keep, so they are a known parity gap, not enforced here.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.handle_receipt", level = "debug", skip_all, fields(chat = %receipt.source.chat.observe(), sender = %receipt.source.sender.observe(), count = tracing::field::Empty), err(Debug)))]
     pub(crate) async fn handle_retry_receipt(
         self: &Arc<Self>,
