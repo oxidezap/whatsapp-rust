@@ -134,8 +134,11 @@ impl SenderKeyDeviceCache {
         for jid in devices {
             if let Some(by_device) = map.devices.get(jid.user.as_str())
                 && let Some(flag) = by_device.get(&jid.device)
+                && flag.swap(false, Ordering::Relaxed)
             {
-                flag.store(false, Ordering::Relaxed);
+                // Only a real high→low transition is a warm-state change; a
+                // device already cold must not advance the generation, or a
+                // retry storm would churn the warm memo with no-op misses.
                 changed = true;
             }
         }
@@ -243,6 +246,15 @@ mod tests {
             map.generation(),
             gen_after,
             "no-op mark must not bump generation"
+        );
+
+        // Re-marking an already-cold device it DOES hold is also a no-op: the
+        // flag is already false, so a retry storm must not churn the generation.
+        c.mark_forgotten(group, std::slice::from_ref(&dev5)).await;
+        assert_eq!(
+            map.generation(),
+            gen_after,
+            "duplicate cold mark must not bump generation"
         );
     }
 
