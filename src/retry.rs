@@ -331,6 +331,27 @@ impl Client {
                 .as_ref()
                 .is_some_and(|our_lid| info.requester.is_same_user_as(our_lid));
 
+        // Opt-in admission policy (default: none → admit all, matching WA Web,
+        // which never volume-throttles inbound retries). Consulted only for
+        // group/status retries from other accounts; our own companion devices
+        // (`is_peer`) always pass so their group session can rebuild. A `false`
+        // verdict drops the receipt before all repair work — the group-info
+        // fetch, the unknown-device rotateKey block, markForgetSenderKey,
+        // key-bundle processing and the resend — releasing the pending-retry
+        // scopeguard normally on the early return. Unset is one OnceLock read.
+        if is_group_or_status
+            && !is_peer
+            && let Some(policy) = self.retry_admission.get().cloned()
+            && !policy.admit(&info.chat, &info.requester, retry_count).await
+        {
+            debug!(
+                "Retry receipt from {} in {} dropped by RetryAdmission policy",
+                info.requester.observe(),
+                info.chat.observe()
+            );
+            return Ok(());
+        }
+
         // Fetch group info (cache-first, server on miss) — used for SKDM rotation + addressing_mode.
         // Without this, a cold cache would silently default to PN semantics for LID groups.
         let cached_group_info = if info.chat.is_group() {
@@ -620,7 +641,10 @@ impl Client {
                     } else {
                         "group"
                     };
-                    info!(
+                    // debug, not info: one line per retry receipt, and a broken
+                    // cohort in a large group emits tens of thousands per day
+                    // (WA Web logs the same event at its verbose LOG level).
+                    debug!(
                         "Marked {} for fresh SKDM in {} {} due to retry receipt",
                         info.requester.observe(),
                         chat_type,
