@@ -284,6 +284,30 @@ opt-level = "z"
 opt-level = "z"
 [profile.release.package.http]
 opt-level = "z"
+# rustls-rustcrypto's asymmetric handshake + cert-parsing crates. These run only
+# during the TLS handshake (RSA/ECDSA cert verify, ECDHE key agreement, DER
+# decoding) — once per connection, never per record — and reach the tree solely
+# via rustls-rustcrypto (confirmed with `cargo tree -e no-dev -i`), so the
+# per-frame record ciphers (aes-gcm/chacha20poly1305) are untouched at their
+# default opt-level. Same PKI category as rustls-webpki above.
+[profile.release.package.rsa]
+opt-level = "z"
+[profile.release.package.num-bigint-dig]
+opt-level = "z"
+[profile.release.package.crypto-bigint]
+opt-level = "z"
+[profile.release.package.p256]
+opt-level = "z"
+[profile.release.package.p384]
+opt-level = "z"
+[profile.release.package.primeorder]
+opt-level = "z"
+[profile.release.package.elliptic-curve]
+opt-level = "z"
+[profile.release.package.ecdsa]
+opt-level = "z"
+[profile.release.package.der]
+opt-level = "z"
 # s = data-path framing kept a notch faster than z: low throughput for a chat
 # client, but still touched on every frame/record.
 [profile.release.package.rustls]
