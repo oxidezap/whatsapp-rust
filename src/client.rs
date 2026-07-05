@@ -775,13 +775,16 @@ pub struct Client {
     pub(crate) group_distribution_locks: Cache<Jid, Arc<async_lock::Mutex<()>>>,
 
     /// Last `(devices, sender-key-device map)` Arc pair with an empty `needs_skdm`,
-    /// so a warm repeat send skips `filter_skdm_targets`. `Weak` keeps the pointer
-    /// comparison ABA-safe, matching `GroupDevicesMemo`.
+    /// plus the map's generation at that point, so a warm repeat send skips
+    /// `filter_skdm_targets`. `Weak` keeps the pointer comparison ABA-safe
+    /// (matching `GroupDevicesMemo`); the generation catches an in-place cold
+    /// flip that leaves the `Arc` pointer unchanged.
     pub(crate) skdm_warm_memo: Cache<
         Jid,
         (
             std::sync::Weak<wacore::send::ResolvedGroupDevices>,
             std::sync::Weak<crate::sender_key_device_cache::SenderKeyDeviceMap>,
+            u64,
         ),
     >,
 

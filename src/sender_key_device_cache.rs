@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use portable_atomic::AtomicU64;
+
 use crate::cache::Cache;
 use crate::cache_config::CacheEntryConfig;
 use wacore_binary::Jid;
@@ -14,11 +16,16 @@ use wacore_binary::Jid;
 /// `has_key` is an [`AtomicBool`] so `markForgetSenderKey` can flip one device
 /// cold in place, matching WA Web's per-device participant-record update,
 /// instead of invalidating the whole group and forcing the next send to re-read
-/// and re-parse every row from the DB.
+/// and re-parse every row from the DB. An in-place flip keeps the same `Arc`, so
+/// `generation` is the version stamp the `skdm_warm_memo` compares to notice the
+/// change (pointer identity alone cannot).
 #[derive(Debug)]
 pub(crate) struct SenderKeyDeviceMap {
     /// user → (device_id → has_key)
     devices: HashMap<Arc<str>, HashMap<u16, AtomicBool>>,
+    /// Bumped on every in-place warm-state change. Same freshness contract the
+    /// device-registry generation gives membership.
+    generation: AtomicU64,
 }
 
 impl SenderKeyDeviceMap {
@@ -41,7 +48,18 @@ impl SenderKeyDeviceMap {
             }
         }
 
-        Self { devices }
+        Self {
+            devices,
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Monotonic version stamp for the warm state. The `skdm_warm_memo` records
+    /// this value and rejects its skip once it advances, so an in-place cold
+    /// flip (which does not swap the `Arc`) is still detected. Load this BEFORE
+    /// reading device state, so a racing flip stamps the memo as already stale.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -101,7 +119,8 @@ impl SenderKeyDeviceCache {
     }
 
     /// Flip the given devices to `has_key=false` in place, if this group's map
-    /// is cached. Matches WA Web's per-device `markForgetSenderKey`: no
+    /// is cached, and bump the map's generation so the `skdm_warm_memo` re-runs
+    /// its target filter. Matches WA Web's per-device `markForgetSenderKey`: no
     /// whole-group invalidation, so a storm of retry receipts never forces the
     /// next send to re-read every row. A device absent from the map is already
     /// cold, so it is skipped. The DB write is the source of truth; this only
@@ -111,12 +130,19 @@ impl SenderKeyDeviceCache {
         let Some(map) = self.inner.get(group_jid).await else {
             return;
         };
+        let mut changed = false;
         for jid in devices {
             if let Some(by_device) = map.devices.get(jid.user.as_str())
                 && let Some(flag) = by_device.get(&jid.device)
             {
                 flag.store(false, Ordering::Relaxed);
+                changed = true;
             }
+        }
+        if changed {
+            // Release publishes the flip(s); the memo's Acquire load of the
+            // generation then also observes the cold state.
+            map.generation.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -178,14 +204,16 @@ mod tests {
     async fn mark_forgotten_flips_in_place_without_invalidating() {
         let c = cache();
         let group = "120363000000000001@g.us";
-        c.get_or_init(group, async {
-            Arc::new(SenderKeyDeviceMap::from_db_rows(&[
-                ("111:0@lid".to_string(), true),
-                ("111:5@lid".to_string(), true),
-                ("222:0@lid".to_string(), true),
-            ]))
-        })
-        .await;
+        let map0 = c
+            .get_or_init(group, async {
+                Arc::new(SenderKeyDeviceMap::from_db_rows(&[
+                    ("111:0@lid".to_string(), true),
+                    ("111:5@lid".to_string(), true),
+                    ("222:0@lid".to_string(), true),
+                ]))
+            })
+            .await;
+        let gen_before = map0.generation();
 
         let dev5: Jid = "111:5@lid".parse().unwrap();
         c.mark_forgotten(group, std::slice::from_ref(&dev5)).await;
@@ -202,6 +230,20 @@ mod tests {
         assert_eq!(map.device_has_key("222", 0), Some(true));
         assert!(!map.device_and_primary_warm("111", 5));
         assert!(map.device_and_primary_warm("222", 0));
+        // Same Arc, advanced generation: the warm memo detects the change.
+        assert!(Arc::ptr_eq(&map0, &map));
+        assert_ne!(map.generation(), gen_before);
+
+        // A mark for a device the map doesn't hold changes nothing, so the
+        // generation must not advance (no spurious memo miss).
+        let gen_after = map.generation();
+        let absent: Jid = "999:0@lid".parse().unwrap();
+        c.mark_forgotten(group, std::slice::from_ref(&absent)).await;
+        assert_eq!(
+            map.generation(),
+            gen_after,
+            "no-op mark must not bump generation"
+        );
     }
 
     #[tokio::test]

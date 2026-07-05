@@ -55,20 +55,16 @@ impl Client {
             // the DB write above.
             self.sender_key_device_cache.invalidate(group_jid).await;
         } else {
-            // Marking cold flips existing entries in place (no whole-group
-            // re-read on the next send), matching WA Web's per-device
-            // markForgetSenderKey. But `skdm_warm_memo` skips filter_skdm_targets
-            // while the cached_map Arc is pointer-identical, and an in-place flip
-            // does not swap that Arc — so drop the memo entry too, or the next
-            // warm send would short-circuit past the now-cold device and never
-            // redistribute its SKDM.
+            // Marking cold flips existing entries in place and bumps the map's
+            // generation (no whole-group re-read on the next send), matching WA
+            // Web's per-device markForgetSenderKey. The generation bump is what
+            // the skdm_warm_memo compares, so a warm send re-runs its target
+            // filter and re-sends the now-cold device's SKDM — no separate memo
+            // invalidation, hence no cross-cache ordering window.
             let jids: Vec<Jid> = kept.into_iter().cloned().collect();
             self.sender_key_device_cache
                 .mark_forgotten(group_jid, &jids)
                 .await;
-            if let Ok(group) = group_jid.parse::<Jid>() {
-                self.skdm_warm_memo.invalidate(&group).await;
-            }
         }
         Ok(())
     }
@@ -389,38 +385,57 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use crate::sender_key_device_cache::SenderKeyDeviceMap;
     use crate::test_utils::create_test_client;
+    use std::sync::Arc;
     use wacore_binary::Jid;
 
-    // A cold mark flips has_key in place without swapping the cached_map Arc.
-    // The skdm_warm_memo short-circuits filter_skdm_targets on Arc pointer
-    // identity, so it must be dropped or the next warm send skips the now-cold
-    // device and never redistributes its SKDM.
+    // A cold mark flips has_key in place, keeping the same cached_map Arc, so the
+    // skdm_warm_memo cannot notice via pointer identity. It bumps the map's
+    // generation instead; this asserts the client cold path advances that
+    // generation (and flips the device) so a warm send re-runs its target filter
+    // and re-sends the now-cold device's SKDM.
     #[tokio::test]
-    async fn cold_mark_invalidates_skdm_warm_memo() {
+    async fn cold_mark_bumps_map_generation() {
         let client = create_test_client().await;
-        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let group = "120363000000000001@g.us";
 
-        // Seed a warm-memo entry for the group (contents irrelevant to this
-        // test; empty Weaks stand in for the (devices, cached_map) pair).
-        client
-            .skdm_warm_memo
-            .insert(
-                group.clone(),
-                (std::sync::Weak::new(), std::sync::Weak::new()),
-            )
+        let map = client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                Arc::new(SenderKeyDeviceMap::from_db_rows(&[(
+                    "111:0@lid".to_string(),
+                    true,
+                )]))
+            })
             .await;
-        assert!(client.skdm_warm_memo.get(&group).await.is_some());
+        let gen_before = map.generation();
 
         let device: Jid = "111:0@lid".parse().unwrap();
         client
-            .mark_forget_sender_key(&group.to_string(), std::slice::from_ref(&device))
+            .mark_forget_sender_key(group, std::slice::from_ref(&device))
             .await
             .unwrap();
 
+        // Same Arc (in-place) but a fresh generation, so any memo stamped with
+        // gen_before is now detectably stale.
+        let map_after = client
+            .sender_key_device_cache
+            .get_or_init(group, async { panic!("cache should still hold the group") })
+            .await;
         assert!(
-            client.skdm_warm_memo.get(&group).await.is_none(),
-            "cold mark must invalidate the warm memo so the cold device is re-targeted"
+            Arc::ptr_eq(&map, &map_after),
+            "in-place flip keeps the same Arc"
+        );
+        assert_ne!(
+            map_after.generation(),
+            gen_before,
+            "cold mark must advance the generation"
+        );
+        assert_eq!(
+            map_after.device_has_key("111", 0),
+            Some(false),
+            "device flipped cold"
         );
     }
 }
