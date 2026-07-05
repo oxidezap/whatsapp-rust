@@ -7431,7 +7431,6 @@ async fn app_state_sync_key_share_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "AKS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .clone()
         .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
         .await
         .unwrap();
@@ -7448,7 +7447,6 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .clone()
         .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
         .await
         .unwrap();
@@ -7497,7 +7495,6 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "LMS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .clone()
         .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
         .await
         .unwrap();
@@ -7514,7 +7511,6 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .clone()
         .handle_decrypted_plaintext("msg", &padded, 2, &Arc::new(info))
         .await
         .unwrap();
@@ -10257,5 +10253,156 @@ async fn addon_decrypts_right_after_capture_without_flush() {
     assert!(
         out.is_some(),
         "an add-on right after the capture must find the secret"
+    );
+}
+
+// ===========================================================================
+// Empirical steady-state session-decrypt benchmark (ignored; run explicitly).
+//
+//   cargo test -p whatsapp-rust --release bench_session_decrypt_throughput \
+//       -- --ignored --nocapture
+//
+// Wall-clock gives throughput; for deterministic CPU-instructions and
+// per-callsite allocations run the SAME test binary under valgrind
+// (callgrind / dhat) with a small BENCH_N.
+// ===========================================================================
+
+async fn bench_feed(
+    client: &Arc<Client>,
+    peer: &Jid,
+    enc_type: &'static str,
+    bytes: Vec<u8>,
+) -> bool {
+    let enc_node = NodeBuilder::new("enc")
+        .attr("type", enc_type)
+        .bytes(bytes)
+        .build();
+    let enc_ref = enc_node.as_node_ref();
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let info = Arc::new(MessageInfo {
+        source: crate::types::message::MessageSource {
+            sender: peer.clone(),
+            chat: peer.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let outcome = client
+        .clone()
+        .process_session_enc_batch(
+            &payloads,
+            &info,
+            peer,
+            crate::types::events::DecryptFailMode::Show,
+        )
+        .await;
+    outcome.decrypted && !outcome.undecryptable
+}
+
+fn bench_vm_kb(key: &str) -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with(key))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "benchmark: run explicitly with --ignored --nocapture"]
+async fn bench_session_decrypt_throughput() {
+    let n: usize = std::env::var("BENCH_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000);
+    let warmup: usize = std::env::var("BENCH_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+
+    let client = crate::test_utils::create_test_client_with_name("bench_decrypt").await;
+    ensure_bob_paired(&client).await;
+    let (bundle, _bob) = bobs_prekey_bundle(&client).await;
+    let bob_addr = {
+        let s = client.persistence_manager.get_device_snapshot();
+        s.lid
+            .as_ref()
+            .or(s.pn.as_ref())
+            .expect("own jid")
+            .to_protocol_address()
+    };
+
+    let mut alice = AlicePeer::new("10000000000001:0@s.whatsapp.net").await;
+    alice.install_bob_session(&bob_addr, &bundle).await;
+
+    // One real pkmsg decrypt to establish Bob's reciprocal session.
+    let pkmsg = alice.encrypt_text(&bob_addr, "establish").await;
+    let pk_bytes = match &pkmsg {
+        CiphertextMessage::PreKeySignalMessage(m) => m.serialized().to_vec(),
+        _ => panic!("first message must be pkmsg"),
+    };
+    assert!(
+        bench_feed(&client, &alice.jid, "pkmsg", pk_bytes).await,
+        "establish decrypt must succeed"
+    );
+
+    // Steady state: force plain SignalMessages (the common case) from here on.
+    {
+        let record = alice
+            .sessions
+            .0
+            .get_mut(&bob_addr)
+            .expect("alice session for bob");
+        if let Some(state) = record.session_state_mut() {
+            state.clear_unacknowledged_pre_key_message();
+        }
+    }
+
+    // Pre-encrypt warmup + N steady-state `msg` ciphertexts (Alice ratchets).
+    let total = warmup + n;
+    let mut msgs: Vec<Vec<u8>> = Vec::with_capacity(total);
+    for i in 0..total {
+        let ct = alice
+            .encrypt_text(&bob_addr, &format!("benchmark payload {i}"))
+            .await;
+        match ct {
+            CiphertextMessage::SignalMessage(m) => msgs.push(m.serialized().to_vec()),
+            other => panic!(
+                "expected steady-state msg, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    for b in msgs.iter().take(warmup) {
+        assert!(
+            bench_feed(&client, &alice.jid, "msg", b.clone()).await,
+            "warmup decrypt"
+        );
+    }
+
+    let rss0 = bench_vm_kb("VmRSS");
+    let t0 = wacore::time::Instant::now();
+    let mut ok = 0usize;
+    for b in msgs.iter().skip(warmup) {
+        if bench_feed(&client, &alice.jid, "msg", b.clone()).await {
+            ok += 1;
+        }
+    }
+    let elapsed = t0.elapsed();
+    let rss1 = bench_vm_kb("VmRSS");
+    let hwm = bench_vm_kb("VmHWM");
+
+    assert_eq!(ok, n, "all steady-state messages must decrypt");
+    let per_ns = elapsed.as_nanos() as f64 / n as f64;
+    let thrpt = n as f64 / elapsed.as_secs_f64();
+    println!(
+        "\n=== BENCH session decrypt (msg) ===\n\
+         n={n} elapsed={elapsed:.2?} per_msg={per_ns:.0}ns throughput={thrpt:.0} msg/s\n\
+         rss_start={rss0}KB rss_end={rss1}KB rss_delta={}KB vm_hwm={hwm}KB\n",
+        rss1.saturating_sub(rss0)
     );
 }
