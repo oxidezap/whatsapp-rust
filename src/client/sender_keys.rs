@@ -55,13 +55,20 @@ impl Client {
             // the DB write above.
             self.sender_key_device_cache.invalidate(group_jid).await;
         } else {
-            // Marking cold only flips existing entries: update them in place so a
-            // retry-receipt storm never forces a whole-group re-read on the next
-            // send. Matches WA Web's per-device markForgetSenderKey.
+            // Marking cold flips existing entries in place (no whole-group
+            // re-read on the next send), matching WA Web's per-device
+            // markForgetSenderKey. But `skdm_warm_memo` skips filter_skdm_targets
+            // while the cached_map Arc is pointer-identical, and an in-place flip
+            // does not swap that Arc — so drop the memo entry too, or the next
+            // warm send would short-circuit past the now-cold device and never
+            // redistribute its SKDM.
             let jids: Vec<Jid> = kept.into_iter().cloned().collect();
             self.sender_key_device_cache
                 .mark_forgotten(group_jid, &jids)
                 .await;
+            if let Ok(group) = group_jid.parse::<Jid>() {
+                self.skdm_warm_memo.invalidate(&group).await;
+            }
         }
         Ok(())
     }
@@ -377,5 +384,43 @@ impl Client {
                 log::warn!("Failed to store sent message to DB: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_utils::create_test_client;
+    use wacore_binary::Jid;
+
+    // A cold mark flips has_key in place without swapping the cached_map Arc.
+    // The skdm_warm_memo short-circuits filter_skdm_targets on Arc pointer
+    // identity, so it must be dropped or the next warm send skips the now-cold
+    // device and never redistributes its SKDM.
+    #[tokio::test]
+    async fn cold_mark_invalidates_skdm_warm_memo() {
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+
+        // Seed a warm-memo entry for the group (contents irrelevant to this
+        // test; empty Weaks stand in for the (devices, cached_map) pair).
+        client
+            .skdm_warm_memo
+            .insert(
+                group.clone(),
+                (std::sync::Weak::new(), std::sync::Weak::new()),
+            )
+            .await;
+        assert!(client.skdm_warm_memo.get(&group).await.is_some());
+
+        let device: Jid = "111:0@lid".parse().unwrap();
+        client
+            .mark_forget_sender_key(&group.to_string(), std::slice::from_ref(&device))
+            .await
+            .unwrap();
+
+        assert!(
+            client.skdm_warm_memo.get(&group).await.is_none(),
+            "cold mark must invalidate the warm memo so the cold device is re-targeted"
+        );
     }
 }
