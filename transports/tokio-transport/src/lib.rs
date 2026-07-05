@@ -108,14 +108,13 @@ pub fn default_tls_connector() -> Connector {
             }
         }
 
-        let config = rustls::ClientConfig::builder_with_provider(StdArc::new(
-            rustls_rustcrypto::provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("RustCrypto provider supports the default TLS protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(StdArc::new(NoVerifier))
-        .with_no_client_auth();
+        let config =
+            rustls::ClientConfig::builder_with_provider(StdArc::new(rustls_rustcrypto::provider()))
+                .with_safe_default_protocol_versions()
+                .expect("RustCrypto provider supports the default TLS protocol versions")
+                .dangerous()
+                .with_custom_certificate_verifier(StdArc::new(NoVerifier))
+                .with_no_client_auth();
 
         Connector::Rustls(TlsConnector::from(StdArc::new(config)))
     }
@@ -128,13 +127,12 @@ pub fn default_tls_connector() -> Connector {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let config = rustls::ClientConfig::builder_with_provider(StdArc::new(
-            rustls_rustcrypto::provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("RustCrypto provider supports the default TLS protocol versions")
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        let config =
+            rustls::ClientConfig::builder_with_provider(StdArc::new(rustls_rustcrypto::provider()))
+                .with_safe_default_protocol_versions()
+                .expect("RustCrypto provider supports the default TLS protocol versions")
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
 
         Connector::Rustls(TlsConnector::from(StdArc::new(config)))
     }
