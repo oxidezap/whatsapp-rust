@@ -1142,7 +1142,6 @@ impl Client {
         } in deferred
         {
             match self
-                .clone()
                 .handle_decrypted_plaintext(enc_type, &plaintext, padding_version, info)
                 .await
             {
@@ -1218,7 +1217,6 @@ impl Client {
                     }
 
                     if let Err(e) = self
-                        .clone()
                         .handle_decrypted_plaintext(
                             "skmsg",
                             &padded_plaintext,
@@ -1361,7 +1359,7 @@ impl Client {
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.handle_plaintext", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, enc_type = %enc_type), err(Debug)))]
     pub(crate) async fn handle_decrypted_plaintext(
-        self: Arc<Self>,
+        self: &Arc<Self>,
         enc_type: &str,
         padded_plaintext: &[u8],
         padding_version: u8,
