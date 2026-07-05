@@ -18,6 +18,12 @@ use wacore_binary::Jid;
 /// [`std::sync::OnceLock::get`] on the receive path, so an unset policy costs
 /// nothing.
 ///
+/// [`admit`](RetryAdmission::admit) is called inline on the receive path, so it
+/// must be a fast, local decision (a token-bucket check, an atomic counter) with
+/// no I/O or blocking. It is deliberately synchronous: an admission verdict that
+/// could `.await` would let a slow policy stall retry processing for the pending
+/// key, and a gate never needs to wait.
+///
 /// Scope: the policy is consulted only for group and `status@broadcast` retry
 /// receipts from other accounts. Retries from our own companion devices
 /// (`is_peer`) and all DM retries are always admitted and never reach the
@@ -30,16 +36,15 @@ use wacore_binary::Jid;
 ///
 /// See `examples/retry_quarantine.rs` for a token-bucket implementation keyed by
 /// (chat, requester).
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait RetryAdmission: wacore::sync_marker::MaybeSendSync {
     /// Return `true` to admit the retry receipt (WA Web behavior), `false` to
-    /// drop it before any repair work runs.
+    /// drop it before any repair work runs. Must return promptly (no I/O, no
+    /// blocking).
     ///
     /// `chat` is the group or `status@broadcast` JID, `requester` the retrying
     /// participant device, and `retry_count` the receipt's attempt number. The
     /// device is intentionally part of `requester` but a policy may key on the
     /// user only: WA Web re-targets a whole user's sender key, so all devices of
     /// one broken account can share a budget.
-    async fn admit(&self, chat: &Jid, requester: &Jid, retry_count: u8) -> bool;
+    fn admit(&self, chat: &Jid, requester: &Jid, retry_count: u8) -> bool;
 }

@@ -3,21 +3,28 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cache::Cache;
 use crate::cache_config::CacheEntryConfig;
 use wacore_binary::Jid;
 
 /// Pre-parsed, pre-indexed sender key device map for one group.
-#[derive(Clone, Debug)]
+///
+/// `has_key` is an [`AtomicBool`] so `markForgetSenderKey` can flip one device
+/// cold in place, matching WA Web's per-device participant-record update,
+/// instead of invalidating the whole group and forcing the next send to re-read
+/// and re-parse every row from the DB.
+#[derive(Debug)]
 pub(crate) struct SenderKeyDeviceMap {
     /// user → (device_id → has_key)
-    devices: HashMap<Arc<str>, HashMap<u16, bool>>,
+    devices: HashMap<Arc<str>, HashMap<u16, AtomicBool>>,
 }
 
 impl SenderKeyDeviceMap {
     pub fn from_db_rows(rows: &[(String, bool)]) -> Self {
-        let mut devices: HashMap<Arc<str>, HashMap<u16, bool>> = HashMap::with_capacity(rows.len());
+        let mut devices: HashMap<Arc<str>, HashMap<u16, AtomicBool>> =
+            HashMap::with_capacity(rows.len());
 
         for (jid_str, has_key) in rows {
             match jid_str.parse::<Jid>() {
@@ -26,7 +33,7 @@ impl SenderKeyDeviceMap {
                     devices
                         .entry(user)
                         .or_default()
-                        .insert(jid.device, *has_key);
+                        .insert(jid.device, AtomicBool::new(*has_key));
                 }
                 Err(e) => {
                     log::warn!("Skipping malformed device JID '{}': {}", jid_str, e);
@@ -46,19 +53,26 @@ impl SenderKeyDeviceMap {
     /// warm gate; production resolves both lookups via `device_and_primary_warm`.
     #[cfg(test)]
     pub fn device_has_key(&self, user: &str, device: u16) -> Option<bool> {
-        self.devices.get(user)?.get(&device).copied()
+        Some(
+            self.devices
+                .get(user)?
+                .get(&device)?
+                .load(Ordering::Relaxed),
+        )
     }
 
     /// WA Web warm gate (ParticipantStore.js): a device is warm only when it AND
     /// its primary (device 0) hold the key. Resolves the per-user inner map once
     /// so the two device lookups share a single outer (user-string) hash instead
-    /// of re-hashing the user per call. A missing entry counts as cold (`?? false`).
+    /// of re-hashing the user per call. A missing entry counts as cold.
     pub fn device_and_primary_warm(&self, user: &str, device: u16) -> bool {
         let Some(by_device) = self.devices.get(user) else {
             return false;
         };
-        by_device.get(&device).copied().unwrap_or(false)
-            && by_device.get(&0).copied().unwrap_or(false)
+        by_device
+            .get(&device)
+            .is_some_and(|k| k.load(Ordering::Relaxed))
+            && by_device.get(&0).is_some_and(|k| k.load(Ordering::Relaxed))
     }
 }
 
@@ -84,6 +98,26 @@ impl SenderKeyDeviceCache {
 
     pub(crate) async fn invalidate(&self, group_jid: &str) {
         self.inner.invalidate(group_jid).await;
+    }
+
+    /// Flip the given devices to `has_key=false` in place, if this group's map
+    /// is cached. Matches WA Web's per-device `markForgetSenderKey`: no
+    /// whole-group invalidation, so a storm of retry receipts never forces the
+    /// next send to re-read every row. A device absent from the map is already
+    /// cold, so it is skipped. The DB write is the source of truth; this only
+    /// keeps a live cache entry consistent with it. On a cache miss the next
+    /// send rebuilds from the DB, which already carries the write.
+    pub(crate) async fn mark_forgotten(&self, group_jid: &str, devices: &[Jid]) {
+        let Some(map) = self.inner.get(group_jid).await else {
+            return;
+        };
+        for jid in devices {
+            if let Some(by_device) = map.devices.get(jid.user.as_str())
+                && let Some(flag) = by_device.get(&jid.device)
+            {
+                flag.store(false, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Drop cache entries whose map indexes the given (user, device_id). Needed
@@ -117,14 +151,71 @@ impl SenderKeyDeviceCache {
         self.inner
             .memory_stats(|k, v| {
                 k.capacity()
-                    + v.devices.capacity() * std::mem::size_of::<(Arc<str>, HashMap<u16, bool>)>()
+                    + v.devices.capacity()
+                        * std::mem::size_of::<(Arc<str>, HashMap<u16, AtomicBool>)>()
                     + v.devices
                         .iter()
                         .map(|(user, by_device)| {
-                            user.len() + by_device.capacity() * std::mem::size_of::<(u16, bool)>()
+                            user.len()
+                                + by_device.capacity() * std::mem::size_of::<(u16, AtomicBool)>()
                         })
                         .sum::<usize>()
             })
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache_config::CacheEntryConfig;
+
+    fn cache() -> SenderKeyDeviceCache {
+        SenderKeyDeviceCache::new(&CacheEntryConfig::new(None, 100))
+    }
+
+    #[tokio::test]
+    async fn mark_forgotten_flips_in_place_without_invalidating() {
+        let c = cache();
+        let group = "120363000000000001@g.us";
+        c.get_or_init(group, async {
+            Arc::new(SenderKeyDeviceMap::from_db_rows(&[
+                ("111:0@lid".to_string(), true),
+                ("111:5@lid".to_string(), true),
+                ("222:0@lid".to_string(), true),
+            ]))
+        })
+        .await;
+
+        let dev5: Jid = "111:5@lid".parse().unwrap();
+        c.mark_forgotten(group, std::slice::from_ref(&dev5)).await;
+
+        // Still cached (no whole-group invalidation): reading it must not run
+        // the init closure.
+        let map = c
+            .get_or_init(group, async { panic!("group was invalidated") })
+            .await;
+        // The forgotten device is cold; its sibling and the other user are
+        // untouched, which the blunt whole-group invalidate could not preserve.
+        assert_eq!(map.device_has_key("111", 5), Some(false));
+        assert_eq!(map.device_has_key("111", 0), Some(true));
+        assert_eq!(map.device_has_key("222", 0), Some(true));
+        assert!(!map.device_and_primary_warm("111", 5));
+        assert!(map.device_and_primary_warm("222", 0));
+    }
+
+    #[tokio::test]
+    async fn mark_forgotten_is_noop_on_cache_miss() {
+        let c = cache();
+        let dev: Jid = "111:0@lid".parse().unwrap();
+        // No entry for this group: must not panic or create one.
+        c.mark_forgotten("120363000000000009@g.us", std::slice::from_ref(&dev))
+            .await;
+        let map = c
+            .get_or_init("120363000000000009@g.us", async {
+                Arc::new(SenderKeyDeviceMap::from_db_rows(&[]))
+            })
+            .await;
+        assert!(map.is_empty());
     }
 }

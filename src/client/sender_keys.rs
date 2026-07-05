@@ -30,28 +30,39 @@ impl Client {
             .and_then(|s| s.pn.as_ref())
             .map(|j| j.user.as_str());
 
-        let device_ids: Vec<String> = device_jids
+        let kept: Vec<&Jid> = device_jids
             .iter()
             .filter(|jid| {
                 !exclude_own_devices
                     || !(own_lid_user.is_some_and(|u| u == jid.user)
                         || own_pn_user.is_some_and(|u| u == jid.user))
             })
-            .map(ToString::to_string)
             .collect();
 
-        if device_ids.is_empty() {
+        if kept.is_empty() {
             return Ok(());
         }
 
-        let entries: Vec<(&str, bool)> = device_ids
-            .iter()
-            .map(|jid| (jid.as_str(), has_key))
-            .collect();
+        let device_ids: Vec<String> = kept.iter().map(|jid| jid.to_string()).collect();
+        let entries: Vec<(&str, bool)> = device_ids.iter().map(|s| (s.as_str(), has_key)).collect();
         self.persistence_manager
             .set_sender_key_status(group_jid, &entries)
             .await?;
-        self.sender_key_device_cache.invalidate(group_jid).await;
+
+        if has_key {
+            // Marking devices warm can introduce (user, device) pairs the cached
+            // map doesn't have yet, so drop it and let the next send rebuild from
+            // the DB write above.
+            self.sender_key_device_cache.invalidate(group_jid).await;
+        } else {
+            // Marking cold only flips existing entries: update them in place so a
+            // retry-receipt storm never forces a whole-group re-read on the next
+            // send. Matches WA Web's per-device markForgetSenderKey.
+            let jids: Vec<Jid> = kept.into_iter().cloned().collect();
+            self.sender_key_device_cache
+                .mark_forgotten(group_jid, &jids)
+                .await;
+        }
         Ok(())
     }
 

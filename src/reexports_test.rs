@@ -59,9 +59,8 @@ fn hook_impl_is_object_safe_and_constructible() {
 // A RetryAdmission policy built purely from re-exports.
 struct AdmitAll;
 
-#[whatsapp_rust::async_trait]
 impl whatsapp_rust::RetryAdmission for AdmitAll {
-    async fn admit(
+    fn admit(
         &self,
         _chat: &whatsapp_rust::Jid,
         _requester: &whatsapp_rust::Jid,

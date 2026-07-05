@@ -724,11 +724,10 @@ pub struct Client {
     pub(crate) inbound_durability_hook:
         std::sync::OnceLock<Arc<dyn crate::types::durability_hook::InboundDurabilityHook>>,
 
-    /// Optional inbound retry-receipt admission policy. When set, a group or
-    /// status retry receipt from another account can be dropped before any
-    /// repair work runs (see [`crate::types::retry_admission::RetryAdmission`]).
-    /// `None` (default) admits every receipt, matching WA Web, and the receive
-    /// path pays only one lock-free `OnceLock::get`.
+    /// Optional retry-receipt admission policy (see
+    /// [`crate::types::retry_admission::RetryAdmission`]): an operator opt-in to
+    /// drop some group/status retries. `None` (default) keeps WA Web behavior
+    /// with a single lock-free `OnceLock::get` on the receive path.
     pub(crate) retry_admission:
         std::sync::OnceLock<Arc<dyn crate::types::retry_admission::RetryAdmission>>,
 

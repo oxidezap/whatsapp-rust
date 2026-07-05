@@ -331,18 +331,14 @@ impl Client {
                 .as_ref()
                 .is_some_and(|our_lid| info.requester.is_same_user_as(our_lid));
 
-        // Opt-in admission policy (default: none → admit all, matching WA Web,
-        // which never volume-throttles inbound retries). Consulted only for
-        // group/status retries from other accounts; our own companion devices
-        // (`is_peer`) always pass so their group session can rebuild. A `false`
-        // verdict drops the receipt before all repair work — the group-info
-        // fetch, the unknown-device rotateKey block, markForgetSenderKey,
-        // key-bundle processing and the resend — releasing the pending-retry
-        // scopeguard normally on the early return. Unset is one OnceLock read.
+        // Volume-throttling inbound retries diverges from WA Web (which
+        // processes every receipt), so it is an operator opt-in, gated here
+        // before the expensive repair stages below. Own devices (`is_peer`) and
+        // DMs are never gated: dropping their retries has no safe SKDM fallback.
         if is_group_or_status
             && !is_peer
-            && let Some(policy) = self.retry_admission.get().cloned()
-            && !policy.admit(&info.chat, &info.requester, retry_count).await
+            && let Some(policy) = self.retry_admission.get()
+            && !policy.admit(&info.chat, &info.requester, retry_count)
         {
             debug!(
                 "Retry receipt from {} in {} dropped by RetryAdmission policy",

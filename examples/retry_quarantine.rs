@@ -96,17 +96,16 @@ impl RetryQuarantine {
     }
 }
 
-#[whatsapp_rust::async_trait]
 impl RetryAdmission for RetryQuarantine {
-    async fn admit(&self, chat: &Jid, requester: &Jid, _retry_count: u8) -> bool {
+    fn admit(&self, chat: &Jid, requester: &Jid, _retry_count: u8) -> bool {
         if self.burst == 0.0 {
             return true;
         }
         let now = Instant::now();
         let key = (chat.user.to_string(), requester.user.to_string());
 
-        // std Mutex, never held across an await: the critical section is a map
-        // op plus the bucket arithmetic.
+        // Synchronous, so the receive path never awaits a policy: the critical
+        // section is a map lookup plus the bucket arithmetic.
         let mut buckets = self.buckets.lock().expect("quarantine mutex poisoned");
         // Fail open if we would exceed the cap with a brand-new pair, so the
         // guard never blocks repair for a pair it isn't already tracking.
@@ -182,42 +181,42 @@ fn main() {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn bounds_per_pair_and_isolates_pairs() {
+    #[test]
+    fn bounds_per_pair_and_isolates_pairs() {
         // burst 2, refill 0: two attempts, then quarantined.
         let q = RetryQuarantine::new(2, 0, 100);
         let g: Jid = "123-456@g.us".parse().unwrap();
         let a: Jid = "111@lid".parse().unwrap();
         let b: Jid = "222@lid".parse().unwrap();
-        assert!(q.admit(&g, &a, 1).await);
-        assert!(q.admit(&g, &a, 1).await);
-        assert!(!q.admit(&g, &a, 1).await, "third receipt quarantined");
+        assert!(q.admit(&g, &a, 1));
+        assert!(q.admit(&g, &a, 1));
+        assert!(!q.admit(&g, &a, 1), "third receipt quarantined");
         // A different requester in the same chat has its own budget.
-        assert!(q.admit(&g, &b, 1).await);
+        assert!(q.admit(&g, &b, 1));
         assert_eq!(q.quarantined_total(), 1);
     }
 
-    #[tokio::test]
-    async fn burst_zero_disables() {
+    #[test]
+    fn burst_zero_disables() {
         let q = RetryQuarantine::new(0, 0, 100);
         let g: Jid = "123-456@g.us".parse().unwrap();
         let a: Jid = "111@lid".parse().unwrap();
         for _ in 0..10 {
-            assert!(q.admit(&g, &a, 1).await);
+            assert!(q.admit(&g, &a, 1));
         }
         assert_eq!(q.quarantined_total(), 0);
     }
 
-    #[tokio::test]
-    async fn fails_open_past_capacity_for_new_pairs() {
+    #[test]
+    fn fails_open_past_capacity_for_new_pairs() {
         // Cap 1: the first pair is tracked and bounded, a second brand-new pair
         // is admitted rather than evicting/blocking.
         let q = RetryQuarantine::new(1, 0, 1);
         let g: Jid = "123-456@g.us".parse().unwrap();
         let a: Jid = "111@lid".parse().unwrap();
         let b: Jid = "222@lid".parse().unwrap();
-        assert!(q.admit(&g, &a, 1).await);
-        assert!(!q.admit(&g, &a, 1).await, "tracked pair still bounded");
-        assert!(q.admit(&g, &b, 1).await, "new pair fails open past cap");
+        assert!(q.admit(&g, &a, 1));
+        assert!(!q.admit(&g, &a, 1), "tracked pair still bounded");
+        assert!(q.admit(&g, &b, 1), "new pair fails open past cap");
     }
 }
