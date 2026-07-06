@@ -348,9 +348,9 @@ fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<()
 /// * `had_no_prior_state` - True for the genesis patch (version 1) seeding an empty
 ///   collection. Its ltHash is the known empty baseline, so the aggregate MACs are
 ///   still computable and MUST be validated (WA Web's `computeLtHashAndValidatePatch`
-///   validates them unconditionally). A genesis patch that omits `patch_mac` is treated
-///   as tampering. The empty + non-genesis case (a patch that can't anchor the ltHash)
-///   is rejected upstream in `process_patch_list` as a retryable resync.
+///   validates them unconditionally). A genesis patch that omits either aggregate MAC
+///   is treated as tampering. The empty + non-genesis case (a patch that can't anchor
+///   the ltHash) is rejected upstream in `process_patch_list` as a retryable resync.
 /// * `has_missing_remove` - If true, a REMOVE mutation was missing its previous value.
 ///   WhatsApp Web reports this as MAC-failure telemetry, but it does not make
 ///   aggregate MAC mismatches acceptable.
@@ -412,6 +412,12 @@ pub fn validate_patch_macs(
         // prior lenient behavior (patchMac only enforced when present).
         None if had_no_prior_state => return Err(AppStateError::PatchMACMismatch),
         None => {}
+    }
+
+    // WA Web validates both aggregate MACs unconditionally, so a genesis patch
+    // that supplies patchMac but strips snapshotMac is rejected all the same.
+    if had_no_prior_state && patch.snapshot_mac.is_none() {
+        return Err(AppStateError::PatchSnapshotMACMismatch);
     }
 
     Ok(())
@@ -838,6 +844,26 @@ mod tests {
         let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
             .expect_err("genesis patch without patchMAC must be rejected");
         assert!(matches!(err, AppStateError::PatchMACMismatch));
+    }
+
+    #[test]
+    fn validate_patch_macs_rejects_genesis_missing_snapshot_mac() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let state = HashState {
+            version: 1,
+            hash: [3u8; 128],
+            index_value_map: HashMap::new(),
+        };
+        // Valid patchMac but snapshotMac stripped: WA Web validates both, so still
+        // rejected — a server can't forge either, so neither may be omitted.
+        let mut patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            ..Default::default()
+        };
+        patch.patch_mac = Some(generate_patch_mac(&patch, "regular", &keys.patch_mac, 1));
+        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+            .expect_err("genesis patch without snapshotMAC must be rejected");
+        assert!(matches!(err, AppStateError::PatchSnapshotMACMismatch));
     }
 
     #[test]
