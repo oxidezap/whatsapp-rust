@@ -86,24 +86,32 @@ where
     ) {
         if let Some(cap) = max_capacity {
             while self.map.len() as u64 >= cap {
-                let victim = match evict_guard {
-                    // Evict the oldest entry no live task still holds; skip protected
-                    // ones so a later lookup can't mint a duplicate. If every entry is
-                    // held, allow temporary over-capacity rather than dropping a live
-                    // entry (growth is bounded by the number of concurrently-held ones).
-                    Some(is_evictable) => self
-                        .order
-                        .iter()
-                        .find(|(_, k)| self.map.get(*k).is_some_and(|e| is_evictable(&e.value)))
-                        .map(|(seq, k)| (*seq, k.clone())),
-                    None => self.order.iter().next().map(|(seq, k)| (*seq, k.clone())),
-                };
-                match victim {
-                    Some((seq, oldest_key)) => {
-                        self.order.remove(&seq);
-                        self.map.remove(&oldest_key);
+                match evict_guard {
+                    // Unguarded caches keep the fast single-pass pop_first() path.
+                    None => match self.order.pop_first() {
+                        Some((_, oldest_key)) => {
+                            self.map.remove(&oldest_key);
+                        }
+                        None => break,
+                    },
+                    // Guarded: evict the oldest entry no live task still holds; skip
+                    // protected ones so a later lookup can't mint a duplicate. If every
+                    // entry is held, allow temporary over-capacity rather than dropping
+                    // a live entry (growth is bounded by the concurrently-held count).
+                    Some(is_evictable) => {
+                        let victim = self
+                            .order
+                            .iter()
+                            .find(|(_, k)| self.map.get(*k).is_some_and(|e| is_evictable(&e.value)))
+                            .map(|(seq, k)| (*seq, k.clone()));
+                        match victim {
+                            Some((seq, oldest_key)) => {
+                                self.order.remove(&seq);
+                                self.map.remove(&oldest_key);
+                            }
+                            None => break,
+                        }
                     }
-                    None => break,
                 }
             }
         }
@@ -616,6 +624,39 @@ mod tests {
         assert!(
             unguarded.get("held").await.is_none(),
             "an unguarded cache FIFO-evicts the held entry (the bug this guards)"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_guard_allows_temporary_over_capacity_when_all_held() {
+        type Lock = Arc<AsyncMutex<()>>;
+        let cache: PortableCache<String, Lock> = PortableCache::builder()
+            .max_capacity(2)
+            .evict_guard(|m| Arc::strong_count(m) <= 1)
+            .build();
+
+        // Hold every entry, then insert one more: with nothing evictable the cache
+        // grows past capacity rather than dropping a live lock.
+        let mut held = Vec::new();
+        for i in 0..3 {
+            let lock: Lock = Arc::new(AsyncMutex::new(()));
+            held.push(lock.clone());
+            cache.insert(format!("k{i}"), lock).await;
+        }
+        assert_eq!(
+            cache.entry_count(),
+            3,
+            "all entries held -> cache exceeds capacity instead of evicting a live lock"
+        );
+
+        // Drop the external refs; the next insert can now evict down toward capacity.
+        drop(held);
+        cache
+            .insert("fresh".into(), Arc::new(AsyncMutex::new(())))
+            .await;
+        assert!(
+            cache.entry_count() <= 3,
+            "once entries are released, eviction resumes"
         );
     }
 
