@@ -10406,3 +10406,47 @@ async fn bench_session_decrypt_throughput() {
         rss1.saturating_sub(rss0)
     );
 }
+
+/// F3: group (skmsg) decrypt failures from a sender-key desync must map to a
+/// retry receipt (WA Web treats every `SignalDecryptionError` as
+/// `SignalRetryable`), not a terminal NACK that drops the message. Locks the
+/// classification in `group_decrypt_retry_reason`.
+#[test]
+fn test_group_decrypt_retry_reason_classification() {
+    use wacore::libsignal::protocol::CiphertextMessageType;
+
+    // Recoverable sender-key errors -> retry receipt.
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::SignatureValidationFailed),
+        Some(RetryReason::InvalidSignature)
+    );
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::InvalidSenderKeySession),
+        Some(RetryReason::InvalidSession)
+    );
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::UnrecognizedMessageVersion(2)),
+        Some(RetryReason::InvalidMessage)
+    );
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::InvalidMessage(
+            CiphertextMessageType::SenderKey,
+            "decryption failed"
+        )),
+        Some(RetryReason::InvalidMessage)
+    );
+
+    // Errors handled by dedicated arms (or genuinely non-Signal) -> keep NACK.
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::NoSenderKeyState("x".into())),
+        None
+    );
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::DuplicatedMessage(1, 1)),
+        None
+    );
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::InvalidProtobufEncoding),
+        None
+    );
+}
