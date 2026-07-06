@@ -230,6 +230,10 @@ const SPECS = [
 ]
 
 // ------------------------------------------------------------------ helpers
+// The harness may deliver `args` as a JSON string; normalize to object/primitive.
+let ARGS = args
+if (typeof ARGS === 'string') { try { const _p = JSON.parse(ARGS); if (_p && typeof _p === 'object') ARGS = _p } catch (_e) { /* keep string (e.g. 'all' or a track id) */ } }
+
 const GROUPS = ['performance', 'overhead', 'bug', 'compliance', 'feature-gap', 'security', 'concurrency']
 const range = (n) => Array.from({ length: n }, (_, i) => i)
 const sevRank = (s) => ({ P0: 0, P1: 1, P2: 2, P3: 3 })[s] ?? 2
@@ -363,10 +367,10 @@ Return markdown + headline + confirmed_count.`
 }
 
 // ------------------------------------------------------------------ per-track harness
-const VERIFIERS = (args && args.verifiers) || 3
-const MAX_VERIFY = (args && args.maxFindingsPerTrack) || 20
-const FINDER_EFFORT = (args && args.finderEffort) || 'high'
-const VERIFY_EFFORT = (args && args.verifyEffort) || 'high'
+const VERIFIERS = (ARGS && ARGS.verifiers) || 3
+const MAX_VERIFY = (ARGS && ARGS.maxFindingsPerTrack) || 20
+const FINDER_EFFORT = (ARGS && ARGS.finderEffort) || 'high'
+const VERIFY_EFFORT = (ARGS && ARGS.verifyEffort) || 'high'
 const VERIFY_LENSES = [
   'reproduce-or-refute: construct the concrete failing input / interleaving / byte sequence. If you cannot construct it, refuted=true.',
   'compliance-vs-reference: check the claim against captured-js ground truth / whatsmeow. Refuted if the Rust code actually matches the spec.',
@@ -374,7 +378,7 @@ const VERIFY_LENSES = [
 ]
 
 async function runTrack(spec) {
-  const extraLenses = (args && args.extraLenses) || []
+  const extraLenses = (ARGS && ARGS.extraLenses) || []
   const lenses = spec.lenses.concat(extraLenses)
 
   const finderResults = await parallel(lenses.map((lens, i) => () =>
@@ -417,7 +421,7 @@ async function runTrack(spec) {
 }
 
 // ------------------------------------------------------------------ entry
-const selected = selectSpecs(args)
+const selected = selectSpecs(ARGS)
 if (selected.length === 0) {
   log('No track selected. Available tracks:')
   for (const s of SPECS) log(`  [${s.priority}/${s.group}] ${s.id}`)
@@ -428,7 +432,7 @@ if (selected.length === 0) {
 log(`Adversarial review — ${selected.length} track(s): ${selected.map((s) => s.id).join(', ')} | ${VERIFIERS} verifiers/finding, top ${MAX_VERIFY}/track`)
 
 let results = []
-if (args && args.parallelTracks) {
+if (ARGS && ARGS.parallelTracks) {
   results = (await parallel(selected.map((sp) => () => runTrack(sp)))).filter(Boolean)
 } else {
   for (const sp of selected) results.push(await runTrack(sp))
