@@ -73,6 +73,45 @@ where
         Some(entry)
     }
 
+    /// Evict entries until under `cap`. Outlined and never-inlined so the guarded
+    /// scan is compiled once per `<K, V>` (not duplicated into every `insert_new`
+    /// inline site), keeping the binary-size cost of the guard path small.
+    #[inline(never)]
+    fn evict_to_capacity(&mut self, cap: u64, evict_guard: Option<fn(&V) -> bool>) {
+        while self.map.len() as u64 >= cap {
+            match evict_guard {
+                // Unguarded caches keep the single-pass pop_first() fast path.
+                None => match self.order.pop_first() {
+                    Some((_, oldest_key)) => {
+                        self.map.remove(&oldest_key);
+                    }
+                    None => break,
+                },
+                // Guarded: skip entries a live task still holds so a later lookup
+                // can't mint a duplicate; if every entry is held, allow temporary
+                // over-capacity rather than dropping a live entry. Remove by seq so
+                // the key isn't cloned.
+                Some(is_evictable) => {
+                    let mut victim_seq = None;
+                    for (seq, k) in self.order.iter() {
+                        if self.map.get(k).is_some_and(|e| is_evictable(&e.value)) {
+                            victim_seq = Some(*seq);
+                            break;
+                        }
+                    }
+                    match victim_seq {
+                        Some(seq) => {
+                            if let Some(oldest_key) = self.order.remove(&seq) {
+                                self.map.remove(&oldest_key);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
     /// Insert a brand-new entry (the caller has already confirmed the key is
     /// absent), evicting the oldest entries first if at capacity. Assigns and
     /// records the FIFO sequence.
@@ -85,35 +124,7 @@ where
         evict_guard: Option<fn(&V) -> bool>,
     ) {
         if let Some(cap) = max_capacity {
-            while self.map.len() as u64 >= cap {
-                match evict_guard {
-                    // Unguarded caches keep the fast single-pass pop_first() path.
-                    None => match self.order.pop_first() {
-                        Some((_, oldest_key)) => {
-                            self.map.remove(&oldest_key);
-                        }
-                        None => break,
-                    },
-                    // Guarded: evict the oldest entry no live task still holds; skip
-                    // protected ones so a later lookup can't mint a duplicate. If every
-                    // entry is held, allow temporary over-capacity rather than dropping
-                    // a live entry (growth is bounded by the concurrently-held count).
-                    Some(is_evictable) => {
-                        let victim = self
-                            .order
-                            .iter()
-                            .find(|(_, k)| self.map.get(*k).is_some_and(|e| is_evictable(&e.value)))
-                            .map(|(seq, k)| (*seq, k.clone()));
-                        match victim {
-                            Some((seq, oldest_key)) => {
-                                self.order.remove(&seq);
-                                self.map.remove(&oldest_key);
-                            }
-                            None => break,
-                        }
-                    }
-                }
-            }
+            self.evict_to_capacity(cap, evict_guard);
         }
 
         let seq = self.next_seq;
