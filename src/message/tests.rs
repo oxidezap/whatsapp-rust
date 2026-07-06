@@ -759,6 +759,15 @@ async fn ensure_bob_paired(client: &Arc<Client>) {
 /// keys back to the sender — assembled through the same
 /// `SignalProtocolStoreAdapter` traits production uses.
 async fn bobs_prekey_bundle(client: &Arc<Client>) -> (PreKeyBundle, Jid) {
+    bobs_prekey_bundle_with_spk_id(client, 1).await
+}
+
+/// Like [`bobs_prekey_bundle`] but advertises `spk_id` as the bundle's signed
+/// prekey id while still signing with the real record (#1). The signed-prekey
+/// signature covers only the public key, not the id, so an id the client never
+/// provisioned still yields a bundle Alice accepts — and a resulting
+/// PreKeySignalMessage whose decrypt hits `InvalidSignedPreKeyId` on Bob.
+async fn bobs_prekey_bundle_with_spk_id(client: &Arc<Client>, spk_id: u32) -> (PreKeyBundle, Jid) {
     use wacore::libsignal::protocol::GenericSignedPreKey;
     ensure_bob_paired(client).await;
     let snapshot = client.persistence_manager.get_device_snapshot();
@@ -799,7 +808,7 @@ async fn bobs_prekey_bundle(client: &Arc<Client>) -> (PreKeyBundle, Jid) {
         reg_id,
         u32::from(own_device_jid.device).into(),
         Some((pk_id_u32.into(), pk_pair.public_key)),
-        1.into(),
+        spk_id.into(),
         spk_pub,
         spk_sig_vec,
         IdentityKey::new(identity_kp.public_key),
@@ -10449,4 +10458,70 @@ fn test_group_decrypt_retry_reason_classification() {
         group_decrypt_retry_reason(&SignalProtocolError::InvalidProtobufEncoding),
         None
     );
+}
+
+/// F4: a PreKeySignalMessage naming a signed prekey we've rotated past
+/// SIGNED_PRE_KEY_RETENTION surfaces `InvalidSignedPreKeyId`. WA Web classifies
+/// this as `SignalRetryable`, so it must send a retry receipt (carrying our live
+/// bundle) rather than a terminal NACK that drops the 1:1 message. The sibling
+/// `InvalidPreKeyId` arm already retries; this locks the same for signed prekeys.
+#[tokio::test]
+async fn test_invalid_signed_prekey_id_sends_retry_receipt() {
+    let client = crate::test_utils::create_test_client_with_name("invalid_spk_id").await;
+
+    // Bundle advertises a signed-prekey id the client never provisioned, so
+    // Bob's decrypt hits InvalidSignedPreKeyId (as a rotated-out signed prekey
+    // would). Alice still accepts the bundle because the id is not signed.
+    let (bundle, bob_jid) = bobs_prekey_bundle_with_spk_id(&client, 4242).await;
+    let bob_addr = bob_jid.to_protocol_address();
+
+    let mut alice = AlicePeer::new("15550002002@s.whatsapp.net").await;
+    alice.install_bob_session(&bob_addr, &bundle).await;
+    let pkmsg = alice
+        .encrypt_text(&bob_addr, "signed prekey rotated out")
+        .await;
+    assert!(
+        matches!(pkmsg, CiphertextMessage::PreKeySignalMessage(_)),
+        "must be a pkmsg so decrypt looks up the signed prekey"
+    );
+
+    let bytes = match &pkmsg {
+        CiphertextMessage::PreKeySignalMessage(m) => m.serialized().to_vec(),
+        _ => unreachable!(),
+    };
+    let enc_node = NodeBuilder::new("enc")
+        .attr("type", "pkmsg")
+        .bytes(bytes)
+        .build();
+    let enc_ref = enc_node.as_node_ref();
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let info = Arc::new(MessageInfo {
+        id: "INVALID_SPK_ID_MSG".to_string(),
+        source: crate::types::message::MessageSource {
+            sender: alice.jid.clone(),
+            chat: alice.jid.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let outcome = client
+        .clone()
+        .process_session_enc_batch(
+            &payloads,
+            &info,
+            &alice.jid,
+            crate::types::events::DecryptFailMode::Show,
+        )
+        .await;
+    assert!(
+        !outcome.decrypted,
+        "must not decrypt with a missing signed prekey"
+    );
+    assert!(outcome.had_failure, "must record a decrypt failure");
+
+    // The fix routes InvalidSignedPreKeyId to handle_decrypt_failure -> retry
+    // receipt with RetryReason::InvalidKeyId. Pre-fix this took the terminal
+    // NACK path, which never bumps the retry caches.
+    await_retry_receipt(&client, &info, 1, RetryReason::InvalidKeyId).await;
 }
