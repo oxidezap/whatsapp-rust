@@ -423,17 +423,24 @@ pub async fn prepare_group_stanza(
             // `decrypt-fail="hide"` but the payload does not (e.g. AdminRevoke), recipients
             // without a sender key never decrypt the skmsg and the revoke is silently dropped.
             let skdm_hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
-            match encrypt_for_devices_with_sessions(
-                runtime,
-                stores,
-                distribution_list,
-                &skdm_plaintext_to_encrypt,
-                skdm_hide_decrypt_fail,
-                None,
-                plan,
-            )
-            .await
-            {
+            // The fan-out mutates each target's pairwise Signal session; the chain
+            // lock above only covers the sender-key chain. Hold the same per-device
+            // session locks the DM path uses so a concurrent DM / group send can't
+            // race the ratchet and drop an advance (lost SKDM -> undecryptable skmsg).
+            let skdm_result = {
+                let _session_guard = resolver.lock_device_sessions(distribution_list).await;
+                encrypt_for_devices_with_sessions(
+                    runtime,
+                    stores,
+                    distribution_list,
+                    &skdm_plaintext_to_encrypt,
+                    skdm_hide_decrypt_fail,
+                    None,
+                    plan,
+                )
+                .await
+            };
+            match skdm_result {
                 Ok(result) => {
                     includes_prekey_message =
                         includes_prekey_message || result.includes_prekey_message;
