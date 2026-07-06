@@ -1286,13 +1286,8 @@ impl Client {
                         continue;
                     }
 
-                    // Recoverable sender-key desync (participant rotated their sender
-                    // key / re-registered). WA Web classifies every SignalDecryptionError
-                    // as SignalRetryable -> retry receipt, which prompts the sender to
-                    // resend the SKDM + message. NACKing (500) instead tells the server
-                    // to stop retransmitting -> permanent, silent group-message loss.
-                    // Mirror the 1:1 path (BadMac/InvalidMessage) and the NoSenderKeyState
-                    // arm above, which already retry.
+                    // Recoverable sender-key desync: retry receipt (prompts an SKDM
+                    // resend), not a 500 NACK that would drop the message permanently.
                     if let Some(reason) = group_decrypt_retry_reason(&e) {
                         log::log!(
                             decrypt_fail_log_level(decrypt_fail_mode),

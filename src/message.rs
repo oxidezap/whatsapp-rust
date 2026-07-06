@@ -143,13 +143,9 @@ fn decrypt_fail_log_level(mode: crate::types::events::DecryptFailMode) -> log::L
     }
 }
 
-/// Maps a recoverable group (skmsg) `group_decrypt` error to the retry reason to
-/// send in a retry receipt, or `None` for a genuinely non-recoverable error that
-/// should still be NACKed. WA Web treats every `SignalDecryptionError` as
-/// `SignalRetryable`, so a sender-key desync (rotated/re-registered sender key)
-/// must request a resend rather than tell the server to stop retransmitting.
-/// `NoSenderKeyState`/`DuplicatedMessage` are handled by dedicated match arms and
-/// never reach here.
+/// WA Web treats every `SignalDecryptionError` as `SignalRetryable`, so a
+/// sender-key desync must request a resend rather than NACK (which stops the
+/// server retransmitting). `None` = keep the NACK (genuinely non-Signal error).
 fn group_decrypt_retry_reason(e: &SignalProtocolError) -> Option<RetryReason> {
     match e {
         SignalProtocolError::SignatureValidationFailed => Some(RetryReason::InvalidSignature),
