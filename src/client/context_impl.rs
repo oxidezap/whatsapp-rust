@@ -68,9 +68,7 @@ impl SendContextResolver for Client {
         if device_jids.is_empty() {
             return SessionLockGuard::none();
         }
-        // Reuse the DM send path's key derivation + ordering (resolve_encryption_jid
-        // keys, sorted by cmp_for_lock_order) so both paths serialize on the identical
-        // per-device mutexes.
+        // Reuse the DM path's helpers so both lock the identical per-device mutexes.
         let keys = self.build_session_lock_keys(device_jids).await;
         let mutexes = self.session_mutexes_for(&keys).await;
         let mut guards = Vec::with_capacity(mutexes.len());
