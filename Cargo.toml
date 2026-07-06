@@ -82,9 +82,11 @@ log = "0.4"
 metrics = "0.24"
 portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 rand = "0.10"
-# rustls CryptoProvider with no C/asm build dependency (unlike `ring`/aws-lc-rs),
-# so the default build stays pure-Rust and cross-compiles cleanly (notably wasm).
-# Pinned to a pre-release; the real-server TLS handshake is not yet validated.
+# Pure-Rust rustls CryptoProvider: no C/asm build dep (unlike `ring`/aws-lc-rs),
+# so no C toolchain or cross-compile blocker on native targets. Not
+# wasm32-unknown-unknown-buildable though — it pulls getrandom 0.2, whose OsRng has
+# no wasm backend (the repo's `wasm_js` cfg only reaches the workspace's getrandom 0.4).
+# Pre-release (0.0.2-alpha); real-server handshake validated, but the dep is still alpha.
 rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["std", "tls12", "zeroize"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
@@ -306,6 +308,24 @@ opt-level = "z"
 [profile.release.package.ecdsa]
 opt-level = "z"
 [profile.release.package.der]
+opt-level = "z"
+[profile.release.package.ed25519-dalek]
+opt-level = "z"
+[profile.release.package.signature]
+opt-level = "z"
+[profile.release.package.sec1]
+opt-level = "z"
+[profile.release.package.spki]
+opt-level = "z"
+[profile.release.package.pkcs1]
+opt-level = "z"
+[profile.release.package.pkcs5]
+opt-level = "z"
+[profile.release.package.pkcs8]
+opt-level = "z"
+[profile.release.package.ff]
+opt-level = "z"
+[profile.release.package.group]
 opt-level = "z"
 # s = data-path framing kept a notch faster than z: low throughput for a chat
 # client, but still touched on every frame/record.
