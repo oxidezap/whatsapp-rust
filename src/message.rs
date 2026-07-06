@@ -5,6 +5,7 @@ use log::{debug, warn};
 use std::sync::Arc;
 use wacore::libsignal::crypto::DecryptionError;
 use wacore::libsignal::protocol::SenderKeyDistributionMessage;
+use wacore::libsignal::protocol::SenderKeyStore;
 use wacore::libsignal::protocol::group_decrypt;
 use wacore::libsignal::protocol::process_sender_key_distribution_message;
 use wacore::libsignal::protocol::{

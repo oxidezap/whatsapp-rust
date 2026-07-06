@@ -1219,8 +1219,20 @@ impl Client {
                 info.source.sender.observe()
             );
 
-            let decrypt_result =
-                group_decrypt(ciphertext, &mut adapter.sender_key_store, &sender_key_name).await;
+            // Serialize the receiving sender-key chain's load/mutate/store. The 1:1
+            // path holds session_lock_for around its decrypt; the group path held
+            // nothing, so two workers for the same (group, sender) — e.g. after a
+            // chat-lane eviction spawns a duplicate worker — could advance the same
+            // ratchet at once and drop a chain step, leaving later skmsg undecryptable
+            // (bad-mac / NoSenderKeyState) until the sender rotates an SKDM.
+            let decrypt_result = {
+                let chain_lock = adapter
+                    .sender_key_store
+                    .sender_key_lock(&sender_key_name)
+                    .await;
+                let _chain_guard = chain_lock.lock().await;
+                group_decrypt(ciphertext, &mut adapter.sender_key_store, &sender_key_name).await
+            };
 
             match decrypt_result {
                 Ok(padded_plaintext) => {
