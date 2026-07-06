@@ -649,14 +649,15 @@ mod tests {
             "all entries held -> cache exceeds capacity instead of evicting a live lock"
         );
 
-        // Drop the external refs; the next insert can now evict down toward capacity.
+        // Drop the external refs; the next insert now evicts back down to capacity.
         drop(held);
         cache
             .insert("fresh".into(), Arc::new(AsyncMutex::new(())))
             .await;
-        assert!(
-            cache.entry_count() <= 3,
-            "once entries are released, eviction resumes"
+        assert_eq!(
+            cache.entry_count(),
+            2,
+            "once entries are released, eviction resumes down to capacity"
         );
     }
 
