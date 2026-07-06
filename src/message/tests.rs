@@ -762,11 +762,9 @@ async fn bobs_prekey_bundle(client: &Arc<Client>) -> (PreKeyBundle, Jid) {
     bobs_prekey_bundle_with_spk_id(client, 1).await
 }
 
-/// Like [`bobs_prekey_bundle`] but advertises `spk_id` as the bundle's signed
-/// prekey id while still signing with the real record (#1). The signed-prekey
-/// signature covers only the public key, not the id, so an id the client never
-/// provisioned still yields a bundle Alice accepts — and a resulting
-/// PreKeySignalMessage whose decrypt hits `InvalidSignedPreKeyId` on Bob.
+/// Like [`bobs_prekey_bundle`] but advertises an arbitrary `spk_id` so callers
+/// can trigger `InvalidSignedPreKeyId` on Bob's decrypt path (the signed-prekey
+/// signature covers only the public key, so an unprovisioned id still verifies).
 async fn bobs_prekey_bundle_with_spk_id(client: &Arc<Client>, spk_id: u32) -> (PreKeyBundle, Jid) {
     use wacore::libsignal::protocol::GenericSignedPreKey;
     ensure_bob_paired(client).await;

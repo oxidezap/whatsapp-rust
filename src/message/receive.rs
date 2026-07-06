@@ -1103,14 +1103,9 @@ impl Client {
                             .await;
                         continue;
                     } else if matches!(e, SignalProtocolError::InvalidSignedPreKeyId) {
-                        // A PreKeySignalMessage naming a signed prekey we've
-                        // rotated past SIGNED_PRE_KEY_RETENTION yields
-                        // InvalidSignedPreKeyId. WA Web classifies it as
-                        // SignalRetryable -> retry receipt (carrying our live
-                        // bundle so the peer rebuilds against the current signed
-                        // prekey). The catch-all nack would instead drop the
-                        // stanza from the offline queue -> permanent 1:1 loss;
-                        // the sibling InvalidPreKeyId arm already retries.
+                        // WA Web classifies this as SignalRetryable; the catch-all
+                        // nack would permanently drop the stanza from the offline
+                        // queue. Mirrors the sibling InvalidPreKeyId arm.
                         log::debug!(
                             "[msg:{}] Decryption failed for {} message from {} due to InvalidSignedPreKeyId. \
                              Sender used a signed prekey we've rotated out. Sending retry receipt with fresh prekeys.",
