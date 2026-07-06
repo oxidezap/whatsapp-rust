@@ -484,6 +484,11 @@ pub async fn prepare_group_stanza(
         }
     }
 
+    // The skmsg encrypt only advances the sender-key chain, not any pairwise
+    // session, so release the per-device locks now instead of holding them across
+    // it (avoids head-of-line blocking a concurrent DM to a shared device).
+    drop(session_guard);
+
     let skmsg = encrypt_group_message(
         stores.sender_key_store,
         &sender_key_name,
@@ -494,7 +499,6 @@ pub async fn prepare_group_stanza(
 
     // Release before the chain-independent stanza build.
     drop(chain_guard);
-    drop(session_guard);
 
     let skmsg_ciphertext = skmsg.into_serialized();
 
