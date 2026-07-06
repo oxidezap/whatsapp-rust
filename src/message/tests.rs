@@ -6670,9 +6670,16 @@ async fn group_skmsg_decrypts_under_sender_key_lock() {
     )
     .await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let mut texts = Vec::new();
+    for _ in 0..80 {
+        texts = message_texts_for_id(&rx, id);
+        if !texts.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     assert_eq!(
-        message_texts_for_id(&rx, id),
+        texts,
         vec!["hello group".to_string()],
         "group skmsg content must surface after decrypt under the chain lock"
     );
