@@ -1,4 +1,4 @@
-//! Auto-generated AppState (syncd) action schemas (WhatsApp 2.3000.1042742319). DO NOT EDIT.
+//! Auto-generated AppState (syncd) action schemas (WhatsApp 2.3000.1040878135). DO NOT EDIT.
 //!
 //! Typed registry of syncd actions: collection, version, scope, value proto type,
 //! enum fields, and the mutation-index parts. `const`/`&'static`, no deps.
@@ -249,9 +249,9 @@ pub const AVATAR_UPDATED: Schema = Schema {
     collection: Collection::Regular,
     version: 7,
     scope: Scope::Account,
-    value_field: None,
-    value_proto_type: None,
-    value_enum_fields: &[],
+    value_field: Some("avatarUpdatedAction"),
+    value_proto_type: Some("SyncActionValue.AvatarUpdatedAction"),
+    value_enum_fields: &[("eventType", "AvatarUpdatedAction.AvatarEventType")],
     chat_jid_index: None,
     index_parts: &[IndexPart::Literal {
         value: "avatar_updated_action",
@@ -1252,10 +1252,7 @@ pub const STATUS_PRIVACY: Schema = Schema {
     scope: Scope::Account,
     value_field: Some("statusPrivacy"),
     value_proto_type: Some("SyncActionValue.StatusPrivacyAction"),
-    value_enum_fields: &[
-        ("mode", "StatusPrivacyAction.StatusDistributionMode"),
-        ("modes", "StatusPrivacyAction.StatusDistributionMode"),
-    ],
+    value_enum_fields: &[],
     chat_jid_index: None,
     index_parts: &[IndexPart::Literal {
         value: "status_privacy",
@@ -1367,26 +1364,6 @@ pub const WAFFLE_ACCOUNT_LINK_STATE: Schema = Schema {
     }],
 };
 
-/// `WasaRootSecret` — module `WAWebWASARootSecretSync`.
-pub const WASA_ROOT_SECRET: Schema = Schema {
-    key: "WasaRootSecret",
-    name: "wasa_root_secret",
-    module: "WAWebWASARootSecretSync",
-    collection: Collection::RegularHigh,
-    version: 1,
-    scope: Scope::Chat,
-    value_field: Some("wasaRootSecretAction"),
-    value_proto_type: Some("SyncActionValue.WASARootSecretAction"),
-    value_enum_fields: &[],
-    chat_jid_index: Some(1),
-    index_parts: &[
-        IndexPart::Literal {
-            value: "wasa_root_secret",
-        },
-        IndexPart::Jid { name: "chatJid" },
-    ],
-};
-
 /// Every action schema, keyed-sorted.
 pub const ALL: &[Schema] = &[
     ADS_CTWA_PER_CUSTOMER_DATA_SHARING,
@@ -1454,7 +1431,6 @@ pub const ALL: &[Schema] = &[
     USER_STATUS_MUTE,
     VOIP_RELAY_ALL_CALLS,
     WAFFLE_ACCOUNT_LINK_STATE,
-    WASA_ROOT_SECRET,
 ];
 
 /// Look up a schema by its action key (the registry key, e.g. `"Agent"`).
