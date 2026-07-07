@@ -605,15 +605,17 @@ pub struct DisappearingModeChanged {
 
 /// An event dispatched by the client to registered handlers.
 ///
-/// # Stability (pre-1.0)
+/// # Stability
 ///
 /// The enum is `#[non_exhaustive]`, so match arms must keep a `_` catch-all.
-/// The payload structs are *not* sealed: while the crate is `0.x`, an existing
-/// payload may gain new fields in a minor release, so read the fields you need
-/// (`ack.class`) or keep a `..` rest when destructuring, rather than binding
-/// every field. A maybe-absent field is always modeled as `Option<T>`, never
-/// an empty-string / zero sentinel. Sealing the payloads behind
-/// `#[non_exhaustive]` + constructors is deferred to the 1.0 API freeze.
+/// Payload structs are being sealed the same way — `#[non_exhaustive]` plus a
+/// `bon` builder for construction — so a payload can gain fields without
+/// breaking consumers. Read the fields you need (`ack.class`) or keep a `..`
+/// rest when destructuring, rather than binding every field. Construct payloads
+/// via their generated builder (`ServerAck::builder()…build()`), not a struct
+/// literal; a maybe-absent field is always modeled as `Option<T>` (with a
+/// `maybe_*` setter), never an empty-string / zero sentinel. The seal is
+/// rolling out per struct, so not every payload carries the attribute yet.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub enum Event {
