@@ -274,6 +274,39 @@ async fn test_ack_dispatches_server_ack_event() {
         2,
         "an <ack> without an id must not dispatch Event::ServerAck"
     );
+
+    // The headline guarantee: with a waiter registered for the same id, the
+    // event STILL fires and the waiter STILL resolves — dispatch and waiter
+    // resolution are independent.
+    let (tx, rx) = oneshot::channel();
+    client
+        .response_waiters_guard()
+        .insert("ack-evt-3".to_string(), tx);
+    let waited_ack = NodeBuilder::new("ack")
+        .attr("id", "ack-evt-3")
+        .attr("class", "message")
+        .attr("from", SERVER_JID)
+        .build();
+    let handled = client.handle_ack_response(&waited_ack.as_node_ref()).await;
+    assert!(handled, "waiter for the id should have been resolved");
+    let resolved = tokio::time::timeout(Duration::from_secs(1), rx)
+        .await
+        .expect("timed out waiting for ack waiter")
+        .expect("waiter sender was dropped");
+    assert!(
+        resolved
+            .get()
+            .get_attr("id")
+            .is_some_and(|v| v.as_str() == "ack-evt-3"),
+        "waiter should receive the ack node"
+    );
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(ack) if ack.id == "ack-evt-3"
+        )),
+        "Event::ServerAck should fire even when a waiter consumes the ack"
+    );
 }
 
 /// Test that the lid_pn_cache correctly stores and retrieves LID mappings.
