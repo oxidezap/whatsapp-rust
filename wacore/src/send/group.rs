@@ -88,12 +88,13 @@ where
 /// tracking without re-resolving devices.
 pub struct PreparedGroupStanza {
     pub node: Node,
-    /// Full SKDM distribution target set, marked `has_key=true` after the
-    /// server ACK. Mirrors WA Web `markHasSenderKey(x, M)` which marks the
-    /// whole target set `M`, not only the devices that encrypted successfully:
-    /// devices that failed (406 / no bundle) are marked too so they are not
-    /// re-targeted on every send (the retry-receipt path repairs any that are
-    /// actually alive and keyless via `mark_forget_sender_key`).
+    /// Full SKDM distribution target set. After the server ACK the persist step
+    /// (`update_sender_key_devices`) marks `has_key=true`, mirroring WA Web
+    /// `markHasSenderKey(x, M)`: the whole target `M`, not only the devices that
+    /// encrypted successfully, so a failed external device (406 / no bundle) isn't
+    /// re-targeted every send (the retry-receipt path repairs any alive-but-keyless
+    /// one). Own devices are filtered out at persist time (WA Web `!isMeDevice`), so
+    /// own companions are never memoized and get a fresh SKDM every send.
     pub skdm_devices: Vec<Jid>,
     /// Users whose device registry should be invalidated because their
     /// devices returned 406 (unregistered) during SKDM prekey fetch.

@@ -1158,13 +1158,22 @@ impl Client {
     /// for the stanza, avoiding a redundant `resolve_devices` call and preventing
     /// the clear-then-fail race where a transient resolver failure leaves the map empty.
     /// Mark devices as `has_key=true` after successful SKDM distribution.
+    ///
+    /// Excludes our own devices (`exclude_own_devices=true`), mirroring WA Web's
+    /// `ParticipantStore` helper, which guards every `markHasSenderKey` mutation
+    /// with `!isMeDevice`. Own companions are therefore never memoized as warm, so
+    /// `filter_skdm_targets` re-distributes their SKDM on every send — the same
+    /// reason WA Web can't orphan its own companions. Marking them here instead
+    /// would be one-directional: the retry-receipt forget path also excludes own
+    /// devices (to stop an inbound retry tearing down our own session), so an own
+    /// companion whose one SKDM encryption failed could never be re-sent one.
     async fn update_sender_key_devices(&self, group_jid: &str, devices: &[Jid]) {
         if devices.is_empty() {
             return;
         }
 
         if let Err(e) = self
-            .set_sender_key_status_for_devices(group_jid, devices, true, false)
+            .set_sender_key_status_for_devices(group_jid, devices, true, true)
             .await
         {
             log::warn!(
@@ -2906,6 +2915,61 @@ mod tests {
             needs.len(),
             1,
             "absent primary is cold, companion redistributes"
+        );
+    }
+
+    /// End-to-end: after a send marks its SKDM targets, our own companion is NOT
+    /// memoized (WA Web `!isMeDevice` guard on `markHasSenderKey`), so the next send
+    /// re-distributes its SKDM — it can't be orphaned by a one-off encryption
+    /// failure (the retry/forget path also excludes own devices). An external member
+    /// stays warm and is not re-targeted.
+    #[tokio::test]
+    async fn own_companion_is_never_memoized_so_it_redistributes_every_send() {
+        use crate::sender_key_device_cache::SenderKeyDeviceMap;
+
+        let client = crate::test_utils::create_test_client().await;
+        let own_lid = Jid::from_str("888000888000888:1@lid").unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+
+        let group = "120363000000000009@g.us";
+        let own_companion = Jid::from_str("888000888000888:5@lid").unwrap();
+        let member = Jid::from_str("111000111000111@lid").unwrap();
+
+        // A send marks its full target set warm (own companion + external member).
+        client
+            .update_sender_key_devices(group, &[own_companion.clone(), member.clone()])
+            .await;
+
+        // Persisted: the external member is warm; our own companion was skipped.
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        let map = SenderKeyDeviceMap::from_db_rows(&rows);
+        assert_eq!(
+            map.device_has_key("111000111000111", 0),
+            Some(true),
+            "external member is memoized warm"
+        );
+        assert_eq!(
+            map.device_has_key("888000888000888", 5),
+            None,
+            "own companion is never memoized (re-distributed every send)"
+        );
+
+        // Next send: only the own companion is re-targeted; the member stays warm.
+        let devices = [own_companion.clone(), member];
+        let needs = client.filter_skdm_targets(group, &devices, &map, &own_lid);
+        assert_eq!(
+            needs,
+            vec![own_companion],
+            "own companion redistributes; external member stays warm"
         );
     }
 
