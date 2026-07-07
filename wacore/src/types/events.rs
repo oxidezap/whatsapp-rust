@@ -1140,7 +1140,8 @@ impl ConnectFailureReason {
 #[non_exhaustive]
 pub struct ConnectFailure {
     pub reason: ConnectFailureReason,
-    pub message: String,
+    /// The server's `message` attribute on the `<failure>` stanza, when present.
+    pub message: Option<String>,
     pub raw: Option<Node>,
 }
 

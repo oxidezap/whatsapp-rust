@@ -1419,13 +1419,7 @@ impl Client {
             self.core.event_bus.dispatch(Event::ConnectFailure(
                 crate::types::events::ConnectFailure::builder()
                     .reason(reason)
-                    .message(
-                        attrs
-                            .optional_string("message")
-                            .as_deref()
-                            .unwrap_or("")
-                            .to_string(),
-                    )
+                    .maybe_message(attrs.optional_string("message").map(|m| m.into_owned()))
                     .raw(node.to_owned())
                     .build(),
             ));
