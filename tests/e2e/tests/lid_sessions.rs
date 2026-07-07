@@ -30,6 +30,16 @@ fn mask_addr(addr: &str) -> String {
     }
 }
 
+/// Backend session-store key for a peer's `(user, server, device)`, matching the
+/// `<user>[:dev]@<server>.0` protocol-address form the Signal store keys on.
+fn peer_session_addr(user: &str, server: &str, device: u16) -> String {
+    if device == 0 {
+        format!("{user}@{server}.0")
+    } else {
+        format!("{user}:{device}@{server}.0")
+    }
+}
+
 /// Scan backend for sessions matching a user across device IDs 0..=99.
 async fn scan_sessions(
     backend: &dyn SignalStore,
@@ -38,11 +48,7 @@ async fn scan_sessions(
 ) -> anyhow::Result<Vec<String>> {
     let mut results = Vec::new();
     for device_id in 0..=99u16 {
-        let addr = if device_id == 0 {
-            format!("{user}@{server}.0")
-        } else {
-            format!("{user}:{device_id}@{server}.0")
-        };
+        let addr = peer_session_addr(user, server, device_id);
         if backend.get_session(&addr).await?.is_some() {
             results.push(addr);
         }
@@ -232,15 +238,15 @@ async fn test_stale_pn_session_does_not_break_lid_messaging() -> anyhow::Result<
 
     let backend_a = client_a.client.persistence_manager().backend();
 
-    // Read the existing LID session data
-    let lid_addr = format!("{}@lid.0", lid_b.user);
+    // Read the existing LID session data at B's connected device (companion, not 0).
+    let lid_addr = peer_session_addr(&lid_b.user, "lid", lid_b.device);
     let lid_session_data = backend_a
         .get_session(&lid_addr)
         .await?
         .expect("LID session should exist after roundtrip");
 
     // Inject a copy under the PN address (simulates legacy database state)
-    let pn_addr = format!("{}@c.us.0", jid_b.user);
+    let pn_addr = peer_session_addr(&jid_b.user, "c.us", jid_b.device);
     backend_a.put_session(&pn_addr, &lid_session_data).await?;
     info!("Injected stale PN session at {}", mask_addr(&pn_addr));
 
@@ -511,10 +517,12 @@ async fn test_pn_only_session_causes_undecryptable_on_lid_lookup() -> anyhow::Re
     .await?;
     info!("Verified messaging works after first reconnect");
 
-    // Step 4: Simulate legacy DB — move session from LID to PN address
+    // Step 4: Simulate legacy DB — move session from LID to PN address.
+    // Target B's connected device: under LID addressing a 1:1 peer sends from its
+    // companion, never device 0, so the inbound session lives there (not at :0).
     let backend_a = client_a.client.persistence_manager().backend();
-    let lid_addr = format!("{}@lid.0", lid_b.user);
-    let pn_addr = format!("{}@c.us.0", jid_b.user);
+    let lid_addr = peer_session_addr(&lid_b.user, "lid", lid_b.device);
+    let pn_addr = peer_session_addr(&jid_b.user, "c.us", jid_b.device);
 
     let lid_session_data = backend_a
         .get_session(&lid_addr)
@@ -578,6 +586,101 @@ async fn test_pn_only_session_causes_undecryptable_on_lid_lookup() -> anyhow::Re
         "PN session should be cleaned up after migration"
     );
     info!("Session correctly under LID after on-the-fly migration");
+
+    client_a.disconnect().await;
+    client_b.disconnect().await;
+    Ok(())
+}
+
+/// Regression guard for the assumption the migration tests rely on: under LID
+/// addressing a 1:1 peer is reached at its connected companion device (non-zero),
+/// so A keys B's inbound Signal session there — never at device 0. A test that
+/// hardcodes device 0 would silently exercise nothing.
+#[tokio::test]
+async fn test_inbound_1x1_session_keyed_at_companion_device() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut client_a = TestClient::connect("e2e_lid_dev_a").await?;
+    let mut client_b = TestClient::connect("e2e_lid_dev_b").await?;
+    let jid_a = client_a.jid().await;
+    let jid_b = client_b.jid().await;
+    let lid_b = client_b.client.get_lid().expect("B should have LID");
+
+    send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "hi", 30).await?;
+    send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "reply", 30).await?;
+
+    assert_ne!(
+        lid_b.device, 0,
+        "a companion 1:1 peer must be addressed at a non-zero device"
+    );
+    let backend_a = client_a.client.persistence_manager().backend();
+    let addr = peer_session_addr(&lid_b.user, "lid", lid_b.device);
+    assert!(
+        backend_a.get_session(&addr).await?.is_some(),
+        "A must hold B's inbound LID session at its companion device ({addr})"
+    );
+
+    client_a.disconnect().await;
+    client_b.disconnect().await;
+    Ok(())
+}
+
+/// After a legacy PN-only session migrates to LID on the first inbound message,
+/// follow-up messages must keep flowing on the migrated LID session — no
+/// re-migration flap, no undecryptable, and the stale PN copy stays gone.
+#[tokio::test]
+async fn test_pn_migration_is_durable_across_followup_messages() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut client_a = TestClient::connect("e2e_lid_dur_a").await?;
+    let mut client_b = TestClient::connect("e2e_lid_dur_b").await?;
+    let jid_a = client_a.jid().await;
+    let jid_b = client_b.jid().await;
+    let lid_b = client_b.client.get_lid().expect("B should have LID");
+
+    send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "setup", 30).await?;
+    send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "setup reply", 30).await?;
+    client_a.reconnect_and_wait().await?;
+
+    // Downgrade B's connected-device session to PN-only (legacy state).
+    let backend_a = client_a.client.persistence_manager().backend();
+    let lid_addr = peer_session_addr(&lid_b.user, "lid", lid_b.device);
+    let pn_addr = peer_session_addr(&jid_b.user, "c.us", jid_b.device);
+    let data = backend_a
+        .get_session(&lid_addr)
+        .await?
+        .expect("LID session should exist after roundtrip");
+    backend_a.put_session(&pn_addr, &data).await?;
+    backend_a.delete_session(&lid_addr).await?;
+    client_a.reconnect_and_wait().await?;
+
+    // First inbound triggers migration; the rest must ride the migrated session.
+    for i in 0..3 {
+        send_and_expect_text(
+            &client_b.client,
+            &mut client_a,
+            &jid_a,
+            &format!("m{i}"),
+            30,
+        )
+        .await?;
+    }
+
+    assert!(
+        backend_a.get_session(&lid_addr).await?.is_some(),
+        "session stays under LID across follow-up messaging"
+    );
+    assert!(
+        backend_a.get_session(&pn_addr).await?.is_none(),
+        "stale PN copy stays gone after migration"
+    );
+    client_a
+        .assert_no_event(
+            3,
+            |e| matches!(e, Event::UndecryptableMessage(_)),
+            "no undecryptable after PN→LID migration",
+        )
+        .await?;
 
     client_a.disconnect().await;
     client_b.disconnect().await;
