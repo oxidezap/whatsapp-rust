@@ -52,6 +52,8 @@ pub struct SessionStats {
     last_data_received_ms: AtomicU64,
     /// Dead-socket watchdog anchor (WA Web `deadSocketTimer.onOrBefore`): the first
     /// send since the last receive, so continued traffic can't push the deadline out.
+    /// Treated as stale (and re-armed) once `<= last_data_received_ms`, so a send that
+    /// raced past a receive-reset can't leave a pre-receive value stuck here.
     first_send_since_recv_ms: AtomicU64,
 }
 
@@ -102,16 +104,17 @@ impl SessionStats {
         self.frames_sent.fetch_add(1, Ordering::Relaxed);
         let now = Self::now_ms();
         self.last_data_sent_ms.store(now, Ordering::Relaxed);
-        // Arm the dead-socket deadline on the FIRST send after a receive only;
-        // later sends must not push it out (WA Web `onOrBefore` keeps the earliest
-        // deadline). The load fast-paths the common already-armed case.
-        if self.first_send_since_recv_ms.load(Ordering::Relaxed) == 0 {
-            let _ = self.first_send_since_recv_ms.compare_exchange(
-                0,
-                now,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+        // Arm the dead-socket deadline on the FIRST send after a receive (WA Web
+        // `onOrBefore` keeps the earliest deadline; later sends must not push it out).
+        // Re-arm when the anchor is unset OR stale — a receive landed after it was
+        // armed (`anchor <= last_received`). Guarding only on `== 0` would let a send
+        // that captured `now` before a concurrent receive-reset write a pre-receive
+        // timestamp that then sticks forever (its arm raced past the reset), silently
+        // disabling detection; the stale check re-arms it on the next send instead.
+        let last_recv = self.last_data_received_ms.load(Ordering::Relaxed);
+        let anchor = self.first_send_since_recv_ms.load(Ordering::Relaxed);
+        if anchor == 0 || anchor <= last_recv {
+            self.first_send_since_recv_ms.store(now, Ordering::Relaxed);
         }
     }
 
@@ -801,6 +804,35 @@ mod tests {
         assert!(
             stats.first_send_since_recv_ms() > 0,
             "the next send after a receive re-arms the anchor"
+        );
+    }
+
+    /// A send whose arm raced past a concurrent receive-reset can leave the anchor
+    /// at a PRE-receive timestamp. The next send must re-arm it (stale: anchor <=
+    /// last_received) rather than treat it as live and stick there forever, which
+    /// would silently disable dead-socket detection for the rest of the connection.
+    #[test]
+    fn stale_pre_receive_anchor_self_heals_on_next_send() {
+        use crate::protocol::keepalive::is_dead_socket;
+        let stats = SessionStats::new();
+        let base = SessionStats::now_ms();
+        // Reconstruct the race outcome directly: a receive at `base`, and an anchor
+        // left behind at a pre-receive instant (the lost-reset send's stale `now`).
+        stats.last_data_received_ms.store(base, Ordering::Relaxed);
+        stats
+            .first_send_since_recv_ms
+            .store(base.saturating_sub(1_000), Ordering::Relaxed);
+
+        stats.record_frame_sent(10);
+
+        let rearmed = stats.first_send_since_recv_ms();
+        assert!(
+            rearmed >= base,
+            "a stale pre-receive anchor must re-arm to a post-receive send, got {rearmed} < {base}"
+        );
+        assert!(
+            !is_dead_socket(rearmed, base),
+            "the re-armed anchor is after the receive, so the socket is not dead"
         );
     }
 
