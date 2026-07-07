@@ -202,15 +202,16 @@ impl Client {
                     }
 
                     // WA Web: deadSocketTimer is an independent 20s watchdog armed on
-                    // every send and cancelled on every receive. We approximate this by
+                    // the FIRST send after a receive (onOrBefore keeps the earliest
+                    // deadline) and cancelled on every receive. We approximate this by
                     // checking is_dead_socket on EVERY keepalive tick — not just after
                     // a failed ping. This catches scenarios where pending IQs caused
                     // the ping to be skipped, or where the ping "succeeded" but the
                     // connection died immediately after.
-                    let last_sent = self.stats.last_data_sent_ms();
+                    let first_send = self.stats.first_send_since_recv_ms();
                     let last_recv = self.stats.last_data_received_ms();
-                    if is_dead_socket(last_sent, last_recv) {
-                        let elapsed = ms_since(last_sent).unwrap_or(0);
+                    if is_dead_socket(first_send, last_recv) {
+                        let elapsed = ms_since(first_send).unwrap_or(0);
                         warn!(
                             target: "Client/Keepalive",
                             "No data received for {:.1}s after send (dead socket), forcing reconnect.",

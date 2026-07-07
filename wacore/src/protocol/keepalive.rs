@@ -27,23 +27,25 @@ pub fn ms_since(timestamp_ms: u64) -> Option<u64> {
     Some(now.saturating_sub(timestamp_ms))
 }
 
-/// Checks the dead-socket condition: data was sent but nothing received
-/// within [`DEAD_SOCKET_TIME`].
+/// Checks the dead-socket condition: [`DEAD_SOCKET_TIME`] elapsed since the timer
+/// was armed without a receive cancelling it.
 ///
-/// WA Web: `deadSocketTimer` is armed on every `callStanza` (send) and
-/// cancelled on every `parseAndHandleStanza` (receive).  It fires when
-/// `deadSocketTime` (20 s) elapses after the last send without any receive.
-pub fn is_dead_socket(last_sent_ms: u64, last_received_ms: u64) -> bool {
-    // Never sent anything yet -- timer not armed.
-    if last_sent_ms == 0 {
+/// `armed_ms` is the anchor WA Web's `deadSocketTimer.onOrBefore` keeps: the FIRST
+/// send after the last receive (0 when unarmed / cancelled). It must NOT be the
+/// most-recent send — anchoring there lets continued outgoing traffic keep pushing
+/// the deadline out and hide a half-open socket forever. The caller feeds
+/// `SessionStats::first_send_since_recv_ms`, reset to 0 on every receive
+/// (`parseAndHandleStanza` → `cancel()`).
+pub fn is_dead_socket(armed_ms: u64, last_received_ms: u64) -> bool {
+    // Timer not armed (never sent since the last receive).
+    if armed_ms == 0 {
         return false;
     }
-    // Received data after (or at) the last send -- timer cancelled.
-    if last_received_ms >= last_sent_ms {
+    // Received data after (or at) the armed instant -- timer cancelled.
+    if last_received_ms >= armed_ms {
         return false;
     }
-    // Sent but no reply: check if DEAD_SOCKET_TIME has elapsed since the send.
-    ms_since(last_sent_ms)
+    ms_since(armed_ms)
         .map(|elapsed| elapsed > DEAD_SOCKET_TIME.as_millis() as u64)
         .unwrap_or(false)
 }
