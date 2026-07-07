@@ -17,6 +17,9 @@ pub enum BinaryError {
     EmptyData,
     LeftoverData(usize),
     AttrList(Vec<BinaryError>),
+    /// Node nesting exceeded the recursion cap — a hostile frame trying to
+    /// overflow the native stack, rejected before recursing.
+    MaxDepthExceeded,
 }
 
 impl fmt::Display for BinaryError {
@@ -35,6 +38,7 @@ impl fmt::Display for BinaryError {
             BinaryError::EmptyData => write!(f, "Received empty data where payload was expected"),
             BinaryError::LeftoverData(n) => write!(f, "Leftover data after decoding: {n} bytes"),
             BinaryError::AttrList(list) => write!(f, "Multiple attribute parsing errors: {list:?}"),
+            BinaryError::MaxDepthExceeded => write!(f, "Node nesting exceeded the maximum depth"),
         }
     }
 }
@@ -81,6 +85,7 @@ impl Clone for BinaryError {
             BinaryError::EmptyData => BinaryError::EmptyData,
             BinaryError::LeftoverData(n) => BinaryError::LeftoverData(*n),
             BinaryError::AttrList(list) => BinaryError::AttrList(list.clone()),
+            BinaryError::MaxDepthExceeded => BinaryError::MaxDepthExceeded,
         }
     }
 }
