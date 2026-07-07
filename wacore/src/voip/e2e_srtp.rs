@@ -9,7 +9,9 @@ use ctr::Ctr128BE;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 
 use crate::voip::hkdf_sha256;
-pub use crate::voip::warp::{WARP_MI_TAG_LEN, append_warp_mi_tag, compute_warp_mi_tag};
+pub use crate::voip::warp::{
+    WARP_MI_TAG_LEN, append_warp_mi_tag, compute_warp_mi_tag, verify_warp_mi_tag,
+};
 
 type AesCtr = Ctr128BE<Aes128>;
 
@@ -142,16 +144,16 @@ pub(crate) struct RecvRocTracker {
 }
 
 impl RecvRocTracker {
-    /// Guess the ROC for `seq` and fold it into the state. Seeds from the first packet (roc=0).
-    pub fn guess_roc(&mut self, seq: u16) -> u32 {
+    /// Estimate the ROC for `seq` WITHOUT mutating state (RFC 3711 guess-index).
+    /// Use this to build the IV / verify a packet; only [`Self::commit_roc`] after
+    /// the packet authenticates, so an unauthenticated packet can't desync state.
+    pub fn estimate_roc(&self, seq: u16) -> u32 {
         if !self.initialized {
-            self.s_l = seq;
-            self.initialized = true;
             return self.roc;
         }
         // Pick v in {roc-1, roc, roc+1} so 2^16*v+seq is closest to 2^16*roc+s_l. The signed 16-bit
         // gap (not a modular wrapping_sub) is what distinguishes "next-but-reordered" from "wrapped".
-        let v = if self.s_l < 0x8000 {
+        if self.s_l < 0x8000 {
             if (seq as i32 - self.s_l as i32) > 0x8000 {
                 self.roc.wrapping_sub(1) // old packet from before the origin (roc-1)
             } else {
@@ -161,7 +163,18 @@ impl RecvRocTracker {
             self.roc.wrapping_add(1) // forward wrap into roc+1
         } else {
             self.roc
-        };
+        }
+    }
+
+    /// Fold an AUTHENTICATED packet's `(v, seq)` into the state; `v` must come from
+    /// a prior [`Self::estimate_roc`] whose MI tag verified. Seeds from the first
+    /// packet (roc stays 0).
+    pub fn commit_roc(&mut self, v: u32, seq: u16) {
+        if !self.initialized {
+            self.s_l = seq;
+            self.initialized = true;
+            return;
+        }
         if v == self.roc {
             if seq > self.s_l {
                 self.s_l = seq;
@@ -170,7 +183,16 @@ impl RecvRocTracker {
             self.roc = v;
             self.s_l = seq;
         }
-        // v == roc-1 (reordered late packet): return the lower ROC, leave state untouched.
+        // v == roc-1 (reordered late packet): leave state untouched.
+    }
+
+    /// Estimate + commit in one step. Test-only: production authenticates the WARP
+    /// MI tag against `estimate_roc` first and only `commit_roc` on success, so an
+    /// unauthenticated packet can't fold state. Kept for the wrap-tracking tests.
+    #[cfg(test)]
+    pub fn guess_roc(&mut self, seq: u16) -> u32 {
+        let v = self.estimate_roc(seq);
+        self.commit_roc(v, seq);
         v
     }
 }
