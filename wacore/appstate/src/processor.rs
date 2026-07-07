@@ -345,11 +345,12 @@ fn detect_duplicate_index_in_patch(mutations: &[wa::SyncdMutation]) -> Result<()
 /// * `state` - The hash state AFTER applying the patch mutations
 /// * `keys` - The expanded app state keys for MAC computation
 /// * `collection_name` - The collection name
-/// * `had_no_prior_state` - If true, skip ALL MAC validation. On an empty collection
-///   this is only reached for the genesis patch (version 1), which has no prior baseline
-///   to validate against. The empty + non-genesis case (a patch without a snapshot that
-///   can't anchor the ltHash) is rejected upstream in `process_patch_list`, which marks
-///   the collection retryable so it re-syncs via snapshot, matching WhatsApp Web.
+/// * `had_no_prior_state` - True for the genesis patch (version 1) seeding an empty
+///   collection. Its ltHash is the known empty baseline, so the aggregate MACs are
+///   still computable and MUST be validated (WA Web's `computeLtHashAndValidatePatch`
+///   validates them unconditionally). A genesis patch that omits either aggregate MAC
+///   is treated as tampering. The empty + non-genesis case (a patch that can't anchor
+///   the ltHash) is rejected upstream in `process_patch_list` as a retryable resync.
 /// * `has_missing_remove` - If true, a REMOVE mutation was missing its previous value.
 ///   WhatsApp Web reports this as MAC-failure telemetry, but it does not make
 ///   aggregate MAC mismatches acceptable.
@@ -361,14 +362,10 @@ pub fn validate_patch_macs(
     had_no_prior_state: bool,
     has_missing_remove: bool,
 ) -> Result<(), AppStateError> {
-    // Skip ALL MAC validation only for the genesis patch (version 1) seeding an
-    // empty baseline: there is no prior snapshotMac/patchMac baseline to validate
-    // against. The empty + non-genesis case (a patch without a snapshot that can't
-    // anchor the ltHash) is rejected upstream in `process_patch_list` as a retryable
-    // resync, so it never reaches here.
-    if had_no_prior_state {
-        return Ok(());
-    }
+    // The aggregate MACs are keyed by the app-state key (which the server lacks), so
+    // validating them even for the genesis patch closes the hole where a malicious
+    // server seeds a curated baseline — dropping a delete/block/mute — that the client
+    // would otherwise accept unauthenticated. WA Web validates them on every patch.
 
     if let Some(snap_mac) = patch.snapshot_mac.as_ref() {
         let computed_snap = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
@@ -393,19 +390,34 @@ pub fn validate_patch_macs(
         }
     }
 
-    if let Some(patch_mac) = patch.patch_mac.as_ref() {
-        let version = patch.version.version.unwrap_or(0);
-        let computed_patch = generate_patch_mac(patch, collection_name, &keys.patch_mac, version);
-        if computed_patch != *patch_mac {
-            debug!(
-                target: "AppState",
-                "Patch {} v{} patchMAC MISMATCH, hasMissingRemove={}",
-                collection_name,
-                state.version,
-                has_missing_remove
-            );
-            return Err(AppStateError::PatchMACMismatch);
+    match patch.patch_mac.as_ref() {
+        Some(patch_mac) => {
+            let version = patch.version.version.unwrap_or(0);
+            let computed_patch =
+                generate_patch_mac(patch, collection_name, &keys.patch_mac, version);
+            if computed_patch != *patch_mac {
+                debug!(
+                    target: "AppState",
+                    "Patch {} v{} patchMAC MISMATCH, hasMissingRemove={}",
+                    collection_name,
+                    state.version,
+                    has_missing_remove
+                );
+                return Err(AppStateError::PatchMACMismatch);
+            }
         }
+        // WA Web treats a missing patchMac as a failed comparison (fatal). A genesis
+        // patch that omits it is exactly the curated-baseline case, so reject rather
+        // than accept an unauthenticated record set. Non-genesis patches keep the
+        // prior lenient behavior (patchMac only enforced when present).
+        None if had_no_prior_state => return Err(AppStateError::PatchMACMismatch),
+        None => {}
+    }
+
+    // WA Web validates both aggregate MACs unconditionally, so a genesis patch
+    // that supplies patchMac but strips snapshotMac is rejected all the same.
+    if had_no_prior_state && patch.snapshot_mac.is_none() {
+        return Err(AppStateError::PatchSnapshotMACMismatch);
     }
 
     Ok(())
@@ -440,6 +452,28 @@ mod tests {
     use crate::lthash::WAPATCH_INTEGRITY;
     use buffa::Message;
     use wacore_libsignal::crypto::aes_256_cbc_encrypt_into;
+
+    /// Sign a genesis (v1) patch's aggregate MACs the way a legitimate server does,
+    /// so it passes the validation `validate_patch_macs` now enforces for genesis.
+    /// A validate-off probe run reproduces the resulting ltHash to MAC over.
+    fn sign_genesis_patch(
+        patch: &mut wa::SyncdPatch,
+        keys: &ExpandedAppStateKeys,
+        collection: &str,
+    ) {
+        let mut probe = HashState::default();
+        let gk = |_: &[u8]| Ok(Arc::new(keys.clone()));
+        let gp = |_: &[u8]| Ok(None);
+        process_patch(patch, &mut probe, gk, gp, false, collection).expect("probe apply");
+        patch.snapshot_mac = Some(probe.generate_snapshot_mac(collection, &keys.snapshot_mac));
+        let version = patch.version.version.unwrap_or(0);
+        patch.patch_mac = Some(generate_patch_mac(
+            patch,
+            collection,
+            &keys.patch_mac,
+            version,
+        ));
+    }
 
     fn create_encrypted_record(
         op: wa::syncd_mutation::SyncdOperation,
@@ -753,6 +787,105 @@ mod tests {
         assert!(matches!(err, AppStateError::PatchMACMismatch));
     }
 
+    // F2: WA Web validates snapshotMac/patchMac on every patch, including the
+    // genesis (v1) patch. These lock that a genesis patch is no longer exempt.
+
+    #[test]
+    fn validate_patch_macs_rejects_genesis_tampered_snapshot_mac() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            snapshot_mac: Some(vec![0u8; 32]),
+            ..Default::default()
+        };
+        let state = HashState {
+            version: 1,
+            hash: [3u8; 128],
+            index_value_map: HashMap::new(),
+        };
+        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+            .expect_err("genesis snapshotMAC must be validated, not skipped");
+        assert!(matches!(err, AppStateError::PatchSnapshotMACMismatch));
+    }
+
+    #[test]
+    fn validate_patch_macs_rejects_genesis_tampered_patch_mac() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            patch_mac: Some(vec![0u8; 32]),
+            ..Default::default()
+        };
+        let state = HashState {
+            version: 1,
+            hash: [5u8; 128],
+            index_value_map: HashMap::new(),
+        };
+        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+            .expect_err("genesis patchMAC must be validated, not skipped");
+        assert!(matches!(err, AppStateError::PatchMACMismatch));
+    }
+
+    #[test]
+    fn validate_patch_macs_rejects_genesis_missing_patch_mac() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        // No snapshot_mac and no patch_mac: a curated baseline with the aggregate
+        // MAC stripped. The server can't forge it (no app-state key), so a genesis
+        // patch that omits it must be rejected rather than silently accepted.
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            ..Default::default()
+        };
+        let state = HashState {
+            version: 1,
+            hash: [5u8; 128],
+            index_value_map: HashMap::new(),
+        };
+        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+            .expect_err("genesis patch without patchMAC must be rejected");
+        assert!(matches!(err, AppStateError::PatchMACMismatch));
+    }
+
+    #[test]
+    fn validate_patch_macs_rejects_genesis_missing_snapshot_mac() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let state = HashState {
+            version: 1,
+            hash: [3u8; 128],
+            index_value_map: HashMap::new(),
+        };
+        // Valid patchMac but snapshotMac stripped: WA Web validates both, so still
+        // rejected — a server can't forge either, so neither may be omitted.
+        let mut patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            ..Default::default()
+        };
+        patch.patch_mac = Some(generate_patch_mac(&patch, "regular", &keys.patch_mac, 1));
+        let err = validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+            .expect_err("genesis patch without snapshotMAC must be rejected");
+        assert!(matches!(err, AppStateError::PatchSnapshotMACMismatch));
+    }
+
+    #[test]
+    fn validate_patch_macs_accepts_genesis_valid_macs() {
+        // Regression guard: a legitimate genesis patch, whose MACs are computed over
+        // the empty-seeded ltHash exactly as WA Web does, must still be accepted.
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let state = HashState {
+            version: 1,
+            hash: [3u8; 128],
+            index_value_map: HashMap::new(),
+        };
+        let mut patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            ..Default::default()
+        };
+        patch.snapshot_mac = Some(state.generate_snapshot_mac("regular", &keys.snapshot_mac));
+        patch.patch_mac = Some(generate_patch_mac(&patch, "regular", &keys.patch_mac, 1));
+        validate_patch_macs(&patch, &state, &keys, "regular", true, false)
+            .expect("legitimate genesis patch with correct MACs must be accepted");
+    }
+
     #[test]
     fn process_patch_rejects_duplicate_set_index() {
         let master_key = [7u8; 32];
@@ -771,7 +904,7 @@ mod tests {
                 ts,
             )),
         };
-        let patch = wa::SyncdPatch {
+        let mut patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             mutations: vec![mk(1), mk(2)],
             key_id: buffa::MessageField::some(wa::KeyId {
@@ -779,6 +912,7 @@ mod tests {
             }),
             ..Default::default()
         };
+        sign_genesis_patch(&mut patch, &keys, "regular");
 
         let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| Ok(None);
@@ -817,7 +951,7 @@ mod tests {
                 2,
             )),
         };
-        let patch = wa::SyncdPatch {
+        let mut patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             mutations: vec![set, remove],
             key_id: buffa::MessageField::some(wa::KeyId {
@@ -825,6 +959,7 @@ mod tests {
             }),
             ..Default::default()
         };
+        sign_genesis_patch(&mut patch, &keys, "regular");
 
         let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| Ok(None);
@@ -852,7 +987,7 @@ mod tests {
                 ts,
             )),
         };
-        let patch = wa::SyncdPatch {
+        let mut patch = wa::SyncdPatch {
             version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
             mutations: vec![mk(&[3u8; 32], 1), mk(&[4u8; 32], 2)],
             key_id: buffa::MessageField::some(wa::KeyId {
@@ -860,6 +995,7 @@ mod tests {
             }),
             ..Default::default()
         };
+        sign_genesis_patch(&mut patch, &keys, "regular");
 
         let get_keys = |_: &[u8]| Ok(Arc::new(keys.clone()));
         let get_prev = |_: &[u8]| Ok(None);

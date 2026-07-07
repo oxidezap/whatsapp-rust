@@ -341,6 +341,16 @@ pub async fn prepare_group_stanza(
 
     let sender_key_name = make_sender_key_name(&to_jid, &own_sending_jid.to_protocol_address());
 
+    // Hold the per-device session locks the DM path uses across BOTH the X3DH setup
+    // and the SKDM fan-out below, so a concurrent DM or group send sharing a device
+    // can't race that device's pairwise session (create or ratchet-advance). The DM
+    // path holds the same locks across all of prepare_dm_stanza; sender_key_lock only
+    // serializes the sender-key chain. Acquired before sender_key_lock so the whole
+    // send path takes session -> sender-key order (no other path takes the reverse).
+    let session_guard = resolver
+        .lock_device_sessions(distribution_list.as_deref().unwrap_or(&[]))
+        .await;
+
     // Establish missing pairwise sessions (prekey fetch + X3DH) for the SKDM
     // targets before taking the chain lock, so the chain critical section
     // below never spans a network RTT — concurrent sends to the same group
@@ -385,11 +395,9 @@ pub async fn prepare_group_stanza(
 
     // The lock spans SKDM creation, the pairwise SKDM fan-out, and the skmsg
     // encrypt. Creating the SKDM snapshots the sender key and the skmsg uses it,
-    // so those must be atomic. The fan-out also mutates the shared per-device
-    // Signal sessions, which the group path (unlike the DM path) does not lock,
-    // so it has to stay serialized here too or concurrent same-group sends race
-    // those sessions. Dropped after the encrypt so only the stanza build runs
-    // off the serialization point.
+    // so those must be atomic. Per-device pairwise sessions are guarded separately
+    // by `session_guard` above. Dropped after the encrypt so only the stanza build
+    // runs off the serialization point.
     let chain_lock = stores
         .sender_key_store
         .sender_key_lock(&sender_key_name)
@@ -475,6 +483,11 @@ pub async fn prepare_group_stanza(
             }
         }
     }
+
+    // The skmsg encrypt only advances the sender-key chain, not any pairwise
+    // session, so release the per-device locks now instead of holding them across
+    // it (avoids head-of-line blocking a concurrent DM to a shared device).
+    drop(session_guard);
 
     let skmsg = encrypt_group_message(
         stores.sender_key_store,

@@ -2136,6 +2136,43 @@ mod tests {
         assert!(out.participants.iter().any(|p| p.is_same_user_as(&own)));
     }
 
+    // The group SKDM pairwise fan-out must hold the SAME per-device session mutex
+    // the DM path locks, so the two can't advance a shared device's ratchet at
+    // once. Acquiring the group lock must block the DM per-device lock.
+    #[tokio::test]
+    async fn group_skdm_lock_shares_dm_per_device_session_mutex() {
+        use wacore::client::context::SendContextResolver;
+
+        let client = crate::test_utils::create_test_client().await;
+        let device: Jid = "15551234567:3@s.whatsapp.net".parse().unwrap();
+
+        // The exact mutex the DM send path would lock for this device.
+        let keys = client
+            .build_session_lock_keys(std::slice::from_ref(&device))
+            .await;
+        let dm_mutexes = client.session_mutexes_for(&keys).await;
+        assert_eq!(dm_mutexes.len(), 1);
+        assert!(
+            dm_mutexes[0].try_lock().is_some(),
+            "uncontended before the group lock"
+        );
+
+        // Hold the group SKDM lock for the same device.
+        let guard = client
+            .lock_device_sessions(std::slice::from_ref(&device))
+            .await;
+        assert!(
+            dm_mutexes[0].try_lock().is_none(),
+            "group SKDM fan-out must block the DM per-device session lock"
+        );
+
+        drop(guard);
+        assert!(
+            dm_mutexes[0].try_lock().is_some(),
+            "the per-device session lock releases when the group guard drops"
+        );
+    }
+
     #[tokio::test]
     async fn send_message_to_status_without_reaction_errors() {
         let client = crate::test_utils::create_test_client().await;

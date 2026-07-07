@@ -7,6 +7,7 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
+use subtle::ConstantTimeEq;
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -39,6 +40,21 @@ pub fn compute_warp_mi_tag(
     mac.update(&roc.to_be_bytes());
     let full = mac.finalize().into_bytes();
     full[..tag_len].to_vec()
+}
+
+/// Constant-time-verify a received WARP MI tag against the one we compute for
+/// `roc`. Callers must reject a packet whose tag fails BEFORE folding recv ROC
+/// state, so an unauthenticated packet can't desync the rollover counter
+/// (RFC 3711 §3.3.1: update the index only after authentication).
+pub fn verify_warp_mi_tag(
+    auth_key: &[u8],
+    packet_without_tag: &[u8],
+    roc: u32,
+    tag_len: usize,
+    received_tag: &[u8],
+) -> bool {
+    let expected = compute_warp_mi_tag(auth_key, packet_without_tag, roc, tag_len);
+    expected.ct_eq(received_tag).into()
 }
 
 /// Append the WARP MI tag to a protected packet.

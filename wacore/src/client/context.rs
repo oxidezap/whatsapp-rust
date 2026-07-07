@@ -188,6 +188,28 @@ impl crate::stats::HeapSize for GroupInfo {
     }
 }
 
+/// Opaque RAII holder for the per-device pairwise session locks a
+/// [`SendContextResolver`] acquires around the group SKDM fan-out. Wacore holds it
+/// across the fan-out and drops it to release; the concrete guard type lives in the
+/// platform crate, since the per-address lock cache is not part of the portable core.
+#[must_use = "the session locks release the moment this guard is dropped"]
+pub struct SessionLockGuard(
+    // Held purely for its `Drop` (releases the locks); never read.
+    #[allow(dead_code)] Option<Box<dyn crate::sync_marker::MaybeSendSync>>,
+);
+
+impl SessionLockGuard {
+    /// No locks held — the default resolver behavior (tests/benches don't race).
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Hold `guards` until this value is dropped.
+    pub fn hold(guards: Box<dyn crate::sync_marker::MaybeSendSync>) -> Self {
+        Self(Some(guards))
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
@@ -224,6 +246,17 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
     /// back to the client available inside `encrypt_for_devices`.
     fn on_local_identity_change(&self, jid: &Jid) {
         let _ = jid;
+    }
+
+    /// Acquire the per-device pairwise session locks for the SKDM fan-out targets,
+    /// in the same deadlock-free order the DM send path uses, so a group send and a
+    /// concurrent DM (or another group send) sharing a device can't advance that
+    /// device's pairwise ratchet at once and drop a chain step. The `sender_key_lock`
+    /// only serializes the sender-key chain, not these pairwise sessions. Default:
+    /// no-op — tests and benches don't race concurrent sends.
+    async fn lock_device_sessions(&self, device_jids: &[Jid]) -> SessionLockGuard {
+        let _ = device_jids;
+        SessionLockGuard::none()
     }
 }
 

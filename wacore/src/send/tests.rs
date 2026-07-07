@@ -802,6 +802,30 @@ fn create_mock_bundle() -> PreKeyBundle {
     .expect("Failed to create PreKeyBundle")
 }
 
+/// A bundle whose signed-prekey signature actually verifies, so
+/// `process_prekey_bundle` establishes a session. Contrast `create_mock_bundle`,
+/// whose zeroed signature deliberately fails X3DH (used to exercise the reject path).
+fn signed_prekey_bundle() -> PreKeyBundle {
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let receiver = IdentityKeyPair::generate(&mut rng);
+    let spk = KeyPair::generate(&mut rng);
+    let opk = KeyPair::generate(&mut rng);
+    let sig = receiver
+        .private_key()
+        .calculate_signature(&spk.public_key.serialize(), &mut rng)
+        .unwrap();
+    PreKeyBundle::new(
+        1,
+        1u32.into(),
+        Some((1u32.into(), opk.public_key)),
+        1u32.into(),
+        spk.public_key,
+        sig.to_vec(),
+        *receiver.identity_key(),
+    )
+    .unwrap()
+}
+
 // These tests validate the fix for the LID-PN session mismatch issue.
 // When a message is received with sender_lid, the session is stored under the LID address.
 // When sending a reply using the phone number, we must reuse the existing LID session
@@ -1212,8 +1236,8 @@ fn test_lid_prekey_lookup_normalization() {
 mod group_retry {
     use super::*;
     use crate::libsignal::protocol::{
-        Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, KeyPair,
-        PreKeyBundle, ProtocolAddress, SessionStore, process_prekey_bundle,
+        Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, ProtocolAddress,
+        SessionStore, process_prekey_bundle,
     };
     use crate::types::message::AddressingMode;
     use std::collections::HashMap;
@@ -1300,23 +1324,7 @@ mod group_retry {
     async fn setup_session() -> (MemSessionStore, MemIdentityStore, Jid) {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let sender = IdentityKeyPair::generate(&mut rng);
-        let receiver = IdentityKeyPair::generate(&mut rng);
-        let spk = KeyPair::generate(&mut rng);
-        let opk = KeyPair::generate(&mut rng);
-        let sig = receiver
-            .private_key()
-            .calculate_signature(&spk.public_key.serialize(), &mut rng)
-            .unwrap();
-        let bundle = PreKeyBundle::new(
-            1,
-            1u32.into(),
-            Some((1u32.into(), opk.public_key)),
-            1u32.into(),
-            spk.public_key,
-            sig.to_vec(),
-            *receiver.identity_key(),
-        )
-        .unwrap();
+        let bundle = signed_prekey_bundle();
         let jid: Jid = "559911112222@s.whatsapp.net".parse().unwrap();
         let addr = jid.to_protocol_address();
         let mut ss = MemSessionStore::new();
@@ -2924,23 +2932,7 @@ mod mark_full_distribution_list {
     async fn established_stores(a: &Jid) -> (MemSessionStore, MemIdentityStore) {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let sender = IdentityKeyPair::generate(&mut rng);
-        let receiver = IdentityKeyPair::generate(&mut rng);
-        let spk = KeyPair::generate(&mut rng);
-        let opk = KeyPair::generate(&mut rng);
-        let sig = receiver
-            .private_key()
-            .calculate_signature(&spk.public_key.serialize(), &mut rng)
-            .unwrap();
-        let bundle = PreKeyBundle::new(
-            1,
-            1u32.into(),
-            Some((1u32.into(), opk.public_key)),
-            1u32.into(),
-            spk.public_key,
-            sig.to_vec(),
-            *receiver.identity_key(),
-        )
-        .unwrap();
+        let bundle = signed_prekey_bundle();
         let mut ss = MemSessionStore::default();
         let mut is = MemIdentityStore {
             pair: sender,
@@ -3193,27 +3185,8 @@ mod mark_full_distribution_list {
             signed_prekey_store: &spks,
         };
 
-        // Verifiable bundle (create_mock_bundle's zeroed signature fails X3DH).
-        let receiver = IdentityKeyPair::generate(&mut rng);
-        let spk = KeyPair::generate(&mut rng);
-        let opk = KeyPair::generate(&mut rng);
-        let sig = receiver
-            .private_key()
-            .calculate_signature(&spk.public_key.serialize(), &mut rng)
-            .unwrap();
-        let bundle = PreKeyBundle::new(
-            1,
-            1u32.into(),
-            Some((1u32.into(), opk.public_key)),
-            1u32.into(),
-            spk.public_key,
-            sig.to_vec(),
-            *receiver.identity_key(),
-        )
-        .unwrap();
-
         let resolver = MockSendContextResolver::new()
-            .with_bundle(b.clone(), bundle)
+            .with_bundle(b.clone(), signed_prekey_bundle())
             .with_chain_lock_probe(probe.clone());
         let rt = TokioTestRuntime;
 
@@ -3269,6 +3242,86 @@ mod mark_full_distribution_list {
             participants.children().map(|c| c.len()).unwrap_or(0),
             1,
             "B must receive a pairwise SKDM via the pre-established session"
+        );
+    }
+
+    /// One participant's session-setup failure must NOT abort the SKDM for the
+    /// rest of the cohort: the good device still gets its pairwise SKDM, the bad
+    /// one is dropped. Before the fix, the failing device's process_prekey_bundle
+    /// error nulled the whole session_plan, so no device got an SKDM (and the
+    /// cohort was still marked has_key=true, orphaning own companions).
+    #[tokio::test]
+    async fn group_skdm_setup_failure_is_isolated_to_the_bad_device() {
+        let group: Jid = "120363000000000003@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000001@lid".parse().unwrap();
+        // good: valid bundle → session establishes. bad: create_mock_bundle's
+        // zeroed signature fails X3DH inside process_prekey_bundle.
+        let good: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let bad: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        let resolver = MockSendContextResolver::new()
+            .with_bundle(good.clone(), signed_prekey_bundle())
+            .with_bundle(bad.clone(), create_mock_bundle());
+        let rt = TokioTestRuntime;
+
+        let group_info = GroupInfo::new(
+            vec![own_jid.to_non_ad(), good.to_non_ad(), bad.to_non_ad()],
+            AddressingMode::Pn,
+        );
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_group_stanza(
+            &rt,
+            &mut stores,
+            &resolver,
+            &group_info,
+            &own_jid,
+            &own_lid,
+            None,
+            group,
+            &msg,
+            "TESTREQID_ISO".into(),
+            false,
+            Some(vec![good.clone(), bad.clone()]),
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("prepare_group_stanza must succeed despite one device's setup failure");
+
+        let participants = prepared
+            .node
+            .get_optional_child("participants")
+            .expect("the good device's SKDM must still be distributed");
+        assert_eq!(
+            participants.children().map(|c| c.len()).unwrap_or(0),
+            1,
+            "only the good device receives an SKDM; the failed one is skipped, \
+             not aborting the whole cohort"
         );
     }
 }

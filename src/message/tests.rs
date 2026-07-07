@@ -759,6 +759,13 @@ async fn ensure_bob_paired(client: &Arc<Client>) {
 /// keys back to the sender — assembled through the same
 /// `SignalProtocolStoreAdapter` traits production uses.
 async fn bobs_prekey_bundle(client: &Arc<Client>) -> (PreKeyBundle, Jid) {
+    bobs_prekey_bundle_with_spk_id(client, 1).await
+}
+
+/// Like [`bobs_prekey_bundle`] but advertises an arbitrary `spk_id` so callers
+/// can trigger `InvalidSignedPreKeyId` on Bob's decrypt path (the signed-prekey
+/// signature covers only the public key, so an unprovisioned id still verifies).
+async fn bobs_prekey_bundle_with_spk_id(client: &Arc<Client>, spk_id: u32) -> (PreKeyBundle, Jid) {
     use wacore::libsignal::protocol::GenericSignedPreKey;
     ensure_bob_paired(client).await;
     let snapshot = client.persistence_manager.get_device_snapshot();
@@ -799,7 +806,7 @@ async fn bobs_prekey_bundle(client: &Arc<Client>) -> (PreKeyBundle, Jid) {
         reg_id,
         u32::from(own_device_jid.device).into(),
         Some((pk_id_u32.into(), pk_pair.public_key)),
-        1.into(),
+        spk_id.into(),
         spk_pub,
         spk_sig_vec,
         IdentityKey::new(identity_kp.public_key),
@@ -6621,6 +6628,120 @@ async fn bad_session_plaintext_skips_skmsg_sibling_after_nack() {
     );
 }
 
+/// Happy path: a group skmsg with an established sender key decrypts through
+/// process_group_enc_batch — now under the sender-key chain lock — and surfaces
+/// its content. The added lock must not block the normal decrypt.
+#[tokio::test]
+async fn group_skmsg_decrypts_under_sender_key_lock() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("group_skmsg_lock_happy").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.add_handler(handler);
+
+    let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+    let bob_addr = bob_jid.to_protocol_address();
+    let mut alice = AlicePeer::new("146824178450540@lid").await;
+    alice.install_bob_session(&bob_addr, &bundle).await;
+
+    let group: Jid = "120363408782575460@g.us".parse().expect("group");
+    let skdm = alice.create_group_skdm(&group).await;
+    let skdm_plaintext = MessageUtils::encode_and_pad(&wa::Message {
+        sender_key_distribution_message: buffa::MessageField::some(skdm),
+        ..Default::default()
+    });
+    let skdm_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
+
+    let content = MessageUtils::encode_and_pad(&wa::Message {
+        conversation: Some("hello group".to_string()),
+        ..Default::default()
+    });
+    let skmsg = alice.encrypt_group_message(&group, &content).await;
+
+    let id = "GROUP_SKMSG_LOCK_HAPPY";
+    let info = group_message_info(id, &group, &alice.jid, false);
+    process_group_classified_with_sessions(
+        &client,
+        info,
+        &alice.jid,
+        vec![enc_payload_from_ciphertext(&skdm_ct)],
+        vec![skmsg_payload_from_bytes(skmsg)],
+    )
+    .await;
+
+    let mut texts = Vec::new();
+    for _ in 0..80 {
+        texts = message_texts_for_id(&rx, id);
+        if !texts.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        texts,
+        vec!["hello group".to_string()],
+        "group skmsg content must surface after decrypt under the chain lock"
+    );
+}
+
+/// Bad path: a group skmsg whose sender key was never distributed hits
+/// NoSenderKeyState inside process_group_enc_batch (still under the lock) and
+/// takes the retry path — one undecryptable event, no user content.
+#[tokio::test]
+async fn group_skmsg_without_sender_key_takes_retry_path() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("group_skmsg_lock_bad").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.add_handler(handler);
+    let recorder = Arc::new(EventRecorder::default());
+    client.register_handler(recorder.clone());
+
+    let mut alice = AlicePeer::new("146824178450541@lid").await;
+    let group: Jid = "120363408782575461@g.us".parse().expect("group");
+
+    // Init alice's own sender key so she can encrypt, but never deliver the SKDM:
+    // Bob has no sender key for this (group, sender).
+    let _ = alice.create_group_skdm(&group).await;
+    let content = MessageUtils::encode_and_pad(&wa::Message {
+        conversation: Some("no key".to_string()),
+        ..Default::default()
+    });
+    let skmsg = alice.encrypt_group_message(&group, &content).await;
+
+    let id = "GROUP_SKMSG_LOCK_BAD";
+    let info = group_message_info(id, &group, &alice.jid, false);
+    process_group_classified_with_payloads(
+        &client,
+        info,
+        &alice.jid,
+        vec![],
+        vec![skmsg_payload_from_bytes(skmsg)],
+        vec![],
+    )
+    .await;
+
+    let mut undecryptable = 0;
+    for _ in 0..80 {
+        undecryptable = recorder.undecryptable().len();
+        if undecryptable > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        undecryptable, 1,
+        "a missing sender key must surface exactly one undecryptable event"
+    );
+    assert_eq!(
+        message_texts_for_id(&rx, id),
+        Vec::<String>::new(),
+        "no user content is dispatched without a sender key"
+    );
+}
+
 #[tokio::test]
 async fn skdm_only_session_with_msmsg_waits_for_bot_payload_response() {
     use wacore::messages::MessageUtils;
@@ -10405,4 +10526,114 @@ async fn bench_session_decrypt_throughput() {
          rss_start={rss0}KB rss_end={rss1}KB rss_delta={}KB vm_hwm={hwm}KB\n",
         rss1.saturating_sub(rss0)
     );
+}
+
+/// F3: group (skmsg) decrypt failures from a sender-key desync must map to a
+/// retry receipt (WA Web treats every `SignalDecryptionError` as
+/// `SignalRetryable`), not a terminal NACK that drops the message. Locks the
+/// classification in `group_decrypt_retry_reason`.
+#[test]
+fn test_group_decrypt_retry_reason_classification() {
+    use wacore::libsignal::protocol::CiphertextMessageType;
+
+    // Recoverable sender-key errors -> retry receipt.
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::SignatureValidationFailed),
+        Some(RetryReason::InvalidSignature)
+    );
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::InvalidSenderKeySession),
+        Some(RetryReason::InvalidSession)
+    );
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::UnrecognizedMessageVersion(2)),
+        Some(RetryReason::InvalidMessage)
+    );
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::InvalidMessage(
+            CiphertextMessageType::SenderKey,
+            "decryption failed"
+        )),
+        Some(RetryReason::InvalidMessage)
+    );
+
+    // Errors handled by dedicated arms (or genuinely non-Signal) -> keep NACK.
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::NoSenderKeyState("x".into())),
+        None
+    );
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::DuplicatedMessage(1, 1)),
+        None
+    );
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::InvalidProtobufEncoding),
+        None
+    );
+}
+
+/// F4: a PreKeySignalMessage naming a signed prekey we've rotated past
+/// SIGNED_PRE_KEY_RETENTION surfaces `InvalidSignedPreKeyId`. WA Web classifies
+/// this as `SignalRetryable`, so it must send a retry receipt (carrying our live
+/// bundle) rather than a terminal NACK that drops the 1:1 message. The sibling
+/// `InvalidPreKeyId` arm already retries; this locks the same for signed prekeys.
+#[tokio::test]
+async fn test_invalid_signed_prekey_id_sends_retry_receipt() {
+    let client = crate::test_utils::create_test_client_with_name("invalid_spk_id").await;
+
+    // Bundle advertises a signed-prekey id the client never provisioned, so
+    // Bob's decrypt hits InvalidSignedPreKeyId (as a rotated-out signed prekey
+    // would). Alice still accepts the bundle because the id is not signed.
+    let (bundle, bob_jid) = bobs_prekey_bundle_with_spk_id(&client, 4242).await;
+    let bob_addr = bob_jid.to_protocol_address();
+
+    let mut alice = AlicePeer::new("15550002002@s.whatsapp.net").await;
+    alice.install_bob_session(&bob_addr, &bundle).await;
+    let pkmsg = alice
+        .encrypt_text(&bob_addr, "signed prekey rotated out")
+        .await;
+    assert!(
+        matches!(pkmsg, CiphertextMessage::PreKeySignalMessage(_)),
+        "must be a pkmsg so decrypt looks up the signed prekey"
+    );
+
+    let bytes = match &pkmsg {
+        CiphertextMessage::PreKeySignalMessage(m) => m.serialized().to_vec(),
+        _ => unreachable!(),
+    };
+    let enc_node = NodeBuilder::new("enc")
+        .attr("type", "pkmsg")
+        .bytes(bytes)
+        .build();
+    let enc_ref = enc_node.as_node_ref();
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let info = Arc::new(MessageInfo {
+        id: "INVALID_SPK_ID_MSG".to_string(),
+        source: crate::types::message::MessageSource {
+            sender: alice.jid.clone(),
+            chat: alice.jid.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let outcome = client
+        .clone()
+        .process_session_enc_batch(
+            &payloads,
+            &info,
+            &alice.jid,
+            crate::types::events::DecryptFailMode::Show,
+        )
+        .await;
+    assert!(
+        !outcome.decrypted,
+        "must not decrypt with a missing signed prekey"
+    );
+    assert!(outcome.had_failure, "must record a decrypt failure");
+
+    // The fix routes InvalidSignedPreKeyId to handle_decrypt_failure -> retry
+    // receipt with RetryReason::InvalidKeyId. Pre-fix this took the terminal
+    // NACK path, which never bumps the retry caches.
+    await_retry_receipt(&client, &info, 1, RetryReason::InvalidKeyId).await;
 }

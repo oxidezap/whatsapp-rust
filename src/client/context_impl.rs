@@ -59,4 +59,22 @@ impl SendContextResolver for Client {
     fn on_local_identity_change(&self, jid: &Jid) {
         self.react_to_local_identity_change(jid);
     }
+
+    async fn lock_device_sessions(
+        &self,
+        device_jids: &[Jid],
+    ) -> wacore::client::context::SessionLockGuard {
+        use wacore::client::context::SessionLockGuard;
+        if device_jids.is_empty() {
+            return SessionLockGuard::none();
+        }
+        // Reuse the DM path's helpers so both lock the identical per-device mutexes.
+        let keys = self.build_session_lock_keys(device_jids).await;
+        let mutexes = self.session_mutexes_for(&keys).await;
+        let mut guards = Vec::with_capacity(mutexes.len());
+        for mutex in &mutexes {
+            guards.push(mutex.lock_arc().await);
+        }
+        SessionLockGuard::hold(Box::new(guards))
+    }
 }

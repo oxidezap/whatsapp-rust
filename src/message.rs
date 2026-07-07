@@ -5,6 +5,7 @@ use log::{debug, warn};
 use std::sync::Arc;
 use wacore::libsignal::crypto::DecryptionError;
 use wacore::libsignal::protocol::SenderKeyDistributionMessage;
+use wacore::libsignal::protocol::SenderKeyStore;
 use wacore::libsignal::protocol::group_decrypt;
 use wacore::libsignal::protocol::process_sender_key_distribution_message;
 use wacore::libsignal::protocol::{
@@ -140,6 +141,19 @@ fn decrypt_fail_log_level(mode: crate::types::events::DecryptFailMode) -> log::L
     match mode {
         crate::types::events::DecryptFailMode::Hide => log::Level::Debug,
         crate::types::events::DecryptFailMode::Show => log::Level::Warn,
+    }
+}
+
+/// WA Web treats every `SignalDecryptionError` as `SignalRetryable`, so a
+/// sender-key desync must request a resend rather than NACK (which stops the
+/// server retransmitting). `None` = keep the NACK (genuinely non-Signal error).
+fn group_decrypt_retry_reason(e: &SignalProtocolError) -> Option<RetryReason> {
+    match e {
+        SignalProtocolError::SignatureValidationFailed => Some(RetryReason::InvalidSignature),
+        SignalProtocolError::InvalidSenderKeySession => Some(RetryReason::InvalidSession),
+        SignalProtocolError::UnrecognizedMessageVersion(_) => Some(RetryReason::InvalidMessage),
+        SignalProtocolError::InvalidMessage(_, _) => Some(RetryReason::InvalidMessage),
+        _ => None,
     }
 }
 

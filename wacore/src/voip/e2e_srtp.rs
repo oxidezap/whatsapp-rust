@@ -1,6 +1,7 @@
 //! E2E 1:1 SRTP, the primary working path. Keys derive from `callKey` (32B) +
 //! participant LID via HKDF-SHA256, then an AES-CM PRF; payloads use AES-128-CTR
-//! with a 4-byte WARP MESSAGE-INTEGRITY tag (HMAC-SHA1, not verified on recv).
+//! with a 4-byte WARP MESSAGE-INTEGRITY tag (HMAC-SHA1), verified on recv before
+//! the rollover counter is advanced (see `session::unprotect_audio`).
 //!
 //! wacrg spec: srtp-e2e (CRY-05), srtp-master-key (CRY-02), call-key (CRY-01).
 
@@ -9,7 +10,9 @@ use ctr::Ctr128BE;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 
 use crate::voip::hkdf_sha256;
-pub use crate::voip::warp::{WARP_MI_TAG_LEN, append_warp_mi_tag, compute_warp_mi_tag};
+pub use crate::voip::warp::{
+    WARP_MI_TAG_LEN, append_warp_mi_tag, compute_warp_mi_tag, verify_warp_mi_tag,
+};
 
 type AesCtr = Ctr128BE<Aes128>;
 
@@ -142,16 +145,16 @@ pub(crate) struct RecvRocTracker {
 }
 
 impl RecvRocTracker {
-    /// Guess the ROC for `seq` and fold it into the state. Seeds from the first packet (roc=0).
-    pub fn guess_roc(&mut self, seq: u16) -> u32 {
+    /// Estimate the ROC for `seq` WITHOUT mutating state (RFC 3711 guess-index).
+    /// Use this to build the IV / verify a packet; only [`Self::commit_roc`] after
+    /// the packet authenticates, so an unauthenticated packet can't desync state.
+    pub fn estimate_roc(&self, seq: u16) -> u32 {
         if !self.initialized {
-            self.s_l = seq;
-            self.initialized = true;
             return self.roc;
         }
         // Pick v in {roc-1, roc, roc+1} so 2^16*v+seq is closest to 2^16*roc+s_l. The signed 16-bit
         // gap (not a modular wrapping_sub) is what distinguishes "next-but-reordered" from "wrapped".
-        let v = if self.s_l < 0x8000 {
+        if self.s_l < 0x8000 {
             if (seq as i32 - self.s_l as i32) > 0x8000 {
                 self.roc.wrapping_sub(1) // old packet from before the origin (roc-1)
             } else {
@@ -161,7 +164,18 @@ impl RecvRocTracker {
             self.roc.wrapping_add(1) // forward wrap into roc+1
         } else {
             self.roc
-        };
+        }
+    }
+
+    /// Fold an AUTHENTICATED packet's `(v, seq)` into the state; `v` must come from
+    /// a prior [`Self::estimate_roc`] whose MI tag verified. Seeds from the first
+    /// packet (roc stays 0).
+    pub fn commit_roc(&mut self, v: u32, seq: u16) {
+        if !self.initialized {
+            self.s_l = seq;
+            self.initialized = true;
+            return;
+        }
         if v == self.roc {
             if seq > self.s_l {
                 self.s_l = seq;
@@ -170,7 +184,16 @@ impl RecvRocTracker {
             self.roc = v;
             self.s_l = seq;
         }
-        // v == roc-1 (reordered late packet): return the lower ROC, leave state untouched.
+        // v == roc-1 (reordered late packet): leave state untouched.
+    }
+
+    /// Estimate + commit in one step. Test-only: production authenticates the WARP
+    /// MI tag against `estimate_roc` first and only `commit_roc` on success, so an
+    /// unauthenticated packet can't fold state. Kept for the wrap-tracking tests.
+    #[cfg(test)]
+    pub fn guess_roc(&mut self, seq: u16) -> u32 {
+        let v = self.estimate_roc(seq);
+        self.commit_roc(v, seq);
         v
     }
 }
@@ -272,6 +295,37 @@ mod tests {
             rx.guess_roc(0x0001),
             2,
             "state not corrupted by the late packet"
+        );
+    }
+
+    /// The exact rollover-desync the auth fix prevents. `unprotect_audio` only
+    /// `commit_roc`s after the MI tag verifies, so a rejected (unauthenticated)
+    /// packet stays on the pure `estimate_roc` path and can't fold state — while the
+    /// attacker's 2-packet staircase, if committed, advances the ROC by one.
+    #[test]
+    fn unauthenticated_staircase_cannot_advance_roc_without_commit() {
+        let mut rx = RecvRocTracker::default();
+        rx.guess_roc(0x7FFE); // seed s_l into the high half (the exploit's start)
+        assert_eq!(rx.roc, 0);
+
+        // A rejected packet only reaches estimate_roc (never commit_roc): the
+        // attacker's staircase seqs leave the state untouched.
+        let _ = rx.estimate_roc(0xFFFE);
+        let _ = rx.estimate_roc(0x7FFD);
+        assert_eq!(rx.roc, 0, "estimate alone must not advance the ROC");
+        assert_eq!(
+            rx.estimate_roc(0x7FFF),
+            0,
+            "a legit in-window seq still maps to roc=0"
+        );
+
+        // Contrast: committing that same staircase (the pre-fix path) advances the
+        // ROC by one — the desync authentication now blocks.
+        rx.commit_roc(rx.estimate_roc(0xFFFE), 0xFFFE);
+        rx.commit_roc(rx.estimate_roc(0x7FFD), 0x7FFD);
+        assert_eq!(
+            rx.roc, 1,
+            "committing the staircase advances the ROC (the pre-fix desync)"
         );
     }
 

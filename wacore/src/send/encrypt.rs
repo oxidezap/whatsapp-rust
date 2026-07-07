@@ -604,7 +604,13 @@ pub async fn ensure_sessions_for_devices(
                 // identity; notify the client so it can react off-path.
                 Ok(Ok(Some(changed_jid))) => resolver.on_local_identity_change(&changed_jid),
                 Ok(Ok(None)) => {}
-                Ok(Err(e)) => return Err(e),
+                // Isolate the failure to this device so one participant can't abort
+                // the cohort's SKDM (matching WA Web GroupKeyDistributionMsg's
+                // per-device try/catch). The sessionless device is dropped by the
+                // fan-out below.
+                Ok(Err(e)) => {
+                    log::warn!("Group session setup failed for a device, skipping it: {e}");
+                }
                 Err(SpawnCanceled) => {
                     log::warn!(
                         "Session-establishment task did not deliver a result; skipping device."

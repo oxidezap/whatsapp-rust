@@ -197,7 +197,10 @@ pub struct CacheConfig {
     pub session_recreate_history: CacheEntryConfig,
 
     // --- Coordination caches (capacity-only, no TTL) ---
-    /// Per-device Signal session lock capacity. Default: 10000.
+    /// Per-device Signal session lock capacity. Default: 10000. Soft cap: a lock a
+    /// task is actively holding is never evicted, so the map can briefly exceed this
+    /// under heavy concurrent fan-out (bounded by the concurrently-held count) rather
+    /// than evicting a live lock and letting two writers race the same session.
     pub session_locks_capacity: u64,
     /// Per-chat lane capacity (combined lock + queue). Default: 5000.
     pub chat_lanes_capacity: u64,
