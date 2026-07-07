@@ -241,17 +241,16 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
             notification.group_jid.observe(), action.tag_name()
         );
 
-        client
-            .core
-            .event_bus
-            .dispatch(Event::GroupUpdate(GroupUpdate {
-                group_jid: notification.group_jid.clone(),
-                participant: notification.participant.clone(),
-                participant_pn: notification.participant_pn.clone(),
-                timestamp,
-                is_lid_addressing_mode: notification.is_lid_addressing_mode,
-                action,
-            }));
+        client.core.event_bus.dispatch(Event::GroupUpdate(
+            GroupUpdate::builder()
+                .group_jid(notification.group_jid.clone())
+                .maybe_participant(notification.participant.clone())
+                .maybe_participant_pn(notification.participant_pn.clone())
+                .timestamp(timestamp)
+                .is_lid_addressing_mode(notification.is_lid_addressing_mode)
+                .action(action)
+                .build(),
+        ));
     }
 
     // Also dispatch legacy generic notification for backward compatibility

@@ -875,11 +875,11 @@ impl Client {
                     .process_command(DeviceCommand::SetPushName(new_name.clone()))
                     .await;
                 bus.dispatch(Event::SelfPushNameUpdated(
-                    crate::types::events::SelfPushNameUpdated {
-                        from_server: true,
-                        old_name: old.clone(),
-                        new_name: new_name.clone(),
-                    },
+                    crate::types::events::SelfPushNameUpdated::builder()
+                        .from_server(true)
+                        .old_name(old.clone())
+                        .new_name(new_name.clone())
+                        .build(),
                 ));
 
                 // WhatsApp Web sends presence immediately when receiving pushname

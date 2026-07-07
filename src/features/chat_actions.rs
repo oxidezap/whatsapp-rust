@@ -130,12 +130,14 @@ pub(crate) fn dispatch_chat_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = val.mute_action.as_option()
             {
-                event_bus.dispatch(Event::MuteUpdate(MuteUpdate {
-                    jid,
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::MuteUpdate(
+                    MuteUpdate::builder()
+                        .jid(jid)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }
@@ -143,12 +145,14 @@ pub(crate) fn dispatch_chat_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = val.pin_action.as_option()
             {
-                event_bus.dispatch(Event::PinUpdate(PinUpdate {
-                    jid,
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::PinUpdate(
+                    PinUpdate::builder()
+                        .jid(jid)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }
@@ -156,12 +160,14 @@ pub(crate) fn dispatch_chat_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = val.archive_chat_action.as_option()
             {
-                event_bus.dispatch(Event::ArchiveUpdate(ArchiveUpdate {
-                    jid,
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::ArchiveUpdate(
+                    ArchiveUpdate::builder()
+                        .jid(jid)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }
@@ -171,15 +177,17 @@ pub(crate) fn dispatch_chat_mutation(
                 && let Some((message_id, from_me, participant_jid)) =
                     parse_message_key_fields(kind, &m.index)
             {
-                event_bus.dispatch(Event::StarUpdate(StarUpdate {
-                    chat_jid: jid,
-                    participant_jid,
-                    message_id,
-                    from_me,
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::StarUpdate(
+                    StarUpdate::builder()
+                        .chat_jid(jid)
+                        .maybe_participant_jid(participant_jid)
+                        .message_id(message_id)
+                        .from_me(from_me)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }
@@ -187,12 +195,14 @@ pub(crate) fn dispatch_chat_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = val.contact_action.as_option()
             {
-                event_bus.dispatch(Event::ContactUpdate(ContactUpdate {
-                    jid,
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::ContactUpdate(
+                    ContactUpdate::builder()
+                        .jid(jid)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }
@@ -200,12 +210,14 @@ pub(crate) fn dispatch_chat_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = val.mark_chat_as_read_action.as_option()
             {
-                event_bus.dispatch(Event::MarkChatAsReadUpdate(MarkChatAsReadUpdate {
-                    jid,
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::MarkChatAsReadUpdate(
+                    MarkChatAsReadUpdate::builder()
+                        .jid(jid)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }
@@ -215,13 +227,15 @@ pub(crate) fn dispatch_chat_mutation(
             {
                 // delete_media is in index[2], not in the proto (which only has messageRange)
                 let delete_media = m.index.get(2).is_none_or(|v| v != "0");
-                event_bus.dispatch(Event::DeleteChatUpdate(DeleteChatUpdate {
-                    jid,
-                    delete_media,
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::DeleteChatUpdate(
+                    DeleteChatUpdate::builder()
+                        .jid(jid)
+                        .delete_media(delete_media)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }
@@ -234,14 +248,16 @@ pub(crate) fn dispatch_chat_mutation(
                 // builder encodes both as "1"/"0".
                 let delete_starred = m.index.get(2).is_some_and(|v| v == "1");
                 let delete_media = m.index.get(3).is_some_and(|v| v == "1");
-                event_bus.dispatch(Event::ClearChatUpdate(ClearChatUpdate {
-                    jid,
-                    delete_starred,
-                    delete_media,
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::ClearChatUpdate(
+                    ClearChatUpdate::builder()
+                        .jid(jid)
+                        .delete_starred(delete_starred)
+                        .delete_media(delete_media)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }
@@ -249,13 +265,15 @@ pub(crate) fn dispatch_chat_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = val.user_status_mute_action.as_option()
             {
-                event_bus.dispatch(Event::UserStatusMuteUpdate(UserStatusMuteUpdate {
-                    jid,
-                    muted: act.muted.unwrap_or(false),
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::UserStatusMuteUpdate(
+                    UserStatusMuteUpdate::builder()
+                        .jid(jid)
+                        .muted(act.muted.unwrap_or(false))
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }
@@ -265,15 +283,17 @@ pub(crate) fn dispatch_chat_mutation(
                 && let Some((message_id, from_me, participant_jid)) =
                     parse_message_key_fields(kind, &m.index)
             {
-                event_bus.dispatch(Event::DeleteMessageForMeUpdate(DeleteMessageForMeUpdate {
-                    chat_jid: jid,
-                    participant_jid,
-                    message_id,
-                    from_me,
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::DeleteMessageForMeUpdate(
+                    DeleteMessageForMeUpdate::builder()
+                        .chat_jid(jid)
+                        .maybe_participant_jid(participant_jid)
+                        .message_id(message_id)
+                        .from_me(from_me)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }

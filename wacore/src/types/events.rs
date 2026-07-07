@@ -439,7 +439,8 @@ impl CoreEventBus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct SelfPushNameUpdated {
     pub from_server: bool,
     pub old_name: String,
@@ -1222,14 +1223,16 @@ pub struct ServerAck {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ChatPresenceUpdate {
     pub source: crate::types::message::MessageSource,
     pub state: ChatPresence,
     pub media: ChatPresenceMedia,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct PresenceUpdate {
     /// The contact whose presence changed.
     pub from: Jid,
@@ -1237,7 +1240,8 @@ pub struct PresenceUpdate {
     pub last_seen: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct PictureUpdate {
     /// The JID whose picture changed (user or group).
     pub jid: Jid,
@@ -1253,7 +1257,8 @@ pub struct PictureUpdate {
     pub picture_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct UserAboutUpdate {
     /// The contact whose about text changed.
     pub jid: Jid,
@@ -1269,7 +1274,8 @@ pub struct UserAboutUpdate {
 ///
 /// Not to be confused with [`ContactUpdate`] which comes from app-state
 /// sync mutations (different source, different payload).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ContactUpdated {
     /// The contact whose profile was updated.
     pub jid: Jid,
@@ -1287,7 +1293,8 @@ pub struct ContactUpdated {
 /// sessions intact). Group participant updates arrive via separate
 /// `w:gp2` notifications, so per-group caches are not touched here.
 /// Consumers can subscribe and refresh their own caches if needed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ContactNumberChanged {
     /// Old phone number JID.
     pub old_jid: Jid,
@@ -1305,7 +1312,8 @@ pub struct ContactNumberChanged {
 /// Server requests a full contact re-sync.
 ///
 /// Emitted from `<notification type="contacts"><sync after="..."/>`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ContactSyncRequested {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<DateTime<Utc>>,
@@ -1316,7 +1324,8 @@ pub struct ContactSyncRequested {
 ///
 /// Emitted for each action in a `<notification type="w:gp2">` stanza.
 /// A single notification may produce multiple `GroupUpdate` events (one per action).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct GroupUpdate {
     /// The group this update applies to
     pub group_jid: Jid,
@@ -1334,7 +1343,8 @@ pub struct GroupUpdate {
     pub action: crate::stanza::groups::GroupNotificationAction,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ContactUpdate {
     /// The chat/contact this sync action applies to.
     pub jid: Jid,
@@ -1343,7 +1353,8 @@ pub struct ContactUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct PushNameUpdate {
     /// The contact who changed their push name.
     pub jid: Jid,
@@ -1352,7 +1363,8 @@ pub struct PushNameUpdate {
     pub new_push_name: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct PinUpdate {
     /// The chat being pinned or unpinned.
     pub jid: Jid,
@@ -1361,7 +1373,8 @@ pub struct PinUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct MuteUpdate {
     /// The chat being muted or unmuted.
     pub jid: Jid,
@@ -1370,7 +1383,8 @@ pub struct MuteUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ArchiveUpdate {
     /// The chat being archived or unarchived.
     pub jid: Jid,
@@ -1379,7 +1393,8 @@ pub struct ArchiveUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct StarUpdate {
     /// The chat containing the starred or unstarred message.
     pub chat_jid: Jid,
@@ -1393,7 +1408,8 @@ pub struct StarUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct MarkChatAsReadUpdate {
     /// The chat being marked as read or unread.
     pub jid: Jid,
@@ -1402,7 +1418,8 @@ pub struct MarkChatAsReadUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct DeleteChatUpdate {
     /// The chat being deleted.
     pub jid: Jid,
@@ -1414,7 +1431,8 @@ pub struct DeleteChatUpdate {
 }
 
 /// A chat's messages were cleared (kept) on a linked device.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ClearChatUpdate {
     /// The chat being cleared.
     pub jid: Jid,
@@ -1428,7 +1446,8 @@ pub struct ClearChatUpdate {
 }
 
 /// A contact/group/newsletter's status updates were muted/unmuted on a linked device.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct UserStatusMuteUpdate {
     /// The entity whose status was (un)muted.
     pub jid: Jid,
@@ -1439,7 +1458,8 @@ pub struct UserStatusMuteUpdate {
     pub from_full_sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct DeleteMessageForMeUpdate {
     /// The chat containing the deleted message.
     pub chat_jid: Jid,
@@ -1453,7 +1473,8 @@ pub struct DeleteMessageForMeUpdate {
 
 /// A label was created, renamed/recolored, or deleted on a linked device.
 /// `action.deleted == Some(true)` means the label was removed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct LabelEditUpdate {
     /// The label identifier (the index key, not a JID).
     pub label_id: String,
@@ -1464,7 +1485,8 @@ pub struct LabelEditUpdate {
 
 /// A label was associated with or removed from a chat on a linked device.
 /// `action.labeled == Some(true)` means the label was added to the chat.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct LabelAssociationUpdate {
     /// The label identifier.
     pub label_id: String,
