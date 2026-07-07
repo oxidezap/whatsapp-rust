@@ -1,14 +1,14 @@
 syntax = "proto2";
 package whatsapp;
 
-/// WhatsApp Version: 2.3000.1040878135
+/// WhatsApp Version: 2.3000.1042742319
 
 message ADVDeviceIdentity {
   optional uint32 rawId = 1;
   optional uint64 timestamp = 2;
   optional uint32 keyIndex = 3;
-  optional ADVEncryptionType accountType = 4;
-  optional ADVEncryptionType deviceType = 5;
+  optional ADVEncryptionType accountType = 4 [default = E2EE];
+  optional ADVEncryptionType deviceType = 5 [default = E2EE];
 }
 
 enum ADVEncryptionType {
@@ -21,7 +21,7 @@ message ADVKeyIndexList {
   optional uint64 timestamp = 2;
   optional uint32 currentIndex = 3;
   repeated uint32 validIndexes = 4 [packed = true];
-  optional ADVEncryptionType accountType = 5;
+  optional ADVEncryptionType accountType = 5 [default = E2EE];
 }
 
 message ADVSignedDeviceIdentity {
@@ -34,7 +34,7 @@ message ADVSignedDeviceIdentity {
 message ADVSignedDeviceIdentityHMAC {
   optional bytes details = 1;
   optional bytes hmac = 2;
-  optional ADVEncryptionType accountType = 3;
+  optional ADVEncryptionType accountType = 3 [default = E2EE];
 }
 
 message ADVSignedKeyIndexList {
@@ -1808,11 +1808,11 @@ message ContextInfo {
   }
 
   message FeatureEligibilities {
-    optional bool cannotBeReactedTo = 1;
-    optional bool cannotBeRanked = 2;
-    optional bool canRequestFeedback = 3;
-    optional bool canBeReshared = 4;
-    optional bool canReceiveMultiReact = 5;
+    optional bool cannotBeReactedTo = 1 [default = false];
+    optional bool cannotBeRanked = 2 [default = false];
+    optional bool canRequestFeedback = 3 [default = false];
+    optional bool canBeReshared = 4 [default = false];
+    optional bool canReceiveMultiReact = 5 [default = false];
   }
 
   enum ForwardOrigin {
@@ -1970,6 +1970,32 @@ message Conversation {
   }
 }
 
+message CreateBackupInput {
+  required string recoveryCode = 1;
+  required uint64 userId = 2;
+}
+
+message CreateBackupOutput {
+  optional DeviceOutput device = 1;
+  optional VirtualDeviceOutput virtualDevice = 2;
+  optional Epoch0Output epoch0 = 3;
+  optional bytes mailboxRootKey = 4;
+  optional string error = 5;
+}
+
+message DecryptMessageInput {
+  required bytes epochRootKey = 1;
+  required bytes epochAnonId = 2;
+  required string threadId = 3;
+  required int32 encryptionVersion = 4;
+  required bytes ciphertext = 5;
+}
+
+message DecryptMessageOutput {
+  optional bytes plaintextPayload = 1;
+  optional string error = 2;
+}
+
 message DeviceCapabilities {
   optional ChatLockSupportLevel chatLockSupportLevel = 1;
   optional LIDMigration lidMigration = 2;
@@ -2022,11 +2048,23 @@ message DeviceListMetadata {
   optional bytes senderKeyHash = 1;
   optional uint64 senderTimestamp = 2;
   repeated uint32 senderKeyIndexes = 3 [packed = true];
-  optional ADVEncryptionType senderAccountType = 4;
-  optional ADVEncryptionType receiverAccountType = 5;
+  optional ADVEncryptionType senderAccountType = 4 [default = E2EE];
+  optional ADVEncryptionType receiverAccountType = 5 [default = E2EE];
   optional bytes recipientKeyHash = 8;
   optional uint64 recipientTimestamp = 9;
   repeated uint32 recipientKeyIndexes = 10 [packed = true];
+}
+
+message DeviceOutput {
+  required bytes publicKey = 1;
+  required bytes epochAuthPublicKey = 2;
+  required bytes epochAuthPublicKeySig = 3;
+  required bytes epochStoragePublicKey = 4;
+  required bytes epochStoragePublicKeySig = 5;
+  repeated int32 supportedEncryptionVersions = 6;
+  required bytes encryptionVersionSignature = 7;
+  required int32 clientVersion = 8;
+  required bytes ocmfClientState = 9;
 }
 
 message DeviceProps {
@@ -2149,14 +2187,59 @@ message EmbeddedMusic {
   optional int64 overlapDurationInMs = 14;
 }
 
+message EncryptMessageInput {
+  required bytes epochRootKey = 1;
+  required bytes mailboxRootKey = 2;
+  required bytes orfClientState = 3;
+  required bytes epochAnonId = 4;
+  required uint64 epochId = 5;
+  required string threadId = 6;
+  required uint64 waCanonicalUserFbid = 7;
+  required uint64 timestampMs = 8;
+  required uint64 backupId = 9;
+  required bytes plaintextPayload = 10;
+  required string stanzaId = 11;
+}
+
+message EncryptMessageOutput {
+  optional bytes encryptedProtobuf = 1;
+  optional bytes orfThreadId = 2;
+  optional string valueSecretRef = 3;
+  optional uint64 offlineThreadingId = 4;
+  optional uint64 timestampMs = 5;
+  optional bytes messageKey = 6;
+  optional string error = 7;
+}
+
 message EncryptedPairingRequest {
   optional bytes encryptedPayload = 1;
   optional bytes iv = 2;
 }
 
+message EncryptedSecretValuesOutput {
+  required bytes encryptedDevicePrivateKey = 1;
+  required bytes encryptedObliviousValidationTokenBlob = 2;
+  required bytes encryptedEpochStoragePrivateKey = 3;
+  required bytes encryptedOcmfClientState = 4;
+  optional bytes encryptedOrfClientStateV2 = 5;
+  required bytes encryptedMailboxRootKeyBlob = 6;
+  required bytes encryptedEpochAnonId = 7;
+  required bytes encryptedEpochRootKey = 8;
+}
+
 message EphemeralSetting {
   optional sfixed32 duration = 1;
   optional sfixed64 timestamp = 2;
+}
+
+message Epoch0Output {
+  required uint64 epochFbid = 1;
+  required bytes epochAnonId = 2;
+  required bytes epochData = 3;
+  required bytes wrappedRootKeyForSelf = 4;
+  required bytes epochSignature = 5;
+  required bytes epochRootKeyFingerprint = 6;
+  optional bytes epochRootKey = 7;
 }
 
 message EventAdditionalMetadata {
@@ -2190,7 +2273,7 @@ enum FUTURE_PROOF_BEHAVIOR {
   IGNORE = 2;
 }
 message Field {
-  optional uint32 minVersion = 1;
+  optional uint32 minVersion = 1 [default = 1];
   optional uint32 maxVersion = 2;
   optional uint32 notReportableMinVersion = 3;
   optional bool isMessage = 4;
@@ -2519,19 +2602,30 @@ message KeyId {
   optional bytes id = 1;
 }
 
+message LIDMigrationMappingSyncMessage {
+  optional bytes encodedMappingPayload = 1;
+}
+
+// Retained locally: WA dropped these from the public JS bundle, but the wire
+// still carries them as the protobuf-encoded `encodedMappingPayload` above.
 message LIDMigrationMapping {
   required uint64 pn = 1;
   required uint64 assignedLid = 2;
   optional uint64 latestLid = 3;
 }
 
-message LIDMigrationMappingSyncMessage {
-  optional bytes encodedMappingPayload = 1;
-}
-
 message LIDMigrationMappingSyncPayload {
   repeated LIDMigrationMapping pnToLidMappings = 1;
   optional uint64 chatDbMigrationTimestamp = 2;
+}
+
+message LabyrinthWaCommand {
+  oneof commandInput {
+    CreateBackupInput createBackupInput = 1;
+    EncryptMessageInput encryptMessageInput = 2;
+    DecryptMessageInput decryptMessageInput = 3;
+    OrfThreadIdInput orfThreadIdInput = 4;
+  }
 }
 
 message LegacyMessage {
@@ -2541,7 +2635,7 @@ message LegacyMessage {
 
 message LimitSharing {
   optional bool sharingLimited = 1;
-  optional TriggerType trigger = 2;
+  optional TriggerType trigger = 2 [default = UNKNOWN];
   optional int64 limitSharingSettingTimestamp = 3;
   optional bool initiatedByMe = 4;
   enum TriggerType {
@@ -3366,8 +3460,8 @@ message Message {
 
     message CarouselMessage {
       repeated Message.InteractiveMessage cards = 1;
-      optional int32 messageVersion = 2;
-      optional CarouselCardType carouselCardType = 3;
+      optional int32 messageVersion = 2 [default = 1];
+      optional CarouselCardType carouselCardType = 3 [default = HSCROLL_CARDS];
       enum CarouselCardType {
         UNKNOWN = 0;
         HSCROLL_CARDS = 1;
@@ -3378,7 +3472,7 @@ message Message {
     message CollectionMessage {
       optional string bizJid = 1;
       optional string id = 2;
-      optional int32 messageVersion = 3;
+      optional int32 messageVersion = 3 [default = 1];
     }
 
     message Footer {
@@ -3407,7 +3501,7 @@ message Message {
     message NativeFlowMessage {
       repeated NativeFlowButton buttons = 1;
       optional string messageParamsJson = 2;
-      optional int32 messageVersion = 3;
+      optional int32 messageVersion = 3 [default = 1];
       message NativeFlowButton {
         optional string name = 1;
         optional string buttonParamsJson = 2;
@@ -3417,7 +3511,7 @@ message Message {
     message ShopMessage {
       optional string id = 1;
       optional Surface surface = 2;
-      optional int32 messageVersion = 3;
+      optional int32 messageVersion = 3 [default = 1];
       enum Surface {
         UNKNOWN_SURFACE = 0;
         FB = 1;
@@ -3435,7 +3529,7 @@ message Message {
     }
     message Body {
       optional string text = 1;
-      optional Format format = 2;
+      optional Format format = 2 [default = DEFAULT];
       enum Format {
         DEFAULT = 0;
         EXTENSIONS_1 = 1;
@@ -3445,7 +3539,7 @@ message Message {
     message NativeFlowResponseMessage {
       optional string name = 1;
       optional string paramsJson = 2;
-      optional int32 version = 3;
+      optional int32 version = 3 [default = 1];
     }
   }
 
@@ -3645,7 +3739,7 @@ message Message {
     optional int64 totalAmount1000 = 10;
     optional string totalCurrencyCode = 11;
     optional ContextInfo contextInfo = 17;
-    optional int32 messageVersion = 12;
+    optional int32 messageVersion = 12 [default = 1];
     optional MessageKey orderRequestMessageId = 13;
     optional string catalogType = 15;
     enum OrderStatus {
@@ -4451,7 +4545,7 @@ message MessageAddOn {
   optional Message messageAddOn = 2;
   optional int64 senderTimestampMs = 3;
   optional int64 serverTimestampMs = 4;
-  optional WebMessageInfo.Status status = 5;
+  optional WebMessageInfo.Status status = 5 [default = PENDING];
   optional MessageAddOnContextInfo addOnContextInfo = 6;
   optional MessageKey messageAddOnKey = 7;
   optional LegacyMessage legacyMessage = 8;
@@ -4724,6 +4818,8 @@ enum MutationProps {
   THREAD_PIN_ACTION = 85;
   AUTO_ORGANIZE_BUSINESS_CHAT_SETTING = 86;
   BIZ_AI_SETTINGS_NUDGE_ACTION = 87;
+  COEX_V2_VERSION_ACTION = 88;
+  WASA_ROOT_SECRET_ACTION = 89;
   SHARE_OWN_PN = 10001;
   BUSINESS_BROADCAST_ACTION = 10002;
   AI_THREAD_DELETE_ACTION = 10003;
@@ -4754,6 +4850,16 @@ message NotificationSettings {
   optional bool lowPriorityNotifications = 4;
   optional bool reactionsMuted = 5;
   optional string callVibrate = 6;
+}
+
+message OrfThreadIdInput {
+  required bytes orfClientState = 1;
+  required string threadId = 2;
+}
+
+message OrfThreadIdOutput {
+  optional bytes orfThreadId = 1;
+  optional string error = 2;
 }
 
 message PairingRequest {
@@ -4965,6 +5071,8 @@ message PreKeySignalMessage {
   optional bytes baseKey = 2;
   optional bytes identityKey = 3;
   optional bytes message = 4;
+  optional uint32 kyberPreKeyId = 7;
+  optional bytes kyberCiphertext = 8;
 }
 
 message PremiumMessageInfo {
@@ -5067,7 +5175,7 @@ message RecordStructure {
 }
 
 message Reportable {
-  optional uint32 minVersion = 1;
+  optional uint32 minVersion = 1 [default = 1];
   optional uint32 maxVersion = 2;
   optional uint32 notReportableMinVersion = 3;
   optional bool never = 4;
@@ -5080,9 +5188,9 @@ message ReportingTokenInfo {
 message RoutingInfo {
   repeated int32 regionId = 1;
   repeated int32 clusterId = 2;
-  optional int32 taskId = 3;
-  optional bool debug = 4;
-  optional bool tcpBbr = 5;
+  optional int32 taskId = 3 [default = -1];
+  optional bool debug = 4 [default = false];
+  optional bool tcpBbr = 5 [default = false];
   optional bool tcpKeepalive = 6;
 }
 
@@ -5180,6 +5288,8 @@ message SessionStructure {
     optional uint32 preKeyId = 1;
     optional int32 signedPreKeyId = 3;
     optional bytes baseKey = 2;
+    optional uint32 kyberPreKeyId = 4;
+    optional bytes kyberCiphertext = 5;
   }
 }
 
@@ -5424,9 +5534,11 @@ message SyncActionValue {
   optional ThreadPinAction threadPinAction = 85;
   optional AutoOrganizeBusinessChatSetting autoOrganizeBusinessChatSetting = 86;
   optional BizAISettingsNudgeAction bizAiSettingsNudgeAction = 87;
+  optional CoexV2VersionAction coexV2VersionAction = 88;
+  optional WASARootSecretAction wasaRootSecretAction = 89;
   message AgentAction {
     optional string name = 1;
-    optional int32 deviceID = 2;
+    optional int32 deviceId = 2;
     optional bool isDeleted = 3;
   }
 
@@ -5524,7 +5636,7 @@ message SyncActionValue {
   }
 
   message ChatAssignmentAction {
-    optional string deviceAgentID = 1;
+    optional string deviceAgentId = 1;
   }
 
   message ChatAssignmentOpenedStatusAction {
@@ -5533,6 +5645,10 @@ message SyncActionValue {
 
   message ClearChatAction {
     optional SyncActionValue.SyncActionMessageRange messageRange = 1;
+  }
+
+  message CoexV2VersionAction {
+    optional uint64 version = 1;
   }
 
   message ContactAction {
@@ -5942,8 +6058,8 @@ message SyncActionValue {
   message StatusPrivacyAction {
     optional StatusDistributionMode mode = 1;
     repeated string userJid = 2;
-    optional bool shareToFB = 3;
-    optional bool shareToIG = 4;
+    optional bool shareToFb = 3;
+    optional bool shareToIg = 4;
     repeated CustomList customLists = 5;
     repeated StatusDistributionMode modes = 6;
     message CustomList {
@@ -6043,6 +6159,15 @@ message SyncActionValue {
     enum ChatStartMode {
       LID = 1;
       PN = 2;
+    }
+  }
+
+  message WASARootSecretAction {
+    repeated RootSecretEntry secrets = 1;
+    message RootSecretEntry {
+      optional string id = 1;
+      optional bytes rootSecret = 2;
+      optional int64 epoch = 3;
     }
   }
 
@@ -6230,6 +6355,16 @@ message VerifiedNameCertificate {
   }
 }
 
+message VirtualDeviceOutput {
+  required bytes vdId = 1;
+  required bytes vdPublicKey = 2;
+  required bytes vdEpochStoragePublicKey = 3;
+  required bytes vdEpochStoragePublicKeySig = 4;
+  required bytes ocmfRotationToken = 5;
+  required bytes deviceEpochHmac = 6;
+  required EncryptedSecretValuesOutput encryptedSecretValues = 7;
+}
+
 message WallpaperSettings {
   optional string filename = 1;
   optional uint32 opacity = 2;
@@ -6298,7 +6433,7 @@ message WebMessageInfo {
   required MessageKey key = 1;
   optional Message message = 2;
   optional uint64 messageTimestamp = 3;
-  optional Status status = 4;
+  optional Status status = 4 [default = PENDING];
   optional string participant = 5;
   optional uint64 messageC2STimestamp = 6;
   optional bool ignore = 16;
@@ -6608,6 +6743,10 @@ message WebMessageInfo {
     GROUP_TEE_BOT_ADDED = 223;
     CONTACT_INFO = 224;
     SCHEDULED_MESSAGE_CREATED = 225;
+    IDENTITY_TRUST_MARKED = 226;
+    IDENTITY_TRUST_UNMARKED = 227;
+    IDENTITY_TRUST_REVOKED = 228;
+    CTWA_CONSUMER_DISCLOSURE = 230;
   }
 }
 
