@@ -1236,8 +1236,8 @@ fn test_lid_prekey_lookup_normalization() {
 mod group_retry {
     use super::*;
     use crate::libsignal::protocol::{
-        Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, KeyPair,
-        PreKeyBundle, ProtocolAddress, SessionStore, process_prekey_bundle,
+        Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore,
+        ProtocolAddress, SessionStore, process_prekey_bundle,
     };
     use crate::types::message::AddressingMode;
     use std::collections::HashMap;
@@ -1324,23 +1324,7 @@ mod group_retry {
     async fn setup_session() -> (MemSessionStore, MemIdentityStore, Jid) {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let sender = IdentityKeyPair::generate(&mut rng);
-        let receiver = IdentityKeyPair::generate(&mut rng);
-        let spk = KeyPair::generate(&mut rng);
-        let opk = KeyPair::generate(&mut rng);
-        let sig = receiver
-            .private_key()
-            .calculate_signature(&spk.public_key.serialize(), &mut rng)
-            .unwrap();
-        let bundle = PreKeyBundle::new(
-            1,
-            1u32.into(),
-            Some((1u32.into(), opk.public_key)),
-            1u32.into(),
-            spk.public_key,
-            sig.to_vec(),
-            *receiver.identity_key(),
-        )
-        .unwrap();
+        let bundle = signed_prekey_bundle();
         let jid: Jid = "559911112222@s.whatsapp.net".parse().unwrap();
         let addr = jid.to_protocol_address();
         let mut ss = MemSessionStore::new();
@@ -2948,23 +2932,7 @@ mod mark_full_distribution_list {
     async fn established_stores(a: &Jid) -> (MemSessionStore, MemIdentityStore) {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let sender = IdentityKeyPair::generate(&mut rng);
-        let receiver = IdentityKeyPair::generate(&mut rng);
-        let spk = KeyPair::generate(&mut rng);
-        let opk = KeyPair::generate(&mut rng);
-        let sig = receiver
-            .private_key()
-            .calculate_signature(&spk.public_key.serialize(), &mut rng)
-            .unwrap();
-        let bundle = PreKeyBundle::new(
-            1,
-            1u32.into(),
-            Some((1u32.into(), opk.public_key)),
-            1u32.into(),
-            spk.public_key,
-            sig.to_vec(),
-            *receiver.identity_key(),
-        )
-        .unwrap();
+        let bundle = signed_prekey_bundle();
         let mut ss = MemSessionStore::default();
         let mut is = MemIdentityStore {
             pair: sender,
