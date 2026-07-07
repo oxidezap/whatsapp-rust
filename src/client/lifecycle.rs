@@ -157,8 +157,12 @@ impl Client {
             // Coordination caches: capacity-only eviction, no TTL/TTI.
             // These hold live mutexes and channel senders; time-based eviction
             // while tasks hold references would silently break serialisation.
+            // The evict_guard also blocks capacity eviction of a mutex a task is
+            // holding (strong_count > 1) — evicting it would mint a second mutex
+            // and let two writers race the same Signal session.
             session_locks: Cache::builder()
                 .max_capacity(cache_config.session_locks_capacity.max(1))
+                .evict_guard(|m| Arc::strong_count(m) <= 1)
                 .build(),
             chat_lanes: Cache::builder()
                 .max_capacity(cache_config.chat_lanes_capacity.max(1))
