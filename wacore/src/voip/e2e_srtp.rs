@@ -1,6 +1,7 @@
 //! E2E 1:1 SRTP, the primary working path. Keys derive from `callKey` (32B) +
 //! participant LID via HKDF-SHA256, then an AES-CM PRF; payloads use AES-128-CTR
-//! with a 4-byte WARP MESSAGE-INTEGRITY tag (HMAC-SHA1, not verified on recv).
+//! with a 4-byte WARP MESSAGE-INTEGRITY tag (HMAC-SHA1), verified on recv before
+//! the rollover counter is advanced (see `session::unprotect_audio`).
 //!
 //! wacrg spec: srtp-e2e (CRY-05), srtp-master-key (CRY-02), call-key (CRY-01).
 
@@ -294,6 +295,37 @@ mod tests {
             rx.guess_roc(0x0001),
             2,
             "state not corrupted by the late packet"
+        );
+    }
+
+    /// The exact rollover-desync the auth fix prevents. `unprotect_audio` only
+    /// `commit_roc`s after the MI tag verifies, so a rejected (unauthenticated)
+    /// packet stays on the pure `estimate_roc` path and can't fold state — while the
+    /// attacker's 2-packet staircase, if committed, advances the ROC by one.
+    #[test]
+    fn unauthenticated_staircase_cannot_advance_roc_without_commit() {
+        let mut rx = RecvRocTracker::default();
+        rx.guess_roc(0x7FFE); // seed s_l into the high half (the exploit's start)
+        assert_eq!(rx.roc, 0);
+
+        // A rejected packet only reaches estimate_roc (never commit_roc): the
+        // attacker's staircase seqs leave the state untouched.
+        let _ = rx.estimate_roc(0xFFFE);
+        let _ = rx.estimate_roc(0x7FFD);
+        assert_eq!(rx.roc, 0, "estimate alone must not advance the ROC");
+        assert_eq!(
+            rx.estimate_roc(0x7FFF),
+            0,
+            "a legit in-window seq still maps to roc=0"
+        );
+
+        // Contrast: committing that same staircase (the pre-fix path) advances the
+        // ROC by one — the desync authentication now blocks.
+        rx.commit_roc(rx.estimate_roc(0xFFFE), 0xFFFE);
+        rx.commit_roc(rx.estimate_roc(0x7FFD), 0x7FFD);
+        assert_eq!(
+            rx.roc, 1,
+            "committing the staircase advances the ROC (the pre-fix desync)"
         );
     }
 
