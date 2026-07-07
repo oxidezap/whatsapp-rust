@@ -627,18 +627,21 @@ mod tests {
         // Legit frame seeds the recv tracker and decrypts cleanly.
         let f0 = tx.protect_audio(&opus);
         assert_eq!(rx.unprotect_audio(&f0).unwrap().1, opus);
+        let base_seq = u16::from_be_bytes([f0[2], f0[3]]);
 
-        // Forge the next frame by corrupting its MI tag (last byte).
+        // Forge a far-AHEAD packet: rewrite the RTP sequence field (bytes 2..4) to a
+        // forward jump the pre-fix guess_roc would have folded into s_l. The rewrite
+        // also invalidates the MI tag, so authentication rejects the packet.
         let mut forged = tx.protect_audio(&opus);
-        let last = forged.len() - 1;
-        forged[last] ^= 0xFF;
+        forged[2..4].copy_from_slice(&base_seq.wrapping_add(0x4000).to_be_bytes());
         assert!(
             rx.unprotect_audio(&forged).is_none(),
-            "an unauthenticated packet must be rejected, not decrypted"
+            "an unauthenticated far-ahead packet must be rejected, not fold the ROC"
         );
 
-        // The forged packet did not advance the ROC: a subsequent legit frame still
-        // decrypts (pre-fix, guess_roc folded it before any auth and could desync).
+        // The rejected packet left the recv tracker untouched, so a subsequent legit
+        // frame still decrypts. (The exact roc-bump staircase is pinned by
+        // e2e_srtp::unauthenticated_staircase_cannot_advance_roc_without_commit.)
         let f2 = tx.protect_audio(&opus);
         assert_eq!(
             rx.unprotect_audio(&f2).unwrap().1,
