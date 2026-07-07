@@ -26,6 +26,10 @@ struct CacheEntry<V> {
     seq: u64,
 }
 
+/// Predicate deciding whether a cache entry may be capacity-evicted; see
+/// [`PortableCacheBuilder::evict_guard`].
+type EvictGuard<V> = Arc<dyn Fn(&V) -> bool + Send + Sync>;
+
 /// Portable, runtime-agnostic in-process cache.
 ///
 /// - Max capacity with FIFO eviction
@@ -38,6 +42,12 @@ pub struct PortableCache<K, V> {
     max_capacity: Option<u64>,
     ttl: Option<Duration>,
     tti: Option<Duration>,
+    /// Returns `true` when an entry is safe to capacity-evict. Lets a
+    /// coordination-lock cache refuse to evict a value that is still referenced
+    /// elsewhere (e.g. an `Arc<Mutex>` a task holds mid-critical-section), which
+    /// would otherwise mint a second serializer for the same key. `None` = plain
+    /// FIFO (any entry evictable).
+    evict_guard: Option<EvictGuard<V>>,
 }
 
 struct CacheInner<K, V> {
@@ -71,12 +81,34 @@ where
     /// Insert a brand-new entry (the caller has already confirmed the key is
     /// absent), evicting the oldest entries first if at capacity. Assigns and
     /// records the FIFO sequence.
-    fn insert_new(&mut self, key: K, value: V, now: Instant, max_capacity: Option<u64>) {
+    fn insert_new(
+        &mut self,
+        key: K,
+        value: V,
+        now: Instant,
+        max_capacity: Option<u64>,
+        evict_guard: Option<&(dyn Fn(&V) -> bool + Send + Sync)>,
+    ) {
         if let Some(cap) = max_capacity {
             while self.map.len() as u64 >= cap {
-                match self.order.pop_first() {
-                    Some((_, oldest_key)) => {
-                        self.map.remove(&oldest_key);
+                // Pick the oldest entry the guard allows evicting. Without a guard
+                // that is simply the FIFO head; with one, skip still-referenced
+                // entries (a live coordination lock) so we never drop and re-mint a
+                // second serializer for the same key. If nothing is evictable the
+                // map is left to exceed capacity — a bounded, transient overshoot
+                // that self-corrects once the held entries are released.
+                let victim = match evict_guard {
+                    None => self.order.iter().next().map(|(&seq, k)| (seq, k.clone())),
+                    Some(guard) => self
+                        .order
+                        .iter()
+                        .find(|(_, k)| self.map.get(*k).is_none_or(|e| guard(&e.value)))
+                        .map(|(&seq, k)| (seq, k.clone())),
+                };
+                match victim {
+                    Some((seq, victim_key)) => {
+                        self.order.remove(&seq);
+                        self.map.remove(&victim_key);
                     }
                     None => break,
                 }
@@ -104,6 +136,7 @@ pub struct PortableCacheBuilder<K, V> {
     max_capacity: Option<u64>,
     ttl: Option<Duration>,
     tti: Option<Duration>,
+    evict_guard: Option<EvictGuard<V>>,
     _marker: std::marker::PhantomData<fn(K, V)>,
 }
 
@@ -117,6 +150,7 @@ where
             max_capacity: None,
             ttl: None,
             tti: None,
+            evict_guard: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -136,6 +170,15 @@ where
         self
     }
 
+    /// Refuse to capacity-evict entries for which `f` returns `false`. Use it for
+    /// coordination-lock caches (e.g. `|lock| Arc::strong_count(lock) == 1`) so a
+    /// live lock/lane held by an in-flight task is never dropped and re-minted as
+    /// a second serializer for the same key.
+    pub fn evict_guard(mut self, f: impl Fn(&V) -> bool + Send + Sync + 'static) -> Self {
+        self.evict_guard = Some(Arc::new(f));
+        self
+    }
+
     pub fn build(self) -> PortableCache<K, V> {
         PortableCache {
             inner: Arc::new(RwLock::new(CacheInner::new())),
@@ -143,6 +186,7 @@ where
             max_capacity: self.max_capacity,
             ttl: self.ttl,
             tti: self.tti,
+            evict_guard: self.evict_guard,
         }
     }
 }
@@ -232,7 +276,13 @@ where
             return;
         }
 
-        guard.insert_new(key, value, now, self.max_capacity);
+        guard.insert_new(
+            key,
+            value,
+            now,
+            self.max_capacity,
+            self.evict_guard.as_deref(),
+        );
     }
 
     /// Insert and return a clone of the value in one write lock.
@@ -253,7 +303,13 @@ where
         }
 
         let ret = value.clone();
-        guard.insert_new(key, value, now, self.max_capacity);
+        guard.insert_new(
+            key,
+            value,
+            now,
+            self.max_capacity,
+            self.evict_guard.as_deref(),
+        );
         ret
     }
 
@@ -486,6 +542,7 @@ impl<K, V> Clone for PortableCache<K, V> {
             max_capacity: self.max_capacity,
             ttl: self.ttl,
             tti: self.tti,
+            evict_guard: self.evict_guard.clone(),
         }
     }
 }
@@ -537,6 +594,74 @@ mod tests {
         assert!(cache.get("a").await.is_none());
         assert_eq!(cache.get("b").await, Some(2));
         assert_eq!(cache.get("d").await, Some(4));
+    }
+
+    // F6: a coordination-lock cache must not FIFO-evict a lock a task still holds
+    // (strong_count > 1), or a concurrent access mints a second mutex and races
+    // the ratchet.
+    #[tokio::test]
+    async fn test_evict_guard_skips_strongly_held_entries() {
+        let cache: PortableCache<String, Arc<AsyncMutex<()>>> = PortableCache::builder()
+            .max_capacity(2)
+            .evict_guard(|lock: &Arc<AsyncMutex<()>>| Arc::strong_count(lock) == 1)
+            .build();
+
+        // "a" is held by a task (external clone) -> strong_count 2.
+        let held = Arc::new(AsyncMutex::new(()));
+        cache.insert("a".into(), held.clone()).await;
+        // "b" is unheld (cache is sole owner) -> strong_count 1.
+        cache
+            .insert("b".into(), Arc::new(AsyncMutex::new(())))
+            .await;
+
+        // At capacity: inserting "c" must skip the held head "a" and evict "b".
+        cache
+            .insert("c".into(), Arc::new(AsyncMutex::new(())))
+            .await;
+
+        assert!(
+            cache.get("a").await.is_some(),
+            "held lock must survive eviction"
+        );
+        assert!(
+            cache.get("b").await.is_none(),
+            "unheld older lock is evicted instead"
+        );
+        assert!(cache.get("c").await.is_some());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn test_evict_guard_overflows_when_all_held_then_recovers() {
+        let cache: PortableCache<String, Arc<AsyncMutex<()>>> = PortableCache::builder()
+            .max_capacity(2)
+            .evict_guard(|lock: &Arc<AsyncMutex<()>>| Arc::strong_count(lock) == 1)
+            .build();
+
+        let a = Arc::new(AsyncMutex::new(()));
+        let b = Arc::new(AsyncMutex::new(()));
+        let c = Arc::new(AsyncMutex::new(()));
+        cache.insert("a".into(), a.clone()).await;
+        cache.insert("b".into(), b.clone()).await;
+        // Both held: nothing evictable, so the cache overflows rather than drop a
+        // live lock — a bounded, transient overshoot.
+        cache.insert("c".into(), c.clone()).await;
+        assert_eq!(
+            cache.entry_count(),
+            3,
+            "held locks force a bounded overflow"
+        );
+
+        // Once released, a later insert evicts back down to capacity.
+        drop((a, b, c));
+        cache
+            .insert("d".into(), Arc::new(AsyncMutex::new(())))
+            .await;
+        assert_eq!(
+            cache.entry_count(),
+            2,
+            "overflow self-corrects after release"
+        );
     }
 
     #[tokio::test]

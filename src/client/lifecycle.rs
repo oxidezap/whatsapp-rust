@@ -159,6 +159,11 @@ impl Client {
             // while tasks hold references would silently break serialisation.
             session_locks: Cache::builder()
                 .max_capacity(cache_config.session_locks_capacity.max(1))
+                // Never FIFO-evict a lock a task still holds: strong_count > 1
+                // means an in-flight decrypt/encrypt owns a clone, and dropping it
+                // would let a concurrent access mint a second mutex for the same
+                // session and race the ratchet.
+                .evict_guard(|lock: &Arc<async_lock::Mutex<()>>| Arc::strong_count(lock) == 1)
                 .build(),
             chat_lanes: Cache::builder()
                 .max_capacity(cache_config.chat_lanes_capacity.max(1))
