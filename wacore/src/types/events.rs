@@ -1201,7 +1201,8 @@ pub struct Receipt {
 /// outgoing stanza. Server acks cover every outgoing stanza class — message,
 /// receipt, notification, call — so consumers should filter on [`class`](Self::class)
 /// before correlating ids.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct ServerAck {
     /// Id of the acked stanza (for a sent message, its message id).
     pub id: String,

@@ -1147,16 +1147,17 @@ impl Client {
             .has_handler_for(wacore::types::events::EventKind::ServerAck)
             && let Some(id) = &ack_id
         {
-            let ack = wacore::types::events::ServerAck {
-                id: id.as_str().to_string(),
-                class: node.get_attr("class").map(|v| v.as_str().to_string()),
-                from: node.get_attr("from").and_then(|v| v.as_str().parse().ok()),
-                timestamp: node
-                    .get_attr("t")
-                    .and_then(|v| v.as_str().parse::<i64>().ok())
-                    .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0)),
-                error: ack_error.as_ref().map(|v| v.as_str().to_string()),
-            };
+            let ack = wacore::types::events::ServerAck::builder()
+                .id(id.as_str().to_string())
+                .maybe_class(node.get_attr("class").map(|v| v.as_str().to_string()))
+                .maybe_from(node.get_attr("from").and_then(|v| v.as_str().parse().ok()))
+                .maybe_timestamp(
+                    node.get_attr("t")
+                        .and_then(|v| v.as_str().parse::<i64>().ok())
+                        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0)),
+                )
+                .maybe_error(ack_error.as_ref().map(|v| v.as_str().to_string()))
+                .build();
             self.core
                 .event_bus
                 .dispatch(wacore::types::events::Event::ServerAck(ack));
