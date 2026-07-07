@@ -428,18 +428,18 @@ impl Client {
                     ),
                     None => receipt_type.clone(),
                 };
-                let r = Receipt {
-                    message_ids: vec![fan_out_id.clone()],
-                    source: crate::types::message::MessageSource {
+                let r = Receipt::builder()
+                    .message_ids(vec![fan_out_id.clone()])
+                    .source(crate::types::message::MessageSource {
                         chat: from.clone(),
                         sender: user.jid,
                         sender_alt: user.participant_pn,
                         ..Default::default()
-                    },
-                    timestamp: user_ts,
-                    r#type: effective_type,
-                    offline,
-                };
+                    })
+                    .timestamp(user_ts)
+                    .r#type(effective_type)
+                    .offline(offline)
+                    .build();
                 self.core.event_bus.dispatch(Event::Receipt(r));
             }
             return;
@@ -456,18 +456,18 @@ impl Client {
             from.observe()
         );
 
-        let receipt = Receipt {
-            message_ids,
-            source: crate::types::message::MessageSource {
+        let receipt = Receipt::builder()
+            .message_ids(message_ids)
+            .source(crate::types::message::MessageSource {
                 chat: from,
                 sender: default_sender,
                 sender_alt: participant_pn,
                 ..Default::default()
-            },
-            timestamp: stanza_ts,
-            r#type: receipt_type,
-            offline,
-        };
+            })
+            .timestamp(stanza_ts)
+            .r#type(receipt_type)
+            .offline(offline)
+            .build();
 
         if receipt.r#type == ReceiptType::Retry {
             let client_clone = Arc::clone(self);

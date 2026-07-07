@@ -776,10 +776,12 @@ impl Client {
         if is_drain {
             self.flush_offline_receipts();
         }
-        self.core.event_bus.dispatch(Event::Messages(MessageBatch {
-            messages: items,
-            origin,
-        }));
+        self.core.event_bus.dispatch(Event::Messages(
+            MessageBatch::builder()
+                .messages(items)
+                .origin(origin)
+                .build(),
+        ));
         true
     }
 }
@@ -813,12 +815,12 @@ mod tests {
     }
 
     fn item(id: &str) -> InboundMessage {
-        InboundMessage {
-            message: Arc::new(wa::Message {
+        InboundMessage::builder()
+            .message(Arc::new(wa::Message {
                 conversation: Some(format!("text {id}")),
                 ..Default::default()
-            }),
-            info: Arc::new(MessageInfo {
+            }))
+            .info(Arc::new(MessageInfo {
                 id: id.to_string(),
                 source: MessageSource {
                     chat: "100@g.us".parse().unwrap(),
@@ -826,8 +828,8 @@ mod tests {
                     ..Default::default()
                 },
                 ..Default::default()
-            }),
-        }
+            }))
+            .build()
     }
 
     // During the drain, messages accumulate and one flush commits them all in

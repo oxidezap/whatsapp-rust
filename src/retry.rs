@@ -2334,18 +2334,18 @@ mod tests {
                 .build()])
             .build();
         let node_ref = crate::test_utils::node_to_owned_ref(&node);
-        let receipt = Receipt {
-            source: crate::types::message::MessageSource {
+        let receipt = Receipt::builder()
+            .source(crate::types::message::MessageSource {
                 chat: group.clone(),
                 sender: "555000111@lid".parse().unwrap(),
                 is_group: true,
                 ..Default::default()
-            },
-            message_ids: vec![msg_id.to_string()],
-            timestamp: wacore::time::now_utc(),
-            r#type: crate::types::presence::ReceiptType::Retry,
-            offline: false,
-        };
+            })
+            .message_ids(vec![msg_id.to_string()])
+            .timestamp(wacore::time::now_utc())
+            .r#type(crate::types::presence::ReceiptType::Retry)
+            .offline(false)
+            .build();
 
         let result = client.handle_retry_receipt(&receipt, &node_ref).await;
         assert!(
@@ -2845,17 +2845,17 @@ mod tests {
 
     /// Helper to build a DM Receipt for testing resolve_retry_chat_info.
     fn make_test_receipt(from: &str) -> Receipt {
-        Receipt {
-            source: crate::types::message::MessageSource {
+        Receipt::builder()
+            .source(crate::types::message::MessageSource {
                 chat: from.parse().unwrap(),
                 sender: from.parse().unwrap(),
                 ..Default::default()
-            },
-            message_ids: vec!["MSG001".to_string()],
-            timestamp: wacore::time::now_utc(),
-            r#type: crate::types::presence::ReceiptType::Retry,
-            offline: false,
-        }
+            })
+            .message_ids(vec!["MSG001".to_string()])
+            .timestamp(wacore::time::now_utc())
+            .r#type(crate::types::presence::ReceiptType::Retry)
+            .offline(false)
+            .build()
     }
 
     #[test]
@@ -2961,17 +2961,17 @@ mod tests {
             .attr("participant", "236395184570386:33@lid")
             .attr("type", "retry")
             .build();
-        let receipt = Receipt {
-            source: crate::types::message::MessageSource {
+        let receipt = Receipt::builder()
+            .source(crate::types::message::MessageSource {
                 chat: "120363021033254949@g.us".parse().unwrap(),
                 sender: "236395184570386:33@lid".parse().unwrap(),
                 ..Default::default()
-            },
-            message_ids: vec!["MSG001".to_string()],
-            timestamp: wacore::time::now_utc(),
-            r#type: crate::types::presence::ReceiptType::Retry,
-            offline: false,
-        };
+            })
+            .message_ids(vec!["MSG001".to_string()])
+            .timestamp(wacore::time::now_utc())
+            .r#type(crate::types::presence::ReceiptType::Retry)
+            .offline(false)
+            .build();
         let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
 
         assert!(info.chat.is_group());
@@ -2987,17 +2987,17 @@ mod tests {
         let node = NodeBuilder::new("receipt")
             .attr("participant", "somebot:4@bot")
             .build();
-        let receipt = Receipt {
-            source: crate::types::message::MessageSource {
+        let receipt = Receipt::builder()
+            .source(crate::types::message::MessageSource {
                 chat: "120363021033254949@g.us".parse().unwrap(),
                 sender: "somebot:4@bot".parse().unwrap(),
                 ..Default::default()
-            },
-            message_ids: vec!["MSG001".to_string()],
-            timestamp: wacore::time::now_utc(),
-            r#type: crate::types::presence::ReceiptType::Retry,
-            offline: false,
-        };
+            })
+            .message_ids(vec!["MSG001".to_string()])
+            .timestamp(wacore::time::now_utc())
+            .r#type(crate::types::presence::ReceiptType::Retry)
+            .offline(false)
+            .build();
 
         let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
 
@@ -3013,17 +3013,17 @@ mod tests {
         let node = NodeBuilder::new("receipt")
             .attr("participant", "somebot@bot")
             .build();
-        let receipt = Receipt {
-            source: crate::types::message::MessageSource {
+        let receipt = Receipt::builder()
+            .source(crate::types::message::MessageSource {
                 chat: "120363021033254949@g.us".parse().unwrap(),
                 sender: "somebot@bot".parse().unwrap(),
                 ..Default::default()
-            },
-            message_ids: vec!["MSG001".to_string()],
-            timestamp: wacore::time::now_utc(),
-            r#type: crate::types::presence::ReceiptType::Retry,
-            offline: false,
-        };
+            })
+            .message_ids(vec!["MSG001".to_string()])
+            .timestamp(wacore::time::now_utc())
+            .r#type(crate::types::presence::ReceiptType::Retry)
+            .offline(false)
+            .build();
 
         let info = resolve_retry_chat_info(&receipt, &node.as_node_ref(), None, None);
 

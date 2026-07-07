@@ -49,12 +49,12 @@ fn spawn_qr_autoresponder_http(
         let url = mock_admin_scan_qr_url();
         let http = UreqHttpClient::new();
         while let Ok(event) = event_rx.recv().await {
-            if let Event::PairingQrCode { code, .. } = &*event {
+            if let Event::PairingQrCode(qr) = &*event {
                 let req = HttpRequest {
                     url: url.clone(),
                     method: "POST".into(),
                     headers: HashMap::new(),
-                    body: Some(code.as_bytes().to_vec().into()),
+                    body: Some(qr.code.as_bytes().to_vec().into()),
                 };
                 match http.execute(req).await {
                     Ok(resp) if (200..300).contains(&resp.status_code) => return,

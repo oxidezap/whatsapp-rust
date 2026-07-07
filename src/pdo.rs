@@ -422,13 +422,15 @@ impl Client {
         self.core
             .event_bus
             .dispatch(wacore::types::events::Event::Messages(
-                wacore::types::events::MessageBatch {
-                    messages: std::sync::Arc::from([wacore::types::events::InboundMessage {
-                        message: Arc::from(message),
-                        info: message_info,
-                    }]),
-                    origin: wacore::types::events::BatchOrigin::Live,
-                },
+                wacore::types::events::MessageBatch::builder()
+                    .messages(std::sync::Arc::from([
+                        wacore::types::events::InboundMessage::builder()
+                            .message(Arc::from(message))
+                            .info(message_info)
+                            .build(),
+                    ]))
+                    .origin(wacore::types::events::BatchOrigin::Live)
+                    .build(),
             ));
     }
 

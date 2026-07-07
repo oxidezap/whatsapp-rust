@@ -301,27 +301,30 @@ pub(crate) fn handle_newsletter_notification(client: &Arc<Client>, node: Arc<Own
 
                 let reactions = parse_reaction_counts(msg_node)
                     .into_iter()
-                    .map(|r| NewsletterLiveUpdateReaction {
-                        code: r.code,
-                        count: r.count,
+                    .map(|r| {
+                        NewsletterLiveUpdateReaction::builder()
+                            .code(r.code)
+                            .count(r.count)
+                            .build()
                     })
                     .collect();
 
-                Some(NewsletterLiveUpdateMessage {
-                    server_id,
-                    reactions,
-                })
+                Some(
+                    NewsletterLiveUpdateMessage::builder()
+                        .server_id(server_id)
+                        .reactions(reactions)
+                        .build(),
+                )
             })
             .collect();
 
         if !messages.is_empty() {
-            client
-                .core
-                .event_bus
-                .dispatch(Event::NewsletterLiveUpdate(NewsletterLiveUpdate {
-                    newsletter_jid,
-                    messages,
-                }));
+            client.core.event_bus.dispatch(Event::NewsletterLiveUpdate(
+                NewsletterLiveUpdate::builder()
+                    .newsletter_jid(newsletter_jid)
+                    .messages(messages)
+                    .build(),
+            ));
         }
     }
 
@@ -382,16 +385,15 @@ pub(crate) fn handle_mex_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
         "mex notification received: op_name={op_name} offline={}",
         offline.is_some()
     );
-    client
-        .core
-        .event_bus
-        .dispatch(Event::MexNotification(MexNotification {
-            op_name,
-            from,
-            stanza_id,
-            offline,
-            payload,
-        }));
+    client.core.event_bus.dispatch(Event::MexNotification(
+        MexNotification::builder()
+            .op_name(op_name)
+            .maybe_from(from)
+            .maybe_stanza_id(stanza_id)
+            .maybe_offline(offline)
+            .payload(payload)
+            .build(),
+    ));
 }
 
 /// Handle `<notification type="disappearing_mode">` — a contact changed
@@ -448,10 +450,10 @@ pub(crate) fn handle_disappearing_mode_notification(client: &Arc<Client>, node: 
         .core
         .event_bus
         .dispatch(Event::DisappearingModeChanged(
-            wacore::types::events::DisappearingModeChanged {
-                from,
-                duration,
-                setting_timestamp,
-            },
+            wacore::types::events::DisappearingModeChanged::builder()
+                .from(from)
+                .duration(duration)
+                .setting_timestamp(setting_timestamp)
+                .build(),
         ));
 }

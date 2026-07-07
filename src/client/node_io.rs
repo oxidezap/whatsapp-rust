@@ -1224,12 +1224,14 @@ impl Client {
             self.enable_auto_reconnect.store(false, Ordering::Relaxed);
 
             let event = if conflict_type == "replaced" {
-                Event::StreamReplaced(crate::types::events::StreamReplaced)
+                Event::StreamReplaced(crate::types::events::StreamReplaced::builder().build())
             } else {
-                Event::LoggedOut(crate::types::events::LoggedOut {
-                    on_connect: false,
-                    reason: ConnectFailureReason::LoggedOut,
-                })
+                Event::LoggedOut(
+                    crate::types::events::LoggedOut::builder()
+                        .on_connect(false)
+                        .reason(ConnectFailureReason::LoggedOut)
+                        .build(),
+                )
             };
             self.core.event_bus.dispatch(event);
             should_disconnect = true;
@@ -1247,10 +1249,10 @@ impl Client {
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::LoggedOut(
-                        crate::types::events::LoggedOut {
-                            on_connect: false,
-                            reason: ConnectFailureReason::LoggedOut,
-                        },
+                        crate::types::events::LoggedOut::builder()
+                            .on_connect(false)
+                            .reason(ConnectFailureReason::LoggedOut)
+                            .build(),
                     ));
                     should_disconnect = true;
                 }
@@ -1259,10 +1261,10 @@ impl Client {
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::LoggedOut(
-                        crate::types::events::LoggedOut {
-                            on_connect: false,
-                            reason: ConnectFailureReason::LoggedOut,
-                        },
+                        crate::types::events::LoggedOut::builder()
+                            .on_connect(false)
+                            .reason(ConnectFailureReason::LoggedOut)
+                            .build(),
                     ));
                     should_disconnect = true;
                 }
@@ -1270,9 +1272,9 @@ impl Client {
                     info!("Got 409 stream error (conflict). Another session replaced this one.");
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
-                    self.core
-                        .event_bus
-                        .dispatch(Event::StreamReplaced(crate::types::events::StreamReplaced));
+                    self.core.event_bus.dispatch(Event::StreamReplaced(
+                        crate::types::events::StreamReplaced::builder().build(),
+                    ));
                     should_disconnect = true;
                 }
                 "429" => {
@@ -1332,10 +1334,10 @@ impl Client {
                         warn!("Unknown stream error: {}", DisplayableNodeRef(node));
                     }
                     self.core.event_bus.dispatch(Event::StreamError(
-                        crate::types::events::StreamError {
-                            code: code.to_string(),
-                            raw: Some(node.to_owned()),
-                        },
+                        crate::types::events::StreamError::builder()
+                            .code(code.to_string())
+                            .raw(node.to_owned())
+                            .build(),
                     ));
                 }
             }
@@ -1387,10 +1389,10 @@ impl Client {
             self.core
                 .event_bus
                 .dispatch(wacore::types::events::Event::LoggedOut(
-                    crate::types::events::LoggedOut {
-                        on_connect: true,
-                        reason,
-                    },
+                    crate::types::events::LoggedOut::builder()
+                        .on_connect(true)
+                        .reason(reason)
+                        .build(),
                 ));
         } else if let ConnectFailureReason::TempBanned = reason {
             let ban_code = attrs.optional_u64("code").unwrap_or(0) as i32;
@@ -1401,29 +1403,31 @@ impl Client {
                 "Temporary ban connect failure: {}",
                 DisplayableNodeRef(node)
             );
-            self.core
-                .event_bus
-                .dispatch(Event::TemporaryBan(crate::types::events::TemporaryBan {
-                    code: crate::types::events::TempBanReason::from(ban_code),
-                    expire: expire_duration,
-                }));
+            self.core.event_bus.dispatch(Event::TemporaryBan(
+                crate::types::events::TemporaryBan::builder()
+                    .code(crate::types::events::TempBanReason::from(ban_code))
+                    .expire(expire_duration)
+                    .build(),
+            ));
         } else if let ConnectFailureReason::ClientOutdated = reason {
             error!("Client is outdated and was rejected by server.");
-            self.core
-                .event_bus
-                .dispatch(Event::ClientOutdated(crate::types::events::ClientOutdated));
+            self.core.event_bus.dispatch(Event::ClientOutdated(
+                crate::types::events::ClientOutdated::builder().build(),
+            ));
         } else {
             warn!("Unknown connect failure: {}", DisplayableNodeRef(node));
             self.core.event_bus.dispatch(Event::ConnectFailure(
-                crate::types::events::ConnectFailure {
-                    reason,
-                    message: attrs
-                        .optional_string("message")
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_string(),
-                    raw: Some(node.to_owned()),
-                },
+                crate::types::events::ConnectFailure::builder()
+                    .reason(reason)
+                    .message(
+                        attrs
+                            .optional_string("message")
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_string(),
+                    )
+                    .raw(node.to_owned())
+                    .build(),
             ));
         }
     }

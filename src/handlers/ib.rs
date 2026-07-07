@@ -153,16 +153,15 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                     total, messages, notifications, receipts, app_data_changes,
                 );
 
-                client
-                    .core
-                    .event_bus
-                    .dispatch(Event::OfflineSyncPreview(OfflineSyncPreview {
-                        total,
-                        app_data_changes,
-                        messages,
-                        notifications,
-                        receipts,
-                    }));
+                client.core.event_bus.dispatch(Event::OfflineSyncPreview(
+                    OfflineSyncPreview::builder()
+                        .total(total)
+                        .app_data_changes(app_data_changes)
+                        .messages(messages)
+                        .notifications(notifications)
+                        .receipts(receipts)
+                        .build(),
+                ));
 
                 // Drive pull-based delivery: without this the server stops
                 // after the ~5-stanza primer and the rest of the backlog is

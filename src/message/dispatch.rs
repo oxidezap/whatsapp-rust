@@ -46,15 +46,16 @@ impl Client {
         // reach here without the processing permit, so enqueueing could
         // straddle the drain→live transition.
         if info.source.chat.is_newsletter() {
-            self.core
-                .event_bus
-                .dispatch(Event::Messages(wacore::types::events::MessageBatch {
-                    messages: Arc::from([wacore::types::events::InboundMessage {
-                        message: dispatch_msg,
-                        info,
-                    }]),
-                    origin: wacore::types::events::BatchOrigin::Live,
-                }));
+            self.core.event_bus.dispatch(Event::Messages(
+                wacore::types::events::MessageBatch::builder()
+                    .messages(Arc::from([wacore::types::events::InboundMessage::builder(
+                    )
+                    .message(dispatch_msg)
+                    .info(info)
+                    .build()]))
+                    .origin(wacore::types::events::BatchOrigin::Live)
+                    .build(),
+            ));
             return;
         }
 
@@ -62,10 +63,12 @@ impl Client {
         // offline drain the message joins the accumulating commit batch and
         // the event/ack fire only after its batch commits. Either way the
         // hook (when registered) gates everything observable.
-        self.commit_or_batch_inbound(wacore::types::events::InboundMessage {
-            message: dispatch_msg,
-            info,
-        })
+        self.commit_or_batch_inbound(
+            wacore::types::events::InboundMessage::builder()
+                .message(dispatch_msg)
+                .info(info)
+                .build(),
+        )
         .await;
     }
 

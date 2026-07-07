@@ -165,17 +165,19 @@ pub(crate) async fn handle_business_notification(client: &Arc<Client>, node: &No
         .as_ref()
         .and_then(|vn| vn.name.clone());
 
-    let event = Event::BusinessStatusUpdate(BusinessStatusUpdate {
-        jid: notification.from.clone(),
-        update_type,
-        timestamp: wacore::time::from_secs_or_now(notification.timestamp),
-        target_jid: notification.jid.clone(),
-        hash: notification.hash.clone(),
-        verified_name,
-        product_ids: notification.product_ids.clone(),
-        collection_ids: notification.collection_ids.clone(),
-        subscriptions: notification.subscriptions.clone(),
-    });
+    let event = Event::BusinessStatusUpdate(
+        BusinessStatusUpdate::builder()
+            .jid(notification.from.clone())
+            .update_type(update_type)
+            .timestamp(wacore::time::from_secs_or_now(notification.timestamp))
+            .maybe_target_jid(notification.jid.clone())
+            .maybe_hash(notification.hash.clone())
+            .maybe_verified_name(verified_name)
+            .product_ids(notification.product_ids.clone())
+            .collection_ids(notification.collection_ids.clone())
+            .subscriptions(notification.subscriptions.clone())
+            .build(),
+    );
 
     match notification.notification_type {
         wacore::stanza::business::BusinessNotificationType::RemoveJid

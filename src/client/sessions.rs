@@ -129,9 +129,9 @@ impl Client {
             None => {}
         }
         self.offline_sync_notifier.notify(usize::MAX);
-        self.core
-            .event_bus
-            .dispatch(Event::OfflineSyncCompleted(OfflineSyncCompleted { count }));
+        self.core.event_bus.dispatch(Event::OfflineSyncCompleted(
+            OfflineSyncCompleted::builder().count(count).build(),
+        ));
     }
 
     /// Wait for offline message delivery to complete (with timeout).

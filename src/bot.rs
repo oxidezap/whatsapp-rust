@@ -952,7 +952,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     {
         self.on_event_for(&[EventKind::PairingQrCode], move |event, _client| {
             let fut = match &*event {
-                Event::PairingQrCode { code, timeout } => Some(handler(code.clone(), *timeout)),
+                Event::PairingQrCode(qr) => Some(handler(qr.code.clone(), qr.timeout)),
                 _ => None,
             };
             async move {
@@ -972,7 +972,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     {
         self.on_event_for(&[EventKind::PairingCode], move |event, _client| {
             let fut = match &*event {
-                Event::PairingCode { code, timeout } => Some(handler(code.clone(), *timeout)),
+                Event::PairingCode(pc) => Some(handler(pc.code.clone(), pc.timeout)),
                 _ => None,
             };
             async move {
@@ -994,7 +994,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     {
         self.on_event_for(&[EventKind::PairingCodeRefresh], move |event, client| {
             let fut = match &*event {
-                Event::PairingCodeRefresh { force_manual } => Some(handler(*force_manual, client)),
+                Event::PairingCodeRefresh(r) => Some(handler(r.force_manual, client)),
                 _ => None,
             };
             async move {
@@ -1437,10 +1437,12 @@ mod tests {
     }
 
     fn pairing_code_event(code: &str) -> Arc<Event> {
-        Arc::new(Event::PairingCode {
-            code: code.to_string(),
-            timeout: std::time::Duration::ZERO,
-        })
+        Arc::new(Event::PairingCode(
+            crate::types::events::PairingCode::builder()
+                .code(code.to_string())
+                .timeout(std::time::Duration::ZERO)
+                .build(),
+        ))
     }
 
     /// `EventDelivery::Ordered` delivers events to a callback in arrival order —
@@ -1454,8 +1456,8 @@ mod tests {
             callback: Arc::new(move |event, _client| {
                 let order_tx = order_tx.clone();
                 Box::pin(async move {
-                    if let Event::PairingCode { code, .. } = &*event {
-                        let _ = order_tx.send(code.clone()).await;
+                    if let Event::PairingCode(pc) = &*event {
+                        let _ = order_tx.send(pc.code.clone()).await;
                     }
                 })
             }),
@@ -1502,8 +1504,8 @@ mod tests {
                 Box::pin(async move {
                     // Only the first event parks the single drainer, so the
                     // capacity-1 mailbox is deterministically full for the rest.
-                    if let Event::PairingCode { code, .. } = &*event
-                        && code == "0"
+                    if let Event::PairingCode(pc) = &*event
+                        && pc.code == "0"
                     {
                         let _ = started_tx.send(()).await;
                         let _ = release_rx.recv().await;
@@ -1549,12 +1551,12 @@ mod tests {
         let handler = RegisteredHandler {
             callback: Arc::new(move |event: Arc<Event>, _client| {
                 let tx = tx.clone();
-                if let Event::PairingCode { code, .. } = &*event {
-                    assert_ne!(code, "boom", "deliberate test panic");
+                if let Event::PairingCode(pc) = &*event {
+                    assert_ne!(&pc.code, "boom", "deliberate test panic");
                 }
                 Box::pin(async move {
-                    if let Event::PairingCode { code, .. } = &*event {
-                        let _ = tx.send(code.clone()).await;
+                    if let Event::PairingCode(pc) = &*event {
+                        let _ = tx.send(pc.code.clone()).await;
                     }
                 })
             }),

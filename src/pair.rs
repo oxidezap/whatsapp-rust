@@ -101,10 +101,12 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                                     std::time::Duration::from_secs(20)
                                 };
 
-                                client_clone
-                                    .core
-                                    .event_bus
-                                    .dispatch(Event::PairingQrCode { code, timeout });
+                                client_clone.core.event_bus.dispatch(Event::PairingQrCode(
+                                    crate::types::events::PairingQrCode::builder()
+                                        .code(code)
+                                        .timeout(timeout)
+                                        .build(),
+                                ));
 
                                 let sleep = client_clone.runtime.sleep(timeout);
                                 let stop = stop_rx.recv();
@@ -240,13 +242,17 @@ async fn handle_pair_success<'a>(
                     error!(
                         "FATAL: Failed to re-decode self-signed identity for event, pairing cannot complete: {e}"
                     );
-                    client.core.event_bus.dispatch(Event::PairError(PairError {
-                        id: jid.clone(),
-                        lid: lid.clone(),
-                        business_name: business_name.clone(),
-                        platform: platform.clone(),
-                        error: format!("internal error: failed to decode identity for event: {e}"),
-                    }));
+                    client.core.event_bus.dispatch(Event::PairError(
+                        PairError::builder()
+                            .id(jid.clone())
+                            .lid(lid.clone())
+                            .business_name(business_name.clone())
+                            .platform(platform.clone())
+                            .error(format!(
+                                "internal error: failed to decode identity for event: {e}"
+                            ))
+                            .build(),
+                    ));
                     return;
                 }
             };
@@ -367,12 +373,12 @@ async fn handle_pair_success<'a>(
 
             info!("Successfully paired {}", jid.observe());
 
-            let success_event = PairSuccess {
-                id: jid,
-                lid,
-                business_name,
-                platform,
-            };
+            let success_event = PairSuccess::builder()
+                .id(jid)
+                .lid(lid)
+                .business_name(business_name)
+                .platform(platform)
+                .build();
             client
                 .core
                 .event_bus
@@ -385,13 +391,13 @@ async fn handle_pair_success<'a>(
                 error!("Failed to send pair error node: {send_err}");
             }
 
-            let pair_error_event = crate::types::events::PairError {
-                id: jid,
-                lid,
-                business_name,
-                platform,
-                error: e.to_string(),
-            };
+            let pair_error_event = crate::types::events::PairError::builder()
+                .id(jid)
+                .lid(lid)
+                .business_name(business_name)
+                .platform(platform)
+                .error(e.to_string())
+                .build();
             client
                 .core
                 .event_bus
