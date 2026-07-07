@@ -15,10 +15,8 @@ fn jid_ref_to_compact(j: &JidRef<'_>) -> CompactString {
     s
 }
 
-/// Maximum node-nesting depth accepted while decoding. Real WA stanza trees are
-/// shallow (well under 20 levels); the cap only exists to reject a hostile frame
-/// whose deep `LIST` nesting would otherwise overflow the native stack via
-/// unbounded `read_node_ref` recursion.
+/// Node-nesting cap rejecting deep-`LIST` frames that would overflow the stack via
+/// unbounded `read_node_ref` recursion (real WA trees are well under 20 levels).
 const MAX_NODE_DEPTH: usize = 128;
 
 pub(crate) struct Decoder<'a> {
@@ -516,9 +514,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_node_ref_at(&mut self, depth: usize) -> Result<NodeRef<'a>> {
-        // Reject before recursing: a hostile frame with deeply nested LISTs would
-        // otherwise blow the native stack (uncatchable abort) rather than error.
-        if depth > MAX_NODE_DEPTH {
+        // Reject before recursing, so a hostile deep-LIST frame errors instead of
+        // aborting the process on a stack overflow.
+        if depth >= MAX_NODE_DEPTH {
             return Err(BinaryError::MaxDepthExceeded);
         }
         let tag = self.read_u8()?;
@@ -916,23 +914,33 @@ mod tests {
         buffer
     }
 
-    /// Deep-but-within-cap nesting decodes normally.
+    fn is_max_depth_err(buffer: &[u8]) -> bool {
+        matches!(
+            Decoder::new(&buffer[1..]).read_node_ref(),
+            Err(BinaryError::MaxDepthExceeded)
+        )
+    }
+
+    /// The deepest accepted nesting (a leaf at depth `MAX_NODE_DEPTH - 1`) decodes.
+    /// Pins the exact accept side of the cap so a `>`/`>=` flip is caught.
     #[test]
-    fn deeply_nested_within_cap_decodes() -> TestResult {
-        let buffer = encode_nested(MAX_NODE_DEPTH - 8);
+    fn deeply_nested_at_cap_decodes() -> TestResult {
+        let buffer = encode_nested(MAX_NODE_DEPTH - 1);
         let decoded = Decoder::new(&buffer[1..]).read_node_ref()?;
-        assert_eq!(decoded.tag, format!("l{}", MAX_NODE_DEPTH - 9).as_str());
+        assert_eq!(decoded.tag, format!("l{}", MAX_NODE_DEPTH - 2).as_str());
         Ok(())
     }
 
-    /// A frame nested far past the cap must return `MaxDepthExceeded`, not overflow
-    /// the native stack (this test completing at all is the assertion against abort).
+    /// Exactly one level past the accepted range is rejected (pins the reject side).
     #[test]
-    fn deeply_nested_past_cap_is_rejected() {
-        let buffer = encode_nested(MAX_NODE_DEPTH * 3);
-        let err = Decoder::new(&buffer[1..])
-            .read_node_ref()
-            .expect_err("nesting past the cap must be rejected");
-        assert!(matches!(err, BinaryError::MaxDepthExceeded), "got {err:?}");
+    fn deeply_nested_one_past_cap_is_rejected() {
+        assert!(is_max_depth_err(&encode_nested(MAX_NODE_DEPTH)));
+    }
+
+    /// A frame nested far past the cap must return `MaxDepthExceeded`, not overflow
+    /// the native stack — this test completing at all is the assertion against abort.
+    #[test]
+    fn deeply_nested_far_past_cap_is_rejected() {
+        assert!(is_max_depth_err(&encode_nested(MAX_NODE_DEPTH * 3)));
     }
 }
