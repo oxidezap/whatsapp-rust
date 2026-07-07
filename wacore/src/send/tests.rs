@@ -802,6 +802,30 @@ fn create_mock_bundle() -> PreKeyBundle {
     .expect("Failed to create PreKeyBundle")
 }
 
+/// A bundle whose signed-prekey signature actually verifies, so
+/// `process_prekey_bundle` establishes a session. Contrast `create_mock_bundle`,
+/// whose zeroed signature deliberately fails X3DH (used to exercise the reject path).
+fn signed_prekey_bundle() -> PreKeyBundle {
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let receiver = IdentityKeyPair::generate(&mut rng);
+    let spk = KeyPair::generate(&mut rng);
+    let opk = KeyPair::generate(&mut rng);
+    let sig = receiver
+        .private_key()
+        .calculate_signature(&spk.public_key.serialize(), &mut rng)
+        .unwrap();
+    PreKeyBundle::new(
+        1,
+        1u32.into(),
+        Some((1u32.into(), opk.public_key)),
+        1u32.into(),
+        spk.public_key,
+        sig.to_vec(),
+        *receiver.identity_key(),
+    )
+    .unwrap()
+}
+
 // These tests validate the fix for the LID-PN session mismatch issue.
 // When a message is received with sender_lid, the session is stored under the LID address.
 // When sending a reply using the phone number, we must reuse the existing LID session
@@ -3193,27 +3217,8 @@ mod mark_full_distribution_list {
             signed_prekey_store: &spks,
         };
 
-        // Verifiable bundle (create_mock_bundle's zeroed signature fails X3DH).
-        let receiver = IdentityKeyPair::generate(&mut rng);
-        let spk = KeyPair::generate(&mut rng);
-        let opk = KeyPair::generate(&mut rng);
-        let sig = receiver
-            .private_key()
-            .calculate_signature(&spk.public_key.serialize(), &mut rng)
-            .unwrap();
-        let bundle = PreKeyBundle::new(
-            1,
-            1u32.into(),
-            Some((1u32.into(), opk.public_key)),
-            1u32.into(),
-            spk.public_key,
-            sig.to_vec(),
-            *receiver.identity_key(),
-        )
-        .unwrap();
-
         let resolver = MockSendContextResolver::new()
-            .with_bundle(b.clone(), bundle)
+            .with_bundle(b.clone(), signed_prekey_bundle())
             .with_chain_lock_probe(probe.clone());
         let rt = TokioTestRuntime;
 
@@ -3305,27 +3310,8 @@ mod mark_full_distribution_list {
             signed_prekey_store: &spks,
         };
 
-        // Properly-signed bundle for the good device.
-        let receiver = IdentityKeyPair::generate(&mut rng);
-        let spk = KeyPair::generate(&mut rng);
-        let opk = KeyPair::generate(&mut rng);
-        let sig = receiver
-            .private_key()
-            .calculate_signature(&spk.public_key.serialize(), &mut rng)
-            .unwrap();
-        let good_bundle = PreKeyBundle::new(
-            1,
-            1u32.into(),
-            Some((1u32.into(), opk.public_key)),
-            1u32.into(),
-            spk.public_key,
-            sig.to_vec(),
-            *receiver.identity_key(),
-        )
-        .unwrap();
-
         let resolver = MockSendContextResolver::new()
-            .with_bundle(good.clone(), good_bundle)
+            .with_bundle(good.clone(), signed_prekey_bundle())
             .with_bundle(bad.clone(), create_mock_bundle());
         let rt = TokioTestRuntime;
 

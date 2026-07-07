@@ -604,15 +604,10 @@ pub async fn ensure_sessions_for_devices(
                 // identity; notify the client so it can react off-path.
                 Ok(Ok(Some(changed_jid))) => resolver.on_local_identity_change(&changed_jid),
                 Ok(Ok(None)) => {}
-                // Isolate the failure to this device: one participant's session
-                // setup must NOT abort the whole cohort. Aborting here left every
-                // other target — including our own companion devices — without an
-                // SKDM even though their sessions established fine, and the cohort
-                // was then marked has_key=true, permanently orphaning own companions
-                // (their retry path is an own-device no-op). WA Web's
-                // GroupKeyDistributionMsg wraps each device's encrypt in try/catch
-                // and drops only the failing one; the skipped device just stays
-                // sessionless and is skipped by the fan-out below.
+                // Isolate the failure to this device so one participant can't abort
+                // the cohort's SKDM (matching WA Web GroupKeyDistributionMsg's
+                // per-device try/catch). The sessionless device is dropped by the
+                // fan-out below.
                 Ok(Err(e)) => {
                     log::warn!("Group session setup failed for a device, skipping it: {e}");
                 }
