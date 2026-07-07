@@ -521,16 +521,22 @@ pub(crate) async fn handle_passkey_notification(client: &Arc<Client>, node: Arc<
 }
 
 async fn drive_passkey_request(client: &Arc<Client>, options_json: String) {
-    // Handoff key from the current secret proves continuity to the server; presence
-    // of a key marks this as a re-link. The rotated secret itself is generated
-    // per-attempt in the session.
-    let adv_secret = client
-        .persistence_manager
-        .get_device_snapshot()
-        .adv_secret_key;
-    let handoff_key = ShortcakeUtils::derive_pairing_handoff_hmac_key(&adv_secret)
-        .inspect_err(|e| warn!("failed to derive pairing-handoff key: {e}"))
-        .ok();
+    // The handoff key proves ADV-secret continuity to the server and suppresses the
+    // verification-code UX — that is a RE-LINK signal. adv_secret_key is present even
+    // on a brand-new device, so gating on it alone makes skip_handoff_ux structurally
+    // always true and disables the fresh-link code check. Only derive it when a prior
+    // linked identity exists; a fresh device leaves it None so the human code-compare
+    // still defends the (server-supplied) primary ephemeral identity.
+    let snapshot = client.persistence_manager.get_device_snapshot();
+    let previously_linked =
+        snapshot.account.is_some() || snapshot.pn.is_some() || snapshot.lid.is_some();
+    let handoff_key = if previously_linked {
+        ShortcakeUtils::derive_pairing_handoff_hmac_key(&snapshot.adv_secret_key)
+            .inspect_err(|e| warn!("failed to derive pairing-handoff key: {e}"))
+            .ok()
+    } else {
+        None
+    };
     client.passkey_state.lock().await.handoff_key = handoff_key;
 
     client
@@ -1020,6 +1026,35 @@ mod tests {
                 .as_node_ref()
                 .get_optional_child(TAG_PAIRING_HANDOFF_PROOF)
                 .is_none()
+        );
+    }
+
+    /// A fresh device (never linked) must NOT derive a handoff key, so
+    /// skip_handoff_ux stays false and the verification-code check runs.
+    #[tokio::test]
+    async fn fresh_link_does_not_derive_a_handoff_key() {
+        let client = create_test_client().await;
+        drive_passkey_request(&client, "{}".to_string()).await;
+        assert!(
+            client.passkey_state.lock().await.handoff_key.is_none(),
+            "a fresh link must leave handoff_key None (verification-code UX stays on)"
+        );
+    }
+
+    /// A re-link (a prior identity is present) derives the handoff key, which is
+    /// what legitimately lets the server skip the verification-code UX.
+    #[tokio::test]
+    async fn relink_derives_a_handoff_key() {
+        let client = create_test_client().await;
+        let pn: Jid = "15551230000:1@s.whatsapp.net".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(pn)))
+            .await;
+        drive_passkey_request(&client, "{}".to_string()).await;
+        assert!(
+            client.passkey_state.lock().await.handoff_key.is_some(),
+            "a re-link with a prior identity must derive the handoff key"
         );
     }
 }
