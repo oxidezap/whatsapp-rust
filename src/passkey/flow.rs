@@ -521,12 +521,9 @@ pub(crate) async fn handle_passkey_notification(client: &Arc<Client>, node: Arc<
 }
 
 async fn drive_passkey_request(client: &Arc<Client>, options_json: String) {
-    // The handoff key proves ADV-secret continuity to the server and suppresses the
-    // verification-code UX — that is a RE-LINK signal. adv_secret_key is present even
-    // on a brand-new device, so gating on it alone makes skip_handoff_ux structurally
-    // always true and disables the fresh-link code check. Only derive it when a prior
-    // linked identity exists; a fresh device leaves it None so the human code-compare
-    // still defends the (server-supplied) primary ephemeral identity.
+    // The handoff key suppresses the verification-code UX, so it must be a RE-LINK
+    // signal only: adv_secret_key alone is present on a fresh device too, which would
+    // disable the code check on a first link. Gate on a prior linked identity.
     let snapshot = client.persistence_manager.get_device_snapshot();
     let previously_linked =
         snapshot.account.is_some() || snapshot.pn.is_some() || snapshot.lid.is_some();
