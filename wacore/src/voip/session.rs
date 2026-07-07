@@ -4,6 +4,7 @@
 
 use super::e2e_srtp::{
     E2eSrtpKeys, RecvRocTracker, RocTracker, append_warp_mi_tag, crypt_payload, derive_e2e_keys,
+    verify_warp_mi_tag,
 };
 use super::rtp::{
     RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, encode_rtp_header_into, parse_rtp_header,
@@ -215,20 +216,38 @@ impl MediaPipeline {
         append_warp_mi_tag(&self.send_keys.auth_key, &packet, roc, self.warp_mi_tag_len)
     }
 
-    /// Inbound: strip the WARP MI tag (not verified), parse the header, decrypt the payload.
+    /// Inbound: verify the WARP MI tag, parse the header, decrypt the payload.
     /// The ROC is derived per-packet from the recv tracker (RFC 3711 guess-index), so the keystream
     /// stays aligned with the sender's across 16-bit seq wraps even under reorder/loss.
+    ///
+    /// The tag is authenticated (constant-time) against the *estimated* ROC BEFORE
+    /// that ROC is committed, so an on-path relay can't fold unauthenticated packets
+    /// into the rollover counter and permanently desync the receiver (RFC 3711
+    /// §3.3.1 requires the index update to follow authentication).
     pub fn unprotect_audio(&mut self, packet: &[u8]) -> Option<(RtpHeader, Vec<u8>)> {
         if packet.len() < RTP_FIXED_HEADER_LEN + self.warp_mi_tag_len {
             return None;
         }
-        let without_tag = &packet[..packet.len() - self.warp_mi_tag_len];
+        let split = packet.len() - self.warp_mi_tag_len;
+        let without_tag = &packet[..split];
+        let received_tag = &packet[split..];
         let header = parse_rtp_header(without_tag)?;
         let header_len = rtp_header_byte_length(without_tag)?;
         if without_tag.len() <= header_len {
             return None;
         }
-        let roc = self.recv_roc.guess_roc(header.sequence_number);
+        let roc = self.recv_roc.estimate_roc(header.sequence_number);
+        if !verify_warp_mi_tag(
+            &self.recv_keys.auth_key,
+            without_tag,
+            roc,
+            self.warp_mi_tag_len,
+            received_tag,
+        ) {
+            return None;
+        }
+        // Authenticated: now it's safe to advance the rollover counter.
+        self.recv_roc.commit_roc(roc, header.sequence_number);
         let cipher = &without_tag[header_len..];
         let plain = crypt_payload(
             &self.recv_keys,
@@ -454,8 +473,10 @@ mod tests {
             warp_mi_tag_len: WARP_MI_TAG_LEN,
         })
         .unwrap();
-        let (_, mis) = us2.unprotect_audio(&wrong).unwrap();
-        assert_ne!(mis, opus, "recv must not recover a self-LID-keyed packet");
+        assert!(
+            us2.unprotect_audio(&wrong).is_none(),
+            "recv must reject a self-LID-keyed packet (its MI tag fails to authenticate)"
+        );
     }
 
     // The recv keystream is HKDF'd over the FULL peer LID INCLUDING the device suffix, so the caller
@@ -484,7 +505,8 @@ mod tests {
         .unwrap();
         let from_answerer = answerer_tx.protect_audio(&opus);
 
-        // BUG: caller keys recv from the dialed BASE LID `:0` -> decrypts to garbage.
+        // Wrong keying: caller keys recv from the dialed BASE LID `:0`. The frame's
+        // MI tag (keyed by the answering device) fails to authenticate, so it's rejected.
         let mut caller_base = MediaPipeline::new(&MediaPipelineParams {
             call_key: &call_key,
             self_lid: caller,
@@ -494,10 +516,9 @@ mod tests {
             warp_mi_tag_len: WARP_MI_TAG_LEN,
         })
         .unwrap();
-        let (_, garbled) = caller_base.unprotect_audio(&from_answerer).unwrap();
-        assert_ne!(
-            garbled, opus,
-            "base-LID recv keys must NOT recover a companion-device-keyed frame (proves the bug)"
+        assert!(
+            caller_base.unprotect_audio(&from_answerer).is_none(),
+            "base-LID recv keys must reject a companion-device-keyed frame"
         );
 
         // FIX: caller keys recv from the ANSWERING device LID `:2` -> recovers cleanly.
@@ -540,7 +561,8 @@ mod tests {
         })
         .unwrap();
 
-        // Caller starts keyed to the dialed BASE LID (the bug state) -> a companion frame is garbage.
+        // Caller starts keyed to the dialed BASE LID (the bug state): the companion
+        // frame's MI tag doesn't authenticate under the base-LID recv keys -> rejected.
         let mut caller_pipe = MediaPipeline::new(&MediaPipelineParams {
             call_key: &call_key,
             self_lid: caller,
@@ -551,10 +573,9 @@ mod tests {
         })
         .unwrap();
         let frame1 = answerer_tx.protect_audio(&opus);
-        let (_, garbled) = caller_pipe.unprotect_audio(&frame1).unwrap();
-        assert_ne!(
-            garbled, opus,
-            "pre-rekey: a companion-keyed frame is garbage"
+        assert!(
+            caller_pipe.unprotect_audio(&frame1).is_none(),
+            "pre-rekey: a companion-keyed frame is rejected"
         );
 
         // Rekey to the answering device; a subsequent frame now recovers cleanly.
@@ -579,6 +600,54 @@ mod tests {
         let ours = caller_pipe.protect_audio(&opus);
         let (_, got) = peer_rx.unprotect_audio(&ours).unwrap();
         assert_eq!(got, opus, "rekey_recv must not disturb send keys");
+    }
+
+    // An unauthenticated packet (bad WARP MI tag — an on-path relay can't forge it
+    // without the SRTP auth key) is rejected and must NOT fold the recv rollover
+    // counter, so a following legit frame still decrypts (RFC 3711 §3.3.1).
+    #[test]
+    fn forged_packet_is_rejected_and_does_not_desync_roc() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let ssrc = 0x0BADF00D;
+        let opus = vec![0x50u8, 1, 2, 3, 4, 5, 6, 7];
+
+        let params = |self_lid, peer_lid| MediaPipelineParams {
+            call_key: &call_key,
+            self_lid,
+            peer_lid,
+            ssrc,
+            samples_per_packet: 960,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        };
+        let mut tx = MediaPipeline::new(&params(a, b)).unwrap();
+        let mut rx = MediaPipeline::new(&params(b, a)).unwrap();
+
+        // Legit frame seeds the recv tracker and decrypts cleanly.
+        let f0 = tx.protect_audio(&opus);
+        assert_eq!(rx.unprotect_audio(&f0).unwrap().1, opus);
+        let base_seq = u16::from_be_bytes([f0[2], f0[3]]);
+
+        // Forge a far-AHEAD packet: rewrite the RTP sequence field (bytes 2..4) to a
+        // forward jump the pre-fix guess_roc would have folded into s_l. The rewrite
+        // also invalidates the MI tag, so authentication rejects the packet.
+        let mut forged = tx.protect_audio(&opus);
+        forged[2..4].copy_from_slice(&base_seq.wrapping_add(0x4000).to_be_bytes());
+        assert!(
+            rx.unprotect_audio(&forged).is_none(),
+            "an unauthenticated far-ahead packet must be rejected, not fold the ROC"
+        );
+
+        // The rejected packet left the recv tracker untouched, so a subsequent legit
+        // frame still decrypts. (The exact roc-bump staircase is pinned by
+        // e2e_srtp::unauthenticated_staircase_cannot_advance_roc_without_commit.)
+        let f2 = tx.protect_audio(&opus);
+        assert_eq!(
+            rx.unprotect_audio(&f2).unwrap().1,
+            opus,
+            "recv keystream survives an injected forged packet"
+        );
     }
 
     // A relay-advertised non-4 WARP MI tag length must round-trip: the tag the sender appends and the
