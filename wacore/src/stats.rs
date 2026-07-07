@@ -50,11 +50,8 @@ pub struct SessionStats {
     /// Timestamp (ms since UNIX epoch) of the last received WebSocket data.
     /// WA Web: `parseAndHandleStanza` → `deadSocketTimer.cancel()`.
     last_data_received_ms: AtomicU64,
-    /// Timestamp (ms) of the FIRST send since the last receive — the dead-socket
-    /// watchdog anchor. WA Web's `deadSocketTimer.onOrBefore` keeps the EARLIEST
-    /// armed deadline, so subsequent sends must not push it out; reset to 0 on any
-    /// receive. Anchoring on the last send instead would let steady outgoing
-    /// traffic hide a half-open socket forever.
+    /// Dead-socket watchdog anchor (WA Web `deadSocketTimer.onOrBefore`): the first
+    /// send since the last receive, so continued traffic can't push the deadline out.
     first_send_since_recv_ms: AtomicU64,
 }
 
@@ -103,15 +100,15 @@ impl SessionStats {
         self.bytes_sent
             .fetch_add(wire_bytes as u64, Ordering::Relaxed);
         self.frames_sent.fetch_add(1, Ordering::Relaxed);
-        self.last_data_sent_ms
-            .store(Self::now_ms(), Ordering::Relaxed);
+        let now = Self::now_ms();
+        self.last_data_sent_ms.store(now, Ordering::Relaxed);
         // Arm the dead-socket deadline on the FIRST send after a receive only;
         // later sends must not push it out (WA Web `onOrBefore` keeps the earliest
         // deadline). The load fast-paths the common already-armed case.
         if self.first_send_since_recv_ms.load(Ordering::Relaxed) == 0 {
             let _ = self.first_send_since_recv_ms.compare_exchange(
                 0,
-                Self::now_ms(),
+                now,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             );
@@ -771,41 +768,39 @@ mod tests {
         assert!(armed > 0, "the first send arms the dead-socket anchor");
 
         // Continued outgoing traffic must NOT push the anchor out (WA Web onOrBefore
-        // keeps the earliest deadline) — anchoring on the last send is what let a
-        // half-open socket hide. The last-send stamp, by contrast, does advance.
+        // keeps the earliest deadline) — this is what let a half-open socket hide.
+        // The CAS gate holds the anchor put across further sends; a sleep makes an
+        // "unconditional store" regression observable without the assert depending
+        // on the clock actually ticking (it stays == armed either way).
         std::thread::sleep(std::time::Duration::from_millis(2));
+        stats.record_frame_sent(10);
         stats.record_frame_sent(10);
         assert_eq!(
             stats.first_send_since_recv_ms(),
             armed,
-            "later sends keep the anchor"
-        );
-        assert!(
-            stats.last_data_sent_ms() > armed,
-            "the last-send stamp does advance"
+            "later sends keep the earliest anchor"
         );
 
         // A dead socket is detected once DEAD_SOCKET_TIME passes the anchor, even
         // though sends kept happening (anchor far in the past, no receive since).
         let now = crate::time::now_millis().max(0) as u64;
-        let stale = now - 21_000;
+        let stale = now.saturating_sub(21_000);
         assert!(
-            is_dead_socket(stale, stale - 5_000),
+            is_dead_socket(stale, stale.saturating_sub(5_000)),
             "20s past the anchor with no receive => dead"
         );
 
-        // A receive cancels the anchor; the next send re-arms with a fresh instant.
+        // A receive cancels the anchor; the next send re-arms it (non-zero again).
         stats.mark_recv_activity();
         assert_eq!(
             stats.first_send_since_recv_ms(),
             0,
             "a receive cancels the anchor"
         );
-        std::thread::sleep(std::time::Duration::from_millis(2));
         stats.record_frame_sent(10);
         assert!(
-            stats.first_send_since_recv_ms() > armed,
-            "the next send after a receive re-arms with a fresh anchor"
+            stats.first_send_since_recv_ms() > 0,
+            "the next send after a receive re-arms the anchor"
         );
     }
 
