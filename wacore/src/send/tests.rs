@@ -1236,8 +1236,8 @@ fn test_lid_prekey_lookup_normalization() {
 mod group_retry {
     use super::*;
     use crate::libsignal::protocol::{
-        Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore,
-        ProtocolAddress, SessionStore, process_prekey_bundle,
+        Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, ProtocolAddress,
+        SessionStore, process_prekey_bundle,
     };
     use crate::types::message::AddressingMode;
     use std::collections::HashMap;
