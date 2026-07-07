@@ -50,6 +50,12 @@ pub struct SessionStats {
     /// Timestamp (ms since UNIX epoch) of the last received WebSocket data.
     /// WA Web: `parseAndHandleStanza` → `deadSocketTimer.cancel()`.
     last_data_received_ms: AtomicU64,
+    /// Timestamp (ms) of the FIRST send since the last receive — the dead-socket
+    /// watchdog anchor. WA Web's `deadSocketTimer.onOrBefore` keeps the EARLIEST
+    /// armed deadline, so subsequent sends must not push it out; reset to 0 on any
+    /// receive. Anchoring on the last send instead would let steady outgoing
+    /// traffic hide a half-open socket forever.
+    first_send_since_recv_ms: AtomicU64,
 }
 
 /// Point-in-time copy of [`SessionStats`], plus client-level counters the
@@ -99,6 +105,17 @@ impl SessionStats {
         self.frames_sent.fetch_add(1, Ordering::Relaxed);
         self.last_data_sent_ms
             .store(Self::now_ms(), Ordering::Relaxed);
+        // Arm the dead-socket deadline on the FIRST send after a receive only;
+        // later sends must not push it out (WA Web `onOrBefore` keeps the earliest
+        // deadline). The load fast-paths the common already-armed case.
+        if self.first_send_since_recv_ms.load(Ordering::Relaxed) == 0 {
+            let _ = self.first_send_since_recv_ms.compare_exchange(
+                0,
+                Self::now_ms(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     /// One transport data event carrying `frames` decodable frames.
@@ -117,6 +134,8 @@ impl SessionStats {
         if frames > 1 {
             self.last_data_received_ms
                 .store(Self::now_ms(), Ordering::Relaxed);
+            // A receive cancels the dead-socket deadline; the next send re-arms it.
+            self.first_send_since_recv_ms.store(0, Ordering::Relaxed);
         }
     }
 
@@ -127,6 +146,8 @@ impl SessionStats {
     pub fn mark_recv_activity(&self) {
         self.last_data_received_ms
             .store(Self::now_ms(), Ordering::Relaxed);
+        // A receive cancels the dead-socket deadline; the next send re-arms it.
+        self.first_send_since_recv_ms.store(0, Ordering::Relaxed);
     }
 
     #[inline]
@@ -161,11 +182,20 @@ impl SessionStats {
     pub fn reset_connection_activity(&self) {
         self.last_data_sent_ms.store(0, Ordering::Relaxed);
         self.last_data_received_ms.store(0, Ordering::Relaxed);
+        self.first_send_since_recv_ms.store(0, Ordering::Relaxed);
     }
 
     #[inline]
     pub fn last_data_sent_ms(&self) -> u64 {
         self.last_data_sent_ms.load(Ordering::Relaxed)
+    }
+
+    /// The dead-socket watchdog anchor: the first send since the last receive
+    /// (0 when unarmed). Evaluate [`is_dead_socket`] against this, not the last
+    /// send, so continued outgoing traffic can't hide a half-open socket.
+    #[inline]
+    pub fn first_send_since_recv_ms(&self) -> u64 {
+        self.first_send_since_recv_ms.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -727,6 +757,56 @@ mod tests {
         assert_eq!(snap.events_dropped, 2);
         assert!(snap.last_data_sent_ms > 0);
         assert!(snap.last_data_received_ms > 0);
+    }
+
+    #[test]
+    fn dead_socket_anchor_holds_across_continued_sends() {
+        use crate::protocol::keepalive::is_dead_socket;
+
+        let stats = SessionStats::new();
+        assert_eq!(stats.first_send_since_recv_ms(), 0, "unarmed initially");
+
+        stats.record_frame_sent(10);
+        let armed = stats.first_send_since_recv_ms();
+        assert!(armed > 0, "the first send arms the dead-socket anchor");
+
+        // Continued outgoing traffic must NOT push the anchor out (WA Web onOrBefore
+        // keeps the earliest deadline) — anchoring on the last send is what let a
+        // half-open socket hide. The last-send stamp, by contrast, does advance.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        stats.record_frame_sent(10);
+        assert_eq!(
+            stats.first_send_since_recv_ms(),
+            armed,
+            "later sends keep the anchor"
+        );
+        assert!(
+            stats.last_data_sent_ms() > armed,
+            "the last-send stamp does advance"
+        );
+
+        // A dead socket is detected once DEAD_SOCKET_TIME passes the anchor, even
+        // though sends kept happening (anchor far in the past, no receive since).
+        let now = crate::time::now_millis().max(0) as u64;
+        let stale = now - 21_000;
+        assert!(
+            is_dead_socket(stale, stale - 5_000),
+            "20s past the anchor with no receive => dead"
+        );
+
+        // A receive cancels the anchor; the next send re-arms with a fresh instant.
+        stats.mark_recv_activity();
+        assert_eq!(
+            stats.first_send_since_recv_ms(),
+            0,
+            "a receive cancels the anchor"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        stats.record_frame_sent(10);
+        assert!(
+            stats.first_send_since_recv_ms() > armed,
+            "the next send after a receive re-arms with a fresh anchor"
+        );
     }
 
     #[test]
