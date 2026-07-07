@@ -265,6 +265,7 @@ pub enum EventKind {
     PairPasskeyRequest,
     PairPasskeyConfirmation,
     PairPasskeyError,
+    ServerAck,
     // When adding a variant, mind the 64-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u64) and keep the guard pointing at the
     // last variant.
@@ -278,7 +279,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::PairPasskeyError as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::ServerAck as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. The event bus skips
 /// materializing and dispatching events whose kind no handler wants, so a
@@ -651,6 +652,14 @@ pub enum Event {
     /// `info.unavailable_request_id`) dispatch event-only.
     Messages(MessageBatch),
     Receipt(Receipt),
+    /// The server `<ack>`-ed (or nack-ed) an outgoing stanza.
+    ///
+    /// Observe-only: dispatched for every server `<ack>` that carries an id,
+    /// before and independently of the internal ack-waiter resolution, so it
+    /// never interacts with the send/phash flow. Lets consumers measure
+    /// send → server-accept latency and surface nack codes programmatically
+    /// (today nacks are only visible as `warn!` logs).
+    ServerAck(ServerAck),
     UndecryptableMessage(UndecryptableMessage),
     #[serde(skip)]
     Notification(Arc<OwnedNodeRef>),
@@ -843,6 +852,7 @@ impl Event {
             Event::PairPasskeyRequest(_) => EventKind::PairPasskeyRequest,
             Event::PairPasskeyConfirmation(_) => EventKind::PairPasskeyConfirmation,
             Event::PairPasskeyError(_) => EventKind::PairPasskeyError,
+            Event::ServerAck(_) => EventKind::ServerAck,
         }
     }
 
@@ -1174,6 +1184,28 @@ pub struct Receipt {
     /// from the server's offline queue on reconnect rather than delivered live.
     /// Mirrors WA Web `incomingMsgReceiptParser` (`offline: maybeAttrString`).
     pub offline: bool,
+}
+
+/// Payload of [`Event::ServerAck`]: the server acknowledged (or nacked) an
+/// outgoing stanza. Server acks cover every outgoing stanza class — message,
+/// receipt, notification, call — so consumers should filter on [`class`](Self::class)
+/// before correlating ids.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerAck {
+    /// Id of the acked stanza (for a sent message, its message id).
+    pub id: String,
+    /// Stanza class the ack refers to (`"message"`, `"receipt"`,
+    /// `"notification"`, `"call"`, …). Empty when the server omits it.
+    pub class: String,
+    /// Chat/entity the ack refers to, when present and parseable.
+    pub from: Option<Jid>,
+    /// Server timestamp from the ack's `t` attribute, when present. For a
+    /// message ack this is the authoritative send timestamp (whatsmeow reads
+    /// the same attribute into `SendResponse.Timestamp`).
+    pub timestamp: Option<DateTime<Utc>>,
+    /// Nack code (e.g. `"479"`) when the server rejected the stanza; `None`
+    /// for a plain ack.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

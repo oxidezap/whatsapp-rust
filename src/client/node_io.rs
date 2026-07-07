@@ -1101,11 +1101,14 @@ impl Client {
         tracing::instrument(name = "wa.conn.ack_response", level = "debug", skip_all)
     )]
     pub(crate) async fn handle_ack_response(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+        let ack_id = node.get_attr("id");
+        let ack_error = node.get_attr("error");
+
         // Surface server nack codes for diagnosability. A nacked send still
         // resolves Ok to the caller, so without this the failure is invisible.
-        if let Some(error_code) = node.get_attr("error") {
+        if let Some(error_code) = &ack_error {
             let code = error_code.as_str();
-            let id = node.get_attr("id").map(|v| v.as_str());
+            let id = ack_id.as_ref().map(|v| v.as_str());
             match code.as_ref() {
                 "463" => {
                     warn!(
@@ -1136,7 +1139,33 @@ impl Client {
             }
         }
 
-        if let Some(id) = node.get_attr("id").map(|v| v.as_str())
+        // Dispatched before waiter resolution; gated on interest so the hot path
+        // allocates nothing when nobody is listening.
+        if self
+            .core
+            .event_bus
+            .has_handler_for(wacore::types::events::EventKind::ServerAck)
+            && let Some(id) = &ack_id
+        {
+            let ack = wacore::types::events::ServerAck {
+                id: id.as_str().to_string(),
+                class: node
+                    .get_attr("class")
+                    .map(|v| v.as_str().to_string())
+                    .unwrap_or_default(),
+                from: node.get_attr("from").and_then(|v| v.as_str().parse().ok()),
+                timestamp: node
+                    .get_attr("t")
+                    .and_then(|v| v.as_str().parse::<i64>().ok())
+                    .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0)),
+                error: ack_error.as_ref().map(|v| v.as_str().to_string()),
+            };
+            self.core
+                .event_bus
+                .dispatch(wacore::types::events::Event::ServerAck(ack));
+        }
+
+        if let Some(id) = ack_id.map(|v| v.as_str())
             && let Some(waiter) = self.response_waiters_guard().remove(id.as_ref())
         {
             // ACK responses are infrequent; re-encode into OwnedNodeRef for the channel.
