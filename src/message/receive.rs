@@ -1208,6 +1208,15 @@ impl Client {
         let sender_address = sender_for_sk.to_protocol_address();
         let sender_key_name = make_sender_key_name(&info.source.chat, &sender_address);
 
+        // Two workers for the same (group, sender) can coexist after a chat-lane
+        // eviction; without a lock they race the ratchet advance and drop a chain
+        // step, leaving later skmsg undecryptable until the sender rotates an SKDM.
+        // The 1:1 path holds the analogous session_lock_for around its decrypt.
+        let chain_lock = adapter
+            .sender_key_store
+            .sender_key_lock(&sender_key_name)
+            .await;
+
         for payload in payloads {
             let ciphertext = &payload.ciphertext[..];
             let padding_version = payload.padding_version;
@@ -1219,8 +1228,10 @@ impl Client {
                 info.source.sender.observe()
             );
 
-            let decrypt_result =
-                group_decrypt(ciphertext, &mut adapter.sender_key_store, &sender_key_name).await;
+            let decrypt_result = {
+                let _chain_guard = chain_lock.lock().await;
+                group_decrypt(ciphertext, &mut adapter.sender_key_store, &sender_key_name).await
+            };
 
             match decrypt_result {
                 Ok(padded_plaintext) => {

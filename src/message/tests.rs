@@ -6628,6 +6628,120 @@ async fn bad_session_plaintext_skips_skmsg_sibling_after_nack() {
     );
 }
 
+/// Happy path: a group skmsg with an established sender key decrypts through
+/// process_group_enc_batch — now under the sender-key chain lock — and surfaces
+/// its content. The added lock must not block the normal decrypt.
+#[tokio::test]
+async fn group_skmsg_decrypts_under_sender_key_lock() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("group_skmsg_lock_happy").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.add_handler(handler);
+
+    let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+    let bob_addr = bob_jid.to_protocol_address();
+    let mut alice = AlicePeer::new("146824178450540@lid").await;
+    alice.install_bob_session(&bob_addr, &bundle).await;
+
+    let group: Jid = "120363408782575460@g.us".parse().expect("group");
+    let skdm = alice.create_group_skdm(&group).await;
+    let skdm_plaintext = MessageUtils::encode_and_pad(&wa::Message {
+        sender_key_distribution_message: buffa::MessageField::some(skdm),
+        ..Default::default()
+    });
+    let skdm_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
+
+    let content = MessageUtils::encode_and_pad(&wa::Message {
+        conversation: Some("hello group".to_string()),
+        ..Default::default()
+    });
+    let skmsg = alice.encrypt_group_message(&group, &content).await;
+
+    let id = "GROUP_SKMSG_LOCK_HAPPY";
+    let info = group_message_info(id, &group, &alice.jid, false);
+    process_group_classified_with_sessions(
+        &client,
+        info,
+        &alice.jid,
+        vec![enc_payload_from_ciphertext(&skdm_ct)],
+        vec![skmsg_payload_from_bytes(skmsg)],
+    )
+    .await;
+
+    let mut texts = Vec::new();
+    for _ in 0..80 {
+        texts = message_texts_for_id(&rx, id);
+        if !texts.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        texts,
+        vec!["hello group".to_string()],
+        "group skmsg content must surface after decrypt under the chain lock"
+    );
+}
+
+/// Bad path: a group skmsg whose sender key was never distributed hits
+/// NoSenderKeyState inside process_group_enc_batch (still under the lock) and
+/// takes the retry path — one undecryptable event, no user content.
+#[tokio::test]
+async fn group_skmsg_without_sender_key_takes_retry_path() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("group_skmsg_lock_bad").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.add_handler(handler);
+    let recorder = Arc::new(EventRecorder::default());
+    client.register_handler(recorder.clone());
+
+    let mut alice = AlicePeer::new("146824178450541@lid").await;
+    let group: Jid = "120363408782575461@g.us".parse().expect("group");
+
+    // Init alice's own sender key so she can encrypt, but never deliver the SKDM:
+    // Bob has no sender key for this (group, sender).
+    let _ = alice.create_group_skdm(&group).await;
+    let content = MessageUtils::encode_and_pad(&wa::Message {
+        conversation: Some("no key".to_string()),
+        ..Default::default()
+    });
+    let skmsg = alice.encrypt_group_message(&group, &content).await;
+
+    let id = "GROUP_SKMSG_LOCK_BAD";
+    let info = group_message_info(id, &group, &alice.jid, false);
+    process_group_classified_with_payloads(
+        &client,
+        info,
+        &alice.jid,
+        vec![],
+        vec![skmsg_payload_from_bytes(skmsg)],
+        vec![],
+    )
+    .await;
+
+    let mut undecryptable = 0;
+    for _ in 0..80 {
+        undecryptable = recorder.undecryptable().len();
+        if undecryptable > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        undecryptable, 1,
+        "a missing sender key must surface exactly one undecryptable event"
+    );
+    assert_eq!(
+        message_texts_for_id(&rx, id),
+        Vec::<String>::new(),
+        "no user content is dispatched without a sender key"
+    );
+}
+
 #[tokio::test]
 async fn skdm_only_session_with_msmsg_waits_for_bot_payload_response() {
     use wacore::messages::MessageUtils;
