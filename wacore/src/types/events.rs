@@ -603,6 +603,17 @@ pub struct DisappearingModeChanged {
     pub setting_timestamp: DateTime<Utc>,
 }
 
+/// An event dispatched by the client to registered handlers.
+///
+/// # Stability (pre-1.0)
+///
+/// The enum is `#[non_exhaustive]`, so match arms must keep a `_` catch-all.
+/// The payload structs are *not* sealed: while the crate is `0.x`, an existing
+/// payload may gain new fields in a minor release, so read the fields you need
+/// (`ack.class`) or keep a `..` rest when destructuring, rather than binding
+/// every field. A maybe-absent field is always modeled as `Option<T>`, never
+/// an empty-string / zero sentinel. Sealing the payloads behind
+/// `#[non_exhaustive]` + constructors is deferred to the 1.0 API freeze.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub enum Event {
@@ -1195,8 +1206,8 @@ pub struct ServerAck {
     /// Id of the acked stanza (for a sent message, its message id).
     pub id: String,
     /// Stanza class the ack refers to (`"message"`, `"receipt"`,
-    /// `"notification"`, `"call"`, …). Empty when the server omits it.
-    pub class: String,
+    /// `"notification"`, `"call"`, …). `None` when the server omits it.
+    pub class: Option<String>,
     /// Chat/entity the ack refers to, when present and parseable.
     pub from: Option<Jid>,
     /// Server timestamp from the ack's `t` attribute, when present. For a

@@ -1149,10 +1149,7 @@ impl Client {
         {
             let ack = wacore::types::events::ServerAck {
                 id: id.as_str().to_string(),
-                class: node
-                    .get_attr("class")
-                    .map(|v| v.as_str().to_string())
-                    .unwrap_or_default(),
+                class: node.get_attr("class").map(|v| v.as_str().to_string()),
                 from: node.get_attr("from").and_then(|v| v.as_str().parse().ok()),
                 timestamp: node
                     .get_attr("t")
