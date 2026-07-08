@@ -387,27 +387,12 @@ impl Client {
         let current_lid = self.lid_pn_cache.get_current_lid(phone_number).await;
         let reverse_pn = self.lid_pn_cache.get_phone_number(lid).await;
         let exact = current_lid.as_deref() == Some(lid);
-        let lid_unseen = reverse_pn.is_none();
-        let (write, needs_usync) = lid_pn_write_policy(source, lid_unseen, exact);
-
-        if write {
-            let created_at = if is_stale_source(source) {
-                0
-            } else {
-                wacore::time::now_secs()
-            };
-            let entry = LidPnEntry::with_timestamp(lid, phone_number, created_at, source);
-            self.lid_pn_cache.add(&entry).await;
-            return RecordOutcome::Written {
-                entry,
-                is_new: current_lid.is_none(),
-            };
-        }
 
         // Re-warm/re-affirm durability for a pair that is already the cached
         // mapping (exact, or reverse-only after a bounded-cache PN eviction).
-        // Must precede the conflict branch so a half-evicted but self-consistent
-        // pair is not mistaken for an observational conflict and re-queried.
+        // Precedes the write/conflict branches so a self-consistent pair is
+        // neither re-migrated as a fresh directed write nor re-queried as a
+        // conflict; no migration runs, the PN↔LID association is unchanged.
         let same_pair_forward_evicted =
             current_lid.is_none() && reverse_pn.as_deref() == Some(phone_number);
         if exact || same_pair_forward_evicted {
@@ -424,6 +409,24 @@ impl Client {
                     }
                 }
                 None => RecordOutcome::Skipped,
+            };
+        }
+
+        // Not a self-consistent pair: apply the source's write policy.
+        let lid_unseen = reverse_pn.is_none();
+        let (write, needs_usync) = lid_pn_write_policy(source, lid_unseen, exact);
+
+        if write {
+            let created_at = if is_stale_source(source) {
+                0
+            } else {
+                wacore::time::now_secs()
+            };
+            let entry = LidPnEntry::with_timestamp(lid, phone_number, created_at, source);
+            self.lid_pn_cache.add(&entry).await;
+            return RecordOutcome::Written {
+                entry,
+                is_new: current_lid.is_none(),
             };
         }
 
@@ -1126,6 +1129,14 @@ mod tests {
             arm_count(LearningSource::Other),
             "add the new LearningSource variant to ALL_SOURCES (and the match above)"
         );
+        // Reject duplicates: a repeated entry could pad the length back to the
+        // arm count while a variant is silently missing.
+        for (idx, src) in ALL_SOURCES.iter().enumerate() {
+            assert!(
+                !ALL_SOURCES[..idx].contains(src),
+                "ALL_SOURCES contains duplicate {src:?}"
+            );
+        }
     }
 
     /// An observational source (`Other`, e.g. the history-sync seed) must not
