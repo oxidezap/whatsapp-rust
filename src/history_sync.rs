@@ -212,7 +212,10 @@ impl Client {
                     .await;
 
                 // Bulk PN-LID identity seed from field 15; persist and migrations
-                // run detached, like the other batch learn paths.
+                // run detached, like the other batch learn paths. `Other`
+                // matches WA Web's `learningSource: "other"` for this harvest
+                // (WAWebHistorySyncChunk): a conservative seed that only adds
+                // new LIDs and never clobbers a live-learned mapping.
                 if !sync_result.lid_mappings.is_empty() {
                     let pairs: Vec<(String, String)> = sync_result
                         .lid_mappings
@@ -225,7 +228,7 @@ impl Client {
                     );
                     self.learn_lid_pn_mappings_batch(
                         pairs,
-                        crate::lid_pn_cache::LearningSource::MigrationSyncLatest,
+                        crate::lid_pn_cache::LearningSource::Other,
                         false,
                     )
                     .await;

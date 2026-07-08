@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use log::debug;
+use wacore::iq::usync::LidQuerySpec;
 use wacore::store::traits::LidPnMappingEntry;
 use wacore_binary::Jid;
 
@@ -33,6 +34,79 @@ fn mapping_to_entry(m: LidPnMappingEntry) -> LidPnEntry {
         m.created_at,
         LearningSource::parse(&m.learning_source),
     )
+}
+
+/// Per-mapping write policy, mirroring WhatsApp Web's `createLidPnMappings`
+/// `switch (learningSource)` (`WAWebDBCreateLidPnMappings`). The learning
+/// source is not mere provenance: it decides whether an incoming pair may
+/// overwrite what the cache already holds.
+///
+/// Inputs (WA Web `c`/`y`/`C`):
+/// - `lid_unseen`: the LID has no phone number cached yet (`c`).
+/// - `exact`: the phone already resolves to this exact LID (`y`).
+/// - derived `lid_known_mismatch = !lid_unseen && !exact` (`C`): the LID is
+///   already known but the phone currently resolves elsewhere.
+///
+/// Returns `(write, needs_usync)`:
+/// - `write` (WA Web `v`): update the cache/DB with this pair.
+/// - `needs_usync` (WA Web `b`): a conservative source hit a conflicting LID;
+///   re-resolve the phone authoritatively via a live LID query instead of
+///   trusting the observational pair. Only ever set when `write` is false.
+fn lid_pn_write_policy(source: LearningSource, lid_unseen: bool, exact: bool) -> (bool, bool) {
+    let lid_known_mismatch = !lid_unseen && !exact;
+    match source {
+        // Device-list usync: authoritative for a new LID and for correcting a
+        // known LID whose phone drifted.
+        LearningSource::Usync => (lid_unseen || lid_known_mismatch, false),
+        // Directed sources: overwrite on any difference from what's cached.
+        LearningSource::PeerPnMessage
+        | LearningSource::PeerLidMessage
+        | LearningSource::RecipientLatestLid
+        | LearningSource::MigrationSyncLatest
+        | LearningSource::MigrationSyncOld
+        | LearningSource::BlocklistActive
+        | LearningSource::BlocklistInactive => (!exact, false),
+        // Observational bulk sources (WA Web `default`, i.e. `learningSource:
+        // "other"`): only seed genuinely new LIDs; on a conflict with an
+        // already-known LID, don't clobber — request a live re-resolve. WA Web
+        // tags history sync, group/participant seeds, device- and
+        // contact-notifications, status/voip, etc. all as "other".
+        LearningSource::Other | LearningSource::Pairing | LearningSource::DeviceNotification => {
+            (lid_unseen, lid_known_mismatch)
+        }
+    }
+}
+
+/// WA Web `S`: sources carrying known-stale data get `created_at = 0` so any
+/// later live mapping for the same phone outranks them in the cache's
+/// most-recent-wins (PN→LID) resolution. Only the forward direction is
+/// timestamp-ordered; the LID→PN reverse map always takes the latest write (as
+/// in WA Web), so this does not guard the reverse lookup.
+fn is_stale_source(source: LearningSource) -> bool {
+    matches!(
+        source,
+        LearningSource::MigrationSyncOld | LearningSource::BlocklistInactive
+    )
+}
+
+/// Outcome of recording one (lid, phone) pair against current cache state.
+enum RecordOutcome {
+    /// Already durable in both directions; nothing to do.
+    Skipped,
+    /// Written to (or re-affirmed in) the cache; the caller should persist it.
+    /// `is_new` drives the PN→LID device/session migration.
+    Written { entry: LidPnEntry, is_new: bool },
+    /// An observational source conflicted with a known LID; the phone should be
+    /// re-resolved via a live LID query rather than trusting this pair.
+    NeedsUsync,
+}
+
+/// Outcome of recording a batch: entries to persist (with their `is_new`
+/// flags) plus phones that need a live LID re-query.
+struct BatchRecordOutcome {
+    entries: Vec<LidPnEntry>,
+    is_new_flags: Vec<bool>,
+    usync_phones: Vec<String>,
 }
 
 impl Client {
@@ -80,10 +154,19 @@ impl Client {
         phone_number: &str,
         source: LearningSource,
     ) -> Result<()> {
-        let (entry, is_new_mapping) = self
+        match self
             .record_lid_pn_in_memory(lid, phone_number, source)
-            .await;
-        self.persist_and_migrate_lid_pn(entry, is_new_mapping).await
+            .await
+        {
+            RecordOutcome::Skipped => Ok(()),
+            RecordOutcome::NeedsUsync => {
+                self.spawn_lid_usync_reconcile(vec![phone_number.to_string()]);
+                Ok(())
+            }
+            RecordOutcome::Written { entry, is_new } => {
+                self.persist_and_migrate_lid_pn(entry, is_new).await
+            }
+        }
     }
 
     /// Hot-path variant: cache is updated synchronously (so a subsequent
@@ -116,16 +199,17 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        // Skip the per-message re-record/re-persist only when this exact pair is
-        // durably persisted and resolvable both ways in cache: an offline-only
-        // learn, a remap (even one whose write failed), or an evicted entry all
-        // fall through and re-warm/persist. `source` drift is ignored.
-        if self.lid_pn_cache.can_skip_relearn(phone_number, lid).await {
-            return;
-        }
-        let (entry, is_new_mapping) = self
+        let (entry, is_new_mapping) = match self
             .record_lid_pn_in_memory(lid, phone_number, source)
-            .await;
+            .await
+        {
+            RecordOutcome::Skipped => return,
+            RecordOutcome::NeedsUsync => {
+                self.spawn_lid_usync_reconcile(vec![phone_number.to_string()]);
+                return;
+            }
+            RecordOutcome::Written { entry, is_new } => (entry, is_new),
+        };
         if is_offline {
             return;
         }
@@ -166,9 +250,18 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        let (entries, is_new_flags) = self.record_lid_pn_batch_in_memory(mappings, source).await;
+        let BatchRecordOutcome {
+            entries,
+            is_new_flags,
+            usync_phones,
+        } = self.record_lid_pn_batch_in_memory(mappings, source).await;
 
-        // Every pair was already durable; nothing to persist or migrate.
+        // Conflicting observational pairs re-resolve live, independent of the
+        // flush gate (WA Web fires syncContactListJob regardless of
+        // flushImmediately).
+        self.spawn_lid_usync_reconcile(usync_phones);
+
+        // Nothing written, or an offline replay: skip the persist/migrate task.
         if is_offline || entries.is_empty() {
             return;
         }
@@ -186,17 +279,67 @@ impl Client {
             .detach();
     }
 
+    /// Fire-and-forget the WA Web `syncContactListJob({mode:"query"})` analog:
+    /// one background LID usync for phones an observational source found in
+    /// conflict with a known LID, learning the authoritative result under
+    /// `LearningSource::Usync` (which cannot itself trigger another reconcile,
+    /// so there is no query→learn→query loop). Best-effort: a failed query
+    /// leaves the existing mapping untouched.
+    fn spawn_lid_usync_reconcile(&self, phones: Vec<String>) {
+        if phones.is_empty() {
+            return;
+        }
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let runtime = client.runtime.clone();
+        runtime
+            .spawn(Box::pin(async move {
+                client.reconcile_lid_mappings_via_usync(phones).await;
+            }))
+            .detach();
+    }
+
+    async fn reconcile_lid_mappings_via_usync(&self, phones: Vec<String>) {
+        let jids: Vec<Jid> = phones.iter().map(|p| Jid::pn(p.as_str())).collect();
+        let sid = self.generate_request_id();
+        match self.execute(LidQuerySpec::new(jids, sid)).await {
+            Ok(resp) => {
+                for mapping in &resp.lid_mappings {
+                    if let Err(err) = self
+                        .add_lid_pn_mapping(
+                            &mapping.lid,
+                            &mapping.phone_number,
+                            LearningSource::Usync,
+                        )
+                        .await
+                    {
+                        log::warn!(
+                            "LID reconcile persist failed for {} -> {}: {err}",
+                            mapping.phone_number,
+                            mapping.lid
+                        );
+                    }
+                }
+            }
+            Err(err) => debug!("LID reconcile usync query failed: {err}"),
+        }
+    }
+
     /// Batch cache warm-up shared by the fire-and-forget learn path and the
-    /// migration-sync handler (which awaits persistence instead). Dedups by
-    /// phone_number (last lid wins) — otherwise the same phone appearing twice
-    /// in one batch yields is_new=true for the first (lid_A) and is_new=false
-    /// for the second (lid_B), so signal migration runs for lid_A while the
-    /// persisted mapping ends up pointing at lid_B.
+    /// migration-sync handler (which awaits persistence instead). Each pair
+    /// runs through [`Self::record_lid_pn_in_memory`] under the source's write
+    /// policy. Dedups by phone_number (last lid wins) — otherwise the same
+    /// phone appearing twice in one batch yields is_new=true for the first
+    /// (lid_A) and is_new=false for the second (lid_B), so signal migration
+    /// runs for lid_A while the persisted mapping ends up pointing at lid_B.
+    /// (WA Web instead records the superseded entry with created_at=0; dropping
+    /// it is equivalent for the resolved PN→LID mapping.)
     async fn record_lid_pn_batch_in_memory(
         &self,
         mappings: Vec<(String, String)>,
         source: LearningSource,
-    ) -> (Vec<LidPnEntry>, Vec<bool>) {
+    ) -> BatchRecordOutcome {
         let cap = mappings.len();
         let mut deduped: std::collections::HashMap<String, String> =
             std::collections::HashMap::with_capacity(cap);
@@ -206,43 +349,94 @@ impl Client {
 
         let mut entries: Vec<LidPnEntry> = Vec::with_capacity(deduped.len());
         let mut is_new_flags: Vec<bool> = Vec::with_capacity(deduped.len());
+        let mut usync_phones: Vec<String> = Vec::new();
         for (phone_number, lid) in deduped {
-            // Same fast path as the single-entry learn: an already durable and
-            // both-ways cached pair needs no re-add, re-persist or migration.
-            if self
-                .lid_pn_cache
-                .can_skip_relearn(&phone_number, &lid)
+            match self
+                .record_lid_pn_in_memory(&lid, &phone_number, source)
                 .await
             {
-                continue;
+                RecordOutcome::Skipped => {}
+                RecordOutcome::Written { entry, is_new } => {
+                    entries.push(entry);
+                    is_new_flags.push(is_new);
+                }
+                RecordOutcome::NeedsUsync => usync_phones.push(phone_number),
             }
-            let is_new = self
-                .lid_pn_cache
-                .get_current_lid(&phone_number)
-                .await
-                .is_none();
-            let entry = LidPnEntry::new(lid, phone_number, source);
-            self.lid_pn_cache.add(&entry).await;
-            entries.push(entry);
-            is_new_flags.push(is_new);
         }
-        (entries, is_new_flags)
+        BatchRecordOutcome {
+            entries,
+            is_new_flags,
+            usync_phones,
+        }
     }
 
+    /// Record one pair in the in-memory cache under [`lid_pn_write_policy`].
+    /// Does not persist — the caller drives persistence/migration from the
+    /// returned [`RecordOutcome`].
     async fn record_lid_pn_in_memory(
         &self,
         lid: &str,
         phone_number: &str,
         source: LearningSource,
-    ) -> (LidPnEntry, bool) {
-        let is_new_mapping = self
-            .lid_pn_cache
-            .get_current_lid(phone_number)
-            .await
-            .is_none();
-        let entry = LidPnEntry::new(lid.to_string(), phone_number.to_string(), source);
-        self.lid_pn_cache.add(&entry).await;
-        (entry, is_new_mapping)
+    ) -> RecordOutcome {
+        // Fully durable and resolvable both ways: nothing to re-add or persist.
+        if self.lid_pn_cache.can_skip_relearn(phone_number, lid).await {
+            return RecordOutcome::Skipped;
+        }
+
+        let current_lid = self.lid_pn_cache.get_current_lid(phone_number).await;
+        let reverse_pn = self.lid_pn_cache.get_phone_number(lid).await;
+        let exact = current_lid.as_deref() == Some(lid);
+        let lid_unseen = reverse_pn.is_none();
+        let (write, needs_usync) = lid_pn_write_policy(source, lid_unseen, exact);
+
+        if write {
+            let created_at = if is_stale_source(source) {
+                0
+            } else {
+                wacore::time::now_secs()
+            };
+            let entry = LidPnEntry::with_timestamp(lid, phone_number, created_at, source);
+            self.lid_pn_cache.add(&entry).await;
+            return RecordOutcome::Written {
+                entry,
+                is_new: current_lid.is_none(),
+            };
+        }
+
+        // Not writing. The pair may already BE the cached mapping and just need
+        // re-warming: an exact forward (PN→LID) match, or — under a
+        // capacity-bounded cache, which WA Web's unbounded Maps never hit — a
+        // reverse-only (LID→PN) match whose forward side was evicted. Re-affirm
+        // both directions and durability without bumping the mapping or running
+        // a migration; the PN↔LID association is unchanged. This must precede
+        // the conflict branch so a half-evicted, self-consistent pair is not
+        // mistaken for an observational conflict and needlessly re-queried.
+        let same_pair_forward_evicted =
+            current_lid.is_none() && reverse_pn.as_deref() == Some(phone_number);
+        if exact || same_pair_forward_evicted {
+            let existing = match self.lid_pn_cache.get_entry_by_phone(phone_number).await {
+                Some(entry) => Some(entry),
+                None => self.lid_pn_cache.get_entry_by_lid(lid).await,
+            };
+            return match existing {
+                Some(entry) => {
+                    self.lid_pn_cache.add(&entry).await;
+                    RecordOutcome::Written {
+                        entry,
+                        is_new: false,
+                    }
+                }
+                None => RecordOutcome::Skipped,
+            };
+        }
+
+        // A genuine observational conflict with a different known LID: leave the
+        // live mapping in place and request an authoritative live re-resolve.
+        if needs_usync {
+            return RecordOutcome::NeedsUsync;
+        }
+        RecordOutcome::Skipped
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.persist_migrate_lid_pn", level = "debug", skip_all, fields(is_new = is_new_mapping), err(Debug)))]
@@ -519,12 +713,17 @@ impl Client {
         // detached task instead: this handler runs under the message
         // pipeline's processing permit, and a large first push walking
         // MIGRATION_DEVICE_RANGE locks per mapping would stall it.
-        let (entries, is_new_flags) = self
+        let BatchRecordOutcome {
+            entries,
+            is_new_flags,
+            usync_phones,
+        } = self
             .record_lid_pn_batch_in_memory(
                 mappings,
                 crate::lid_pn_cache::LearningSource::MigrationSyncLatest,
             )
             .await;
+        self.spawn_lid_usync_reconcile(usync_phones);
         if !entries.is_empty() {
             match self.persist_lid_pn_batch(entries).await {
                 Ok(storage) => {
@@ -812,6 +1011,344 @@ mod tests {
             .await
             .unwrap();
         (client, pn, lid)
+    }
+
+    // ── WA Web `createLidPnMappings` switch(learningSource) parity ─────────
+
+    /// Every non-default `LearningSource`, for the pure decision table below.
+    const ALL_SOURCES: [LearningSource; 11] = [
+        LearningSource::Usync,
+        LearningSource::PeerPnMessage,
+        LearningSource::PeerLidMessage,
+        LearningSource::RecipientLatestLid,
+        LearningSource::MigrationSyncLatest,
+        LearningSource::MigrationSyncOld,
+        LearningSource::BlocklistActive,
+        LearningSource::BlocklistInactive,
+        LearningSource::Pairing,
+        LearningSource::DeviceNotification,
+        LearningSource::Other,
+    ];
+
+    /// Pure decision table for [`lid_pn_write_policy`], mirroring WA Web's
+    /// `createLidPnMappings` `switch (learningSource)`. Columns are
+    /// `(lid_unseen, exact)`; `exact` implies the LID is already seen, so
+    /// `(true, true)` is unreachable.
+    #[test]
+    fn test_lid_pn_write_policy_switch_matrix() {
+        // Brand-new LID: every source writes it, none needs a re-query.
+        for src in ALL_SOURCES {
+            assert_eq!(
+                lid_pn_write_policy(src, true, false),
+                (true, false),
+                "a brand-new LID must always be written, never re-queried ({src:?})"
+            );
+        }
+
+        // Exact match already cached: no source rewrites, none re-queries.
+        for src in ALL_SOURCES {
+            assert_eq!(
+                lid_pn_write_policy(src, false, true),
+                (false, false),
+                "an exact match is a no-op ({src:?})"
+            );
+        }
+
+        // Known-LID conflict (WA Web `C`): directed sources overwrite;
+        // observational sources refuse and request a live re-resolve.
+        let directed = [
+            LearningSource::Usync,
+            LearningSource::PeerPnMessage,
+            LearningSource::PeerLidMessage,
+            LearningSource::RecipientLatestLid,
+            LearningSource::MigrationSyncLatest,
+            LearningSource::MigrationSyncOld,
+            LearningSource::BlocklistActive,
+            LearningSource::BlocklistInactive,
+        ];
+        for src in directed {
+            assert_eq!(
+                lid_pn_write_policy(src, false, false),
+                (true, false),
+                "a directed source overwrites a conflicting known LID ({src:?})"
+            );
+        }
+        for src in [
+            LearningSource::Other,
+            LearningSource::Pairing,
+            LearningSource::DeviceNotification,
+        ] {
+            assert_eq!(
+                lid_pn_write_policy(src, false, false),
+                (false, true),
+                "an observational source must not clobber; it re-queries ({src:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_stale_source() {
+        assert!(is_stale_source(LearningSource::MigrationSyncOld));
+        assert!(is_stale_source(LearningSource::BlocklistInactive));
+        for src in [
+            LearningSource::Usync,
+            LearningSource::PeerPnMessage,
+            LearningSource::MigrationSyncLatest,
+            LearningSource::BlocklistActive,
+            LearningSource::Other,
+            LearningSource::Pairing,
+            LearningSource::DeviceNotification,
+        ] {
+            assert!(!is_stale_source(src), "{src:?} is not stale");
+        }
+    }
+
+    /// An observational source (`Other`, e.g. the history-sync seed) must not
+    /// overwrite a live-learned LID for the same phone; it returns
+    /// `NeedsUsync` and leaves the cache untouched.
+    #[tokio::test]
+    async fn test_record_observational_preserves_conflicting_known_lid() {
+        let client = create_test_client().await;
+        let phone = "5511900000001";
+        let lid_live = "200000000000001";
+        let lid_other = "200000000000002";
+        client
+            .add_lid_pn_mapping(lid_live, phone, LearningSource::Usync)
+            .await
+            .unwrap();
+        // Make lid_other a *known* LID (mapped to some other phone).
+        client
+            .add_lid_pn_mapping(lid_other, "5511900000099", LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let outcome = client
+            .record_lid_pn_in_memory(lid_other, phone, LearningSource::Other)
+            .await;
+
+        assert!(
+            matches!(outcome, RecordOutcome::NeedsUsync),
+            "observational conflict must request a usync, not clobber"
+        );
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
+            Some(lid_live),
+            "the live mapping must survive an observational conflict"
+        );
+    }
+
+    /// A directed source (`PeerPnMessage`) does overwrite a conflicting known
+    /// LID — the WA Web `!y` branch.
+    #[tokio::test]
+    async fn test_record_directed_overwrites_conflicting_known_lid() {
+        let client = create_test_client().await;
+        let phone = "5511900000010";
+        let lid_old = "200000000000010";
+        let lid_new = "200000000000020";
+        client
+            .add_lid_pn_mapping(lid_old, phone, LearningSource::Usync)
+            .await
+            .unwrap();
+        client
+            .add_lid_pn_mapping(lid_new, "5511900000098", LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let outcome = client
+            .record_lid_pn_in_memory(lid_new, phone, LearningSource::PeerPnMessage)
+            .await;
+
+        assert!(matches!(
+            outcome,
+            RecordOutcome::Written { is_new: false, .. }
+        ));
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
+            Some(lid_new),
+            "a directed source must overwrite a conflicting known LID"
+        );
+    }
+
+    /// Even an observational source seeds a *brand-new* LID for an existing
+    /// phone (WA Web `c` is true), overwriting the prior mapping.
+    #[tokio::test]
+    async fn test_record_observational_seeds_new_lid_over_existing() {
+        let client = create_test_client().await;
+        let phone = "5511900000030";
+        let lid_old = "200000000000030";
+        let lid_brand_new = "200000000000031";
+        client
+            .add_lid_pn_mapping(lid_old, phone, LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let outcome = client
+            .record_lid_pn_in_memory(lid_brand_new, phone, LearningSource::Other)
+            .await;
+
+        assert!(matches!(outcome, RecordOutcome::Written { .. }));
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
+            Some(lid_brand_new),
+            "a brand-new LID is seeded even by an observational source"
+        );
+    }
+
+    /// An exact re-learn of a not-yet-durable pair re-affirms durability
+    /// (WA Web dirty-set flush analog) without a migration.
+    #[tokio::test]
+    async fn test_record_exact_match_heals_without_migration() {
+        let client = create_test_client().await;
+        let phone = "5511900000040";
+        let lid = "200000000000040";
+        // Cache-only seed (never persisted), so can_skip_relearn stays false.
+        let _ = client
+            .record_lid_pn_in_memory(lid, phone, LearningSource::Other)
+            .await;
+
+        let outcome = client
+            .record_lid_pn_in_memory(lid, phone, LearningSource::Other)
+            .await;
+
+        assert!(
+            matches!(outcome, RecordOutcome::Written { is_new: false, .. }),
+            "an exact re-learn re-affirms durability, no migration"
+        );
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
+            Some(lid)
+        );
+    }
+
+    /// A stale source (`MigrationSyncOld`) writes, but with `created_at = 0`,
+    /// so the cache's most-recent-wins keeps a fresher mapping for the phone.
+    #[tokio::test]
+    async fn test_stale_source_does_not_outrank_fresh_mapping() {
+        let client = create_test_client().await;
+        let phone = "5511900000050";
+        let lid_fresh = "200000000000050";
+        let lid_stale = "200000000000051";
+        client
+            .add_lid_pn_mapping(lid_fresh, phone, LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let outcome = client
+            .record_lid_pn_in_memory(lid_stale, phone, LearningSource::MigrationSyncOld)
+            .await;
+
+        assert!(matches!(outcome, RecordOutcome::Written { .. }));
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
+            Some(lid_fresh),
+            "a created_at=0 stale mapping must not outrank a fresh one"
+        );
+        // The reverse LID→phone direction is still recorded.
+        assert_eq!(
+            client
+                .lid_pn_cache
+                .get_phone_number(lid_stale)
+                .await
+                .as_deref(),
+            Some(phone)
+        );
+    }
+
+    /// A stale source still seeds into an empty cache (no fresher mapping to
+    /// lose to).
+    #[tokio::test]
+    async fn test_stale_source_seeds_empty_cache() {
+        let client = create_test_client().await;
+        let phone = "5511900000060";
+        let lid = "200000000000060";
+
+        let outcome = client
+            .record_lid_pn_in_memory(lid, phone, LearningSource::MigrationSyncOld)
+            .await;
+
+        assert!(matches!(
+            outcome,
+            RecordOutcome::Written { is_new: true, .. }
+        ));
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
+            Some(lid)
+        );
+    }
+
+    /// The batch recorder routes a conflicting observational pair to
+    /// `usync_phones` while still writing the non-conflicting new pair.
+    #[tokio::test]
+    async fn test_record_batch_splits_written_and_usync() {
+        let client = create_test_client().await;
+        let phone_conflict = "5511900000070";
+        let lid_live = "200000000000070";
+        let lid_known = "200000000000071";
+        let phone_fresh = "5511900000072";
+        let lid_fresh = "200000000000073";
+        client
+            .add_lid_pn_mapping(lid_live, phone_conflict, LearningSource::Usync)
+            .await
+            .unwrap();
+        client
+            .add_lid_pn_mapping(lid_known, "5511900000079", LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let outcome = client
+            .record_lid_pn_batch_in_memory(
+                vec![
+                    (lid_known.to_string(), phone_conflict.to_string()),
+                    (lid_fresh.to_string(), phone_fresh.to_string()),
+                ],
+                LearningSource::Other,
+            )
+            .await;
+
+        assert_eq!(outcome.usync_phones, vec![phone_conflict.to_string()]);
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(&*outcome.entries[0].phone_number, phone_fresh);
+        assert_eq!(
+            client
+                .lid_pn_cache
+                .get_current_lid(phone_conflict)
+                .await
+                .as_deref(),
+            Some(lid_live),
+            "the conflicting phone must keep its live LID"
+        );
+    }
+
+    /// End-to-end through the public batch learn: an `Other` (history-sync)
+    /// seed must not overwrite a live-learned LID for the same phone.
+    #[tokio::test]
+    async fn test_learn_batch_other_preserves_live_mapping() {
+        let client = create_test_client().await;
+        let phone = "5511900000080";
+        let lid_live = "200000000000080";
+        let lid_hist = "200000000000081";
+        client
+            .add_lid_pn_mapping(lid_live, phone, LearningSource::Usync)
+            .await
+            .unwrap();
+        client
+            .add_lid_pn_mapping(lid_hist, "5511900000089", LearningSource::Usync)
+            .await
+            .unwrap();
+
+        client
+            .learn_lid_pn_mappings_batch(
+                vec![(lid_hist.to_string(), phone.to_string())],
+                LearningSource::Other,
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
+            Some(lid_live),
+            "a history-sync seed must not clobber the live mapping"
+        );
     }
 
     #[tokio::test]
