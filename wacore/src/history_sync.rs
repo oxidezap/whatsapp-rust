@@ -39,6 +39,10 @@ pub struct HistorySyncResult {
     /// Tctoken candidates extracted from 1:1 conversations during streaming.
     pub tc_token_candidates: Vec<TcTokenCandidate>,
     pub msg_secret_records: Vec<HistoryMsgSecretRecord>,
+    /// PN↔LID pairs from `HistorySync.phoneNumberToLidMappings` (field 15) —
+    /// the bulk identity seed the server sends alongside the chats. Same
+    /// source whatsmeow harvests in `storeHistoricalPNLIDMappings`.
+    pub lid_mappings: Vec<HistoryLidMapping>,
     /// The original zlib-compressed input, handed back (moved, never copied or
     /// re-inflated) only when event listeners exist. Wrapped in
     /// `LazyHistorySync` for on-demand consumption.
@@ -277,6 +281,7 @@ fn process_history_sync_streaming(
         // holding only the secret-record subset (over-allocating, ~2.5% of
         // the decode).
         msg_secret_records: Vec::new(),
+        lid_mappings: Vec::new(),
         compressed_bytes: None,
         decompressed_size: 0,
     };
@@ -334,6 +339,12 @@ fn process_history_sync_streaming(
             }
             tags::history_sync::NCT_SALT if !value.is_empty() => {
                 result.nct_salt = Some(value.to_vec());
+            }
+            // phoneNumberToLidMappings (repeated)
+            tags::history_sync::PHONE_NUMBER_TO_LID_MAPPINGS => {
+                if let Some(mapping) = extract_lid_mapping(value) {
+                    result.lid_mappings.push(mapping);
+                }
             }
             _ => {}
         }
@@ -602,11 +613,77 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
     if id_match { pushname } else { None }
 }
 
+/// One PN↔LID pair from `HistorySync.phoneNumberToLidMappings`, reduced to
+/// bare user parts (no server, no device).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryLidMapping {
+    pub phone_number: String,
+    pub lid: String,
+}
+
+// Best-effort: a malformed mapping entry (optional metadata) must not abort
+// the sync, mirroring the pushname extractor above.
+fn extract_lid_mapping(data: &[u8]) -> Option<HistoryLidMapping> {
+    use wacore_binary::{Jid, Server};
+
+    let mut pn_raw: Option<&str> = None;
+    let mut lid_raw: Option<&str> = None;
+    let mut pos = 0;
+
+    while pos < data.len() {
+        let (tag, bytes_read) = read_varint(data.get(pos..)?)?;
+        pos += bytes_read;
+        let field_number = (tag >> 3) as u32;
+        let wt = (tag & 0x7) as u32;
+
+        match field_number {
+            tags::phone_number_to_lid_mapping::PN_JID if wt == wire_type::LENGTH_DELIMITED => {
+                let (len, vlen) = read_varint(data.get(pos..)?)?;
+                pos += vlen;
+                let len = usize::try_from(len).ok()?;
+                let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
+                pn_raw = smoothutf8::from_utf8(data.get(pos..end)?);
+                pos = end;
+            }
+            tags::phone_number_to_lid_mapping::LID_JID if wt == wire_type::LENGTH_DELIMITED => {
+                let (len, vlen) = read_varint(data.get(pos..)?)?;
+                pos += vlen;
+                let len = usize::try_from(len).ok()?;
+                let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
+                lid_raw = smoothutf8::from_utf8(data.get(pos..end)?);
+                pos = end;
+            }
+            _ => {
+                pos = skip_field(wt, data, pos).ok()?;
+            }
+        }
+    }
+
+    let pn: Jid = pn_raw?.parse().ok()?;
+    let lid: Jid = lid_raw?.parse().ok()?;
+    // Legacy `@c.us` is the PN namespace under its old name (whatsmeow maps it
+    // to `@s.whatsapp.net` the same way); the user part is the phone either way.
+    if !(pn.is_pn() || pn.server == Server::Legacy) || !lid.is_lid() {
+        return None;
+    }
+    if pn.user_base().is_empty() || lid.user_base().is_empty() {
+        return None;
+    }
+    Some(HistoryLidMapping {
+        phone_number: pn.user_base().to_string(),
+        lid: lid.user_base().to_string(),
+    })
+}
+
 // Schema pinning: assert that the tags::* constants used by fast_extract and
 // extract_conversation_fields match the generated proto field numbers. If
 // whatsapp.proto renumbers a field, compilation fails here instead of the
 // fast-path silently reading the wrong wire field.
 const _: () = {
+    assert!(tags::history_sync::PHONE_NUMBER_TO_LID_MAPPINGS == 15);
+    assert!(tags::phone_number_to_lid_mapping::PN_JID == 1);
+    assert!(tags::phone_number_to_lid_mapping::LID_JID == 2);
+
     assert!(tags::history_sync_msg::MESSAGE == 1);
 
     assert!(tags::web_message_info::KEY == 1);
@@ -1669,6 +1746,59 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&proto_bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    /// `phoneNumberToLidMappings` (field 15) is the bulk PN-LID identity seed;
+    /// valid pairs (including legacy `@c.us` phones and device-suffixed users)
+    /// are extracted, wrong namespaces and incomplete entries are skipped
+    /// without aborting the sync.
+    #[test]
+    fn test_lid_mappings_extracted_and_invalid_skipped() {
+        let mapping = |pn: &str, lid: &str| wa::PhoneNumberToLIDMapping {
+            pn_jid: Some(pn.to_string()),
+            lid_jid: Some(lid.to_string()),
+        };
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            phone_number_to_lid_mappings: vec![
+                mapping("5511777776666@s.whatsapp.net", "111222333444555@lid"),
+                // Legacy PN namespace, still a phone.
+                mapping("15550001111@c.us", "222333444555666@lid"),
+                // Device suffix reduces to the bare user.
+                mapping("5511222223333:2@s.whatsapp.net", "333444555666777@lid"),
+                // Wrong namespaces: skipped.
+                mapping("999888777666555@lid", "111222333444555@lid"),
+                mapping(
+                    "5511777776666@s.whatsapp.net",
+                    "5511777776666@s.whatsapp.net",
+                ),
+                // Incomplete: skipped.
+                wa::PhoneNumberToLIDMapping {
+                    pn_jid: Some("5511000000000@s.whatsapp.net".to_string()),
+                    lid_jid: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
+        assert_eq!(
+            result.lid_mappings,
+            vec![
+                HistoryLidMapping {
+                    phone_number: "5511777776666".to_string(),
+                    lid: "111222333444555".to_string(),
+                },
+                HistoryLidMapping {
+                    phone_number: "15550001111".to_string(),
+                    lid: "222333444555666".to_string(),
+                },
+                HistoryLidMapping {
+                    phone_number: "5511222223333".to_string(),
+                    lid: "333444555666777".to_string(),
+                },
+            ]
+        );
     }
 
     /// Prost-only oracle: what the pre-fast-path pipeline produced for one
@@ -2839,6 +2969,7 @@ mod tests {
             conversations_processed: 0,
             tc_token_candidates: Vec::new(),
             msg_secret_records: Vec::new(),
+            lid_mappings: Vec::new(),
             compressed_bytes: None,
             decompressed_size: decompressed.len(),
         };
