@@ -331,10 +331,9 @@ impl Client {
             ReceivedChatState::Idle => (ChatPresence::Paused, ChatPresenceMedia::Text),
         };
 
-        self.core
-            .event_bus
-            .dispatch(Event::ChatPresence(ChatPresenceUpdate {
-                source: MessageSource {
+        self.core.event_bus.dispatch(Event::ChatPresence(
+            ChatPresenceUpdate::builder()
+                .source(MessageSource {
                     chat,
                     sender,
                     is_from_me: false,
@@ -344,10 +343,11 @@ impl Client {
                     recipient_alt: None,
                     broadcast_list_owner: None,
                     recipient: None,
-                },
-                state,
-                media,
-            }));
+                })
+                .state(state)
+                .media(media)
+                .build(),
+        ));
 
         // Invoke legacy callback handlers
         let event = ChatStateEvent::from_stanza(stanza);

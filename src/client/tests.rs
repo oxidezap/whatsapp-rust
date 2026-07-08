@@ -235,7 +235,7 @@ async fn test_ack_dispatches_server_ack_event() {
             e.as_ref(),
             Event::ServerAck(ack)
                 if ack.id == "ack-evt-1"
-                    && ack.class == "message"
+                    && ack.class.as_deref() == Some("message")
                     && ack.from.as_ref().is_some_and(|j| j.to_string() == "123456789@s.whatsapp.net")
                     && ack.timestamp.is_some_and(|t| t.timestamp() == 1_720_000_000)
                     && ack.error.is_none()
@@ -243,7 +243,7 @@ async fn test_ack_dispatches_server_ack_event() {
         "server <ack> should dispatch Event::ServerAck with class/from/t"
     );
 
-    // Nack: the error code rides along; absent class/t stay empty/None.
+    // Nack: the error code rides along; absent class/t stay None.
     let nack_node = NodeBuilder::new("ack")
         .attr("id", "ack-evt-2")
         .attr("error", "479")
@@ -255,7 +255,7 @@ async fn test_ack_dispatches_server_ack_event() {
             e.as_ref(),
             Event::ServerAck(ack)
                 if ack.id == "ack-evt-2"
-                    && ack.class.is_empty()
+                    && ack.class.is_none()
                     && ack.timestamp.is_none()
                     && ack.error.as_deref() == Some("479")
         )),

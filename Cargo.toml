@@ -63,6 +63,7 @@ buffa-build = { version = "0.8.1", default-features = false }
 buffa-descriptor = { version = "0.8.1", default-features = false }
 bytemuck = { version = "1.25", default-features = false }
 bytes = { version = "1.12", default-features = false }
+bon = { version = "3.9.3", default-features = false, features = ["std"] }
 cbc = { version = "0.2", features = ["alloc"] }
 chrono = { version = "0.4", default-features = false }
 compact_str = { version = "0.9", default-features = false }

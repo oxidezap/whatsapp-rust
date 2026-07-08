@@ -56,14 +56,13 @@ impl StanzaHandler for PresenceHandler {
             from_jid.observe(), unavailable
         );
 
-        client
-            .core
-            .event_bus
-            .dispatch(Event::Presence(PresenceUpdate {
-                from: from_jid,
-                unavailable,
-                last_seen,
-            }));
+        client.core.event_bus.dispatch(Event::Presence(
+            PresenceUpdate::builder()
+                .from(from_jid)
+                .unavailable(unavailable)
+                .maybe_last_seen(last_seen)
+                .build(),
+        ));
 
         true
     }
