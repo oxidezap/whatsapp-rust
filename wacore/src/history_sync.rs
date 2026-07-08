@@ -340,7 +340,6 @@ fn process_history_sync_streaming(
             tags::history_sync::NCT_SALT if !value.is_empty() => {
                 result.nct_salt = Some(value.to_vec());
             }
-            // phoneNumberToLidMappings (repeated)
             tags::history_sync::PHONE_NUMBER_TO_LID_MAPPINGS => {
                 if let Some(mapping) = extract_lid_mapping(value) {
                     result.lid_mappings.push(mapping);
@@ -621,6 +620,17 @@ pub struct HistoryLidMapping {
     pub lid: String,
 }
 
+/// Read one length-delimited UTF-8 string field, advancing `pos` past it.
+fn read_str_field<'a>(data: &'a [u8], pos: &mut usize) -> Option<&'a str> {
+    let (len, vlen) = read_varint(data.get(*pos..)?)?;
+    *pos += vlen;
+    let len = usize::try_from(len).ok()?;
+    let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
+    let value = smoothutf8::from_utf8(data.get(*pos..end)?)?;
+    *pos = end;
+    Some(value)
+}
+
 // Best-effort: a malformed mapping entry (optional metadata) must not abort
 // the sync, mirroring the pushname extractor above.
 fn extract_lid_mapping(data: &[u8]) -> Option<HistoryLidMapping> {
@@ -638,20 +648,10 @@ fn extract_lid_mapping(data: &[u8]) -> Option<HistoryLidMapping> {
 
         match field_number {
             tags::phone_number_to_lid_mapping::PN_JID if wt == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(data.get(pos..)?)?;
-                pos += vlen;
-                let len = usize::try_from(len).ok()?;
-                let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
-                pn_raw = smoothutf8::from_utf8(data.get(pos..end)?);
-                pos = end;
+                pn_raw = Some(read_str_field(data, &mut pos)?);
             }
             tags::phone_number_to_lid_mapping::LID_JID if wt == wire_type::LENGTH_DELIMITED => {
-                let (len, vlen) = read_varint(data.get(pos..)?)?;
-                pos += vlen;
-                let len = usize::try_from(len).ok()?;
-                let end = pos.checked_add(len).filter(|&e| e <= data.len())?;
-                lid_raw = smoothutf8::from_utf8(data.get(pos..end)?);
-                pos = end;
+                lid_raw = Some(read_str_field(data, &mut pos)?);
             }
             _ => {
                 pos = skip_field(wt, data, pos).ok()?;
@@ -3018,6 +3018,17 @@ mod tests {
                     }
                     pos = end;
                 }
+                tags::history_sync::PHONE_NUMBER_TO_LID_MAPPINGS
+                    if wt == wire_type::LENGTH_DELIMITED =>
+                {
+                    let (len, vlen) = read_varint(&decompressed[pos..]).unwrap();
+                    pos += vlen;
+                    let end = checked_end(pos, len, decompressed.len()).unwrap();
+                    if let Some(mapping) = extract_lid_mapping(&decompressed[pos..end]) {
+                        result.lid_mappings.push(mapping);
+                    }
+                    pos = end;
+                }
                 _ => {
                     pos = skip_field(wt, decompressed, pos).unwrap();
                 }
@@ -3087,6 +3098,17 @@ mod tests {
                 pushname: Some("Me".into()),
             }],
             nct_salt: Some(vec![0x01, 0x02, 0x03, 0x04]),
+            phone_number_to_lid_mappings: vec![
+                wa::PhoneNumberToLIDMapping {
+                    pn_jid: Some("5511777776666@s.whatsapp.net".to_string()),
+                    lid_jid: Some("111222333444555@lid".to_string()),
+                },
+                // Wrong namespace: both walks must skip it identically.
+                wa::PhoneNumberToLIDMapping {
+                    pn_jid: Some("999888777666555@lid".to_string()),
+                    lid_jid: Some("111222333444555@lid".to_string()),
+                },
+            ],
             ..Default::default()
         }
     }
@@ -3133,6 +3155,15 @@ mod tests {
             );
             assert_eq!(result.msg_secret_records, reference.msg_secret_records);
             assert_eq!(result.msg_secret_records.len(), 1500 + 1);
+            assert_eq!(result.lid_mappings, reference.lid_mappings);
+            assert_eq!(
+                result.lid_mappings,
+                vec![HistoryLidMapping {
+                    phone_number: "5511777776666".to_string(),
+                    lid: "111222333444555".to_string(),
+                }],
+                "valid mapping extracted, wrong-namespace entry skipped"
+            );
         }
     }
 

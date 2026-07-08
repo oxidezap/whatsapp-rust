@@ -211,12 +211,8 @@ impl Client {
                 self.store_history_sync_msg_secrets(sync_result.msg_secret_records)
                     .await;
 
-                // PN-LID mappings the server ships with the history (field 15):
-                // the bulk identity seed. Same source whatsmeow harvests in
-                // storeHistoricalPNLIDMappings; without it a freshly paired
-                // client only learns peers' LID-PN pairs one by one from live
-                // traffic. Persist and migrations run detached, like the other
-                // batch learn paths.
+                // Bulk PN-LID identity seed from field 15; persist and migrations
+                // run detached, like the other batch learn paths.
                 if !sync_result.lid_mappings.is_empty() {
                     let pairs: Vec<(String, String)> = sync_result
                         .lid_mappings
