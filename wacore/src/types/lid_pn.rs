@@ -21,8 +21,9 @@ use std::sync::Arc;
 /// `createLidPnMappings` `switch (learningSource)`. Directed sources overwrite
 /// on any change; observational bulk sources (`Other` and friends, WA Web
 /// `"other"`) only seed new LIDs and re-resolve conflicts via a live query;
-/// known-stale sources are stamped `created_at = 0` so they never outrank
-/// fresh data.
+/// known-stale sources are stamped `created_at = 0` so they never outrank a
+/// fresher mapping for the same phone (the PN→LID resolution direction; the
+/// LID→PN reverse map always takes the latest write).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum LearningSource {
     /// Mapping learned from usync (device sync) query response

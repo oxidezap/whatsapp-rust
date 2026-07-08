@@ -404,14 +404,10 @@ impl Client {
             };
         }
 
-        // Not writing. The pair may already BE the cached mapping and just need
-        // re-warming: an exact forward (PN→LID) match, or — under a
-        // capacity-bounded cache, which WA Web's unbounded Maps never hit — a
-        // reverse-only (LID→PN) match whose forward side was evicted. Re-affirm
-        // both directions and durability without bumping the mapping or running
-        // a migration; the PN↔LID association is unchanged. This must precede
-        // the conflict branch so a half-evicted, self-consistent pair is not
-        // mistaken for an observational conflict and needlessly re-queried.
+        // Re-warm/re-affirm durability for a pair that is already the cached
+        // mapping (exact, or reverse-only after a bounded-cache PN eviction).
+        // Must precede the conflict branch so a half-evicted but self-consistent
+        // pair is not mistaken for an observational conflict and re-queried.
         let same_pair_forward_evicted =
             current_lid.is_none() && reverse_pn.as_deref() == Some(phone_number);
         if exact || same_pair_forward_evicted {
@@ -1090,15 +1086,15 @@ mod tests {
     fn test_is_stale_source() {
         assert!(is_stale_source(LearningSource::MigrationSyncOld));
         assert!(is_stale_source(LearningSource::BlocklistInactive));
-        for src in [
-            LearningSource::Usync,
-            LearningSource::PeerPnMessage,
-            LearningSource::MigrationSyncLatest,
-            LearningSource::BlocklistActive,
-            LearningSource::Other,
-            LearningSource::Pairing,
-            LearningSource::DeviceNotification,
-        ] {
+        // Every other source (iterated from the full set, so a new variant is
+        // covered automatically) must be non-stale.
+        for src in ALL_SOURCES {
+            if matches!(
+                src,
+                LearningSource::MigrationSyncOld | LearningSource::BlocklistInactive
+            ) {
+                continue;
+            }
             assert!(!is_stale_source(src), "{src:?} is not stale");
         }
     }
