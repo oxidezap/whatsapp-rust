@@ -1086,8 +1086,8 @@ mod tests {
     fn test_is_stale_source() {
         assert!(is_stale_source(LearningSource::MigrationSyncOld));
         assert!(is_stale_source(LearningSource::BlocklistInactive));
-        // Every other source (iterated from the full set, so a new variant is
-        // covered automatically) must be non-stale.
+        // Every other source must be non-stale. Iterates ALL_SOURCES, which
+        // `all_sources_is_exhaustive` keeps in step with the enum.
         for src in ALL_SOURCES {
             if matches!(
                 src,
@@ -1097,6 +1097,35 @@ mod tests {
             }
             assert!(!is_stale_source(src), "{src:?} is not stale");
         }
+    }
+
+    /// Keeps `ALL_SOURCES` (a hand-written array the policy tests iterate) in
+    /// sync with the enum: the wildcard-free match below fails to compile when
+    /// a `LearningSource` variant is added, and its arm count is asserted equal
+    /// to `ALL_SOURCES.len()`, so a new variant must be appended to both.
+    #[test]
+    fn all_sources_is_exhaustive() {
+        fn arm_count(s: LearningSource) -> usize {
+            // Wildcard-free on purpose — a new variant breaks compilation here.
+            match s {
+                LearningSource::Usync
+                | LearningSource::PeerPnMessage
+                | LearningSource::PeerLidMessage
+                | LearningSource::RecipientLatestLid
+                | LearningSource::MigrationSyncLatest
+                | LearningSource::MigrationSyncOld
+                | LearningSource::BlocklistActive
+                | LearningSource::BlocklistInactive
+                | LearningSource::Pairing
+                | LearningSource::DeviceNotification
+                | LearningSource::Other => 11,
+            }
+        }
+        assert_eq!(
+            ALL_SOURCES.len(),
+            arm_count(LearningSource::Other),
+            "add the new LearningSource variant to ALL_SOURCES (and the match above)"
+        );
     }
 
     /// An observational source (`Other`, e.g. the history-sync seed) must not
