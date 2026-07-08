@@ -4,15 +4,20 @@ use e2e_tests::{TestClient, send_and_expect_text};
 use log::info;
 use wacore::libsignal::protocol::SessionRecord;
 
-/// Scan backend for sessions matching a user across device IDs 0..=5.
+/// Scan backend for sessions matching a user across device IDs 0..=99.
 /// Returns Vec<(address, has_pending_pre_key)> for all found sessions.
+///
+/// The range must cover the peer's real companion device (a paired client is a
+/// non-zero device, e.g. 33), not just low ids — otherwise the only session found
+/// is the phantom device-0 one, whose pending_pre_key never clears (device 0 never
+/// completes the X3DH handshake).
 async fn scan_sessions(
     backend: &dyn wacore::store::traits::SignalStore,
     user: &str,
     server: &str,
 ) -> anyhow::Result<Vec<(String, bool)>> {
     let mut results = Vec::new();
-    for device_id in 0..=5u16 {
+    for device_id in 0..=99u16 {
         let addr = if device_id == 0 {
             format!("{user}@{server}.0")
         } else {
@@ -169,15 +174,16 @@ async fn test_session_state_after_roundtrip() -> anyhow::Result<()> {
         "Should have at least one session for B in A's store"
     );
 
-    // If LID sessions exist (expected with modern mock server), verify the primary
-    // device's session has pending_pre_key cleared after roundtrip.
+    // If LID sessions exist (expected with modern mock server), the active session
+    // used for messaging must have pending_pre_key cleared after the roundtrip. B is
+    // a companion, so its session is device-suffixed (`<lid>:33@lid.0`) — there is no
+    // bare device-0 "primary" session to key on; assert that at least one of B's LID
+    // sessions is fully established.
     if !lid_sessions.is_empty() {
-        let primary_cleared = lid_sessions
-            .iter()
-            .any(|(addr, pending)| !addr.contains(':') && !pending);
+        let established = lid_sessions.iter().any(|(_, pending)| !pending);
         assert!(
-            primary_cleared,
-            "Primary LID session should have pending_pre_key cleared after roundtrip. \
+            established,
+            "At least one LID session should have pending_pre_key cleared after roundtrip. \
              LID sessions: {lid_sessions:?}"
         );
     }
@@ -386,9 +392,18 @@ async fn test_message_info_fields() -> anyhow::Result<()> {
             "B should see A's message as not from_me"
         );
         assert!(!info.source.is_group, "DM should not be marked as group");
-        assert_eq!(
-            info.source.sender.user, jid_a.user,
-            "Sender user should match A's JID user"
+        // A 1:1 message is LID-addressed on the wire (compliant), so B sees A's LID
+        // as the sender (with the PN carried in sender_pn). Accept either identity.
+        let sender_user = info.source.sender.user.as_str();
+        let a_lid = client_a.client.get_lid();
+        assert!(
+            sender_user == jid_a.user.as_str()
+                || a_lid
+                    .as_ref()
+                    .is_some_and(|l| l.user.as_str() == sender_user),
+            "Sender should be A (PN {} or LID {:?}), got {sender_user}",
+            jid_a.user,
+            a_lid.as_ref().map(|l| l.user.as_str()),
         );
         info!(
             "MessageInfo verified: id={}, sender={}, timestamp={}, from_me={}, is_group={}",
@@ -416,7 +431,18 @@ async fn test_message_info_fields() -> anyhow::Result<()> {
         let info = &m.info;
         assert!(!info.source.is_from_me);
         assert!(!info.source.is_group);
-        assert_eq!(info.source.sender.user, jid_b.user);
+        // LID-addressed 1:1 → A sees B's LID as the sender; accept PN or LID.
+        let sender_user = info.source.sender.user.as_str();
+        let b_lid = client_b.client.get_lid();
+        assert!(
+            sender_user == jid_b.user.as_str()
+                || b_lid
+                    .as_ref()
+                    .is_some_and(|l| l.user.as_str() == sender_user),
+            "Sender should be B (PN {} or LID {:?}), got {sender_user}",
+            jid_b.user,
+            b_lid.as_ref().map(|l| l.user.as_str()),
+        );
         info!("Reverse direction MessageInfo verified");
     }
 

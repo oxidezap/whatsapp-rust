@@ -415,9 +415,13 @@ async fn test_only_nct_send_ab_without_salt_still_receives_463() -> anyhow::Resu
         .await
         .map_err(|_| anyhow::anyhow!("Timed out waiting for sent message node"))?
         .map_err(|_| anyhow::anyhow!("sent message waiter was canceled"))?;
+    // A 1:1 `to` carries the recipient's BARE LID (device-stripped); the device is
+    // addressed per-recipient in the enc fan-out, never on `to`. `get_lid()` returns
+    // the account's own device-suffixed LID (e.g. `:33`, matching the real WA
+    // `<success lid="…:33@lid">`), so compare against the non-AD form.
     assert_eq!(
         sent.attrs.get("to").map(|v| v.to_string()),
-        Some(jid_a_lid.to_string())
+        Some(jid_a_lid.to_non_ad_string())
     );
     assert!(!has_child(&sent, "tctoken"));
     assert!(!has_child(&sent, "cstoken"));
@@ -474,9 +478,13 @@ async fn test_send_and_syncd_ab_without_delivery_still_receives_463() -> anyhow:
         .await
         .map_err(|_| anyhow::anyhow!("Timed out waiting for sent message node"))?
         .map_err(|_| anyhow::anyhow!("sent message waiter was canceled"))?;
+    // A 1:1 `to` carries the recipient's BARE LID (device-stripped); the device is
+    // addressed per-recipient in the enc fan-out, never on `to`. `get_lid()` returns
+    // the account's own device-suffixed LID (e.g. `:33`, matching the real WA
+    // `<success lid="…:33@lid">`), so compare against the non-AD form.
     assert_eq!(
         sent.attrs.get("to").map(|v| v.to_string()),
-        Some(jid_a_lid.to_string())
+        Some(jid_a_lid.to_non_ad_string())
     );
     assert!(!has_child(&sent, "tctoken"));
     assert!(!has_child(&sent, "cstoken"));

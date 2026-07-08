@@ -548,6 +548,9 @@ impl SessionState {
             pre_key_id: pre_key_id.map(PreKeyId::into),
             signed_pre_key_id: Some(signed_ec_pre_key_id as i32),
             base_key: Some(base_key.serialize().to_vec()),
+            // Post-quantum (Kyber) prekeys are not implemented; classic X3DH only.
+            kyber_pre_key_id: None,
+            kyber_ciphertext: None,
         };
         self.session.pending_pre_key = MessageField::some(pending);
     }
