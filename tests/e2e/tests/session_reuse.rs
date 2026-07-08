@@ -4,15 +4,20 @@ use e2e_tests::{TestClient, send_and_expect_text};
 use log::info;
 use wacore::libsignal::protocol::SessionRecord;
 
-/// Scan backend for sessions matching a user across device IDs 0..=5.
+/// Scan backend for sessions matching a user across device IDs 0..=99.
 /// Returns Vec<(address, has_pending_pre_key)> for all found sessions.
+///
+/// The range must cover the peer's real companion device (a paired client is a
+/// non-zero device, e.g. 33), not just low ids — otherwise the only session found
+/// is the phantom device-0 one, whose pending_pre_key never clears (device 0 never
+/// completes the X3DH handshake).
 async fn scan_sessions(
     backend: &dyn wacore::store::traits::SignalStore,
     user: &str,
     server: &str,
 ) -> anyhow::Result<Vec<(String, bool)>> {
     let mut results = Vec::new();
-    for device_id in 0..=5u16 {
+    for device_id in 0..=99u16 {
         let addr = if device_id == 0 {
             format!("{user}@{server}.0")
         } else {
