@@ -284,7 +284,7 @@ fn apply_writer_msg(
             timestamp_ms,
         } => {
             let chat_str = chat.to_string();
-            let _ = insert_message(
+            let stored = insert_message(
                 conn,
                 device_id,
                 NewMessage {
@@ -301,16 +301,18 @@ fn apply_writer_msg(
                     overwrite: true,
                 },
             )?;
-            bump_chat(
-                conn,
-                device_id,
-                &chat_str,
-                *timestamp_ms,
-                text.as_deref(),
-                Some(kind),
-                0,
-            )?;
-            cs.chats = true;
+            if stored != StoredRow::Skipped {
+                bump_chat(
+                    conn,
+                    device_id,
+                    &chat_str,
+                    *timestamp_ms,
+                    text.as_deref(),
+                    Some(kind),
+                    0,
+                )?;
+                cs.chats = true;
+            }
             cs.message_chats.insert(chat_str);
             Ok(())
         }
@@ -353,16 +355,20 @@ fn apply_event(
                     overwrite: false,
                 },
             )?;
-            bump_chat(
-                conn,
-                device_id,
-                &chat,
-                undec.info.timestamp.timestamp_millis(),
-                None,
-                Some(KIND_UNDECRYPTABLE),
-                i32::from(inserted && !undec.info.source.is_from_me),
-            )?;
-            cs.chats = true;
+            // A duplicate placeholder (or one for an id that was already
+            // recovered/revoked) must neither recount nor blank the preview.
+            if inserted == StoredRow::Inserted {
+                bump_chat(
+                    conn,
+                    device_id,
+                    &chat,
+                    undec.info.timestamp.timestamp_millis(),
+                    None,
+                    Some(KIND_UNDECRYPTABLE),
+                    i32::from(!undec.info.source.is_from_me),
+                )?;
+                cs.chats = true;
+            }
             cs.message_chats.insert(chat);
             Ok(())
         }
@@ -541,18 +547,23 @@ fn apply_inbound(
                 },
             )?;
             // A refreshed row (redelivery, PDO recovery of a placeholder that
-            // already counted) must not inflate the unread badge again.
-            let unread_delta = i32::from(inserted && !info.source.is_from_me);
-            bump_chat(
-                conn,
-                device_id,
-                &chat,
-                ts_ms,
-                text.as_deref(),
-                Some(kind),
-                unread_delta,
-            )?;
-            cs.chats = true;
+            // already counted) must not inflate the unread badge again — and a
+            // skipped one (revoked tombstone) must not surface its content in
+            // the chat preview at all.
+            let unread_delta =
+                i32::from(inserted == StoredRow::Inserted && !info.source.is_from_me);
+            if inserted != StoredRow::Skipped {
+                bump_chat(
+                    conn,
+                    device_id,
+                    &chat,
+                    ts_ms,
+                    text.as_deref(),
+                    Some(kind),
+                    unread_delta,
+                )?;
+                cs.chats = true;
+            }
             cs.message_chats.insert(chat);
         }
         MessageOp::Reaction { target_id, emoji } => {
@@ -607,6 +618,8 @@ fn apply_edit(
     use schema::messages::dsl;
     let updated = diesel::update(
         message_row(device_id, chat, target_id)
+            // A tombstone absorbs edits too: revoked content must not resurface.
+            .filter(dsl::revoked.eq(false))
             .filter(dsl::edited_at_ms.is_null().or(dsl::edited_at_ms.le(ts_ms))),
     )
     .set((
@@ -662,6 +675,8 @@ fn apply_revoke(
 
 /// When `msg_id` is the chat's most recent message, replace the denormalized
 /// chat-list preview (an edit/revoke of an older message leaves it alone).
+/// "Most recent" uses the same total order as `messages()` — `(timestamp_ms,
+/// msg_id)` — so a same-millisecond sibling can't hijack the preview.
 fn refresh_preview_if_latest(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -671,21 +686,22 @@ fn refresh_preview_if_latest(
     kind: Option<&str>,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
-    let ts: Option<i64> = message_row(device_id, chat, msg_id)
-        .select(dsl::timestamp_ms)
+    let newest: Option<String> = dsl::messages
+        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
+        .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
+        .select(dsl::msg_id)
         .first(conn)
         .optional()?;
-    let Some(ts) = ts else {
+    if newest.as_deref() != Some(msg_id) {
         return Ok(false);
-    };
-    let updated =
-        diesel::update(chat_row(device_id, chat).filter(schema::chats::last_message_ts.le(ts)))
-            .set((
-                schema::chats::last_message_preview.eq(preview),
-                schema::chats::last_message_kind.eq(kind),
-            ))
-            .execute(conn)?;
-    Ok(updated > 0)
+    }
+    diesel::update(chat_row(device_id, chat))
+        .set((
+            schema::chats::last_message_preview.eq(preview),
+            schema::chats::last_message_kind.eq(kind),
+        ))
+        .execute(conn)?;
+    Ok(true)
 }
 
 /// Re-derive the chat-list preview from the newest remaining message (used
@@ -726,13 +742,16 @@ fn apply_reaction(
 ) -> QueryResult<()> {
     use schema::reactions::dsl;
     if emoji.is_empty() {
+        // Same monotonic rule as the add path: a stale remove (older than the
+        // stored reaction) must not delete a newer live one.
         diesel::delete(
             dsl::reactions.filter(
                 dsl::device_id
                     .eq(device_id)
                     .and(dsl::chat_jid.eq(chat))
                     .and(dsl::msg_id.eq(target_id))
-                    .and(dsl::sender_jid.eq(sender)),
+                    .and(dsl::sender_jid.eq(sender))
+                    .and(dsl::ts_ms.le(ts_ms)),
             ),
         )
         .execute(conn)?;
@@ -1098,14 +1117,26 @@ struct NewMessage<'a> {
     overwrite: bool,
 }
 
-/// Returns whether a NEW row was inserted (`false` = the id already existed;
-/// with `overwrite` its content was refreshed in place). A refresh never
-/// touches `revoked`: a tombstone outranks any stale redelivery.
+/// What actually happened to the row, so callers can gate side effects
+/// (unread counting, chat-preview bumps) on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredRow {
+    /// A new row was inserted.
+    Inserted,
+    /// The id existed; its content was refreshed in place (`overwrite`).
+    Refreshed,
+    /// The id existed and was left untouched (history duplicate, or a revoked
+    /// tombstone that a redelivery must not resurrect or re-surface).
+    Skipped,
+}
+
+/// A refresh never touches `revoked`: a tombstone outranks any stale
+/// redelivery — such a write reports [`StoredRow::Skipped`].
 fn insert_message(
     conn: &mut SqliteConnection,
     device_id: i32,
     new: NewMessage<'_>,
-) -> QueryResult<bool> {
+) -> QueryResult<StoredRow> {
     use schema::messages::dsl;
     let values = (
         dsl::device_id.eq(device_id),
@@ -1125,8 +1156,11 @@ fn insert_message(
         .on_conflict_do_nothing()
         .execute(conn)?
         > 0;
-    if !inserted && new.overwrite {
-        diesel::update(
+    if inserted {
+        return Ok(StoredRow::Inserted);
+    }
+    if new.overwrite {
+        let refreshed = diesel::update(
             message_row(device_id, new.chat_jid, new.msg_id).filter(dsl::revoked.eq(false)),
         )
         .set((
@@ -1135,8 +1169,11 @@ fn insert_message(
             dsl::proto.eq(new.proto),
         ))
         .execute(conn)?;
+        if refreshed > 0 {
+            return Ok(StoredRow::Refreshed);
+        }
     }
-    Ok(inserted)
+    Ok(StoredRow::Skipped)
 }
 
 /// Refresh a chat's activity row for a message at `ts_ms`: creates the row if

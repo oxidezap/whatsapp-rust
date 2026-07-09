@@ -778,6 +778,126 @@ async fn revoke_before_content_is_not_resurrected() {
     let still_revoked = chat_store.message(&chat, "MSG-RB").await.unwrap().unwrap();
     assert!(still_revoked.revoked);
     assert!(still_revoked.text.is_none());
+    // ...and the skipped redelivery must not surface its content in the
+    // chat-list preview either.
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert!(
+        chats
+            .iter()
+            .all(|c| c.last_message_preview.as_deref() != Some("too late"))
+    );
+}
+
+#[tokio::test]
+async fn edit_of_revoked_message_is_a_no_op() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("original"),
+            incoming_info(PEER, PEER, "MSG-ER", 1_700_000_000),
+        )],
+    )
+    .await;
+    let revoke = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-ER".into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::REVOKE),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            revoke,
+            incoming_info(PEER, PEER, "MSG-ER2", 1_700_000_010),
+        )],
+    )
+    .await;
+
+    // An edit targeting the tombstone must not resurrect content.
+    let edit = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-ER".into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+            edited_message: MessageField::from_box(Box::new(wa::Message::text("resurrected"))),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            edit,
+            incoming_info(PEER, PEER, "MSG-ER3", 1_700_000_020),
+        )],
+    )
+    .await;
+    let msg = chat_store.message(&chat, "MSG-ER").await.unwrap().unwrap();
+    assert!(msg.revoked);
+    assert!(msg.text.is_none());
+    assert!(msg.message.is_none());
+}
+
+#[tokio::test]
+async fn same_millisecond_sibling_does_not_hijack_preview() {
+    let (_store, chat_store) = test_store().await;
+
+    // Two messages in the same millisecond; (timestamp, msg_id) ordering makes
+    // MSG-Z2 the latest.
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("first"),
+                incoming_info(PEER, PEER, "MSG-A1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("second"),
+                incoming_info(PEER, PEER, "MSG-Z2", 1_700_000_000),
+            ),
+        ],
+    )
+    .await;
+
+    // Editing the OLDER same-millisecond sibling must not steal the preview.
+    let edit = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-A1".into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+            edited_message: MessageField::from_box(Box::new(wa::Message::text("hijacked"))),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            edit,
+            incoming_info(PEER, PEER, "MSG-E1", 1_700_000_100),
+        )],
+    )
+    .await;
+    let msg = chat_store
+        .message(&jid(PEER), "MSG-A1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.text.as_deref(), Some("hijacked"));
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("second"));
 }
 
 #[tokio::test]
@@ -960,6 +1080,21 @@ async fn stale_reaction_timestamp_does_not_replace_newer() {
     let reactions = chat_store.reactions(&chat, "MSG-RT").await.unwrap();
     assert_eq!(reactions.len(), 1);
     assert_eq!(reactions[0].emoji, "👍");
+
+    // Neither must a stale REMOVE delete it...
+    feed(&chat_store, [react("", "R3", 1_700_000_150)]).await;
+    let reactions = chat_store.reactions(&chat, "MSG-RT").await.unwrap();
+    assert_eq!(reactions.len(), 1);
+
+    // ...while a newer remove still works.
+    feed(&chat_store, [react("", "R4", 1_700_000_300)]).await;
+    assert!(
+        chat_store
+            .reactions(&chat, "MSG-RT")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
