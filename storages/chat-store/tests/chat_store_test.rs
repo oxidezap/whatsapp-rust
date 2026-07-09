@@ -1528,3 +1528,143 @@ async fn same_millisecond_insert_order_does_not_hijack_preview() {
         Some("newest by id")
     );
 }
+
+#[tokio::test]
+async fn range_boundary_covers_the_whole_wire_second() {
+    let (_store, chat_store) = test_store().await;
+
+    // 500 ms into the boundary second: the wire range (whole seconds) covers
+    // it, so a mark-read up to that second must clear it.
+    let mut info = incoming_info(PEER, PEER, "MSG-SUB", 1_700_000_000);
+    info.timestamp = Utc.timestamp_opt(1_700_000_000, 500_000_000).unwrap();
+    feed(
+        &chat_store,
+        [message_event(wa::Message::text("sub-second"), info)],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+
+    feed(
+        &chat_store,
+        [Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(Utc.timestamp_opt(1_700_000_001, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    message_range: range_up_to(1_700_000_000),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn keyed_range_spares_unlisted_same_second_siblings() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    // Two messages inside the SAME wire second.
+    for (id, text) in [("MSG-IN", "covered"), ("MSG-OUT", "not in the range")] {
+        feed(
+            &chat_store,
+            [message_event(
+                wa::Message::text(text),
+                incoming_info(PEER, PEER, id, 1_700_000_000),
+            )],
+        )
+        .await;
+    }
+
+    // The action enumerates only MSG-IN at the boundary.
+    let range = buffa::MessageField::some(wa::sync_action_value::SyncActionMessageRange {
+        last_message_timestamp: Some(1_700_000_000),
+        messages: vec![wa::sync_action_value::SyncActionMessage {
+            key: buffa::MessageField::some(wa::MessageKey {
+                id: Some("MSG-IN".into()),
+                remote_jid: Some(PEER.into()),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000),
+        }],
+        ..Default::default()
+    });
+    feed(
+        &chat_store,
+        [Event::ClearChatUpdate(
+            wacore::types::events::ClearChatUpdate::builder()
+                .jid(chat.clone())
+                .delete_starred(true)
+                .delete_media(false)
+                .timestamp(Utc.timestamp_opt(1_700_000_001, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::ClearChatAction {
+                    message_range: range,
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+
+    // Only the enumerated sibling went away; the other survives, still unread.
+    assert!(chat_store.message(&chat, "MSG-IN").await.unwrap().is_none());
+    assert!(
+        chat_store
+            .message(&chat, "MSG-OUT")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].unread_count, 1);
+    assert_eq!(
+        chats[0].last_message_preview.as_deref(),
+        Some("not in the range")
+    );
+}
+
+#[tokio::test]
+async fn ranged_clear_keeps_unread_survivors_counted() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("cleared"),
+                incoming_info(PEER, PEER, "MSG-CL", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("unread survivor"),
+                incoming_info(PEER, PEER, "MSG-UN", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 2);
+
+    feed(
+        &chat_store,
+        [Event::ClearChatUpdate(
+            wacore::types::events::ClearChatUpdate::builder()
+                .jid(chat.clone())
+                .delete_starred(true)
+                .delete_media(false)
+                .timestamp(Utc.timestamp_opt(1_700_000_050, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::ClearChatAction {
+                    message_range: range_up_to(1_700_000_000),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+
+    // The survivor is still there AND still counted as unread.
+    assert!(chat_store.message(&chat, "MSG-UN").await.unwrap().is_some());
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}

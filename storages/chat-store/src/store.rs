@@ -190,16 +190,70 @@ impl ChatStore {
     }
 }
 
-/// Upper bound (in ms) of a sync action's message range. The wire value is
-/// unix SECONDS (same clock as conversation timestamps). `None` = unbounded.
-fn range_bound_ms(
+/// A sync action's message range. The wire boundary is unix SECONDS while
+/// rows store milliseconds, so the boundary covers its WHOLE second; when the
+/// action lists explicit boundary messages (WA Web fills `messages` exactly to
+/// disambiguate same-second siblings), only the listed ids inside the boundary
+/// second count as covered.
+struct RangeBound {
+    /// First ms of the boundary second.
+    second_start_ms: i64,
+    /// Last ms of the boundary second.
+    second_end_ms: i64,
+    /// Ids the action explicitly covers at the boundary; `None` = the whole
+    /// boundary second is covered (sender did not enumerate).
+    keys: Option<Vec<String>>,
+}
+
+fn range_bound(
     range: &buffa::MessageField<wa::sync_action_value::SyncActionMessageRange>,
-) -> Option<i64> {
-    range
-        .as_option()
-        .and_then(|r| r.last_message_timestamp)
-        .filter(|&ts| ts > 0)
-        .map(|ts| ts.saturating_mul(1000))
+) -> Option<RangeBound> {
+    let range = range.as_option()?;
+    let ts_secs = range.last_message_timestamp.filter(|&ts| ts > 0)?;
+    let second_start_ms = ts_secs.saturating_mul(1000);
+    let keys: Vec<String> = range
+        .messages
+        .iter()
+        .filter_map(|m| m.key.as_option().and_then(|k| k.id.clone()))
+        .collect();
+    Some(RangeBound {
+        second_start_ms,
+        second_end_ms: second_start_ms.saturating_add(999),
+        keys: (!keys.is_empty()).then_some(keys),
+    })
+}
+
+/// Incoming rows NOT covered by `bound`: strictly newer than the boundary
+/// second, plus same-second rows the action's keyed list does not name.
+fn count_uncovered_incoming(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    bound: &RangeBound,
+) -> QueryResult<i32> {
+    use schema::messages::dsl;
+    let base = dsl::messages.filter(
+        dsl::device_id
+            .eq(device_id)
+            .and(dsl::chat_jid.eq(chat))
+            .and(dsl::from_me.eq(false)),
+    );
+    let uncovered: i64 = match &bound.keys {
+        None => base
+            .filter(dsl::timestamp_ms.gt(bound.second_end_ms))
+            .count()
+            .get_result(conn)?,
+        Some(keys) => base
+            .filter(dsl::timestamp_ms.gt(bound.second_start_ms - 1))
+            .filter(
+                dsl::timestamp_ms
+                    .gt(bound.second_end_ms)
+                    .or(dsl::msg_id.ne_all(keys)),
+            )
+            .count()
+            .get_result(conn)?,
+    };
+    Ok(uncovered.min(i32::MAX as i64) as i32)
 }
 
 /// Chats/contacts touched by a batch, accumulated for post-commit invalidation.
@@ -469,23 +523,10 @@ fn apply_event(
         Event::MarkChatAsReadUpdate(update) => {
             let chat = update.jid.to_string();
             let unread = if update.action.read.unwrap_or(false) {
-                // A delayed replay only covers messages up to its range end;
-                // anything we materialized after it is still unread.
-                match range_bound_ms(&update.action.message_range) {
-                    Some(bound_ms) => {
-                        use schema::messages::dsl;
-                        let newer: i64 = dsl::messages
-                            .filter(
-                                dsl::device_id
-                                    .eq(device_id)
-                                    .and(dsl::chat_jid.eq(&chat))
-                                    .and(dsl::from_me.eq(false))
-                                    .and(dsl::timestamp_ms.gt(bound_ms)),
-                            )
-                            .count()
-                            .get_result(conn)?;
-                        newer.min(i32::MAX as i64) as i32
-                    }
+                // A delayed replay only covers messages up to its range;
+                // anything we materialized past it is still unread.
+                match range_bound(&update.action.message_range) {
+                    Some(bound) => count_uncovered_incoming(conn, device_id, &chat, &bound)?,
                     None => 0,
                 }
             } else {
@@ -508,16 +549,23 @@ fn apply_event(
         }
         Event::DeleteChatUpdate(update) => {
             let chat = update.jid.to_string();
-            let bound_ms = range_bound_ms(&update.action.message_range);
-            delete_chat_rows(conn, device_id, &chat, true, bound_ms)?;
-            // A delayed delete only covers up to its range end: when newer
+            let bound = range_bound(&update.action.message_range);
+            delete_chat_rows(conn, device_id, &chat, true, bound.as_ref())?;
+            // A delayed delete only covers up to its range: when newer
             // messages were already materialized locally, the chat survives
             // with them instead of vanishing.
             let survivors = remaining_messages(conn, device_id, &chat)?;
-            if bound_ms.is_some() && survivors > 0 {
-                recompute_chat_preview(conn, device_id, &chat)?;
-            } else {
-                diesel::delete(chat_row(device_id, &chat)).execute(conn)?;
+            match &bound {
+                Some(bound) if survivors > 0 => {
+                    recompute_chat_preview(conn, device_id, &chat)?;
+                    let unread = count_uncovered_incoming(conn, device_id, &chat, bound)?;
+                    diesel::update(chat_row(device_id, &chat))
+                        .set(schema::chats::unread_count.eq(unread))
+                        .execute(conn)?;
+                }
+                _ => {
+                    diesel::delete(chat_row(device_id, &chat)).execute(conn)?;
+                }
             }
             cs.chats = true;
             cs.message_chats.insert(chat);
@@ -525,14 +573,26 @@ fn apply_event(
         }
         Event::ClearChatUpdate(update) => {
             let chat = update.jid.to_string();
-            let bound_ms = range_bound_ms(&update.action.message_range);
-            delete_chat_rows(conn, device_id, &chat, update.delete_starred, bound_ms)?;
+            let bound = range_bound(&update.action.message_range);
+            delete_chat_rows(
+                conn,
+                device_id,
+                &chat,
+                update.delete_starred,
+                bound.as_ref(),
+            )?;
             // Starred rows (and messages newer than the range) may survive the
             // clear: the preview/kind must reflect the newest survivor, not go
             // blank (or keep stale kind).
             recompute_chat_preview(conn, device_id, &chat)?;
+            // Unread survivors past a ranged clear keep their badge; an
+            // unranged clear empties the chat, so zero is exact there.
+            let unread = match &bound {
+                Some(bound) => count_uncovered_incoming(conn, device_id, &chat, bound)?,
+                None => 0,
+            };
             diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::unread_count.eq(0))
+                .set(schema::chats::unread_count.eq(unread))
                 .execute(conn)?;
             cs.chats = true;
             cs.message_chats.insert(chat);
@@ -1365,21 +1425,56 @@ fn delete_chat_rows(
     device_id: i32,
     chat: &str,
     delete_starred: bool,
-    up_to_ts_ms: Option<i64>,
+    bound: Option<&RangeBound>,
 ) -> QueryResult<()> {
     use schema::messages::dsl as m;
-    let mut query =
-        diesel::delete(m::messages.filter(m::device_id.eq(device_id).and(m::chat_jid.eq(chat))))
-            .into_boxed();
-    if !delete_starred {
-        query = query.filter(m::starred.eq(false));
-    }
     // A ranged action only covers messages up to its boundary; rows we
-    // materialized after it (live/offline traffic) survive.
-    if let Some(bound_ms) = up_to_ts_ms {
-        query = query.filter(m::timestamp_ms.le(bound_ms));
+    // materialized after it (live/offline traffic) survive. With a keyed
+    // boundary, same-second siblings the action does not name survive too.
+    match bound {
+        None => {
+            let mut query = diesel::delete(
+                m::messages.filter(m::device_id.eq(device_id).and(m::chat_jid.eq(chat))),
+            )
+            .into_boxed();
+            if !delete_starred {
+                query = query.filter(m::starred.eq(false));
+            }
+            query.execute(conn)?;
+        }
+        Some(bound) => {
+            let mut query = diesel::delete(
+                m::messages.filter(m::device_id.eq(device_id).and(m::chat_jid.eq(chat))),
+            )
+            .into_boxed();
+            if !delete_starred {
+                query = query.filter(m::starred.eq(false));
+            }
+            match &bound.keys {
+                None => {
+                    query = query.filter(m::timestamp_ms.le(bound.second_end_ms));
+                    query.execute(conn)?;
+                }
+                Some(keys) => {
+                    // Everything strictly before the boundary second...
+                    query = query.filter(m::timestamp_ms.lt(bound.second_start_ms));
+                    query.execute(conn)?;
+                    // ...plus the boundary rows the action names explicitly.
+                    let mut keyed = diesel::delete(
+                        m::messages.filter(m::device_id.eq(device_id).and(m::chat_jid.eq(chat))),
+                    )
+                    .into_boxed();
+                    if !delete_starred {
+                        keyed = keyed.filter(m::starred.eq(false));
+                    }
+                    keyed
+                        .filter(m::timestamp_ms.le(bound.second_end_ms))
+                        .filter(m::msg_id.eq_any(keys))
+                        .execute(conn)?;
+                }
+            }
+        }
     }
-    query.execute(conn)?;
     // Satellites of messages that no longer exist.
     diesel::sql_query(
         "DELETE FROM reactions WHERE device_id = ? AND chat_jid = ? AND msg_id NOT IN \
