@@ -22,12 +22,14 @@ pub(crate) enum MessageOp {
         new_kind: &'static str,
         new_proto: Vec<u8>,
     },
-    /// A revoke of another message: tombstone it. `target_from_me` is the
-    /// revoke key's `fromMe` — whether the TARGET message was ours — used when
+    /// A revoke of another message: tombstone it. `target_from_me`/`target_participant`
+    /// come from the revoke KEY (they identify the target message's owner, not
+    /// the revoker — an admin revoke is authored by someone else), used when
     /// the tombstone has to be created before its content arrives.
     Revoke {
         target_id: String,
         target_from_me: bool,
+        target_participant: Option<String>,
     },
     /// Protocol/bookkeeping payloads that don't belong in a chat log.
     Ignore,
@@ -96,9 +98,11 @@ pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
         let target_id = pm.key.as_option().and_then(|k| k.id.clone());
         match (pm.r#type, target_id) {
             (Some(ProtocolType::REVOKE), Some(target_id)) => {
+                let key = pm.key.as_option();
                 return MessageOp::Revoke {
                     target_id,
-                    target_from_me: pm.key.as_option().and_then(|k| k.from_me).unwrap_or(false),
+                    target_from_me: key.and_then(|k| k.from_me).unwrap_or(false),
+                    target_participant: key.and_then(|k| k.participant.clone()),
                 };
             }
             (Some(ProtocolType::MESSAGE_EDIT), Some(target_id)) => {

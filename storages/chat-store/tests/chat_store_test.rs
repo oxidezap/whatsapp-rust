@@ -1889,3 +1889,134 @@ async fn stale_ranged_mark_read_respects_the_read_cursor() {
     .await;
     assert_eq!(chat_store.unread_total().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn keyed_mark_read_spares_unlisted_same_second_sibling() {
+    let (_store, chat_store) = test_store().await;
+
+    // Two incoming rows in the SAME wire second; the mark-read names only one.
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("named"),
+                incoming_info(PEER, PEER, "MSG-KA", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("unnamed sibling"),
+                incoming_info(PEER, PEER, "MSG-KB", 1_700_000_000),
+            ),
+        ],
+    )
+    .await;
+
+    let range = buffa::MessageField::some(wa::sync_action_value::SyncActionMessageRange {
+        last_message_timestamp: Some(1_700_000_000),
+        messages: vec![wa::sync_action_value::SyncActionMessage {
+            key: buffa::MessageField::some(wa::MessageKey {
+                id: Some("MSG-KA".into()),
+                remote_jid: Some(PEER.into()),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000),
+        }],
+        ..Default::default()
+    });
+    feed(
+        &chat_store,
+        [Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(Utc.timestamp_opt(1_700_000_001, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    message_range: range,
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn late_materialized_old_message_does_not_badge_after_read() {
+    let (_store, chat_store) = test_store().await;
+
+    // Unranged mark-read on an EMPTY chat: the cursor must advance off the
+    // action's own timestamp.
+    feed(
+        &chat_store,
+        [Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(Utc.timestamp_opt(1_700_000_100, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+
+    // An OLDER message materializes afterwards (offline drain): already read,
+    // must not badge.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("late but old"),
+            incoming_info(PEER, PEER, "MSG-LATE", 1_700_000_000),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+
+    // While a genuinely NEW message still badges.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("genuinely new"),
+            incoming_info(PEER, PEER, "MSG-NEW", 1_700_000_200),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn admin_revoke_tombstone_keeps_target_author() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    let admin = "559900000077@s.whatsapp.net";
+    let author = "559900000088@s.whatsapp.net";
+
+    // Admin revoke arriving BEFORE the original: the tombstone must attribute
+    // the message to its author (revoke key participant), not to the admin.
+    let revoke = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-ADM".into()),
+                from_me: Some(false),
+                participant: Some(author.into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::REVOKE),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            revoke,
+            incoming_info(GROUP, admin, "MSG-ADM2", 1_700_000_000),
+        )],
+    )
+    .await;
+    let tombstone = chat_store.message(&chat, "MSG-ADM").await.unwrap().unwrap();
+    assert!(tombstone.revoked);
+    assert_eq!(tombstone.sender_jid, jid(author));
+}

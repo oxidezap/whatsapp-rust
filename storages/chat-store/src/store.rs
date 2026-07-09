@@ -557,8 +557,18 @@ fn apply_event(
                 // can't resurrect the badge.
                 match range_bound(&update.action.message_range) {
                     Some(bound) => {
-                        advance_read_cursor(conn, device_id, &chat, bound.second_end_ms)?;
-                        count_uncovered_incoming(conn, device_id, &chat, &bound)?
+                        // Count against the PREVIOUS cursor, then advance: a
+                        // keyed boundary second can't be expressed by a ms
+                        // cursor, so it only advances past the fully-covered
+                        // region (unlisted same-second siblings stay unread).
+                        let unread = count_uncovered_incoming(conn, device_id, &chat, &bound)?;
+                        let durable = if bound.keys.is_some() {
+                            bound.second_start_ms - 1
+                        } else {
+                            bound.second_end_ms
+                        };
+                        advance_read_cursor(conn, device_id, &chat, durable)?;
+                        unread
                     }
                     None => {
                         use schema::messages::dsl;
@@ -567,9 +577,13 @@ fn apply_event(
                             .select(diesel::dsl::max(dsl::timestamp_ms))
                             .first(conn)
                             .optional()?;
-                        if let Some(newest_ms) = newest.flatten() {
-                            advance_read_cursor(conn, device_id, &chat, newest_ms)?;
-                        }
+                        // Empty chat: the action's own timestamp is the read
+                        // moment — the cursor must still advance, or a later
+                        // stale replay resurrects a badge this read cleared.
+                        let boundary_ms = newest
+                            .flatten()
+                            .unwrap_or_else(|| update.timestamp.timestamp_millis());
+                        advance_read_cursor(conn, device_id, &chat, boundary_ms)?;
                         0
                     }
                 }
@@ -763,13 +777,14 @@ fn apply_inbound(
         MessageOp::Revoke {
             target_id,
             target_from_me,
+            target_participant,
         } => {
             if apply_revoke(
                 conn,
                 device_id,
                 &chat,
                 &target_id,
-                &sender,
+                target_participant.as_deref().unwrap_or(&sender),
                 target_from_me,
                 ts_ms,
             )? {
@@ -1137,11 +1152,20 @@ fn apply_history_sync(
             Ok(Some(conv)) => conv,
             Ok(None) => break,
             Err(e) => {
-                warn!("chat-store: history sync chunk unreadable, skipping: {e}");
+                // Framing/zlib failure: the stream position is gone, the rest
+                // of this chunk is unreadable (per-conversation decode errors
+                // are skipped inside the stream, not surfaced here).
+                warn!("chat-store: history sync chunk framing broken, aborting chunk: {e}");
                 return Ok(());
             }
         };
         apply_history_conversation(conn, device_id, &conv, cs)?;
+    }
+    if stream.skipped_conversations() > 0 {
+        warn!(
+            "chat-store: history sync skipped {} undecodable conversation(s)",
+            stream.skipped_conversations()
+        );
     }
     match stream.remainder() {
         Ok(rest) => {
@@ -1302,13 +1326,14 @@ fn apply_history_message(
             MessageOp::Revoke {
                 target_id,
                 target_from_me,
+                target_participant,
             } => {
                 if apply_revoke(
                     conn,
                     device_id,
                     chat,
                     &target_id,
-                    sender,
+                    target_participant.as_deref().unwrap_or(sender),
                     target_from_me,
                     ts_ms,
                 )? {
@@ -1449,9 +1474,15 @@ fn bump_chat(
     // msg_id) order — a same-millisecond sibling applied later must not win.
     refresh_preview_if_latest(conn, device_id, chat, bump.msg_id, bump.preview, bump.kind)?;
     if bump.unread_delta != 0 {
-        diesel::update(chat_row(device_id, chat).filter(dsl::unread_count.ge(0)))
-            .set(dsl::unread_count.eq(dsl::unread_count + bump.unread_delta))
-            .execute(conn)?;
+        // An old row materialized late (offline drain) that a read already
+        // covered must not badge: only rows past the read cursor count.
+        diesel::update(
+            chat_row(device_id, chat)
+                .filter(dsl::unread_count.ge(0))
+                .filter(dsl::read_boundary_ms.lt(bump.ts_ms)),
+        )
+        .set(dsl::unread_count.eq(dsl::unread_count + bump.unread_delta))
+        .execute(conn)?;
     }
     Ok(())
 }
