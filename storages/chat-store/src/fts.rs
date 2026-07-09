@@ -16,6 +16,13 @@ use crate::store::ChatStore;
 use crate::types::StoredMessage;
 
 pub(crate) fn ensure_fts(conn: &mut SqliteConnection) -> QueryResult<()> {
+    // One transaction for existence-check + DDL + backfill: a partially
+    // created index (table committed, rebuild lost) would pass the existence
+    // gate forever after, leaving pre-existing rows permanently unindexed.
+    conn.transaction(ensure_fts_inner)
+}
+
+fn ensure_fts_inner(conn: &mut SqliteConnection) -> QueryResult<()> {
     #[derive(QueryableByName)]
     struct CountRow {
         #[diesel(sql_type = diesel::sql_types::Integer)]

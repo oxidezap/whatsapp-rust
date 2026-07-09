@@ -190,6 +190,18 @@ impl ChatStore {
     }
 }
 
+/// Upper bound (in ms) of a sync action's message range. The wire value is
+/// unix SECONDS (same clock as conversation timestamps). `None` = unbounded.
+fn range_bound_ms(
+    range: &buffa::MessageField<wa::sync_action_value::SyncActionMessageRange>,
+) -> Option<i64> {
+    range
+        .as_option()
+        .and_then(|r| r.last_message_timestamp)
+        .filter(|&ts| ts > 0)
+        .map(|ts| ts.saturating_mul(1000))
+}
+
 /// Chats/contacts touched by a batch, accumulated for post-commit invalidation.
 #[derive(Default)]
 struct ChangeSet {
@@ -204,10 +216,13 @@ async fn writer_loop(
     mut rx: mpsc::UnboundedReceiver<WriterMsg>,
     changes: broadcast::Sender<StoreChange>,
 ) {
+    // Sticky across iterations: a failed batch with no flush waiter of its
+    // own must still be reported to the NEXT flush (a >BATCH_MAX backlog spans
+    // several transactions). Consumed when delivered.
+    let mut pending_error: Option<String> = None;
     while let Some(first) = rx.recv().await {
         let mut batch = Vec::with_capacity(8);
         let mut flushes = Vec::new();
-        let mut batch_error = None;
         // A Flush is a batch BARRIER: stop draining there, so writes enqueued
         // after a caller's flush() can neither commit ahead of that call's
         // answer nor drag the awaited writes down with a later failure.
@@ -249,15 +264,19 @@ async fn writer_loop(
                 // crashing the writer.
                 Err(e) => {
                     warn!("chat-store: dropping write batch: {e}");
-                    batch_error = Some(e.to_string());
+                    pending_error = Some(e.to_string());
                 }
             }
         }
+        if flushes.is_empty() {
+            continue;
+        }
+        let outcome = match pending_error.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
         for done in flushes {
-            let _ = done.send(match &batch_error {
-                Some(e) => Err(e.clone()),
-                None => Ok(()),
-            });
+            let _ = done.send(outcome.clone());
         }
     }
 }
@@ -315,10 +334,13 @@ fn apply_writer_msg(
                     conn,
                     device_id,
                     &chat_str,
-                    *timestamp_ms,
-                    text.as_deref(),
-                    Some(kind),
-                    0,
+                    ChatBump {
+                        msg_id,
+                        ts_ms: *timestamp_ms,
+                        preview: text.as_deref(),
+                        kind: Some(kind),
+                        unread_delta: 0,
+                    },
                 )?;
                 cs.chats = true;
             }
@@ -371,10 +393,13 @@ fn apply_event(
                     conn,
                     device_id,
                     &chat,
-                    undec.info.timestamp.timestamp_millis(),
-                    None,
-                    Some(KIND_UNDECRYPTABLE),
-                    i32::from(!undec.info.source.is_from_me),
+                    ChatBump {
+                        msg_id: &undec.info.id,
+                        ts_ms: undec.info.timestamp.timestamp_millis(),
+                        preview: None,
+                        kind: Some(KIND_UNDECRYPTABLE),
+                        unread_delta: i32::from(!undec.info.source.is_from_me),
+                    },
                 )?;
                 cs.chats = true;
             }
@@ -442,12 +467,30 @@ fn apply_event(
             Ok(())
         }
         Event::MarkChatAsReadUpdate(update) => {
+            let chat = update.jid.to_string();
             let unread = if update.action.read.unwrap_or(false) {
-                0
+                // A delayed replay only covers messages up to its range end;
+                // anything we materialized after it is still unread.
+                match range_bound_ms(&update.action.message_range) {
+                    Some(bound_ms) => {
+                        use schema::messages::dsl;
+                        let newer: i64 = dsl::messages
+                            .filter(
+                                dsl::device_id
+                                    .eq(device_id)
+                                    .and(dsl::chat_jid.eq(&chat))
+                                    .and(dsl::from_me.eq(false))
+                                    .and(dsl::timestamp_ms.gt(bound_ms)),
+                            )
+                            .count()
+                            .get_result(conn)?;
+                        newer.min(i32::MAX as i64) as i32
+                    }
+                    None => 0,
+                }
             } else {
                 UNREAD_MARKER
             };
-            let chat = update.jid.to_string();
             ensure_chat(conn, device_id, &chat)?;
             diesel::update(chat_row(device_id, &chat))
                 .set(schema::chats::unread_count.eq(unread))
@@ -465,17 +508,28 @@ fn apply_event(
         }
         Event::DeleteChatUpdate(update) => {
             let chat = update.jid.to_string();
-            delete_chat_rows(conn, device_id, &chat, true)?;
-            diesel::delete(chat_row(device_id, &chat)).execute(conn)?;
+            let bound_ms = range_bound_ms(&update.action.message_range);
+            delete_chat_rows(conn, device_id, &chat, true, bound_ms)?;
+            // A delayed delete only covers up to its range end: when newer
+            // messages were already materialized locally, the chat survives
+            // with them instead of vanishing.
+            let survivors = remaining_messages(conn, device_id, &chat)?;
+            if bound_ms.is_some() && survivors > 0 {
+                recompute_chat_preview(conn, device_id, &chat)?;
+            } else {
+                diesel::delete(chat_row(device_id, &chat)).execute(conn)?;
+            }
             cs.chats = true;
             cs.message_chats.insert(chat);
             Ok(())
         }
         Event::ClearChatUpdate(update) => {
             let chat = update.jid.to_string();
-            delete_chat_rows(conn, device_id, &chat, update.delete_starred)?;
-            // Starred rows may survive the clear: the preview/kind must
-            // reflect the newest survivor, not go blank (or keep stale kind).
+            let bound_ms = range_bound_ms(&update.action.message_range);
+            delete_chat_rows(conn, device_id, &chat, update.delete_starred, bound_ms)?;
+            // Starred rows (and messages newer than the range) may survive the
+            // clear: the preview/kind must reflect the newest survivor, not go
+            // blank (or keep stale kind).
             recompute_chat_preview(conn, device_id, &chat)?;
             diesel::update(chat_row(device_id, &chat))
                 .set(schema::chats::unread_count.eq(0))
@@ -566,10 +620,13 @@ fn apply_inbound(
                     conn,
                     device_id,
                     &chat,
-                    ts_ms,
-                    text.as_deref(),
-                    Some(kind),
-                    unread_delta,
+                    ChatBump {
+                        msg_id: &info.id,
+                        ts_ms,
+                        preview: text.as_deref(),
+                        kind: Some(kind),
+                        unread_delta,
+                    },
                 )?;
                 cs.chats = true;
             }
@@ -599,8 +656,19 @@ fn apply_inbound(
             }
             cs.message_chats.insert(chat);
         }
-        MessageOp::Revoke { target_id } => {
-            if apply_revoke(conn, device_id, &chat, &target_id, &sender, ts_ms)? {
+        MessageOp::Revoke {
+            target_id,
+            target_from_me,
+        } => {
+            if apply_revoke(
+                conn,
+                device_id,
+                &chat,
+                &target_id,
+                &sender,
+                target_from_me,
+                ts_ms,
+            )? {
                 cs.chats = true;
             }
             cs.message_chats.insert(chat);
@@ -653,6 +721,7 @@ fn apply_revoke(
     chat: &str,
     target_id: &str,
     sender: &str,
+    target_from_me: bool,
     ts_ms: i64,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
@@ -670,7 +739,7 @@ fn apply_revoke(
                 dsl::chat_jid.eq(chat),
                 dsl::msg_id.eq(target_id),
                 dsl::sender_jid.eq(sender),
-                dsl::from_me.eq(false),
+                dsl::from_me.eq(target_from_me),
                 dsl::timestamp_ms.eq(ts_ms),
                 dsl::kind.eq("unknown"),
                 dsl::revoked.eq(true),
@@ -726,15 +795,17 @@ fn recompute_chat_preview(
     chat: &str,
 ) -> QueryResult<()> {
     use schema::messages::dsl;
-    let newest: Option<(Option<String>, String)> = dsl::messages
+    let newest: Option<(Option<String>, String, bool)> = dsl::messages
         .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
         .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
-        .select((dsl::text_content, dsl::kind))
+        .select((dsl::text_content, dsl::kind, dsl::revoked))
         .first(conn)
         .optional()?;
     let (preview, kind) = match newest {
-        Some((text, kind)) => (text, Some(kind)),
-        None => (None, None),
+        // A tombstone previews as nothing at all — its pre-revoke kind must
+        // not leak back (mirrors the revoke path's (None, None)).
+        Some((_, _, true)) | None => (None, None),
+        Some((text, kind, false)) => (text, Some(kind)),
     };
     diesel::update(chat_row(device_id, chat))
         .set((
@@ -1084,8 +1155,19 @@ fn apply_history_message(
                     cs.chats = true;
                 }
             }
-            MessageOp::Revoke { target_id } => {
-                if apply_revoke(conn, device_id, chat, &target_id, sender, ts_ms)? {
+            MessageOp::Revoke {
+                target_id,
+                target_from_me,
+            } => {
+                if apply_revoke(
+                    conn,
+                    device_id,
+                    chat,
+                    &target_id,
+                    sender,
+                    target_from_me,
+                    ts_ms,
+                )? {
                     cs.chats = true;
                 }
             }
@@ -1193,27 +1275,33 @@ fn insert_message(
 /// Refresh a chat's activity row for a message at `ts_ms`: creates the row if
 /// missing, advances ordering/preview only for newer messages, and bumps the
 /// unread counter by `unread_delta` (unless manually marked unread).
+/// One message's contribution to its chat's denormalized row.
+struct ChatBump<'a> {
+    msg_id: &'a str,
+    ts_ms: i64,
+    preview: Option<&'a str>,
+    kind: Option<&'a str>,
+    unread_delta: i32,
+}
+
 fn bump_chat(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,
-    ts_ms: i64,
-    preview: Option<&str>,
-    kind: Option<&str>,
-    unread_delta: i32,
+    bump: ChatBump<'_>,
 ) -> QueryResult<()> {
     use schema::chats::dsl;
     ensure_chat(conn, device_id, chat)?;
-    diesel::update(chat_row(device_id, chat).filter(dsl::last_message_ts.le(ts_ms)))
-        .set((
-            dsl::last_message_ts.eq(ts_ms),
-            dsl::last_message_preview.eq(preview),
-            dsl::last_message_kind.eq(kind),
-        ))
+    // Ordering timestamp is monotonic on its own...
+    diesel::update(chat_row(device_id, chat).filter(dsl::last_message_ts.le(bump.ts_ms)))
+        .set(dsl::last_message_ts.eq(bump.ts_ms))
         .execute(conn)?;
-    if unread_delta != 0 {
+    // ...but the preview belongs to the newest row by the FULL (timestamp_ms,
+    // msg_id) order — a same-millisecond sibling applied later must not win.
+    refresh_preview_if_latest(conn, device_id, chat, bump.msg_id, bump.preview, bump.kind)?;
+    if bump.unread_delta != 0 {
         diesel::update(chat_row(device_id, chat).filter(dsl::unread_count.ge(0)))
-            .set(dsl::unread_count.eq(dsl::unread_count + unread_delta))
+            .set(dsl::unread_count.eq(dsl::unread_count + bump.unread_delta))
             .execute(conn)?;
     }
     Ok(())
@@ -1277,15 +1365,21 @@ fn delete_chat_rows(
     device_id: i32,
     chat: &str,
     delete_starred: bool,
+    up_to_ts_ms: Option<i64>,
 ) -> QueryResult<()> {
     use schema::messages::dsl as m;
-    let base =
-        diesel::delete(m::messages.filter(m::device_id.eq(device_id).and(m::chat_jid.eq(chat))));
-    if delete_starred {
-        base.execute(conn)?;
-    } else {
-        base.filter(m::starred.eq(false)).execute(conn)?;
+    let mut query =
+        diesel::delete(m::messages.filter(m::device_id.eq(device_id).and(m::chat_jid.eq(chat))))
+            .into_boxed();
+    if !delete_starred {
+        query = query.filter(m::starred.eq(false));
     }
+    // A ranged action only covers messages up to its boundary; rows we
+    // materialized after it (live/offline traffic) survive.
+    if let Some(bound_ms) = up_to_ts_ms {
+        query = query.filter(m::timestamp_ms.le(bound_ms));
+    }
+    query.execute(conn)?;
     // Satellites of messages that no longer exist.
     diesel::sql_query(
         "DELETE FROM reactions WHERE device_id = ? AND chat_jid = ? AND msg_id NOT IN \
@@ -1306,6 +1400,14 @@ fn delete_chat_rows(
     .bind::<diesel::sql_types::Text, _>(chat)
     .execute(conn)?;
     Ok(())
+}
+
+fn remaining_messages(conn: &mut SqliteConnection, device_id: i32, chat: &str) -> QueryResult<i64> {
+    use schema::messages::dsl;
+    dsl::messages
+        .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
+        .count()
+        .get_result(conn)
 }
 
 type ChatRowFilter<'a> = diesel::dsl::Filter<

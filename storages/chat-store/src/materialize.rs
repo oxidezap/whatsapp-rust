@@ -22,8 +22,13 @@ pub(crate) enum MessageOp {
         new_kind: &'static str,
         new_proto: Vec<u8>,
     },
-    /// A revoke of another message: tombstone it.
-    Revoke { target_id: String },
+    /// A revoke of another message: tombstone it. `target_from_me` is the
+    /// revoke key's `fromMe` — whether the TARGET message was ours — used when
+    /// the tombstone has to be created before its content arrives.
+    Revoke {
+        target_id: String,
+        target_from_me: bool,
+    },
     /// Protocol/bookkeeping payloads that don't belong in a chat log.
     Ignore,
 }
@@ -91,7 +96,10 @@ pub(crate) fn classify(msg: &wa::Message) -> MessageOp {
         let target_id = pm.key.as_option().and_then(|k| k.id.clone());
         match (pm.r#type, target_id) {
             (Some(ProtocolType::REVOKE), Some(target_id)) => {
-                return MessageOp::Revoke { target_id };
+                return MessageOp::Revoke {
+                    target_id,
+                    target_from_me: pm.key.as_option().and_then(|k| k.from_me).unwrap_or(false),
+                };
             }
             (Some(ProtocolType::MESSAGE_EDIT), Some(target_id)) => {
                 if let Some(edited) = pm.edited_message.as_option() {
@@ -279,7 +287,7 @@ mod tests {
         };
         assert!(matches!(
             classify(&revoke),
-            MessageOp::Revoke { target_id } if target_id == "MSG2"
+            MessageOp::Revoke { target_id, .. } if target_id == "MSG2"
         ));
 
         let edit = wa::Message {

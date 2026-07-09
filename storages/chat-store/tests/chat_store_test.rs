@@ -1279,3 +1279,252 @@ async fn clear_chat_reflects_surviving_starred_messages() {
     assert_eq!(chats[0].last_message_kind, Some(MessageKind::Text));
     assert_eq!(chats[0].unread_count, 0);
 }
+
+fn range_up_to(ts_secs: i64) -> buffa::MessageField<wa::sync_action_value::SyncActionMessageRange> {
+    buffa::MessageField::some(wa::sync_action_value::SyncActionMessageRange {
+        last_message_timestamp: Some(ts_secs),
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn mark_read_range_preserves_newer_unread() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("covered"),
+                incoming_info(PEER, PEER, "MSG-C1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("newer than the replayed read"),
+                incoming_info(PEER, PEER, "MSG-C2", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 2);
+
+    // A delayed mark-read whose range ends at the first message must not
+    // swallow the second one's unread state.
+    feed(
+        &chat_store,
+        [Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(Utc.timestamp_opt(1_700_000_050, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    message_range: range_up_to(1_700_000_000),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn ranged_clear_and_delete_keep_newer_messages() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    let seed = |chat_store: &Arc<ChatStore>| {
+        let a = message_event(
+            wa::Message::text("old"),
+            incoming_info(PEER, PEER, "MSG-O", 1_700_000_000),
+        );
+        let b = message_event(
+            wa::Message::text("newer than the action"),
+            incoming_info(PEER, PEER, "MSG-N", 1_700_000_100),
+        );
+        (chat_store.clone(), [a, b])
+    };
+
+    // Ranged clear: only rows up to the boundary go away.
+    let (cs, events) = seed(&chat_store);
+    feed(&cs, events).await;
+    feed(
+        &chat_store,
+        [Event::ClearChatUpdate(
+            wacore::types::events::ClearChatUpdate::builder()
+                .jid(chat.clone())
+                .delete_starred(true)
+                .delete_media(false)
+                .timestamp(Utc.timestamp_opt(1_700_000_050, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::ClearChatAction {
+                    message_range: range_up_to(1_700_000_000),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert!(chat_store.message(&chat, "MSG-O").await.unwrap().is_none());
+    assert!(chat_store.message(&chat, "MSG-N").await.unwrap().is_some());
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(
+        chats[0].last_message_preview.as_deref(),
+        Some("newer than the action")
+    );
+
+    // Ranged delete-chat: newer rows keep the chat alive.
+    feed(
+        &chat_store,
+        [Event::DeleteChatUpdate(
+            wacore::types::events::DeleteChatUpdate::builder()
+                .jid(chat.clone())
+                .delete_media(false)
+                .timestamp(Utc.timestamp_opt(1_700_000_060, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::DeleteChatAction {
+                    message_range: range_up_to(1_700_000_000),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert!(chat_store.message(&chat, "MSG-N").await.unwrap().is_some());
+    assert_eq!(chat_store.chats(false, 10).await.unwrap().len(), 1);
+
+    // Unranged delete-chat: everything goes.
+    feed(
+        &chat_store,
+        [Event::DeleteChatUpdate(
+            wacore::types::events::DeleteChatUpdate::builder()
+                .jid(chat.clone())
+                .delete_media(false)
+                .timestamp(Utc.timestamp_opt(1_700_000_070, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::DeleteChatAction::default()))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert!(chat_store.chats(false, 10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn revoke_tombstone_keeps_target_from_me() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    // Revoke of OUR OWN message (key.fromMe = true) arriving before the
+    // content: the tombstone must not read as incoming forever.
+    let revoke = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-FM".into()),
+                from_me: Some(true),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::REVOKE),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            revoke,
+            incoming_info(PEER, PEER, "MSG-FM2", 1_700_000_000),
+        )],
+    )
+    .await;
+    let tombstone = chat_store.message(&chat, "MSG-FM").await.unwrap().unwrap();
+    assert!(tombstone.revoked);
+    assert!(tombstone.from_me);
+}
+
+#[tokio::test]
+async fn recompute_does_not_resurrect_tombstone_kind() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("older"),
+                incoming_info(PEER, PEER, "MSG-T1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("newest, will be revoked"),
+                incoming_info(PEER, PEER, "MSG-T2", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+    let revoke = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-T2".into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::REVOKE),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            revoke,
+            incoming_info(PEER, PEER, "MSG-T3", 1_700_000_200),
+        )],
+    )
+    .await;
+
+    // Deleting the OLDER row forces a recompute whose newest row is the
+    // tombstone: neither its text (None already) nor its pre-revoke kind may
+    // come back.
+    feed(
+        &chat_store,
+        [Event::DeleteMessageForMeUpdate(
+            wacore::types::events::DeleteMessageForMeUpdate::builder()
+                .chat_jid(chat.clone())
+                .message_id("MSG-T1".to_string())
+                .from_me(false)
+                .timestamp(Utc.timestamp_opt(1_700_000_300, 0).unwrap())
+                .action(Box::new(
+                    wa::sync_action_value::DeleteMessageForMeAction::default(),
+                ))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert!(chats[0].last_message_preview.is_none());
+    assert!(chats[0].last_message_kind.is_none());
+}
+
+#[tokio::test]
+async fn same_millisecond_insert_order_does_not_hijack_preview() {
+    let (_store, chat_store) = test_store().await;
+
+    // Applied in REVERSE msg_id order within the same millisecond: the row
+    // that is newest by (timestamp_ms, msg_id) must own the preview.
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("newest by id"),
+                incoming_info(PEER, PEER, "MSG-Z9", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("older by id, applied later"),
+                incoming_info(PEER, PEER, "MSG-A1", 1_700_000_000),
+            ),
+        ],
+    )
+    .await;
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(
+        chats[0].last_message_preview.as_deref(),
+        Some("newest by id")
+    );
+}
