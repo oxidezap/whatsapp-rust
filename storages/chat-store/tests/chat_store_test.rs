@@ -2020,3 +2020,185 @@ async fn admin_revoke_tombstone_keeps_target_author() {
     assert!(tombstone.revoked);
     assert_eq!(tombstone.sender_jid, jid(author));
 }
+
+#[tokio::test]
+async fn redelivery_after_edit_keeps_edited_content() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    let original = || {
+        message_event(
+            wa::Message::text("original"),
+            incoming_info(PEER, PEER, "MSG-RED", 1_700_000_000),
+        )
+    };
+    feed(&chat_store, [original()]).await;
+    let edit = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-RED".into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+            edited_message: MessageField::from_box(Box::new(wa::Message::text("edited"))),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            edit,
+            incoming_info(PEER, PEER, "MSG-RED2", 1_700_000_100),
+        )],
+    )
+    .await;
+
+    // A duplicate delivery of the PRE-edit original must not roll content back.
+    feed(&chat_store, [original()]).await;
+    let msg = chat_store.message(&chat, "MSG-RED").await.unwrap().unwrap();
+    assert_eq!(msg.text.as_deref(), Some("edited"));
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("edited"));
+}
+
+#[tokio::test]
+async fn late_same_instant_sibling_still_badges_after_read_self() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("named"),
+            incoming_info(PEER, PEER, "MSG-SI1", 1_700_000_000),
+        )],
+    )
+    .await;
+    feed(
+        &chat_store,
+        [Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: jid(PEER),
+                    sender: jid(PEER),
+                    ..Default::default()
+                })
+                .message_ids(vec!["MSG-SI1".to_string()])
+                .timestamp(Utc.timestamp_opt(1_700_000_050, 0).unwrap())
+                .r#type(ReceiptType::ReadSelf)
+                .offline(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+
+    // An unlisted sibling at the SAME instant materializes later (offline
+    // drain): the receipt didn't cover it, so it must badge.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("same instant, uncovered"),
+            incoming_info(PEER, PEER, "MSG-SI2", 1_700_000_000),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn delete_for_me_drops_the_victims_badge() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("stays unread"),
+                incoming_info(PEER, PEER, "MSG-U1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("deleted while unread"),
+                incoming_info(PEER, PEER, "MSG-U2", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 2);
+
+    feed(
+        &chat_store,
+        [Event::DeleteMessageForMeUpdate(
+            wacore::types::events::DeleteMessageForMeUpdate::builder()
+                .chat_jid(chat.clone())
+                .message_id("MSG-U2".to_string())
+                .from_me(false)
+                .timestamp(Utc.timestamp_opt(1_700_000_200, 0).unwrap())
+                .action(Box::new(
+                    wa::sync_action_value::DeleteMessageForMeAction::default(),
+                ))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn keyed_read_covers_a_message_that_materializes_later() {
+    let (_store, chat_store) = test_store().await;
+
+    // The keyed mark-read arrives BEFORE the message it names (read on
+    // another device, local drain lagging).
+    let range = buffa::MessageField::some(wa::sync_action_value::SyncActionMessageRange {
+        last_message_timestamp: Some(1_700_000_000),
+        messages: vec![wa::sync_action_value::SyncActionMessage {
+            key: buffa::MessageField::some(wa::MessageKey {
+                id: Some("MSG-FUT".into()),
+                remote_jid: Some(PEER.into()),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000),
+        }],
+        ..Default::default()
+    });
+    feed(
+        &chat_store,
+        [Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(Utc.timestamp_opt(1_700_000_001, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    message_range: range,
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+
+    // The named message materializes afterwards: covered, no badge...
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("read elsewhere before arriving"),
+            incoming_info(PEER, PEER, "MSG-FUT", 1_700_000_000),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+
+    // ...while an unnamed same-second sibling still badges.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("uncovered sibling"),
+            incoming_info(PEER, PEER, "MSG-SIB", 1_700_000_000),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}

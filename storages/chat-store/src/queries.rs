@@ -61,6 +61,8 @@ struct ChatRow {
     ephemeral_expiration: Option<i32>,
     #[allow(dead_code)]
     read_boundary_ms: i64,
+    #[allow(dead_code)]
+    read_boundary_ids: Option<String>,
 }
 
 impl From<ChatRow> for ChatEntry {

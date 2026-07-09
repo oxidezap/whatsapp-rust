@@ -4383,6 +4383,7 @@ dependencies = [
  "flate2",
  "log",
  "portable-atomic",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "wacore",

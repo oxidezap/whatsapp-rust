@@ -169,8 +169,12 @@ impl ChatStore {
     }
 
     /// Wait until every write enqueued before this call is committed. Errors
-    /// with [`ChatStoreError::WriteBatchFailed`] when the batch containing
-    /// those writes rolled back instead.
+    /// with [`ChatStoreError::WriteBatchFailed`] when any batch since the
+    /// previous flush answer rolled back. The contract is TEMPORAL, not
+    /// per-caller: writes enqueued by anyone before this call share its fate,
+    /// so a failure that dropped someone else's earlier writes still reports
+    /// here (conservative: a false failure is possible, a false success is
+    /// not).
     pub async fn flush(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -223,33 +227,126 @@ fn range_bound(
     })
 }
 
-/// The chat's monotonic self-read cursor (0 when the chat row doesn't exist).
-fn read_cursor(conn: &mut SqliteConnection, device_id: i32, chat: &str) -> QueryResult<i64> {
-    Ok(chat_row(device_id, chat)
-        .select(schema::chats::read_boundary_ms)
-        .first(conn)
-        .optional()?
-        .unwrap_or(0))
+/// Extra read-boundary ids kept per chat; overflow drops the oldest entries.
+const READ_EXTRA_IDS_CAP: usize = 256;
+
+/// The chat's materialized self-read state: everything at or below the
+/// watermark is read, plus the explicitly-named ids — boundary-instant/keyed
+/// coverage that a scalar watermark cannot express (both directions of the
+/// same-second ambiguity are lossy without them).
+struct ReadState {
+    watermark_ms: i64,
+    extra_ids: Vec<String>,
 }
 
-/// Advance the self-read cursor (never backwards).
-fn advance_read_cursor(
+impl ReadState {
+    fn covers(&self, ts_ms: i64, msg_id: &str) -> bool {
+        ts_ms <= self.watermark_ms || self.extra_ids.iter().any(|id| id == msg_id)
+    }
+}
+
+fn read_state(conn: &mut SqliteConnection, device_id: i32, chat: &str) -> QueryResult<ReadState> {
+    let row: Option<(i64, Option<String>)> = chat_row(device_id, chat)
+        .select((
+            schema::chats::read_boundary_ms,
+            schema::chats::read_boundary_ids,
+        ))
+        .first(conn)
+        .optional()?;
+    let (watermark_ms, ids_json) = row.unwrap_or((0, None));
+    let extra_ids = ids_json
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    Ok(ReadState {
+        watermark_ms,
+        extra_ids,
+    })
+}
+
+/// Fold a read event (watermark + explicitly covered ids) into the chat's
+/// monotonic read state. Ids already implied by the watermark are pruned.
+/// Returns the post-advance state, or `None` when the event brought nothing
+/// new (a stale replay, which must not touch the unread badge).
+fn advance_read_state(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,
-    boundary_ms: i64,
-) -> QueryResult<usize> {
-    diesel::update(
-        chat_row(device_id, chat).filter(schema::chats::read_boundary_ms.lt(boundary_ms)),
-    )
-    .set(schema::chats::read_boundary_ms.eq(boundary_ms))
-    .execute(conn)
+    watermark_ms: i64,
+    covered_ids: &[String],
+) -> QueryResult<Option<ReadState>> {
+    use schema::messages::dsl;
+    let mut state = read_state(conn, device_id, chat)?;
+    let before = (state.watermark_ms, state.extra_ids.clone());
+    if watermark_ms > state.watermark_ms {
+        state.watermark_ms = watermark_ms;
+    }
+    for id in covered_ids {
+        if !state.extra_ids.iter().any(|existing| existing == id) {
+            state.extra_ids.push(id.clone());
+        }
+    }
+    if !state.extra_ids.is_empty() {
+        let implied: Vec<String> = dsl::messages
+            .filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::chat_jid.eq(chat))
+                    .and(dsl::msg_id.eq_any(&state.extra_ids))
+                    .and(dsl::timestamp_ms.le(state.watermark_ms)),
+            )
+            .select(dsl::msg_id)
+            .load(conn)?;
+        if !implied.is_empty() {
+            state.extra_ids.retain(|id| !implied.contains(id));
+        }
+    }
+    if state.extra_ids.len() > READ_EXTRA_IDS_CAP {
+        let overflow = state.extra_ids.len() - READ_EXTRA_IDS_CAP;
+        state.extra_ids.drain(..overflow);
+    }
+    if (state.watermark_ms, &state.extra_ids) == (before.0, &before.1) {
+        return Ok(None);
+    }
+    let ids_json = (!state.extra_ids.is_empty())
+        .then(|| serde_json::to_string(&state.extra_ids).ok())
+        .flatten();
+    diesel::update(chat_row(device_id, chat))
+        .set((
+            schema::chats::read_boundary_ms.eq(state.watermark_ms),
+            schema::chats::read_boundary_ids.eq(ids_json),
+        ))
+        .execute(conn)?;
+    Ok(Some(state))
+}
+
+/// Incoming rows not covered by the read state.
+fn count_unread(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    state: &ReadState,
+) -> QueryResult<i32> {
+    use schema::messages::dsl;
+    let mut query = dsl::messages
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq(chat))
+                .and(dsl::from_me.eq(false))
+                .and(dsl::timestamp_ms.gt(state.watermark_ms)),
+        )
+        .into_boxed();
+    if !state.extra_ids.is_empty() {
+        query = query.filter(dsl::msg_id.ne_all(&state.extra_ids));
+    }
+    let unread: i64 = query.count().get_result(conn)?;
+    Ok(unread.min(i32::MAX as i64) as i32)
 }
 
 /// Incoming rows NOT covered by `bound`: strictly newer than the boundary
 /// second, plus same-second rows the action's keyed list does not name.
-/// Rows at or before the chat's read cursor are already read — a stale ranged
-/// action replaying after a newer self-read must not resurrect their badge.
+/// Rows the read state already covers don't count — a stale ranged action
+/// replaying after a newer self-read must not resurrect their badge.
 fn count_uncovered_incoming(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -257,14 +354,19 @@ fn count_uncovered_incoming(
     bound: &RangeBound,
 ) -> QueryResult<i32> {
     use schema::messages::dsl;
-    let read_boundary_ms = read_cursor(conn, device_id, chat)?;
-    let base = dsl::messages.filter(
-        dsl::device_id
-            .eq(device_id)
-            .and(dsl::chat_jid.eq(chat))
-            .and(dsl::from_me.eq(false))
-            .and(dsl::timestamp_ms.gt(read_boundary_ms)),
-    );
+    let state = read_state(conn, device_id, chat)?;
+    let mut base = dsl::messages
+        .filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::chat_jid.eq(chat))
+                .and(dsl::from_me.eq(false))
+                .and(dsl::timestamp_ms.gt(state.watermark_ms)),
+        )
+        .into_boxed();
+    if !state.extra_ids.is_empty() {
+        base = base.filter(dsl::msg_id.ne_all(state.extra_ids.clone()));
+    }
     let uncovered: i64 = match &bound.keys {
         None => base
             .filter(dsl::timestamp_ms.gt(bound.second_end_ms))
@@ -275,7 +377,7 @@ fn count_uncovered_incoming(
             .filter(
                 dsl::timestamp_ms
                     .gt(bound.second_end_ms)
-                    .or(dsl::msg_id.ne_all(keys)),
+                    .or(dsl::msg_id.ne_all(keys.clone())),
             )
             .count()
             .get_result(conn)?,
@@ -549,26 +651,24 @@ fn apply_event(
         }
         Event::MarkChatAsReadUpdate(update) => {
             let chat = update.jid.to_string();
-            let unread = if update.action.read.unwrap_or(false) {
-                ensure_chat(conn, device_id, &chat)?;
+            ensure_chat(conn, device_id, &chat)?;
+            if update.action.read.unwrap_or(false) {
                 // A delayed replay only covers messages up to its range;
-                // anything we materialized past it is still unread. Reads also
-                // advance the self-read cursor so later stale actions/receipts
-                // can't resurrect the badge.
-                match range_bound(&update.action.message_range) {
+                // anything we materialized past it is still unread. Reads
+                // fold into the monotonic read state (watermark + keyed
+                // boundary ids), so later stale actions/receipts can't
+                // resurrect the badge — and a stale replay itself changes
+                // nothing.
+                let advanced = match range_bound(&update.action.message_range) {
                     Some(bound) => {
-                        // Count against the PREVIOUS cursor, then advance: a
-                        // keyed boundary second can't be expressed by a ms
-                        // cursor, so it only advances past the fully-covered
-                        // region (unlisted same-second siblings stay unread).
-                        let unread = count_uncovered_incoming(conn, device_id, &chat, &bound)?;
-                        let durable = if bound.keys.is_some() {
-                            bound.second_start_ms - 1
-                        } else {
-                            bound.second_end_ms
+                        // A keyed boundary second can't be expressed by the
+                        // watermark alone: it stops short and the named ids
+                        // ride along in the state.
+                        let (watermark, ids): (i64, &[String]) = match &bound.keys {
+                            Some(keys) => (bound.second_start_ms - 1, keys.as_slice()),
+                            None => (bound.second_end_ms, &[]),
                         };
-                        advance_read_cursor(conn, device_id, &chat, durable)?;
-                        unread
+                        advance_read_state(conn, device_id, &chat, watermark, ids)?
                     }
                     None => {
                         use schema::messages::dsl;
@@ -578,22 +678,25 @@ fn apply_event(
                             .first(conn)
                             .optional()?;
                         // Empty chat: the action's own timestamp is the read
-                        // moment — the cursor must still advance, or a later
+                        // moment — the state must still advance, or a later
                         // stale replay resurrects a badge this read cleared.
-                        let boundary_ms = newest
+                        let watermark = newest
                             .flatten()
                             .unwrap_or_else(|| update.timestamp.timestamp_millis());
-                        advance_read_cursor(conn, device_id, &chat, boundary_ms)?;
-                        0
+                        advance_read_state(conn, device_id, &chat, watermark, &[])?
                     }
+                };
+                if let Some(state) = advanced {
+                    let unread = count_unread(conn, device_id, &chat, &state)?;
+                    diesel::update(chat_row(device_id, &chat))
+                        .set(schema::chats::unread_count.eq(unread))
+                        .execute(conn)?;
                 }
             } else {
-                UNREAD_MARKER
-            };
-            ensure_chat(conn, device_id, &chat)?;
-            diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::unread_count.eq(unread))
-                .execute(conn)?;
+                diesel::update(chat_row(device_id, &chat))
+                    .set(schema::chats::unread_count.eq(UNREAD_MARKER))
+                    .execute(conn)?;
+            }
             cs.chats = true;
             Ok(())
         }
@@ -658,7 +761,23 @@ fn apply_event(
         }
         Event::DeleteMessageForMeUpdate(update) => {
             let chat = update.chat_jid.to_string();
+            // Capture the victim's read state before it goes: deleting an
+            // unread inbound row must also drop its badge (sentinel -1 and
+            // already-read rows are untouched).
+            let victim: Option<(bool, i64)> = message_row(device_id, &chat, &update.message_id)
+                .select((schema::messages::from_me, schema::messages::timestamp_ms))
+                .first(conn)
+                .optional()?;
             diesel::delete(message_row(device_id, &chat, &update.message_id)).execute(conn)?;
+            if let Some((false, ts_ms)) = victim
+                && !read_state(conn, device_id, &chat)?.covers(ts_ms, &update.message_id)
+            {
+                diesel::update(
+                    chat_row(device_id, &chat).filter(schema::chats::unread_count.gt(0)),
+                )
+                .set(schema::chats::unread_count.eq(schema::chats::unread_count - 1))
+                .execute(conn)?;
+            }
             diesel::delete(
                 schema::reactions::table.filter(
                     schema::reactions::device_id
@@ -1019,32 +1138,25 @@ fn apply_receipt(
                 .optional()?;
             let boundary_ms = covered_max.flatten().unwrap_or(ts_ms);
             ensure_chat(conn, device_id, &chat)?;
-            // Monotonic cursor: receipts can replay out of order across
-            // offline drains, and a stale one must neither re-inflate nor
-            // re-clear the badge.
-            if advance_read_cursor(conn, device_id, &chat, boundary_ms)? == 0 {
+            // Fold into the monotonic read state: the watermark stops SHORT
+            // of the boundary instant (coverage there is keyed by the
+            // receipt's ids — timestamps collide at wire granularity), and
+            // the named ids ride along so a covered row materialized later
+            // stays read while an unlisted same-instant sibling still badges.
+            // A stale replay changes nothing and is skipped outright.
+            let Some(state) = advance_read_state(
+                conn,
+                device_id,
+                &chat,
+                boundary_ms - 1,
+                &receipt.message_ids,
+            )?
+            else {
                 return Ok(());
-            }
-            // Uncovered = strictly past the boundary, plus boundary-instant
-            // siblings the receipt does not name (ids are the authoritative
-            // coverage signal; timestamps collide at wire granularity).
-            let unread: i64 = dsl::messages
-                .filter(
-                    dsl::device_id
-                        .eq(device_id)
-                        .and(dsl::chat_jid.eq(&chat))
-                        .and(dsl::from_me.eq(false))
-                        .and(dsl::timestamp_ms.ge(boundary_ms))
-                        .and(
-                            dsl::timestamp_ms
-                                .gt(boundary_ms)
-                                .or(dsl::msg_id.ne_all(&receipt.message_ids)),
-                        ),
-                )
-                .count()
-                .get_result(conn)?;
+            };
+            let unread = count_unread(conn, device_id, &chat, &state)?;
             diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::unread_count.eq(unread.min(i32::MAX as i64) as i32))
+                .set(schema::chats::unread_count.eq(unread))
                 .execute(conn)?;
             cs.chats = true;
             return Ok(());
@@ -1431,7 +1543,10 @@ fn insert_message(
         let refreshed = diesel::update(
             message_row(device_id, new.chat_jid, new.msg_id)
                 .filter(dsl::revoked.eq(false))
-                .filter(dsl::sender_jid.eq(new.sender_jid)),
+                .filter(dsl::sender_jid.eq(new.sender_jid))
+                // A redelivery carries the PRE-edit original; an edited row
+                // must keep its newer content.
+                .filter(dsl::edited_at_ms.is_null()),
         )
         .set((
             dsl::kind.eq(new.kind),
@@ -1475,14 +1590,13 @@ fn bump_chat(
     refresh_preview_if_latest(conn, device_id, chat, bump.msg_id, bump.preview, bump.kind)?;
     if bump.unread_delta != 0 {
         // An old row materialized late (offline drain) that a read already
-        // covered must not badge: only rows past the read cursor count.
-        diesel::update(
-            chat_row(device_id, chat)
-                .filter(dsl::unread_count.ge(0))
-                .filter(dsl::read_boundary_ms.lt(bump.ts_ms)),
-        )
-        .set(dsl::unread_count.eq(dsl::unread_count + bump.unread_delta))
-        .execute(conn)?;
+        // covered must not badge.
+        let state = read_state(conn, device_id, chat)?;
+        if !state.covers(bump.ts_ms, bump.msg_id) {
+            diesel::update(chat_row(device_id, chat).filter(dsl::unread_count.ge(0)))
+                .set(dsl::unread_count.eq(dsl::unread_count + bump.unread_delta))
+                .execute(conn)?;
+        }
     }
     Ok(())
 }

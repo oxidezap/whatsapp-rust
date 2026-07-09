@@ -20,6 +20,7 @@ chrono = { workspace = true, features = ["std", "clock"] }
 diesel = { workspace = true }
 diesel_migrations = { workspace = true }
 log = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 wacore = { workspace = true }
