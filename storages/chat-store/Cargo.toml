@@ -1,0 +1,42 @@
+[package]
+name = "whatsapp-rust-chat-store"
+version = "0.1.0"
+edition = "2024"
+authors = ["João Lucas <jlucaso@hotmail.com>"]
+license = "MIT"
+repository = "https://github.com/jlucaso1/whatsapp-rust"
+description = "SQLite-backed chat/message history store for whatsapp-rust"
+
+[features]
+default = []
+# Full-text message search via SQLite FTS5 (virtual table + sync triggers,
+# created lazily at open; requires an FTS5-enabled SQLite, which the bundled
+# build of whatsapp-rust-sqlite-storage provides).
+search = []
+
+[dependencies]
+buffa = { workspace = true }
+chrono = { workspace = true, features = ["std", "clock"] }
+diesel = { workspace = true }
+diesel_migrations = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+wacore = { workspace = true }
+wacore-binary = { workspace = true }
+waproto = { workspace = true }
+whatsapp-rust-sqlite-storage = { path = "../sqlite-storage", version = "0.6.0" }
+
+[dev-dependencies]
+flate2 = { workspace = true }
+portable-atomic = { workspace = true }
+tokio = { workspace = true, features = [
+    "sync",
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "macros",
+] }
+
+[lints]
+workspace = true

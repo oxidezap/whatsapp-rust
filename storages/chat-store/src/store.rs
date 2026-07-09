@@ -1,0 +1,1103 @@
+//! The store itself: a write-behind materializer over the client's event
+//! stream plus the public write API. All writes funnel through one writer task
+//! (one transaction per drained batch), so event order is preserved and fan-in
+//! bursts don't pay per-event commit costs.
+
+use std::collections::BTreeSet;
+use std::str::FromStr;
+use std::sync::Arc;
+
+use buffa::Message as _;
+use chrono::{DateTime, Utc};
+use diesel::prelude::*;
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+use log::warn;
+use tokio::sync::{broadcast, mpsc, oneshot};
+use wacore::store::error::StoreError;
+use wacore::types::events::{Event, EventHandler, EventInterest, EventKind, InboundMessage};
+use wacore::types::presence::ReceiptType;
+use wacore_binary::Jid;
+use waproto::whatsapp as wa;
+use whatsapp_rust_sqlite_storage::{SharedSqlite, SqliteStore};
+
+use crate::error::{ChatStoreError, Result, db_err};
+use crate::materialize::{KIND_UNDECRYPTABLE, MessageOp, classify, extract_text, message_kind};
+use crate::schema;
+use crate::types::StoreChange;
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+/// Max events applied per transaction. Bounds transaction size during
+/// offline-drain bursts; the writer loops immediately for the remainder.
+const BATCH_MAX: usize = 128;
+
+/// Capacity of the invalidation broadcast. Lagging receivers see
+/// `RecvError::Lagged` and should re-query everything they display.
+const CHANGE_CHANNEL_CAPACITY: usize = 256;
+
+/// Manually-marked-unread sentinel for `chats.unread_count` (WA Web convention).
+const UNREAD_MARKER: i32 = -1;
+
+pub(crate) enum WriterMsg {
+    Event(Arc<Event>),
+    Outgoing {
+        chat: Jid,
+        msg_id: String,
+        proto: Vec<u8>,
+        kind: &'static str,
+        text: Option<String>,
+        timestamp_ms: i64,
+    },
+    Flush(oneshot::Sender<()>),
+}
+
+/// SQLite-backed chat/message/contact history, materialized from the client's
+/// event stream into the same database file as the device store.
+///
+/// Wire-up:
+/// ```ignore
+/// let chat_store = ChatStore::new(&sqlite_store).await?;
+/// client.register_handler(chat_store.handler());
+/// let mut changes = chat_store.subscribe();
+/// ```
+pub struct ChatStore {
+    db: SharedSqlite,
+    device_id: i32,
+    tx: mpsc::UnboundedSender<WriterMsg>,
+    changes: broadcast::Sender<StoreChange>,
+}
+
+struct ChatStoreHandler {
+    tx: mpsc::UnboundedSender<WriterMsg>,
+}
+
+impl EventHandler for ChatStoreHandler {
+    fn handle_event(&self, event: Arc<Event>) {
+        // Writer gone (store dropped): nothing to record into, drop silently.
+        let _ = self.tx.send(WriterMsg::Event(event));
+    }
+
+    fn interest(&self) -> EventInterest {
+        EventInterest::of(&[
+            EventKind::Messages,
+            EventKind::Receipt,
+            EventKind::ServerAck,
+            EventKind::UndecryptableMessage,
+            EventKind::HistorySync,
+            EventKind::PushNameUpdate,
+            EventKind::ContactUpdate,
+            EventKind::PinUpdate,
+            EventKind::MuteUpdate,
+            EventKind::ArchiveUpdate,
+            EventKind::StarUpdate,
+            EventKind::MarkChatAsReadUpdate,
+            EventKind::DeleteChatUpdate,
+            EventKind::ClearChatUpdate,
+            EventKind::DeleteMessageForMeUpdate,
+        ])
+    }
+}
+
+impl ChatStore {
+    /// Open (running migrations if needed) on the same database file as
+    /// `store`, bound to its device id, and start the writer task.
+    pub async fn new(store: &SqliteStore) -> Result<Arc<Self>> {
+        let db = store.shared();
+        let device_id = store.device_id();
+
+        db.run(|conn| {
+            conn.run_pending_migrations(MIGRATIONS)
+                .map(|_| ())
+                .map_err(StoreError::Migration)?;
+            #[cfg(feature = "search")]
+            crate::fts::ensure_fts(conn).map_err(db_err)?;
+            Ok(())
+        })
+        .await?;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (changes, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
+
+        let this = Arc::new(Self {
+            db: db.clone(),
+            device_id,
+            tx,
+            changes: changes.clone(),
+        });
+        tokio::spawn(writer_loop(db, device_id, rx, changes));
+        Ok(this)
+    }
+
+    /// Event handler to register on the client. The store keeps working if the
+    /// handler outlives it (events are then dropped), and vice versa.
+    pub fn handler(&self) -> Arc<dyn EventHandler> {
+        Arc::new(ChatStoreHandler {
+            tx: self.tx.clone(),
+        })
+    }
+
+    /// Subscribe to invalidation signals. Emitted once per committed write
+    /// batch, deduplicated. On `Lagged`, re-query all visible state.
+    pub fn subscribe(&self) -> broadcast::Receiver<StoreChange> {
+        self.changes.subscribe()
+    }
+
+    /// Record a message this client just sent. Goes through the writer queue so
+    /// it cannot race the server ack / receipts that follow it in event order.
+    /// Status starts at [`MessageStatus::Pending`](crate::types::MessageStatus::Pending)
+    /// and is lifted by acks/receipts.
+    pub fn record_outgoing(
+        &self,
+        chat: &Jid,
+        msg_id: impl Into<String>,
+        message: &wa::Message,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
+        let base = wacore::proto_helpers::MessageExt::get_base_message(message);
+        self.tx
+            .send(WriterMsg::Outgoing {
+                chat: chat.clone(),
+                msg_id: msg_id.into(),
+                proto: message.encode_to_vec(),
+                kind: message_kind(base),
+                text: extract_text(base),
+                timestamp_ms: timestamp.timestamp_millis(),
+            })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Wait until every write enqueued before this call is committed.
+    pub async fn flush(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(WriterMsg::Flush(tx))
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))?;
+        rx.await
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    pub fn device_id(&self) -> i32 {
+        self.device_id
+    }
+
+    pub(crate) fn db(&self) -> &SharedSqlite {
+        &self.db
+    }
+}
+
+/// Chats/contacts touched by a batch, accumulated for post-commit invalidation.
+#[derive(Default)]
+struct ChangeSet {
+    chats: bool,
+    contacts: bool,
+    message_chats: BTreeSet<String>,
+}
+
+async fn writer_loop(
+    db: SharedSqlite,
+    device_id: i32,
+    mut rx: mpsc::UnboundedReceiver<WriterMsg>,
+    changes: broadcast::Sender<StoreChange>,
+) {
+    while let Some(first) = rx.recv().await {
+        let mut batch = Vec::with_capacity(8);
+        let mut flushes = Vec::new();
+        let mut queue_msg = |msg: WriterMsg, batch: &mut Vec<WriterMsg>| match msg {
+            WriterMsg::Flush(done) => flushes.push(done),
+            other => batch.push(other),
+        };
+        queue_msg(first, &mut batch);
+        while batch.len() < BATCH_MAX {
+            match rx.try_recv() {
+                Ok(msg) => queue_msg(msg, &mut batch),
+                Err(_) => break,
+            }
+        }
+
+        if !batch.is_empty() {
+            let result = db
+                .run(move |conn| {
+                    conn.transaction(|conn| {
+                        let mut cs = ChangeSet::default();
+                        for msg in &batch {
+                            apply_writer_msg(conn, device_id, msg, &mut cs)?;
+                        }
+                        Ok(cs)
+                    })
+                    .map_err(db_err)
+                })
+                .await;
+            match result {
+                Ok(cs) => emit_changes(&changes, cs),
+                // The batch rolled back; state stays consistent (previous
+                // commit) but this slice of history is lost. Surfacing beats
+                // crashing the writer.
+                Err(e) => warn!("chat-store: dropping write batch: {e}"),
+            }
+        }
+        for done in flushes {
+            let _ = done.send(());
+        }
+    }
+}
+
+fn emit_changes(changes: &broadcast::Sender<StoreChange>, cs: ChangeSet) {
+    if cs.chats {
+        let _ = changes.send(StoreChange::Chats);
+    }
+    if cs.contacts {
+        let _ = changes.send(StoreChange::Contacts);
+    }
+    for chat in cs.message_chats {
+        if let Ok(jid) = Jid::from_str(&chat) {
+            let _ = changes.send(StoreChange::Messages { chat: jid });
+        }
+    }
+}
+
+fn apply_writer_msg(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    msg: &WriterMsg,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    match msg {
+        WriterMsg::Event(event) => apply_event(conn, device_id, event, cs),
+        WriterMsg::Outgoing {
+            chat,
+            msg_id,
+            proto,
+            kind,
+            text,
+            timestamp_ms,
+        } => {
+            let chat_str = chat.to_string();
+            insert_message(
+                conn,
+                device_id,
+                NewMessage {
+                    chat_jid: &chat_str,
+                    msg_id,
+                    sender_jid: "",
+                    from_me: true,
+                    timestamp_ms: *timestamp_ms,
+                    kind,
+                    text: text.as_deref(),
+                    proto: Some(proto),
+                    status: wa::web_message_info::Status::PENDING as i32,
+                    starred: false,
+                    overwrite: true,
+                },
+            )?;
+            bump_chat(
+                conn,
+                device_id,
+                &chat_str,
+                *timestamp_ms,
+                text.as_deref(),
+                0,
+            )?;
+            cs.chats = true;
+            cs.message_chats.insert(chat_str);
+            Ok(())
+        }
+        WriterMsg::Flush(_) => Ok(()),
+    }
+}
+
+fn apply_event(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    event: &Event,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    match event {
+        Event::Messages(batch) => {
+            for inbound in batch.iter() {
+                apply_inbound(conn, device_id, inbound, cs)?;
+            }
+            Ok(())
+        }
+        Event::Receipt(receipt) => apply_receipt(conn, device_id, receipt, cs),
+        Event::ServerAck(ack) => apply_server_ack(conn, device_id, ack, cs),
+        Event::UndecryptableMessage(undec) => {
+            let chat = undec.info.source.chat.to_string();
+            let sender = undec.info.source.sender.to_string();
+            insert_message(
+                conn,
+                device_id,
+                NewMessage {
+                    chat_jid: &chat,
+                    msg_id: &undec.info.id,
+                    sender_jid: &sender,
+                    from_me: undec.info.source.is_from_me,
+                    timestamp_ms: undec.info.timestamp.timestamp_millis(),
+                    kind: KIND_UNDECRYPTABLE,
+                    text: None,
+                    proto: None,
+                    status: wa::web_message_info::Status::DELIVERY_ACK as i32,
+                    starred: false,
+                    overwrite: false,
+                },
+            )?;
+            bump_chat(
+                conn,
+                device_id,
+                &chat,
+                undec.info.timestamp.timestamp_millis(),
+                None,
+                i32::from(!undec.info.source.is_from_me),
+            )?;
+            cs.chats = true;
+            cs.message_chats.insert(chat);
+            Ok(())
+        }
+        Event::HistorySync(lazy) => apply_history_sync(conn, device_id, lazy, cs),
+        Event::PushNameUpdate(update) => {
+            upsert_contact_push_name(
+                conn,
+                device_id,
+                &update.jid.to_string(),
+                &update.new_push_name,
+            )?;
+            cs.contacts = true;
+            Ok(())
+        }
+        Event::ContactUpdate(update) => {
+            upsert_contact_names(
+                conn,
+                device_id,
+                &update.jid.to_string(),
+                update.action.full_name.as_deref(),
+                update.action.first_name.as_deref(),
+            )?;
+            cs.contacts = true;
+            Ok(())
+        }
+        Event::PinUpdate(update) => {
+            let pinned_at = update
+                .action
+                .pinned
+                .unwrap_or(false)
+                .then(|| update.timestamp.timestamp_millis());
+            let chat = update.jid.to_string();
+            ensure_chat(conn, device_id, &chat)?;
+            diesel::update(chat_row(device_id, &chat))
+                .set(schema::chats::pinned_at.eq(pinned_at))
+                .execute(conn)?;
+            cs.chats = true;
+            Ok(())
+        }
+        Event::MuteUpdate(update) => {
+            let muted_until = if update.action.muted.unwrap_or(false) {
+                // No end timestamp = muted forever.
+                Some(update.action.mute_end_timestamp.unwrap_or(i64::MAX))
+            } else {
+                None
+            };
+            let chat = update.jid.to_string();
+            ensure_chat(conn, device_id, &chat)?;
+            diesel::update(chat_row(device_id, &chat))
+                .set(schema::chats::muted_until.eq(muted_until))
+                .execute(conn)?;
+            cs.chats = true;
+            Ok(())
+        }
+        Event::ArchiveUpdate(update) => {
+            let chat = update.jid.to_string();
+            ensure_chat(conn, device_id, &chat)?;
+            diesel::update(chat_row(device_id, &chat))
+                .set(schema::chats::archived.eq(update.action.archived.unwrap_or(false)))
+                .execute(conn)?;
+            cs.chats = true;
+            Ok(())
+        }
+        Event::MarkChatAsReadUpdate(update) => {
+            let unread = if update.action.read.unwrap_or(false) {
+                0
+            } else {
+                UNREAD_MARKER
+            };
+            let chat = update.jid.to_string();
+            ensure_chat(conn, device_id, &chat)?;
+            diesel::update(chat_row(device_id, &chat))
+                .set(schema::chats::unread_count.eq(unread))
+                .execute(conn)?;
+            cs.chats = true;
+            Ok(())
+        }
+        Event::StarUpdate(update) => {
+            let chat = update.chat_jid.to_string();
+            diesel::update(message_row(device_id, &chat, &update.message_id))
+                .set(schema::messages::starred.eq(update.action.starred.unwrap_or(false)))
+                .execute(conn)?;
+            cs.message_chats.insert(chat);
+            Ok(())
+        }
+        Event::DeleteChatUpdate(update) => {
+            let chat = update.jid.to_string();
+            delete_chat_rows(conn, device_id, &chat, true)?;
+            diesel::delete(chat_row(device_id, &chat)).execute(conn)?;
+            cs.chats = true;
+            cs.message_chats.insert(chat);
+            Ok(())
+        }
+        Event::ClearChatUpdate(update) => {
+            let chat = update.jid.to_string();
+            delete_chat_rows(conn, device_id, &chat, update.delete_starred)?;
+            diesel::update(chat_row(device_id, &chat))
+                .set((
+                    schema::chats::last_message_preview.eq(None::<String>),
+                    schema::chats::unread_count.eq(0),
+                ))
+                .execute(conn)?;
+            cs.chats = true;
+            cs.message_chats.insert(chat);
+            Ok(())
+        }
+        Event::DeleteMessageForMeUpdate(update) => {
+            let chat = update.chat_jid.to_string();
+            diesel::delete(message_row(device_id, &chat, &update.message_id)).execute(conn)?;
+            diesel::delete(
+                schema::reactions::table.filter(
+                    schema::reactions::device_id
+                        .eq(device_id)
+                        .and(schema::reactions::chat_jid.eq(&chat))
+                        .and(schema::reactions::msg_id.eq(&update.message_id)),
+                ),
+            )
+            .execute(conn)?;
+            cs.message_chats.insert(chat);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn apply_inbound(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    inbound: &InboundMessage,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    let info = &inbound.info;
+    let chat = info.source.chat.to_string();
+    let sender = info.source.sender.to_string();
+    let ts_ms = info.timestamp.timestamp_millis();
+
+    // Live push names ride on every message; keep contacts warm from them.
+    if !info.push_name.is_empty() && !info.source.is_from_me {
+        upsert_contact_push_name(conn, device_id, &sender, &info.push_name)?;
+        cs.contacts = true;
+    }
+
+    match classify(&inbound.message) {
+        MessageOp::Store { kind, text } => {
+            insert_message(
+                conn,
+                device_id,
+                NewMessage {
+                    chat_jid: &chat,
+                    msg_id: &info.id,
+                    sender_jid: &sender,
+                    from_me: info.source.is_from_me,
+                    timestamp_ms: ts_ms,
+                    kind,
+                    text: text.as_deref(),
+                    proto: Some(&inbound.message.encode_to_vec()),
+                    status: if info.source.is_from_me {
+                        wa::web_message_info::Status::SERVER_ACK as i32
+                    } else {
+                        wa::web_message_info::Status::DELIVERY_ACK as i32
+                    },
+                    starred: false,
+                    overwrite: true,
+                },
+            )?;
+            bump_chat(
+                conn,
+                device_id,
+                &chat,
+                ts_ms,
+                text.as_deref(),
+                i32::from(!info.source.is_from_me),
+            )?;
+            cs.chats = true;
+            cs.message_chats.insert(chat);
+        }
+        MessageOp::Reaction { target_id, emoji } => {
+            apply_reaction(conn, device_id, &chat, &target_id, &sender, &emoji, ts_ms)?;
+            cs.message_chats.insert(chat);
+        }
+        MessageOp::Edit {
+            target_id,
+            new_text,
+            new_kind,
+            new_proto,
+        } => {
+            diesel::update(message_row(device_id, &chat, &target_id))
+                .set((
+                    schema::messages::text_content.eq(new_text.as_deref()),
+                    schema::messages::kind.eq(new_kind),
+                    schema::messages::proto.eq(Some(new_proto)),
+                    schema::messages::edited_at_ms.eq(Some(ts_ms)),
+                ))
+                .execute(conn)?;
+            cs.message_chats.insert(chat);
+        }
+        MessageOp::Revoke { target_id } => {
+            diesel::update(message_row(device_id, &chat, &target_id))
+                .set((
+                    schema::messages::revoked.eq(true),
+                    schema::messages::text_content.eq(None::<String>),
+                    schema::messages::proto.eq(None::<Vec<u8>>),
+                ))
+                .execute(conn)?;
+            cs.message_chats.insert(chat);
+        }
+        MessageOp::Ignore => {}
+    }
+    Ok(())
+}
+
+fn apply_reaction(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    target_id: &str,
+    sender: &str,
+    emoji: &str,
+    ts_ms: i64,
+) -> QueryResult<()> {
+    use schema::reactions::dsl;
+    if emoji.is_empty() {
+        diesel::delete(
+            dsl::reactions.filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::chat_jid.eq(chat))
+                    .and(dsl::msg_id.eq(target_id))
+                    .and(dsl::sender_jid.eq(sender)),
+            ),
+        )
+        .execute(conn)?;
+    } else {
+        diesel::insert_into(dsl::reactions)
+            .values((
+                dsl::device_id.eq(device_id),
+                dsl::chat_jid.eq(chat),
+                dsl::msg_id.eq(target_id),
+                dsl::sender_jid.eq(sender),
+                dsl::emoji.eq(emoji),
+                dsl::ts_ms.eq(ts_ms),
+            ))
+            .on_conflict((dsl::device_id, dsl::chat_jid, dsl::msg_id, dsl::sender_jid))
+            .do_update()
+            .set((dsl::emoji.eq(emoji), dsl::ts_ms.eq(ts_ms)))
+            .execute(conn)?;
+    }
+    Ok(())
+}
+
+fn apply_receipt(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    receipt: &wacore::types::events::Receipt,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    let chat = receipt.source.chat.to_string();
+    let ts_ms = receipt.timestamp.timestamp_millis();
+
+    let status = match receipt.r#type {
+        ReceiptType::Delivered => wa::web_message_info::Status::DELIVERY_ACK as i32,
+        ReceiptType::Read => wa::web_message_info::Status::READ as i32,
+        ReceiptType::Played => wa::web_message_info::Status::PLAYED as i32,
+        ReceiptType::ReadSelf | ReceiptType::PlayedSelf => {
+            // Read on another of our devices: the chat is no longer unread.
+            ensure_chat(conn, device_id, &chat)?;
+            diesel::update(chat_row(device_id, &chat))
+                .set(schema::chats::unread_count.eq(0))
+                .execute(conn)?;
+            cs.chats = true;
+            return Ok(());
+        }
+        _ => return Ok(()),
+    };
+
+    let user = receipt.source.sender.to_string();
+    for msg_id in &receipt.message_ids {
+        // Peer receipts only ever advance the delivery state of our own
+        // messages, and never backwards.
+        diesel::update(
+            message_row(device_id, &chat, msg_id).filter(
+                schema::messages::from_me
+                    .eq(true)
+                    .and(schema::messages::status.lt(status)),
+            ),
+        )
+        .set(schema::messages::status.eq(status))
+        .execute(conn)?;
+
+        if receipt.source.is_group {
+            use schema::message_receipts::dsl;
+            diesel::insert_into(dsl::message_receipts)
+                .values((
+                    dsl::device_id.eq(device_id),
+                    dsl::chat_jid.eq(&chat),
+                    dsl::msg_id.eq(msg_id),
+                    dsl::user_jid.eq(&user),
+                    dsl::receipt_type.eq(status),
+                    dsl::ts_ms.eq(ts_ms),
+                ))
+                .on_conflict_do_nothing()
+                .execute(conn)?;
+            // Existing row: advance only (a late "delivered" must not undo "read").
+            diesel::update(
+                dsl::message_receipts.filter(
+                    dsl::device_id
+                        .eq(device_id)
+                        .and(dsl::chat_jid.eq(&chat))
+                        .and(dsl::msg_id.eq(msg_id))
+                        .and(dsl::user_jid.eq(&user))
+                        .and(dsl::receipt_type.lt(status)),
+                ),
+            )
+            .set((dsl::receipt_type.eq(status), dsl::ts_ms.eq(ts_ms)))
+            .execute(conn)?;
+        }
+    }
+    cs.message_chats.insert(chat);
+    Ok(())
+}
+
+fn apply_server_ack(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    ack: &wacore::types::events::ServerAck,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    // Acks cover every stanza class; only message acks map to a stored row.
+    if ack.class.as_deref() != Some("message") || ack.error.is_some() {
+        return Ok(());
+    }
+    use schema::messages::dsl;
+    let updated = diesel::update(
+        dsl::messages.filter(
+            dsl::device_id
+                .eq(device_id)
+                .and(dsl::msg_id.eq(&ack.id))
+                .and(dsl::from_me.eq(true))
+                .and(dsl::status.lt(wa::web_message_info::Status::SERVER_ACK as i32)),
+        ),
+    )
+    .set(dsl::status.eq(wa::web_message_info::Status::SERVER_ACK as i32))
+    .execute(conn)?;
+    if updated > 0
+        && let Some(from) = &ack.from
+    {
+        cs.message_chats.insert(from.to_string());
+    }
+    Ok(())
+}
+
+fn apply_history_sync(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    lazy: &wacore::types::events::LazyHistorySync,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    let mut stream = lazy.stream();
+    loop {
+        let conv = match stream.next_conversation() {
+            Ok(Some(conv)) => conv,
+            Ok(None) => break,
+            Err(e) => {
+                warn!("chat-store: history sync chunk unreadable, skipping: {e}");
+                return Ok(());
+            }
+        };
+        apply_history_conversation(conn, device_id, &conv, cs)?;
+    }
+    match stream.remainder() {
+        Ok(rest) => {
+            for pushname in &rest.pushnames {
+                if let (Some(jid), Some(name)) = (&pushname.id, &pushname.pushname) {
+                    upsert_contact_push_name(conn, device_id, jid, name)?;
+                    cs.contacts = true;
+                }
+            }
+        }
+        Err(e) => warn!("chat-store: history sync remainder unreadable: {e}"),
+    }
+    Ok(())
+}
+
+fn apply_history_conversation(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    conv: &wa::Conversation,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    let chat = conv.id.as_str();
+    let last_ts_ms = conv
+        .conversation_timestamp
+        .map(|s| (s as i64).saturating_mul(1000))
+        .unwrap_or(0);
+
+    {
+        use schema::chats::dsl;
+        let name = conv.name.as_deref().or(conv.display_name.as_deref());
+        diesel::insert_into(dsl::chats)
+            .values((
+                dsl::device_id.eq(device_id),
+                dsl::jid.eq(chat),
+                dsl::name.eq(name),
+                dsl::last_message_ts.eq(last_ts_ms),
+                dsl::unread_count.eq(conv.unread_count.unwrap_or(0) as i32),
+                dsl::pinned_at.eq(conv.pinned.map(|p| p as i64).filter(|&p| p > 0)),
+                dsl::muted_until.eq(conv.mute_end_time.map(|m| m as i64).filter(|&m| m > 0)),
+                dsl::archived.eq(conv.archived.unwrap_or(false)),
+                dsl::ephemeral_expiration.eq(conv.ephemeral_expiration.map(|e| e as i32)),
+            ))
+            .on_conflict((dsl::device_id, dsl::jid))
+            .do_update()
+            // Live rows already track unread/mute/pin; history only refreshes
+            // identity + activity floor.
+            .set((
+                dsl::name.eq(name),
+                dsl::last_message_ts.eq(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+                    "MAX(last_message_ts, excluded.last_message_ts)",
+                )),
+            ))
+            .execute(conn)?;
+    }
+
+    for hist_msg in &conv.messages {
+        let Some(wmi) = hist_msg.message.as_option() else {
+            continue;
+        };
+        apply_history_message(conn, device_id, chat, wmi, cs)?;
+    }
+    cs.chats = true;
+    cs.message_chats.insert(chat.to_string());
+    Ok(())
+}
+
+fn apply_history_message(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    wmi: &wa::WebMessageInfo,
+    cs: &mut ChangeSet,
+) -> QueryResult<()> {
+    let Some(key) = wmi.key.as_option() else {
+        return Ok(());
+    };
+    let Some(msg_id) = key.id.as_deref() else {
+        return Ok(());
+    };
+    let from_me = key.from_me.unwrap_or(false);
+    let sender = wmi
+        .participant
+        .as_deref()
+        .or(key.participant.as_deref())
+        .unwrap_or(if from_me { "" } else { chat });
+    let ts_ms = wmi
+        .message_timestamp
+        .map(|s| (s as i64).saturating_mul(1000))
+        .unwrap_or(0);
+
+    if let Some(name) = wmi.push_name.as_deref()
+        && !name.is_empty()
+        && !from_me
+        && !sender.is_empty()
+    {
+        upsert_contact_push_name(conn, device_id, sender, name)?;
+        cs.contacts = true;
+    }
+
+    if let Some(message) = wmi.message.as_option() {
+        match classify(message) {
+            MessageOp::Store { kind, text } => {
+                insert_message(
+                    conn,
+                    device_id,
+                    NewMessage {
+                        chat_jid: chat,
+                        msg_id,
+                        sender_jid: sender,
+                        from_me,
+                        timestamp_ms: ts_ms,
+                        kind,
+                        text: text.as_deref(),
+                        proto: Some(&message.encode_to_vec()),
+                        status: wmi
+                            .status
+                            .map(|s| s as i32)
+                            .unwrap_or(wa::web_message_info::Status::PENDING as i32),
+                        starred: wmi.starred.unwrap_or(false),
+                        // History is the stale copy: live rows win.
+                        overwrite: false,
+                    },
+                )?;
+            }
+            MessageOp::Reaction { target_id, emoji } => {
+                apply_reaction(conn, device_id, chat, &target_id, sender, &emoji, ts_ms)?;
+            }
+            MessageOp::Edit {
+                target_id,
+                new_text,
+                new_kind,
+                new_proto,
+            } => {
+                diesel::update(message_row(device_id, chat, &target_id))
+                    .set((
+                        schema::messages::text_content.eq(new_text.as_deref()),
+                        schema::messages::kind.eq(new_kind),
+                        schema::messages::proto.eq(Some(new_proto)),
+                        schema::messages::edited_at_ms.eq(Some(ts_ms)),
+                    ))
+                    .execute(conn)?;
+            }
+            MessageOp::Revoke { target_id } => {
+                diesel::update(message_row(device_id, chat, &target_id))
+                    .set((
+                        schema::messages::revoked.eq(true),
+                        schema::messages::text_content.eq(None::<String>),
+                        schema::messages::proto.eq(None::<Vec<u8>>),
+                    ))
+                    .execute(conn)?;
+            }
+            MessageOp::Ignore => {}
+        }
+    }
+
+    // Reactions the server aggregated onto the target message.
+    for reaction in &wmi.reactions {
+        let Some(text) = reaction.text.as_deref() else {
+            continue;
+        };
+        let reactor = reaction
+            .key
+            .as_option()
+            .and_then(|k| {
+                if k.from_me.unwrap_or(false) {
+                    Some("")
+                } else {
+                    k.participant.as_deref().or(k.remote_jid.as_deref())
+                }
+            })
+            .unwrap_or("");
+        let reaction_ts = reaction.sender_timestamp_ms.unwrap_or(ts_ms);
+        apply_reaction(conn, device_id, chat, msg_id, reactor, text, reaction_ts)?;
+    }
+    Ok(())
+}
+
+struct NewMessage<'a> {
+    chat_jid: &'a str,
+    msg_id: &'a str,
+    sender_jid: &'a str,
+    from_me: bool,
+    timestamp_ms: i64,
+    kind: &'a str,
+    text: Option<&'a str>,
+    proto: Option<&'a [u8]>,
+    status: i32,
+    starred: bool,
+    /// Live redeliveries refresh content in place (PDO recovery replaces an
+    /// `undecryptable` placeholder); history-sync copies never clobber live rows.
+    overwrite: bool,
+}
+
+fn insert_message(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    new: NewMessage<'_>,
+) -> QueryResult<()> {
+    use schema::messages::dsl;
+    let values = (
+        dsl::device_id.eq(device_id),
+        dsl::chat_jid.eq(new.chat_jid),
+        dsl::msg_id.eq(new.msg_id),
+        dsl::sender_jid.eq(new.sender_jid),
+        dsl::from_me.eq(new.from_me),
+        dsl::timestamp_ms.eq(new.timestamp_ms),
+        dsl::kind.eq(new.kind),
+        dsl::text_content.eq(new.text),
+        dsl::proto.eq(new.proto),
+        dsl::status.eq(new.status),
+        dsl::starred.eq(new.starred),
+    );
+    let insert = diesel::insert_into(dsl::messages).values(values);
+    if new.overwrite {
+        insert
+            .on_conflict((dsl::device_id, dsl::chat_jid, dsl::msg_id))
+            .do_update()
+            .set((
+                dsl::kind.eq(new.kind),
+                dsl::text_content.eq(new.text),
+                dsl::proto.eq(new.proto),
+                dsl::revoked.eq(false),
+            ))
+            .execute(conn)?;
+    } else {
+        insert
+            .on_conflict((dsl::device_id, dsl::chat_jid, dsl::msg_id))
+            .do_nothing()
+            .execute(conn)?;
+    }
+    Ok(())
+}
+
+/// Refresh a chat's activity row for a message at `ts_ms`: creates the row if
+/// missing, advances ordering/preview only for newer messages, and bumps the
+/// unread counter by `unread_delta` (unless manually marked unread).
+fn bump_chat(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    ts_ms: i64,
+    preview: Option<&str>,
+    unread_delta: i32,
+) -> QueryResult<()> {
+    use schema::chats::dsl;
+    ensure_chat(conn, device_id, chat)?;
+    diesel::update(chat_row(device_id, chat).filter(dsl::last_message_ts.le(ts_ms)))
+        .set((
+            dsl::last_message_ts.eq(ts_ms),
+            dsl::last_message_preview.eq(preview),
+        ))
+        .execute(conn)?;
+    if unread_delta != 0 {
+        diesel::update(chat_row(device_id, chat).filter(dsl::unread_count.ge(0)))
+            .set(dsl::unread_count.eq(dsl::unread_count + unread_delta))
+            .execute(conn)?;
+    }
+    Ok(())
+}
+
+fn ensure_chat(conn: &mut SqliteConnection, device_id: i32, chat: &str) -> QueryResult<()> {
+    use schema::chats::dsl;
+    diesel::insert_into(dsl::chats)
+        .values((dsl::device_id.eq(device_id), dsl::jid.eq(chat)))
+        .on_conflict_do_nothing()
+        .execute(conn)?;
+    Ok(())
+}
+
+fn upsert_contact_push_name(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    jid: &str,
+    push_name: &str,
+) -> QueryResult<()> {
+    use schema::contacts::dsl;
+    diesel::insert_into(dsl::contacts)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::jid.eq(jid),
+            dsl::push_name.eq(push_name),
+        ))
+        .on_conflict((dsl::device_id, dsl::jid))
+        .do_update()
+        .set(dsl::push_name.eq(push_name))
+        .execute(conn)?;
+    Ok(())
+}
+
+fn upsert_contact_names(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    jid: &str,
+    full_name: Option<&str>,
+    first_name: Option<&str>,
+) -> QueryResult<()> {
+    use schema::contacts::dsl;
+    diesel::insert_into(dsl::contacts)
+        .values((
+            dsl::device_id.eq(device_id),
+            dsl::jid.eq(jid),
+            dsl::full_name.eq(full_name),
+            dsl::first_name.eq(first_name),
+        ))
+        .on_conflict((dsl::device_id, dsl::jid))
+        .do_update()
+        .set((dsl::full_name.eq(full_name), dsl::first_name.eq(first_name)))
+        .execute(conn)?;
+    Ok(())
+}
+
+/// Delete a chat's message rows (and their reactions/receipts). With
+/// `delete_starred = false`, starred messages and their satellites survive.
+fn delete_chat_rows(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    delete_starred: bool,
+) -> QueryResult<()> {
+    use schema::messages::dsl as m;
+    let base =
+        diesel::delete(m::messages.filter(m::device_id.eq(device_id).and(m::chat_jid.eq(chat))));
+    if delete_starred {
+        base.execute(conn)?;
+    } else {
+        base.filter(m::starred.eq(false)).execute(conn)?;
+    }
+    // Satellites of messages that no longer exist.
+    diesel::sql_query(
+        "DELETE FROM reactions WHERE device_id = ? AND chat_jid = ? AND msg_id NOT IN \
+         (SELECT msg_id FROM messages WHERE device_id = ? AND chat_jid = ?)",
+    )
+    .bind::<diesel::sql_types::Integer, _>(device_id)
+    .bind::<diesel::sql_types::Text, _>(chat)
+    .bind::<diesel::sql_types::Integer, _>(device_id)
+    .bind::<diesel::sql_types::Text, _>(chat)
+    .execute(conn)?;
+    diesel::sql_query(
+        "DELETE FROM message_receipts WHERE device_id = ? AND chat_jid = ? AND msg_id NOT IN \
+         (SELECT msg_id FROM messages WHERE device_id = ? AND chat_jid = ?)",
+    )
+    .bind::<diesel::sql_types::Integer, _>(device_id)
+    .bind::<diesel::sql_types::Text, _>(chat)
+    .bind::<diesel::sql_types::Integer, _>(device_id)
+    .bind::<diesel::sql_types::Text, _>(chat)
+    .execute(conn)?;
+    Ok(())
+}
+
+type ChatRowFilter<'a> = diesel::dsl::Filter<
+    schema::chats::table,
+    diesel::dsl::And<
+        diesel::dsl::Eq<schema::chats::device_id, i32>,
+        diesel::dsl::Eq<schema::chats::jid, &'a str>,
+    >,
+>;
+
+fn chat_row(device_id: i32, chat: &str) -> ChatRowFilter<'_> {
+    schema::chats::table.filter(
+        schema::chats::device_id
+            .eq(device_id)
+            .and(schema::chats::jid.eq(chat)),
+    )
+}
+
+type MessageRowFilter<'a> = diesel::dsl::Filter<
+    schema::messages::table,
+    diesel::dsl::And<
+        diesel::dsl::And<
+            diesel::dsl::Eq<schema::messages::device_id, i32>,
+            diesel::dsl::Eq<schema::messages::chat_jid, &'a str>,
+        >,
+        diesel::dsl::Eq<schema::messages::msg_id, &'a str>,
+    >,
+>;
+
+fn message_row<'a>(device_id: i32, chat: &'a str, msg_id: &'a str) -> MessageRowFilter<'a> {
+    schema::messages::table.filter(
+        schema::messages::device_id
+            .eq(device_id)
+            .and(schema::messages::chat_jid.eq(chat))
+            .and(schema::messages::msg_id.eq(msg_id)),
+    )
+}
