@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use wacore::store::error::StoreError;
 use wacore::types::events::{Event, EventHandler, EventInterest, EventKind, InboundMessage};
 use wacore::types::presence::ReceiptType;
-use wacore_binary::Jid;
+use wacore_binary::{Jid, JidExt as _};
 use waproto::whatsapp as wa;
 use whatsapp_rust_sqlite_storage::{SharedSqlite, SqliteStore};
 
@@ -944,10 +944,36 @@ fn apply_receipt(
         ReceiptType::Read => wa::web_message_info::Status::READ as i32,
         ReceiptType::Played => wa::web_message_info::Status::PLAYED as i32,
         ReceiptType::ReadSelf | ReceiptType::PlayedSelf => {
-            // Read on another of our devices: the chat is no longer unread.
+            // Read on another of our devices — up to the covered messages.
+            // WA read state is "read up to X": the boundary is the newest
+            // covered row (falling back to the receipt's own timestamp), and
+            // anything we materialized past it keeps its unread badge (a
+            // delayed offline receipt must not swallow newer messages).
+            use schema::messages::dsl;
+            let covered_max: Option<Option<i64>> = dsl::messages
+                .filter(
+                    dsl::device_id
+                        .eq(device_id)
+                        .and(dsl::chat_jid.eq(&chat))
+                        .and(dsl::msg_id.eq_any(&receipt.message_ids)),
+                )
+                .select(diesel::dsl::max(dsl::timestamp_ms))
+                .first(conn)
+                .optional()?;
+            let boundary_ms = covered_max.flatten().unwrap_or(ts_ms);
+            let unread: i64 = dsl::messages
+                .filter(
+                    dsl::device_id
+                        .eq(device_id)
+                        .and(dsl::chat_jid.eq(&chat))
+                        .and(dsl::from_me.eq(false))
+                        .and(dsl::timestamp_ms.gt(boundary_ms)),
+                )
+                .count()
+                .get_result(conn)?;
             ensure_chat(conn, device_id, &chat)?;
             diesel::update(chat_row(device_id, &chat))
-                .set(schema::chats::unread_count.eq(0))
+                .set(schema::chats::unread_count.eq(unread.min(i32::MAX as i64) as i32))
                 .execute(conn)?;
             cs.chats = true;
             return Ok(());
@@ -969,7 +995,9 @@ fn apply_receipt(
         .set(schema::messages::status.eq(status))
         .execute(conn)?;
 
-        if receipt.source.is_group {
+        // Derived from the JID: the library's receipt parser leaves
+        // `source.is_group` defaulted, so the flag can't be trusted here.
+        if receipt.source.chat.is_group() {
             use schema::message_receipts::dsl;
             diesel::insert_into(dsl::message_receipts)
                 .values((

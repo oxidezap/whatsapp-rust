@@ -594,10 +594,11 @@ async fn group_receipts_track_per_user_state() {
         &chat_store,
         [Event::Receipt(
             Receipt::builder()
+                // Production receipts leave is_group defaulted (false); the
+                // store must derive groupness from the chat JID.
                 .source(MessageSource {
                     chat: group.clone(),
                     sender: jid(alice),
-                    is_group: true,
                     ..Default::default()
                 })
                 .message_ids(vec!["OUT-G".to_string()])
@@ -1332,21 +1333,21 @@ async fn ranged_clear_and_delete_keep_newer_messages() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);
 
-    let seed = |chat_store: &Arc<ChatStore>| {
-        let a = message_event(
-            wa::Message::text("old"),
-            incoming_info(PEER, PEER, "MSG-O", 1_700_000_000),
-        );
-        let b = message_event(
-            wa::Message::text("newer than the action"),
-            incoming_info(PEER, PEER, "MSG-N", 1_700_000_100),
-        );
-        (chat_store.clone(), [a, b])
-    };
-
     // Ranged clear: only rows up to the boundary go away.
-    let (cs, events) = seed(&chat_store);
-    feed(&cs, events).await;
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("old"),
+                incoming_info(PEER, PEER, "MSG-O", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("newer than the action"),
+                incoming_info(PEER, PEER, "MSG-N", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
     feed(
         &chat_store,
         [Event::ClearChatUpdate(
@@ -1666,5 +1667,47 @@ async fn ranged_clear_keeps_unread_survivors_counted() {
 
     // The survivor is still there AND still counted as unread.
     assert!(chat_store.message(&chat, "MSG-UN").await.unwrap().is_some());
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn delayed_read_self_keeps_newer_unread() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("read on the phone"),
+                incoming_info(PEER, PEER, "MSG-RS1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("arrived after the read"),
+                incoming_info(PEER, PEER, "MSG-RS2", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 2);
+
+    // Offline-delayed read-self covering only the FIRST message: the second
+    // one keeps its badge.
+    feed(
+        &chat_store,
+        [Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: jid(PEER),
+                    sender: jid(PEER),
+                    ..Default::default()
+                })
+                .message_ids(vec!["MSG-RS1".to_string()])
+                .timestamp(Utc.timestamp_opt(1_700_000_050, 0).unwrap())
+                .r#type(ReceiptType::ReadSelf)
+                .offline(true)
+                .build(),
+        )],
+    )
+    .await;
     assert_eq!(chat_store.unread_total().await.unwrap(), 1);
 }
