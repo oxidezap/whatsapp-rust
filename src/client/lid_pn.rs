@@ -139,6 +139,16 @@ impl Client {
 
     /// Awaits the persist + any device/session migrations. Hot paths should
     /// prefer [`learn_lid_pn_mapping_fast`].
+    ///
+    /// Public so embedders can feed in pairs the library never observes
+    /// itself — e.g. app-state `ContactAction` mutations, which carry
+    /// `lidJid`/`pnJid` for the user's address-book contacts — instead of
+    /// writing the backend mapping table behind the cache's back.
+    ///
+    /// `lid` and `phone_number` are bare user parts (no `@lid` /
+    /// `@s.whatsapp.net` server, no device suffix). Pick the
+    /// [`LearningSource`] that matches where the pair came from;
+    /// [`LearningSource::Other`] covers sources without a dedicated variant.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -148,7 +158,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub(crate) async fn add_lid_pn_mapping(
+    pub async fn add_lid_pn_mapping(
         &self,
         lid: &str,
         phone_number: &str,
