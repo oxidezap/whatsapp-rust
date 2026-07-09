@@ -1191,3 +1191,91 @@ async fn fts_backfills_rows_that_predate_the_index() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, "MSG-BF");
 }
+
+#[tokio::test]
+async fn forever_mute_is_not_reported_as_unmuted() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("hi"),
+                incoming_info(PEER, PEER, "MSG-M", 1_700_000_000),
+            ),
+            Event::MuteUpdate(
+                wacore::types::events::MuteUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(Utc.timestamp_opt(1_700_000_100, 0).unwrap())
+                    // muted with no end timestamp = muted forever
+                    .action(Box::new(wa::sync_action_value::MuteAction {
+                        muted: Some(true),
+                        ..Default::default()
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    let muted_until = chats[0].muted_until.expect("forever mute must be Some");
+    assert!(muted_until > wacore::time::now_utc());
+    assert_eq!(muted_until, chrono::DateTime::<Utc>::MAX_UTC);
+}
+
+#[tokio::test]
+async fn clear_chat_reflects_surviving_starred_messages() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("starred survivor"),
+                incoming_info(PEER, PEER, "MSG-S1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("cleared away"),
+                incoming_info(PEER, PEER, "MSG-S2", 1_700_000_100),
+            ),
+            Event::StarUpdate(
+                wacore::types::events::StarUpdate::builder()
+                    .chat_jid(chat.clone())
+                    .message_id("MSG-S1".to_string())
+                    .from_me(false)
+                    .timestamp(Utc.timestamp_opt(1_700_000_200, 0).unwrap())
+                    .action(Box::new(wa::sync_action_value::StarAction {
+                        starred: Some(true),
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            Event::ClearChatUpdate(
+                wacore::types::events::ClearChatUpdate::builder()
+                    .jid(chat.clone())
+                    .delete_starred(false)
+                    .delete_media(false)
+                    .timestamp(Utc.timestamp_opt(1_700_000_300, 0).unwrap())
+                    .action(Box::new(wa::sync_action_value::ClearChatAction::default()))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+
+    // The starred message survives and becomes the preview (not a blank one
+    // with the deleted message's stale kind).
+    assert!(chat_store.message(&chat, "MSG-S1").await.unwrap().is_some());
+    assert!(chat_store.message(&chat, "MSG-S2").await.unwrap().is_none());
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(
+        chats[0].last_message_preview.as_deref(),
+        Some("starred survivor")
+    );
+    assert_eq!(chats[0].last_message_kind, Some(MessageKind::Text));
+    assert_eq!(chats[0].unread_count, 0);
+}

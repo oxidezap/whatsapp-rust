@@ -73,7 +73,16 @@ impl From<ChatRow> for ChatEntry {
             last_message_kind: row.last_message_kind.map(MessageKind::from_db),
             unread_count: row.unread_count,
             pinned_at: row.pinned_at.and_then(ms_to_utc),
-            muted_until: row.muted_until.and_then(ms_to_utc),
+            // The writer stores i64::MAX for "muted forever"; that value is
+            // outside DateTime's range, and silently mapping it to None would
+            // make a forever-muted chat read as unmuted.
+            muted_until: row.muted_until.and_then(|ms| {
+                if ms == i64::MAX {
+                    Some(DateTime::<Utc>::MAX_UTC)
+                } else {
+                    ms_to_utc(ms)
+                }
+            }),
             archived: row.archived,
             ephemeral_expiration: row.ephemeral_expiration.map(|e| e as u32),
         }

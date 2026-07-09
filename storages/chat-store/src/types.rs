@@ -118,6 +118,7 @@ pub struct ChatEntry {
     /// `-1` means "manually marked unread" (WA Web convention).
     pub unread_count: i32,
     pub pinned_at: Option<DateTime<Utc>>,
+    /// `Some(DateTime::MAX_UTC)` = muted forever (no expiry).
     pub muted_until: Option<DateTime<Utc>>,
     pub archived: bool,
     pub ephemeral_expiration: Option<u32>,

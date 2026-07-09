@@ -208,14 +208,23 @@ async fn writer_loop(
         let mut batch = Vec::with_capacity(8);
         let mut flushes = Vec::new();
         let mut batch_error = None;
+        // A Flush is a batch BARRIER: stop draining there, so writes enqueued
+        // after a caller's flush() can neither commit ahead of that call's
+        // answer nor drag the awaited writes down with a later failure.
         let mut queue_msg = |msg: WriterMsg, batch: &mut Vec<WriterMsg>| match msg {
-            WriterMsg::Flush(done) => flushes.push(done),
-            other => batch.push(other),
+            WriterMsg::Flush(done) => {
+                flushes.push(done);
+                true
+            }
+            other => {
+                batch.push(other);
+                false
+            }
         };
-        queue_msg(first, &mut batch);
-        while batch.len() < BATCH_MAX {
+        let mut at_barrier = queue_msg(first, &mut batch);
+        while !at_barrier && batch.len() < BATCH_MAX {
             match rx.try_recv() {
-                Ok(msg) => queue_msg(msg, &mut batch),
+                Ok(msg) => at_barrier = queue_msg(msg, &mut batch),
                 Err(_) => break,
             }
         }
@@ -465,11 +474,11 @@ fn apply_event(
         Event::ClearChatUpdate(update) => {
             let chat = update.jid.to_string();
             delete_chat_rows(conn, device_id, &chat, update.delete_starred)?;
+            // Starred rows may survive the clear: the preview/kind must
+            // reflect the newest survivor, not go blank (or keep stale kind).
+            recompute_chat_preview(conn, device_id, &chat)?;
             diesel::update(chat_row(device_id, &chat))
-                .set((
-                    schema::chats::last_message_preview.eq(None::<String>),
-                    schema::chats::unread_count.eq(0),
-                ))
+                .set(schema::chats::unread_count.eq(0))
                 .execute(conn)?;
             cs.chats = true;
             cs.message_chats.insert(chat);
