@@ -706,6 +706,11 @@ fn refresh_preview_if_latest(
 
 /// Re-derive the chat-list preview from the newest remaining message (used
 /// after deletions, where the previewed row may be gone).
+///
+/// `last_message_ts` is deliberately NOT recomputed: it models the chat's
+/// activity (list position), which WhatsApp keeps in place when the latest
+/// message is deleted-for-me. Newest-row time is derivable via
+/// `messages(chat, None, 1)` if a consumer ever needs it.
 fn recompute_chat_preview(
     conn: &mut SqliteConnection,
     device_id: i32,
