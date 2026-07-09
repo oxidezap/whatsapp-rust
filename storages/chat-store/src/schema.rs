@@ -5,6 +5,7 @@ diesel::table! {
         name -> Nullable<Text>,
         last_message_ts -> BigInt,
         last_message_preview -> Nullable<Text>,
+        last_message_kind -> Nullable<Text>,
         unread_count -> Integer,
         pinned_at -> Nullable<BigInt>,
         muted_until -> Nullable<BigInt>,

@@ -8,6 +8,7 @@ CREATE TABLE chats (
     name TEXT,
     last_message_ts BIGINT NOT NULL DEFAULT 0,
     last_message_preview TEXT,
+    last_message_kind TEXT,
     -- -1 = manually marked unread (WA Web convention)
     unread_count INTEGER NOT NULL DEFAULT 0,
     pinned_at BIGINT,

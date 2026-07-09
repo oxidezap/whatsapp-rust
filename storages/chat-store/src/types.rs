@@ -2,6 +2,81 @@ use chrono::{DateTime, Utc};
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
+/// Content class of a stored message: one label per renderable bubble type,
+/// shared by every frontend (desktop, TUI, mobile) so none of them hard-codes
+/// label strings. Stored as text in the database; [`Other`](Self::Other)
+/// round-trips labels written by a newer crate version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MessageKind {
+    Text,
+    Image,
+    Video,
+    /// Round video note ("ptv").
+    VideoNote,
+    Audio,
+    /// Push-to-talk voice note ("ptt").
+    VoiceNote,
+    Sticker,
+    Document,
+    Contact,
+    Location,
+    Poll,
+    Event,
+    GroupInvite,
+    /// Placeholder for a message that could not be decrypted (yet).
+    Undecryptable,
+    /// Real content this crate version doesn't classify.
+    Unknown,
+    /// A database label written by a newer crate version.
+    Other(String),
+}
+
+impl MessageKind {
+    /// The database label. Stable: these are on-disk values.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::VideoNote => "ptv",
+            Self::Audio => "audio",
+            Self::VoiceNote => "ptt",
+            Self::Sticker => "sticker",
+            Self::Document => "document",
+            Self::Contact => "contact",
+            Self::Location => "location",
+            Self::Poll => "poll",
+            Self::Event => "event",
+            Self::GroupInvite => "group_invite",
+            Self::Undecryptable => "undecryptable",
+            Self::Unknown => "unknown",
+            Self::Other(label) => label,
+        }
+    }
+
+    pub(crate) fn from_db(label: String) -> Self {
+        match label.as_str() {
+            "text" => Self::Text,
+            "image" => Self::Image,
+            "video" => Self::Video,
+            "ptv" => Self::VideoNote,
+            "audio" => Self::Audio,
+            "ptt" => Self::VoiceNote,
+            "sticker" => Self::Sticker,
+            "document" => Self::Document,
+            "contact" => Self::Contact,
+            "location" => Self::Location,
+            "poll" => Self::Poll,
+            "event" => Self::Event,
+            "group_invite" => Self::GroupInvite,
+            "undecryptable" => Self::Undecryptable,
+            "unknown" => Self::Unknown,
+            _ => Self::Other(label),
+        }
+    }
+}
+
 /// Delivery state of a stored message, on the same scale WhatsApp itself uses
 /// (`WebMessageInfo.Status`), so history-sync statuses map through unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -36,6 +111,10 @@ pub struct ChatEntry {
     pub name: Option<String>,
     pub last_message_at: Option<DateTime<Utc>>,
     pub last_message_preview: Option<String>,
+    /// Content class of the latest message, so a media preview can render as
+    /// "[photo]"/"[voice note]" in whatever way (and language) the frontend
+    /// chooses — the store never bakes in presentation strings.
+    pub last_message_kind: Option<MessageKind>,
     /// `-1` means "manually marked unread" (WA Web convention).
     pub unread_count: i32,
     pub pinned_at: Option<DateTime<Utc>>,
@@ -54,7 +133,7 @@ pub struct StoredMessage {
     pub sender_jid: Jid,
     pub from_me: bool,
     pub timestamp: DateTime<Utc>,
-    pub kind: String,
+    pub kind: MessageKind,
     pub text: Option<String>,
     pub message: Option<Box<wa::Message>>,
     pub status: MessageStatus,

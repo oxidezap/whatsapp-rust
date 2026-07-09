@@ -28,9 +28,10 @@ pub(crate) enum MessageOp {
     Ignore,
 }
 
-/// UI-facing content class, derived from the unwrapped message. Coarser than
-/// the proto (one label per renderable bubble type), finer than WA's stanza
-/// `type` attribute (which collapses everything to text/media).
+/// Content class of the unwrapped message, as a database label (the typed
+/// read-model view is [`MessageKind`](crate::types::MessageKind)). Coarser
+/// than the proto (one label per renderable bubble type), finer than WA's
+/// stanza `type` attribute (which collapses everything to text/media).
 pub(crate) fn message_kind(base: &wa::Message) -> &'static str {
     if base.conversation.is_some() || base.extended_text_message.is_set() {
         "text"

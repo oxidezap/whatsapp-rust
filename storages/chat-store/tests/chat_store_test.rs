@@ -15,7 +15,7 @@ use wacore::types::message::{MessageInfo, MessageSource};
 use wacore::types::presence::ReceiptType;
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
-use whatsapp_rust_chat_store::{ChatStore, MessageStatus, StoreChange};
+use whatsapp_rust_chat_store::{ChatStore, MessageKind, MessageStatus, StoreChange};
 use whatsapp_rust_sqlite_storage::SqliteStore;
 
 const PEER: &str = "559900000001@s.whatsapp.net";
@@ -93,7 +93,7 @@ async fn live_text_message_materializes_chat_and_message() {
     assert_eq!(messages.len(), 1);
     let msg = &messages[0];
     assert_eq!(msg.id, "MSG-1");
-    assert_eq!(msg.kind, "text");
+    assert_eq!(msg.kind, MessageKind::Text);
     assert_eq!(msg.text.as_deref(), Some("olá"));
     assert!(!msg.from_me);
     // The stored proto round-trips.
@@ -438,6 +438,9 @@ async fn history_sync_materializes_without_clobbering_live_rows() {
         .find(|c| c.jid == jid(PEER))
         .expect("alice chat");
     assert_eq!(alice.name.as_deref(), Some("Alice"));
+    // History backfills the denormalized preview (newest materialized row).
+    assert_eq!(alice.last_message_preview.as_deref(), Some("sent"));
+    assert_eq!(alice.last_message_kind, Some(MessageKind::Text));
     // Seconds-to-ms conversion: a future mute/pin must not decode as 1970.
     let muted = chats
         .iter()
@@ -482,7 +485,7 @@ async fn undecryptable_placeholder_is_replaced_by_recovery() {
     )
     .await;
     let placeholder = chat_store.message(&chat, "MSG-U").await.unwrap().unwrap();
-    assert_eq!(placeholder.kind, "undecryptable");
+    assert_eq!(placeholder.kind, MessageKind::Undecryptable);
     assert!(placeholder.message.is_none());
 
     // PDO/retry later recovers the real content under the same id.
@@ -492,7 +495,7 @@ async fn undecryptable_placeholder_is_replaced_by_recovery() {
     )
     .await;
     let recovered = chat_store.message(&chat, "MSG-U").await.unwrap().unwrap();
-    assert_eq!(recovered.kind, "text");
+    assert_eq!(recovered.kind, MessageKind::Text);
     assert_eq!(recovered.text.as_deref(), Some("recovered"));
 }
 

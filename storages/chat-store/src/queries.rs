@@ -15,8 +15,8 @@ use crate::error::{Result, db_err};
 use crate::schema;
 use crate::store::ChatStore;
 use crate::types::{
-    ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageStatus, ReactionEntry, ReceiptEntry,
-    StoredMessage,
+    ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind, MessageStatus, ReactionEntry,
+    ReceiptEntry, StoredMessage,
 };
 
 fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
@@ -53,6 +53,7 @@ struct ChatRow {
     name: Option<String>,
     last_message_ts: i64,
     last_message_preview: Option<String>,
+    last_message_kind: Option<String>,
     unread_count: i32,
     pinned_at: Option<i64>,
     muted_until: Option<i64>,
@@ -69,6 +70,7 @@ impl From<ChatRow> for ChatEntry {
                 .then(|| ms_to_utc(row.last_message_ts))
                 .flatten(),
             last_message_preview: row.last_message_preview,
+            last_message_kind: row.last_message_kind.map(MessageKind::from_db),
             unread_count: row.unread_count,
             pinned_at: row.pinned_at.and_then(ms_to_utc),
             muted_until: row.muted_until.and_then(ms_to_utc),
@@ -117,7 +119,7 @@ impl From<MessageRow> for StoredMessage {
             sender_jid: parse_jid(&row.sender_jid),
             from_me: row.from_me,
             timestamp: ms_to_utc(row.timestamp_ms).unwrap_or_default(),
-            kind: row.kind,
+            kind: MessageKind::from_db(row.kind),
             text: row.text_content,
             message,
             status: MessageStatus::from_raw(row.status),
@@ -129,8 +131,10 @@ impl From<MessageRow> for StoredMessage {
 }
 
 impl ChatStore {
-    /// Chat list in display order: pinned first (most recently pinned on top),
-    /// then by latest activity.
+    /// Chat list in a sensible default order (pinned first, then latest
+    /// activity). Purely a default: every ordering input (`pinned_at`,
+    /// `last_message_at`, `archived`, ...) is on [`ChatEntry`], so a frontend
+    /// with different needs re-sorts freely.
     pub async fn chats(&self, include_archived: bool, limit: i64) -> Result<Vec<ChatEntry>> {
         use schema::chats::dsl;
         // A negative LIMIT means "unbounded" to SQLite; never let that happen.

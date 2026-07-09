@@ -307,6 +307,7 @@ fn apply_writer_msg(
                 &chat_str,
                 *timestamp_ms,
                 text.as_deref(),
+                Some(kind),
                 0,
             )?;
             cs.chats = true;
@@ -358,6 +359,7 @@ fn apply_event(
                 &chat,
                 undec.info.timestamp.timestamp_millis(),
                 None,
+                Some(KIND_UNDECRYPTABLE),
                 i32::from(inserted && !undec.info.source.is_from_me),
             )?;
             cs.chats = true;
@@ -541,7 +543,15 @@ fn apply_inbound(
             // A refreshed row (redelivery, PDO recovery of a placeholder that
             // already counted) must not inflate the unread badge again.
             let unread_delta = i32::from(inserted && !info.source.is_from_me);
-            bump_chat(conn, device_id, &chat, ts_ms, text.as_deref(), unread_delta)?;
+            bump_chat(
+                conn,
+                device_id,
+                &chat,
+                ts_ms,
+                text.as_deref(),
+                Some(kind),
+                unread_delta,
+            )?;
             cs.chats = true;
             cs.message_chats.insert(chat);
         }
@@ -609,7 +619,7 @@ fn apply_edit(
     if updated == 0 {
         return Ok(false);
     }
-    refresh_preview_if_latest(conn, device_id, chat, target_id, new_text)
+    refresh_preview_if_latest(conn, device_id, chat, target_id, new_text, Some(new_kind))
 }
 
 /// Tombstone the target row. A revoke arriving before its content (offline
@@ -647,7 +657,7 @@ fn apply_revoke(
             .execute(conn)?;
         return Ok(false);
     }
-    refresh_preview_if_latest(conn, device_id, chat, target_id, None)
+    refresh_preview_if_latest(conn, device_id, chat, target_id, None, None)
 }
 
 /// When `msg_id` is the chat's most recent message, replace the denormalized
@@ -658,6 +668,7 @@ fn refresh_preview_if_latest(
     chat: &str,
     msg_id: &str,
     preview: Option<&str>,
+    kind: Option<&str>,
 ) -> QueryResult<bool> {
     use schema::messages::dsl;
     let ts: Option<i64> = message_row(device_id, chat, msg_id)
@@ -669,7 +680,10 @@ fn refresh_preview_if_latest(
     };
     let updated =
         diesel::update(chat_row(device_id, chat).filter(schema::chats::last_message_ts.le(ts)))
-            .set(schema::chats::last_message_preview.eq(preview))
+            .set((
+                schema::chats::last_message_preview.eq(preview),
+                schema::chats::last_message_kind.eq(kind),
+            ))
             .execute(conn)?;
     Ok(updated > 0)
 }
@@ -682,14 +696,21 @@ fn recompute_chat_preview(
     chat: &str,
 ) -> QueryResult<()> {
     use schema::messages::dsl;
-    let newest: Option<Option<String>> = dsl::messages
+    let newest: Option<(Option<String>, String)> = dsl::messages
         .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(chat)))
         .order((dsl::timestamp_ms.desc(), dsl::msg_id.desc()))
-        .select(dsl::text_content)
+        .select((dsl::text_content, dsl::kind))
         .first(conn)
         .optional()?;
+    let (preview, kind) = match newest {
+        Some((text, kind)) => (text, Some(kind)),
+        None => (None, None),
+    };
     diesel::update(chat_row(device_id, chat))
-        .set(schema::chats::last_message_preview.eq(newest.flatten()))
+        .set((
+            schema::chats::last_message_preview.eq(preview),
+            schema::chats::last_message_kind.eq(kind),
+        ))
         .execute(conn)?;
     Ok(())
 }
@@ -942,6 +963,9 @@ fn apply_history_conversation(
         };
         apply_history_message(conn, device_id, chat, wmi, cs)?;
     }
+    // Backfill the denormalized preview from the newest materialized row, so a
+    // freshly-paired client's chat list isn't blank until live traffic.
+    recompute_chat_preview(conn, device_id, chat)?;
     cs.chats = true;
     cs.message_chats.insert(chat.to_string());
     Ok(())
@@ -1124,6 +1148,7 @@ fn bump_chat(
     chat: &str,
     ts_ms: i64,
     preview: Option<&str>,
+    kind: Option<&str>,
     unread_delta: i32,
 ) -> QueryResult<()> {
     use schema::chats::dsl;
@@ -1132,6 +1157,7 @@ fn bump_chat(
         .set((
             dsl::last_message_ts.eq(ts_ms),
             dsl::last_message_preview.eq(preview),
+            dsl::last_message_kind.eq(kind),
         ))
         .execute(conn)?;
     if unread_delta != 0 {
