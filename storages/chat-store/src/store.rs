@@ -223,8 +223,33 @@ fn range_bound(
     })
 }
 
+/// The chat's monotonic self-read cursor (0 when the chat row doesn't exist).
+fn read_cursor(conn: &mut SqliteConnection, device_id: i32, chat: &str) -> QueryResult<i64> {
+    Ok(chat_row(device_id, chat)
+        .select(schema::chats::read_boundary_ms)
+        .first(conn)
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// Advance the self-read cursor (never backwards).
+fn advance_read_cursor(
+    conn: &mut SqliteConnection,
+    device_id: i32,
+    chat: &str,
+    boundary_ms: i64,
+) -> QueryResult<usize> {
+    diesel::update(
+        chat_row(device_id, chat).filter(schema::chats::read_boundary_ms.lt(boundary_ms)),
+    )
+    .set(schema::chats::read_boundary_ms.eq(boundary_ms))
+    .execute(conn)
+}
+
 /// Incoming rows NOT covered by `bound`: strictly newer than the boundary
 /// second, plus same-second rows the action's keyed list does not name.
+/// Rows at or before the chat's read cursor are already read — a stale ranged
+/// action replaying after a newer self-read must not resurrect their badge.
 fn count_uncovered_incoming(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -232,11 +257,13 @@ fn count_uncovered_incoming(
     bound: &RangeBound,
 ) -> QueryResult<i32> {
     use schema::messages::dsl;
+    let read_boundary_ms = read_cursor(conn, device_id, chat)?;
     let base = dsl::messages.filter(
         dsl::device_id
             .eq(device_id)
             .and(dsl::chat_jid.eq(chat))
-            .and(dsl::from_me.eq(false)),
+            .and(dsl::from_me.eq(false))
+            .and(dsl::timestamp_ms.gt(read_boundary_ms)),
     );
     let uncovered: i64 = match &bound.keys {
         None => base
@@ -523,11 +550,28 @@ fn apply_event(
         Event::MarkChatAsReadUpdate(update) => {
             let chat = update.jid.to_string();
             let unread = if update.action.read.unwrap_or(false) {
+                ensure_chat(conn, device_id, &chat)?;
                 // A delayed replay only covers messages up to its range;
-                // anything we materialized past it is still unread.
+                // anything we materialized past it is still unread. Reads also
+                // advance the self-read cursor so later stale actions/receipts
+                // can't resurrect the badge.
                 match range_bound(&update.action.message_range) {
-                    Some(bound) => count_uncovered_incoming(conn, device_id, &chat, &bound)?,
-                    None => 0,
+                    Some(bound) => {
+                        advance_read_cursor(conn, device_id, &chat, bound.second_end_ms)?;
+                        count_uncovered_incoming(conn, device_id, &chat, &bound)?
+                    }
+                    None => {
+                        use schema::messages::dsl;
+                        let newest: Option<Option<i64>> = dsl::messages
+                            .filter(dsl::device_id.eq(device_id).and(dsl::chat_jid.eq(&chat)))
+                            .select(diesel::dsl::max(dsl::timestamp_ms))
+                            .first(conn)
+                            .optional()?;
+                        if let Some(newest_ms) = newest.flatten() {
+                            advance_read_cursor(conn, device_id, &chat, newest_ms)?;
+                        }
+                        0
+                    }
                 }
             } else {
                 UNREAD_MARKER
@@ -963,12 +1007,7 @@ fn apply_receipt(
             // Monotonic cursor: receipts can replay out of order across
             // offline drains, and a stale one must neither re-inflate nor
             // re-clear the badge.
-            let advanced = diesel::update(
-                chat_row(device_id, &chat).filter(schema::chats::read_boundary_ms.lt(boundary_ms)),
-            )
-            .set(schema::chats::read_boundary_ms.eq(boundary_ms))
-            .execute(conn)?;
-            if advanced == 0 {
+            if advance_read_cursor(conn, device_id, &chat, boundary_ms)? == 0 {
                 return Ok(());
             }
             // Uncovered = strictly past the boundary, plus boundary-instant
@@ -1331,8 +1370,11 @@ enum StoredRow {
     Skipped,
 }
 
-/// A refresh never touches `revoked`: a tombstone outranks any stale
-/// redelivery — such a write reports [`StoredRow::Skipped`].
+/// A refresh never touches `revoked` (a tombstone outranks any stale
+/// redelivery) and never crosses senders: message ids are SENDER-chosen, so a
+/// same-id row from a different sender must not rewrite the original's content
+/// (adversarial id reuse would otherwise alter someone else's message in the
+/// local history). Both cases report [`StoredRow::Skipped`].
 fn insert_message(
     conn: &mut SqliteConnection,
     device_id: i32,
@@ -1362,7 +1404,9 @@ fn insert_message(
     }
     if new.overwrite {
         let refreshed = diesel::update(
-            message_row(device_id, new.chat_jid, new.msg_id).filter(dsl::revoked.eq(false)),
+            message_row(device_id, new.chat_jid, new.msg_id)
+                .filter(dsl::revoked.eq(false))
+                .filter(dsl::sender_jid.eq(new.sender_jid)),
         )
         .set((
             dsl::kind.eq(new.kind),

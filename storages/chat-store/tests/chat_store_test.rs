@@ -1799,3 +1799,93 @@ async fn stale_read_self_does_not_reinflate_the_badge() {
     feed(&chat_store, [read_self(vec!["MSG-B1"], 1_700_000_050)]).await;
     assert_eq!(chat_store.unread_total().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn cross_sender_id_reuse_cannot_rewrite_a_message() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(GROUP);
+    let mallory = "559900000066@s.whatsapp.net";
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("victim's original words"),
+            incoming_info(GROUP, PEER, "MSG-VIC", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    // Message ids are sender-chosen: a different participant reusing the id
+    // must be deduped, never rewrite the victim's row.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("attacker rewrite"),
+            incoming_info(GROUP, mallory, "MSG-VIC", 1_700_000_100),
+        )],
+    )
+    .await;
+
+    let msg = chat_store.message(&chat, "MSG-VIC").await.unwrap().unwrap();
+    assert_eq!(msg.text.as_deref(), Some("victim's original words"));
+    assert_eq!(msg.sender_jid, jid(PEER));
+}
+
+#[tokio::test]
+async fn stale_ranged_mark_read_respects_the_read_cursor() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("first"),
+                incoming_info(PEER, PEER, "MSG-RC1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("second"),
+                incoming_info(PEER, PEER, "MSG-RC2", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+
+    // A read-self covering everything clears the badge and advances the cursor.
+    feed(
+        &chat_store,
+        [Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: jid(PEER),
+                    sender: jid(PEER),
+                    ..Default::default()
+                })
+                .message_ids(vec!["MSG-RC1".to_string(), "MSG-RC2".to_string()])
+                .timestamp(Utc.timestamp_opt(1_700_000_150, 0).unwrap())
+                .r#type(ReceiptType::ReadSelf)
+                .offline(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+
+    // A STALE ranged mark-read (covers only the first message) replays later:
+    // it must not resurrect the second message's badge.
+    feed(
+        &chat_store,
+        [Event::MarkChatAsReadUpdate(
+            wacore::types::events::MarkChatAsReadUpdate::builder()
+                .jid(jid(PEER))
+                .timestamp(Utc.timestamp_opt(1_700_000_050, 0).unwrap())
+                .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                    read: Some(true),
+                    message_range: range_up_to(1_700_000_000),
+                }))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+}
