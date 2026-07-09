@@ -2202,3 +2202,70 @@ async fn keyed_read_covers_a_message_that_materializes_later() {
     .await;
     assert_eq!(chat_store.unread_total().await.unwrap(), 1);
 }
+
+#[tokio::test]
+async fn wire_indefinite_mute_value_reads_as_forever() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("hi"),
+                incoming_info(PEER, PEER, "MSG-IM", 1_700_000_000),
+            ),
+            Event::MuteUpdate(
+                wacore::types::events::MuteUpdate::builder()
+                    .jid(jid(PEER))
+                    .timestamp(Utc.timestamp_opt(1_700_000_100, 0).unwrap())
+                    // The wire's indefinite-mute sentinel (what the library's
+                    // own mute_chat() sends).
+                    .action(Box::new(wa::sync_action_value::MuteAction {
+                        muted: Some(true),
+                        mute_end_timestamp: Some(-1),
+                        ..Default::default()
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].muted_until, Some(chrono::DateTime::<Utc>::MAX_UTC));
+}
+
+#[tokio::test]
+async fn early_tombstone_materializes_and_badges_the_chat() {
+    let (_store, chat_store) = test_store().await;
+
+    // A revoke for a message we never saw, in a chat we never saw: the chat
+    // must still appear (the deleted message DID happen) and badge.
+    let revoke = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-GHOST".into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::REVOKE),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            revoke,
+            incoming_info(PEER, PEER, "MSG-GHOST2", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].jid, jid(PEER));
+    assert!(chats[0].last_message_at.is_some());
+    assert!(chats[0].last_message_preview.is_none());
+    assert_eq!(chats[0].unread_count, 1);
+}

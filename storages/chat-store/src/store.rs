@@ -627,8 +627,15 @@ fn apply_event(
         }
         Event::MuteUpdate(update) => {
             let muted_until = if update.action.muted.unwrap_or(false) {
-                // No end timestamp = muted forever.
-                Some(update.action.mute_end_timestamp.unwrap_or(i64::MAX))
+                // Absent or non-positive (WA Web sends -1 for indefinite,
+                // this crate's own mute_chat() included) = muted forever.
+                Some(
+                    update
+                        .action
+                        .mute_end_timestamp
+                        .filter(|&ts| ts > 0)
+                        .unwrap_or(i64::MAX),
+                )
             } else {
                 None
             };
@@ -971,7 +978,7 @@ fn apply_revoke(
         ))
         .execute(conn)?;
     if updated == 0 {
-        diesel::insert_into(dsl::messages)
+        let inserted = diesel::insert_into(dsl::messages)
             .values((
                 dsl::device_id.eq(device_id),
                 dsl::chat_jid.eq(chat),
@@ -983,7 +990,26 @@ fn apply_revoke(
                 dsl::revoked.eq(true),
             ))
             .on_conflict_do_nothing()
-            .execute(conn)?;
+            .execute(conn)?
+            > 0;
+        // The tombstone may be the chat's first/newest row: the chat must
+        // exist and order by it (the deleted message DID happen), and an
+        // unseen deletion still counts as unread like WA's own badge does.
+        if inserted {
+            bump_chat(
+                conn,
+                device_id,
+                chat,
+                ChatBump {
+                    msg_id: target_id,
+                    ts_ms,
+                    preview: None,
+                    kind: None,
+                    unread_delta: i32::from(!target_from_me),
+                },
+            )?;
+            return Ok(true);
+        }
         return Ok(false);
     }
     refresh_preview_if_latest(conn, device_id, chat, target_id, None, None)
