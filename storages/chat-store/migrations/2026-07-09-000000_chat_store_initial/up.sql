@@ -15,6 +15,9 @@ CREATE TABLE chats (
     muted_until BIGINT,
     archived BOOLEAN NOT NULL DEFAULT FALSE,
     ephemeral_expiration INTEGER,
+    -- Monotonic self-read cursor (ms): a delayed/stale read-self receipt must
+    -- not re-inflate or re-clear the unread badge.
+    read_boundary_ms BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (device_id, jid)
 );
 

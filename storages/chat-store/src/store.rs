@@ -946,9 +946,7 @@ fn apply_receipt(
         ReceiptType::ReadSelf | ReceiptType::PlayedSelf => {
             // Read on another of our devices — up to the covered messages.
             // WA read state is "read up to X": the boundary is the newest
-            // covered row (falling back to the receipt's own timestamp), and
-            // anything we materialized past it keeps its unread badge (a
-            // delayed offline receipt must not swallow newer messages).
+            // covered row (falling back to the receipt's own timestamp).
             use schema::messages::dsl;
             let covered_max: Option<Option<i64>> = dsl::messages
                 .filter(
@@ -961,17 +959,36 @@ fn apply_receipt(
                 .first(conn)
                 .optional()?;
             let boundary_ms = covered_max.flatten().unwrap_or(ts_ms);
+            ensure_chat(conn, device_id, &chat)?;
+            // Monotonic cursor: receipts can replay out of order across
+            // offline drains, and a stale one must neither re-inflate nor
+            // re-clear the badge.
+            let advanced = diesel::update(
+                chat_row(device_id, &chat).filter(schema::chats::read_boundary_ms.lt(boundary_ms)),
+            )
+            .set(schema::chats::read_boundary_ms.eq(boundary_ms))
+            .execute(conn)?;
+            if advanced == 0 {
+                return Ok(());
+            }
+            // Uncovered = strictly past the boundary, plus boundary-instant
+            // siblings the receipt does not name (ids are the authoritative
+            // coverage signal; timestamps collide at wire granularity).
             let unread: i64 = dsl::messages
                 .filter(
                     dsl::device_id
                         .eq(device_id)
                         .and(dsl::chat_jid.eq(&chat))
                         .and(dsl::from_me.eq(false))
-                        .and(dsl::timestamp_ms.gt(boundary_ms)),
+                        .and(dsl::timestamp_ms.ge(boundary_ms))
+                        .and(
+                            dsl::timestamp_ms
+                                .gt(boundary_ms)
+                                .or(dsl::msg_id.ne_all(&receipt.message_ids)),
+                        ),
                 )
                 .count()
                 .get_result(conn)?;
-            ensure_chat(conn, device_id, &chat)?;
             diesel::update(chat_row(device_id, &chat))
                 .set(schema::chats::unread_count.eq(unread.min(i32::MAX as i64) as i32))
                 .execute(conn)?;

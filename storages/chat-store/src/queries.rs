@@ -59,6 +59,8 @@ struct ChatRow {
     muted_until: Option<i64>,
     archived: bool,
     ephemeral_expiration: Option<i32>,
+    #[allow(dead_code)]
+    read_boundary_ms: i64,
 }
 
 impl From<ChatRow> for ChatEntry {

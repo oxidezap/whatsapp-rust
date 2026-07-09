@@ -11,6 +11,7 @@ diesel::table! {
         muted_until -> Nullable<BigInt>,
         archived -> Bool,
         ephemeral_expiration -> Nullable<Integer>,
+        read_boundary_ms -> BigInt,
     }
 }
 

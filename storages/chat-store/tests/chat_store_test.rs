@@ -1711,3 +1711,91 @@ async fn delayed_read_self_keeps_newer_unread() {
     .await;
     assert_eq!(chat_store.unread_total().await.unwrap(), 1);
 }
+
+#[tokio::test]
+async fn read_self_spares_unlisted_same_timestamp_siblings() {
+    let (_store, chat_store) = test_store().await;
+
+    // Two incoming rows at the SAME stored timestamp; the receipt names one.
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("named"),
+                incoming_info(PEER, PEER, "MSG-RSA", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("same instant, not named"),
+                incoming_info(PEER, PEER, "MSG-RSB", 1_700_000_000),
+            ),
+        ],
+    )
+    .await;
+    feed(
+        &chat_store,
+        [Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: jid(PEER),
+                    sender: jid(PEER),
+                    ..Default::default()
+                })
+                .message_ids(vec!["MSG-RSA".to_string()])
+                .timestamp(Utc.timestamp_opt(1_700_000_050, 0).unwrap())
+                .r#type(ReceiptType::ReadSelf)
+                .offline(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn stale_read_self_does_not_reinflate_the_badge() {
+    let (_store, chat_store) = test_store().await;
+
+    let read_self = |ids: Vec<&str>, ts: i64| {
+        Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: jid(PEER),
+                    sender: jid(PEER),
+                    ..Default::default()
+                })
+                .message_ids(ids.into_iter().map(String::from).collect())
+                .timestamp(Utc.timestamp_opt(ts, 0).unwrap())
+                .r#type(ReceiptType::ReadSelf)
+                .offline(true)
+                .build(),
+        )
+    };
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("first"),
+                incoming_info(PEER, PEER, "MSG-B1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("second"),
+                incoming_info(PEER, PEER, "MSG-B2", 1_700_000_100),
+            ),
+        ],
+    )
+    .await;
+
+    // Newest receipt clears everything...
+    feed(
+        &chat_store,
+        [read_self(vec!["MSG-B1", "MSG-B2"], 1_700_000_150)],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+
+    // ...and a stale replay covering only the FIRST message must not
+    // resurrect the badge for the second.
+    feed(&chat_store, [read_self(vec!["MSG-B1"], 1_700_000_050)]).await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+}
