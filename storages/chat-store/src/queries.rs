@@ -133,6 +133,8 @@ impl ChatStore {
     /// then by latest activity.
     pub async fn chats(&self, include_archived: bool, limit: i64) -> Result<Vec<ChatEntry>> {
         use schema::chats::dsl;
+        // A negative LIMIT means "unbounded" to SQLite; never let that happen.
+        let limit = limit.max(0);
         let device_id = self.device_id();
         let rows: Vec<ChatRow> = self
             .db()
@@ -164,6 +166,7 @@ impl ChatStore {
         limit: i64,
     ) -> Result<Vec<StoredMessage>> {
         use schema::messages::dsl;
+        let limit = limit.max(0);
         let device_id = self.device_id();
         let chat = chat.to_string();
         let rows: Vec<MessageRow> = self

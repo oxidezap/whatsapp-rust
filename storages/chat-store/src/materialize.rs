@@ -130,21 +130,18 @@ pub(crate) fn extract_text(base: &wa::Message) -> Option<String> {
 
 /// Whether the unwrapped message carries anything a chat log should show.
 /// Guards against storing rows for pure-bookkeeping payloads that classify as
-/// "unknown".
+/// "unknown". Decided structurally: strip the bookkeeping carriers and check
+/// whether ANY other field remains set, so an unclassified-but-real bubble
+/// (e.g. a future WA message type) that also carries `message_context_info`
+/// is still stored.
 fn has_any_content(base: &wa::Message) -> bool {
-    // A message whose ONLY set fields are bookkeeping carriers has no bubble.
-    // buffa keeps unknown fields out of these accessors, so checking the known
-    // bookkeeping set suffices.
-    let only_bookkeeping = base.sender_key_distribution_message.is_set()
-        || base
-            .fast_ratchet_key_sender_key_distribution_message
-            .is_set()
-        || base.message_context_info.is_set();
-    if !only_bookkeeping {
-        return true;
-    }
-    // Any renderable field set alongside the carrier still counts as content.
-    message_kind(base) != "unknown"
+    let mut probe = base.clone();
+    probe.sender_key_distribution_message = Default::default();
+    probe.fast_ratchet_key_sender_key_distribution_message = Default::default();
+    probe.message_context_info = Default::default();
+    // Encoded emptiness, not PartialEq: presence of an empty submessage still
+    // costs wire bytes, while buffa's equality folds it into "absent".
+    !probe.encode_to_vec().is_empty()
 }
 
 #[cfg(test)]
@@ -327,6 +324,31 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(classify(&key_share), MessageOp::Ignore));
+    }
+
+    #[test]
+    fn unknown_content_with_context_info_is_still_stored() {
+        // A future/unclassified bubble type often carries message_context_info
+        // (msg secrets); that must not demote it to bookkeeping-only.
+        let msg = wa::Message {
+            send_payment_message: MessageField::some(wa::message::SendPaymentMessage::default()),
+            message_context_info: MessageField::some(wa::MessageContextInfo::default()),
+            ..Default::default()
+        };
+        match classify(&msg) {
+            MessageOp::Store { kind, .. } => assert_eq!(kind, "unknown"),
+            other => panic!("expected Store, got {other:?}"),
+        }
+
+        // While a PURE bookkeeping payload still has no bubble.
+        let carrier_only = wa::Message {
+            sender_key_distribution_message: MessageField::some(
+                wa::message::SenderKeyDistributionMessage::default(),
+            ),
+            message_context_info: MessageField::some(wa::MessageContextInfo::default()),
+            ..Default::default()
+        };
+        assert!(matches!(classify(&carrier_only), MessageOp::Ignore));
     }
 
     #[test]

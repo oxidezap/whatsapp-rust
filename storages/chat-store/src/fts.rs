@@ -16,6 +16,17 @@ use crate::store::ChatStore;
 use crate::types::StoredMessage;
 
 pub(crate) fn ensure_fts(conn: &mut SqliteConnection) -> QueryResult<()> {
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        n: i32,
+    }
+    let already_exists: bool = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+    )
+    .get_result::<CountRow>(conn)?
+    .n > 0;
+
     // Canonical FTS5 external-content recipe: EVERY content row gets exactly
     // one index entry (NULL indexes as empty), and the update trigger pairs
     // delete-then-insert in one body. Anything cuter (WHEN guards, split
@@ -38,6 +49,12 @@ pub(crate) fn ensure_fts(conn: &mut SqliteConnection) -> QueryResult<()> {
              END",
     ] {
         diesel::sql_query(statement).execute(conn)?;
+    }
+    // First enablement on a database that already has messages: the triggers
+    // only cover future writes, so index the existing rows once.
+    if !already_exists {
+        diesel::sql_query("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+            .execute(conn)?;
     }
     Ok(())
 }
@@ -78,6 +95,11 @@ impl ChatStore {
         let Some(match_query) = build_match_query(query) else {
             return Err(ChatStoreError::InvalidSearchQuery);
         };
+        // A negative LIMIT means "unbounded" to SQLite; never let that happen.
+        let limit = limit.max(0);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let device_id = self.device_id();
         let hits: Vec<FtsRow> = self
             .db()

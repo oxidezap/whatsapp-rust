@@ -105,11 +105,12 @@ pub struct ContactEntry {
 }
 
 impl ContactEntry {
-    /// Best display name available, WA Web precedence: address book, then
-    /// push name, then business name.
+    /// Best display name available, WA Web precedence: address book (full,
+    /// then first name), then push name, then business name.
     pub fn display_name(&self) -> Option<&str> {
         self.full_name
             .as_deref()
+            .or(self.first_name.as_deref())
             .or(self.push_name.as_deref())
             .or(self.business_name.as_deref())
     }

@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use buffa::MessageField;
-use chrono::{TimeZone, Utc};
+use chrono::{Datelike, TimeZone, Utc};
+use diesel::RunQueryDsl;
 use wacore::proto_helpers::MessageBuilderExt;
 use wacore::types::events::{
     BatchOrigin, Event, InboundMessage, LazyHistorySync, MessageBatch, Receipt, ServerAck,
@@ -363,28 +364,44 @@ async fn history_sync_materializes_without_clobbering_live_rows() {
     };
     let history = wa::HistorySync {
         sync_type: wa::history_sync::HistorySyncType::RECENT,
-        conversations: vec![wa::Conversation {
-            id: PEER.to_string(),
-            name: Some("Alice".into()),
-            conversation_timestamp: Some(1_700_000_900),
-            unread_count: Some(0),
-            messages: vec![
-                wa::HistorySyncMsg {
-                    message: MessageField::some(make_wmi(
-                        "MSG-H1",
-                        false,
-                        1_700_000_000,
-                        "stale history copy",
-                    )),
-                    ..Default::default()
-                },
-                wa::HistorySyncMsg {
-                    message: MessageField::some(make_wmi("MSG-H2", true, 1_700_000_900, "sent")),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        }],
+        conversations: vec![
+            // Fresh chat (no live row): mute/pin land via the INSERT path.
+            // Wire values are unix seconds; the store must convert to ms.
+            wa::Conversation {
+                id: "559900000004@s.whatsapp.net".to_string(),
+                conversation_timestamp: Some(1_700_000_500),
+                mute_end_time: Some(1_800_000_000),
+                pinned: Some(1_700_000_800),
+                ..Default::default()
+            },
+            wa::Conversation {
+                id: PEER.to_string(),
+                name: Some("Alice".into()),
+                conversation_timestamp: Some(1_700_000_900),
+                unread_count: Some(0),
+                messages: vec![
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(make_wmi(
+                            "MSG-H1",
+                            false,
+                            1_700_000_000,
+                            "stale history copy",
+                        )),
+                        ..Default::default()
+                    },
+                    wa::HistorySyncMsg {
+                        message: MessageField::some(make_wmi(
+                            "MSG-H2",
+                            true,
+                            1_700_000_900,
+                            "sent",
+                        )),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        ],
         pushnames: vec![wa::Pushname {
             id: Some("559900000003@s.whatsapp.net".into()),
             pushname: Some("Bob Example".into()),
@@ -415,8 +432,19 @@ async fn history_sync_materializes_without_clobbering_live_rows() {
 
     // Chat identity from history; live message content preserved.
     let chats = chat_store.chats(false, 10).await.unwrap();
-    assert_eq!(chats.len(), 1);
-    assert_eq!(chats[0].name.as_deref(), Some("Alice"));
+    assert_eq!(chats.len(), 2);
+    let alice = chats
+        .iter()
+        .find(|c| c.jid == jid(PEER))
+        .expect("alice chat");
+    assert_eq!(alice.name.as_deref(), Some("Alice"));
+    // Seconds-to-ms conversion: a future mute/pin must not decode as 1970.
+    let muted = chats
+        .iter()
+        .find(|c| c.jid == jid("559900000004@s.whatsapp.net"))
+        .expect("muted chat");
+    assert!(muted.muted_until.unwrap().year() > 2020);
+    assert!(muted.pinned_at.unwrap().year() > 2020);
 
     let live = chat_store.message(&chat, "MSG-H1").await.unwrap().unwrap();
     assert_eq!(live.text.as_deref(), Some("live copy"));
@@ -704,4 +732,324 @@ async fn full_text_search_finds_and_survives_operator_input() {
     let hits = chat_store.search_messages("recuperado", 10).await.unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, "MSG-S5");
+}
+
+#[tokio::test]
+async fn revoke_before_content_is_not_resurrected() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    // Offline drain can deliver the revoke before the content it targets.
+    let revoke = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-RB".into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::REVOKE),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            revoke,
+            incoming_info(PEER, PEER, "MSG-RB2", 1_700_000_010),
+        )],
+    )
+    .await;
+    let tombstone = chat_store.message(&chat, "MSG-RB").await.unwrap().unwrap();
+    assert!(tombstone.revoked);
+
+    // The content arriving later (redelivery path, overwrite=true) must not
+    // un-revoke the tombstone.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("too late"),
+            incoming_info(PEER, PEER, "MSG-RB", 1_700_000_000),
+        )],
+    )
+    .await;
+    let still_revoked = chat_store.message(&chat, "MSG-RB").await.unwrap().unwrap();
+    assert!(still_revoked.revoked);
+    assert!(still_revoked.text.is_none());
+}
+
+#[tokio::test]
+async fn pdo_recovery_does_not_double_count_unread() {
+    let (_store, chat_store) = test_store().await;
+
+    let info = incoming_info(PEER, PEER, "MSG-DC", 1_700_000_000);
+    feed(
+        &chat_store,
+        [Event::UndecryptableMessage(
+            wacore::types::events::UndecryptableMessage::builder()
+                .info(Arc::new(info.clone()))
+                .is_unavailable(false)
+                .unavailable_type(wacore::types::events::UnavailableType::Unknown)
+                .decrypt_fail_mode(wacore::types::events::DecryptFailMode::Show)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+
+    // PDO recovery replaces the placeholder under the same id: same message,
+    // must not count twice.
+    feed(
+        &chat_store,
+        [message_event(wa::Message::text("recovered"), info)],
+    )
+    .await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn edit_of_latest_message_refreshes_preview_and_stale_edit_is_ignored() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("original"),
+            incoming_info(PEER, PEER, "MSG-EP", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    let edit_with = |text: &str, id: &str, ts: i64| {
+        message_event(
+            wa::Message {
+                protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("MSG-EP".into()),
+                        ..Default::default()
+                    }),
+                    r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                    edited_message: MessageField::from_box(Box::new(wa::Message::text(text))),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            incoming_info(PEER, PEER, id, ts),
+        )
+    };
+
+    feed(&chat_store, [edit_with("edited", "E1", 1_700_000_100)]).await;
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("edited"));
+
+    // A stale edit (older than the applied one) must not roll content back.
+    feed(&chat_store, [edit_with("stale", "E2", 1_700_000_050)]).await;
+    let msg = chat_store.message(&chat, "MSG-EP").await.unwrap().unwrap();
+    assert_eq!(msg.text.as_deref(), Some("edited"));
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("edited"));
+}
+
+#[tokio::test]
+async fn delete_for_me_cleans_satellites_and_recomputes_preview() {
+    let (_store, chat_store) = test_store().await;
+    let group = jid(GROUP);
+    let alice = "559900000002@s.whatsapp.net";
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("keep me"),
+            incoming_info(GROUP, PEER, "MSG-K", 1_700_000_000),
+        )],
+    )
+    .await;
+    chat_store
+        .record_outgoing(
+            &group,
+            "MSG-D",
+            &wa::Message::text("delete me"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: group.clone(),
+                    sender: jid(alice),
+                    is_group: true,
+                    ..Default::default()
+                })
+                .message_ids(vec!["MSG-D".to_string()])
+                .timestamp(Utc.timestamp_opt(1_700_000_110, 0).unwrap())
+                .r#type(ReceiptType::Read)
+                .offline(false)
+                .build(),
+        )],
+    )
+    .await;
+    assert_eq!(chat_store.receipts(&group, "MSG-D").await.unwrap().len(), 1);
+
+    feed(
+        &chat_store,
+        [Event::DeleteMessageForMeUpdate(
+            wacore::types::events::DeleteMessageForMeUpdate::builder()
+                .chat_jid(group.clone())
+                .message_id("MSG-D".to_string())
+                .from_me(true)
+                .timestamp(Utc.timestamp_opt(1_700_000_200, 0).unwrap())
+                .action(Box::new(
+                    wa::sync_action_value::DeleteMessageForMeAction::default(),
+                ))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+
+    assert!(chat_store.message(&group, "MSG-D").await.unwrap().is_none());
+    assert!(
+        chat_store
+            .receipts(&group, "MSG-D")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // The chat-list preview falls back to the newest remaining message.
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("keep me"));
+}
+
+#[tokio::test]
+async fn stale_reaction_timestamp_does_not_replace_newer() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("target"),
+            incoming_info(PEER, PEER, "MSG-RT", 1_700_000_000),
+        )],
+    )
+    .await;
+    let react = |emoji: &str, id: &str, ts: i64| {
+        message_event(
+            wa::Message {
+                reaction_message: MessageField::some(wa::message::ReactionMessage {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("MSG-RT".into()),
+                        ..Default::default()
+                    }),
+                    text: Some(emoji.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            incoming_info(PEER, PEER, id, ts),
+        )
+    };
+    feed(&chat_store, [react("👍", "R1", 1_700_000_200)]).await;
+    // An older copy (e.g. replayed from a history chunk) must not win.
+    feed(&chat_store, [react("❤️", "R2", 1_700_000_100)]).await;
+    let reactions = chat_store.reactions(&chat, "MSG-RT").await.unwrap();
+    assert_eq!(reactions.len(), 1);
+    assert_eq!(reactions[0].emoji, "👍");
+}
+
+#[tokio::test]
+async fn flush_surfaces_a_failed_batch() {
+    let (store, chat_store) = test_store().await;
+
+    // Sabotage the schema so the next batch rolls back.
+    store
+        .shared()
+        .run(|conn| {
+            diesel::sql_query("ALTER TABLE messages RENAME TO messages_gone")
+                .execute(conn)
+                .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let handler = chat_store.handler();
+    handler.handle_event(Arc::new(message_event(
+        wa::Message::text("will fail"),
+        incoming_info(PEER, PEER, "MSG-F", 1_700_000_000),
+    )));
+    let err = chat_store.flush().await.expect_err("batch must fail");
+    assert!(matches!(
+        err,
+        whatsapp_rust_chat_store::ChatStoreError::WriteBatchFailed(_)
+    ));
+
+    // Restore and confirm the writer survived the failure.
+    store
+        .shared()
+        .run(|conn| {
+            diesel::sql_query("ALTER TABLE messages_gone RENAME TO messages")
+                .execute(conn)
+                .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("works again"),
+            incoming_info(PEER, PEER, "MSG-OK", 1_700_000_010),
+        )],
+    )
+    .await;
+    assert!(
+        chat_store
+            .message(&jid(PEER), "MSG-OK")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[cfg(feature = "search")]
+#[tokio::test]
+async fn fts_backfills_rows_that_predate_the_index() {
+    let (store, chat_store) = test_store().await;
+
+    // Simulate a database created before the `search` feature existed: drop
+    // the FTS objects, then write rows with no triggers in place.
+    store
+        .shared()
+        .run(|conn| {
+            for stmt in [
+                "DROP TRIGGER IF EXISTS messages_fts_ai",
+                "DROP TRIGGER IF EXISTS messages_fts_ad",
+                "DROP TRIGGER IF EXISTS messages_fts_au",
+                "DROP TABLE IF EXISTS messages_fts",
+            ] {
+                diesel::sql_query(stmt)
+                    .execute(conn)
+                    .map_err(|e| wacore::store::error::StoreError::Database(Box::new(e)))?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("mensagem antiga indexável"),
+            incoming_info(PEER, PEER, "MSG-BF", 1_700_000_000),
+        )],
+    )
+    .await;
+
+    // A second open on the same file recreates the index and must backfill it.
+    let chat_store2 = ChatStore::new(&store).await.unwrap();
+    let hits = chat_store2.search_messages("antiga", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, "MSG-BF");
 }
