@@ -531,20 +531,49 @@ impl WhatsAppClient {
         }
 
         // Check for image message
-        if let Some(image) = msg.image_message.as_option()
-            && let Some(data) = Self::download_media(_client, image, "image").await
-        {
+        if let Some(image) = msg.image_message.as_option() {
+            let downloadable = DownloadableBuilder {
+                direct_path: image.direct_path.as_deref(),
+                media_key: image.media_key.as_deref(),
+                file_enc_sha256: image.file_enc_sha256.as_deref(),
+                file_length: image.file_length,
+                mime_type: image.mimetype.as_deref().unwrap_or("image/jpeg"),
+                duration_secs: None,
+                download_type: DownloadMediaType::Image,
+            }
+            .build();
+            // A failed eager download keeps the metadata: the thumbnail shows
+            // now and the full image stays retryable, instead of the message
+            // degrading to a plain text row for the whole session.
+            let (data, mime_type) = match Self::download_media(_client, image, "image").await {
+                Some(data) => (
+                    data,
+                    image
+                        .mimetype
+                        .clone()
+                        .unwrap_or_else(|| "image/jpeg".to_string()),
+                ),
+                None => (
+                    image
+                        .jpeg_thumbnail
+                        .as_ref()
+                        .filter(|t| !t.is_empty())
+                        .cloned()
+                        .unwrap_or_default(),
+                    "image/jpeg".to_string(),
+                ),
+            };
+            if data.is_empty() && downloadable.is_none() {
+                return None;
+            }
             return Some(MediaContent {
                 media_type: MediaType::Image,
                 data: Arc::new(data),
-                mime_type: image
-                    .mimetype
-                    .clone()
-                    .unwrap_or_else(|| "image/jpeg".to_string()),
+                mime_type,
                 width: image.width,
                 height: image.height,
                 caption: image.caption.clone(),
-                downloadable: None,
+                downloadable,
                 is_animated: false,
                 duration_secs: None,
             });
@@ -659,8 +688,10 @@ impl WhatsAppClient {
                     }
                 };
 
-                let guard = client_handle.lock().await;
-                if let Some(client) = guard.as_ref() {
+                // Clone the Arc and release the mutex: a slow network call
+                // here must not queue every other client action behind it.
+                let client = client_handle.lock().await.clone();
+                if let Some(client) = client {
                     let message = wa::Message {
                         conversation: Some(content.clone()),
                         ..Default::default()
@@ -708,8 +739,10 @@ impl WhatsAppClient {
 
         std::thread::spawn(move || {
             runtime.block_on(async move {
-                let guard = client_handle.lock().await;
-                if let Some(client) = guard.as_ref() {
+                // Clone the Arc and release the mutex: a slow network call
+                // here must not queue every other client action behind it.
+                let client = client_handle.lock().await.clone();
+                if let Some(client) = client {
                     info!(
                         "Downloading media: {} bytes expected",
                         downloadable.file_length
@@ -759,8 +792,10 @@ impl WhatsAppClient {
                     }
                 };
 
-                let guard = client_handle.lock().await;
-                if let Some(client) = guard.as_ref() {
+                // Clone the Arc and release the mutex: a slow network call
+                // here must not queue every other client action behind it.
+                let client = client_handle.lock().await.clone();
+                if let Some(client) = client {
                     // Upload the audio file
                     let upload_result = match client
                         .upload(audio_data, DownloadMediaType::Audio, Default::default())
@@ -838,8 +873,8 @@ impl WhatsAppClient {
                     }
                 };
 
-                let guard = client_handle.lock().await;
-                if let Some(client) = guard.as_ref()
+                let client = client_handle.lock().await.clone();
+                if let Some(client) = client
                     && let Err(e) = client.chatstate().send_composing(&jid).await
                 {
                     warn!("Failed to send composing state: {}", e);
@@ -864,8 +899,8 @@ impl WhatsAppClient {
                     }
                 };
 
-                let guard = client_handle.lock().await;
-                if let Some(client) = guard.as_ref()
+                let client = client_handle.lock().await.clone();
+                if let Some(client) = client
                     && let Err(e) = client.chatstate().send_paused(&jid).await
                 {
                     warn!("Failed to send paused state: {}", e);
@@ -915,8 +950,10 @@ impl WhatsAppClient {
                     return;
                 }
 
-                let guard = client_handle.lock().await;
-                if let Some(client) = guard.as_ref() {
+                // Clone the Arc and release the mutex: a slow network call
+                // here must not queue every other client action behind it.
+                let client = client_handle.lock().await.clone();
+                if let Some(client) = client {
                     // Group messages by sender, then send read receipts per sender
                     let mut by_sender: HashMap<Jid, Vec<String>> = HashMap::new();
                     for (msg_id, sender) in parsed_messages {
