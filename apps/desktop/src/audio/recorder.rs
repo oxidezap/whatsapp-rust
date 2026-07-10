@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Stream, StreamConfig};
+use cpal::{Device, FromSample, Sample as _, SampleFormat, SizedSample, Stream, StreamConfig};
 use log::{error, info, warn};
 use wacore::time::Instant;
 
@@ -34,12 +34,47 @@ impl RecordedAudio {
         let mut output = Vec::with_capacity(output_len);
 
         if self.sample_rate.is_multiple_of(TARGET_SAMPLE_RATE) {
-            // Integer decimation (the common 48kHz case): box-filter each
-            // window, since plain sample dropping folds everything above
-            // 8kHz back into the voice band.
+            // Integer decimation (the common 48kHz case): low-pass BEFORE
+            // dropping samples, or everything above the 8kHz target Nyquist
+            // folds back into the voice band (a box average only manages
+            // ~10dB there). Windowed-sinc FIR, ~7kHz cutoff at the input
+            // rate, unity DC gain so speech level is preserved; evaluated
+            // only at the kept samples, O(n·taps) — fine for PTT lengths.
+            const TAPS: usize = 63;
+            const CUTOFF_HZ: f32 = 7_000.0;
+            let fc = CUTOFF_HZ / self.sample_rate as f32;
+            let center = (TAPS - 1) / 2;
+            let mut fir = [0.0f32; TAPS];
+            for (k, tap) in fir.iter_mut().enumerate() {
+                let n = k as f32 - center as f32;
+                let sinc = if n == 0.0 {
+                    2.0 * fc
+                } else {
+                    (std::f32::consts::TAU * fc * n).sin() / (std::f32::consts::PI * n)
+                };
+                let hamming =
+                    0.54 - 0.46 * (std::f32::consts::TAU * k as f32 / (TAPS - 1) as f32).cos();
+                *tap = sinc * hamming;
+            }
+            let dc_gain: f32 = fir.iter().sum();
+            for tap in fir.iter_mut() {
+                *tap /= dc_gain;
+            }
+
             let step = (self.sample_rate / TARGET_SAMPLE_RATE) as usize;
-            for chunk in self.samples.chunks_exact(step) {
-                output.push(chunk.iter().sum::<f32>() / step as f32);
+            // saturating: an empty capture must not underflow (the loop below
+            // is a no-op then anyway).
+            let last = self.samples.len().saturating_sub(1);
+            for i in 0..self.samples.len() / step {
+                let mid = (i * step) as isize;
+                let mut acc = 0.0f32;
+                for (k, &tap) in fir.iter().enumerate() {
+                    // Clamped edges: replicating the boundary sample beats
+                    // zero-padding, which would fade the clip's ends.
+                    let src = (mid + k as isize - center as isize).clamp(0, last as isize);
+                    acc += tap * self.samples[src as usize];
+                }
+                output.push(acc);
             }
         } else {
             for i in 0..output_len {
@@ -67,6 +102,7 @@ pub struct AudioRecorder {
     start_time: Option<Instant>,
     device: Option<Device>,
     config: Option<StreamConfig>,
+    sample_format: SampleFormat,
     sample_rate: u32,
 }
 
@@ -85,6 +121,7 @@ impl AudioRecorder {
             start_time: None,
             device: None,
             config: None,
+            sample_format: SampleFormat::F32,
             sample_rate: CAPTURE_SAMPLE_RATE,
         }
     }
@@ -108,17 +145,23 @@ impl AudioRecorder {
             .supported_input_configs()
             .map_err(|e| RecorderError::DeviceError(e.to_string()))?;
 
-        // The callback is built for f32 frames, so only F32 configs are usable.
-        // 48kHz support outweighs mono: multichannel is downmixed anyway,
+        // Prefer F32 (native to our buffer), but i16/u16-only mics still
+        // record: the callback converts per sample. Format outranks 48kHz
+        // support, which outranks mono: multichannel is downmixed anyway,
         // while a low capture rate permanently costs voice bandwidth.
         let mut best: Option<(u8, _)> = None;
         for config in supported {
-            if config.sample_format() != cpal::SampleFormat::F32 {
+            if !matches!(
+                config.sample_format(),
+                SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16
+            ) {
                 continue;
             }
             let supports_rate = config.min_sample_rate() <= CAPTURE_SAMPLE_RATE
                 && config.max_sample_rate() >= CAPTURE_SAMPLE_RATE;
-            let score = u8::from(supports_rate) * 2 + u8::from(config.channels() == 1);
+            let score = u8::from(config.sample_format() == SampleFormat::F32) * 4
+                + u8::from(supports_rate) * 2
+                + u8::from(config.channels() == 1);
             if best.as_ref().is_none_or(|(s, _)| score > *s) {
                 let candidate = if supports_rate {
                     config.with_sample_rate(CAPTURE_SAMPLE_RATE)
@@ -133,12 +176,13 @@ impl AudioRecorder {
             .map(|(_, c)| c)
             .ok_or(RecorderError::NoSupportedConfig)?;
 
+        self.sample_format = supported_config.sample_format();
         let stream_config: StreamConfig = supported_config.into();
         self.sample_rate = stream_config.sample_rate;
 
         info!(
-            "Audio config: {} Hz, {} channel(s)",
-            stream_config.sample_rate, stream_config.channels
+            "Audio config: {} Hz, {} channel(s), {:?}",
+            stream_config.sample_rate, stream_config.channels, self.sample_format
         );
 
         self.device = Some(device);
@@ -164,31 +208,15 @@ impl AudioRecorder {
         }
 
         let samples = self.samples.clone();
-        let channels = config.channels as usize;
 
-        let stream = device
-            .build_input_stream(
-                config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let Ok(mut buffer) = samples.lock() else {
-                        return;
-                    };
-                    if channels == 1 {
-                        buffer.extend_from_slice(data);
-                    } else {
-                        // Downmix to mono
-                        for chunk in data.chunks(channels) {
-                            let mono: f32 = chunk.iter().sum::<f32>() / channels as f32;
-                            buffer.push(mono);
-                        }
-                    }
-                },
-                move |err| {
-                    error!("Audio input stream error: {}", err);
-                },
-                None,
-            )
-            .map_err(|e| RecorderError::StreamError(e.to_string()))?;
+        let stream = match self.sample_format {
+            SampleFormat::F32 => build_input_stream::<f32>(device, config, samples),
+            SampleFormat::I16 => build_input_stream::<i16>(device, config, samples),
+            SampleFormat::U16 => build_input_stream::<u16>(device, config, samples),
+            other => Err(RecorderError::StreamError(format!(
+                "unsupported input sample format {other:?}"
+            ))),
+        }?;
 
         stream
             .play()
@@ -241,6 +269,43 @@ impl AudioRecorder {
     }
 }
 
+/// Build the input stream for the device's sample format, converting to f32
+/// in the callback (same dispatch as the player's output path).
+fn build_input_stream<T: SizedSample>(
+    device: &Device,
+    config: StreamConfig,
+    samples: Arc<Mutex<Vec<f32>>>,
+) -> Result<Stream, RecorderError>
+where
+    f32: FromSample<T>,
+{
+    let channels = config.channels as usize;
+    device
+        .build_input_stream(
+            config,
+            move |data: &[T], _: &cpal::InputCallbackInfo| {
+                let Ok(mut buffer) = samples.lock() else {
+                    return;
+                };
+                if channels == 1 {
+                    buffer.extend(data.iter().map(|&s| f32::from_sample(s)));
+                } else {
+                    // Downmix to mono
+                    for chunk in data.chunks(channels) {
+                        let mono: f32 = chunk.iter().map(|&s| f32::from_sample(s)).sum::<f32>()
+                            / channels as f32;
+                        buffer.push(mono);
+                    }
+                }
+            },
+            move |err| {
+                error!("Audio input stream error: {}", err);
+            },
+            None,
+        )
+        .map_err(|e| RecorderError::StreamError(e.to_string()))
+}
+
 #[derive(Debug)]
 pub enum RecorderError {
     NoInputDevice,
@@ -285,14 +350,49 @@ mod tests {
     }
 
     #[test]
-    fn resample_box_filters_integer_decimation() {
-        // 48kHz is 3:1; each output sample averages its window instead of
-        // dropping two of every three samples (which aliases above 8kHz).
+    fn resample_decimation_has_unity_dc_gain() {
+        // The FIR taps are normalized to unity DC gain: a constant signal
+        // must come out at the same level (edges included — they clamp to
+        // the boundary sample, so even they see pure DC).
         let audio = RecordedAudio {
-            samples: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            samples: vec![0.5; 4800],
             sample_rate: 48_000,
             duration_secs: 0,
         };
-        assert_eq!(audio.resample_to_16khz(), vec![1.0, 4.0]);
+        let out = audio.resample_to_16khz();
+        assert_eq!(out.len(), 1600);
+        for &s in &out {
+            assert!((s - 0.5).abs() < 1e-3, "DC gain drifted: {s}");
+        }
+    }
+
+    #[test]
+    fn resample_decimation_attenuates_aliasing_band() {
+        // 12kHz at 48k folds to 4kHz after naive 3:1 decimation — squarely
+        // in the voice band. The low-pass must crush it while passing 1kHz
+        // essentially untouched.
+        let rate = 48_000u32;
+        let tone = |freq: f32| -> RecordedAudio {
+            RecordedAudio {
+                samples: (0..rate as usize)
+                    .map(|i| (std::f32::consts::TAU * freq * i as f32 / rate as f32).sin())
+                    .collect(),
+                sample_rate: rate,
+                duration_secs: 1,
+            }
+        };
+        let rms = |samples: &[f32]| -> f32 {
+            (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+        };
+        let low = tone(1_000.0).resample_to_16khz();
+        let high = tone(12_000.0).resample_to_16khz();
+        // Skip the clamped edges; a full-scale sine has ~0.707 rms.
+        let low_rms = rms(&low[100..low.len() - 100]);
+        let high_rms = rms(&high[100..high.len() - 100]);
+        assert!(low_rms > 0.65, "1kHz should pass through, rms {low_rms}");
+        assert!(
+            high_rms < 0.02,
+            "12kHz should alias-filter to near silence, rms {high_rms}"
+        );
     }
 }

@@ -48,6 +48,10 @@ pub(crate) enum WriterMsg {
         text: Option<String>,
         timestamp_ms: i64,
     },
+    SendFailed {
+        chat: Jid,
+        msg_id: String,
+    },
     // String, not StoreError: one batch outcome fans out to many waiters and
     // StoreError is not Clone.
     Flush(oneshot::Sender<std::result::Result<(), String>>),
@@ -164,6 +168,20 @@ impl ChatStore {
                 kind: message_kind(base),
                 text: extract_text(base),
                 timestamp_ms: timestamp.timestamp_millis(),
+            })
+            .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
+    }
+
+    /// Mark a send this client gave up on (no server answer will come to do
+    /// it). Goes through the writer queue so it cannot outrun the
+    /// [`record_outgoing`](Self::record_outgoing) row it targets. Same rule
+    /// as a server nack: only a still-[`Pending`](crate::types::MessageStatus::Pending)
+    /// row fails — a positive ack that won the race must not be regressed.
+    pub fn mark_send_failed(&self, chat: &Jid, msg_id: impl Into<String>) -> Result<()> {
+        self.tx
+            .send(WriterMsg::SendFailed {
+                chat: chat.clone(),
+                msg_id: msg_id.into(),
             })
             .map_err(|_| ChatStoreError::Store(StoreError::Validation("writer stopped".into())))
     }
@@ -527,6 +545,22 @@ fn apply_writer_msg(
                 )?;
                 cs.chats = true;
             }
+            cs.message_chats.insert(chat_str);
+            Ok(())
+        }
+        WriterMsg::SendFailed { chat, msg_id } => {
+            let chat_str = chat.to_string();
+            // Same guard as the nack path: a row past PENDING already got its
+            // positive answer, so a late local failure must not regress it.
+            diesel::update(
+                message_row(device_id, &chat_str, msg_id).filter(
+                    schema::messages::from_me.eq(true).and(
+                        schema::messages::status.eq(wa::web_message_info::Status::PENDING as i32),
+                    ),
+                ),
+            )
+            .set(schema::messages::status.eq(wa::web_message_info::Status::ERROR as i32))
+            .execute(conn)?;
             cs.message_chats.insert(chat_str);
             Ok(())
         }

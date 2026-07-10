@@ -452,6 +452,12 @@ impl Chat {
                 new_media.data = old_media.data;
                 new_media.data_is_preview = old_media.data_is_preview;
             }
+            // Live-only state the store doesn't carry must also survive the
+            // replace: the SendFailed flag and the push name on group bubbles.
+            message.failed |= existing.failed;
+            if message.sender_name.is_none() {
+                message.sender_name = existing.sender_name;
+            }
         }
         let pos = self
             .messages
@@ -698,6 +704,41 @@ mod tests {
         let media = chat.messages[0].media.as_ref().unwrap();
         assert_eq!(*media.data, vec![1, 2, 3]);
         assert!(!media.data_is_preview);
+    }
+
+    #[test]
+    fn test_hydration_replacement_keeps_failed_flag_and_sender_name() {
+        let mut chat = Chat::new("123456789-group@g.us".to_string());
+
+        // Live bubble: an outgoing send that failed, plus an incoming group
+        // bubble that carried its sender's push name
+        let mut failed_send = make_message("OUT-1", 1000);
+        failed_send.is_from_me = true;
+        failed_send.failed = true;
+        chat.add_message(failed_send);
+        let mut incoming = make_message("IN-1", 2000);
+        incoming.sender_name = Some("Alice".to_string());
+        chat.add_message(incoming);
+
+        // The hydrated rows carry neither the failure flag nor the push name;
+        // the replace must not lose them
+        let mut hydrated_send = make_message("OUT-1", 1000);
+        hydrated_send.is_from_me = true;
+        chat.insert_history_message(hydrated_send);
+        chat.insert_history_message(make_message("IN-1", 2000));
+
+        assert_eq!(chat.messages.len(), 2);
+        assert!(chat.messages[0].failed);
+        assert_eq!(chat.messages[1].sender_name.as_deref(), Some("Alice"));
+
+        // A hydrated name wins over the live one (store is authoritative)
+        let mut renamed = make_message("IN-1", 2000);
+        renamed.sender_name = Some("Alice Example".to_string());
+        chat.insert_history_message(renamed);
+        assert_eq!(
+            chat.messages[1].sender_name.as_deref(),
+            Some("Alice Example")
+        );
     }
 
     #[test]

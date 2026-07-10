@@ -2522,3 +2522,54 @@ async fn server_nack_marks_outgoing_failed() {
         .unwrap();
     assert_eq!(msg.status, MessageStatus::ServerAck);
 }
+
+#[tokio::test]
+async fn mark_send_failed_fails_pending_row_only() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    // A client-side send error has no server nack to fail the row; the
+    // explicit mark does it. Same writer queue as the record, so the mark
+    // cannot outrun the row it targets.
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-LOCAL",
+            &wa::Message::text("oi"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.mark_send_failed(&chat, "OUT-LOCAL").unwrap();
+    chat_store.flush().await.unwrap();
+    let msg = chat_store
+        .message(&chat, "OUT-LOCAL")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Error);
+
+    // A row the server already answered keeps its positive status.
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-WON",
+            &wa::Message::text("oi2"),
+            Utc.timestamp_opt(1_700_000_200, 0).unwrap(),
+        )
+        .unwrap();
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-WON".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .build(),
+        )],
+    )
+    .await;
+    chat_store.mark_send_failed(&chat, "OUT-WON").unwrap();
+    chat_store.flush().await.unwrap();
+    let msg = chat_store.message(&chat, "OUT-WON").await.unwrap().unwrap();
+    assert_eq!(msg.status, MessageStatus::ServerAck);
+}

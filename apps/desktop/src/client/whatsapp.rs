@@ -765,6 +765,7 @@ impl WhatsAppClient {
                         }
                         Err(e) => {
                             error!("Failed to send message {}: {}", msg_id, e);
+                            mark_send_failed(&chat_store, &jid, &msg_id).await;
                             notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
                         }
                     }
@@ -907,6 +908,7 @@ impl WhatsAppClient {
                         }
                         Err(e) => {
                             error!("Failed to send audio message {}: {}", msg_id, e);
+                            mark_send_failed(&chat_store, &jid, &msg_id).await;
                             notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
                         }
                     }
@@ -1350,6 +1352,9 @@ impl WhatsAppClient {
     ) -> Result<Vec<crate::state::Chat>, whatsapp_rust_chat_store::ChatStoreError> {
         let entries = chat_store.chats(false, Self::HISTORY_CHAT_LIMIT).await?;
         let mut chats: Vec<crate::state::Chat> = Vec::with_capacity(entries.len());
+        // Sender-name lookups memoized across the whole load: group pages
+        // repeat the same handful of senders many times over.
+        let mut sender_names: HashMap<String, Option<String>> = HashMap::new();
         for entry in entries {
             // Same PN->LID mapping live events go through, or the restored
             // chat and the next live message split into two conversations.
@@ -1365,6 +1370,9 @@ impl WhatsAppClient {
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
                 Self::hydrate_reactions(chat_store, &entry.jid, &mut msgs).await;
+                if existing.is_group {
+                    Self::hydrate_sender_names(chat_store, &mut msgs, &mut sender_names).await;
+                }
                 // The rows are distinct messages, so this side's unread state
                 // adds to the merged chat: fold the counter in and un-read its
                 // tail so opening the chat still sends those receipts.
@@ -1408,6 +1416,9 @@ impl WhatsAppClient {
             page.reverse(); // store returns newest-first; the UI renders oldest-first
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
             Self::hydrate_reactions(chat_store, &entry.jid, &mut chat.messages).await;
+            if chat.is_group {
+                Self::hydrate_sender_names(chat_store, &mut chat.messages, &mut sender_names).await;
+            }
             // The newest `unread_count` incoming messages are the unread ones;
             // select_chat only sends read receipts for !is_read, so hydrated
             // unread must not come up pre-read.
@@ -1451,6 +1462,37 @@ impl WhatsAppClient {
                     .or_default()
                     .push(entry.sender_jid.to_string());
             }
+        }
+    }
+
+    /// Group bubbles label their sender, but hydrated rows don't carry the
+    /// push name the live path attaches; resolve it from the contacts table.
+    /// `cache` memoizes per sender JID (misses included) so a page never pays
+    /// more than one query per unique sender. Best-effort like reactions: a
+    /// failed lookup logs and the bubble falls back to the JID label.
+    async fn hydrate_sender_names(
+        chat_store: &Arc<ChatStore>,
+        msgs: &mut [ChatMessage],
+        cache: &mut HashMap<String, Option<String>>,
+    ) {
+        for msg in msgs.iter_mut() {
+            if msg.is_from_me || msg.sender_name.is_some() {
+                continue;
+            }
+            if !cache.contains_key(&msg.sender) {
+                let name = match msg.sender.parse::<Jid>() {
+                    Ok(jid) => match chat_store.contact(&jid).await {
+                        Ok(contact) => contact.and_then(|c| c.display_name().map(str::to_owned)),
+                        Err(e) => {
+                            warn!("failed to hydrate sender name for {}: {e}", msg.sender);
+                            None
+                        }
+                    },
+                    Err(_) => None,
+                };
+                cache.insert(msg.sender.clone(), name);
+            }
+            msg.sender_name = cache.get(&msg.sender).cloned().flatten();
         }
     }
 }
@@ -1666,7 +1708,9 @@ fn stored_to_chat_message(stored: whatsapp_rust_chat_store::StoredMessage) -> Ch
         is_read,
         media,
         reactions: std::collections::HashMap::new(),
-        failed: false,
+        // Error is terminal for from_me rows (nack or local send failure), so
+        // hydration restores the failure indicator instead of grey ticks.
+        failed: stored.from_me && stored.status == whatsapp_rust_chat_store::MessageStatus::Error,
     }
 }
 
@@ -1714,6 +1758,17 @@ async fn record_outgoing(
         && let Err(e) = store.record_outgoing(jid, message_id, message, wacore::time::now_utc())
     {
         warn!("Failed to record outgoing message {}: {e}", message_id);
+    }
+}
+
+/// Best-effort failure mark on the durable row a client-side send error
+/// orphans at Pending (no server nack will come to fail it), so a restart
+/// hydrates the bubble with its failure indicator instead of grey ticks.
+async fn mark_send_failed(chat_store: &ChatStoreHandle, jid: &Jid, message_id: &str) {
+    if let Some(store) = chat_store.lock().await.as_ref()
+        && let Err(e) = store.mark_send_failed(jid, message_id)
+    {
+        warn!("Failed to mark send {} as failed: {e}", message_id);
     }
 }
 
