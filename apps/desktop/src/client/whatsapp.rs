@@ -9,7 +9,7 @@ use wacore::proto_helpers::MessageExt;
 use wacore::types::call::{CallAction, IncomingCall as WaIncomingCall};
 use wacore::types::events::Event;
 use wacore::types::presence::ReceiptType;
-use wacore_binary::jid::Jid;
+use wacore_binary::jid::{Jid, JidExt};
 use waproto::whatsapp as wa;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::client::Client;
@@ -417,6 +417,13 @@ impl WhatsAppClient {
             return;
         }
 
+        // Revokes/edits and other protocol stubs carry no displayable body;
+        // the chat store materializes them durably (a reload shows the right
+        // state), so don't fabricate a "[Media]" bubble under their own id.
+        if base_msg.protocol_message.is_set() {
+            return;
+        }
+
         // Try to extract media content
         let media_result = Self::try_extract_media(base_msg, client).await;
 
@@ -489,7 +496,7 @@ impl WhatsAppClient {
     /// Try to extract and download media from a message
     async fn try_extract_media(msg: &wa::Message, _client: &Arc<Client>) -> Option<MediaContent> {
         // Check for sticker message
-        if let Some(sticker) = msg.sticker_message.as_option() {
+        if let Some(sticker) = effective_sticker(msg) {
             let mime = sticker
                 .mimetype
                 .clone()
@@ -593,8 +600,14 @@ impl WhatsAppClient {
             });
         }
 
-        // Check for video message - store thumbnail for preview, metadata for download
-        if let Some(video) = msg.video_message.as_option() {
+        // Check for video message - store thumbnail for preview, metadata for
+        // download. PTVs (round video notes) are the same proto type in a
+        // different field and play like any other video.
+        if let Some(video) = msg
+            .ptv_message
+            .as_option()
+            .or(msg.video_message.as_option())
+        {
             // Use thumbnail for display, or empty vec if none
             let thumbnail_data = video
                 .jpeg_thumbnail
@@ -664,16 +677,27 @@ impl WhatsAppClient {
             }
         }
 
-        // Check for document message (no download, just metadata)
+        // Check for document message (no eager download, just metadata)
         if let Some(doc) = msg.document_message.as_option() {
+            let mime = doc.mimetype.clone().unwrap_or_default();
+            let downloadable = DownloadableBuilder {
+                direct_path: doc.direct_path.as_deref(),
+                media_key: doc.media_key.as_deref(),
+                file_enc_sha256: doc.file_enc_sha256.as_deref(),
+                file_length: doc.file_length,
+                mime_type: &mime,
+                duration_secs: None,
+                download_type: DownloadMediaType::Document,
+            }
+            .build();
             return Some(MediaContent {
                 media_type: MediaType::Document,
                 data: Arc::new(vec![]),
-                mime_type: doc.mimetype.clone().unwrap_or_default(),
+                mime_type: mime,
                 width: None,
                 height: None,
                 caption: doc.caption.clone(),
-                downloadable: None,
+                downloadable,
                 is_animated: false,
                 duration_secs: None,
             });
@@ -969,6 +993,12 @@ impl WhatsAppClient {
                     return;
                 }
 
+                // Only group/broadcast receipts carry a participant (matches
+                // whatsmeow/WA Web); a plain DM receipt must not.
+                let needs_participant = chat_jid.is_group()
+                    || chat_jid.is_broadcast_list()
+                    || chat_jid.is_status_broadcast();
+
                 // Clone the Arc and release the mutex: a slow network call
                 // here must not queue every other client action behind it.
                 let client = client_handle.lock().await.clone();
@@ -981,7 +1011,7 @@ impl WhatsAppClient {
                     for (sender, msg_ids) in by_sender {
                         let id_refs: Vec<&str> = msg_ids.iter().map(String::as_str).collect();
                         if let Err(e) = client
-                            .mark_as_read(&chat_jid, Some(&sender), &id_refs)
+                            .mark_as_read(&chat_jid, needs_participant.then_some(&sender), &id_refs)
                             .await
                         {
                             warn!("Failed to mark messages as read: {}", e);
@@ -1019,6 +1049,15 @@ impl WhatsAppClient {
                     (mic, speaker) => {
                         let err = mic.err().or(speaker.err()).map(|e| e.to_string());
                         error!("Audio device setup failed: {:?}", err);
+                        // The offer is consumed and no accept went out: reject
+                        // so the caller stops ringing instead of waiting out
+                        // the timeout.
+                        if let Err(e) = client.voip().reject(&offer).await {
+                            error!(
+                                "Failed to reject call {} after audio failure: {}",
+                                call_id, e
+                            );
+                        }
                         Self::notify_call_ended(&ui_sender, &call_id).await;
                         return;
                     }
@@ -1297,6 +1336,7 @@ impl WhatsAppClient {
                 page.reverse();
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
+                Self::hydrate_reactions(chat_store, &entry.jid, &mut msgs).await?;
                 // The rows are distinct messages, so this side's unread state
                 // adds to the merged chat: fold the counter in and un-read its
                 // tail so opening the chat still sends those receipts.
@@ -1339,6 +1379,7 @@ impl WhatsAppClient {
                 .await?;
             page.reverse(); // store returns newest-first; the UI renders oldest-first
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
+            Self::hydrate_reactions(chat_store, &entry.jid, &mut chat.messages).await?;
             // The newest `unread_count` incoming messages are the unread ones;
             // select_chat only sends read receipts for !is_read, so hydrated
             // unread must not come up pre-read.
@@ -1356,6 +1397,27 @@ impl WhatsAppClient {
         }
         Ok(chats)
     }
+
+    /// Reactions live in their own table, so hydrated messages come out with
+    /// an empty map; fold the stored rows back in. Per-message point lookups:
+    /// the store exposes no per-chat batch query.
+    async fn hydrate_reactions(
+        chat_store: &Arc<ChatStore>,
+        chat_jid: &Jid,
+        msgs: &mut [ChatMessage],
+    ) -> Result<(), whatsapp_rust_chat_store::ChatStoreError> {
+        for msg in msgs.iter_mut() {
+            // The store keeps one row per sender (latest wins), matching the
+            // live add_reaction semantics, so a plain rebuild is enough.
+            for entry in chat_store.reactions(chat_jid, &msg.id).await? {
+                msg.reactions
+                    .entry(entry.emoji)
+                    .or_default()
+                    .push(entry.sender_jid.to_string());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Convert a durable store row into the UI message model. Media stays
@@ -1364,7 +1426,7 @@ impl WhatsAppClient {
 /// downloading anything. Shared by hydration; the live path additionally
 /// downloads images/stickers eagerly.
 fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
-    if let Some(sticker) = msg.sticker_message.as_option() {
+    if let Some(sticker) = effective_sticker(msg) {
         let mime = sticker
             .mimetype
             .clone()
@@ -1423,7 +1485,12 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             duration_secs: None,
         });
     }
-    if let Some(video) = msg.video_message.as_option() {
+    // PTVs (round video notes) are VideoMessage in a different field.
+    if let Some(video) = msg
+        .ptv_message
+        .as_option()
+        .or(msg.video_message.as_option())
+    {
         let downloadable = DownloadableBuilder {
             direct_path: video.direct_path.as_deref(),
             media_key: video.media_key.as_deref(),
@@ -1483,19 +1550,41 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
         });
     }
     if let Some(doc) = msg.document_message.as_option() {
+        let mime = doc.mimetype.clone().unwrap_or_default();
+        let downloadable = DownloadableBuilder {
+            direct_path: doc.direct_path.as_deref(),
+            media_key: doc.media_key.as_deref(),
+            file_enc_sha256: doc.file_enc_sha256.as_deref(),
+            file_length: doc.file_length,
+            mime_type: &mime,
+            duration_secs: None,
+            download_type: DownloadMediaType::Document,
+        }
+        .build();
         return Some(MediaContent {
             media_type: MediaType::Document,
             data: Arc::new(vec![]),
-            mime_type: doc.mimetype.clone().unwrap_or_default(),
+            mime_type: mime,
             width: None,
             height: None,
             caption: doc.caption.clone(),
-            downloadable: None,
+            downloadable,
             is_animated: false,
             duration_secs: None,
         });
     }
     None
+}
+
+/// Some animated stickers arrive wrapped in the `lottie_sticker_message`
+/// future-proof envelope instead of the top-level `sticker_message`.
+fn effective_sticker(msg: &wa::Message) -> Option<&wa::message::StickerMessage> {
+    msg.sticker_message.as_option().or_else(|| {
+        msg.lottie_sticker_message
+            .as_option()
+            .and_then(|w| w.message.as_option())
+            .and_then(|m| m.sticker_message.as_option())
+    })
 }
 
 fn stored_to_chat_message(stored: whatsapp_rust_chat_store::StoredMessage) -> ChatMessage {

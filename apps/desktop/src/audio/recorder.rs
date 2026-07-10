@@ -34,10 +34,16 @@ impl RecordedAudio {
         let mut output = Vec::with_capacity(output_len);
 
         for i in 0..output_len {
-            let src_idx = (i as f32 * ratio) as usize;
-            if src_idx < self.samples.len() {
-                output.push(self.samples[src_idx]);
-            }
+            // Linear interpolation: nearest-neighbor sample dropping aliases
+            // audibly on voice.
+            let src_pos = i as f32 * ratio;
+            let idx = src_pos as usize;
+            let frac = src_pos - idx as f32;
+            let Some(&a) = self.samples.get(idx) else {
+                break;
+            };
+            let b = self.samples.get(idx + 1).copied().unwrap_or(a);
+            output.push(a + (b - a) * frac);
         }
 
         output
@@ -250,3 +256,20 @@ impl std::fmt::Display for RecorderError {
 }
 
 impl std::error::Error for RecorderError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resample_interpolates_between_source_samples() {
+        // A linear ramp resamples to exact fractional positions; the old
+        // nearest-neighbor drop would return [0.0, 1.0, 3.0, 4.0].
+        let audio = RecordedAudio {
+            samples: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            sample_rate: 24_000,
+            duration_secs: 0,
+        };
+        assert_eq!(audio.resample_to_16khz(), vec![0.0, 1.5, 3.0, 4.5]);
+    }
+}

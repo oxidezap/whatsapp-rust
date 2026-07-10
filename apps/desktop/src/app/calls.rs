@@ -28,12 +28,15 @@ impl CallState {
 
     /// Set an incoming call
     pub fn set_incoming(&mut self, call: IncomingCall) {
+        // A second offer while one is still ringing would clobber the first
+        // and desync UI vs registry; ignore it (no multi-call UI yet).
         if let Some(prev) = &self.incoming {
             log::warn!(
-                "replacing incoming call {} with {}",
-                prev.call_id,
-                call.call_id
+                "ignoring incoming call {} while {} is still pending",
+                call.call_id,
+                prev.call_id
             );
+            return;
         }
         self.incoming = Some(call);
     }

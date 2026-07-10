@@ -179,6 +179,10 @@ pub struct WhatsAppApp {
     audio_owner: Option<String>,
     /// Currently active media (mutual exclusion: only one audio or video at a time)
     active_media: ActiveMedia,
+    /// Message id of the most recent user-requested playback; download/decode
+    /// completions autoplay only if they still match it, so a stale download
+    /// can't steal playback from media the user started meanwhile.
+    pending_media_request: Option<String>,
     /// Call state (incoming and outgoing calls)
     call_state: CallState,
     /// Cache of JID -> display name mappings (from notify/pushname attribute)
@@ -246,6 +250,7 @@ impl WhatsAppApp {
             audio_player: AudioPlayer::new(),
             audio_owner: None,
             active_media: ActiveMedia::None,
+            pending_media_request: None,
             call_state: CallState::new(),
             name_cache: HashMap::new(),
             video_players: HashMap::new(),
@@ -399,7 +404,7 @@ impl WhatsAppApp {
             if let Some(msg) = chat.messages.iter_mut().find(|m| m.id == message_id) {
                 if let Some(ref mut media) = msg.media {
                     media.data = Arc::new(data);
-                    info!("Cached audio data for message {}", message_id);
+                    info!("Cached media data for message {}", message_id);
                     // Invalidate message cache since we modified the message
                     self.message_list_cache.borrow_mut().remove(&chat.jid);
                 }
@@ -697,6 +702,20 @@ impl WhatsAppApp {
         }
     }
 
+    /// Unique optimistic-bubble id: a millisecond timestamp alone collides on
+    /// fast double-sends (add_message would dedup one bubble away and
+    /// MessageIdAssigned could rename the wrong one).
+    fn next_local_id(prefix: &str) -> String {
+        use portable_atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{prefix}_{}_{}",
+            wacore::time::now_millis(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
     /// Send a message to the currently selected chat
     fn send_message(&mut self, text: &str, cx: &mut Context<Self>) {
         // Check if connected before attempting to send
@@ -709,7 +728,7 @@ impl WhatsAppApp {
             return;
         };
 
-        let local_id = format!("local_{}", wacore::time::now_millis());
+        let local_id = Self::next_local_id("local");
         self.client.send_message(&jid, text, local_id.clone());
 
         // Add to local chat immediately for responsiveness; the client renames
@@ -790,6 +809,9 @@ impl WhatsAppApp {
             Err(e) => {
                 error!("Failed to stop recording: {}", e);
                 self.recording_state = RecordingState::Idle;
+                // Every abort path must reset the input area too, or it keeps
+                // rendering the recording UI forever.
+                self.update_input_recording(cx);
                 cx.notify();
                 return;
             }
@@ -799,6 +821,7 @@ impl WhatsAppApp {
         if recorded.duration_secs < 1 {
             warn!("Recording too short, discarding");
             self.recording_state = RecordingState::Idle;
+            self.update_input_recording(cx);
             cx.notify();
             return;
         }
@@ -818,6 +841,7 @@ impl WhatsAppApp {
             Err(e) => {
                 error!("Failed to encode audio: {}", e);
                 self.recording_state = RecordingState::Idle;
+                self.update_input_recording(cx);
                 cx.notify();
                 return;
             }
@@ -825,7 +849,7 @@ impl WhatsAppApp {
 
         let duration_secs = recorded.duration_secs;
 
-        let local_id = format!("local_audio_{}", wacore::time::now_millis());
+        let local_id = Self::next_local_id("local_audio");
         self.client.send_audio_message(
             &jid,
             ogg_data.clone(),
@@ -991,6 +1015,7 @@ impl WhatsAppApp {
 
     pub fn play_audio(&mut self, message_id: String, audio_data: Vec<u8>, cx: &mut Context<Self>) {
         self.stop_current_media();
+        self.pending_media_request = Some(message_id.clone());
 
         let completion_rx = self.audio_player.on_complete();
 
@@ -1075,8 +1100,10 @@ impl WhatsAppApp {
             return;
         }
 
-        // Stop any current playback
-        self.stop_audio(cx);
+        // Stop any current playback, video included: a playing video must not
+        // keep running underneath the download.
+        self.stop_current_media();
+        self.pending_media_request = Some(message_id.clone());
 
         // Start async download
         let download_rx = self.client.download_downloadable_media(downloadable);
@@ -1094,8 +1121,13 @@ impl WhatsAppApp {
                     let _ = entity.update(cx, |app, cx| {
                         // Cache the audio data in the message so we don't need to download again
                         app.update_message_media_data(&msg_id, data.clone());
-                        // Play the downloaded audio
-                        app.play_audio(msg_id, data, cx);
+                        // Autoplay only if the user hasn't started other media
+                        // since this download began.
+                        if app.pending_media_request.as_deref() == Some(msg_id.as_str()) {
+                            app.play_audio(msg_id, data, cx);
+                        } else {
+                            cx.notify();
+                        }
                     });
                 }
                 Err(e) => {
@@ -1106,6 +1138,34 @@ impl WhatsAppApp {
         .detach();
 
         cx.notify();
+    }
+
+    /// Fetch the full image for a bubble whose eager download failed and left
+    /// no thumbnail; mirrors the audio lazy-download path (no autoplay, the
+    /// cached bytes just render).
+    pub fn download_image(
+        &mut self,
+        message_id: String,
+        downloadable: DownloadableMedia,
+        cx: &mut Context<Self>,
+    ) {
+        let download_rx = self.client.download_downloadable_media(downloadable);
+
+        cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+            match download_with_timeout(download_rx).await {
+                Ok(data) => {
+                    info!("Image downloaded: {} bytes", data.len());
+                    let _ = entity.update(cx, |app, cx| {
+                        app.update_message_media_data(&message_id, data);
+                        cx.notify();
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to download image: {}", e);
+                }
+            }
+        })
+        .detach();
     }
 
     // ========== Video Playback ==========
@@ -1178,6 +1238,7 @@ impl WhatsAppApp {
                 if !self.active_media.is_playing(&message_id) && !owns_audio {
                     self.stop_current_media();
                 }
+                self.pending_media_request = Some(message_id.clone());
 
                 let (needs_audio, audio_data) =
                     if let Some(player) = self.video_players.get_mut(&message_id) {
@@ -1238,6 +1299,7 @@ impl WhatsAppApp {
     ) {
         // Stop any currently playing media (mutual exclusion)
         self.stop_current_media();
+        self.pending_media_request = Some(message_id.clone());
 
         // Evict old video players if cache is full (excluding currently playing)
         if self.video_players.len() >= MAX_VIDEO_PLAYERS {
@@ -1321,8 +1383,12 @@ impl WhatsAppApp {
                                     smol::Timer::after(std::time::Duration::from_millis(16)).await;
 
                                     let _ = entity.update(cx, |app, cx| {
-                                        if let Some(player) =
-                                            app.video_players.get_mut(&msg_id_for_play)
+                                        // Skip autoplay when the user started
+                                        // other media during download/decode.
+                                        if app.pending_media_request.as_deref()
+                                            == Some(msg_id_for_play.as_str())
+                                            && let Some(player) =
+                                                app.video_players.get_mut(&msg_id_for_play)
                                             && player.state() == VideoPlayerState::Paused
                                         {
                                             let needs_audio = player.play();
@@ -1657,6 +1723,12 @@ impl WhatsAppApp {
         let is_group = jid.as_ref().is_some_and(|j| j.is_group());
         let is_status = jid.as_ref().is_some_and(|j| j.is_status_broadcast());
 
+        // A message landing in the currently open chat is read immediately:
+        // receipt out now, no badge (select_chat won't re-run to send it).
+        let read_now = (!message.is_from_me
+            && self.selected_chat.as_deref() == Some(chat_jid.as_str()))
+        .then(|| (message.id.clone(), message.sender.clone()));
+
         // Cache the sender's name if provided
         if let Some(ref name) = sender_name {
             self.name_cache.insert(message.sender.clone(), name.clone());
@@ -1716,9 +1788,9 @@ impl WhatsAppApp {
             };
 
             let mut new_chat = if let Some(name) = display_name {
-                Chat::with_name(chat_jid, name)
+                Chat::with_name(chat_jid.clone(), name)
             } else {
-                Chat::new(chat_jid)
+                Chat::new(chat_jid.clone())
             };
 
             // For groups: track participant
@@ -1729,6 +1801,15 @@ impl WhatsAppApp {
             new_chat.add_message(message);
             self.chats.insert(0, new_chat);
             self.invalidate_chat_cache();
+        }
+
+        if let Some(receipt) = read_now {
+            self.client.send_read_receipts(&chat_jid, vec![receipt]);
+            if let Some(chat) = self.find_chat_mut(&chat_jid) {
+                chat.mark_as_read();
+            }
+            self.invalidate_chat_cache();
+            self.invalidate_message_cache(&chat_jid);
         }
     }
 

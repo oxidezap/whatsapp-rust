@@ -402,28 +402,41 @@ pub fn spawn_speaker() -> Result<async_channel::Sender<Vec<i16>>> {
         teardown_drain.store(true, Ordering::Relaxed);
     });
 
+    // Startup barrier mirroring spawn_mic: a speaker whose stream never started must fail call
+    // setup, not leave the engine writing remote audio into a ring nobody drains (silent call).
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
     // Build/play the !Send output stream on a dedicated parked thread.
     std::thread::spawn(move || {
-        match build_output_stream(&device, &config, format, channels, cons, pops, underruns) {
-            Ok(stream) => {
-                if let Err(e) = stream.play() {
-                    error!("speaker stream play failed: {e}");
-                } else {
-                    // Hold the stream until the drain signals teardown, then fall out of scope so
-                    // the stream drops and frees the output device.
-                    while !teardown.load(Ordering::Relaxed) {
-                        std::thread::park_timeout(std::time::Duration::from_millis(250));
-                    }
-                    return;
+        let started =
+            build_output_stream(&device, &config, format, channels, cons, pops, underruns)
+                .and_then(|stream| match stream.play() {
+                    Ok(()) => Ok(stream),
+                    Err(e) => Err(anyhow!("play output stream: {e}")),
+                });
+        match started {
+            // The binding keeps the stream alive while parked.
+            Ok(_stream) => {
+                let _ = ready_tx.send(Ok(()));
+                // Hold the stream until the drain signals teardown, then fall out of scope so
+                // the stream drops and frees the output device.
+                while !teardown.load(Ordering::Relaxed) {
+                    std::thread::park_timeout(std::time::Duration::from_millis(250));
                 }
             }
-            Err(e) => error!("speaker stream build failed: {e}"),
+            Err(e) => {
+                error!("speaker stream startup failed: {e}");
+                let _ = ready_tx.send(Err(e));
+                // Signal teardown and close the channel so the drain and diag tasks stop and
+                // senders see the dead speaker instead of feeding a stream that never started.
+                teardown.store(true, Ordering::Relaxed);
+                rx_close.close();
+            }
         }
-        // Build/play failed: signal teardown and close the channel so the drain and diag tasks
-        // stop and senders see the dead speaker instead of feeding a stream that never started.
-        teardown.store(true, Ordering::Relaxed);
-        rx_close.close();
     });
+    // Build/play are near-instant; a dead sender means the thread panicked.
+    ready_rx
+        .recv()
+        .map_err(|_| anyhow!("speaker stream thread exited before signaling readiness"))??;
     Ok(tx)
 }
 
