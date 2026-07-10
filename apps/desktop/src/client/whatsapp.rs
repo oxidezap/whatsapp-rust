@@ -650,13 +650,24 @@ impl WhatsAppClient {
                         ..Default::default()
                     };
 
-                    match client.send_message(jid.clone(), message.clone()).await {
+                    // Record BEFORE sending: the server ack event fires during
+                    // send_message, so a row recorded after it would stay
+                    // Pending forever (the ack precedes it in writer order).
+                    let msg_id = client.generate_message_id();
+                    record_outgoing(&chat_store, &jid, &msg_id, &message).await;
+                    let options = whatsapp_rust::SendOptions {
+                        message_id: Some(msg_id.clone()),
+                        ..Default::default()
+                    };
+                    match client
+                        .send_message_with_options(jid.clone(), message, options)
+                        .await
+                    {
                         Ok(result) => {
                             info!("Message sent successfully: {}", result.message_id);
-                            record_outgoing(&chat_store, &jid, &result.message_id, &message).await;
                         }
                         Err(e) => {
-                            error!("Failed to send message: {}", e);
+                            error!("Failed to send message {}: {}", msg_id, e);
                         }
                     }
                 } else {
@@ -766,13 +777,23 @@ impl WhatsAppClient {
                         ..Default::default()
                     };
 
-                    match client.send_message(jid.clone(), message.clone()).await {
+                    // Same ordering as the text path: record before sending so
+                    // the ack can't precede the row in the writer queue.
+                    let msg_id = client.generate_message_id();
+                    record_outgoing(&chat_store, &jid, &msg_id, &message).await;
+                    let options = whatsapp_rust::SendOptions {
+                        message_id: Some(msg_id.clone()),
+                        ..Default::default()
+                    };
+                    match client
+                        .send_message_with_options(jid.clone(), message, options)
+                        .await
+                    {
                         Ok(result) => {
                             info!("Audio message sent successfully: {}", result.message_id);
-                            record_outgoing(&chat_store, &jid, &result.message_id, &message).await;
                         }
                         Err(e) => {
-                            error!("Failed to send audio message: {}", e);
+                            error!("Failed to send audio message {}: {}", msg_id, e);
                         }
                     }
                 } else {
