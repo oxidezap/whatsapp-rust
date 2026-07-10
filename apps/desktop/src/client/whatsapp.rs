@@ -770,6 +770,14 @@ impl WhatsAppClient {
                     }
                 } else {
                     error!("Client not available for sending message");
+                    // The bubble still carries its local id (no rename ran)
+                    notify_send_failed(
+                        &ui_sender,
+                        &jid_str,
+                        &local_id,
+                        "client not available".to_string(),
+                    )
+                    .await;
                 }
             });
         });
@@ -904,6 +912,14 @@ impl WhatsAppClient {
                     }
                 } else {
                     error!("Client not available for sending audio message");
+                    // The bubble still carries its local id (no rename ran)
+                    notify_send_failed(
+                        &ui_sender,
+                        &jid_str,
+                        &local_id,
+                        "client not available".to_string(),
+                    )
+                    .await;
                 }
             });
         });
