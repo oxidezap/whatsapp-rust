@@ -376,16 +376,19 @@ impl Chat {
             })
             .unwrap_or_else(|pos| pos);
 
-        // >= on purpose: WhatsApp timestamps are second-granular, so live
-        // same-second siblings must still badge. History hydration never goes
-        // through here (insert_history_message/merge_history), and the dup
-        // guard above already blocks redelivery recounts.
+        // >= on purpose: WhatsApp timestamps are second-granular, so a live
+        // same-second sibling still takes over the preview.
         let is_newer_or_same = self
             .last_message_time
             .map(|t| message.timestamp >= t)
             .unwrap_or(true);
 
-        if !message.is_from_me && is_newer_or_same {
+        // Unread is not gated on recency: history hydration never goes through
+        // here (insert_history_message/merge_history) and the dup guard above
+        // blocks redelivery recounts, so every incoming message that reaches
+        // this point is new even when it lands behind the newest bubble
+        // (offline catch-up, out-of-order decryption).
+        if !message.is_from_me {
             self.unread_count += 1;
         }
 
@@ -590,6 +593,22 @@ mod tests {
         assert_eq!(chat.messages[0].id, "1"); // oldest
         assert_eq!(chat.messages[1].id, "2"); // middle
         assert_eq!(chat.messages[2].id, "3"); // newest
+    }
+
+    #[test]
+    fn test_out_of_order_incoming_still_counts_as_unread() {
+        let mut chat = Chat::new("test@s.whatsapp.net".to_string());
+
+        chat.add_message(make_message("2", 2000));
+        // Lands behind the newest bubble (offline catch-up / late decrypt):
+        // no preview takeover, but the badge must still count it.
+        let bumped = chat.add_message(make_message("1", 1000));
+
+        assert!(!bumped);
+        assert_eq!(chat.unread_count, 2);
+        // Redelivery of the same id must not recount.
+        chat.add_message(make_message("1", 1000));
+        assert_eq!(chat.unread_count, 2);
     }
 
     #[test]
