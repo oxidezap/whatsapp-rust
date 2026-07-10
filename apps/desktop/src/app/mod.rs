@@ -132,9 +132,8 @@ fn save_to_downloads(file_name: &str, data: &[u8]) -> std::io::Result<std::path:
     // Windows treats device basenames (CON, NUL, COM1…) as reserved for any
     // extension; prefix them so the save can't resolve to a device.
     let stem = name
-        .split('.')
-        .next()
-        .unwrap_or(name)
+        .split_once('.')
+        .map_or(name, |(stem, _)| stem)
         .trim_end_matches([' ', '.'])
         .to_ascii_uppercase();
     let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
@@ -1132,7 +1131,9 @@ impl WhatsAppApp {
     /// Get the currently playing audio message ID (if audio is playing)
     pub fn playing_message_id(&self) -> Option<&str> {
         match &self.active_media {
-            ActiveMedia::Audio { message_id } => Some(message_id),
+            // Gated on the stream so a paused voice note renders as paused;
+            // resume still works because toggle_audio matches on active_media.
+            ActiveMedia::Audio { message_id } if self.audio_player.is_playing() => Some(message_id),
             _ => None,
         }
     }

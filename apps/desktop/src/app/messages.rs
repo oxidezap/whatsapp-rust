@@ -45,10 +45,14 @@ impl MessageListCache {
                 .iter()
                 .enumerate()
                 .map(|(i, msg)| {
-                    let show_sender = is_group && show_sender_flags[i];
                     size(
                         px(600.),
-                        px(calculate_message_height(msg, show_sender, max_media_size)),
+                        px(calculate_message_height(
+                            msg,
+                            show_sender_flags[i],
+                            is_group,
+                            max_media_size,
+                        )),
                     )
                 })
                 .collect(),
@@ -76,8 +80,15 @@ pub fn should_show_sender(messages: &[ChatMessage], index: usize) -> bool {
 }
 
 /// Calculate the height needed for a message bubble.
-/// `max_media_size` should come from ResponsiveLayout for correct sizing.
-pub fn calculate_message_height(msg: &ChatMessage, show_sender: bool, max_media_size: f32) -> f32 {
+/// `show_sender` must be the same raw grouping flag the bubble renders with:
+/// it drives the outer padding in every chat, while the sender-name line only
+/// exists in groups. `max_media_size` should come from ResponsiveLayout.
+pub fn calculate_message_height(
+    msg: &ChatMessage,
+    show_sender: bool,
+    is_group: bool,
+    max_media_size: f32,
+) -> f32 {
     let outer_top = if show_sender {
         layout::MSG_PADDING_TOP_FIRST
     } else {
@@ -90,7 +101,7 @@ pub fn calculate_message_height(msg: &ChatMessage, show_sender: bool, max_media_
 
     let mut content_items = 1;
 
-    if show_sender && msg.sender_name.is_some() && !msg.is_from_me {
+    if is_group && show_sender && msg.sender_name.is_some() && !msg.is_from_me {
         height += layout::MSG_SENDER_NAME_HEIGHT;
         content_items += 1;
     }
