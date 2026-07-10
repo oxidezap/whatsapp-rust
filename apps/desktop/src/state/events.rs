@@ -41,6 +41,14 @@ pub enum UiEvent {
         local_id: String,
         message_id: String,
     },
+    /// A send attempt failed after the optimistic bubble was already renamed
+    /// to its real id; the UI marks that bubble failed instead of leaving it
+    /// pending forever.
+    SendFailed {
+        chat_jid: String,
+        message_id: String,
+        reason: String,
+    },
     ReactionReceived {
         chat_jid: String,
         message_id: String,

@@ -217,27 +217,42 @@ pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
     // wake and free the input device instead of holding it until process exit.
     let teardown = tx.clone();
     let alive_thread = alive;
+    // Startup barrier: the caller must not get a "working" mic whose stream never started —
+    // the call would establish and transmit silence forever.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
     // Build on a dedicated thread: the !Send stream must be created, played, and dropped there.
     std::thread::spawn(move || {
-        match build_input_stream(&device, &config, format, channels, prod) {
-            Ok(stream) => {
-                if let Err(e) = stream.play() {
-                    error!("mic stream play failed: {e}");
-                } else {
-                    // Hold the stream until the call drops its receiver (or the call ends), polling in
-                    // short intervals (park alone never wakes on a channel close), then fall out of
-                    // scope so the stream drops and frees the device.
-                    while !teardown.is_closed() && alive_thread.load(Ordering::Relaxed) {
-                        std::thread::park_timeout(std::time::Duration::from_millis(250));
-                    }
+        let started =
+            build_input_stream(&device, &config, format, channels, prod).and_then(|stream| {
+                match stream.play() {
+                    Ok(()) => Ok(stream),
+                    Err(e) => Err(anyhow!("play input stream: {e}")),
+                }
+            });
+        match started {
+            // The binding keeps the stream alive while parked.
+            Ok(_stream) => {
+                let _ = ready_tx.send(Ok(()));
+                // Hold the stream until the call drops its receiver (or the call ends), polling in
+                // short intervals (park alone never wakes on a channel close), then fall out of
+                // scope so the stream drops and frees the device.
+                while !teardown.is_closed() && alive_thread.load(Ordering::Relaxed) {
+                    std::thread::park_timeout(std::time::Duration::from_millis(250));
                 }
             }
-            Err(e) => error!("mic stream build failed: {e}"),
+            Err(e) => {
+                error!("mic stream startup failed: {e}");
+                let _ = ready_tx.send(Err(e));
+            }
         }
         // Signal the drain to stop (single exit, any reason) so the channel closes and the
         // consumer observes the mic ending instead of blocking forever on frames that never arrive.
         alive_thread.store(false, Ordering::Relaxed);
     });
+    // Build/play are near-instant; a dead sender means the thread panicked.
+    ready_rx
+        .recv()
+        .map_err(|_| anyhow!("mic stream thread exited before signaling readiness"))??;
     Ok(rx)
 }
 

@@ -14,6 +14,10 @@ use crate::utils::scale_media_dimensions;
 pub struct MessageListCache {
     /// Message count when cache was created (invalidation check)
     pub message_count: usize,
+    /// Group flag the sizes were computed with (invalidation check)
+    pub is_group: bool,
+    /// Media size cap the sizes were computed with (invalidation check)
+    pub max_media_size: f32,
     /// Pre-computed item sizes for virtual list
     pub item_sizes: Rc<Vec<Size<Pixels>>>,
     /// Pre-computed show_sender flags for message grouping
@@ -52,6 +56,8 @@ impl MessageListCache {
 
         Self {
             message_count: messages.len(),
+            is_group,
+            max_media_size,
             item_sizes,
             show_sender_flags,
             messages: messages_arc,

@@ -147,6 +147,8 @@ pub struct ChatMessage {
     pub media: Option<MediaContent>,
     /// Reactions on this message (emoji -> list of sender JIDs)
     pub reactions: HashMap<String, Vec<String>>,
+    /// Whether an outgoing send attempt for this message failed
+    pub failed: bool,
 }
 
 impl ChatMessage {
@@ -162,6 +164,7 @@ impl ChatMessage {
             is_read: false,
             media: None,
             reactions: HashMap::new(),
+            failed: false,
         }
     }
 
@@ -177,6 +180,7 @@ impl ChatMessage {
             is_read: false,
             media: Some(media),
             reactions: HashMap::new(),
+            failed: false,
         }
     }
 
@@ -193,6 +197,7 @@ impl ChatMessage {
             is_read: false,
             media: None,
             reactions: HashMap::new(),
+            failed: false,
         }
     }
 
@@ -342,8 +347,11 @@ impl Chat {
             .unwrap_or_else(|| jid.split('@').next().unwrap_or(jid).to_string())
     }
 
-    /// Add a message to the chat, maintaining chronological order by timestamp
-    pub fn add_message(&mut self, message: ChatMessage) {
+    /// Add a message to the chat, maintaining chronological order by timestamp.
+    /// Returns true when the message became the chat's newest content, so the
+    /// caller knows whether to bump the chat in the list; duplicates and older
+    /// backfills return false.
+    pub fn add_message(&mut self, message: ChatMessage) -> bool {
         // Sorted insert (out-of-order decryption during history sync); equal
         // timestamps tie-break on message ID for stable ordering.
         let pos = match self.messages.binary_search_by(|m| {
@@ -353,7 +361,7 @@ impl Chat {
         }) {
             // Redelivery of a message we already show (live traffic
             // overlapping hydrated history): no duplicate bubble, no recount.
-            Ok(_) => return,
+            Ok(_) => return false,
             Err(pos) => pos,
         };
 
@@ -376,6 +384,7 @@ impl Chat {
         }
 
         self.messages.insert(pos, message);
+        is_newer_or_same
     }
 
     /// Fold a freshly hydrated copy of this chat (from the durable store) into
@@ -467,6 +476,7 @@ mod tests {
             is_read: false,
             media: None,
             reactions: HashMap::new(),
+            failed: false,
         }
     }
 

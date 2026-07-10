@@ -38,6 +38,7 @@ pub fn render_message_bubble(
     let content_for_copy = message.content.clone();
     let bubble_id: SharedString = format!("msg-{}", message.id).into();
     let is_playing = playing_message_id.as_ref() == Some(&message_id);
+    let send_failed = is_from_me && message.failed;
     let reactions = message.reactions.clone();
     let has_reactions = !reactions.is_empty();
     let sender_name: Option<SharedString> = if is_group && !is_from_me && show_sender {
@@ -124,6 +125,14 @@ pub fn render_message_bubble(
                                                 .text_xs()
                                                 .child(time),
                                         )
+                                        .when(send_failed, |el| {
+                                            el.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(colors::ERROR))
+                                                    .child("failed"),
+                                            )
+                                        })
                                         .when(!content_for_copy.is_empty(), |el| {
                                             el.child(
                                                 Clipboard::new(bubble_id).value(content_for_copy),

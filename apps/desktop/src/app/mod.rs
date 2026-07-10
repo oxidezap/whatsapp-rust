@@ -342,9 +342,12 @@ impl WhatsAppApp {
     ) -> MessageListCache {
         let mut cache = self.message_list_cache.borrow_mut();
 
-        // Check if we have a valid cache entry
+        // Check if we have a valid cache entry; heights depend on the layout
+        // inputs too, so a resize or group-flag change must recompute.
         if let Some(cached) = cache.get(chat_jid)
             && cached.message_count == messages.len()
+            && cached.is_group == is_group
+            && cached.max_media_size == max_media_size
         {
             return cached.clone();
         }
@@ -405,12 +408,15 @@ impl WhatsAppApp {
         }
     }
 
-    /// Add a message to a chat and move it to the top of the list.
+    /// Add a message to a chat, bumping it to the top of the list only when
+    /// the message actually advances the chat (duplicates and older backfills
+    /// leave the ordering alone).
     /// Returns true if the chat was found and updated, false otherwise.
     fn add_message_to_chat(&mut self, jid: &str, message: ChatMessage) -> bool {
         if let Some(index) = self.chats.iter().position(|c| c.jid == jid) {
-            self.chats[index].add_message(message);
-            self.move_chat_to_top(index);
+            if self.chats[index].add_message(message) {
+                self.move_chat_to_top(index);
+            }
             // Always invalidate chat cache since the chat's content changed
             // (even if it didn't move, the last message preview needs updating)
             self.invalidate_chat_cache();
@@ -997,12 +1003,15 @@ impl WhatsAppApp {
                 info!("Started audio playback for message {}", message_id);
 
                 // Wait for completion event (no polling needed)
+                let completed_id = message_id;
                 cx.spawn(async move |entity: WeakEntity<Self>, cx| {
                     let _ = completion_rx.await;
 
                     let _ = entity.update(cx, |app, cx| {
-                        // Only clear if still playing this audio
-                        if app.active_media.is_audio() {
+                        // Id check, not just is_audio: switching A -> B drops
+                        // A's completion sender after B is active, and A's
+                        // stale wakeup must not clear B's state.
+                        if app.active_media.is_playing(&completed_id) {
                             app.active_media = ActiveMedia::None;
                             info!("Audio playback completed");
                             cx.notify();
@@ -1161,7 +1170,12 @@ impl WhatsAppApp {
                 self.video_update_task = None;
             }
             Some(VideoPlayerState::Paused) => {
-                if !self.active_media.is_playing(&message_id) {
+                // Pausing cleared active_media, so is_playing alone can't
+                // tell "nothing else started" from "another media is live";
+                // audio ownership does. Stopping here on resume would drop
+                // this video's own paused audio and it would come back mute.
+                let owns_audio = self.audio_owner.as_deref() == Some(message_id.as_str());
+                if !self.active_media.is_playing(&message_id) && !owns_audio {
                     self.stop_current_media();
                 }
 
@@ -1535,6 +1549,20 @@ impl WhatsAppApp {
                 self.invalidate_message_cache(&chat_jid);
                 cx.notify();
             }
+            UiEvent::SendFailed {
+                chat_jid,
+                message_id,
+                reason,
+            } => {
+                warn!("Send failed for {} in {}: {}", message_id, chat_jid, reason);
+                if let Some(chat) = self.find_chat_mut(&chat_jid)
+                    && let Some(msg) = chat.messages.iter_mut().find(|m| m.id == message_id)
+                {
+                    msg.failed = true;
+                    self.invalidate_message_cache(&chat_jid);
+                    cx.notify();
+                }
+            }
             UiEvent::ReceiptReceived {
                 chat_jid,
                 message_ids,
@@ -1663,10 +1691,13 @@ impl WhatsAppApp {
                 }
             }
             // Status broadcasts: don't update any names
-            chat.add_message(message);
+            let advanced = chat.add_message(message);
 
-            // Move chat to top of list (most recent first)
-            self.move_chat_to_top(index);
+            // Move chat to top of list (most recent first); duplicates and
+            // older backfills don't reorder
+            if advanced {
+                self.move_chat_to_top(index);
+            }
 
             // Always invalidate caches since chat content changed
             self.invalidate_chat_cache();

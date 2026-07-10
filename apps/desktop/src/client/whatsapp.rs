@@ -195,7 +195,6 @@ impl WhatsAppClient {
         let ui_tx_clone = ui_tx.clone();
         let calls_clone = calls.clone();
         let ui_sender_clone = ui_sender.clone();
-        let chat_store_events = chat_store.clone();
 
         // Transport, HTTP client and runtime come from the default cargo
         // features (Tokio WebSocket, ureq, Tokio).
@@ -205,9 +204,8 @@ impl WhatsAppClient {
                 let ui_tx = ui_tx_clone.clone();
                 let calls = calls_clone.clone();
                 let ui_sender = ui_sender_clone.clone();
-                let chat_store = chat_store_events.clone();
                 async move {
-                    Self::handle_event(event, client, ui_tx, calls, ui_sender, chat_store).await;
+                    Self::handle_event(event, client, ui_tx, calls, ui_sender).await;
                 }
             })
             .build()
@@ -235,6 +233,13 @@ impl WhatsAppClient {
         // The chat store materializes history straight off the event bus.
         bot.client().register_handler(chat_store.handler());
 
+        // Re-hydrate the UI off the store's invalidation stream instead of raw
+        // client events: changes are emitted only after commit, so a reload can
+        // never observe pre-commit state (no flush barrier, no dispatch-order
+        // dependency), and the debounce coalesces history-sync bursts into one
+        // reload. HistoryLoaded merges, so re-sending is safe.
+        Self::spawn_history_reloader(chat_store.subscribe(), chat_store.clone(), &bot, &ui_tx);
+
         // Store client reference for UI to use
         {
             let mut guard = client_handle.lock().await;
@@ -254,26 +259,8 @@ impl WhatsAppClient {
         ui_tx: mpsc::UnboundedSender<UiEvent>,
         calls: CallRegistry,
         ui_sender: UiEventSender,
-        chat_store: Arc<ChatStore>,
     ) {
         match &*event {
-            Event::HistorySync(_) => {
-                // The chat store enqueued this same event synchronously during
-                // dispatch; flush() is the barrier that its materialization
-                // committed. HistoryLoaded only adds chats the UI doesn't have,
-                // so re-sending after each chunk is safe.
-                if let Err(e) = chat_store.flush().await {
-                    warn!("history sync flush failed: {e}");
-                    return;
-                }
-                match Self::load_history(&chat_store, &client).await {
-                    Ok(chats) if !chats.is_empty() => {
-                        let _ = ui_tx.send(UiEvent::HistoryLoaded { chats });
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!("failed to reload history after sync: {e}"),
-                }
-            }
             Event::PairingQrCode(qr) => {
                 info!("QR code received");
                 let _ = ui_tx.send(UiEvent::QrCode {
@@ -456,6 +443,7 @@ impl WhatsAppClient {
             is_read: false,
             media: None,
             reactions: std::collections::HashMap::new(),
+            failed: false,
         };
 
         if let Some(media) = media_result {
@@ -501,30 +489,56 @@ impl WhatsAppClient {
     /// Try to extract and download media from a message
     async fn try_extract_media(msg: &wa::Message, _client: &Arc<Client>) -> Option<MediaContent> {
         // Check for sticker message
-        if let Some(sticker) = msg.sticker_message.as_option()
-            && let Some(data) = Self::download_media(_client, sticker, "sticker").await
-        {
-            let is_animated = sticker.is_animated.unwrap_or(false);
-            let is_lottie = sticker.is_lottie.unwrap_or(false);
+        if let Some(sticker) = msg.sticker_message.as_option() {
             let mime = sticker
                 .mimetype
                 .clone()
                 .unwrap_or_else(|| "image/webp".to_string());
+            let downloadable = DownloadableBuilder {
+                direct_path: sticker.direct_path.as_deref(),
+                media_key: sticker.media_key.as_deref(),
+                file_enc_sha256: sticker.file_enc_sha256.as_deref(),
+                file_length: sticker.file_length,
+                mime_type: &mime,
+                duration_secs: None,
+                download_type: DownloadMediaType::Sticker,
+            }
+            .build();
+            // Same rule as the image path below: a failed eager download
+            // degrades to the thumbnail (and stays retryable through the
+            // download metadata) instead of the message losing its media.
+            let (data, mime_type, is_animated) =
+                match Self::download_media(_client, sticker, "sticker").await {
+                    Some(data) => (data, mime, sticker.is_animated.unwrap_or(false)),
+                    None => (
+                        sticker
+                            .png_thumbnail
+                            .as_ref()
+                            .filter(|t| !t.is_empty())
+                            .cloned()
+                            .unwrap_or_default(),
+                        "image/png".to_string(),
+                        false,
+                    ),
+                };
+            if data.is_empty() && downloadable.is_none() {
+                return None;
+            }
             info!(
                 "Sticker: mime={}, is_animated={}, is_lottie={}, size={} bytes",
-                mime,
+                mime_type,
                 is_animated,
-                is_lottie,
+                sticker.is_lottie.unwrap_or(false),
                 data.len()
             );
             return Some(MediaContent {
                 media_type: MediaType::Sticker,
                 data: Arc::new(data),
-                mime_type: mime,
+                mime_type,
                 width: sticker.width,
                 height: sticker.height,
                 caption: None,
-                downloadable: None,
+                downloadable,
                 is_animated,
                 duration_secs: None,
             });
@@ -718,6 +732,7 @@ impl WhatsAppClient {
                         }
                         Err(e) => {
                             error!("Failed to send message {}: {}", msg_id, e);
+                            notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
                         }
                     }
                 } else {
@@ -804,6 +819,9 @@ impl WhatsAppClient {
                         Ok(resp) => resp,
                         Err(e) => {
                             error!("Failed to upload audio: {}", e);
+                            // Bubble still carries the local id at this point.
+                            notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string())
+                                .await;
                             return;
                         }
                     };
@@ -848,6 +866,7 @@ impl WhatsAppClient {
                         }
                         Err(e) => {
                             error!("Failed to send audio message {}: {}", msg_id, e);
+                            notify_send_failed(&ui_sender, &jid_str, &msg_id, e.to_string()).await;
                         }
                     }
                 } else {
@@ -1203,6 +1222,57 @@ impl WhatsAppClient {
 impl WhatsAppClient {
     const HISTORY_CHAT_LIMIT: i64 = 100;
     const HISTORY_MESSAGES_PER_CHAT: i64 = 50;
+    /// Quiet window before reloading: one history-sync chunk commits as many
+    /// write batches, each emitting a change; reload once per burst.
+    const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// One task for the whole session: chat-store invalidations -> debounced
+    /// load_history -> HistoryLoaded. Exits when the store or the UI goes away.
+    fn spawn_history_reloader(
+        mut changes: tokio::sync::broadcast::Receiver<whatsapp_rust_chat_store::StoreChange>,
+        chat_store: Arc<ChatStore>,
+        bot: &Bot,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        use tokio::sync::broadcast::error::RecvError;
+        use whatsapp_rust_chat_store::StoreChange;
+
+        let client = bot.client();
+        let ui_tx = ui_tx.clone();
+        tokio::spawn(async move {
+            let mut open = true;
+            while open {
+                match changes.recv().await {
+                    Ok(StoreChange::Chats) | Ok(StoreChange::Messages { .. }) => {}
+                    Ok(_) => continue,
+                    // Missed changes are covered by the full reload below.
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+                // Drain the burst; a quiet window flushes the reload.
+                loop {
+                    match tokio::time::timeout(Self::RELOAD_DEBOUNCE, changes.recv()).await {
+                        Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => continue,
+                        Ok(Err(RecvError::Closed)) => {
+                            // Reload once more: these changes were committed.
+                            open = false;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                match Self::load_history(&chat_store, &client).await {
+                    Ok(chats) if !chats.is_empty() => {
+                        if ui_tx.send(UiEvent::HistoryLoaded { chats }).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("failed to reload history after store change: {e}"),
+                }
+            }
+        });
+    }
 
     /// Build the UI chat list from the durable store: chats in display order,
     /// each with its most recent page of messages. Media bodies are not
@@ -1464,6 +1534,7 @@ fn stored_to_chat_message(stored: whatsapp_rust_chat_store::StoredMessage) -> Ch
         is_read,
         media,
         reactions: std::collections::HashMap::new(),
+        failed: false,
     }
 }
 
@@ -1479,6 +1550,22 @@ async fn notify_message_id(
             chat_jid: chat_jid.to_string(),
             local_id,
             message_id: message_id.to_string(),
+        });
+    }
+}
+
+/// Tell the UI a send failed so the bubble doesn't sit pending forever.
+async fn notify_send_failed(
+    ui_sender: &UiEventSender,
+    chat_jid: &str,
+    message_id: &str,
+    reason: String,
+) {
+    if let Some(tx) = ui_sender.lock().await.as_ref() {
+        let _ = tx.send(UiEvent::SendFailed {
+            chat_jid: chat_jid.to_string(),
+            message_id: message_id.to_string(),
+            reason,
         });
     }
 }
