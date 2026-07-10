@@ -746,9 +746,14 @@ impl WhatsAppApp {
 
         // A manual-unread badge is the store's -1 sentinel, cleared only by a
         // MarkChatAsRead action; receipts alone would let it come back on the
-        // next history reload.
-        if self.find_chat(&jid).is_some_and(|c| c.manually_unread) {
-            self.client.mark_chat_read(&jid);
+        // next history reload. Bounded to the newest visible bubble so a
+        // message racing the echo isn't marked read sight-unseen.
+        if let Some(chat) = self.find_chat(&jid).filter(|c| c.manually_unread) {
+            let last_displayed = chat
+                .messages
+                .last()
+                .map(|m| (m.id.clone(), m.timestamp.timestamp(), m.is_from_me));
+            self.client.mark_chat_read(&jid, last_displayed);
         }
 
         // Mark as read locally
@@ -1737,6 +1742,16 @@ impl WhatsAppApp {
             }
             UiEvent::HistoryLoaded { chats } => {
                 info!("Loaded {} chats from durable history", chats.len());
+                // The load is the store's display list: a chat it stopped
+                // returning was archived/deleted (possibly on another device)
+                // and must leave the UI too. The selected chat is spared so
+                // the open conversation isn't yanked mid-view.
+                let loaded: std::collections::HashSet<&str> =
+                    chats.iter().map(|c| c.jid.as_str()).collect();
+                self.chats.retain(|c| {
+                    loaded.contains(c.jid.as_str())
+                        || self.selected_chat.as_deref() == Some(c.jid.as_str())
+                });
                 for chat in chats {
                     // Later loads (post-HistorySync re-hydration) fold into
                     // chats the UI already shows instead of being dropped.

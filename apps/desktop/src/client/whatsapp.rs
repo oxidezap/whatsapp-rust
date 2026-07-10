@@ -1143,7 +1143,14 @@ impl WhatsAppClient {
     /// cleared by a MarkChatAsRead app-state action (echoed back through the
     /// event stream), never by message receipts — without this the badge
     /// would come back on the next history reload.
-    pub fn mark_chat_read(&self, chat_jid_str: &str) {
+    ///
+    /// `last_displayed` is `(message id, timestamp in seconds, from_me)` of
+    /// the newest bubble the user actually saw: it bounds the action so a
+    /// message that lands before the echo is processed is not counted as
+    /// read without being viewed.
+    pub fn mark_chat_read(&self, chat_jid_str: &str, last_displayed: Option<(String, i64, bool)>) {
+        use whatsapp_rust::features::{message_key, message_range};
+
         let client_handle = self.client_handle.clone();
         let chat_jid_str = chat_jid_str.to_string();
         let runtime = self.runtime.clone();
@@ -1161,9 +1168,16 @@ impl WhatsAppClient {
                     error!("Client not available for marking chat read");
                     return;
                 };
+                let range = last_displayed.map(|(id, ts_secs, from_me)| {
+                    message_range(
+                        ts_secs,
+                        None,
+                        vec![(message_key(id, &chat_jid, from_me, None), ts_secs)],
+                    )
+                });
                 if let Err(e) = client
                     .chat_actions()
-                    .mark_chat_as_read(&chat_jid, true, None)
+                    .mark_chat_as_read(&chat_jid, true, range)
                     .await
                 {
                     warn!("Failed to mark chat {} as read: {}", chat_jid, e);
