@@ -91,6 +91,45 @@ async fn download_with_timeout(
     .ok_or_else(|| "Download timed out".to_string())?
 }
 
+/// Write a downloaded document into the user's Downloads directory
+/// ($XDG_DOWNLOAD_DIR, then $HOME/Downloads, then the CWD like the database
+/// fallback when no home is known) and return the path written.
+fn save_to_downloads(file_name: &str, data: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let not_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(PathBuf::from(v));
+    let dir = std::env::var_os("XDG_DOWNLOAD_DIR")
+        .and_then(not_empty)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .and_then(not_empty)
+                .map(|home| home.join("Downloads"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&dir)?;
+
+    // The name comes off the wire: strip path separators so a hostile sender
+    // can't traverse out of the directory.
+    let sanitized: String = file_name
+        .chars()
+        .map(|c| {
+            if std::path::is_separator(c) || c == '\\' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let name = match sanitized.trim() {
+        "" | "." | ".." => "document",
+        trimmed => trimmed,
+    };
+
+    let path = dir.join(name);
+    std::fs::write(&path, data)?;
+    Ok(path)
+}
+
 /// Currently active media playback (mutual exclusion: only one media at a time)
 /// Animated stickers are excluded from this - they can play alongside audio/video.
 #[derive(Clone, Debug, Default)]
@@ -658,6 +697,10 @@ impl WhatsAppApp {
     pub fn retry_connection(&mut self, cx: &mut Context<Self>) {
         self.app_state = AppState::Loading;
 
+        // Tear down the old client's background thread first; otherwise every
+        // retry stacks another live runtime + DB pool on the same file.
+        self.client.shutdown();
+
         // Create new client and start event loop
         let mut client = WhatsAppClient::new();
         let ui_rx = client
@@ -907,6 +950,7 @@ impl WhatsAppApp {
                 width: None,
                 height: None,
                 caption: None,
+                file_name: None,
                 downloadable: None,
                 is_animated: false,
                 duration_secs: Some(duration_secs),
@@ -1210,6 +1254,35 @@ impl WhatsAppApp {
         .detach();
     }
 
+    /// Download a document and save it to the user's Downloads directory.
+    /// Documents open in external apps, so bytes on disk beat cached bytes.
+    pub fn download_document(
+        &mut self,
+        message_id: String,
+        file_name: String,
+        downloadable: DownloadableMedia,
+        cx: &mut Context<Self>,
+    ) {
+        let download_rx = self.client.download_downloadable_media(downloadable);
+
+        cx.spawn(async move |_entity: WeakEntity<Self>, _cx| {
+            match download_with_timeout(download_rx).await {
+                Ok(data) => {
+                    // unblock: a large write must not stall the UI executor.
+                    let saved = smol::unblock(move || save_to_downloads(&file_name, &data)).await;
+                    match saved {
+                        Ok(path) => {
+                            info!("Document {} saved to {}", message_id, path.display())
+                        }
+                        Err(e) => warn!("Failed to save document {}: {}", message_id, e),
+                    }
+                }
+                Err(e) => error!("Failed to download document {}: {}", message_id, e),
+            }
+        })
+        .detach();
+    }
+
     // ========== Video Playback ==========
 
     /// Get the video player state for a message (if any)
@@ -1322,8 +1395,12 @@ impl WhatsAppApp {
                     );
                     if let Err(e) = self.audio_player.play_samples(samples, sample_rate) {
                         warn!("Failed to play video audio: {}", e);
+                    } else {
+                        // Ownership only on success: recording it for a dead
+                        // sink would turn every later resume into a silent
+                        // no-op resume().
+                        self.audio_owner = Some(message_id.clone());
                     }
-                    self.audio_owner = Some(message_id.clone());
                 } else if !needs_audio && self.audio_owner.as_ref() == Some(&message_id) {
                     // Only resume if audio belongs to this video
                     self.audio_player.resume();

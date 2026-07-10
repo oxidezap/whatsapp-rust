@@ -101,6 +101,8 @@ pub struct MediaContent {
     /// Caption text (if any)
     #[allow(dead_code)]
     pub caption: Option<String>,
+    /// Original file name (documents), used when saving to disk
+    pub file_name: Option<String>,
     /// Download info for fetching full media (videos, documents)
     pub downloadable: Option<DownloadableMedia>,
     /// Whether this is an animated sticker (WebP animation)
@@ -442,14 +444,18 @@ impl Chat {
         // the (timestamp, id) sort invariant when the timestamp shifted.
         if let Some(pos) = self.messages.iter().position(|m| m.id == message.id) {
             let existing = self.messages.remove(pos);
-            // The store never holds downloaded media bytes; graft the ones
-            // the live bubble already fetched so they survive the replace.
+            // The store never holds downloaded media bytes — hydrated rows
+            // come back empty or with just a preview thumbnail; graft the
+            // bytes the live bubble already fetched so a reload can't
+            // downgrade a full download.
             if let Some(new_media) = message.media.as_mut()
-                && new_media.data.is_empty()
                 && let Some(old_media) = existing.media
                 && !old_media.data.is_empty()
+                && (new_media.data.is_empty()
+                    || (new_media.data_is_preview && !old_media.data_is_preview))
             {
                 new_media.data = old_media.data;
+                new_media.mime_type = old_media.mime_type;
                 new_media.data_is_preview = old_media.data_is_preview;
             }
             // Live-only state the store doesn't carry must also survive the
@@ -548,6 +554,7 @@ mod tests {
             width: None,
             height: None,
             caption: None,
+            file_name: None,
             downloadable: None,
             is_animated: false,
             duration_secs: None,
@@ -703,6 +710,50 @@ mod tests {
         assert_eq!(chat.messages[0].content, "edited caption");
         let media = chat.messages[0].media.as_ref().unwrap();
         assert_eq!(*media.data, vec![1, 2, 3]);
+        assert!(!media.data_is_preview);
+    }
+
+    #[test]
+    fn test_hydration_replacement_keeps_full_bytes_over_incoming_preview() {
+        let mut chat = Chat::new("test@s.whatsapp.net".to_string());
+
+        // Full media bytes already downloaded on the live bubble
+        let mut live = make_message("3EB0AAA", 1000);
+        let mut full = make_media(vec![1, 2, 3], false);
+        full.mime_type = "image/png".to_string();
+        live.media = Some(full);
+        chat.add_message(live);
+
+        // Hydrated image rows carry a jpeg thumbnail flagged as preview; the
+        // replace must not downgrade the full download to it
+        let mut hydrated = make_message("3EB0AAA", 1000);
+        hydrated.media = Some(make_media(vec![9], true));
+        chat.insert_history_message(hydrated);
+
+        assert_eq!(chat.messages.len(), 1);
+        let media = chat.messages[0].media.as_ref().unwrap();
+        assert_eq!(*media.data, vec![1, 2, 3]);
+        assert_eq!(media.mime_type, "image/png");
+        assert!(!media.data_is_preview);
+    }
+
+    #[test]
+    fn test_hydration_replacement_full_bytes_win_over_existing_preview() {
+        let mut chat = Chat::new("test@s.whatsapp.net".to_string());
+
+        // Live bubble degraded to a thumbnail (eager download failed)
+        let mut live = make_message("3EB0AAA", 1000);
+        live.media = Some(make_media(vec![9], true));
+        chat.add_message(live);
+
+        // Incoming copy carrying real bytes must replace the preview
+        let mut hydrated = make_message("3EB0AAA", 1000);
+        hydrated.media = Some(make_media(vec![1, 2, 3, 4], false));
+        chat.insert_history_message(hydrated);
+
+        assert_eq!(chat.messages.len(), 1);
+        let media = chat.messages[0].media.as_ref().unwrap();
+        assert_eq!(*media.data, vec![1, 2, 3, 4]);
         assert!(!media.data_is_preview);
     }
 

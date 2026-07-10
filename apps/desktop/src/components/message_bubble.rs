@@ -335,7 +335,11 @@ fn render_media_content(
             is_playing,
             entity,
         )),
-        MediaType::Document => el.child(render_document_placeholder()),
+        MediaType::Document => el.child(render_document_placeholder(
+            media_content,
+            message_id,
+            entity,
+        )),
     }
 }
 
@@ -488,8 +492,17 @@ fn render_audio_player(
         )
 }
 
-fn render_document_placeholder() -> impl IntoElement {
-    div()
+fn render_document_placeholder(
+    media_content: crate::state::MediaContent,
+    message_id: String,
+    entity: Entity<WhatsAppApp>,
+) -> impl IntoElement {
+    let label: SharedString = media_content
+        .file_name
+        .clone()
+        .unwrap_or_else(|| "Document".to_string())
+        .into();
+    let row = div()
         .w(px(200.))
         .h(px(50.))
         .bg(rgb(colors::BG_SELECTED))
@@ -500,9 +513,32 @@ fn render_document_placeholder() -> impl IntoElement {
         .gap_2()
         .child(
             div()
+                .overflow_hidden()
                 .text_color(rgb(colors::TEXT_SECONDARY))
-                .child("Document"),
-        )
+                .child(label),
+        );
+
+    // Doc bytes are never cached for rendering; with download metadata the
+    // row saves the file to the Downloads dir on tap.
+    if let Some(dl) = media_content.downloadable {
+        let file_name = media_content
+            .file_name
+            .unwrap_or_else(|| "document".to_string());
+        let doc_id: SharedString = format!("doc-{}", message_id).into();
+        row.id(doc_id)
+            .cursor_pointer()
+            .on_click(move |_, _window, cx| {
+                let msg_id = message_id.clone();
+                let name = file_name.clone();
+                let dl = dl.clone();
+                entity.update(cx, |app, cx| {
+                    app.download_document(msg_id, name, dl, cx);
+                });
+            })
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    }
 }
 
 fn render_video_player(

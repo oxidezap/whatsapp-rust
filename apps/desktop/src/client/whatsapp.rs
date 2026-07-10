@@ -35,6 +35,14 @@ fn resolve_database_path() -> String {
         std::env::var_os("HOME")
             .and_then(not_empty)
             .map(|home| home.join("Library/Application Support"))
+    } else if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA")
+            .and_then(not_empty)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .and_then(not_empty)
+                    .map(|profile| profile.join("AppData").join("Local"))
+            })
     } else {
         std::env::var_os("XDG_DATA_HOME")
             .and_then(not_empty)
@@ -126,6 +134,10 @@ pub struct WhatsAppClient {
     calls: CallRegistry,
     /// Durable chat history (same SQLite file as the device store)
     chat_store: ChatStoreHandle,
+    /// Tears down `run_client` on retry: without it the replaced client's
+    /// thread would keep its runtime and SQLite pool alive forever (bot.run()
+    /// reconnects internally and never returns on its own).
+    shutdown: Arc<tokio::sync::Notify>,
     /// Whether the client has been started
     started: bool,
 }
@@ -146,8 +158,16 @@ impl WhatsAppClient {
             ui_sender: Arc::new(Mutex::new(None)),
             calls: CallRegistry::default(),
             chat_store: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
             started: false,
         }
+    }
+
+    /// Stop the background run loop so its thread exits and the runtime and
+    /// SQLite handles drop. Idempotent; a signal fired before the loop is up
+    /// still lands (notify_one stores a permit).
+    pub fn shutdown(&self) {
+        self.shutdown.notify_one();
     }
 
     /// Get the runtime handle for UI async operations
@@ -183,6 +203,7 @@ impl WhatsAppClient {
         let calls = self.calls.clone();
         let chat_store = self.chat_store.clone();
         let runtime = self.runtime.clone();
+        let shutdown = self.shutdown.clone();
 
         std::thread::spawn(move || {
             runtime.block_on(async move {
@@ -191,7 +212,15 @@ impl WhatsAppClient {
                     let mut guard = ui_sender.lock().await;
                     *guard = Some(ui_tx.clone());
                 }
-                Self::run_client(ui_tx, client_handle, calls, chat_store, ui_sender.clone()).await;
+                Self::run_client(
+                    ui_tx,
+                    client_handle,
+                    calls,
+                    chat_store,
+                    ui_sender.clone(),
+                    shutdown,
+                )
+                .await;
             });
         });
 
@@ -205,6 +234,7 @@ impl WhatsAppClient {
         calls: CallRegistry,
         chat_store_handle: ChatStoreHandle,
         ui_sender: UiEventSender,
+        shutdown: Arc<tokio::sync::Notify>,
     ) {
         // Device store + durable chat history share one SQLite file (one pool,
         // one WAL writer).
@@ -289,7 +319,20 @@ impl WhatsAppClient {
         // Notify UI that init is complete
         let _ = ui_tx.send(UiEvent::InitComplete);
 
-        bot.run().await;
+        // bot.run() reconnects internally, so on its own it only returns after
+        // a logout; the shutdown signal is how a replaced client's thread gets
+        // to exit (letting block_on return drops the runtime + SQLite pool).
+        let client = bot.client();
+        tokio::select! {
+            _ = bot.run() => {}
+            _ = shutdown.notified() => {
+                // Graceful stop: flushes state and closes the transport. The
+                // dropped run future is not awaited out instead, because a
+                // disconnect() landing before run()'s first poll would be
+                // clobbered by run's own is_running swap.
+                client.disconnect().await;
+            }
+        }
     }
 
     /// Handle events from the WhatsApp client
@@ -586,6 +629,7 @@ impl WhatsAppClient {
                 width: sticker.width,
                 height: sticker.height,
                 caption: None,
+                file_name: None,
                 downloadable,
                 is_animated,
                 duration_secs: None,
@@ -639,6 +683,7 @@ impl WhatsAppClient {
                 width: image.width,
                 height: image.height,
                 caption: image.caption.clone(),
+                file_name: None,
                 downloadable,
                 is_animated: false,
                 duration_secs: None,
@@ -683,6 +728,7 @@ impl WhatsAppClient {
                     width: video.width,
                     height: video.height,
                     caption: video.caption.clone(),
+                    file_name: None,
                     downloadable,
                     is_animated: false,
                     duration_secs: video.seconds,
@@ -717,6 +763,7 @@ impl WhatsAppClient {
                     width: None,
                     height: None,
                     caption: None,
+                    file_name: None,
                     downloadable,
                     is_animated: false,
                     duration_secs: audio.seconds,
@@ -745,6 +792,7 @@ impl WhatsAppClient {
                 width: None,
                 height: None,
                 caption: doc.caption.clone(),
+                file_name: doc.file_name.clone(),
                 downloadable,
                 is_animated: false,
                 duration_secs: None,
@@ -1565,6 +1613,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             width: sticker.width,
             height: sticker.height,
             caption: None,
+            file_name: None,
             downloadable: Some(downloadable),
             is_animated: sticker.is_animated.unwrap_or(false),
             duration_secs: None,
@@ -1601,6 +1650,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             width: image.width,
             height: image.height,
             caption: image.caption.clone(),
+            file_name: None,
             downloadable,
             is_animated: false,
             duration_secs: None,
@@ -1639,6 +1689,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             width: video.width,
             height: video.height,
             caption: video.caption.clone(),
+            file_name: None,
             downloadable,
             is_animated: false,
             duration_secs: video.seconds,
@@ -1667,6 +1718,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             width: None,
             height: None,
             caption: None,
+            file_name: None,
             downloadable: Some(downloadable),
             is_animated: false,
             duration_secs: audio.seconds,
@@ -1692,6 +1744,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             width: None,
             height: None,
             caption: doc.caption.clone(),
+            file_name: doc.file_name.clone(),
             downloadable,
             is_animated: false,
             duration_secs: None,
@@ -1830,5 +1883,13 @@ async fn normalize_chat_jid(client: &Client, jid_str: &str) -> String {
 impl Default for WhatsAppClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for WhatsAppClient {
+    fn drop(&mut self) {
+        // A dropped wrapper can never be shut down explicitly anymore; free
+        // its background thread instead of leaking the runtime + DB pool.
+        self.shutdown.notify_one();
     }
 }
