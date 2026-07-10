@@ -199,18 +199,10 @@ impl WhatsAppClient {
         }
         info!("SQLite backend + chat store initialized.");
 
-        // Hydrate the UI from durable history before the network is even up.
-        match Self::load_history(&chat_store).await {
-            Ok(chats) if !chats.is_empty() => {
-                let _ = ui_tx.send(UiEvent::HistoryLoaded { chats });
-            }
-            Ok(_) => {}
-            Err(e) => warn!("Failed to load chat history: {e}"),
-        }
-
         let ui_tx_clone = ui_tx.clone();
         let calls_clone = calls.clone();
         let ui_sender_clone = ui_sender.clone();
+        let chat_store_events = chat_store.clone();
 
         // Transport, HTTP client and runtime come from the default cargo
         // features (Tokio WebSocket, ureq, Tokio).
@@ -220,8 +212,9 @@ impl WhatsAppClient {
                 let ui_tx = ui_tx_clone.clone();
                 let calls = calls_clone.clone();
                 let ui_sender = ui_sender_clone.clone();
+                let chat_store = chat_store_events.clone();
                 async move {
-                    Self::handle_event(event, client, ui_tx, calls, ui_sender).await;
+                    Self::handle_event(event, client, ui_tx, calls, ui_sender, chat_store).await;
                 }
             })
             .build()
@@ -234,6 +227,17 @@ impl WhatsAppClient {
                 return;
             }
         };
+
+        // Hydrate the UI from durable history before the network is even up
+        // (bot.run() is what connects). The client is needed here so hydrated
+        // JIDs normalize through the same PN->LID mapping live events use.
+        match Self::load_history(&chat_store, &bot.client()).await {
+            Ok(chats) if !chats.is_empty() => {
+                let _ = ui_tx.send(UiEvent::HistoryLoaded { chats });
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Failed to load chat history: {e}"),
+        }
 
         // The chat store materializes history straight off the event bus.
         bot.client().register_handler(chat_store.handler());
@@ -257,8 +261,26 @@ impl WhatsAppClient {
         ui_tx: mpsc::UnboundedSender<UiEvent>,
         calls: CallRegistry,
         ui_sender: UiEventSender,
+        chat_store: Arc<ChatStore>,
     ) {
         match &*event {
+            Event::HistorySync(_) => {
+                // The chat store enqueued this same event synchronously during
+                // dispatch; flush() is the barrier that its materialization
+                // committed. HistoryLoaded only adds chats the UI doesn't have,
+                // so re-sending after each chunk is safe.
+                if let Err(e) = chat_store.flush().await {
+                    warn!("history sync flush failed: {e}");
+                    return;
+                }
+                match Self::load_history(&chat_store, &client).await {
+                    Ok(chats) if !chats.is_empty() => {
+                        let _ = ui_tx.send(UiEvent::HistoryLoaded { chats });
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("failed to reload history after sync: {e}"),
+                }
+            }
             Event::PairingQrCode(qr) => {
                 info!("QR code received");
                 let _ = ui_tx.send(UiEvent::QrCode {
@@ -1139,11 +1161,19 @@ impl WhatsAppClient {
     /// hydrated here (the proto is in the store; download stays on demand).
     async fn load_history(
         chat_store: &Arc<ChatStore>,
+        client: &Arc<Client>,
     ) -> Result<Vec<crate::state::Chat>, whatsapp_rust_chat_store::ChatStoreError> {
         let entries = chat_store.chats(false, Self::HISTORY_CHAT_LIMIT).await?;
-        let mut chats = Vec::with_capacity(entries.len());
+        let mut chats: Vec<crate::state::Chat> = Vec::with_capacity(entries.len());
         for entry in entries {
-            let jid_str = entry.jid.to_string();
+            // Same PN->LID mapping live events go through, or the restored
+            // chat and the next live message split into two conversations.
+            // A PN/LID pair of stored rows collapses to the most recently
+            // active one (entries arrive in display order).
+            let jid_str = normalize_chat_jid(client, &entry.jid.to_string()).await;
+            if chats.iter().any(|c| c.jid == jid_str) {
+                continue;
+            }
             let mut name = entry.name.clone();
             if name.is_none()
                 && let Ok(Some(contact)) = chat_store.contact(&entry.jid).await
@@ -1155,6 +1185,9 @@ impl WhatsAppClient {
                 None => crate::state::Chat::new(jid_str),
             };
             chat.unread_count = entry.unread_count.max(0) as u32;
+            // -1 = manually marked unread (WA Web convention); .max(0) above
+            // must not silently eat the flag.
+            chat.manually_unread = entry.unread_count < 0;
             chat.last_message = entry.last_message_preview.clone();
             chat.last_message_time = entry.last_message_at;
 
@@ -1163,6 +1196,19 @@ impl WhatsAppClient {
                 .await?;
             page.reverse(); // store returns newest-first; the UI renders oldest-first
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
+            // The newest `unread_count` incoming messages are the unread ones;
+            // select_chat only sends read receipts for !is_read, so hydrated
+            // unread must not come up pre-read.
+            let mut remaining = chat.unread_count;
+            for msg in chat.messages.iter_mut().rev() {
+                if remaining == 0 {
+                    break;
+                }
+                if !msg.is_from_me {
+                    msg.is_read = false;
+                    remaining -= 1;
+                }
+            }
             chats.push(chat);
         }
         Ok(chats)
@@ -1177,6 +1223,18 @@ fn stored_to_chat_message(stored: whatsapp_rust_chat_store::StoredMessage) -> Ch
         (Some(text), _) => text.clone(),
         (None, _) => format!("[{}]", stored.kind.as_str()),
     };
+    // Outgoing ticks come from the stored delivery status; incoming default
+    // to read and load_history un-reads the chat's unread tail (per-incoming
+    // read state lives on the chat cursor, not the row).
+    let is_read = if stored.from_me {
+        matches!(
+            stored.status,
+            whatsapp_rust_chat_store::MessageStatus::Read
+                | whatsapp_rust_chat_store::MessageStatus::Played
+        )
+    } else {
+        true
+    };
     ChatMessage {
         id: stored.id,
         sender: stored.sender_jid.to_string(),
@@ -1184,7 +1242,7 @@ fn stored_to_chat_message(stored: whatsapp_rust_chat_store::StoredMessage) -> Ch
         content,
         timestamp: stored.timestamp,
         is_from_me: stored.from_me,
-        is_read: true,
+        is_read,
         media: None,
         reactions: std::collections::HashMap::new(),
     }

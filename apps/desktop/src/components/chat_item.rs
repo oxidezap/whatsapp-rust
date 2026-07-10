@@ -22,6 +22,7 @@ pub fn render_chat_item(
         .unwrap_or_else(|| "No messages".to_string())
         .into();
     let unread = chat.unread_count;
+    let manually_unread = chat.manually_unread;
     let initial = name.chars().next().unwrap_or('?');
 
     let bg = if is_selected {
@@ -78,7 +79,13 @@ pub fn render_chat_item(
                                 .flex_1()
                                 .child(last_message),
                         )
-                        .when(unread > 0, |el| {
+                        .when(unread > 0 || manually_unread, |el| {
+                            // Manual mark-unread has no count: render a dot.
+                            let label = if unread > 0 {
+                                unread.to_string()
+                            } else {
+                                "\u{2022}".to_string()
+                            };
                             el.child(
                                 div()
                                     .px_2()
@@ -88,7 +95,7 @@ pub fn render_chat_item(
                                     .text_color(rgb(colors::WHITE))
                                     .text_xs()
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .child(unread.to_string()),
+                                    .child(label),
                             )
                         }),
                 ),

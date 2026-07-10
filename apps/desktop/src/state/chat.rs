@@ -272,6 +272,8 @@ pub struct Chat {
     pub last_message_time: Option<DateTime<Utc>>,
     /// Number of unread messages
     pub unread_count: u32,
+    /// Manually marked unread (WA's `-1` sentinel): badge without a count.
+    pub manually_unread: bool,
     /// Whether this is a group chat
     pub is_group: bool,
     /// Participant names in group chats (sender JID -> display name)
@@ -292,6 +294,7 @@ impl Chat {
             last_message: None,
             last_message_time: None,
             unread_count: 0,
+            manually_unread: false,
             is_group,
             participants: HashMap::new(),
             messages: Vec::new(),
@@ -309,6 +312,7 @@ impl Chat {
             last_message: None,
             last_message_time: None,
             unread_count: 0,
+            manually_unread: false,
             is_group,
             participants: HashMap::new(),
             messages: Vec::new(),
@@ -365,6 +369,7 @@ impl Chat {
     /// Mark all messages as read
     pub fn mark_as_read(&mut self) {
         self.unread_count = 0;
+        self.manually_unread = false;
         for msg in &mut self.messages {
             msg.is_read = true;
         }
