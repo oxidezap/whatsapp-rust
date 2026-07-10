@@ -164,20 +164,14 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
         return None;
     }
 
-    // Convert stereo to mono if needed (average L and R channels)
-    let mono_samples = if channels == 2 {
+    // Downmix to mono if needed (average across all channels; the API promises mono)
+    let mono_samples = if channels > 1 {
         let mono: Vec<f32> = all_samples
-            .chunks(2)
-            .map(|chunk| {
-                if chunk.len() == 2 {
-                    (chunk[0] + chunk[1]) / 2.0
-                } else {
-                    chunk[0]
-                }
-            })
+            .chunks(channels as usize)
+            .map(|chunk| chunk.iter().sum::<f32>() / chunk.len() as f32)
             .collect();
         log::info!(
-            "Converted {} stereo samples to {} mono samples",
+            "Converted {} interleaved samples to {} mono samples",
             all_samples.len(),
             mono.len()
         );
@@ -209,8 +203,8 @@ fn wrap_aac_as_adts(frames: &[Vec<u8>], sample_rate: u32, channels: u8) -> Vec<u
         .map(|(_, idx)| *idx)
         .unwrap_or(4); // Default to 44100 (index 4)
 
-    // AAC-LC profile = 1, ADTS uses profile - 1 = 0
-    let profile = 1u8; // AAC-LC
+    // ADTS profile field stores Audio Object Type minus one; AAC-LC AOT = 2
+    let profile = 2u8; // AAC-LC
 
     for frame in frames {
         let frame_len = frame.len() + 7; // ADTS header is 7 bytes

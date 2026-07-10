@@ -92,21 +92,29 @@ impl AudioRecorder {
             .supported_input_configs()
             .map_err(|e| RecorderError::DeviceError(e.to_string()))?;
 
-        let mut best_config = None;
+        // The callback is built for f32 frames, so only F32 configs are usable.
+        // Any channel count works (the callback downmixes); prefer mono at 48kHz.
+        let mut best: Option<(u8, _)> = None;
         for config in supported {
-            if config.channels() == 1 {
-                if config.min_sample_rate() <= CAPTURE_SAMPLE_RATE
-                    && config.max_sample_rate() >= CAPTURE_SAMPLE_RATE
-                {
-                    best_config = Some(config.with_sample_rate(CAPTURE_SAMPLE_RATE));
-                    break;
-                } else if best_config.is_none() {
-                    best_config = Some(config.with_max_sample_rate());
-                }
+            if config.sample_format() != cpal::SampleFormat::F32 {
+                continue;
+            }
+            let supports_rate = config.min_sample_rate() <= CAPTURE_SAMPLE_RATE
+                && config.max_sample_rate() >= CAPTURE_SAMPLE_RATE;
+            let score = u8::from(config.channels() == 1) * 2 + u8::from(supports_rate);
+            if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                let candidate = if supports_rate {
+                    config.with_sample_rate(CAPTURE_SAMPLE_RATE)
+                } else {
+                    config.with_max_sample_rate()
+                };
+                best = Some((score, candidate));
             }
         }
 
-        let supported_config = best_config.ok_or(RecorderError::NoSupportedConfig)?;
+        let supported_config = best
+            .map(|(_, c)| c)
+            .ok_or(RecorderError::NoSupportedConfig)?;
 
         let stream_config: StreamConfig = supported_config.into();
         self.sample_rate = stream_config.sample_rate;
@@ -151,7 +159,7 @@ impl AudioRecorder {
                     if channels == 1 {
                         buffer.extend_from_slice(data);
                     } else {
-                        // Downmix stereo to mono
+                        // Downmix to mono
                         for chunk in data.chunks(channels) {
                             let mono: f32 = chunk.iter().sum::<f32>() / channels as f32;
                             buffer.push(mono);

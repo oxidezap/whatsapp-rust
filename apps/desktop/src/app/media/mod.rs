@@ -25,14 +25,4 @@ impl RecordingState {
     pub fn is_recording(&self) -> bool {
         matches!(self, Self::Recording)
     }
-
-    /// Check if processing (encoding/sending)
-    pub fn is_processing(&self) -> bool {
-        matches!(self, Self::Processing)
-    }
-
-    /// Check if idle (not recording or processing)
-    pub fn is_idle(&self) -> bool {
-        matches!(self, Self::Idle)
-    }
 }

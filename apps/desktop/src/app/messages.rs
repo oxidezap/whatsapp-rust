@@ -7,6 +7,7 @@ use gpui::{Pixels, Size, px, size};
 
 use crate::state::{ChatMessage, MediaType};
 use crate::theme::layout;
+use crate::utils::scale_media_dimensions;
 
 /// Cached data for message list rendering to avoid recomputing on every frame.
 #[derive(Clone)]
@@ -91,10 +92,12 @@ pub fn calculate_message_height(msg: &ChatMessage, show_sender: bool, max_media_
     if let Some(media) = &msg.media {
         let media_h = match media.media_type {
             MediaType::Image | MediaType::Sticker | MediaType::Video => {
-                let h = media.height.unwrap_or(300) as f32;
-                let w = media.width.unwrap_or(300) as f32;
-                let scale = (max_media_size / w).min(max_media_size / h).min(1.0);
-                (h * scale).max(50.0)
+                let (_, h) = scale_media_dimensions(
+                    media.width.unwrap_or(300),
+                    media.height.unwrap_or(300),
+                    max_media_size,
+                );
+                h
             }
             MediaType::Audio => 44.0,
             MediaType::Document => 50.0,

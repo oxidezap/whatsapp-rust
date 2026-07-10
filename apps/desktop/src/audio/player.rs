@@ -96,9 +96,11 @@ impl AudioPlayer {
                 .unwrap_or_default()
         );
 
+        // The callback writes f32 samples, so only F32 configs are usable.
         let supported_configs: Vec<_> = device
             .supported_output_configs()
             .map_err(|e| PlayerError::DeviceError(e.to_string()))?
+            .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
             .collect();
 
         if supported_configs.is_empty() {
@@ -207,6 +209,8 @@ fn decode_ogg(ogg_data: &[u8]) -> Result<Vec<f32>, PlayerError> {
     let mut all_samples: Vec<f32> = Vec::new();
     let mut packet_count = 0;
     let mut decoder: Option<OpusDecoder> = None;
+    let mut channel_count = 1usize;
+    let mut pre_skip = 0usize;
 
     while let Some(packet) = packet_reader
         .read_packet()
@@ -218,7 +222,10 @@ fn decode_ogg(ogg_data: &[u8]) -> Result<Vec<f32>, PlayerError> {
         if packet_count == 1 {
             if packet.data.len() >= 12 && &packet.data[0..8] == b"OpusHead" {
                 let channels = packet.data[9];
-                let opus_channels = if channels > 1 {
+                // 48kHz priming samples the decoder must discard before real audio
+                pre_skip = u16::from_le_bytes([packet.data[10], packet.data[11]]) as usize;
+                channel_count = if channels > 1 { 2 } else { 1 };
+                let opus_channels = if channel_count == 2 {
                     Channels::Stereo
                 } else {
                     Channels::Mono
@@ -242,8 +249,19 @@ fn decode_ogg(ogg_data: &[u8]) -> Result<Vec<f32>, PlayerError> {
         let mut output = vec![0.0f32; 5760 * 2];
         match dec.decode_float(&packet.data, &mut output, false) {
             Ok(n) => {
-                output.truncate(n);
-                all_samples.extend_from_slice(&output);
+                // n is frames per channel; the buffer is interleaved
+                output.truncate(n * channel_count);
+                let mono = if channel_count == 2 {
+                    output
+                        .chunks_exact(2)
+                        .map(|pair| (pair[0] + pair[1]) / 2.0)
+                        .collect()
+                } else {
+                    output
+                };
+                let skip = pre_skip.min(mono.len());
+                pre_skip -= skip;
+                all_samples.extend_from_slice(&mono[skip..]);
             }
             Err(e) => warn!("Opus decode error (packet {}): {}", packet_count, e),
         }

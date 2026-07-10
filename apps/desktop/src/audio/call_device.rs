@@ -183,8 +183,13 @@ pub fn spawn_mic() -> Result<async_channel::Receiver<Vec<i16>>> {
                     peak.fetch_max(p, Ordering::Relaxed);
                     made.fetch_add(1, Ordering::Relaxed);
                     // Drop on full: loss tolerant. Steady state keeps the channel near-empty.
-                    if tx_drain.try_send(frame).is_err() {
-                        dropped.fetch_add(1, Ordering::Relaxed);
+                    match tx_drain.try_send(frame) {
+                        Ok(()) => {}
+                        Err(async_channel::TrySendError::Full(_)) => {
+                            dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // Receiver gone = call ended: teardown, not backpressure.
+                        Err(async_channel::TrySendError::Closed(_)) => return,
                     }
                 }
             }
@@ -366,6 +371,9 @@ pub fn spawn_speaker() -> Result<async_channel::Sender<Vec<i16>>> {
         });
     }
 
+    // Held by the stream thread so a build/play failure can close the channel.
+    let rx_close = rx.clone();
+
     // Async drain: channel -> resample -> ring. Owns the ring producer.
     tokio::spawn(async move {
         let mut resampled: Vec<i16> = Vec::with_capacity(4096);
@@ -381,23 +389,25 @@ pub fn spawn_speaker() -> Result<async_channel::Sender<Vec<i16>>> {
 
     // Build/play the !Send output stream on a dedicated parked thread.
     std::thread::spawn(move || {
-        let stream =
-            match build_output_stream(&device, &config, format, channels, cons, pops, underruns) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("speaker stream build failed: {e}");
+        match build_output_stream(&device, &config, format, channels, cons, pops, underruns) {
+            Ok(stream) => {
+                if let Err(e) = stream.play() {
+                    error!("speaker stream play failed: {e}");
+                } else {
+                    // Hold the stream until the drain signals teardown, then fall out of scope so
+                    // the stream drops and frees the output device.
+                    while !teardown.load(Ordering::Relaxed) {
+                        std::thread::park_timeout(std::time::Duration::from_millis(250));
+                    }
                     return;
                 }
-            };
-        if let Err(e) = stream.play() {
-            error!("speaker stream play failed: {e}");
-            return;
+            }
+            Err(e) => error!("speaker stream build failed: {e}"),
         }
-        // Hold the stream until the drain signals teardown, then fall out of scope so the stream
-        // drops and frees the output device.
-        while !teardown.load(Ordering::Relaxed) {
-            std::thread::park_timeout(std::time::Duration::from_millis(250));
-        }
+        // Build/play failed: signal teardown and close the channel so the drain and diag tasks
+        // stop and senders see the dead speaker instead of feeding a stream that never started.
+        teardown.store(true, Ordering::Relaxed);
+        rx_close.close();
     });
     Ok(tx)
 }

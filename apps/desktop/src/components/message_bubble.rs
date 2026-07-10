@@ -16,7 +16,7 @@ use crate::app::WhatsAppApp;
 use crate::responsive::ResponsiveLayout;
 use crate::state::{ChatMessage, MediaType};
 use crate::theme::{colors, layout};
-use crate::utils::{format_time_local, mime_to_image_format};
+use crate::utils::{format_time_local, mime_to_image_format, scale_media_dimensions};
 use crate::video::VideoPlayerState;
 
 pub fn render_message_bubble(
@@ -193,7 +193,7 @@ fn render_media_content(
 ) -> gpui::Div {
     match media_content.media_type {
         MediaType::Image => {
-            let (display_w, display_h) = calculate_media_size(
+            let (display_w, display_h) = scale_media_dimensions(
                 media_content.width.unwrap_or(300),
                 media_content.height.unwrap_or(300),
                 max_media_size,
@@ -212,7 +212,7 @@ fn render_media_content(
             }
         }
         MediaType::Sticker => {
-            let (display_w, display_h) = calculate_media_size(
+            let (display_w, display_h) = scale_media_dimensions(
                 media_content.width.unwrap_or(300),
                 media_content.height.unwrap_or(300),
                 max_media_size,
@@ -257,13 +257,6 @@ fn render_media_content(
     }
 }
 
-fn calculate_media_size(width: u32, height: u32, max_size: f32) -> (f32, f32) {
-    let w = width as f32;
-    let h = height as f32;
-    let scale = (max_size / w).min(max_size / h).min(1.0);
-    ((w * scale).max(50.0), (h * scale).max(50.0))
-}
-
 fn render_media_placeholder(text: &'static str, width: f32, height: f32) -> impl IntoElement {
     div()
         .w(px(width))
@@ -297,15 +290,6 @@ fn render_image_from_bytes(
     } else {
         img_el
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AudioPlayerState {
-    #[default]
-    Idle,
-    Downloading,
-    Playing,
-    Error,
 }
 
 fn render_audio_player(
@@ -415,7 +399,7 @@ fn render_video_player(
     video_frame: Option<Arc<RenderImage>>,
     max_media_size: f32,
 ) -> impl IntoElement {
-    let (display_w, display_h) = calculate_media_size(
+    let (display_w, display_h) = scale_media_dimensions(
         media_content.width.unwrap_or(300),
         media_content.height.unwrap_or(200),
         max_media_size,

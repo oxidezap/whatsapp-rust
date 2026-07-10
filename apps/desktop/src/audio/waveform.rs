@@ -9,15 +9,8 @@ pub fn generate_waveform(samples: &[f32]) -> Vec<u8> {
         return vec![0u8; WAVEFORM_SAMPLES];
     }
 
-    let chunk_size = samples.len() / WAVEFORM_SAMPLES;
-    if chunk_size == 0 {
-        let mut waveform: Vec<u8> = samples
-            .iter()
-            .map(|s| (s.abs() * MAX_AMPLITUDE as f32).min(MAX_AMPLITUDE as f32) as u8)
-            .collect();
-        waveform.resize(WAVEFORM_SAMPLES, 0);
-        return waveform;
-    }
+    // Ceiling division so the tail of the message is represented too
+    let chunk_size = samples.len().div_ceil(WAVEFORM_SAMPLES);
 
     let rms_values: Vec<f32> = samples
         .chunks(chunk_size)

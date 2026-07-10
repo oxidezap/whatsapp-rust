@@ -4,6 +4,12 @@
 # lib breaks this build in the same PR that makes it.
 [workspace]
 
+# Mirror the root workspace's safeguards (see /clippy.toml for the lists):
+# wacore::time instead of std clocks, portable-atomic for 64-bit atomics.
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"
+
 [package]
 name = "whatsapp-desktop"
 version = "0.1.0"
@@ -15,6 +21,9 @@ description = "WhatsApp desktop client built on whatsapp-rust + GPUI"
 [[bin]]
 name = "whatsapp-desktop"
 path = "src/main.rs"
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow = "1.0"

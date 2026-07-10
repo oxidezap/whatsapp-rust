@@ -183,8 +183,10 @@ impl VideoPlayer {
         let current_time = self.current_time();
 
         if current_time >= decoder.duration() {
+            // stop() clears completion_tx, so take it first or the notification is lost
+            let completion_tx = self.completion_tx.take();
             self.stop();
-            if let Some(tx) = self.completion_tx.take() {
+            if let Some(tx) = completion_tx {
                 let _ = tx.send(());
             }
             return true;

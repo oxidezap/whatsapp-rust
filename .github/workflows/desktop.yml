@@ -45,7 +45,7 @@ jobs:
           toolchain: nightly-2026-06-16
           components: rustfmt, clippy
       - name: Install system dependencies (cached)
-        uses: awalsh128/cache-apt-pkgs-action@latest
+        uses: awalsh128/cache-apt-pkgs-action@v2
         with:
           packages: libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig1-dev libfreetype6-dev
           version: 1.2

@@ -117,8 +117,9 @@ impl StreamingVideoDecoder {
         let duration = video_track.duration();
         let sample_count = video_track.sample_count();
 
-        // Calculate FPS and frame duration
-        let fps = if duration.as_secs_f64() > 0.0 {
+        // Calculate FPS and frame duration; guard sample_count so an empty track
+        // can't produce fps=0 and panic Duration::from_secs_f64 with infinity
+        let fps = if sample_count > 0 && duration.as_secs_f64() > 0.0 {
             sample_count as f64 / duration.as_secs_f64()
         } else {
             30.0

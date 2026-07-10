@@ -15,6 +15,7 @@ const FRAME_SIZE_MS: usize = 20;
 const FRAME_SIZE_SAMPLES: usize = (SAMPLE_RATE as usize * FRAME_SIZE_MS) / 1000;
 const GRANULE_RATE: u32 = 48000;
 const GRANULE_PER_FRAME: u64 = (GRANULE_RATE as u64 * FRAME_SIZE_MS as u64) / 1000;
+const PRE_SKIP: u16 = 312;
 
 pub fn encode_to_opus_ogg(audio: &RecordedAudio) -> Result<Vec<u8>, EncoderError> {
     let samples = audio.resample_to_16khz();
@@ -81,16 +82,21 @@ pub fn encode_to_opus_ogg(audio: &RecordedAudio) -> Result<Vec<u8>, EncoderError
 
         let total_packets = encoded_packets.len();
         let mut current_granule: u64 = 0;
+        // EOS granule reflects the real capture length (plus pre-skip) so decoders
+        // trim the zero-padding of the final frame instead of inflating the duration.
+        let eos_granule = (PRE_SKIP as u64
+            + samples_i16.len() as u64 * (GRANULE_RATE / SAMPLE_RATE) as u64)
+            .min(total_packets as u64 * GRANULE_PER_FRAME);
 
         for (i, packet) in encoded_packets.into_iter().enumerate() {
             current_granule += GRANULE_PER_FRAME;
-            let end_info = if i == total_packets - 1 {
-                PacketWriteEndInfo::EndStream
+            let (end_info, granule) = if i == total_packets - 1 {
+                (PacketWriteEndInfo::EndStream, eos_granule)
             } else {
-                PacketWriteEndInfo::NormalPacket
+                (PacketWriteEndInfo::NormalPacket, current_granule)
             };
             writer
-                .write_packet(packet, serial, end_info, current_granule)
+                .write_packet(packet, serial, end_info, granule)
                 .map_err(|e| EncoderError::OggError(e.to_string()))?;
         }
     }
@@ -104,7 +110,7 @@ fn create_opus_id_header() -> Vec<u8> {
     header.extend_from_slice(b"OpusHead");
     header.push(1); // Version
     header.push(1); // Channels (mono)
-    header.extend_from_slice(&312u16.to_le_bytes()); // Pre-skip
+    header.extend_from_slice(&PRE_SKIP.to_le_bytes());
     header.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
     header.extend_from_slice(&0u16.to_le_bytes()); // Output gain (0 dB)
     header.push(0); // Channel mapping family

@@ -76,7 +76,8 @@ pub fn render_chat_header(
                         .child(name),
                 ),
         )
-        .when(layout.show_call_buttons(), |el| {
+        // Calls are 1:1 only; never offer them for group chats.
+        .when(layout.show_call_buttons() && !chat.is_group, |el| {
             el.child(
                 div()
                     .flex()
