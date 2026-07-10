@@ -820,6 +820,9 @@ impl WhatsAppClient {
                     Ok(j) => j,
                     Err(e) => {
                         error!("Invalid JID '{}': {}", jid_str, e);
+                        // The optimistic bubble still carries its local id;
+                        // without this it would sit unsent with no indicator.
+                        notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
                         return;
                     }
                 };
@@ -934,6 +937,9 @@ impl WhatsAppClient {
                     Ok(j) => j,
                     Err(e) => {
                         error!("Invalid JID '{}': {}", jid_str, e);
+                        // The optimistic bubble still carries its local id;
+                        // without this it would sit unsent with no indicator.
+                        notify_send_failed(&ui_sender, &jid_str, &local_id, e.to_string()).await;
                         return;
                     }
                 };
