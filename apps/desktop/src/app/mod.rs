@@ -604,8 +604,10 @@ impl WhatsAppApp {
         // Mark as read locally
         if let Some(chat) = self.find_chat_mut(&jid) {
             chat.mark_as_read();
-            // Invalidate chat cache so unread badge updates
+            // Both caches: the badge, and the is_read snapshot the message
+            // list renders ticks from (its count guard can't see this).
             self.invalidate_chat_cache();
+            self.invalidate_message_cache(&jid);
         }
 
         // Scroll to the last message

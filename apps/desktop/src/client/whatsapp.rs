@@ -1075,7 +1075,12 @@ impl WhatsAppClient {
                 let notify_failure = |error: String| {
                     let ui_sender = ui_sender.clone();
                     let recipient_jid = recipient_jid.clone();
+                    // A cancel may have landed for a call that will never
+                    // start; consume the marker so the set doesn't grow.
+                    let calls = calls.clone();
+                    let placeholder_id = placeholder_id.clone();
                     async move {
+                        calls.cancelled.lock().await.remove(&placeholder_id);
                         error!("Failed to start call to {}: {}", recipient_jid, error);
                         if let Some(tx) = ui_sender.lock().await.as_ref() {
                             let _ = tx.send(UiEvent::OutgoingCallFailed {
@@ -1428,7 +1433,7 @@ fn stored_to_chat_message(stored: whatsapp_rust_chat_store::StoredMessage) -> Ch
     // download info so historical media renders and stays fetchable, instead
     // of degrading to a [kind] text row until a live redelivery.
     let media = (!stored.revoked)
-        .then(|| stored.message.as_deref())
+        .then_some(stored.message.as_deref())
         .flatten()
         .and_then(|m| media_metadata(m.get_base_message()));
     let content = match (&stored.text, stored.revoked) {
