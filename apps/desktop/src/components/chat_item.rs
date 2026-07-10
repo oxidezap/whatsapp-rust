@@ -42,8 +42,8 @@ pub fn render_chat_item(
         .cursor_pointer()
         .bg(bg)
         .when(!is_selected, |el| el.hover(|s| s.bg(rgb(colors::BG_HOVER))))
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |this, cx| this.select_chat(jid.clone(), cx));
+        .on_click(move |_, window, cx| {
+            entity.update(cx, |this, cx| this.select_chat(jid.clone(), window, cx));
         })
         .child(Avatar::from_initial(initial, layout.avatar_size()))
         .child(

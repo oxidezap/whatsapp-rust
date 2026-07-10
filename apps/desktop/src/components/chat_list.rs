@@ -47,14 +47,14 @@ pub fn render_chat_list(
         .id("chat-list-container")
         .key_context(CHAT_LIST_CONTEXT)
         .track_focus(focus_handle)
-        .on_action(move |_: &SelectUp, _window, cx| {
+        .on_action(move |_: &SelectUp, window, cx| {
             entity_for_up.update(cx, |app, cx| {
-                app.select_previous_chat(cx);
+                app.select_previous_chat(window, cx);
             });
         })
-        .on_action(move |_: &SelectDown, _window, cx| {
+        .on_action(move |_: &SelectDown, window, cx| {
             entity_for_down.update(cx, |app, cx| {
-                app.select_next_chat(cx);
+                app.select_next_chat(window, cx);
             });
         })
         .flex()

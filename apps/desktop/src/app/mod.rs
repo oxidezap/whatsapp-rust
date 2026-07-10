@@ -254,6 +254,9 @@ pub struct WhatsAppApp {
     /// Chat a composing indicator was last sent to: paused must go back to
     /// this chat even if the user switched chats before the typing timeout
     composing_chat: Option<String>,
+    /// Unsent input text stashed per chat on switch; the shared input view
+    /// would otherwise carry chat A's draft into chat B and send it there
+    drafts: HashMap<String, String>,
     /// Background task for event polling (must be retained)
     #[allow(dead_code)]
     event_task: Task<()>,
@@ -337,6 +340,7 @@ impl WhatsAppApp {
             message_list_scroll: VirtualListScrollHandle::new(),
             input_area: None,
             composing_chat: None,
+            drafts: HashMap::new(),
             event_task,
             audio_recorder: AudioRecorder::new(),
             recording_state: RecordingState::default(),
@@ -609,7 +613,7 @@ impl WhatsAppApp {
     // ========== Chat List Navigation ==========
 
     /// Select the next chat in the list (keyboard navigation)
-    pub fn select_next_chat(&mut self, cx: &mut Context<Self>) {
+    pub fn select_next_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cache = self.get_chat_list_cache();
         if cache.chats.is_empty() {
             return;
@@ -627,13 +631,13 @@ impl WhatsAppApp {
         };
 
         let next_jid = cache.chats[next_index].jid.clone();
-        self.select_chat(next_jid, cx);
+        self.select_chat(next_jid, window, cx);
         self.chat_list_scroll
             .scroll_to_item(next_index, ScrollStrategy::Top);
     }
 
     /// Select the previous chat in the list (keyboard navigation)
-    pub fn select_previous_chat(&mut self, cx: &mut Context<Self>) {
+    pub fn select_previous_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cache = self.get_chat_list_cache();
         if cache.chats.is_empty() {
             return;
@@ -651,7 +655,7 @@ impl WhatsAppApp {
         };
 
         let prev_jid = cache.chats[prev_index].jid.clone();
-        self.select_chat(prev_jid, cx);
+        self.select_chat(prev_jid, window, cx);
         self.chat_list_scroll
             .scroll_to_item(prev_index, ScrollStrategy::Top);
     }
@@ -688,7 +692,7 @@ impl WhatsAppApp {
 
     // ========== Actions ==========
 
-    pub fn select_chat(&mut self, jid: String, cx: &mut Context<Self>) {
+    pub fn select_chat(&mut self, jid: String, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_current_media();
         // Leaving a chat mid-composition: release its typing indicator now,
         // or it would stay "typing..." and the eventual paused would land on
@@ -699,6 +703,20 @@ impl WhatsAppApp {
             self.client.send_paused(&prev);
             if let Some(ref input_area) = self.input_area {
                 input_area.update(cx, |view, _| view.reset_typing());
+            }
+        }
+        // Stash the outgoing chat's unsent text and restore the target's, or
+        // the shared input would send A's draft to B. Skipped on reselect so
+        // in-progress text survives a same-chat click.
+        if self.selected_chat.as_deref() != Some(jid.as_str())
+            && let Some(ref input_area) = self.input_area
+        {
+            let restored = self.drafts.remove(&jid).unwrap_or_default();
+            let old = input_area.update(cx, |view, cx| view.swap_text(&restored, window, cx));
+            if let Some(prev) = self.selected_chat.clone()
+                && !old.trim().is_empty()
+            {
+                self.drafts.insert(prev, old);
             }
         }
         self.selected_chat = Some(jid.clone());

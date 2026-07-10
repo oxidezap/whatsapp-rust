@@ -10,7 +10,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::clipboard::Clipboard;
 use gpui_component::h_flex;
 use gpui_component::v_flex;
-use gpui_component::{Disableable, Icon};
+use gpui_component::{Disableable, Icon, IconName};
 
 use crate::app::WhatsAppApp;
 use crate::responsive::ResponsiveLayout;
@@ -640,7 +640,10 @@ fn render_video_player(
                         ))
                         .into_any_element()
                 } else if is_error {
+                    // toggle_video's Error arm restarts the download; without
+                    // a handler a transient failure left the video stuck.
                     div()
+                        .id(button_id)
                         .w(px(48.))
                         .h(px(48.))
                         .rounded_full()
@@ -649,11 +652,19 @@ fn render_video_player(
                         .justify_center()
                         .items_center()
                         .child(
-                            div()
+                            Icon::new(IconName::Redo)
                                 .text_color(rgb(colors::TEXT_PRIMARY))
-                                .text_sm()
-                                .child("⚠"),
+                                .size(px(20.)),
                         )
+                        .when_some(downloadable.clone(), |el, dl| {
+                            el.cursor_pointer().on_click(move |_, _window, cx| {
+                                let msg_id = message_id.clone();
+                                let dl = dl.clone();
+                                entity.update(cx, |app, cx| {
+                                    app.toggle_video(msg_id, dl, cx);
+                                });
+                            })
+                        })
                         .into_any_element()
                 } else if !is_playing {
                     Button::new(button_id)

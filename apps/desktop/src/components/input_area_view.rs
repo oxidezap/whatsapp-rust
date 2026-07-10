@@ -170,6 +170,22 @@ impl InputAreaView {
         cx.notify();
     }
 
+    /// Swap the composed text on chat switch: install the target chat's draft
+    /// and hand the outgoing chat's draft back to the parent, so unsent text
+    /// never rides along to a different recipient.
+    pub fn swap_text(
+        &mut self,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let old = self.input.read(cx).text().to_string();
+        self.input.update(cx, |state, cx| {
+            state.set_value(new_text, window, cx);
+        });
+        old
+    }
+
     /// Read, trim-check, clear and emit the composed message (Enter and the
     /// send button share this path).
     fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
