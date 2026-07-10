@@ -414,6 +414,13 @@ impl WhatsAppApp {
                     media.data = Arc::new(data);
                     // Full bytes landed; the data no longer needs a re-download
                     media.data_is_preview = false;
+                    // Decode with the real media's MIME, not the preview
+                    // thumbnail's (a WebP sticker would fail as image/jpeg)
+                    if let Some(ref dl) = media.downloadable {
+                        media.mime_type = dl.mime_type.clone();
+                    }
+                    // Drop any render-cached image built from the old bytes
+                    self.sticker_images.borrow_mut().shift_remove(message_id);
                     info!("Cached media data for message {}", message_id);
                     // Invalidate message cache since we modified the message
                     self.message_list_cache.borrow_mut().remove(&chat.jid);

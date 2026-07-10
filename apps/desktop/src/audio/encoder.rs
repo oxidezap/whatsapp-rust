@@ -58,6 +58,24 @@ pub fn encode_to_opus_ogg(audio: &RecordedAudio) -> Result<Vec<u8>, EncoderError
         encoded_packets.push(output);
     }
 
+    // EOS granule reflects the real capture length plus pre-skip: decoders
+    // discard PRE_SKIP samples up front, so trimming to the granule must land
+    // on the capture's end, not PRE_SKIP samples before it.
+    let eos_granule =
+        PRE_SKIP as u64 + samples_i16.len() as u64 * (GRANULE_RATE / SAMPLE_RATE) as u64;
+    // When the final frame's zero-padding can't absorb the pre-skip (exact
+    // frame multiples have none at all), one extra silence frame keeps the
+    // packet stream covering the full logical duration.
+    if eos_granule > encoded_packets.len() as u64 * GRANULE_PER_FRAME {
+        let silence = vec![0i16; FRAME_SIZE_SAMPLES];
+        let mut output = vec![0u8; 4000];
+        let len = encoder
+            .encode(&silence, &mut output)
+            .map_err(|e| EncoderError::OpusError(e.to_string()))?;
+        output.truncate(len);
+        encoded_packets.push(output);
+    }
+
     {
         let cursor = Cursor::new(&mut ogg_buffer);
         let mut writer = ogg::PacketWriter::new(cursor);
@@ -82,11 +100,6 @@ pub fn encode_to_opus_ogg(audio: &RecordedAudio) -> Result<Vec<u8>, EncoderError
 
         let total_packets = encoded_packets.len();
         let mut current_granule: u64 = 0;
-        // EOS granule reflects the real capture length (plus pre-skip) so decoders
-        // trim the zero-padding of the final frame instead of inflating the duration.
-        let eos_granule = (PRE_SKIP as u64
-            + samples_i16.len() as u64 * (GRANULE_RATE / SAMPLE_RATE) as u64)
-            .min(total_packets as u64 * GRANULE_PER_FRAME);
 
         for (i, packet) in encoded_packets.into_iter().enumerate() {
             current_granule += GRANULE_PER_FRAME;
@@ -184,5 +197,32 @@ mod tests {
         let ogg_data = result.unwrap();
         // Check OGG magic number
         assert_eq!(&ogg_data[0..4], b"OggS");
+    }
+
+    #[test]
+    fn test_exact_frame_multiple_keeps_full_duration() {
+        // 16000 samples = exactly 50 frames: no zero-padding to absorb the
+        // pre-skip, so a capped EOS granule would clip ~6.5ms of real audio.
+        let samples = 16000u64;
+        let audio = RecordedAudio {
+            samples: vec![0.0f32; samples as usize],
+            sample_rate: 16000,
+            duration_secs: 1,
+        };
+
+        let ogg_data = encode_to_opus_ogg(&audio).unwrap();
+
+        // The EOS granule lives in the header of the last OGG page
+        // (byte offset 6, 8 bytes LE after the "OggS" capture pattern).
+        let last_page = ogg_data
+            .windows(4)
+            .rposition(|w| w == b"OggS")
+            .expect("no OGG page found");
+        let granule_bytes: [u8; 8] = ogg_data[last_page + 6..last_page + 14].try_into().unwrap();
+        let eos_granule = u64::from_le_bytes(granule_bytes);
+        assert_eq!(
+            eos_granule,
+            PRE_SKIP as u64 + samples * (GRANULE_RATE / SAMPLE_RATE) as u64
+        );
     }
 }

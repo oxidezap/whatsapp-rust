@@ -420,7 +420,8 @@ impl Chat {
 
     /// Rename a message (optimistic local id -> real WhatsApp id),
     /// re-inserting so the (timestamp, id) sort invariant holds for
-    /// same-second siblings. A row already present under the new id wins.
+    /// same-second siblings. The renamed bubble replaces a row already
+    /// present under the new id (server echo of the same message).
     pub fn rename_message(&mut self, old_id: &str, new_id: &str) -> bool {
         let Some(pos) = self.messages.iter().position(|m| m.id == old_id) else {
             return false;
@@ -431,14 +432,26 @@ impl Chat {
         true
     }
 
-    /// Insert a hydrated message in order, skipping duplicates, without
-    /// touching unread counters or the preview.
-    pub fn insert_history_message(&mut self, message: ChatMessage) {
-        // Id-only dedup: the hydrated copy may carry a slightly different
-        // timestamp than the optimistic bubble, and the bubble we already
-        // show may hold downloaded media bytes worth keeping.
-        if self.messages.iter().any(|m| m.id == message.id) {
-            return;
+    /// Insert a hydrated message in order, without touching unread counters
+    /// or the preview. An id match replaces the live bubble: the store is
+    /// authoritative (edits and revokes materialize there), so the hydrated
+    /// copy must not be dropped in favor of stale content.
+    pub fn insert_history_message(&mut self, mut message: ChatMessage) {
+        // Id-only match: the hydrated copy may carry a slightly different
+        // timestamp than the optimistic bubble. Remove-and-reinsert keeps
+        // the (timestamp, id) sort invariant when the timestamp shifted.
+        if let Some(pos) = self.messages.iter().position(|m| m.id == message.id) {
+            let existing = self.messages.remove(pos);
+            // The store never holds downloaded media bytes; graft the ones
+            // the live bubble already fetched so they survive the replace.
+            if let Some(new_media) = message.media.as_mut()
+                && new_media.data.is_empty()
+                && let Some(old_media) = existing.media
+                && !old_media.data.is_empty()
+            {
+                new_media.data = old_media.data;
+                new_media.data_is_preview = old_media.data_is_preview;
+            }
         }
         let pos = self
             .messages
@@ -451,12 +464,16 @@ impl Chat {
         self.messages.insert(pos, message);
     }
 
-    /// Mark all messages as read
+    /// Mark all incoming messages as read and clear the unread badge.
+    /// Outgoing bubbles are untouched: their `is_read` means "the peer read
+    /// it" (delivery ticks), which opening the chat locally must not fake.
     pub fn mark_as_read(&mut self) {
         self.unread_count = 0;
         self.manually_unread = false;
         for msg in &mut self.messages {
-            msg.is_read = true;
+            if !msg.is_from_me {
+                msg.is_read = true;
+            }
         }
     }
 
@@ -514,6 +531,21 @@ mod tests {
             media: None,
             reactions: HashMap::new(),
             failed: false,
+        }
+    }
+
+    fn make_media(data: Vec<u8>, data_is_preview: bool) -> MediaContent {
+        MediaContent {
+            media_type: MediaType::Image,
+            data: Arc::new(data),
+            mime_type: "image/jpeg".to_string(),
+            width: None,
+            height: None,
+            caption: None,
+            downloadable: None,
+            is_animated: false,
+            duration_secs: None,
+            data_is_preview,
         }
     }
 
@@ -607,16 +639,19 @@ mod tests {
         chat.add_message(make_message("local_1000_0", 1000));
 
         // The real id already arrived (e.g. server echo); the rename must
-        // not create a duplicate bubble
+        // not create a duplicate bubble. The renamed local bubble replaces
+        // the echo row — same message, and the local copy is the one that
+        // may hold media bytes.
         assert!(chat.rename_message("local_1000_0", "3EB0AAA"));
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].id, "3EB0AAA");
+        assert_eq!(chat.messages[0].content, "Message local_1000_0");
 
         assert!(!chat.rename_message("missing", "whatever"));
     }
 
     #[test]
-    fn test_hydration_dedups_same_id_at_different_timestamp() {
+    fn test_hydration_replaces_same_id_at_different_timestamp() {
         let mut chat = Chat::new("test@s.whatsapp.net".to_string());
 
         // Optimistic bubble stamped with the UI clock, renamed to the real id
@@ -624,17 +659,64 @@ mod tests {
         assert!(chat.rename_message("local_1000_0", "3EB0AAA"));
 
         // The store commits its own slightly-later timestamp; the hydrated
-        // copy must fold into the existing bubble, not sit next to it
-        chat.insert_history_message(make_message("3EB0AAA", 1001));
+        // copy must replace the existing bubble (store is authoritative for
+        // content — edits/revokes materialize there), not sit next to it
+        let mut hydrated = make_message("3EB0AAA", 1001);
+        hydrated.content = "edited text".to_string();
+        chat.insert_history_message(hydrated);
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(
             chat.messages[0].timestamp,
-            Utc.timestamp_opt(1000, 0).unwrap()
+            Utc.timestamp_opt(1001, 0).unwrap()
         );
+        assert_eq!(chat.messages[0].content, "edited text");
 
         // Live redelivery with the shifted timestamp dedups the same way
         assert!(!chat.add_message(make_message("3EB0AAA", 1001)));
         assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].content, "edited text");
+    }
+
+    #[test]
+    fn test_hydration_replacement_keeps_downloaded_media_bytes() {
+        let mut chat = Chat::new("test@s.whatsapp.net".to_string());
+
+        // Live bubble whose full media bytes were already downloaded
+        let mut live = make_message("3EB0AAA", 1000);
+        live.media = Some(make_media(vec![1, 2, 3], false));
+        chat.add_message(live);
+
+        // The hydrated copy carries no media bytes (the store never holds
+        // them) but newer content; the replace must graft the old bytes
+        let mut hydrated = make_message("3EB0AAA", 1000);
+        hydrated.content = "edited caption".to_string();
+        hydrated.media = Some(make_media(Vec::new(), true));
+        chat.insert_history_message(hydrated);
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].content, "edited caption");
+        let media = chat.messages[0].media.as_ref().unwrap();
+        assert_eq!(*media.data, vec![1, 2, 3]);
+        assert!(!media.data_is_preview);
+    }
+
+    #[test]
+    fn test_mark_as_read_leaves_outgoing_delivery_state_alone() {
+        let mut chat = Chat::new("test@s.whatsapp.net".to_string());
+        let mut outgoing = make_message("out", 1000);
+        outgoing.is_from_me = true;
+        chat.add_message(outgoing);
+        chat.add_message(make_message("in", 2000));
+        chat.manually_unread = true;
+
+        chat.mark_as_read();
+
+        assert_eq!(chat.unread_count, 0);
+        assert!(!chat.manually_unread);
+        // Outgoing is_read renders as the peer-read ticks; opening the chat
+        // must not fabricate them
+        assert!(!chat.messages[0].is_read);
+        assert!(chat.messages[1].is_read);
     }
 
     #[test]

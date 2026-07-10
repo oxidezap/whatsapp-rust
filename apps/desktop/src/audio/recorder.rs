@@ -33,17 +33,27 @@ impl RecordedAudio {
         let output_len = (self.samples.len() as f32 / ratio) as usize;
         let mut output = Vec::with_capacity(output_len);
 
-        for i in 0..output_len {
-            // Linear interpolation: nearest-neighbor sample dropping aliases
-            // audibly on voice.
-            let src_pos = i as f32 * ratio;
-            let idx = src_pos as usize;
-            let frac = src_pos - idx as f32;
-            let Some(&a) = self.samples.get(idx) else {
-                break;
-            };
-            let b = self.samples.get(idx + 1).copied().unwrap_or(a);
-            output.push(a + (b - a) * frac);
+        if self.sample_rate.is_multiple_of(TARGET_SAMPLE_RATE) {
+            // Integer decimation (the common 48kHz case): box-filter each
+            // window, since plain sample dropping folds everything above
+            // 8kHz back into the voice band.
+            let step = (self.sample_rate / TARGET_SAMPLE_RATE) as usize;
+            for chunk in self.samples.chunks_exact(step) {
+                output.push(chunk.iter().sum::<f32>() / step as f32);
+            }
+        } else {
+            for i in 0..output_len {
+                // Linear interpolation: nearest-neighbor sample dropping
+                // aliases audibly on voice.
+                let src_pos = i as f32 * ratio;
+                let idx = src_pos as usize;
+                let frac = src_pos - idx as f32;
+                let Some(&a) = self.samples.get(idx) else {
+                    break;
+                };
+                let b = self.samples.get(idx + 1).copied().unwrap_or(a);
+                output.push(a + (b - a) * frac);
+            }
         }
 
         output
@@ -99,7 +109,8 @@ impl AudioRecorder {
             .map_err(|e| RecorderError::DeviceError(e.to_string()))?;
 
         // The callback is built for f32 frames, so only F32 configs are usable.
-        // Any channel count works (the callback downmixes); prefer mono at 48kHz.
+        // 48kHz support outweighs mono: multichannel is downmixed anyway,
+        // while a low capture rate permanently costs voice bandwidth.
         let mut best: Option<(u8, _)> = None;
         for config in supported {
             if config.sample_format() != cpal::SampleFormat::F32 {
@@ -107,7 +118,7 @@ impl AudioRecorder {
             }
             let supports_rate = config.min_sample_rate() <= CAPTURE_SAMPLE_RATE
                 && config.max_sample_rate() >= CAPTURE_SAMPLE_RATE;
-            let score = u8::from(config.channels() == 1) * 2 + u8::from(supports_rate);
+            let score = u8::from(supports_rate) * 2 + u8::from(config.channels() == 1);
             if best.as_ref().is_none_or(|(s, _)| score > *s) {
                 let candidate = if supports_rate {
                     config.with_sample_rate(CAPTURE_SAMPLE_RATE)
@@ -271,5 +282,17 @@ mod tests {
             duration_secs: 0,
         };
         assert_eq!(audio.resample_to_16khz(), vec![0.0, 1.5, 3.0, 4.5]);
+    }
+
+    #[test]
+    fn resample_box_filters_integer_decimation() {
+        // 48kHz is 3:1; each output sample averages its window instead of
+        // dropping two of every three samples (which aliases above 8kHz).
+        let audio = RecordedAudio {
+            samples: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            sample_rate: 48_000,
+            duration_secs: 0,
+        };
+        assert_eq!(audio.resample_to_16khz(), vec![1.0, 4.0]);
     }
 }

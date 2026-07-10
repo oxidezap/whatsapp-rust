@@ -1307,8 +1307,11 @@ impl WhatsAppClient {
             let mut open = true;
             while open {
                 match changes.recv().await {
-                    Ok(StoreChange::Chats) | Ok(StoreChange::Messages { .. }) => {}
-                    Ok(_) => continue,
+                    // Contacts too: a push-name landing after the chat row
+                    // must refresh chats stuck on the JID placeholder.
+                    Ok(
+                        StoreChange::Chats | StoreChange::Messages { .. } | StoreChange::Contacts,
+                    ) => {}
                     // Missed changes are covered by the full reload below.
                     Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => break,
