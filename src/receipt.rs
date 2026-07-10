@@ -349,11 +349,15 @@ impl Client {
             || info.source.is_self_fanout()
     }
 
+    pub(crate) async fn handle_receipt(self: &Arc<Self>, node: Arc<OwnedNodeRef>) {
+        self.handle_receipt_inline(node);
+    }
+
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.receipt.handle", level = "debug", skip_all)
     )]
-    pub(crate) async fn handle_receipt(self: &Arc<Self>, node: Arc<OwnedNodeRef>) {
+    pub(crate) fn handle_receipt_inline(self: &Arc<Self>, node: Arc<OwnedNodeRef>) {
         let nr = node.get();
         let mut attrs = nr.attrs();
         let from = attrs.jid("from");

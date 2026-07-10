@@ -5,6 +5,7 @@
 //! when the struct is dropped.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::appstate::hash::HashState;
@@ -143,6 +144,19 @@ impl SignalStore for InMemoryBackend {
             .await
             .sessions
             .insert(address.to_string(), Bytes::copy_from_slice(session));
+        Ok(())
+    }
+
+    async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.sessions.reserve(sessions.len());
+        for (address, session) in sessions {
+            if let Some(stored) = state.sessions.get_mut(address.as_ref()) {
+                *stored = session.clone();
+            } else {
+                state.sessions.insert(address.to_string(), session.clone());
+            }
+        }
         Ok(())
     }
 
@@ -843,6 +857,34 @@ mod tests {
     #[test]
     fn in_memory_backend_implements_backend() {
         is_backend::<InMemoryBackend>();
+    }
+
+    #[tokio::test]
+    async fn put_sessions_batch_inserts_and_updates() {
+        let backend = InMemoryBackend::new();
+        let first: Arc<str> = "15550000001:1@s.whatsapp.net".into();
+        let second: Arc<str> = "15550000002:2@s.whatsapp.net".into();
+
+        backend
+            .put_sessions_batch(&[
+                (first.clone(), Bytes::from_static(b"first")),
+                (second.clone(), Bytes::from_static(b"second")),
+            ])
+            .await
+            .unwrap();
+        backend
+            .put_sessions_batch(&[(first.clone(), Bytes::from_static(b"updated"))])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.get_session(&first).await.unwrap().unwrap(),
+            Bytes::from_static(b"updated")
+        );
+        assert_eq!(
+            backend.get_session(&second).await.unwrap().unwrap(),
+            Bytes::from_static(b"second")
+        );
     }
 
     #[tokio::test]

@@ -72,28 +72,41 @@ impl MsgSecretWriteBuffer {
             return;
         }
         {
-            use wacore::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
             let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-            for mut entry in entries {
-                let key = (
-                    entry.chat.clone(),
-                    entry.sender.clone(),
-                    entry.msg_id.clone(),
-                );
-                // Two captures coalescing in the same window must merge the
-                // retention metadata exactly like the backend upsert would
-                // have for two sequential writes (never-expire wins, windows
-                // never shrink, a known parent time is never clobbered).
-                if let Some(existing) = pending.get(&key) {
-                    entry.expires_at =
-                        merge_msg_secret_expiry(existing.expires_at, entry.expires_at);
-                    entry.message_ts =
-                        merge_msg_secret_message_ts(existing.message_ts, entry.message_ts);
-                }
-                pending.insert(key, entry);
+            for entry in entries {
+                Self::insert_pending(&mut pending, entry);
             }
         }
-        // The mutex above orders this load against seal(): an insert that the
+        self.schedule_or_flush().await;
+    }
+
+    /// Single-entry fast path for live sends, avoiding a temporary one-element Vec.
+    pub(crate) async fn queue_one(self: &Arc<Self>, entry: MsgSecretEntry) {
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            Self::insert_pending(&mut pending, entry);
+        }
+        self.schedule_or_flush().await;
+    }
+
+    fn insert_pending(pending: &mut HashMap<Key, MsgSecretEntry>, mut entry: MsgSecretEntry) {
+        use wacore::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
+
+        let key = (
+            entry.chat.clone(),
+            entry.sender.clone(),
+            entry.msg_id.clone(),
+        );
+        // Coalesced captures merge retention metadata like sequential backend writes.
+        if let Some(existing) = pending.get(&key) {
+            entry.expires_at = merge_msg_secret_expiry(existing.expires_at, entry.expires_at);
+            entry.message_ts = merge_msg_secret_message_ts(existing.message_ts, entry.message_ts);
+        }
+        pending.insert(key, entry);
+    }
+
+    async fn schedule_or_flush(self: &Arc<Self>) {
+        // The insertion mutex orders this load against seal(): an insert that the
         // shutdown flush's snapshot missed observes sealed and writes inline.
         if self.sealed.load(Ordering::Acquire) {
             self.flush().await;
