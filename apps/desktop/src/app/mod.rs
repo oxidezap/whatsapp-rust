@@ -92,9 +92,11 @@ async fn download_with_timeout(
 }
 
 /// Write a downloaded document into the user's Downloads directory
-/// ($XDG_DOWNLOAD_DIR, then $HOME/Downloads, then the CWD like the database
-/// fallback when no home is known) and return the path written.
+/// ($XDG_DOWNLOAD_DIR, then $HOME or %USERPROFILE% + /Downloads, then the CWD
+/// like the database fallback when no home is known) and return the path
+/// written.
 fn save_to_downloads(file_name: &str, data: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
     use std::path::PathBuf;
 
     let not_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(PathBuf::from(v));
@@ -103,17 +105,19 @@ fn save_to_downloads(file_name: &str, data: &[u8]) -> std::io::Result<std::path:
         .or_else(|| {
             std::env::var_os("HOME")
                 .and_then(not_empty)
+                .or_else(|| std::env::var_os("USERPROFILE").and_then(not_empty))
                 .map(|home| home.join("Downloads"))
         })
         .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir)?;
 
-    // The name comes off the wire: strip path separators so a hostile sender
-    // can't traverse out of the directory.
+    // The name comes off the wire: strip path separators (and `:`, which on
+    // Windows makes a drive-relative path) so a hostile sender can't traverse
+    // out of the directory.
     let sanitized: String = file_name
         .chars()
         .map(|c| {
-            if std::path::is_separator(c) || c == '\\' {
+            if std::path::is_separator(c) || c == '\\' || c == ':' || c.is_control() {
                 '_'
             } else {
                 c
@@ -125,9 +129,35 @@ fn save_to_downloads(file_name: &str, data: &[u8]) -> std::io::Result<std::path:
         trimmed => trimmed,
     };
 
-    let path = dir.join(name);
-    std::fs::write(&path, data)?;
-    Ok(path)
+    // create_new + " (n)" suffixing so a download never clobbers an existing
+    // file of the same name.
+    for attempt in 0..1000u32 {
+        let candidate = if attempt == 0 {
+            name.to_string()
+        } else {
+            match name.rsplit_once('.') {
+                Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({attempt}).{ext}"),
+                _ => format!("{name} ({attempt})"),
+            }
+        };
+        let path = dir.join(candidate);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(data)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many downloads with the same name",
+    ))
 }
 
 /// Currently active media playback (mutual exclusion: only one media at a time)
