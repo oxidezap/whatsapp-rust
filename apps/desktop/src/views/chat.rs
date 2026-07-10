@@ -111,12 +111,7 @@ fn render_chat_area(
         })
         .when_some(selected_chat, |el, chat| {
             let is_group = chat.is_group;
-            let cache = message_cache.unwrap_or_else(|| MessageListCache {
-                message_count: 0,
-                item_sizes: std::rc::Rc::new(vec![]),
-                show_sender_flags: std::sync::Arc::from([]),
-                messages: std::sync::Arc::from([]),
-            });
+            let cache = message_cache.expect("message cache is built for every selected chat");
             el.child(render_chat_header(chat, entity.clone(), layout))
                 .child(render_message_list(
                     cache,

@@ -652,7 +652,7 @@ impl WhatsAppApp {
         if let Some(ref input_area) = self.input_area {
             let is_recording = self.is_recording();
             input_area.update(cx, |view, _cx| {
-                view.set_recording(is_recording);
+                view.set_recording(is_recording, cx);
             });
         }
     }
@@ -1446,12 +1446,21 @@ impl WhatsAppApp {
             UiEvent::HistoryLoaded { chats } => {
                 info!("Loaded {} chats from durable history", chats.len());
                 for chat in chats {
-                    if !self.chats.iter().any(|c| c.jid == chat.jid) {
-                        self.chats.push(chat);
+                    // Later loads (post-HistorySync re-hydration) fold into
+                    // chats the UI already shows instead of being dropped.
+                    match self.chats.iter_mut().find(|c| c.jid == chat.jid) {
+                        Some(existing) => {
+                            let jid = chat.jid.clone();
+                            existing.merge_history(chat);
+                            self.invalidate_message_cache(&jid);
+                        }
+                        None => self.chats.push(chat),
                     }
                 }
                 self.chats
                     .sort_by_key(|c| std::cmp::Reverse(c.last_message_time));
+                // Count-based cache guards can't see reordering/merges.
+                self.invalidate_chat_cache();
                 cx.notify();
             }
             UiEvent::QrCode { code, timeout_secs } => {

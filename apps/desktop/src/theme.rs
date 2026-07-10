@@ -6,6 +6,7 @@
 /// WhatsApp-specific colors
 pub mod colors {
     pub const ACCENT_GREEN: u32 = 0x00a884;
+    pub const ACCENT_RED: u32 = 0xff4444;
     #[allow(dead_code)]
     pub const ACCENT_BLUE: u32 = 0x53bdeb;
 

@@ -56,6 +56,6 @@ fn main() {
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             )
-            .unwrap();
+            .expect("failed to open main window");
         });
 }

@@ -64,10 +64,7 @@ pub fn render_chat_header(
                             ),
                     )
                 })
-                .child(Avatar::from_initial(
-                    initial,
-                    if layout.is_mobile() { 36.0 } else { 40.0 },
-                ))
+                .child(Avatar::from_initial(initial, layout.avatar_size()))
                 .child(
                     div()
                         .flex_1()

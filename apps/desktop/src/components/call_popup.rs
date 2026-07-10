@@ -82,7 +82,7 @@ pub fn render_call_popup(call: &IncomingCall, app_entity: Entity<WhatsAppApp>) -
         .child(render_call_button(
             "Decline",
             "✕",
-            0xff4444,
+            colors::ACCENT_RED,
             move |_, _window, cx| {
                 decline_entity.update(cx, |app, cx| {
                     app.decline_call(cx);

@@ -143,16 +143,6 @@ impl WhatsAppClient {
         let chat_store = self.chat_store.clone();
         let runtime = self.runtime.clone();
 
-        // Store the sender for use by other methods like start_call
-        {
-            let ui_sender_clone = self.ui_sender.clone();
-            let ui_tx_clone = ui_tx.clone();
-            self.runtime.spawn(async move {
-                let mut guard = ui_sender_clone.lock().await;
-                *guard = Some(ui_tx_clone);
-            });
-        }
-
         std::thread::spawn(move || {
             runtime.block_on(async move {
                 // Also store sender in the async context
@@ -744,8 +734,6 @@ impl WhatsAppClient {
         duration_secs: u32,
         waveform: Vec<u8>,
     ) {
-        use wacore::download::MediaType as WaMediaType;
-
         let chat_store = self.chat_store.clone();
 
         let client_handle = self.client_handle.clone();
@@ -767,7 +755,7 @@ impl WhatsAppClient {
                 if let Some(client) = guard.as_ref() {
                     // Upload the audio file
                     let upload_result = match client
-                        .upload(audio_data, WaMediaType::Audio, Default::default())
+                        .upload(audio_data, DownloadMediaType::Audio, Default::default())
                         .await
                     {
                         Ok(resp) => resp,
@@ -921,7 +909,6 @@ impl WhatsAppClient {
                 let guard = client_handle.lock().await;
                 if let Some(client) = guard.as_ref() {
                     // Group messages by sender, then send read receipts per sender
-                    use std::collections::HashMap;
                     let mut by_sender: HashMap<Jid, Vec<String>> = HashMap::new();
                     for (msg_id, sender) in parsed_messages {
                         by_sender.entry(sender).or_default().push(msg_id);
@@ -1168,10 +1155,18 @@ impl WhatsAppClient {
         for entry in entries {
             // Same PN->LID mapping live events go through, or the restored
             // chat and the next live message split into two conversations.
-            // A PN/LID pair of stored rows collapses to the most recently
-            // active one (entries arrive in display order).
+            // A PN/LID pair of stored rows collapses into one chat: the most
+            // recently active row (entries arrive in display order) keeps the
+            // metadata, the older row's messages merge in.
             let jid_str = normalize_chat_jid(client, &entry.jid.to_string()).await;
-            if chats.iter().any(|c| c.jid == jid_str) {
+            if let Some(existing) = chats.iter_mut().find(|c| c.jid == jid_str) {
+                let mut page = chat_store
+                    .messages(&entry.jid, None, Self::HISTORY_MESSAGES_PER_CHAT)
+                    .await?;
+                page.reverse();
+                for msg in page.into_iter().map(stored_to_chat_message) {
+                    existing.insert_history_message(msg);
+                }
                 continue;
             }
             let mut name = entry.name.clone();

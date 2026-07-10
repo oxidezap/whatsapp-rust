@@ -211,7 +211,7 @@ impl ResponsiveLayout {
     }
 
     pub fn message_list_width(&self) -> f32 {
-        self.chat_area_width() - 32.0 - 12.0
+        self.chat_area_width() - (self.padding() * 2.0) - self.gap()
     }
 
     pub fn min_touch_target(&self) -> f32 {

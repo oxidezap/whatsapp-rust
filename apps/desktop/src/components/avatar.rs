@@ -19,9 +19,6 @@ impl Avatar {
 
     /// Render an avatar with just an initial character
     pub fn from_initial(initial: char, size: f32) -> impl IntoElement {
-        GpuiAvatar::new()
-            .name(initial.to_string())
-            .with_size(gpui_component::Size::Large)
-            .size(gpui::px(size))
+        Self::render(initial.to_string(), size)
     }
 }

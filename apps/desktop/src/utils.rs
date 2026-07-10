@@ -11,7 +11,10 @@ pub fn mime_to_image_format(mime: &str) -> ImageFormat {
         "image/gif" => ImageFormat::Gif,
         "image/webp" => ImageFormat::Webp,
         "image/bmp" => ImageFormat::Bmp,
-        _ => ImageFormat::Png, // Default fallback
+        _ => {
+            log::warn!("unrecognized image MIME type {mime}, falling back to PNG");
+            ImageFormat::Png
+        }
     }
 }
 

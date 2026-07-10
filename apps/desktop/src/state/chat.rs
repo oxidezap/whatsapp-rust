@@ -200,6 +200,21 @@ impl ChatMessage {
     /// Each sender can only have one reaction - adding a new one removes the previous.
     /// An empty emoji string removes the sender's reaction entirely.
     pub fn add_reaction(&mut self, emoji: String, sender: String) {
+        // Enforce the limit BEFORE removing the sender's old reaction: a
+        // rejected replacement must not erase what they already had.
+        if !emoji.is_empty()
+            && !self.reactions.contains_key(&emoji)
+            && self.reactions.len() >= MAX_REACTIONS_PER_MESSAGE
+        {
+            let frees_a_slot = self
+                .reactions
+                .values()
+                .any(|senders| senders.len() == 1 && senders.contains(&sender));
+            if !frees_a_slot {
+                return;
+            }
+        }
+
         // Remove any existing reaction from this sender (one reaction per person)
         for senders in self.reactions.values_mut() {
             senders.retain(|s| s != &sender);
@@ -208,12 +223,6 @@ impl ChatMessage {
 
         // Empty emoji means remove reaction
         if emoji.is_empty() {
-            return;
-        }
-
-        // Check if adding a new emoji type would exceed the limit
-        if !self.reactions.contains_key(&emoji) && self.reactions.len() >= MAX_REACTIONS_PER_MESSAGE
-        {
             return;
         }
 
@@ -335,35 +344,67 @@ impl Chat {
 
     /// Add a message to the chat, maintaining chronological order by timestamp
     pub fn add_message(&mut self, message: ChatMessage) {
-        // Only increment unread count for incoming messages that are newer than last seen
-        // (not for old history messages being synced)
-        let is_newer = self
+        // Sorted insert (out-of-order decryption during history sync); equal
+        // timestamps tie-break on message ID for stable ordering.
+        let pos = match self.messages.binary_search_by(|m| {
+            m.timestamp
+                .cmp(&message.timestamp)
+                .then_with(|| m.id.cmp(&message.id))
+        }) {
+            // Redelivery of a message we already show (live traffic
+            // overlapping hydrated history): no duplicate bubble, no recount.
+            Ok(_) => return,
+            Err(pos) => pos,
+        };
+
+        // Unread gate is strictly newer: a same-timestamp history sibling must
+        // not inflate the badge. The preview still updates on ties.
+        let is_strictly_newer = self
+            .last_message_time
+            .map(|t| message.timestamp > t)
+            .unwrap_or(true);
+        let is_newer_or_same = self
             .last_message_time
             .map(|t| message.timestamp >= t)
             .unwrap_or(true);
 
-        if !message.is_from_me && is_newer {
+        if !message.is_from_me && is_strictly_newer {
             self.unread_count += 1;
         }
 
-        // Only update last_message preview if this message is newer than current
-        if is_newer {
+        if is_newer_or_same {
             self.last_message = Some(message.preview_text());
             self.last_message_time = Some(message.timestamp);
         }
 
-        // Insert message in sorted position by timestamp to maintain chronological order.
-        // This handles out-of-order message decryption during history sync.
-        // For equal timestamps, use message ID as secondary sort key for stable ordering.
-        let pos = self
-            .messages
-            .binary_search_by(|m| {
-                m.timestamp
-                    .cmp(&message.timestamp)
-                    .then_with(|| m.id.cmp(&message.id))
-            })
-            .unwrap_or_else(|pos| pos);
         self.messages.insert(pos, message);
+    }
+
+    /// Fold a freshly hydrated copy of this chat (from the durable store) into
+    /// the live one. Messages merge dedup-guarded without unread bumps; the
+    /// store's counters are authoritative after a flush.
+    pub fn merge_history(&mut self, hydrated: Chat) {
+        for msg in hydrated.messages {
+            self.insert_history_message(msg);
+        }
+        self.unread_count = hydrated.unread_count;
+        self.manually_unread = hydrated.manually_unread;
+        if hydrated.last_message_time >= self.last_message_time {
+            self.last_message = hydrated.last_message;
+            self.last_message_time = hydrated.last_message_time;
+        }
+    }
+
+    /// Insert a hydrated message in order, skipping duplicates, without
+    /// touching unread counters or the preview.
+    pub fn insert_history_message(&mut self, message: ChatMessage) {
+        if let Err(pos) = self.messages.binary_search_by(|m| {
+            m.timestamp
+                .cmp(&message.timestamp)
+                .then_with(|| m.id.cmp(&message.id))
+        }) {
+            self.messages.insert(pos, message);
+        }
     }
 
     /// Mark all messages as read

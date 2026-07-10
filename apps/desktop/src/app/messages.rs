@@ -120,5 +120,5 @@ pub fn calculate_message_height(msg: &ChatMessage, show_sender: bool, max_media_
         height += layout::MSG_REACTION_MARGIN_TOP + layout::MSG_REACTION_HEIGHT;
     }
 
-    height.min(500.0)
+    height
 }

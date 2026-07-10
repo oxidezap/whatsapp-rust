@@ -88,18 +88,7 @@ impl InputAreaView {
     ) {
         match event {
             InputEvent::PressEnter { .. } => {
-                // Get the text and send if not empty
-                let text = input.read(cx).text().to_string();
-                if !text.trim().is_empty() {
-                    // Clear the input
-                    input.update(cx, |state, cx| {
-                        state.set_value("", window, cx);
-                    });
-                    // Stop typing indicator
-                    self.stop_typing_internal(cx);
-                    // Emit event to parent
-                    cx.emit(InputAreaEvent::SendMessage(text));
-                }
+                self.submit_input(window, cx);
             }
             InputEvent::Change => {
                 // Handle typing indicator - minimal work, no notify
@@ -167,8 +156,23 @@ impl InputAreaView {
     }
 
     /// Set recording state (called by parent)
-    pub fn set_recording(&mut self, is_recording: bool) {
+    pub fn set_recording(&mut self, is_recording: bool, cx: &mut Context<Self>) {
         self.is_recording = is_recording;
+        cx.notify();
+    }
+
+    /// Read, trim-check, clear and emit the composed message (Enter and the
+    /// send button share this path).
+    fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text().to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        self.stop_typing_internal(cx);
+        cx.emit(InputAreaEvent::SendMessage(text));
     }
 
     /// Toggle PTT recording
@@ -229,14 +233,7 @@ impl Render for InputAreaView {
                             .on_click({
                                 move |_, window, cx| {
                                     entity.update(cx, |view, cx| {
-                                        let text = view.input.read(cx).text().to_string();
-                                        if !text.trim().is_empty() {
-                                            view.input.update(cx, |state, cx| {
-                                                state.set_value("", window, cx);
-                                            });
-                                            view.stop_typing_internal(cx);
-                                            cx.emit(InputAreaEvent::SendMessage(text));
-                                        }
+                                        view.submit_input(window, cx);
                                     });
                                 }
                             }),
