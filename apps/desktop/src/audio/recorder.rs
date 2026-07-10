@@ -40,11 +40,16 @@ impl RecordedAudio {
             // ~10dB there). Windowed-sinc FIR, ~7kHz cutoff at the input
             // rate, unity DC gain so speech level is preserved; evaluated
             // only at the kept samples, O(n·taps) — fine for PTT lengths.
-            const TAPS: usize = 63;
             const CUTOFF_HZ: f32 = 7_000.0;
+            let step = (self.sample_rate / TARGET_SAMPLE_RATE) as usize;
+            // The transition band scales with the input rate, so the tap
+            // count must too: 63 taps suit 48kHz (step 3), but a 96/192kHz
+            // fallback device needs proportionally more or content above
+            // 8kHz still folds into the output.
+            let taps = (21 * step) | 1;
             let fc = CUTOFF_HZ / self.sample_rate as f32;
-            let center = (TAPS - 1) / 2;
-            let mut fir = [0.0f32; TAPS];
+            let center = (taps - 1) / 2;
+            let mut fir = vec![0.0f32; taps];
             for (k, tap) in fir.iter_mut().enumerate() {
                 let n = k as f32 - center as f32;
                 let sinc = if n == 0.0 {
@@ -53,15 +58,13 @@ impl RecordedAudio {
                     (std::f32::consts::TAU * fc * n).sin() / (std::f32::consts::PI * n)
                 };
                 let hamming =
-                    0.54 - 0.46 * (std::f32::consts::TAU * k as f32 / (TAPS - 1) as f32).cos();
+                    0.54 - 0.46 * (std::f32::consts::TAU * k as f32 / (taps - 1) as f32).cos();
                 *tap = sinc * hamming;
             }
             let dc_gain: f32 = fir.iter().sum();
             for tap in fir.iter_mut() {
                 *tap /= dc_gain;
             }
-
-            let step = (self.sample_rate / TARGET_SAMPLE_RATE) as usize;
             // saturating: an empty capture must not underflow (the loop below
             // is a no-op then anyway).
             let last = self.samples.len().saturating_sub(1);
