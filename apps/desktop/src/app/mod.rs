@@ -749,10 +749,20 @@ impl WhatsAppApp {
         // next history reload. Bounded to the newest visible bubble so a
         // message racing the echo isn't marked read sight-unseen.
         if let Some(chat) = self.find_chat(&jid).filter(|c| c.manually_unread) {
-            let last_displayed = chat
-                .messages
-                .last()
-                .map(|m| (m.id.clone(), m.timestamp.timestamp(), m.is_from_me));
+            // Every bubble in the newest second rides along: the keyed range
+            // stops the watermark short of that second, so a same-second
+            // sibling left out would stay unread and re-badge on hydration.
+            let last_displayed = chat.messages.last().map(|last| {
+                let ts_secs = last.timestamp.timestamp();
+                let ids = chat
+                    .messages
+                    .iter()
+                    .rev()
+                    .take_while(|m| m.timestamp.timestamp() == ts_secs)
+                    .map(|m| (m.id.clone(), m.is_from_me))
+                    .collect();
+                (ts_secs, ids)
+            });
             self.client.mark_chat_read(&jid, last_displayed);
         }
 

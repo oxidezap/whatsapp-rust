@@ -1144,11 +1144,17 @@ impl WhatsAppClient {
     /// event stream), never by message receipts — without this the badge
     /// would come back on the next history reload.
     ///
-    /// `last_displayed` is `(message id, timestamp in seconds, from_me)` of
-    /// the newest bubble the user actually saw: it bounds the action so a
-    /// message that lands before the echo is processed is not counted as
-    /// read without being viewed.
-    pub fn mark_chat_read(&self, chat_jid_str: &str, last_displayed: Option<(String, i64, bool)>) {
+    /// `last_displayed` is the newest visible second — `(timestamp in
+    /// seconds, ids-in-that-second)` with each id's `from_me` flag. It bounds
+    /// the action so a message that lands before the echo is processed is not
+    /// counted as read without being viewed. All the boundary second's ids
+    /// ride along: a keyed range stops the watermark short of that second, so
+    /// any sibling left out would stay unread.
+    pub fn mark_chat_read(
+        &self,
+        chat_jid_str: &str,
+        last_displayed: Option<(i64, Vec<(String, bool)>)>,
+    ) {
         use whatsapp_rust::features::{message_key, message_range};
 
         let client_handle = self.client_handle.clone();
@@ -1168,11 +1174,15 @@ impl WhatsAppClient {
                     error!("Client not available for marking chat read");
                     return;
                 };
-                let range = last_displayed.map(|(id, ts_secs, from_me)| {
+                let range = last_displayed.map(|(ts_secs, ids)| {
                     message_range(
                         ts_secs,
                         None,
-                        vec![(message_key(id, &chat_jid, from_me, None), ts_secs)],
+                        ids.into_iter()
+                            .map(|(id, from_me)| {
+                                (message_key(id, &chat_jid, from_me, None), ts_secs)
+                            })
+                            .collect(),
                     )
                 });
                 if let Err(e) = client
@@ -1465,13 +1475,15 @@ impl WhatsAppClient {
                         Err(_) => break,
                     }
                 }
+                // An empty load still goes out: the UI prunes against the
+                // loaded set, so deleting/archiving the last chat elsewhere
+                // must clear the list here too.
                 match Self::load_history(&chat_store, &client).await {
-                    Ok(chats) if !chats.is_empty() => {
+                    Ok(chats) => {
                         if ui_tx.send(UiEvent::HistoryLoaded { chats }).is_err() {
                             break;
                         }
                     }
-                    Ok(_) => {}
                     Err(e) => warn!("failed to reload history after store change: {e}"),
                 }
             }
