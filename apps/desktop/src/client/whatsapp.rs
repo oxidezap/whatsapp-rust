@@ -1479,6 +1479,20 @@ impl WhatsAppClient {
                 }
                 existing.unread_count += entry.unread_count.max(0) as u32;
                 existing.manually_unread |= entry.unread_count < 0;
+                // The kept row can still wear the JID placeholder while this
+                // older row (or its contact) knows the display name.
+                let placeholder = existing.jid.split('@').next().unwrap_or(&existing.jid);
+                if existing.name == placeholder {
+                    let mut name = entry.name.clone();
+                    if name.is_none()
+                        && let Ok(Some(contact)) = chat_store.contact(&entry.jid).await
+                    {
+                        name = contact.display_name().map(str::to_owned);
+                    }
+                    if let Some(name) = name.filter(|n| n != placeholder) {
+                        existing.name = name;
+                    }
+                }
                 continue;
             }
             let mut name = entry.name.clone();
