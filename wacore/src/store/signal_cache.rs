@@ -433,6 +433,39 @@ impl SignalStoreCache {
         state.evict_if_needed(self.max_entries);
     }
 
+    /// Non-blocking [`Self::put_session`]: completes synchronously when the
+    /// sessions lock is free. Returns the record back on contention (e.g. a
+    /// flush commit in progress) so the caller can take the async path
+    /// without cloning.
+    // Err carries the record by value on purpose: boxing it would add the
+    // very allocation this fast path exists to avoid.
+    #[allow(clippy::result_large_err)]
+    pub fn try_put_session(
+        &self,
+        address: &ProtocolAddress,
+        record: SessionRecord,
+    ) -> core::result::Result<(), SessionRecord> {
+        match self.sessions.try_lock() {
+            Some(mut state) => {
+                state.put(address.as_str(), record);
+                state.evict_if_needed(self.max_entries);
+                Ok(())
+            }
+            None => Err(record),
+        }
+    }
+
+    /// Non-blocking [`Self::has_session`] restricted to what the cache already
+    /// knows: `Some` only when the lock is free AND the entry is cached;
+    /// `None` sends the caller to the async path (backend consult).
+    pub fn try_has_session(&self, address: &ProtocolAddress) -> Option<bool> {
+        let state = self.sessions.try_lock()?;
+        state
+            .cache
+            .get(address.as_str())
+            .map(|entry| !matches!(entry, SessionEntry::Absent))
+    }
+
     pub async fn delete_session(&self, address: &ProtocolAddress) {
         let mut state = self.sessions.lock().await;
         state.delete(address.as_str());
@@ -499,6 +532,27 @@ impl SignalStoreCache {
         let mut state = self.identities.lock().await;
         state.put_dedup(address.as_str(), data);
         state.evict_if_needed(self.max_entries);
+    }
+
+    /// Non-blocking cached identity read: `Some` only when the lock is free
+    /// AND the entry is cached (`Some(None)` = known-absent); `None` sends
+    /// the caller to the async path.
+    pub fn try_get_identity(&self, address: &ProtocolAddress) -> Option<Option<Arc<[u8]>>> {
+        let state = self.identities.try_lock()?;
+        state.cache.get(address.as_str()).cloned()
+    }
+
+    /// Non-blocking [`Self::put_identity`]; `false` = contended, caller must
+    /// take the async path.
+    pub fn try_put_identity(&self, address: &ProtocolAddress, data: &[u8]) -> bool {
+        match self.identities.try_lock() {
+            Some(mut state) => {
+                state.put_dedup(address.as_str(), data);
+                state.evict_if_needed(self.max_entries);
+                true
+            }
+            None => false,
+        }
     }
 
     pub async fn delete_identity(&self, address: &ProtocolAddress) {
@@ -900,6 +954,109 @@ mod sender_key_lock_tests {
         // A warm sender-key hit returns a refcount bump of the same allocation,
         // not a deep copy of the message-key backlog.
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    /// The sync fast path must be indistinguishable from `put_session`:
+    /// visible to reads AND marked dirty so the flush persists it.
+    #[tokio::test]
+    async fn try_put_session_marks_dirty_and_flushes() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let addr = ProtocolAddress::new("15550009999".to_string(), 1.into());
+
+        assert!(
+            cache
+                .try_put_session(&addr, SessionRecord::new_fresh())
+                .is_ok(),
+            "uncontended try_put_session must succeed"
+        );
+
+        assert_eq!(cache.try_has_session(&addr), Some(true));
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            crate::store::traits::SignalStore::get_session(&backend, addr.as_str())
+                .await
+                .unwrap()
+                .is_some(),
+            "flush must persist a session stored via the fast path"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_session_paths_fall_back_under_contention() {
+        let cache = SignalStoreCache::new();
+        let addr = ProtocolAddress::new("15550009999".to_string(), 1.into());
+
+        let guard = cache.sessions.lock().await;
+        assert!(
+            cache
+                .try_put_session(&addr, SessionRecord::new_fresh())
+                .is_err(),
+            "held sessions lock must reject try_put_session"
+        );
+        assert_eq!(
+            cache.try_has_session(&addr),
+            None,
+            "held sessions lock must reject try_has_session"
+        );
+        drop(guard);
+
+        assert_eq!(
+            cache.try_has_session(&addr),
+            None,
+            "unknown entry must defer to the async path"
+        );
+        assert!(
+            cache
+                .try_put_session(&addr, SessionRecord::new_fresh())
+                .is_ok(),
+            "released lock must accept try_put_session"
+        );
+        assert_eq!(cache.try_has_session(&addr), Some(true));
+    }
+
+    #[tokio::test]
+    async fn try_has_session_reports_known_absent() {
+        let cache = SignalStoreCache::new();
+        let addr = ProtocolAddress::new("15550009999".to_string(), 1.into());
+
+        cache.delete_session(&addr).await;
+        assert_eq!(
+            cache.try_has_session(&addr),
+            Some(false),
+            "negative-cached entry must answer synchronously"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_identity_paths_cover_hit_miss_and_contention() {
+        let cache = SignalStoreCache::new();
+        let addr = ProtocolAddress::new("15550009999".to_string(), 1.into());
+        let key_bytes = [7u8; 32];
+
+        assert_eq!(
+            cache.try_get_identity(&addr),
+            None,
+            "unknown entry must defer to the async path"
+        );
+
+        assert!(cache.try_put_identity(&addr, &key_bytes));
+        match cache.try_get_identity(&addr) {
+            Some(Some(bytes)) => assert_eq!(bytes.as_ref(), &key_bytes),
+            other => panic!("expected cached identity, got {other:?}"),
+        }
+
+        let guard = cache.identities.lock().await;
+        assert_eq!(cache.try_get_identity(&addr), None);
+        assert!(!cache.try_put_identity(&addr, &key_bytes));
+        drop(guard);
+
+        cache.delete_identity(&addr).await;
+        assert_eq!(
+            cache.try_get_identity(&addr),
+            Some(None),
+            "known-absent identity must answer synchronously"
+        );
     }
 }
 
