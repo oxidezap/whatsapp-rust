@@ -1531,6 +1531,7 @@ impl WhatsAppApp {
                     msg.id = message_id;
                 }
                 self.invalidate_message_cache(&chat_jid);
+                cx.notify();
             }
             UiEvent::ReceiptReceived {
                 chat_jid,
