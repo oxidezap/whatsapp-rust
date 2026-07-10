@@ -357,18 +357,16 @@ impl Chat {
             Err(pos) => pos,
         };
 
-        // Unread gate is strictly newer: a same-timestamp history sibling must
-        // not inflate the badge. The preview still updates on ties.
-        let is_strictly_newer = self
-            .last_message_time
-            .map(|t| message.timestamp > t)
-            .unwrap_or(true);
+        // >= on purpose: WhatsApp timestamps are second-granular, so live
+        // same-second siblings must still badge. History hydration never goes
+        // through here (insert_history_message/merge_history), and the dup
+        // guard above already blocks redelivery recounts.
         let is_newer_or_same = self
             .last_message_time
             .map(|t| message.timestamp >= t)
             .unwrap_or(true);
 
-        if !message.is_from_me && is_strictly_newer {
+        if !message.is_from_me && is_newer_or_same {
             self.unread_count += 1;
         }
 
