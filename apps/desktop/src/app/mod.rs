@@ -129,6 +129,24 @@ fn save_to_downloads(file_name: &str, data: &[u8]) -> std::io::Result<std::path:
         trimmed => trimmed,
     };
 
+    // Windows treats device basenames (CON, NUL, COM1…) as reserved for any
+    // extension; prefix them so the save can't resolve to a device.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches([' ', '.'])
+        .to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    let name = if reserved {
+        format!("_{name}")
+    } else {
+        name.to_string()
+    };
+
     // create_new + " (n)" suffixing so a download never clobbers an existing
     // file of the same name.
     for attempt in 0..1000u32 {
