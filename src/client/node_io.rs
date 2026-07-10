@@ -159,13 +159,29 @@ impl Client {
                                         // - Critical nodes (success/failure/stream:error): inline, required for state
                                         // - Message nodes: inline, preserves arrival order for per-chat queues
                                         //   (MessageHandler just enqueues + ACKs, heavy crypto runs in workers)
+                                        // - Acks/receipts: inline when unobserved; retry work detaches itself
                                         // - ib (in-band): inline, ensures offline sync tracking (expected count)
                                         //   is set up before offline messages are processed
                                         // - Everything else: spawned concurrently for parallelism
-                                        let process_inline = matches!(
-                                            node.tag(),
-                                            "success" | "failure" | "stream:error" | "message" | "ib"
-                                        );
+                                        let process_inline = match node.tag() {
+                                            "success" | "failure" | "stream:error" | "message" | "ib" => true,
+                                            // Preserve concurrent callback behavior when an app
+                                            // observes these events or every raw node.
+                                            "receipt" => {
+                                                !self.synchronous_ack
+                                                    && !self.raw_node_forwarding.load(Ordering::Relaxed)
+                                                    && !self.core.event_bus.has_handler_for(
+                                                        wacore::types::events::EventKind::Receipt,
+                                                    )
+                                            }
+                                            "ack" => {
+                                                !self.raw_node_forwarding.load(Ordering::Relaxed)
+                                                    && !self.core.event_bus.has_handler_for(
+                                                        wacore::types::events::EventKind::ServerAck,
+                                                    )
+                                            }
+                                            _ => false,
+                                        };
 
                                         if process_inline {
                                             self.process_decrypted_node(node).await;
@@ -284,6 +300,19 @@ impl Client {
         self: &Arc<Self>,
         node: wacore_binary::OwnedNodeRef,
     ) {
+        // ACKs need shared ownership only for opt-in raw/node observers. The
+        // usual response-waiter path borrows the node and can skip the Arc.
+        if node.tag() == "ack"
+            && !self.raw_node_forwarding.load(Ordering::Relaxed)
+            && self.node_waiter_count.load(Ordering::Acquire) == 0
+            && !self.offline_sync_metrics.active.load(Ordering::Acquire)
+        {
+            use wacore::xml::DisplayableNodeRef;
+            debug!(target: "Client/Recv", "{}", DisplayableNodeRef(node.get()));
+            self.handle_ack_response_inline(node.get());
+            return;
+        }
+
         // Wrap in Arc once - all handlers will share this same allocation
         let node_arc = Arc::new(node);
         self.process_node(node_arc).await;
@@ -438,13 +467,32 @@ impl Client {
             return;
         }
 
-        // Dispatch to appropriate handler using the router
-        // Clone Arc (cheap - just reference count) not the Node itself
-        if !self
-            .stanza_router
-            .dispatch(self.clone(), Arc::clone(&node), &mut cancelled)
-            .await
-        {
+        // Bypass async_trait's boxed future for the hot built-in handlers while
+        // retaining router registration for direct router callers.
+        let handled = match nr.tag.as_ref() {
+            "ack" => {
+                self.handle_ack_response_inline(nr);
+                true
+            }
+            "receipt" => {
+                self.handle_receipt_inline(Arc::clone(&node));
+                true
+            }
+            "message" => {
+                crate::handlers::message::MessageHandler::handle_inline(
+                    self.clone(),
+                    Arc::clone(&node),
+                    &mut cancelled,
+                )
+                .await
+            }
+            _ => {
+                self.stanza_router
+                    .dispatch(self.clone(), Arc::clone(&node), &mut cancelled)
+                    .await
+            }
+        };
+        if !handled {
             warn!(
                 "Received unknown top-level node: {}",
                 DisplayableNodeRef(nr)
@@ -1096,11 +1144,15 @@ impl Client {
     ///
     /// If an ack with an ID that matches a pending task in `response_waiters`,
     /// the task is resolved and the function returns `true`. Otherwise, returns `false`.
+    pub(crate) async fn handle_ack_response(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+        self.handle_ack_response_inline(node)
+    }
+
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.conn.ack_response", level = "debug", skip_all)
     )]
-    pub(crate) async fn handle_ack_response(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+    pub(crate) fn handle_ack_response_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         let ack_id = node.get_attr("id");
         let ack_error = node.get_attr("error");
 
