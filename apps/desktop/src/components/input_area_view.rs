@@ -155,6 +155,15 @@ impl InputAreaView {
         self.typing_monitor_task = None;
     }
 
+    /// Reset typing state without emitting StoppedTyping (called by parent on
+    /// chat switch, which routes the paused presence itself); otherwise the
+    /// state machine would stay Composing and swallow the first keystroke's
+    /// StartedTyping in the newly selected chat.
+    pub fn reset_typing(&mut self) {
+        self.typing_state = TypingState::Idle;
+        self.typing_monitor_task = None;
+    }
+
     /// Set recording state (called by parent)
     pub fn set_recording(&mut self, is_recording: bool, cx: &mut Context<Self>) {
         self.is_recording = is_recording;

@@ -107,6 +107,9 @@ pub struct MediaContent {
     pub is_animated: bool,
     /// Duration in seconds (for audio/video)
     pub duration_secs: Option<u32>,
+    /// Whether `data` holds only a fallback thumbnail (eager download of the
+    /// full media failed), so the renderer keeps offering the real download
+    pub data_is_preview: bool,
 }
 
 impl MediaContent {
@@ -352,18 +355,24 @@ impl Chat {
     /// caller knows whether to bump the chat in the list; duplicates and older
     /// backfills return false.
     pub fn add_message(&mut self, message: ChatMessage) -> bool {
+        // Redelivery of a message we already show (live traffic overlapping
+        // hydrated history): no duplicate bubble, no recount. Id-only, not
+        // (timestamp, id): the optimistic bubble's UI clock and the store's
+        // commit clock can stamp the same message a second apart.
+        if self.messages.iter().any(|m| m.id == message.id) {
+            return false;
+        }
+
         // Sorted insert (out-of-order decryption during history sync); equal
         // timestamps tie-break on message ID for stable ordering.
-        let pos = match self.messages.binary_search_by(|m| {
-            m.timestamp
-                .cmp(&message.timestamp)
-                .then_with(|| m.id.cmp(&message.id))
-        }) {
-            // Redelivery of a message we already show (live traffic
-            // overlapping hydrated history): no duplicate bubble, no recount.
-            Ok(_) => return false,
-            Err(pos) => pos,
-        };
+        let pos = self
+            .messages
+            .binary_search_by(|m| {
+                m.timestamp
+                    .cmp(&message.timestamp)
+                    .then_with(|| m.id.cmp(&message.id))
+            })
+            .unwrap_or_else(|pos| pos);
 
         // >= on purpose: WhatsApp timestamps are second-granular, so live
         // same-second siblings must still badge. History hydration never goes
@@ -425,13 +434,21 @@ impl Chat {
     /// Insert a hydrated message in order, skipping duplicates, without
     /// touching unread counters or the preview.
     pub fn insert_history_message(&mut self, message: ChatMessage) {
-        if let Err(pos) = self.messages.binary_search_by(|m| {
-            m.timestamp
-                .cmp(&message.timestamp)
-                .then_with(|| m.id.cmp(&message.id))
-        }) {
-            self.messages.insert(pos, message);
+        // Id-only dedup: the hydrated copy may carry a slightly different
+        // timestamp than the optimistic bubble, and the bubble we already
+        // show may hold downloaded media bytes worth keeping.
+        if self.messages.iter().any(|m| m.id == message.id) {
+            return;
         }
+        let pos = self
+            .messages
+            .binary_search_by(|m| {
+                m.timestamp
+                    .cmp(&message.timestamp)
+                    .then_with(|| m.id.cmp(&message.id))
+            })
+            .unwrap_or_else(|pos| pos);
+        self.messages.insert(pos, message);
     }
 
     /// Mark all messages as read
@@ -596,6 +613,28 @@ mod tests {
         assert_eq!(chat.messages[0].id, "3EB0AAA");
 
         assert!(!chat.rename_message("missing", "whatever"));
+    }
+
+    #[test]
+    fn test_hydration_dedups_same_id_at_different_timestamp() {
+        let mut chat = Chat::new("test@s.whatsapp.net".to_string());
+
+        // Optimistic bubble stamped with the UI clock, renamed to the real id
+        chat.add_message(make_message("local_1000_0", 1000));
+        assert!(chat.rename_message("local_1000_0", "3EB0AAA"));
+
+        // The store commits its own slightly-later timestamp; the hydrated
+        // copy must fold into the existing bubble, not sit next to it
+        chat.insert_history_message(make_message("3EB0AAA", 1001));
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(
+            chat.messages[0].timestamp,
+            Utc.timestamp_opt(1000, 0).unwrap()
+        );
+
+        // Live redelivery with the shifted timestamp dedups the same way
+        assert!(!chat.add_message(make_message("3EB0AAA", 1001)));
+        assert_eq!(chat.messages.len(), 1);
     }
 
     #[test]

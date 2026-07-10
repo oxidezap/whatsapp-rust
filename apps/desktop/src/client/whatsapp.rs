@@ -514,9 +514,9 @@ impl WhatsAppClient {
             // Same rule as the image path below: a failed eager download
             // degrades to the thumbnail (and stays retryable through the
             // download metadata) instead of the message losing its media.
-            let (data, mime_type, is_animated) =
+            let (data, mime_type, is_animated, data_is_preview) =
                 match Self::download_media(_client, sticker, "sticker").await {
-                    Some(data) => (data, mime, sticker.is_animated.unwrap_or(false)),
+                    Some(data) => (data, mime, sticker.is_animated.unwrap_or(false), false),
                     None => (
                         sticker
                             .png_thumbnail
@@ -526,6 +526,7 @@ impl WhatsAppClient {
                             .unwrap_or_default(),
                         "image/png".to_string(),
                         false,
+                        true,
                     ),
                 };
             if data.is_empty() && downloadable.is_none() {
@@ -548,6 +549,7 @@ impl WhatsAppClient {
                 downloadable,
                 is_animated,
                 duration_secs: None,
+                data_is_preview,
             });
         }
 
@@ -566,24 +568,27 @@ impl WhatsAppClient {
             // A failed eager download keeps the metadata: the thumbnail shows
             // now and the full image stays retryable, instead of the message
             // degrading to a plain text row for the whole session.
-            let (data, mime_type) = match Self::download_media(_client, image, "image").await {
-                Some(data) => (
-                    data,
-                    image
-                        .mimetype
-                        .clone()
-                        .unwrap_or_else(|| "image/jpeg".to_string()),
-                ),
-                None => (
-                    image
-                        .jpeg_thumbnail
-                        .as_ref()
-                        .filter(|t| !t.is_empty())
-                        .cloned()
-                        .unwrap_or_default(),
-                    "image/jpeg".to_string(),
-                ),
-            };
+            let (data, mime_type, data_is_preview) =
+                match Self::download_media(_client, image, "image").await {
+                    Some(data) => (
+                        data,
+                        image
+                            .mimetype
+                            .clone()
+                            .unwrap_or_else(|| "image/jpeg".to_string()),
+                        false,
+                    ),
+                    None => (
+                        image
+                            .jpeg_thumbnail
+                            .as_ref()
+                            .filter(|t| !t.is_empty())
+                            .cloned()
+                            .unwrap_or_default(),
+                        "image/jpeg".to_string(),
+                        true,
+                    ),
+                };
             if data.is_empty() && downloadable.is_none() {
                 return None;
             }
@@ -597,6 +602,7 @@ impl WhatsAppClient {
                 downloadable,
                 is_animated: false,
                 duration_secs: None,
+                data_is_preview,
             });
         }
 
@@ -640,6 +646,7 @@ impl WhatsAppClient {
                     downloadable,
                     is_animated: false,
                     duration_secs: video.seconds,
+                    data_is_preview: false,
                 });
             }
         }
@@ -673,6 +680,7 @@ impl WhatsAppClient {
                     downloadable,
                     is_animated: false,
                     duration_secs: audio.seconds,
+                    data_is_preview: false,
                 });
             }
         }
@@ -700,6 +708,7 @@ impl WhatsAppClient {
                 downloadable,
                 is_animated: false,
                 duration_secs: None,
+                data_is_preview: false,
             });
         }
 
@@ -1336,7 +1345,7 @@ impl WhatsAppClient {
                 page.reverse();
                 let mut msgs: Vec<ChatMessage> =
                     page.into_iter().map(stored_to_chat_message).collect();
-                Self::hydrate_reactions(chat_store, &entry.jid, &mut msgs).await?;
+                Self::hydrate_reactions(chat_store, &entry.jid, &mut msgs).await;
                 // The rows are distinct messages, so this side's unread state
                 // adds to the merged chat: fold the counter in and un-read its
                 // tail so opening the chat still sends those receipts.
@@ -1379,7 +1388,7 @@ impl WhatsAppClient {
                 .await?;
             page.reverse(); // store returns newest-first; the UI renders oldest-first
             chat.messages = page.into_iter().map(stored_to_chat_message).collect();
-            Self::hydrate_reactions(chat_store, &entry.jid, &mut chat.messages).await?;
+            Self::hydrate_reactions(chat_store, &entry.jid, &mut chat.messages).await;
             // The newest `unread_count` incoming messages are the unread ones;
             // select_chat only sends read receipts for !is_read, so hydrated
             // unread must not come up pre-read.
@@ -1400,23 +1409,30 @@ impl WhatsAppClient {
 
     /// Reactions live in their own table, so hydrated messages come out with
     /// an empty map; fold the stored rows back in. Per-message point lookups:
-    /// the store exposes no per-chat batch query.
+    /// the store exposes no per-chat batch query. Best-effort: one bad row
+    /// must not abort the whole history load and blank the chat list.
     async fn hydrate_reactions(
         chat_store: &Arc<ChatStore>,
         chat_jid: &Jid,
         msgs: &mut [ChatMessage],
-    ) -> Result<(), whatsapp_rust_chat_store::ChatStoreError> {
+    ) {
         for msg in msgs.iter_mut() {
             // The store keeps one row per sender (latest wins), matching the
             // live add_reaction semantics, so a plain rebuild is enough.
-            for entry in chat_store.reactions(chat_jid, &msg.id).await? {
+            let entries = match chat_store.reactions(chat_jid, &msg.id).await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!("failed to hydrate reactions for {}: {e}", msg.id);
+                    continue;
+                }
+            };
+            for entry in entries {
                 msg.reactions
                     .entry(entry.emoji)
                     .or_default()
                     .push(entry.sender_jid.to_string());
             }
         }
-        Ok(())
     }
 }
 
@@ -1451,6 +1467,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             downloadable: Some(downloadable),
             is_animated: sticker.is_animated.unwrap_or(false),
             duration_secs: None,
+            data_is_preview: false,
         });
     }
     if let Some(image) = msg.image_message.as_option() {
@@ -1483,6 +1500,9 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             downloadable,
             is_animated: false,
             duration_secs: None,
+            // Hydrated rows carry only the thumbnail by design; the download
+            // placeholder path already offers the full fetch on tap
+            data_is_preview: false,
         });
     }
     // PTVs (round video notes) are VideoMessage in a different field.
@@ -1520,6 +1540,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             downloadable,
             is_animated: false,
             duration_secs: video.seconds,
+            data_is_preview: false,
         });
     }
     if let Some(audio) = msg.audio_message.as_option() {
@@ -1547,6 +1568,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             downloadable: Some(downloadable),
             is_animated: false,
             duration_secs: audio.seconds,
+            data_is_preview: false,
         });
     }
     if let Some(doc) = msg.document_message.as_option() {
@@ -1571,6 +1593,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             downloadable,
             is_animated: false,
             duration_secs: None,
+            data_is_preview: false,
         });
     }
     None

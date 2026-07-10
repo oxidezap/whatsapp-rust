@@ -165,6 +165,9 @@ pub struct WhatsAppApp {
     message_list_scroll: VirtualListScrollHandle,
     /// Isolated input area view (has its own render cycle for performance)
     input_area: Option<Entity<InputAreaView>>,
+    /// Chat a composing indicator was last sent to: paused must go back to
+    /// this chat even if the user switched chats before the typing timeout
+    composing_chat: Option<String>,
     /// Background task for event polling (must be retained)
     #[allow(dead_code)]
     event_task: Task<()>,
@@ -244,6 +247,7 @@ impl WhatsAppApp {
             chat_search_task: None,
             message_list_scroll: VirtualListScrollHandle::new(),
             input_area: None,
+            composing_chat: None,
             event_task,
             audio_recorder: AudioRecorder::new(),
             recording_state: RecordingState::default(),
@@ -404,6 +408,8 @@ impl WhatsAppApp {
             if let Some(msg) = chat.messages.iter_mut().find(|m| m.id == message_id) {
                 if let Some(ref mut media) = msg.media {
                     media.data = Arc::new(data);
+                    // Full bytes landed; the data no longer needs a re-download
+                    media.data_is_preview = false;
                     info!("Cached media data for message {}", message_id);
                     // Invalidate message cache since we modified the message
                     self.message_list_cache.borrow_mut().remove(&chat.jid);
@@ -587,6 +593,17 @@ impl WhatsAppApp {
 
     pub fn select_chat(&mut self, jid: String, cx: &mut Context<Self>) {
         self.stop_current_media();
+        // Leaving a chat mid-composition: release its typing indicator now,
+        // or it would stay "typing..." and the eventual paused would land on
+        // the newly selected chat instead.
+        if self.composing_chat.as_deref() != Some(jid.as_str())
+            && let Some(prev) = self.composing_chat.take()
+        {
+            self.client.send_paused(&prev);
+            if let Some(ref input_area) = self.input_area {
+                input_area.update(cx, |view, _| view.reset_typing());
+            }
+        }
         self.selected_chat = Some(jid.clone());
         self.navigate_to_chat();
 
@@ -690,13 +707,19 @@ impl WhatsAppApp {
             InputAreaEvent::StartedTyping => {
                 // Send "composing" presence
                 if let Some(jid) = &self.selected_chat {
+                    self.composing_chat = Some(jid.clone());
                     self.client.send_composing(jid);
                 }
             }
             InputAreaEvent::StoppedTyping => {
-                // Send "paused" presence
-                if let Some(jid) = &self.selected_chat {
-                    self.client.send_paused(jid);
+                // Send "paused" presence to the chat the composing went to,
+                // not whatever chat is selected when the timeout fires
+                let target = self
+                    .composing_chat
+                    .take()
+                    .or_else(|| self.selected_chat.clone());
+                if let Some(jid) = target {
+                    self.client.send_paused(&jid);
                 }
             }
         }
@@ -873,6 +896,7 @@ impl WhatsAppApp {
                 downloadable: None,
                 is_animated: false,
                 duration_secs: Some(duration_secs),
+                data_is_preview: false,
             },
         );
 

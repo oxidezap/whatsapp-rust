@@ -14,7 +14,7 @@ use gpui_component::{Disableable, Icon};
 
 use crate::app::WhatsAppApp;
 use crate::responsive::ResponsiveLayout;
-use crate::state::{ChatMessage, MediaType};
+use crate::state::{ChatMessage, DownloadableMedia, MediaType};
 use crate::theme::{colors, layout};
 use crate::utils::{format_time_local, mime_to_image_format, scale_media_dimensions};
 use crate::video::VideoPlayerState;
@@ -209,43 +209,49 @@ fn render_media_content(
             );
 
             if !media_content.data.is_empty() {
-                el.child(render_image_from_bytes(
+                let image = render_image_from_bytes(
                     media_content.data,
                     &media_content.mime_type,
                     display_w,
                     display_h,
                     true,
-                ))
+                );
+                if media_content.data_is_preview
+                    && let Some(dl) = media_content.downloadable.clone()
+                {
+                    // Only the fallback thumbnail is local: tapping it fetches
+                    // the full image, same path as the empty placeholder
+                    let preview_id: SharedString = format!("img-preview-{}", message_id).into();
+                    el.child(
+                        div()
+                            .id(preview_id)
+                            .cursor_pointer()
+                            .on_click(move |_, _window, cx| {
+                                let msg_id = message_id.clone();
+                                let dl = dl.clone();
+                                entity.update(cx, |app, cx| {
+                                    app.download_image(msg_id, dl, cx);
+                                });
+                            })
+                            .child(image),
+                    )
+                } else {
+                    el.child(image)
+                }
             } else if let Some(dl) = media_content.downloadable.clone() {
                 // Eager download failed but the metadata survived: keep the
                 // image fetchable on tap, like audio/video already are.
-                let placeholder_id: SharedString = format!("img-dl-{}", message_id).into();
-                el.child(
-                    div()
-                        .id(placeholder_id)
-                        .w(px(200.))
-                        .h(px(150.))
-                        .bg(rgb(colors::BG_SELECTED))
-                        .rounded(px(layout::RADIUS_SMALL))
-                        .cursor_pointer()
-                        .flex()
-                        .justify_center()
-                        .items_center()
-                        .child(
-                            div()
-                                .text_color(rgb(colors::TEXT_SECONDARY))
-                                .child("[Image] Tap to download"),
-                        )
-                        .on_click(move |_, _window, cx| {
-                            let msg_id = message_id.clone();
-                            let dl = dl.clone();
-                            entity.update(cx, |app, cx| {
-                                app.download_image(msg_id, dl, cx);
-                            });
-                        }),
-                )
+                el.child(render_download_placeholder(
+                    "img-dl",
+                    "[Image] Tap to download",
+                    message_id,
+                    dl,
+                    entity,
+                    display_w,
+                    display_h,
+                ))
             } else {
-                el.child(render_media_placeholder("[Image]", 200.0, 150.0))
+                el.child(render_media_placeholder("[Image]", display_w, display_h))
             }
         }
         MediaType::Sticker => {
@@ -275,33 +281,17 @@ fn render_media_content(
             } else if let Some(dl) = media_content.downloadable.clone() {
                 // Hydrated stickers (and failed eager downloads without a
                 // thumbnail) carry only metadata: fetch on tap like images.
-                let placeholder_id: SharedString = format!("sticker-dl-{}", message_id).into();
-                el.child(
-                    div()
-                        .id(placeholder_id)
-                        .w(px(150.))
-                        .h(px(150.))
-                        .bg(rgb(colors::BG_SELECTED))
-                        .rounded(px(layout::RADIUS_SMALL))
-                        .cursor_pointer()
-                        .flex()
-                        .justify_center()
-                        .items_center()
-                        .child(
-                            div()
-                                .text_color(rgb(colors::TEXT_SECONDARY))
-                                .child("[Sticker] Tap to download"),
-                        )
-                        .on_click(move |_, _window, cx| {
-                            let msg_id = message_id.clone();
-                            let dl = dl.clone();
-                            entity.update(cx, |app, cx| {
-                                app.download_image(msg_id, dl, cx);
-                            });
-                        }),
-                )
+                el.child(render_download_placeholder(
+                    "sticker-dl",
+                    "[Sticker] Tap to download",
+                    message_id,
+                    dl,
+                    entity,
+                    display_w,
+                    display_h,
+                ))
             } else {
-                el.child(render_media_placeholder("[Sticker]", 150.0, 150.0))
+                el.child(render_media_placeholder("[Sticker]", display_w, display_h))
             }
         }
         MediaType::Video => el.child(render_video_player(
@@ -320,6 +310,38 @@ fn render_media_content(
         )),
         MediaType::Document => el.child(render_document_placeholder()),
     }
+}
+
+/// Tap-to-download placeholder for media whose bytes aren't local yet, sized
+/// like the real media so virtual-list row heights don't jump on arrival.
+fn render_download_placeholder(
+    id_prefix: &str,
+    label: &'static str,
+    message_id: String,
+    dl: DownloadableMedia,
+    entity: Entity<WhatsAppApp>,
+    width: f32,
+    height: f32,
+) -> impl IntoElement {
+    let placeholder_id: SharedString = format!("{id_prefix}-{message_id}").into();
+    div()
+        .id(placeholder_id)
+        .w(px(width))
+        .h(px(height))
+        .bg(rgb(colors::BG_SELECTED))
+        .rounded(px(layout::RADIUS_SMALL))
+        .cursor_pointer()
+        .flex()
+        .justify_center()
+        .items_center()
+        .child(div().text_color(rgb(colors::TEXT_SECONDARY)).child(label))
+        .on_click(move |_, _window, cx| {
+            let msg_id = message_id.clone();
+            let dl = dl.clone();
+            entity.update(cx, |app, cx| {
+                app.download_image(msg_id, dl, cx);
+            });
+        })
 }
 
 fn render_media_placeholder(text: &'static str, width: f32, height: f32) -> impl IntoElement {

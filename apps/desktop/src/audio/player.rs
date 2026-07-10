@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Stream, StreamConfig};
+use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 use log::{error, info, warn};
 use ogg::reading::PacketReader;
 use opus::{Channels, Decoder as OpusDecoder};
@@ -96,32 +96,39 @@ impl AudioPlayer {
                 .unwrap_or_default()
         );
 
-        // The callback writes f32 samples, so only F32 configs are usable.
+        // Prefer F32 (native to our samples), but any format the device
+        // offers works: the callback converts per sample, so i16/u16-only
+        // devices still play.
         let supported_configs: Vec<_> = device
             .supported_output_configs()
             .map_err(|e| PlayerError::DeviceError(e.to_string()))?
-            .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
             .collect();
 
-        if supported_configs.is_empty() {
-            return Err(PlayerError::NoSupportedConfig);
-        }
-
-        let config: StreamConfig = supported_configs
+        let supports_48k = |c: &cpal::SupportedStreamConfigRange| {
+            c.min_sample_rate() <= 48000 && c.max_sample_rate() >= 48000
+        };
+        let is_f32 = |c: &cpal::SupportedStreamConfigRange| c.sample_format() == SampleFormat::F32;
+        let chosen = supported_configs
             .iter()
-            .find(|c| c.min_sample_rate() <= 48000 && c.max_sample_rate() >= 48000)
-            .map(|c| c.with_sample_rate(48000))
-            .unwrap_or_else(|| {
-                let first = &supported_configs[0];
-                first.with_sample_rate(first.min_sample_rate())
-            })
-            .into();
+            .find(|c| is_f32(c) && supports_48k(c))
+            .or_else(|| supported_configs.iter().find(|c| is_f32(c)))
+            .or_else(|| supported_configs.iter().find(|c| supports_48k(c)))
+            .or_else(|| supported_configs.first())
+            .ok_or(PlayerError::NoSupportedConfig)?;
+
+        let sample_format = chosen.sample_format();
+        let config: StreamConfig = if supports_48k(chosen) {
+            chosen.with_sample_rate(48000)
+        } else {
+            chosen.with_sample_rate(chosen.min_sample_rate())
+        }
+        .into();
         self.sample_rate = config.sample_rate;
         let output_channels = config.channels as usize;
 
         info!(
-            "Output config: {} Hz, {} channels",
-            config.sample_rate, output_channels
+            "Output config: {} Hz, {} channels, {:?}",
+            config.sample_rate, output_channels, sample_format
         );
 
         let resampled =
@@ -136,39 +143,36 @@ impl AudioPlayer {
         let completion_tx: Arc<Mutex<Option<oneshot::Sender<()>>>> =
             Arc::new(Mutex::new(self.completion_tx.take()));
         let audio_data = Arc::new(resampled);
-        let audio_data_clone = audio_data.clone();
 
-        let stream = device
-            .build_output_stream(
+        let stream = match sample_format {
+            SampleFormat::F32 => build_stream::<f32>(
+                &device,
                 config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut pos = position.load(Ordering::Relaxed);
-                    let audio = &audio_data_clone;
-
-                    for sample in data.iter_mut() {
-                        if pos < audio.len() {
-                            *sample = audio[pos];
-                            pos += 1;
-                        } else {
-                            *sample = 0.0;
-                            // Mark as done and notify completion (only once)
-                            if is_playing.swap(false, Ordering::Relaxed)
-                                && let Ok(mut guard) = completion_tx.lock()
-                                && let Some(tx) = guard.take()
-                            {
-                                let _ = tx.send(());
-                            }
-                        }
-                    }
-
-                    position.store(pos, Ordering::Relaxed);
-                },
-                move |err| {
-                    error!("Audio output error: {}", err);
-                },
-                None,
-            )
-            .map_err(|e| PlayerError::StreamError(e.to_string()))?;
+                audio_data,
+                position,
+                is_playing,
+                completion_tx,
+            ),
+            SampleFormat::I16 => build_stream::<i16>(
+                &device,
+                config,
+                audio_data,
+                position,
+                is_playing,
+                completion_tx,
+            ),
+            SampleFormat::U16 => build_stream::<u16>(
+                &device,
+                config,
+                audio_data,
+                position,
+                is_playing,
+                completion_tx,
+            ),
+            other => Err(PlayerError::StreamError(format!(
+                "unsupported output sample format {other:?}"
+            ))),
+        }?;
 
         stream
             .play()
@@ -201,6 +205,50 @@ impl AudioPlayer {
             self.is_playing.store(true, Ordering::Relaxed);
         }
     }
+}
+
+/// Build the output stream for the device's sample format, converting our
+/// f32 samples in the callback (same dispatch as call_device's speaker path).
+fn build_stream<T: SizedSample + FromSample<f32>>(
+    device: &cpal::Device,
+    config: StreamConfig,
+    audio: Arc<Vec<f32>>,
+    position: Arc<AtomicUsize>,
+    is_playing: Arc<AtomicBool>,
+    completion_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+) -> Result<Stream, PlayerError> {
+    device
+        .build_output_stream(
+            config,
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                let mut pos = position.load(Ordering::Relaxed);
+
+                for sample in data.iter_mut() {
+                    let s = if pos < audio.len() {
+                        let s = audio[pos];
+                        pos += 1;
+                        s
+                    } else {
+                        // Mark as done and notify completion (only once)
+                        if is_playing.swap(false, Ordering::Relaxed)
+                            && let Ok(mut guard) = completion_tx.lock()
+                            && let Some(tx) = guard.take()
+                        {
+                            let _ = tx.send(());
+                        }
+                        0.0
+                    };
+                    *sample = T::from_sample(s);
+                }
+
+                position.store(pos, Ordering::Relaxed);
+            },
+            move |err| {
+                error!("Audio output error: {}", err);
+            },
+            None,
+        )
+        .map_err(|e| PlayerError::StreamError(e.to_string()))
 }
 
 fn decode_ogg(ogg_data: &[u8]) -> Result<Vec<f32>, PlayerError> {
