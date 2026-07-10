@@ -29,7 +29,11 @@ impl CallState {
     /// Set an incoming call
     pub fn set_incoming(&mut self, call: IncomingCall) {
         if let Some(prev) = &self.incoming {
-            log::warn!("replacing incoming call {} with {}", prev.call_id, call.call_id);
+            log::warn!(
+                "replacing incoming call {} with {}",
+                prev.call_id,
+                call.call_id
+            );
         }
         self.incoming = Some(call);
     }
@@ -69,7 +73,11 @@ impl CallState {
     /// Set an outgoing call
     pub fn set_outgoing(&mut self, call: OutgoingCall) {
         if let Some(prev) = &self.outgoing {
-            log::warn!("replacing outgoing call {} with {}", prev.call_id, call.call_id);
+            log::warn!(
+                "replacing outgoing call {} with {}",
+                prev.call_id,
+                call.call_id
+            );
         }
         self.outgoing = Some(call);
     }
