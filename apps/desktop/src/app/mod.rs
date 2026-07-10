@@ -744,6 +744,13 @@ impl WhatsAppApp {
             self.client.send_read_receipts(&jid, unread_messages);
         }
 
+        // A manual-unread badge is the store's -1 sentinel, cleared only by a
+        // MarkChatAsRead action; receipts alone would let it come back on the
+        // next history reload.
+        if self.find_chat(&jid).is_some_and(|c| c.manually_unread) {
+            self.client.mark_chat_read(&jid);
+        }
+
         // Mark as read locally
         if let Some(chat) = self.find_chat_mut(&jid) {
             chat.mark_as_read();

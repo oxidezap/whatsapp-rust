@@ -12,6 +12,14 @@ use crate::theme::colors;
 
 use super::Avatar;
 
+/// Only plain PN/LID user JIDs can receive a call (not groups, broadcast
+/// lists, status or newsletters).
+fn is_callable_user(jid: &str) -> bool {
+    jid.parse::<wacore_binary::jid::Jid>()
+        .map(|j| j.is_pn() || j.is_lid())
+        .unwrap_or(false)
+}
+
 pub fn render_chat_header(
     chat: &Chat,
     entity: Entity<WhatsAppApp>,
@@ -74,21 +82,26 @@ pub fn render_chat_header(
                         .child(name),
                 ),
         )
-        // Calls are 1:1 only; never offer them for group chats. No video
-        // button: the VoIP facade only does audio, and offering "video" while
-        // placing a voice call misleads both sides.
-        .when(layout.show_call_buttons() && !chat.is_group, |el| {
-            el.child(
-                div().flex().items_center().gap_2().child(
-                    Button::new("audio-call")
-                        .label("Call")
-                        .outline()
-                        .small()
-                        .on_click(move |_, _window, cx| {
-                            audio_call_entity
-                                .update(cx, |app, cx| app.start_call(audio_jid.clone(), false, cx));
-                        }),
-                ),
-            )
-        })
+        // Calls are 1:1 only: gate on a parsed PN/LID user JID, since
+        // !is_group alone would still offer calls to status/broadcast and
+        // newsletter rows. No video button: the VoIP facade only does audio,
+        // and offering "video" while placing a voice call misleads both sides.
+        .when(
+            layout.show_call_buttons() && is_callable_user(&chat.jid),
+            |el| {
+                el.child(
+                    div().flex().items_center().gap_2().child(
+                        Button::new("audio-call")
+                            .label("Call")
+                            .outline()
+                            .small()
+                            .on_click(move |_, _window, cx| {
+                                audio_call_entity.update(cx, |app, cx| {
+                                    app.start_call(audio_jid.clone(), false, cx)
+                                });
+                            }),
+                    ),
+                )
+            },
+        )
 }

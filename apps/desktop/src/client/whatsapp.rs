@@ -1139,6 +1139,39 @@ impl WhatsAppClient {
         });
     }
 
+    /// Durably clear a manual-unread mark. The store's `-1` sentinel is only
+    /// cleared by a MarkChatAsRead app-state action (echoed back through the
+    /// event stream), never by message receipts — without this the badge
+    /// would come back on the next history reload.
+    pub fn mark_chat_read(&self, chat_jid_str: &str) {
+        let client_handle = self.client_handle.clone();
+        let chat_jid_str = chat_jid_str.to_string();
+        let runtime = self.runtime.clone();
+
+        std::thread::spawn(move || {
+            runtime.block_on(async move {
+                let chat_jid: Jid = match chat_jid_str.parse() {
+                    Ok(j) => j,
+                    Err(e) => {
+                        error!("Invalid chat JID '{}': {}", chat_jid_str, e);
+                        return;
+                    }
+                };
+                let Some(client) = client_handle.lock().await.clone() else {
+                    error!("Client not available for marking chat read");
+                    return;
+                };
+                if let Err(e) = client
+                    .chat_actions()
+                    .mark_chat_as_read(&chat_jid, true, None)
+                    .await
+                {
+                    warn!("Failed to mark chat {} as read: {}", chat_jid, e);
+                }
+            });
+        });
+    }
+
     /// Accept an incoming call: signaling, callKey decrypt, relay connect and
     /// the audio engine are all inside `client.voip().accept(..)`; this side
     /// only supplies the cpal mic/speaker bridge.
