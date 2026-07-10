@@ -292,6 +292,23 @@ impl Client {
     async fn ensure_sessions_inner(&self, jids: Vec<Jid>) -> Result<()> {
         use wacore::types::jid::JidExt;
 
+        // Warm-cache pre-filter: a cached session answers synchronously, so
+        // the common live-send case skips the probe-stream machinery below
+        // entirely. Contended or unknown entries fall through to the probe.
+        let jids: Vec<Jid> = jids
+            .into_iter()
+            .filter(|jid| {
+                !matches!(
+                    self.signal_cache
+                        .try_has_session(&jid.to_protocol_address()),
+                    Some(true)
+                )
+            })
+            .collect();
+        if jids.is_empty() {
+            return Ok(());
+        }
+
         let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         // Probe sessions concurrently: a cold-cache multi-recipient ensure would

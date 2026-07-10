@@ -28,7 +28,9 @@ impl Client {
             self.resolve_sent_node_waiters(&Arc::new(node.clone()));
         }
 
-        let plaintext_buf = wacore_binary::marshal::marshal_auto(&node).map_err(|e| {
+        // Exact two-pass sizing: typical stanzas are a few hundred bytes, so
+        // the 1 KiB default reserve of the one-pass path mostly over-allocates.
+        let plaintext_buf = wacore_binary::marshal::marshal_exact(&node).map_err(|e| {
             error!("Failed to marshal node: {e:?}");
             SocketError::Marshal(e)
         })?;

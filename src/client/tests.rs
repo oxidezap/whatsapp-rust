@@ -143,7 +143,7 @@ async fn test_ack_waiter_resolves() {
         .build();
 
     // 3. Handle the ack
-    let handled = client.handle_ack_response(&ack_node.as_node_ref()).await;
+    let handled = client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack_node)));
     assert!(
         handled,
         "handle_ack_response should return true when waiter exists"
@@ -197,7 +197,7 @@ async fn test_ack_without_matching_waiter() {
         .build();
 
     // Should return false since there's no waiter
-    let handled = client.handle_ack_response(&ack_node.as_node_ref()).await;
+    let handled = client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack_node)));
     assert!(
         !handled,
         "handle_ack_response should return false when no waiter exists"
@@ -206,6 +206,80 @@ async fn test_ack_without_matching_waiter() {
     info!(
         "✅ test_ack_without_matching_waiter passed: ACK without matching waiter handled gracefully"
     );
+}
+
+/// Round-trip a built `Node` into the raw-bytes shape `unpack()` produces
+/// from the network (marshal_ref prepends a 0x00 format byte that
+/// `OwnedNodeRef::new` does not expect).
+fn to_owned_node(node: &Node) -> wacore_binary::OwnedNodeRef {
+    wacore_binary::marshal::marshal_ref(&node.as_node_ref())
+        .and_then(|buf| wacore_binary::OwnedNodeRef::new(bytes::Bytes::from(buf).slice(1..)))
+        .expect("valid node")
+}
+
+fn owned_ack_node(id: &str) -> wacore_binary::OwnedNodeRef {
+    to_owned_node(
+        &NodeBuilder::new("ack")
+            .attr("id", id)
+            .attr("from", SERVER_JID)
+            .build(),
+    )
+}
+
+/// The Arc entry point must hand the waiter the SAME allocation it was given
+/// (no re-encode + re-parse round trip).
+#[tokio::test]
+async fn ack_arc_delivery_shares_allocation() {
+    let client = crate::test_utils::create_test_client().await;
+
+    let test_id = "ack-arc-456";
+    let (tx, rx) = oneshot::channel();
+    client
+        .response_waiters_guard()
+        .insert(test_id.to_string(), tx);
+
+    let node = Arc::new(owned_ack_node(test_id));
+    assert!(client.handle_ack_response_arc(&node));
+
+    let received = tokio::time::timeout(Duration::from_secs(1), rx)
+        .await
+        .expect("waiter should resolve")
+        .expect("sender must not drop");
+    assert!(
+        Arc::ptr_eq(&received, &node),
+        "waiter must receive the original allocation, not a re-encoded copy"
+    );
+
+    // No waiter: must report unhandled without consuming anything.
+    assert!(!client.handle_ack_response_arc(&Arc::new(owned_ack_node("ack-arc-none"))));
+}
+
+/// The owned entry point (read-loop fast path) resolves the waiter from the
+/// node it already owns.
+#[tokio::test]
+async fn ack_owned_delivery_resolves_waiter() {
+    let client = crate::test_utils::create_test_client().await;
+
+    let test_id = "ack-owned-789";
+    let (tx, rx) = oneshot::channel();
+    client
+        .response_waiters_guard()
+        .insert(test_id.to_string(), tx);
+
+    assert!(client.handle_ack_response_owned(owned_ack_node(test_id)));
+    let received = tokio::time::timeout(Duration::from_secs(1), rx)
+        .await
+        .expect("waiter should resolve")
+        .expect("sender must not drop");
+    assert!(
+        received
+            .get()
+            .get_attr("id")
+            .is_some_and(|v| v.as_str() == test_id),
+        "delivered node must carry the ack id"
+    );
+
+    assert!(!client.handle_ack_response_owned(owned_ack_node("ack-owned-none")));
 }
 
 /// Every server `<ack>` with an id dispatches an observe-only
@@ -229,7 +303,7 @@ async fn test_ack_dispatches_server_ack_event() {
         .attr("from", "123456789@s.whatsapp.net")
         .attr("t", "1720000000")
         .build();
-    client.handle_ack_response(&ack_node.as_node_ref()).await;
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack_node)));
     assert!(
         collector.events().iter().any(|e| matches!(
             e.as_ref(),
@@ -249,7 +323,7 @@ async fn test_ack_dispatches_server_ack_event() {
         .attr("error", "479")
         .attr("from", SERVER_JID)
         .build();
-    client.handle_ack_response(&nack_node.as_node_ref()).await;
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&nack_node)));
     assert!(
         collector.events().iter().any(|e| matches!(
             e.as_ref(),
@@ -264,7 +338,7 @@ async fn test_ack_dispatches_server_ack_event() {
 
     // An ack without an id (e.g. non-message acks) dispatches nothing.
     let anon_ack = NodeBuilder::new("ack").attr("from", SERVER_JID).build();
-    client.handle_ack_response(&anon_ack.as_node_ref()).await;
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&anon_ack)));
     assert_eq!(
         collector
             .events()
@@ -287,7 +361,7 @@ async fn test_ack_dispatches_server_ack_event() {
         .attr("class", "message")
         .attr("from", SERVER_JID)
         .build();
-    let handled = client.handle_ack_response(&waited_ack.as_node_ref()).await;
+    let handled = client.handle_ack_response_arc(&Arc::new(to_owned_node(&waited_ack)));
     assert!(handled, "waiter for the id should have been resolved");
     let resolved = tokio::time::timeout(Duration::from_secs(1), rx)
         .await
@@ -905,6 +979,39 @@ async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
     );
 
     info!("✅ test_ensure_e2e_sessions_waits_for_offline_sync passed");
+}
+
+/// A warm session cache must satisfy the ensure without any network fetch:
+/// the client here is disconnected, so reaching the usync fetch would error.
+#[tokio::test]
+async fn ensure_sessions_warm_cache_short_circuits() {
+    use wacore::types::jid::JidExt;
+    let client = crate::test_utils::create_test_client().await;
+    let jid: Jid = "15550005555@s.whatsapp.net".parse().unwrap();
+
+    // Cold cache and disconnected: the probe misses, so the fetch runs and
+    // fails — proves the pre-filter does not silently skip unknown sessions.
+    assert!(
+        client
+            .ensure_e2e_sessions_resolved(std::slice::from_ref(&jid))
+            .await
+            .is_err(),
+        "unknown session must still attempt the fetch"
+    );
+
+    assert!(
+        client
+            .signal_cache
+            .try_put_session(
+                &jid.to_protocol_address(),
+                wacore::libsignal::protocol::SessionRecord::new_fresh(),
+            )
+            .is_ok()
+    );
+    client
+        .ensure_e2e_sessions_resolved(&[jid])
+        .await
+        .expect("cached session must satisfy ensure without network");
 }
 
 /// Integration test: Verify that the immediate session establishment does NOT
@@ -3177,11 +3284,7 @@ mod counting_alloc {
 async fn ack_miss_path_does_not_heap_allocate() {
     let client = crate::test_utils::create_test_client().await;
 
-    let ack_node = NodeBuilder::new("ack")
-        .attr("id", "3EB0A9252A8F12B7E2")
-        .attr("from", SERVER_JID)
-        .build();
-    let node_ref = ack_node.as_node_ref();
+    let node = Arc::new(owned_ack_node("3EB0A9252A8F12B7E2"));
 
     // Min-delta over many windows: sibling tests share the process-global
     // counter, but their allocations are sporadic. A per-call String shows up
@@ -3189,7 +3292,7 @@ async fn ack_miss_path_does_not_heap_allocate() {
     let mut min_delta = u64::MAX;
     for _ in 0..100 {
         let before = counting_alloc::ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
-        let handled = client.handle_ack_response(&node_ref).await;
+        let handled = client.handle_ack_response_arc(&node);
         let after = counting_alloc::ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(!handled, "no waiter is registered for this id");
         min_delta = min_delta.min(after - before);

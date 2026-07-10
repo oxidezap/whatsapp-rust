@@ -309,7 +309,7 @@ impl Client {
         {
             use wacore::xml::DisplayableNodeRef;
             debug!(target: "Client/Recv", "{}", DisplayableNodeRef(node.get()));
-            self.handle_ack_response_inline(node.get());
+            self.handle_ack_response_owned(node);
             return;
         }
 
@@ -471,7 +471,7 @@ impl Client {
         // retaining router registration for direct router callers.
         let handled = match nr.tag.as_ref() {
             "ack" => {
-                self.handle_ack_response_inline(nr);
+                self.handle_ack_response_arc(&node);
                 true
             }
             "receipt" => {
@@ -1140,19 +1140,49 @@ impl Client {
         })).detach();
     }
 
-    /// Handles incoming `<ack/>` stanzas by resolving pending response waiters.
-    ///
-    /// If an ack with an ID that matches a pending task in `response_waiters`,
-    /// the task is resolved and the function returns `true`. Otherwise, returns `false`.
-    pub(crate) async fn handle_ack_response(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
-        self.handle_ack_response_inline(node)
+    /// Ack entry point for callers that already share the node: the waiter
+    /// receives an `Arc` clone instead of a ~1 KB re-encode + re-parse.
+    pub(crate) fn handle_ack_response_arc(&self, node: &Arc<wacore_binary::OwnedNodeRef>) -> bool {
+        let Some(waiter) = self.take_ack_waiter(node.get()) else {
+            return false;
+        };
+        if let Err(rejected) = waiter.send(Arc::clone(node)) {
+            warn!(
+                target: "Client/Ack",
+                "Failed to send ACK response to waiter for ID {:?}. Receiver was likely dropped.",
+                rejected.get().get_attr("id")
+            );
+        }
+        true
     }
 
+    /// Ack entry point for the read-loop fast path, which owns the node: the
+    /// `Arc` is built from the existing allocation, and only when a waiter is
+    /// actually waiting.
+    pub(crate) fn handle_ack_response_owned(&self, node: wacore_binary::OwnedNodeRef) -> bool {
+        let Some(waiter) = self.take_ack_waiter(node.get()) else {
+            return false;
+        };
+        if let Err(rejected) = waiter.send(Arc::new(node)) {
+            warn!(
+                target: "Client/Ack",
+                "Failed to send ACK response to waiter for ID {:?}. Receiver was likely dropped.",
+                rejected.get().get_attr("id")
+            );
+        }
+        true
+    }
+
+    /// Shared ack prologue: log nack codes, dispatch `ServerAck` when
+    /// observed, and pull the matching response waiter out of the map.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.conn.ack_response", level = "debug", skip_all)
     )]
-    pub(crate) fn handle_ack_response_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+    fn take_ack_waiter(
+        &self,
+        node: &wacore_binary::NodeRef<'_>,
+    ) -> Option<futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>> {
         let ack_id = node.get_attr("id");
         let ack_error = node.get_attr("error");
 
@@ -1215,28 +1245,8 @@ impl Client {
                 .dispatch(wacore::types::events::Event::ServerAck(ack));
         }
 
-        if let Some(id) = ack_id.map(|v| v.as_str())
-            && let Some(waiter) = self.response_waiters_guard().remove(id.as_ref())
-        {
-            // ACK responses are infrequent; re-encode into OwnedNodeRef for the channel.
-            // marshal_ref prepends a leading 0x00 format byte; OwnedNodeRef::new expects raw
-            // protocol bytes without it, matching what unpack() produces from the network.
-            // slice(1..) drops that byte as a zero-copy view instead of re-allocating.
-            match wacore_binary::marshal::marshal_ref(node).and_then(|buf| {
-                wacore_binary::OwnedNodeRef::new(bytes::Bytes::from(buf).slice(1..))
-            }) {
-                Ok(onr) => {
-                    if waiter.send(Arc::new(onr)).is_err() {
-                        warn!(target: "Client/Ack", "Failed to send ACK response to waiter for ID {id}. Receiver was likely dropped.");
-                    }
-                }
-                Err(e) => {
-                    warn!(target: "Client/Ack", "Failed to re-encode ACK node for waiter: {e}");
-                }
-            }
-            return true;
-        }
-        false
+        let id = ack_id.map(|v| v.as_str())?;
+        self.response_waiters_guard().remove(id.as_ref())
     }
 
     #[cfg_attr(
