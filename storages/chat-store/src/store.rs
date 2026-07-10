@@ -552,16 +552,19 @@ fn apply_writer_msg(
             let chat_str = chat.to_string();
             // Same guard as the nack path: a row past PENDING already got its
             // positive answer, so a late local failure must not regress it.
-            diesel::update(
-                message_row(device_id, &chat_str, msg_id).filter(
+            let updated =
+                diesel::update(message_row(device_id, &chat_str, msg_id).filter(
                     schema::messages::from_me.eq(true).and(
                         schema::messages::status.eq(wa::web_message_info::Status::PENDING as i32),
                     ),
-                ),
-            )
-            .set(schema::messages::status.eq(wa::web_message_info::Status::ERROR as i32))
-            .execute(conn)?;
-            cs.message_chats.insert(chat_str);
+                ))
+                .set(schema::messages::status.eq(wa::web_message_info::Status::ERROR as i32))
+                .execute(conn)?;
+            // A no-op update (row already acked, or unknown id) must not
+            // broadcast an invalidation and re-hydrate the UI for nothing.
+            if updated > 0 {
+                cs.message_chats.insert(chat_str);
+            }
             Ok(())
         }
         WriterMsg::Flush(_) => Ok(()),
