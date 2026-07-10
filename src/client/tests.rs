@@ -2901,15 +2901,22 @@ async fn delivery_receipt_dropped_when_flush_scope_closed() {
         0,
         "closed scope must not track new receipts"
     );
-    let start = wacore::time::Instant::now();
-    client
-        .outbound_flush
-        .flush(&*client.runtime, Duration::from_secs(5))
-        .await;
+    // The drop happens before the queue: with the scope closed nothing may be
+    // enqueued, so the lazy worker queue is never even created.
     assert!(
-        start.elapsed() < Duration::from_millis(200),
-        "flush must return immediately when nothing was queued"
+        client.delivery_receipt_queue.get().is_none(),
+        "a dropped receipt must not reach the worker queue"
     );
+    // Finishing well under the 5s flush timeout proves nothing was tracked;
+    // the generous bound keeps this stable on oversubscribed CI runners.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .outbound_flush
+            .flush(&*client.runtime, Duration::from_secs(5)),
+    )
+    .await
+    .expect("flush must not wait when nothing was queued");
 }
 
 /// Issue #571 under the worker model: `flush()` must wait for receipts that
