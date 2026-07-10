@@ -23,6 +23,44 @@ use crate::state::{
 };
 use wacore::download::MediaType as DownloadMediaType;
 
+/// Resolve a stable per-user path for the SQLite database. A CWD-relative
+/// path would silently split state between launch methods (desktop launcher
+/// vs terminal), so prefer the platform data dir and only fall back to the
+/// working directory when no home is known.
+fn resolve_database_path() -> String {
+    const DB_FILE: &str = "whatsapp.db";
+
+    let not_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(std::path::PathBuf::from(v));
+    let data_root = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .and_then(not_empty)
+            .map(|home| home.join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .and_then(not_empty)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .and_then(not_empty)
+                    .map(|home| home.join(".local/share"))
+            })
+    };
+
+    let Some(dir) = data_root.map(|root| root.join("whatsapp-rust-desktop")) else {
+        warn!("No home directory found; using CWD-relative {DB_FILE}");
+        return DB_FILE.to_string();
+    };
+    // SQLite won't create missing parent directories itself.
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(
+            "Failed to create data dir {}: {e}; using CWD-relative {DB_FILE}",
+            dir.display()
+        );
+        return DB_FILE.to_string();
+    }
+
+    dir.join(DB_FILE).to_string_lossy().into_owned()
+}
+
 /// Helper struct for building DownloadableMedia from common message fields
 struct DownloadableBuilder<'a> {
     direct_path: Option<&'a str>,
@@ -170,7 +208,9 @@ impl WhatsAppClient {
     ) {
         // Device store + durable chat history share one SQLite file (one pool,
         // one WAL writer).
-        let backend = match SqliteStore::new("whatsapp.db").await {
+        let db_path = resolve_database_path();
+        info!("Using database at {}", db_path);
+        let backend = match SqliteStore::new(&db_path).await {
             Ok(store) => store,
             Err(e) => {
                 error!("Failed to create SQLite backend: {}", e);

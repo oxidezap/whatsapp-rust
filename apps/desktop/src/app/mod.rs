@@ -1023,6 +1023,9 @@ impl WhatsAppApp {
     fn stop_current_media(&mut self) {
         self.audio_player.stop();
         self.audio_owner = None;
+        // An in-flight lazy download for the stopped media must not autoplay
+        // when it completes; user-initiated requests re-set this after the stop.
+        self.pending_media_request = None;
 
         if let ActiveMedia::Video { message_id } = &self.active_media {
             if let Some(player) = self.video_players.get_mut(message_id) {
@@ -1281,11 +1284,23 @@ impl WhatsAppApp {
 
                 let (needs_audio, audio_data) =
                     if let Some(player) = self.video_players.get_mut(&message_id) {
+                        let resume_pos = player.current_time();
                         let needs = player.play();
                         let data = if needs {
                             player
                                 .get_audio()
                                 .map(|a| (a.samples.clone(), a.sample_rate))
+                        } else if !owns_audio {
+                            // Another media's start stole the paused sink, so a
+                            // plain resume() would leave this video silent;
+                            // re-feed its audio from the pause position
+                            // (samples are mono, so offset is seconds * rate).
+                            player.get_audio().map(|a| {
+                                let offset = ((resume_pos.as_secs_f64() * a.sample_rate as f64)
+                                    as usize)
+                                    .min(a.samples.len());
+                                (a.samples[offset..].to_vec(), a.sample_rate)
+                            })
                         } else {
                             None
                         };
