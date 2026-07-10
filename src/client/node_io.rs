@@ -1147,11 +1147,7 @@ impl Client {
             return false;
         };
         if let Err(rejected) = waiter.send(Arc::clone(node)) {
-            warn!(
-                target: "Client/Ack",
-                "Failed to send ACK response to waiter for ID {:?}. Receiver was likely dropped.",
-                rejected.get().get_attr("id")
-            );
+            Self::warn_ack_waiter_dropped(&rejected);
         }
         true
     }
@@ -1164,13 +1160,17 @@ impl Client {
             return false;
         };
         if let Err(rejected) = waiter.send(Arc::new(node)) {
-            warn!(
-                target: "Client/Ack",
-                "Failed to send ACK response to waiter for ID {:?}. Receiver was likely dropped.",
-                rejected.get().get_attr("id")
-            );
+            Self::warn_ack_waiter_dropped(&rejected);
         }
         true
+    }
+
+    fn warn_ack_waiter_dropped(rejected: &Arc<wacore_binary::OwnedNodeRef>) {
+        warn!(
+            target: "Client/Ack",
+            "Failed to send ACK response to waiter for ID {:?}. Receiver was likely dropped.",
+            rejected.get().get_attr("id")
+        );
     }
 
     /// Shared ack prologue: log nack codes, dispatch `ServerAck` when
