@@ -70,6 +70,9 @@ pub struct CallRegistry {
     pending: Arc<Mutex<HashMap<String, Arc<WaIncomingCall>>>>,
     /// Media-live calls by call id.
     active: Arc<Mutex<HashMap<String, Arc<CallHandle>>>>,
+    /// Ids cancelled before any handle existed (the UI's placeholder id while
+    /// start_call is still connecting); start_call hangs these up on arrival.
+    cancelled: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// WhatsApp client wrapper that manages the connection and provides
@@ -1019,7 +1022,7 @@ impl WhatsAppClient {
     /// offer send and the relay/engine lifecycle are inside
     /// `client.voip().call(..)`. Video calls are not supported by the library
     /// yet; `is_video` only shapes the UI.
-    pub fn start_call(&self, recipient_jid_str: &str, is_video: bool) {
+    pub fn start_call(&self, recipient_jid_str: &str, is_video: bool, placeholder_id: String) {
         let client_handle = self.client_handle.clone();
         let calls = self.calls.clone();
         let ui_sender = self.ui_sender.clone();
@@ -1073,6 +1076,13 @@ impl WhatsAppClient {
                 match client.voip().call(&jid).audio(mic, speaker).start().await {
                     Ok(handle) => {
                         let call_id = handle.call_id().to_string();
+                        // Cancelled while still connecting: the UI only knew
+                        // the placeholder id, so honor it here.
+                        if calls.cancelled.lock().await.remove(&placeholder_id) {
+                            info!("Outgoing call {} cancelled before start", call_id);
+                            handle.hangup().await;
+                            return;
+                        }
                         info!("Outgoing call {} to {} offered", call_id, recipient_jid);
                         let handle = Arc::new(handle);
                         calls
@@ -1108,7 +1118,10 @@ impl WhatsAppClient {
                     handle.hangup().await;
                     info!("Call {} hung up", call_id);
                 } else {
-                    debug!("cancel_call: no live handle for {}", call_id);
+                    // No handle yet (start_call still connecting under a UI
+                    // placeholder id): remember the cancel so it lands.
+                    debug!("cancel_call: no live handle for {}, deferring", call_id);
+                    calls.cancelled.lock().await.insert(call_id);
                 }
             });
         });

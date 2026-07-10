@@ -923,7 +923,7 @@ impl WhatsAppApp {
         // Create the outgoing call state
         let placeholder_call_id = format!("ui-call-{}", wacore::time::now_millis());
         let call = OutgoingCall::new(
-            placeholder_call_id,
+            placeholder_call_id.clone(),
             recipient_jid.clone(),
             recipient_name,
             is_video,
@@ -931,7 +931,8 @@ impl WhatsAppApp {
         self.call_state.set_outgoing(call);
 
         // Initiate the call through the client
-        self.client.start_call(&recipient_jid, is_video);
+        self.client
+            .start_call(&recipient_jid, is_video, placeholder_call_id);
 
         cx.notify();
     }
@@ -1588,9 +1589,13 @@ impl WhatsAppApp {
                 // Update the outgoing call with the actual call ID from CallManager
                 if self
                     .call_state
-                    .update_outgoing_call_id(&recipient_jid, call_id)
+                    .update_outgoing_call_id(&recipient_jid, call_id.clone())
                 {
                     cx.notify();
+                } else {
+                    // Popup already dismissed: the user cancelled while the
+                    // call was connecting; hang up the now-real call.
+                    self.client.cancel_call(&call_id);
                 }
             }
             UiEvent::OutgoingCallFailed {
