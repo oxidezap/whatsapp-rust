@@ -2399,6 +2399,7 @@ async fn edit_before_target_materializes_edited_content() {
     .await;
     let msg = chat_store.message(&chat, "MSG-EB").await.unwrap().unwrap();
     assert_eq!(msg.text.as_deref(), Some("fixed"));
+    assert!(msg.edited_at.is_some());
     let chats = chat_store.chats(false, 10).await.unwrap();
     assert_eq!(chats[0].last_message_preview.as_deref(), Some("fixed"));
     assert_eq!(chats[0].unread_count, 1);
@@ -2481,4 +2482,43 @@ async fn server_nack_marks_outgoing_failed() {
         .unwrap()
         .unwrap();
     assert_eq!(msg.status, MessageStatus::Read);
+
+    // ...nor one the server already accepted: the positive ack answered the
+    // stanza, so a later nack for the same id is noise.
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-ACKED",
+            &wa::Message::text("oi3"),
+            Utc.timestamp_opt(1_700_000_400, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    feed(
+        &chat_store,
+        [
+            Event::ServerAck(
+                ServerAck::builder()
+                    .id("OUT-ACKED".to_string())
+                    .class("message".to_string())
+                    .from(chat.clone())
+                    .build(),
+            ),
+            Event::ServerAck(
+                ServerAck::builder()
+                    .id("OUT-ACKED".to_string())
+                    .class("message".to_string())
+                    .from(chat.clone())
+                    .error("479".to_string())
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+    let msg = chat_store
+        .message(&chat, "OUT-ACKED")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::ServerAck);
 }

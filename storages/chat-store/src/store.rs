@@ -1324,16 +1324,16 @@ fn apply_server_ack(
     }
     use schema::messages::dsl;
     let updated = if ack.error.is_some() {
-        // Nack: the server rejected the send. Only undelivered rows fail — a
-        // stray nack must not regress a message a peer already received.
+        // Nack: the server rejected the send. Only a still-pending row fails —
+        // the server emits one ack per stanza, so a row past PENDING already
+        // got its positive answer and a stray nack must not regress it.
         diesel::update(
             dsl::messages.filter(
                 dsl::device_id
                     .eq(device_id)
                     .and(dsl::msg_id.eq(&ack.id))
                     .and(dsl::from_me.eq(true))
-                    .and(dsl::status.lt(wa::web_message_info::Status::DELIVERY_ACK as i32))
-                    .and(dsl::status.ne(wa::web_message_info::Status::ERROR as i32)),
+                    .and(dsl::status.eq(wa::web_message_info::Status::PENDING as i32)),
             ),
         )
         .set(dsl::status.eq(wa::web_message_info::Status::ERROR as i32))
