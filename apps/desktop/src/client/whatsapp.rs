@@ -1285,10 +1285,156 @@ impl WhatsAppClient {
 
 /// Convert a durable store row into the UI message model. Media stays
 /// download-on-demand (the encoded proto lives in the store if needed later).
+/// Media metadata (thumbnail + download info) from a message proto, without
+/// downloading anything. Shared by hydration; the live path additionally
+/// downloads images/stickers eagerly.
+fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
+    if let Some(sticker) = msg.sticker_message.as_option() {
+        let mime = sticker
+            .mimetype
+            .clone()
+            .unwrap_or_else(|| "image/webp".to_string());
+        let downloadable = DownloadableBuilder {
+            direct_path: sticker.direct_path.as_deref(),
+            media_key: sticker.media_key.as_deref(),
+            file_enc_sha256: sticker.file_enc_sha256.as_deref(),
+            file_length: sticker.file_length,
+            mime_type: &mime,
+            duration_secs: None,
+            download_type: DownloadMediaType::Sticker,
+        }
+        .build()?;
+        return Some(MediaContent {
+            media_type: MediaType::Sticker,
+            data: Arc::new(vec![]),
+            mime_type: mime.clone(),
+            width: sticker.width,
+            height: sticker.height,
+            caption: None,
+            downloadable: Some(downloadable),
+            is_animated: sticker.is_animated.unwrap_or(false),
+            duration_secs: None,
+        });
+    }
+    if let Some(image) = msg.image_message.as_option() {
+        let downloadable = DownloadableBuilder {
+            direct_path: image.direct_path.as_deref(),
+            media_key: image.media_key.as_deref(),
+            file_enc_sha256: image.file_enc_sha256.as_deref(),
+            file_length: image.file_length,
+            mime_type: image.mimetype.as_deref().unwrap_or("image/jpeg"),
+            duration_secs: None,
+            download_type: DownloadMediaType::Image,
+        }
+        .build();
+        let thumbnail = image
+            .jpeg_thumbnail
+            .as_ref()
+            .filter(|t| !t.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        if thumbnail.is_empty() && downloadable.is_none() {
+            return None;
+        }
+        return Some(MediaContent {
+            media_type: MediaType::Image,
+            data: Arc::new(thumbnail),
+            mime_type: "image/jpeg".to_string(),
+            width: image.width,
+            height: image.height,
+            caption: image.caption.clone(),
+            downloadable,
+            is_animated: false,
+            duration_secs: None,
+        });
+    }
+    if let Some(video) = msg.video_message.as_option() {
+        let downloadable = DownloadableBuilder {
+            direct_path: video.direct_path.as_deref(),
+            media_key: video.media_key.as_deref(),
+            file_enc_sha256: video.file_enc_sha256.as_deref(),
+            file_length: video.file_length,
+            mime_type: video.mimetype.as_deref().unwrap_or("video/mp4"),
+            duration_secs: video.seconds,
+            download_type: DownloadMediaType::Video,
+        }
+        .build();
+        let thumbnail = video
+            .jpeg_thumbnail
+            .as_ref()
+            .filter(|t| !t.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        if thumbnail.is_empty() && downloadable.is_none() {
+            return None;
+        }
+        return Some(MediaContent {
+            media_type: MediaType::Video,
+            data: Arc::new(thumbnail),
+            mime_type: "image/jpeg".to_string(),
+            width: video.width,
+            height: video.height,
+            caption: video.caption.clone(),
+            downloadable,
+            is_animated: false,
+            duration_secs: video.seconds,
+        });
+    }
+    if let Some(audio) = msg.audio_message.as_option() {
+        let mime = audio
+            .mimetype
+            .clone()
+            .unwrap_or_else(|| "audio/ogg; codecs=opus".to_string());
+        let downloadable = DownloadableBuilder {
+            direct_path: audio.direct_path.as_deref(),
+            media_key: audio.media_key.as_deref(),
+            file_enc_sha256: audio.file_enc_sha256.as_deref(),
+            file_length: audio.file_length,
+            mime_type: &mime,
+            duration_secs: audio.seconds,
+            download_type: DownloadMediaType::Audio,
+        }
+        .build()?;
+        return Some(MediaContent {
+            media_type: MediaType::Audio,
+            data: Arc::new(vec![]),
+            mime_type: mime.clone(),
+            width: None,
+            height: None,
+            caption: None,
+            downloadable: Some(downloadable),
+            is_animated: false,
+            duration_secs: audio.seconds,
+        });
+    }
+    if let Some(doc) = msg.document_message.as_option() {
+        return Some(MediaContent {
+            media_type: MediaType::Document,
+            data: Arc::new(vec![]),
+            mime_type: doc.mimetype.clone().unwrap_or_default(),
+            width: None,
+            height: None,
+            caption: doc.caption.clone(),
+            downloadable: None,
+            is_animated: false,
+            duration_secs: None,
+        });
+    }
+    None
+}
+
 fn stored_to_chat_message(stored: whatsapp_rust_chat_store::StoredMessage) -> ChatMessage {
+    // The stored proto still carries the media envelope: hydrate thumbnails +
+    // download info so historical media renders and stays fetchable, instead
+    // of degrading to a [kind] text row until a live redelivery.
+    let media = (!stored.revoked)
+        .then(|| stored.message.as_deref())
+        .flatten()
+        .and_then(|m| media_metadata(m.get_base_message()));
     let content = match (&stored.text, stored.revoked) {
         (_, true) => "[Message deleted]".to_string(),
         (Some(text), _) => text.clone(),
+        (None, _) if media.is_some() => String::new(),
         (None, _) => format!("[{}]", stored.kind.as_str()),
     };
     // Outgoing ticks come from the stored delivery status; incoming default
@@ -1311,7 +1457,7 @@ fn stored_to_chat_message(stored: whatsapp_rust_chat_store::StoredMessage) -> Ch
         timestamp: stored.timestamp,
         is_from_me: stored.from_me,
         is_read,
-        media: None,
+        media,
         reactions: std::collections::HashMap::new(),
     }
 }
