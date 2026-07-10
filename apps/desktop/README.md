@@ -12,30 +12,50 @@ A native WhatsApp client built with [GPUI](https://github.com/zed-industries/zed
 
 ## Architecture
 
-```
+```text
 apps/desktop/
 ├── src/
 │   ├── main.rs              # Entry point
-│   ├── app.rs               # WhatsAppApp struct, event handling, render logic
+│   ├── assets.rs            # Embedded asset source (icons)
+│   ├── responsive.rs        # ResponsiveLayout: window-size-aware dimensions
 │   ├── theme.rs             # Colors and layout constants
+│   ├── utils.rs             # Shared helpers (time format, media scaling, MIME)
+│   ├── app/                 # WhatsAppApp: state, event handling, render dispatch
+│   │   ├── mod.rs           # Struct, UiEvent handling, playback/recording control
+│   │   ├── calls.rs         # Call UI state (incoming/outgoing/active)
+│   │   ├── chats.rs         # Chat list cache
+│   │   ├── media/mod.rs     # Active media playback state
+│   │   └── messages.rs      # Message list cache for VirtualList
 │   ├── client/              # WhatsApp client wrapper
 │   │   ├── mod.rs
-│   │   └── whatsapp.rs      # Async client logic
+│   │   └── whatsapp.rs      # Tokio-side client, durable history, UiEvent bridge
+│   ├── audio/               # PTT + call audio
+│   │   ├── call_device.rs   # cpal mic/speaker bridge for voice calls
+│   │   ├── encoder.rs       # Opus/OGG encoding for voice notes
+│   │   ├── player.rs        # Voice note playback
+│   │   ├── recorder.rs      # PTT capture
+│   │   └── waveform.rs      # Waveform generation
+│   ├── video/               # Video message playback
+│   │   ├── audio.rs         # MP4 audio track extraction (AAC→ADTS)
+│   │   ├── player.rs        # Playback state machine
+│   │   └── streaming.rs     # H.264 decoding (openh264)
 │   ├── state/               # Application state
 │   │   ├── mod.rs
 │   │   ├── app_state.rs     # AppState enum (Loading, Connected, etc.)
 │   │   ├── chat.rs          # Chat, ChatMessage, MediaContent structs
-│   │   ├── call.rs          # IncomingCall, ActiveCall structs
+│   │   ├── call.rs          # IncomingCall, OutgoingCall, ActiveCall structs
 │   │   └── events.rs        # UiEvent enum for client->UI communication
 │   ├── components/          # Reusable UI components
 │   │   ├── mod.rs
 │   │   ├── avatar.rs        # Avatar with gpui-component
-│   │   ├── chat_header.rs   # Chat header bar
+│   │   ├── call_popup.rs    # Incoming call popup
+│   │   ├── chat_header.rs   # Chat header bar with call buttons
 │   │   ├── chat_item.rs     # Single chat in list
 │   │   ├── chat_list.rs     # Chat list sidebar with VirtualList
-│   │   ├── input_area.rs    # Message input field
+│   │   ├── input_area_view.rs # Message input + PTT recording controls
 │   │   ├── message_bubble.rs # Message bubble with media support
-│   │   └── message_list.rs  # Message list with VirtualList
+│   │   ├── message_list.rs  # Message list with VirtualList
+│   │   └── outgoing_call_popup.rs # Outgoing/active call popup
 │   └── views/               # Application views
 │       ├── mod.rs
 │       ├── loading.rs       # Loading/connecting spinner views
@@ -70,11 +90,12 @@ Application views for different states:
 - **Error** - Error message with retry button
 - **Chat** - Main connected view with sidebar and chat area
 
-### `app.rs`
+### `app/`
 Main application logic:
 - `WhatsAppApp` struct with all state
 - Event handling from WhatsApp client
 - Render dispatch based on AppState
+- Media playback and PTT recording control
 
 ## GPUI Concepts
 
@@ -144,7 +165,7 @@ div()
 
 ## Data Flow
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                         WhatsAppApp                             │
 │                                                                 │
@@ -212,24 +233,26 @@ cargo run --release -p whatsapp-desktop
 
 - [x] Basic app structure with GPUI
 - [x] Loading/Connecting views with Spinner
-- [x] Pairing view (QR code placeholder)
+- [x] Pairing view with QR code rendering
 - [x] Connected view with chat layout
 - [x] Error view with retry button
 - [x] Event handling from WhatsApp client
 - [x] Chat list with VirtualList
 - [x] Message bubbles with media support
 - [x] Image/sticker display
+- [x] Video and voice note playback
+- [x] PTT voice note recording
 - [x] Input field for messages
 - [x] Modular component architecture
-- [ ] QR code rendering
-- [ ] Call UI components
+- [x] Call UI (incoming/outgoing popups over the library's VoIP facade)
+- [x] Durable chat history (SQLite via whatsapp-rust-chat-store)
+- [x] Message sending status (pending, sent, delivered, read, failed)
 
 ## Future Improvements
 
 - [ ] Contact name resolution from address book
-- [ ] Message sending status (pending, sent, delivered, read)
 - [ ] Group chat features (participants, admin actions)
 - [ ] Settings/preferences screen
 - [ ] Notification system
-- [ ] Voice/video call integration with WebRTC
+- [ ] Video calls
 - [ ] Theme customization
