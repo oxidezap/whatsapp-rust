@@ -294,8 +294,7 @@ impl WhatsAppClient {
         // (bot.run() is what connects). The client is needed here so hydrated
         // JIDs normalize through the same PN->LID mapping live events use.
         match Self::load_history(&chat_store, &bot.client()).await {
-            Ok(chats) if !chats.is_empty() => {
-                let complete = (chats.len() as i64) < Self::HISTORY_CHAT_LIMIT;
+            Ok((chats, complete)) if !chats.is_empty() => {
                 let _ = ui_tx.send(UiEvent::HistoryLoaded { chats, complete });
             }
             Ok(_) => {}
@@ -1487,11 +1486,7 @@ impl WhatsAppClient {
                 // loaded set, so deleting/archiving the last chat elsewhere
                 // must clear the list here too.
                 match Self::load_history(&chat_store, &client).await {
-                    Ok(chats) => {
-                        // A load that filled the limit was truncated: absence
-                        // from it can just mean "fell past the window", so the
-                        // UI must not prune against it.
-                        let complete = (chats.len() as i64) < Self::HISTORY_CHAT_LIMIT;
+                    Ok((chats, complete)) => {
                         if ui_tx
                             .send(UiEvent::HistoryLoaded { chats, complete })
                             .is_err()
@@ -1508,11 +1503,15 @@ impl WhatsAppClient {
     /// Build the UI chat list from the durable store: chats in display order,
     /// each with its most recent page of messages. Media bodies are not
     /// hydrated here (the proto is in the store; download stays on demand).
+    /// The returned flag says whether this is the store's WHOLE display list;
+    /// it comes from the raw entry count, since PN/LID collapsing can shrink
+    /// a truncated fetch back under the limit.
     async fn load_history(
         chat_store: &Arc<ChatStore>,
         client: &Arc<Client>,
-    ) -> Result<Vec<crate::state::Chat>, whatsapp_rust_chat_store::ChatStoreError> {
+    ) -> Result<(Vec<crate::state::Chat>, bool), whatsapp_rust_chat_store::ChatStoreError> {
         let entries = chat_store.chats(false, Self::HISTORY_CHAT_LIMIT).await?;
+        let complete = (entries.len() as i64) < Self::HISTORY_CHAT_LIMIT;
         let mut chats: Vec<crate::state::Chat> = Vec::with_capacity(entries.len());
         // Sender-name lookups memoized across the whole load: group pages
         // repeat the same handful of senders many times over.
@@ -1610,7 +1609,7 @@ impl WhatsAppClient {
             }
             chats.push(chat);
         }
-        Ok(chats)
+        Ok((chats, complete))
     }
 
     /// Reactions live in their own table, so hydrated messages come out with
