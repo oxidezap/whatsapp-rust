@@ -1539,6 +1539,13 @@ impl WhatsAppApp {
                         Some(existing) => {
                             let jid = chat.jid.clone();
                             existing.merge_history(chat);
+                            // The open chat was read locally the moment the
+                            // message arrived; the store row commits with the
+                            // unread bump before our receipt lands, so the
+                            // hydrated counter must not resurrect the badge.
+                            if self.selected_chat.as_deref() == Some(jid.as_str()) {
+                                existing.mark_as_read();
+                            }
                             self.invalidate_message_cache(&jid);
                         }
                         None => self.chats.push(chat),
@@ -1607,10 +1614,11 @@ impl WhatsAppApp {
                 local_id,
                 message_id,
             } => {
-                if let Some(chat) = self.find_chat_mut(&chat_jid)
-                    && let Some(msg) = chat.messages.iter_mut().find(|m| m.id == local_id)
-                {
-                    msg.id = message_id;
+                if let Some(chat) = self.find_chat_mut(&chat_jid) {
+                    // Re-insert, not mutate in place: messages sort by
+                    // (timestamp, id) and the rename can reorder same-second
+                    // siblings.
+                    chat.rename_message(&local_id, &message_id);
                 }
                 self.invalidate_message_cache(&chat_jid);
                 cx.notify();

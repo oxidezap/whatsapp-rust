@@ -20,11 +20,9 @@ pub fn render_chat_header(
     let initial = chat.name.chars().next().unwrap_or('?');
     let name: SharedString = chat.name.clone().into();
     let audio_jid = chat.jid.clone();
-    let video_jid = chat.jid.clone();
 
     let back_entity = entity.clone();
-    let audio_call_entity = entity.clone();
-    let video_call_entity = entity;
+    let audio_call_entity = entity;
 
     div()
         .h(px(layout.header_height()))
@@ -76,35 +74,21 @@ pub fn render_chat_header(
                         .child(name),
                 ),
         )
-        // Calls are 1:1 only; never offer them for group chats.
+        // Calls are 1:1 only; never offer them for group chats. No video
+        // button: the VoIP facade only does audio, and offering "video" while
+        // placing a voice call misleads both sides.
         .when(layout.show_call_buttons() && !chat.is_group, |el| {
             el.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("video-call")
-                            .label("Video")
-                            .outline()
-                            .small()
-                            .on_click(move |_, _window, cx| {
-                                video_call_entity.update(cx, |app, cx| {
-                                    app.start_call(video_jid.clone(), true, cx)
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("audio-call")
-                            .label("Call")
-                            .outline()
-                            .small()
-                            .on_click(move |_, _window, cx| {
-                                audio_call_entity.update(cx, |app, cx| {
-                                    app.start_call(audio_jid.clone(), false, cx)
-                                });
-                            }),
-                    ),
+                div().flex().items_center().gap_2().child(
+                    Button::new("audio-call")
+                        .label("Call")
+                        .outline()
+                        .small()
+                        .on_click(move |_, _window, cx| {
+                            audio_call_entity
+                                .update(cx, |app, cx| app.start_call(audio_jid.clone(), false, cx));
+                        }),
+                ),
             )
         })
 }

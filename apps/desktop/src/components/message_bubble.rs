@@ -272,6 +272,34 @@ fn render_media_content(
                     display_h,
                     false,
                 ))
+            } else if let Some(dl) = media_content.downloadable.clone() {
+                // Hydrated stickers (and failed eager downloads without a
+                // thumbnail) carry only metadata: fetch on tap like images.
+                let placeholder_id: SharedString = format!("sticker-dl-{}", message_id).into();
+                el.child(
+                    div()
+                        .id(placeholder_id)
+                        .w(px(150.))
+                        .h(px(150.))
+                        .bg(rgb(colors::BG_SELECTED))
+                        .rounded(px(layout::RADIUS_SMALL))
+                        .cursor_pointer()
+                        .flex()
+                        .justify_center()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_color(rgb(colors::TEXT_SECONDARY))
+                                .child("[Sticker] Tap to download"),
+                        )
+                        .on_click(move |_, _window, cx| {
+                            let msg_id = message_id.clone();
+                            let dl = dl.clone();
+                            entity.update(cx, |app, cx| {
+                                app.download_image(msg_id, dl, cx);
+                            });
+                        }),
+                )
             } else {
                 el.child(render_media_placeholder("[Sticker]", 150.0, 150.0))
             }

@@ -391,6 +391,13 @@ impl Chat {
     /// the live one. Messages merge dedup-guarded without unread bumps; the
     /// store's counters are authoritative after a flush.
     pub fn merge_history(&mut self, hydrated: Chat) {
+        // A live-created chat starts with the JID prefix as its name; the
+        // hydrated row may be the first source carrying the real subject or
+        // contact name. Never downgrade a real name back to the placeholder.
+        let placeholder = self.jid.split('@').next().unwrap_or(&self.jid);
+        if self.name == placeholder && hydrated.name != placeholder {
+            self.name = hydrated.name;
+        }
         for msg in hydrated.messages {
             self.insert_history_message(msg);
         }
@@ -400,6 +407,19 @@ impl Chat {
             self.last_message = hydrated.last_message;
             self.last_message_time = hydrated.last_message_time;
         }
+    }
+
+    /// Rename a message (optimistic local id -> real WhatsApp id),
+    /// re-inserting so the (timestamp, id) sort invariant holds for
+    /// same-second siblings. A row already present under the new id wins.
+    pub fn rename_message(&mut self, old_id: &str, new_id: &str) -> bool {
+        let Some(pos) = self.messages.iter().position(|m| m.id == old_id) else {
+            return false;
+        };
+        let mut msg = self.messages.remove(pos);
+        msg.id = new_id.to_string();
+        self.insert_history_message(msg);
+        true
     }
 
     /// Insert a hydrated message in order, skipping duplicates, without
@@ -539,6 +559,43 @@ mod tests {
         assert_eq!(chat.messages[0].id, "a");
         assert_eq!(chat.messages[1].id, "b");
         assert_eq!(chat.messages[2].id, "c");
+    }
+
+    #[test]
+    fn test_rename_message_keeps_same_second_sort_order() {
+        let mut chat = Chat::new("test@s.whatsapp.net".to_string());
+
+        chat.add_message(make_message("3EB0BBB", 1000));
+        chat.add_message(make_message("local_1000_0", 1000));
+        // 'l' > '3', so the optimistic bubble sits after its sibling
+        assert_eq!(chat.messages[1].id, "local_1000_0");
+
+        assert!(chat.rename_message("local_1000_0", "3EB0AAA"));
+        // The real id sorts before the sibling; a plain in-place rename
+        // would have left the vector mis-sorted for binary_search_by
+        assert_eq!(chat.messages[0].id, "3EB0AAA");
+        assert_eq!(chat.messages[1].id, "3EB0BBB");
+
+        // A later same-second insert still lands in the right slot
+        chat.add_message(make_message("3EB0AB0", 1000));
+        let ids: Vec<_> = chat.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["3EB0AAA", "3EB0AB0", "3EB0BBB"]);
+    }
+
+    #[test]
+    fn test_rename_message_dedups_against_existing_real_id() {
+        let mut chat = Chat::new("test@s.whatsapp.net".to_string());
+
+        chat.add_message(make_message("3EB0AAA", 1000));
+        chat.add_message(make_message("local_1000_0", 1000));
+
+        // The real id already arrived (e.g. server echo); the rename must
+        // not create a duplicate bubble
+        assert!(chat.rename_message("local_1000_0", "3EB0AAA"));
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].id, "3EB0AAA");
+
+        assert!(!chat.rename_message("missing", "whatever"));
     }
 
     #[test]
