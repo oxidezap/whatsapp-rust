@@ -261,7 +261,34 @@ fn render_media_content(
                 max_media_size,
             );
 
-            if let Some(cached_image) = sticker_image {
+            if media_content.data_is_preview
+                && !media_content.data.is_empty()
+                && let Some(dl) = media_content.downloadable.clone()
+            {
+                // Only the fallback PNG thumbnail is local: tapping fetches
+                // the real sticker, mirroring the image preview branch.
+                let image = render_image_from_bytes(
+                    media_content.data,
+                    &media_content.mime_type,
+                    display_w,
+                    display_h,
+                    false,
+                );
+                let preview_id: SharedString = format!("sticker-preview-{}", message_id).into();
+                el.child(
+                    div()
+                        .id(preview_id)
+                        .cursor_pointer()
+                        .on_click(move |_, _window, cx| {
+                            let msg_id = message_id.clone();
+                            let dl = dl.clone();
+                            entity.update(cx, |app, cx| {
+                                app.download_image(msg_id, dl, cx);
+                            });
+                        })
+                        .child(image),
+                )
+            } else if let Some(cached_image) = sticker_image {
                 let sticker_id: SharedString = format!("sticker-{}", message_id).into();
                 el.child(
                     img(ImageSource::Image(cached_image))

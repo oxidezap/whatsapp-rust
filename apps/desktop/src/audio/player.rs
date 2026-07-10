@@ -96,12 +96,19 @@ impl AudioPlayer {
                 .unwrap_or_default()
         );
 
-        // Prefer F32 (native to our samples), but any format the device
-        // offers works: the callback converts per sample, so i16/u16-only
-        // devices still play.
+        // Prefer F32 (native to our samples), but i16/u16-only devices still
+        // play: the callback converts per sample. Formats build_stream can't
+        // dispatch (i32/f64/...) are filtered out up front so a fallback pick
+        // never lands on one while a buildable range exists.
         let supported_configs: Vec<_> = device
             .supported_output_configs()
             .map_err(|e| PlayerError::DeviceError(e.to_string()))?
+            .filter(|c| {
+                matches!(
+                    c.sample_format(),
+                    SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16
+                )
+            })
             .collect();
 
         let supports_48k = |c: &cpal::SupportedStreamConfigRange| {

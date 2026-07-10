@@ -1490,6 +1490,9 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
         if thumbnail.is_empty() && downloadable.is_none() {
             return None;
         }
+        // Hydrated rows carry only the thumbnail; flag it so the renderer
+        // keeps offering the full download instead of treating it as final
+        let data_is_preview = !thumbnail.is_empty() && downloadable.is_some();
         return Some(MediaContent {
             media_type: MediaType::Image,
             data: Arc::new(thumbnail),
@@ -1500,9 +1503,7 @@ fn media_metadata(msg: &wa::Message) -> Option<MediaContent> {
             downloadable,
             is_animated: false,
             duration_secs: None,
-            // Hydrated rows carry only the thumbnail by design; the download
-            // placeholder path already offers the full fetch on tap
-            data_is_preview: false,
+            data_is_preview,
         });
     }
     // PTVs (round video notes) are VideoMessage in a different field.

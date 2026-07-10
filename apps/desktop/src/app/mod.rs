@@ -175,6 +175,9 @@ pub struct WhatsAppApp {
     audio_recorder: AudioRecorder,
     /// Current recording state
     recording_state: RecordingState,
+    /// Chat the current PTT recording started in; the note is sent there even
+    /// if the user switches chats before stopping
+    recording_chat: Option<String>,
     /// Audio player for voice message and video audio playback
     audio_player: AudioPlayer,
     /// Message ID of the audio currently loaded in audio_player (for ownership tracking)
@@ -251,6 +254,7 @@ impl WhatsAppApp {
             event_task,
             audio_recorder: AudioRecorder::new(),
             recording_state: RecordingState::default(),
+            recording_chat: None,
             audio_player: AudioPlayer::new(),
             audio_owner: None,
             active_media: ActiveMedia::None,
@@ -795,6 +799,9 @@ impl WhatsAppApp {
         }
 
         self.recording_state = RecordingState::Recording;
+        // Bind the note to the chat it started in: resolving the destination
+        // at stop time would misdeliver if the user switches chats meanwhile.
+        self.recording_chat = self.selected_chat.clone();
         self.update_input_recording(cx);
         info!("PTT recording started");
         cx.notify();
@@ -814,10 +821,10 @@ impl WhatsAppApp {
             return;
         }
 
-        let jid = match &self.selected_chat {
-            Some(jid) => jid.clone(),
+        let jid = match self.recording_chat.take() {
+            Some(jid) => jid,
             None => {
-                warn!("No chat selected, cancelling recording");
+                warn!("No recording chat, cancelling recording");
                 self.cancel_recording(cx);
                 return;
             }
@@ -914,6 +921,7 @@ impl WhatsAppApp {
     pub fn cancel_recording(&mut self, cx: &mut Context<Self>) {
         self.audio_recorder.cancel();
         self.recording_state = RecordingState::Idle;
+        self.recording_chat = None;
         self.update_input_recording(cx);
         info!("PTT recording cancelled");
         cx.notify();
