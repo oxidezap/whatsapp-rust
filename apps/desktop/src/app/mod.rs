@@ -651,7 +651,7 @@ impl WhatsAppApp {
     fn update_input_recording(&self, cx: &mut Context<Self>) {
         if let Some(ref input_area) = self.input_area {
             let is_recording = self.is_recording();
-            input_area.update(cx, |view, _cx| {
+            input_area.update(cx, |view, cx| {
                 view.set_recording(is_recording, cx);
             });
         }

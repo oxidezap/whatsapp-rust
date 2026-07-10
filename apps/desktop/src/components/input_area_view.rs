@@ -81,7 +81,7 @@ impl InputAreaView {
     /// Handle input events (Enter, Change, etc.)
     fn handle_input_event(
         &mut self,
-        input: &Entity<InputState>,
+        _input: &Entity<InputState>,
         event: &InputEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
