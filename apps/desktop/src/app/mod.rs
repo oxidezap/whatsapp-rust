@@ -321,7 +321,10 @@ impl WhatsAppApp {
 
     /// Create a new WhatsApp application
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let mut client = WhatsAppClient::new();
+        // Process bootstrap: with no runtime there is no client to hang the
+        // UI off, so failing to boot is fatal here (retries route to the
+        // error screen instead — see retry_connection).
+        let mut client = WhatsAppClient::new().expect("Failed to create tokio runtime at startup");
         let ui_rx = client
             .start()
             .expect("Fresh client should start successfully");
@@ -788,13 +791,22 @@ impl WhatsAppApp {
         // retry stacks another live runtime + DB pool on the same file.
         self.client.shutdown();
 
-        // Create new client and start event loop
-        let mut client = WhatsAppClient::new();
-        let ui_rx = client
-            .start()
-            .expect("Fresh client should start successfully");
-        self.event_task = Self::spawn_event_task(ui_rx, cx);
-        self.client = client;
+        // A failed rebuild routes back to the error screen (retry stays
+        // available) instead of panicking the UI thread.
+        match WhatsAppClient::new() {
+            Ok(mut client) => match client.start() {
+                Ok(ui_rx) => {
+                    self.event_task = Self::spawn_event_task(ui_rx, cx);
+                    self.client = client;
+                }
+                Err(e) => {
+                    self.app_state = AppState::Error(format!("Failed to restart client: {e}"));
+                }
+            },
+            Err(e) => {
+                self.app_state = AppState::Error(format!("Failed to restart client: {e}"));
+            }
+        }
         cx.notify();
     }
 

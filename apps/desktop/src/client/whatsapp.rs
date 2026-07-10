@@ -143,16 +143,17 @@ pub struct WhatsAppClient {
 }
 
 impl WhatsAppClient {
-    /// Create a new WhatsApp client wrapper
-    pub fn new() -> Self {
+    /// Create a new WhatsApp client wrapper. Errors when the tokio runtime
+    /// can't be built (resource exhaustion) so a retry can route to the
+    /// error screen instead of panicking the UI thread.
+    pub fn new() -> std::io::Result<Self> {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime"),
+                .build()?,
         );
 
-        Self {
+        Ok(Self {
             runtime,
             client_handle: Arc::new(Mutex::new(None)),
             ui_sender: Arc::new(Mutex::new(None)),
@@ -160,7 +161,7 @@ impl WhatsAppClient {
             chat_store: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             started: false,
-        }
+        })
     }
 
     /// Stop the background run loop so its thread exits and the runtime and
@@ -1950,12 +1951,6 @@ async fn normalize_chat_jid(client: &Client, jid_str: &str) -> String {
     match client.get_lid_pn_entry(&jid).await {
         Ok(Some(entry)) => format!("{}@lid", entry.lid),
         _ => jid_str.to_string(),
-    }
-}
-
-impl Default for WhatsAppClient {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
