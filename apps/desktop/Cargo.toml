@@ -44,8 +44,8 @@ env_logger = "0.11"
 # one gpui in the tree, no fork.
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "258791447ceb14888012d3dfabb6510524d3b53e" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git", rev = "258791447ceb14888012d3dfabb6510524d3b53e" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "0775df394083c1ed74f36f846b78868d1267398f" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git", rev = "0775df394083c1ed74f36f846b78868d1267398f" }
 
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Ordered maps for deterministic cache eviction
@@ -64,7 +64,7 @@ smallvec = "1"
 # Async utilities (GPUI-compatible timers)
 smol = "2"
 # Audio processing (waveform generation)
-symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4", "mp3", "ogg", "pcm"] }
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4", "mp3", "ogg", "pcm"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 # The library and its satellites, by path: always the checkout's version.

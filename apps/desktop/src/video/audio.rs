@@ -35,12 +35,12 @@ pub struct VideoAudio {
 
 /// Extract audio from MP4 using mp4 crate for demuxing and symphonia for AAC decoding
 pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::formats::FormatOptions;
+    use symphonia::core::formats::probe::Hint;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
 
     // First, use mp4 crate to find and extract audio track
     let cursor = Cursor::new(mp4_data);
@@ -110,24 +110,26 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
     let format_opts = FormatOptions::default();
     let metadata_opts = MetadataOptions::default();
 
-    let probed =
-        match symphonia::default::get_probe().format(&hint, mss, &format_opts, &metadata_opts) {
-            Ok(p) => p,
+    let mut format =
+        match symphonia::default::get_probe().probe(&hint, mss, format_opts, metadata_opts) {
+            Ok(f) => f,
             Err(e) => {
                 log::warn!("Failed to probe ADTS format: {}", e);
                 return None;
             }
         };
 
-    let mut format = probed.format;
-
     // Find the audio track in ADTS
     let track = format.tracks().first()?;
 
     let adts_track_id = track.id;
-    let decoder_opts = DecoderOptions::default();
+    let Some(CodecParameters::Audio(audio_params)) = track.codec_params.clone() else {
+        log::warn!("ADTS track carries no audio codec parameters");
+        return None;
+    };
+    let decoder_opts = AudioDecoderOptions::default();
     let mut decoder =
-        match symphonia::default::get_codecs().make(&track.codec_params, &decoder_opts) {
+        match symphonia::default::get_codecs().make_audio_decoder(&audio_params, &decoder_opts) {
             Ok(d) => d,
             Err(e) => {
                 log::warn!("Failed to create AAC decoder: {}", e);
@@ -136,22 +138,18 @@ pub fn extract_audio_from_mp4(mp4_data: &[u8]) -> Option<VideoAudio> {
         };
 
     let mut all_samples: Vec<f32> = Vec::new();
+    let mut frame: Vec<f32> = Vec::new();
 
     // Decode all audio packets
-    while let Ok(packet) = format.next_packet() {
-        if packet.track_id() != adts_track_id {
+    while let Ok(Some(packet)) = format.next_packet() {
+        if packet.track_id != adts_track_id {
             continue;
         }
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                let spec = *decoded.spec();
-                let duration = decoded.capacity() as u64;
-
-                let mut sample_buf = SampleBuffer::<f32>::new(duration, spec);
-                sample_buf.copy_interleaved_ref(decoded);
-
-                all_samples.extend_from_slice(sample_buf.samples());
+                decoded.copy_to_vec_interleaved(&mut frame);
+                all_samples.extend_from_slice(&frame);
             }
             Err(e) => {
                 log::debug!("Audio decode error (skipping frame): {}", e);
