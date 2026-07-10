@@ -701,14 +701,12 @@ impl WhatsAppApp {
             return;
         };
 
-        // Send the message via client
-        self.client.send_message(&jid, text);
+        let local_id = format!("local_{}", wacore::time::now_millis());
+        self.client.send_message(&jid, text, local_id.clone());
 
-        // Add to local chat immediately for responsiveness
-        let msg = ChatMessage::new_outgoing(
-            format!("local_{}", wacore::time::now_millis()),
-            text.to_string(),
-        );
+        // Add to local chat immediately for responsiveness; the client renames
+        // it to the real id via MessageIdAssigned.
+        let msg = ChatMessage::new_outgoing(local_id, text.to_string());
         if self.add_message_to_chat(&jid, msg) {
             self.scroll_to_last_message();
         }
@@ -819,13 +817,19 @@ impl WhatsAppApp {
 
         let duration_secs = recorded.duration_secs;
 
-        // Send the audio message
-        self.client
-            .send_audio_message(&jid, ogg_data.clone(), duration_secs, waveform.clone());
+        let local_id = format!("local_audio_{}", wacore::time::now_millis());
+        self.client.send_audio_message(
+            &jid,
+            ogg_data.clone(),
+            duration_secs,
+            waveform.clone(),
+            local_id.clone(),
+        );
 
-        // Add to local chat immediately for responsiveness
+        // Add to local chat immediately for responsiveness; the client renames
+        // it to the real id via MessageIdAssigned.
         let msg = ChatMessage::new_outgoing_with_media(
-            format!("local_audio_{}", wacore::time::now_millis()),
+            local_id,
             String::new(), // No text for PTT
             MediaContent {
                 media_type: MediaType::Audio,
@@ -1515,6 +1519,18 @@ impl WhatsAppApp {
                 self.handle_message_received(chat_jid, *message, sender_name);
                 cx.notify();
             }
+            UiEvent::MessageIdAssigned {
+                chat_jid,
+                local_id,
+                message_id,
+            } => {
+                if let Some(chat) = self.find_chat_mut(&chat_jid)
+                    && let Some(msg) = chat.messages.iter_mut().find(|m| m.id == local_id)
+                {
+                    msg.id = message_id;
+                }
+                self.invalidate_message_cache(&chat_jid);
+            }
             UiEvent::ReceiptReceived {
                 chat_jid,
                 message_ids,
@@ -1698,6 +1714,10 @@ impl WhatsAppApp {
                     "Marked {} message(s) as {:?} in {}",
                     count, receipt_type, chat_jid
                 );
+                // Ticks and the unread badge changed; count-based cache
+                // guards can't see either.
+                self.invalidate_message_cache(&chat_jid);
+                self.invalidate_chat_cache();
             }
         }
     }

@@ -33,6 +33,14 @@ pub enum UiEvent {
         message_ids: Vec<String>,
         receipt_type: ReceiptType,
     },
+    /// The client assigned the real WhatsApp id to a just-sent message; the UI
+    /// renames its optimistic bubble so receipts/reactions keyed by the real
+    /// id land on it.
+    MessageIdAssigned {
+        chat_jid: String,
+        local_id: String,
+        message_id: String,
+    },
     ReactionReceived {
         chat_jid: String,
         message_id: String,

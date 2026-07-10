@@ -637,9 +637,10 @@ impl WhatsAppClient {
     }
 
     /// Send a text message to a chat
-    pub fn send_message(&self, jid_str: &str, content: &str) {
+    pub fn send_message(&self, jid_str: &str, content: &str, local_id: String) {
         let client_handle = self.client_handle.clone();
         let chat_store = self.chat_store.clone();
+        let ui_sender = self.ui_sender.clone();
         let jid_str = jid_str.to_string();
         let content = content.to_string();
         let runtime = self.runtime.clone();
@@ -666,6 +667,9 @@ impl WhatsAppClient {
                     // send_message, so a row recorded after it would stay
                     // Pending forever (the ack precedes it in writer order).
                     let msg_id = client.generate_message_id();
+                    // Receipts/reactions arrive keyed by this id; rename the
+                    // optimistic bubble before they can race it.
+                    notify_message_id(&ui_sender, &jid_str, local_id, &msg_id).await;
                     record_outgoing(&chat_store, &jid, &msg_id, &message).await;
                     let options = whatsapp_rust::SendOptions {
                         message_id: Some(msg_id.clone()),
@@ -733,9 +737,10 @@ impl WhatsAppClient {
         audio_data: Vec<u8>,
         duration_secs: u32,
         waveform: Vec<u8>,
+        local_id: String,
     ) {
         let chat_store = self.chat_store.clone();
-
+        let ui_sender = self.ui_sender.clone();
         let client_handle = self.client_handle.clone();
         let jid_str = jid_str.to_string();
         let runtime = self.runtime.clone();
@@ -790,6 +795,7 @@ impl WhatsAppClient {
                     // Same ordering as the text path: record before sending so
                     // the ack can't precede the row in the writer queue.
                     let msg_id = client.generate_message_id();
+                    notify_message_id(&ui_sender, &jid_str, local_id, &msg_id).await;
                     record_outgoing(&chat_store, &jid, &msg_id, &message).await;
                     let options = whatsapp_rust::SendOptions {
                         message_id: Some(msg_id.clone()),
@@ -1164,9 +1170,26 @@ impl WhatsAppClient {
                     .messages(&entry.jid, None, Self::HISTORY_MESSAGES_PER_CHAT)
                     .await?;
                 page.reverse();
-                for msg in page.into_iter().map(stored_to_chat_message) {
+                let mut msgs: Vec<ChatMessage> =
+                    page.into_iter().map(stored_to_chat_message).collect();
+                // The rows are distinct messages, so this side's unread state
+                // adds to the merged chat: fold the counter in and un-read its
+                // tail so opening the chat still sends those receipts.
+                let mut remaining = entry.unread_count.max(0) as u32;
+                for msg in msgs.iter_mut().rev() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if !msg.is_from_me {
+                        msg.is_read = false;
+                        remaining -= 1;
+                    }
+                }
+                for msg in msgs {
                     existing.insert_history_message(msg);
                 }
+                existing.unread_count += entry.unread_count.max(0) as u32;
+                existing.manually_unread |= entry.unread_count < 0;
                 continue;
             }
             let mut name = entry.name.clone();
@@ -1240,6 +1263,22 @@ fn stored_to_chat_message(stored: whatsapp_rust_chat_store::StoredMessage) -> Ch
         is_read,
         media: None,
         reactions: std::collections::HashMap::new(),
+    }
+}
+
+/// Tell the UI which real id a just-sent optimistic bubble got.
+async fn notify_message_id(
+    ui_sender: &UiEventSender,
+    chat_jid: &str,
+    local_id: String,
+    message_id: &str,
+) {
+    if let Some(tx) = ui_sender.lock().await.as_ref() {
+        let _ = tx.send(UiEvent::MessageIdAssigned {
+            chat_jid: chat_jid.to_string(),
+            local_id,
+            message_id: message_id.to_string(),
+        });
     }
 }
 
