@@ -2269,3 +2269,216 @@ async fn early_tombstone_materializes_and_badges_the_chat() {
     assert!(chats[0].last_message_preview.is_none());
     assert_eq!(chats[0].unread_count, 1);
 }
+
+fn mark_read_event(chat: &str, read: bool, ts_secs: i64) -> Event {
+    Event::MarkChatAsReadUpdate(
+        wacore::types::events::MarkChatAsReadUpdate::builder()
+            .jid(jid(chat))
+            .timestamp(Utc.timestamp_opt(ts_secs, 0).unwrap())
+            .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                read: Some(read),
+                ..Default::default()
+            }))
+            .from_full_sync(false)
+            .build(),
+    )
+}
+
+#[tokio::test]
+async fn noop_mark_read_clears_manual_unread_marker() {
+    let (_store, chat_store) = test_store().await;
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("oi"),
+            incoming_info(PEER, PEER, "MSG-MU", 1_700_000_000),
+        )],
+    )
+    .await;
+    feed(&chat_store, [mark_read_event(PEER, true, 1_700_000_010)]).await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+
+    // Manually mark unread, then read the chat again: the cursor can't move
+    // (nothing new arrived), but the marker must still clear.
+    feed(&chat_store, [mark_read_event(PEER, false, 1_700_000_020)]).await;
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].unread_count, -1);
+
+    feed(&chat_store, [mark_read_event(PEER, true, 1_700_000_030)]).await;
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].unread_count, 0);
+}
+
+#[tokio::test]
+async fn noop_read_self_clears_manual_unread_marker() {
+    let (_store, chat_store) = test_store().await;
+
+    let read_self = |ts: i64| {
+        Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: jid(PEER),
+                    sender: jid(PEER),
+                    ..Default::default()
+                })
+                .message_ids(vec!["MSG-RS".to_string()])
+                .timestamp(Utc.timestamp_opt(ts, 0).unwrap())
+                .r#type(ReceiptType::ReadSelf)
+                .offline(false)
+                .build(),
+        )
+    };
+
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("oi"),
+            incoming_info(PEER, PEER, "MSG-RS", 1_700_000_000),
+        )],
+    )
+    .await;
+    feed(&chat_store, [read_self(1_700_000_010)]).await;
+    assert_eq!(chat_store.unread_total().await.unwrap(), 0);
+
+    feed(&chat_store, [mark_read_event(PEER, false, 1_700_000_020)]).await;
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].unread_count, -1);
+
+    // Re-reading on the phone re-sends the same boundary: a no-op for the
+    // cursor, but the marker must still clear.
+    feed(&chat_store, [read_self(1_700_000_030)]).await;
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].unread_count, 0);
+}
+
+#[tokio::test]
+async fn edit_before_target_materializes_edited_content() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    // Offline drain reordering: the edit is applied before the original.
+    let edit = wa::Message {
+        protocol_message: MessageField::some(wa::message::ProtocolMessage {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("MSG-EB".into()),
+                ..Default::default()
+            }),
+            r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+            edited_message: MessageField::from_box(Box::new(wa::Message::text("fixed"))),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    feed(
+        &chat_store,
+        [message_event(
+            edit,
+            incoming_info(PEER, PEER, "MSG-EB2", 1_700_000_050),
+        )],
+    )
+    .await;
+
+    // The edited content materializes up front and badges like the original.
+    let msg = chat_store.message(&chat, "MSG-EB").await.unwrap().unwrap();
+    assert_eq!(msg.text.as_deref(), Some("fixed"));
+    assert!(msg.edited_at.is_some());
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("fixed"));
+    assert_eq!(chats[0].unread_count, 1);
+
+    // The original's late arrival must neither restore pre-edit text nor
+    // count the same message twice.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("typo"),
+            incoming_info(PEER, PEER, "MSG-EB", 1_700_000_000),
+        )],
+    )
+    .await;
+    let msg = chat_store.message(&chat, "MSG-EB").await.unwrap().unwrap();
+    assert_eq!(msg.text.as_deref(), Some("fixed"));
+    let chats = chat_store.chats(false, 10).await.unwrap();
+    assert_eq!(chats[0].last_message_preview.as_deref(), Some("fixed"));
+    assert_eq!(chats[0].unread_count, 1);
+}
+
+#[tokio::test]
+async fn server_nack_marks_outgoing_failed() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-NACK",
+            &wa::Message::text("oi"),
+            Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+
+    feed(
+        &chat_store,
+        [Event::ServerAck(
+            ServerAck::builder()
+                .id("OUT-NACK".to_string())
+                .class("message".to_string())
+                .from(chat.clone())
+                .error("479".to_string())
+                .build(),
+        )],
+    )
+    .await;
+    let msg = chat_store
+        .message(&chat, "OUT-NACK")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Error);
+
+    // A stray nack must not regress a message a peer already received.
+    chat_store
+        .record_outgoing(
+            &chat,
+            "OUT-READ",
+            &wa::Message::text("oi2"),
+            Utc.timestamp_opt(1_700_000_200, 0).unwrap(),
+        )
+        .unwrap();
+    chat_store.flush().await.unwrap();
+    feed(
+        &chat_store,
+        [
+            Event::Receipt(
+                Receipt::builder()
+                    .source(MessageSource {
+                        chat: chat.clone(),
+                        sender: chat.clone(),
+                        ..Default::default()
+                    })
+                    .message_ids(vec!["OUT-READ".to_string()])
+                    .timestamp(Utc.timestamp_opt(1_700_000_300, 0).unwrap())
+                    .r#type(ReceiptType::Read)
+                    .offline(false)
+                    .build(),
+            ),
+            Event::ServerAck(
+                ServerAck::builder()
+                    .id("OUT-READ".to_string())
+                    .class("message".to_string())
+                    .from(chat.clone())
+                    .error("479".to_string())
+                    .build(),
+            ),
+        ],
+    )
+    .await;
+    let msg = chat_store
+        .message(&chat, "OUT-READ")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(msg.status, MessageStatus::Read);
+}

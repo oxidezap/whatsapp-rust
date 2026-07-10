@@ -693,11 +693,25 @@ fn apply_event(
                         advance_read_state(conn, device_id, &chat, watermark, &[])?
                     }
                 };
-                if let Some(state) = advanced {
-                    let unread = count_unread(conn, device_id, &chat, &state)?;
-                    diesel::update(chat_row(device_id, &chat))
+                match advanced {
+                    Some(state) => {
+                        let unread = count_unread(conn, device_id, &chat, &state)?;
+                        diesel::update(chat_row(device_id, &chat))
+                            .set(schema::chats::unread_count.eq(unread))
+                            .execute(conn)?;
+                    }
+                    // Cursor didn't move (re-reading an already-read chat),
+                    // but a read still clears a manual-unread marker.
+                    None => {
+                        let state = read_state(conn, device_id, &chat)?;
+                        let unread = count_unread(conn, device_id, &chat, &state)?;
+                        diesel::update(
+                            chat_row(device_id, &chat)
+                                .filter(schema::chats::unread_count.eq(UNREAD_MARKER)),
+                        )
                         .set(schema::chats::unread_count.eq(unread))
                         .execute(conn)?;
+                    }
                 }
             } else {
                 diesel::update(chat_row(device_id, &chat))
@@ -891,6 +905,8 @@ fn apply_inbound(
                 device_id,
                 &chat,
                 &target_id,
+                &sender,
+                info.source.is_from_me,
                 new_text.as_deref(),
                 new_kind,
                 &new_proto,
@@ -924,14 +940,19 @@ fn apply_inbound(
 }
 
 /// Apply an edit to its target row. Monotonic on `edited_at_ms` so a replayed
-/// or stale (e.g. history-sync) edit can't roll back a newer one. Returns
-/// whether the chat-list preview changed.
+/// or stale (e.g. history-sync) edit can't roll back a newer one. An edit
+/// arriving before its target (offline drain reordering) materializes the
+/// edited content up front — `insert_message` skips edited rows, so the
+/// original's later arrival can't show pre-edit text. Returns whether the
+/// chat-list preview changed.
 #[allow(clippy::too_many_arguments)]
 fn apply_edit(
     conn: &mut SqliteConnection,
     device_id: i32,
     chat: &str,
     target_id: &str,
+    sender: &str,
+    from_me: bool,
     new_text: Option<&str>,
     new_kind: &str,
     new_proto: &[u8],
@@ -952,6 +973,46 @@ fn apply_edit(
     ))
     .execute(conn)?;
     if updated == 0 {
+        let inserted = diesel::insert_into(dsl::messages)
+            .values((
+                dsl::device_id.eq(device_id),
+                dsl::chat_jid.eq(chat),
+                dsl::msg_id.eq(target_id),
+                dsl::sender_jid.eq(sender),
+                dsl::from_me.eq(from_me),
+                dsl::timestamp_ms.eq(ts_ms),
+                dsl::kind.eq(new_kind),
+                dsl::text_content.eq(new_text),
+                dsl::proto.eq(Some(new_proto)),
+                dsl::status.eq(if from_me {
+                    wa::web_message_info::Status::SERVER_ACK as i32
+                } else {
+                    wa::web_message_info::Status::DELIVERY_ACK as i32
+                }),
+                dsl::edited_at_ms.eq(Some(ts_ms)),
+            ))
+            // Conflict = the row exists but rejected the edit (revoked, or a
+            // newer edit already applied): stale, nothing to preserve.
+            .on_conflict_do_nothing()
+            .execute(conn)?
+            > 0;
+        if inserted {
+            // The message DID happen — the chat must exist, order by it and
+            // badge it exactly as if the (never-seen) original had landed.
+            bump_chat(
+                conn,
+                device_id,
+                chat,
+                ChatBump {
+                    msg_id: target_id,
+                    ts_ms,
+                    preview: new_text,
+                    kind: Some(new_kind),
+                    unread_delta: i32::from(!from_me),
+                },
+            )?;
+            return Ok(true);
+        }
         return Ok(false);
     }
     refresh_preview_if_latest(conn, device_id, chat, target_id, new_text, Some(new_kind))
@@ -1178,6 +1239,19 @@ fn apply_receipt(
                 &receipt.message_ids,
             )?
             else {
+                // Cursor didn't move (chat re-read on another device), but a
+                // self-read still clears a manual-unread marker.
+                let state = read_state(conn, device_id, &chat)?;
+                let unread = count_unread(conn, device_id, &chat, &state)?;
+                let cleared = diesel::update(
+                    chat_row(device_id, &chat)
+                        .filter(schema::chats::unread_count.eq(UNREAD_MARKER)),
+                )
+                .set(schema::chats::unread_count.eq(unread))
+                .execute(conn)?;
+                if cleared > 0 {
+                    cs.chats = true;
+                }
                 return Ok(());
             };
             let unread = count_unread(conn, device_id, &chat, &state)?;
@@ -1245,21 +1319,38 @@ fn apply_server_ack(
     cs: &mut ChangeSet,
 ) -> QueryResult<()> {
     // Acks cover every stanza class; only message acks map to a stored row.
-    if ack.class.as_deref() != Some("message") || ack.error.is_some() {
+    if ack.class.as_deref() != Some("message") {
         return Ok(());
     }
     use schema::messages::dsl;
-    let updated = diesel::update(
-        dsl::messages.filter(
-            dsl::device_id
-                .eq(device_id)
-                .and(dsl::msg_id.eq(&ack.id))
-                .and(dsl::from_me.eq(true))
-                .and(dsl::status.lt(wa::web_message_info::Status::SERVER_ACK as i32)),
-        ),
-    )
-    .set(dsl::status.eq(wa::web_message_info::Status::SERVER_ACK as i32))
-    .execute(conn)?;
+    let updated = if ack.error.is_some() {
+        // Nack: the server rejected the send. Only undelivered rows fail — a
+        // stray nack must not regress a message a peer already received.
+        diesel::update(
+            dsl::messages.filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::msg_id.eq(&ack.id))
+                    .and(dsl::from_me.eq(true))
+                    .and(dsl::status.lt(wa::web_message_info::Status::DELIVERY_ACK as i32))
+                    .and(dsl::status.ne(wa::web_message_info::Status::ERROR as i32)),
+            ),
+        )
+        .set(dsl::status.eq(wa::web_message_info::Status::ERROR as i32))
+        .execute(conn)?
+    } else {
+        diesel::update(
+            dsl::messages.filter(
+                dsl::device_id
+                    .eq(device_id)
+                    .and(dsl::msg_id.eq(&ack.id))
+                    .and(dsl::from_me.eq(true))
+                    .and(dsl::status.lt(wa::web_message_info::Status::SERVER_ACK as i32)),
+            ),
+        )
+        .set(dsl::status.eq(wa::web_message_info::Status::SERVER_ACK as i32))
+        .execute(conn)?
+    };
     if updated > 0 {
         // Acks usually carry the chat; when they don't, resolve it from the
         // row we just updated so consumers still get invalidated.
@@ -1453,6 +1544,8 @@ fn apply_history_message(
                     device_id,
                     chat,
                     &target_id,
+                    sender,
+                    from_me,
                     new_text.as_deref(),
                     new_kind,
                     &new_proto,
