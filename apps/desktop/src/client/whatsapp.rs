@@ -295,7 +295,8 @@ impl WhatsAppClient {
         // JIDs normalize through the same PN->LID mapping live events use.
         match Self::load_history(&chat_store, &bot.client()).await {
             Ok(chats) if !chats.is_empty() => {
-                let _ = ui_tx.send(UiEvent::HistoryLoaded { chats });
+                let complete = (chats.len() as i64) < Self::HISTORY_CHAT_LIMIT;
+                let _ = ui_tx.send(UiEvent::HistoryLoaded { chats, complete });
             }
             Ok(_) => {}
             Err(e) => warn!("Failed to load chat history: {e}"),
@@ -1487,7 +1488,14 @@ impl WhatsAppClient {
                 // must clear the list here too.
                 match Self::load_history(&chat_store, &client).await {
                     Ok(chats) => {
-                        if ui_tx.send(UiEvent::HistoryLoaded { chats }).is_err() {
+                        // A load that filled the limit was truncated: absence
+                        // from it can just mean "fell past the window", so the
+                        // UI must not prune against it.
+                        let complete = (chats.len() as i64) < Self::HISTORY_CHAT_LIMIT;
+                        if ui_tx
+                            .send(UiEvent::HistoryLoaded { chats, complete })
+                            .is_err()
+                        {
                             break;
                         }
                     }

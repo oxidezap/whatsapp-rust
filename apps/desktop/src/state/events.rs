@@ -11,6 +11,10 @@ pub enum UiEvent {
     /// Durable history hydrated from the chat store at startup.
     HistoryLoaded {
         chats: Vec<crate::state::Chat>,
+        /// Whether `chats` is the store's whole display list (the load came
+        /// back under its limit). Only then can absence from the list mean
+        /// archived/deleted; a truncated load says nothing about the tail.
+        complete: bool,
     },
     QrCode {
         code: String,

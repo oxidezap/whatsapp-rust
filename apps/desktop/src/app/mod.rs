@@ -1762,18 +1762,22 @@ impl WhatsAppApp {
                 self.app_state = AppState::Connecting;
                 cx.notify();
             }
-            UiEvent::HistoryLoaded { chats } => {
+            UiEvent::HistoryLoaded { chats, complete } => {
                 info!("Loaded {} chats from durable history", chats.len());
-                // The load is the store's display list: a chat it stopped
-                // returning was archived/deleted (possibly on another device)
-                // and must leave the UI too. The selected chat is spared so
-                // the open conversation isn't yanked mid-view.
-                let loaded: std::collections::HashSet<&str> =
-                    chats.iter().map(|c| c.jid.as_str()).collect();
-                self.chats.retain(|c| {
-                    loaded.contains(c.jid.as_str())
-                        || self.selected_chat.as_deref() == Some(c.jid.as_str())
-                });
+                // Prune only against a COMPLETE load: there absence means the
+                // chat was archived/deleted (possibly on another device), so
+                // it must leave the UI too. A truncated load can't distinguish
+                // that from a chat that merely fell past the window, so it
+                // never prunes. The selected chat is spared either way so the
+                // open conversation isn't yanked mid-view.
+                if complete {
+                    let loaded: std::collections::HashSet<&str> =
+                        chats.iter().map(|c| c.jid.as_str()).collect();
+                    self.chats.retain(|c| {
+                        loaded.contains(c.jid.as_str())
+                            || self.selected_chat.as_deref() == Some(c.jid.as_str())
+                    });
+                }
                 for chat in chats {
                     // Later loads (post-HistorySync re-hydration) fold into
                     // chats the UI already shows instead of being dropped.
