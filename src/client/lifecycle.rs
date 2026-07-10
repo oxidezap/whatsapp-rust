@@ -230,6 +230,7 @@ impl Client {
             history_sync_tasks_in_flight: Arc::new(AtomicUsize::new(0)),
             history_sync_idle_notifier: Arc::new(event_listener::Event::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
+            delivery_receipt_queue: std::sync::OnceLock::new(),
             presence_subscriptions: Arc::new(async_lock::Mutex::new(HashSet::new())),
             socket_ready_notifier: Arc::new(event_listener::Event::new()),
             is_ready: Arc::new(AtomicBool::new(false)),

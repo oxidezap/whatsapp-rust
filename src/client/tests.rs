@@ -2814,6 +2814,191 @@ async fn disconnect_does_not_signal_connection_cleanup_before_outbound_flush() {
     );
 }
 
+fn receipt_test_info(id: &str) -> Arc<crate::types::message::MessageInfo> {
+    Arc::new(crate::types::message::MessageInfo {
+        id: id.to_string(),
+        source: crate::types::message::MessageSource {
+            chat: "15550001111@s.whatsapp.net".parse().unwrap(),
+            sender: "15550001111@s.whatsapp.net".parse().unwrap(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
+
+/// Live delivery receipts flow through the persistent worker: the receipt
+/// reaches the transport and the flush counter returns to zero afterwards.
+#[tokio::test]
+async fn delivery_receipt_worker_sends_and_releases_flush() {
+    use crate::socket::NoiseSocket;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use wacore::handshake::NoiseCipher;
+
+    struct CountingTransport {
+        sends: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::transport::Transport for CountingTransport {
+        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+    }
+
+    let client = crate::test_utils::create_test_client().await;
+    let sends = Arc::new(AtomicUsize::new(0));
+    let transport: Arc<dyn crate::transport::Transport> = Arc::new(CountingTransport {
+        sends: Arc::clone(&sends),
+    });
+    let key = [0u8; 32];
+    let noise_socket = NoiseSocket::new(
+        client.runtime.clone(),
+        Arc::clone(&transport),
+        NoiseCipher::new(&key).expect("valid key"),
+        NoiseCipher::new(&key).expect("valid key"),
+    );
+    *client.transport.lock().await = Some(transport);
+    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    client.is_connected.store(true, Ordering::Release);
+
+    client.ack_received_message(&receipt_test_info("RCPT-WORKER-1"));
+
+    let deadline = wacore::time::Instant::now() + Duration::from_secs(2);
+    while sends.load(Ordering::SeqCst) == 0 {
+        assert!(
+            wacore::time::Instant::now() < deadline,
+            "delivery receipt was never sent by the worker"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+
+    client
+        .outbound_flush
+        .flush(&*client.runtime, Duration::from_secs(1))
+        .await;
+    assert_eq!(
+        client.outbound_flush.pending(),
+        0,
+        "worker must release the flush guard after the send"
+    );
+}
+
+/// A closed flush scope (disconnect in progress) drops live receipts without
+/// leaking the flush counter — mirroring the previous spawn-per-receipt path.
+#[tokio::test]
+async fn delivery_receipt_dropped_when_flush_scope_closed() {
+    let client = crate::test_utils::create_test_client().await;
+    client.outbound_flush.close();
+
+    client.ack_received_message(&receipt_test_info("RCPT-CLOSED-1"));
+
+    assert_eq!(
+        client.outbound_flush.pending(),
+        0,
+        "closed scope must not track new receipts"
+    );
+    // The drop happens before the queue: with the scope closed nothing may be
+    // enqueued, so the lazy worker queue is never even created.
+    assert!(
+        client.delivery_receipt_queue.get().is_none(),
+        "a dropped receipt must not reach the worker queue"
+    );
+    // Finishing well under the 5s flush timeout proves nothing was tracked;
+    // the generous bound keeps this stable on oversubscribed CI runners.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .outbound_flush
+            .flush(&*client.runtime, Duration::from_secs(5)),
+    )
+    .await
+    .expect("flush must not wait when nothing was queued");
+}
+
+/// Issue #571 under the worker model: `flush()` must wait for receipts that
+/// are queued to the worker but not yet sent, including one queued behind an
+/// in-flight blocked send.
+#[tokio::test]
+async fn flush_waits_for_queued_delivery_receipts() {
+    use crate::socket::NoiseSocket;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use wacore::handshake::NoiseCipher;
+
+    struct BlockingTransport {
+        send_started: async_channel::Sender<()>,
+        release_send: async_channel::Receiver<()>,
+    }
+
+    #[async_trait]
+    impl crate::transport::Transport for BlockingTransport {
+        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            let _ = self.send_started.try_send(());
+            let _ = self.release_send.recv().await;
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+    }
+
+    let client = crate::test_utils::create_test_client().await;
+    let (send_started_tx, send_started_rx) = async_channel::bounded(2);
+    let (release_send_tx, release_send_rx) = async_channel::bounded(2);
+    let transport: Arc<dyn crate::transport::Transport> = Arc::new(BlockingTransport {
+        send_started: send_started_tx,
+        release_send: release_send_rx,
+    });
+    let key = [0u8; 32];
+    let noise_socket = NoiseSocket::new(
+        client.runtime.clone(),
+        Arc::clone(&transport),
+        NoiseCipher::new(&key).expect("valid key"),
+        NoiseCipher::new(&key).expect("valid key"),
+    );
+    *client.transport.lock().await = Some(transport);
+    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    client.is_connected.store(true, Ordering::Release);
+
+    client.ack_received_message(&receipt_test_info("RCPT-QUEUE-1"));
+    tokio::time::timeout(Duration::from_secs(1), send_started_rx.recv())
+        .await
+        .expect("first receipt send should start")
+        .expect("send_started sender should stay open");
+
+    // Second receipt queues behind the blocked one and must also be tracked.
+    client.ack_received_message(&receipt_test_info("RCPT-QUEUE-2"));
+    assert_eq!(
+        client.outbound_flush.pending(),
+        2,
+        "both the in-flight and the queued receipt must hold flush guards"
+    );
+
+    let flush_client = Arc::clone(&client);
+    let flush_task = tokio::spawn(async move {
+        flush_client
+            .outbound_flush
+            .flush(&*flush_client.runtime, Duration::from_secs(5))
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !flush_task.is_finished(),
+        "flush must wait while receipts are queued or in flight"
+    );
+
+    release_send_tx.send(()).await.expect("release first send");
+    release_send_tx.send(()).await.expect("release second send");
+
+    tokio::time::timeout(Duration::from_secs(2), flush_task)
+        .await
+        .expect("flush should finish once the queue drains")
+        .expect("flush task should not panic");
+    assert_eq!(client.outbound_flush.pending(), 0);
+}
+
 /// Verifies that `send_ack_for` returns an error (not silent Ok) when
 /// disconnected. This ensures the caller's `warn!` fires so dropped acks
 /// are visible in logs.
