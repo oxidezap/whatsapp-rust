@@ -1165,11 +1165,12 @@ impl Client {
                 // that keeps the same Arc. So a stale skip is impossible, and
                 // the memoized needs are a pure function of that same identity.
                 if self.group_devices_memo_enabled
-                    && let Some((dw, cw, memo_gen, memo_needs)) =
+                    && let Some((dw, cw, memo_gen, memo_sender, memo_needs)) =
                         self.skdm_warm_memo.get(group).await
                     && std::ptr::eq(dw.as_ptr(), std::sync::Arc::as_ptr(&all_devices))
                     && std::ptr::eq(cw.as_ptr(), std::sync::Arc::as_ptr(&cached_map))
                     && memo_gen == cached_map_gen
+                    && &memo_sender == own_sending_jid
                 {
                     return Some((all_devices, memo_needs));
                 }
@@ -1196,6 +1197,7 @@ impl Client {
                                 std::sync::Arc::downgrade(&all_devices),
                                 std::sync::Arc::downgrade(&cached_map),
                                 cached_map_gen,
+                                own_sending_jid.clone(),
                                 needs_skdm.clone(),
                             ),
                         )
@@ -1238,10 +1240,10 @@ impl Client {
             return;
         }
 
-        // No invalidation here: set_sender_key_status_for_devices already
-        // drops the cached map when it actually writes new warm marks, and an
-        // own-devices-only set (never memoized) writes nothing — invalidating
-        // for it would force a DB re-read on every warm send.
+        // No invalidation on success: set_sender_key_status_for_devices
+        // already drops the cached map when it actually writes new warm marks,
+        // and an own-devices-only set (never memoized) writes nothing —
+        // invalidating for it would force a DB re-read on every warm send.
         if let Err(e) = self
             .set_sender_key_status_for_devices(group_jid, devices, true, true)
             .await
@@ -1251,6 +1253,10 @@ impl Client {
                 group_jid,
                 e
             );
+            // A failed write may still have partially landed (backend
+            // implementations are not required to be atomic), so drop the
+            // cached map rather than risk serving pre-write state.
+            self.sender_key_device_cache.invalidate(group_jid).await;
         }
     }
 
@@ -1777,7 +1783,16 @@ impl Client {
                             .await
                         {
                             Some((all, needs)) => {
-                                if needs.is_empty() {
+                                // Fully warm OR down to the own-only steady
+                                // state: nothing left that needs the
+                                // single-flight, release it before the send.
+                                if needs.is_empty()
+                                    || skdm_needs_only_own_devices(
+                                        &needs,
+                                        Some(own_jid),
+                                        Some(own_lid),
+                                    )
+                                {
                                     distribution_guard = None;
                                 }
                                 (Some(all), Some(needs))

@@ -149,12 +149,15 @@ use wacore::client::context::GroupInfo;
 type GroupCache = TypedCache<Jid, Arc<GroupInfo>>;
 
 /// Memoized SKDM warm state per group: the `(devices, sender-key map)` Weak
-/// pair + map generation it was computed against, and the memoized
+/// pair + map generation it was computed against, the exact sending identity
+/// the filter ran as (it excludes that device, and own-device classification
+/// depends on it — a mid-session identity change must miss), and the memoized
 /// `needs_skdm` targets (empty or own-devices-only). See `skdm_warm_memo`.
 pub(crate) type SkdmWarmMemoEntry = (
     std::sync::Weak<wacore::send::ResolvedGroupDevices>,
     std::sync::Weak<crate::sender_key_device_cache::SenderKeyDeviceMap>,
     u64,
+    Jid,
     Vec<Jid>,
 );
 use wacore::runtime::timeout as rt_timeout;
