@@ -836,9 +836,13 @@ pub struct Client {
     /// Initialized after `Arc::new(this)` in the constructor.
     pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Client>>,
 
-    /// Trailing-edge debounce flag for the coalesced Signal-cache flush
+    /// Coalescing-window flag for the Signal-cache flush
     /// (see `signal_flush.rs`). True while a fire is armed.
     pub(crate) signal_flush_pending: AtomicBool,
+    /// Injected failures for the coalesced flush (consumed one per attempt),
+    /// so tests can exercise the retry/backoff path deterministically.
+    #[cfg(test)]
+    pub(crate) signal_flush_test_failures: AtomicU32,
 
     /// Holds the background saver's AbortHandle so the task lifetime follows
     /// `Arc<Client>` ref count instead of the Bot wrapper's. Set once by

@@ -9,7 +9,7 @@
 //! Durability model (deliberate, bounded):
 //! - Live acks already went out BEFORE the per-stanza flush, so coalescing
 //!   does not reorder acks vs durability — it widens the existing
-//!   crash-replay window from "one stanza" to at most [`SIGNAL_FLUSH_DEBOUNCE`]
+//!   crash-replay window from "one stanza" to at most [`SIGNAL_FLUSH_WINDOW`]
 //!   plus one flush. Inbound receive chains re-derive forward after a lost
 //!   advance; consumed one-time prekeys stay buffered until their session is
 //!   durable (the flush-internal atomicity is untouched).
@@ -76,7 +76,7 @@ impl Client {
                     // Batch-safe: if an offline drain became active meanwhile,
                     // this routes under the processing permit like any
                     // out-of-band flush.
-                    let Err(e) = client.flush_signal_cache_batch_safe().await else {
+                    let Err(e) = client.coalesced_flush_attempt().await else {
                         return;
                     };
                     // Exponential backoff doubles per consecutive failure and
@@ -92,6 +92,22 @@ impl Client {
                 }
             }))
             .detach();
+    }
+
+    /// One flush attempt of the fire loop; tests can inject failures to
+    /// exercise the retry/backoff path (same pattern as the commit batcher's
+    /// `fail_flushes`).
+    async fn coalesced_flush_attempt(&self) -> Result<(), anyhow::Error> {
+        #[cfg(test)]
+        {
+            let remaining = self.signal_flush_test_failures.load(Ordering::Acquire);
+            if remaining > 0 {
+                self.signal_flush_test_failures
+                    .store(remaining - 1, Ordering::Release);
+                anyhow::bail!("injected coalesced-flush failure");
+            }
+        }
+        self.flush_signal_cache_batch_safe().await
     }
 
     #[cfg(test)]
@@ -163,6 +179,36 @@ mod tests {
         assert!(
             !client.signal_flush_is_pending(),
             "the fire must clear the pending flag"
+        );
+    }
+
+    /// Failed attempts re-arm and back off instead of dropping the dirty
+    /// state: with 2 injected failures, the fire must consume both error
+    /// attempts and still persist the pre-existing dirty entry on the third.
+    #[tokio::test]
+    async fn failed_fire_retries_until_the_dirty_entry_persists() {
+        use std::sync::atomic::Ordering;
+
+        let client = crate::test_utils::create_test_client().await;
+        let addr = dirty_session(&client, "15550004001");
+        client
+            .signal_flush_test_failures
+            .store(2, Ordering::Release);
+
+        client.schedule_signal_flush().await;
+
+        // Success only comes after both injected failures are consumed by the
+        // retry loop (25 + 50 ms of backoff), proving the error path re-armed
+        // rather than stranding the dirty entry.
+        wait_for_backend_session(&client, &addr).await;
+        assert_eq!(
+            client.signal_flush_test_failures.load(Ordering::Acquire),
+            0,
+            "the retry loop must have consumed every injected failure"
+        );
+        assert!(
+            !client.signal_flush_is_pending(),
+            "the successful retry must clear the pending flag"
         );
     }
 

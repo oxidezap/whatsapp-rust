@@ -241,6 +241,8 @@ impl Client {
             passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
             passkey_opening: AtomicBool::new(false),
             signal_flush_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            signal_flush_test_failures: AtomicU32::new(0),
             custom_enc_handlers: std::sync::OnceLock::new(),
             inbound_durability_hook: std::sync::OnceLock::new(),
             retry_admission: std::sync::OnceLock::new(),
