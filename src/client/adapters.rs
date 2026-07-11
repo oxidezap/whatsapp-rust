@@ -68,6 +68,19 @@ impl Client {
             .ok_or(ClientError::NotConnected)
     }
 
+    /// Force any pending write-behind Signal cache state to the backend and
+    /// wait for it to complete.
+    ///
+    /// Live sends and receives schedule a coalesced flush (see
+    /// `signal_flush.rs`) rather than writing synchronously, so durable
+    /// storage lags the in-memory cache by up to one debounce window. Callers
+    /// that need read-after-write durability on the backend — e.g. before
+    /// inspecting persisted session state, or ahead of a non-graceful
+    /// shutdown — use this to settle it deterministically.
+    pub async fn flush_pending_signal_state(&self) -> Result<(), anyhow::Error> {
+        self.flush_signal_cache_batch_safe().await
+    }
+
     /// Flush the in-memory signal cache to the database backend.
     /// Called after each message is decrypted or after encryption operations.
     pub(crate) async fn flush_signal_cache(&self) -> Result<(), anyhow::Error> {

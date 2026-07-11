@@ -140,15 +140,11 @@ async fn test_session_state_after_roundtrip() -> anyhow::Result<()> {
     send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "Session reply", 30).await?;
     info!("Roundtrip complete");
 
-    // Force cache flush by sending another message
-    send_and_expect_text(
-        &client_a.client,
-        &mut client_b,
-        &jid_b,
-        "Post-roundtrip flush",
-        30,
-    )
-    .await?;
+    // Settle A's write-behind Signal cache to the backend before inspecting
+    // it: a live send schedules a coalesced flush rather than writing
+    // synchronously, so a plain send-and-read races the debounce window (and
+    // its timer can slip arbitrarily under CI load).
+    client_a.client.flush_pending_signal_state().await?;
 
     // Inspect session state
     let backend = client_a.client.persistence_manager().backend();
@@ -235,6 +231,10 @@ async fn test_session_persistence() -> anyhow::Result<()> {
     )
     .await?;
     info!("First message sent: {msg_id_1}");
+
+    // Settle the coalesced send flush before reading durable state (see the
+    // roundtrip test): a live send does not write through synchronously.
+    client_a.client.flush_pending_signal_state().await?;
 
     // Session may be under PN (c.us) or LID (lid) depending on whether
     // PN→LID mapping was resolved before encryption.
