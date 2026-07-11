@@ -129,6 +129,48 @@ fn ensure_self_in_group(
     }
 }
 
+/// SKDM update data — only populated for group sends, deferred until after
+/// send_node(). This matches WhatsApp Web which only calls markHasSenderKey()
+/// after server ACK.
+struct SkdmUpdate {
+    to_str: String,
+    devices: Vec<Jid>,
+    stale_users: Vec<String>,
+}
+
+/// One send branch's result: the wire stanza plus the state the shared
+/// epilogue of `send_message_impl` consumes. Each branch runs as its own
+/// boxed future, so a DM send never pays for the group branch's frame.
+struct SendBranchOutput {
+    node: Node,
+    /// Generated `MessageContextInfo.message_secret`, persisted after send_node.
+    msg_secret: Option<[u8; 32]>,
+    /// Group sends: the identity (LID or PN) the secret must be keyed under,
+    /// matching what `<meta target_sender_jid>` echoes back.
+    group_sender_identity: Option<Jid>,
+    skdm_update: Option<SkdmUpdate>,
+    /// Single-flight for cold group sends: held from SKDM target resolution
+    /// through `update_sender_key_devices` in the epilogue so a concurrent
+    /// cold send re-resolves against the winner's warm marking.
+    distribution_guard: Option<async_lock::MutexGuardArc<()>>,
+    issue_tc_token_after_send: bool,
+    dm_phash: Option<String>,
+}
+
+impl SendBranchOutput {
+    fn stanza_only(node: Node) -> Self {
+        Self {
+            node,
+            msg_secret: None,
+            group_sender_identity: None,
+            skdm_update: None,
+            distribution_guard: None,
+            issue_tc_token_after_send: false,
+            dm_phash: None,
+        }
+    }
+}
+
 /// Options for [`Client::send_message_with_options`].
 #[derive(Debug, Clone, Default)]
 pub struct SendOptions {
@@ -656,12 +698,11 @@ impl Client {
 
         let extra_nodes =
             build_extra_stanza_nodes(&to, inferred_meta, biz, options.extra_stanza_nodes);
-        // send_message_impl's state machine is ~13 KB (the whole send path in
-        // one async fn). Boxing keeps `send_message`'s future pointer-sized, so
-        // callers embedding it in their own futures (event handlers, spawned
-        // tasks) don't inherit those 13 KB per instance; the box is allocated
-        // only when a send actually runs.
-        Box::pin(self.send_message_impl(
+        // send_message_impl now boxes each branch future itself, so its own
+        // frame (prologue + epilogue) embeds here without a second box; the
+        // shim's Box::pin above still keeps `send_message`'s future
+        // pointer-sized for callers embedding it in their own futures.
+        self.send_message_impl(
             to,
             &message,
             Some(request_id),
@@ -670,7 +711,7 @@ impl Client {
             edit,
             extra_nodes,
             stanza_type_override,
-        ))
+        )
         .await
         .map_err(SendError::from_anyhow)?;
         Ok(result)
@@ -1158,13 +1199,22 @@ impl Client {
     /// for the stanza, avoiding a redundant `resolve_devices` call and preventing
     /// the clear-then-fail race where a transient resolver failure leaves the map empty.
     /// Mark devices as `has_key=true` after successful SKDM distribution.
+    ///
+    /// Excludes our own devices (`exclude_own_devices=true`), mirroring WA Web's
+    /// `ParticipantStore` helper, which guards every `markHasSenderKey` mutation
+    /// with `!isMeDevice`. Own companions are therefore never memoized as warm, so
+    /// `filter_skdm_targets` re-distributes their SKDM on every send — the same
+    /// reason WA Web can't orphan its own companions. Marking them here instead
+    /// would be one-directional: the retry-receipt forget path also excludes own
+    /// devices (to stop an inbound retry tearing down our own session), so an own
+    /// companion whose one SKDM encryption failed could never be re-sent one.
     async fn update_sender_key_devices(&self, group_jid: &str, devices: &[Jid]) {
         if devices.is_empty() {
             return;
         }
 
         if let Err(e) = self
-            .set_sender_key_status_for_devices(group_jid, devices, true, false)
+            .set_sender_key_status_for_devices(group_jid, devices, true, true)
             .await
         {
             log::warn!(
@@ -1354,31 +1404,146 @@ impl Client {
         // itself is generated inside prepare_dm/group_stanza, not on `message`,
         // so it's threaded back out via PreparedStanza.message_secret below).
         let outbound_id_clone = request_id.clone();
-        let mut outbound_msg_secret: Option<[u8; 32]> = None;
-        // Group prepares pick LID or PN based on group addressing_mode;
-        // capture it so the persisted secret keys match what
-        // `<meta target_sender_jid>` echoes back. For DMs we resolve from
-        // chat.server (LID for bot, PN otherwise) after send_node succeeds.
-        let mut outbound_group_sender_identity: Option<Jid> = None;
-
-        // SKDM update data — only populated for group sends, deferred until after send_node().
-        // This matches WhatsApp Web which only calls markHasSenderKey() after server ACK.
-        struct SkdmUpdate {
-            to_str: String,
-            devices: Vec<Jid>,
-            stale_users: Vec<String>,
-        }
-        let mut skdm_update: Option<SkdmUpdate> = None;
-        // Single-flight for cold group sends: held from SKDM target resolution
-        // through `update_sender_key_devices` (bottom of this function) so a
-        // concurrent cold send re-resolves against the winner's warm marking
-        // instead of redoing the full per-member fan-out. None on warm sends.
-        let mut distribution_guard: Option<async_lock::MutexGuardArc<()>> = None;
-        let mut should_issue_tc_token_after_send = false;
         let tc_issue_target = to.clone();
 
-        let mut dm_phash: Option<String> = None;
-        let stanza_to_send: wacore_binary::Node = if peer && !to.is_group() {
+        // Dispatch to a concrete boxed future per branch: this function's own
+        // frame stays small (prologue + epilogue), and a DM send never
+        // allocates the group branch's state machine, which dominated the old
+        // single-future layout.
+        let SendBranchOutput {
+            node: stanza_to_send,
+            msg_secret: outbound_msg_secret,
+            group_sender_identity: outbound_group_sender_identity,
+            skdm_update,
+            distribution_guard,
+            issue_tc_token_after_send: should_issue_tc_token_after_send,
+            dm_phash,
+        } = if peer && !to.is_group() {
+            Box::pin(self.send_peer_branch(to, message, request_id)).await?
+        } else if to.is_group() {
+            Box::pin(self.send_group_branch(
+                to,
+                message,
+                request_id,
+                force_key_distribution,
+                edit,
+                &extra_stanza_nodes,
+            ))
+            .await?
+        } else {
+            Box::pin(self.send_dm_branch(
+                to,
+                message,
+                request_id,
+                edit,
+                extra_stanza_nodes,
+                is_status_addon,
+            ))
+            .await?
+        };
+
+        let ack = if let Some(phash) = dm_phash
+            && let Some(msg_id) = stanza_to_send
+                .attrs()
+                .optional_string("id")
+                .map(|s| s.into_owned())
+        {
+            let rx = self.register_ack_waiter(&msg_id);
+            Some((rx, phash, msg_id))
+        } else {
+            None
+        };
+
+        // Server expects the outer `to` as the broadcast chat even though
+        // encryption targeted the author's devices (mirrors incoming `from`).
+        let mut stanza_to_send = stanza_to_send;
+        if is_status_addon {
+            stanza_to_send.attrs.insert("to", Jid::status_broadcast());
+        }
+        if let Some(t) = stanza_type_override {
+            stanza_to_send.attrs.insert("type", t.as_wire());
+        }
+
+        if let Err(e) = self.send_node(stanza_to_send).await {
+            if let Some((_, _, ref msg_id)) = ack {
+                self.response_waiters_guard().remove(msg_id);
+            }
+            return Err(e.into());
+        }
+
+        if let Some(secret) = outbound_msg_secret.as_ref() {
+            let sender = match outbound_group_sender_identity {
+                Some(s) => Some(s),
+                None => self.dm_sender_identity_for(&tc_issue_target).await,
+            };
+            if let Some(sender) = sender {
+                let is_bot_chat = tc_issue_target.is_bot();
+                let class = wacore::msg_secret::classify(message, is_bot_chat);
+                self.persist_outbound_msg_secret(
+                    &tc_issue_target,
+                    &sender,
+                    &outbound_id_clone,
+                    secret,
+                    class,
+                )
+                .await;
+            }
+        }
+
+        if let Some((rx, phash, msg_id)) = ack {
+            // Group sends also invalidate group cache on mismatch — server's
+            // participant set diverged, the next send needs a fresh query.
+            let invalidate_group = tc_issue_target.is_group();
+            self.spawn_phash_validation(
+                rx,
+                phash,
+                tc_issue_target.clone(),
+                invalidate_group,
+                msg_id,
+            );
+        }
+
+        if let Some(update) = skdm_update {
+            self.update_sender_key_devices(&update.to_str, &update.devices)
+                .await;
+            for user in &update.stale_users {
+                self.invalidate_device_cache(user).await;
+            }
+        }
+        // Warm marking is visible; a waiting cold send may now re-resolve.
+        drop(distribution_guard);
+
+        // Flush cached Signal state to DB after encryption
+        self.flush_signal_cache_batch_safe_logged("send_message_impl", None)
+            .await;
+
+        // Issue new tc token after send if a bucket boundary was crossed.
+        // Fire-and-forget so send_message returns without waiting for the IQ
+        if should_issue_tc_token_after_send {
+            if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
+                let target = tc_issue_target;
+                self.runtime
+                    .spawn(Box::pin(async move {
+                        client.issue_tc_token_after_send(&target).await;
+                    }))
+                    .detach();
+            } else {
+                log::debug!(target: "Client/TcToken", "Skipping fire-and-forget issuance: client dropped");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Peer branch of [`Self::send_message_impl`]: own-device sync messages,
+    /// never groups.
+    async fn send_peer_branch(
+        &self,
+        to: Jid,
+        message: &wa::Message,
+        request_id: String,
+    ) -> Result<SendBranchOutput, anyhow::Error> {
+        let node = {
             // Peer messages are only valid for individual users, not groups
             // Resolve encryption JID and acquire lock ONLY for encryption
             let encryption_jid = self.resolve_encryption_jid(&to).await;
@@ -1400,7 +1565,27 @@ impl Client {
                 device_snapshot.account.as_deref(),
             )
             .await?
-        } else if to.is_group() {
+        };
+        Ok(SendBranchOutput::stanza_only(node))
+    }
+
+    /// Group branch of [`Self::send_message_impl`]: sender-key encryption,
+    /// SKDM distribution and the cold/rotation single-flight.
+    async fn send_group_branch(
+        &self,
+        to: Jid,
+        message: &wa::Message,
+        request_id: String,
+        force_key_distribution: bool,
+        edit: Option<crate::types::message::EditAttribute>,
+        extra_stanza_nodes: &[Node],
+    ) -> Result<SendBranchOutput, anyhow::Error> {
+        // Every arm of the prepare match below assigns these three.
+        let outbound_msg_secret: Option<[u8; 32]>;
+        let outbound_group_sender_identity: Option<Jid>;
+        let skdm_update: Option<SkdmUpdate>;
+        let mut distribution_guard: Option<async_lock::MutexGuardArc<()>> = None;
+        let node = {
             // No send-level lock: encrypt_group_message serializes the
             // sender-key chain advance per (group, sender) at the cipher.
             let group_info = self.groups().query_info(&to).await?;
@@ -1586,7 +1771,7 @@ impl Client {
                 skdm_target_devices,
                 all_devices_for_phash,
                 edit.clone(),
-                &extra_stanza_nodes,
+                extra_stanza_nodes,
                 shared_content.clone(),
             )
             .await
@@ -1668,7 +1853,7 @@ impl Client {
                             retry_targets,
                             retry_all,
                             edit.clone(),
-                            &extra_stanza_nodes,
+                            extra_stanza_nodes,
                             shared_content.clone(),
                         )
                         .await?;
@@ -1686,7 +1871,31 @@ impl Client {
                     }
                 }
             }
-        } else {
+        };
+        Ok(SendBranchOutput {
+            node,
+            msg_secret: outbound_msg_secret,
+            group_sender_identity: outbound_group_sender_identity,
+            skdm_update,
+            distribution_guard,
+            issue_tc_token_after_send: false,
+            dm_phash: None,
+        })
+    }
+
+    /// DM branch of [`Self::send_message_impl`]: pairwise Signal encryption
+    /// with device fan-out (also used by status-reaction add-ons).
+    async fn send_dm_branch(
+        &self,
+        to: Jid,
+        message: &wa::Message,
+        request_id: String,
+        edit: Option<crate::types::message::EditAttribute>,
+        extra_stanza_nodes: Vec<Node>,
+        is_status_addon: bool,
+    ) -> Result<SendBranchOutput, anyhow::Error> {
+        let mut should_issue_tc_token_after_send = false;
+        let prepared = {
             // Per-device locking to match decrypt path (message.rs:684),
             // preventing ratchet desync on concurrent send/receive.
 
@@ -1856,7 +2065,7 @@ impl Client {
 
             let mut stores = store_adapter.as_signal_stores();
 
-            let prepared = wacore::send::prepare_dm_stanza(
+            wacore::send::prepare_dm_stanza(
                 &*self.runtime,
                 &mut stores,
                 self,
@@ -1871,103 +2080,17 @@ impl Client {
                 all_dm_jids,
                 shared_content,
             )
-            .await?;
-            dm_phash = prepared.phash;
-            outbound_msg_secret = prepared.message_secret;
-            prepared.node
+            .await?
         };
-
-        let ack = if let Some(phash) = dm_phash
-            && let Some(msg_id) = stanza_to_send
-                .attrs()
-                .optional_string("id")
-                .map(|s| s.into_owned())
-        {
-            let rx = self.register_ack_waiter(&msg_id);
-            Some((rx, phash, msg_id))
-        } else {
-            None
-        };
-
-        // Server expects the outer `to` as the broadcast chat even though
-        // encryption targeted the author's devices (mirrors incoming `from`).
-        let mut stanza_to_send = stanza_to_send;
-        if is_status_addon {
-            stanza_to_send.attrs.insert("to", Jid::status_broadcast());
-        }
-        if let Some(t) = stanza_type_override {
-            stanza_to_send.attrs.insert("type", t.as_wire());
-        }
-
-        if let Err(e) = self.send_node(stanza_to_send).await {
-            if let Some((_, _, ref msg_id)) = ack {
-                self.response_waiters_guard().remove(msg_id);
-            }
-            return Err(e.into());
-        }
-
-        if let Some(secret) = outbound_msg_secret.as_ref() {
-            let sender = match outbound_group_sender_identity {
-                Some(s) => Some(s),
-                None => self.dm_sender_identity_for(&tc_issue_target).await,
-            };
-            if let Some(sender) = sender {
-                let is_bot_chat = tc_issue_target.is_bot();
-                let class = wacore::msg_secret::classify(message, is_bot_chat);
-                self.persist_outbound_msg_secret(
-                    &tc_issue_target,
-                    &sender,
-                    &outbound_id_clone,
-                    secret,
-                    class,
-                )
-                .await;
-            }
-        }
-
-        if let Some((rx, phash, msg_id)) = ack {
-            // Group sends also invalidate group cache on mismatch — server's
-            // participant set diverged, the next send needs a fresh query.
-            let invalidate_group = tc_issue_target.is_group();
-            self.spawn_phash_validation(
-                rx,
-                phash,
-                tc_issue_target.clone(),
-                invalidate_group,
-                msg_id,
-            );
-        }
-
-        if let Some(update) = skdm_update {
-            self.update_sender_key_devices(&update.to_str, &update.devices)
-                .await;
-            for user in &update.stale_users {
-                self.invalidate_device_cache(user).await;
-            }
-        }
-        // Warm marking is visible; a waiting cold send may now re-resolve.
-        drop(distribution_guard);
-
-        // Flush cached Signal state to DB after encryption
-        self.flush_signal_cache_batch_safe_logged("send_message_impl", None)
-            .await;
-
-        // Issue new tc token after send if a bucket boundary was crossed.
-        // Fire-and-forget so send_message returns without waiting for the IQ
-        if should_issue_tc_token_after_send {
-            if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
-                let target = tc_issue_target;
-                self.runtime
-                    .spawn(Box::pin(async move {
-                        client.issue_tc_token_after_send(&target).await;
-                    }))
-                    .detach();
-            } else {
-                log::debug!(target: "Client/TcToken", "Skipping fire-and-forget issuance: client dropped");
-            }
-        }
-
-        Ok(())
+        Ok(SendBranchOutput {
+            node: prepared.node,
+            msg_secret: prepared.message_secret,
+            group_sender_identity: None,
+            skdm_update: None,
+            distribution_guard: None,
+            issue_tc_token_after_send: should_issue_tc_token_after_send,
+            dm_phash: prepared.phash,
+        })
     }
 
     /// Persist a generated `MessageContextInfo.message_secret` keyed by
@@ -2011,7 +2134,7 @@ impl Client {
         };
         // Same write-behind buffer as inbound captures: visible immediately,
         // flushed off the send path (msmsg replies read buffer-first).
-        self.msg_secret_buffer.queue(vec![entry]).await;
+        self.msg_secret_buffer.queue_one(entry).await;
     }
 
     /// Decide the identity (LID vs PN) under which an outbound DM's
@@ -2906,6 +3029,61 @@ mod tests {
             needs.len(),
             1,
             "absent primary is cold, companion redistributes"
+        );
+    }
+
+    /// End-to-end: after a send marks its SKDM targets, our own companion is NOT
+    /// memoized (WA Web `!isMeDevice` guard on `markHasSenderKey`), so the next send
+    /// re-distributes its SKDM — it can't be orphaned by a one-off encryption
+    /// failure (the retry/forget path also excludes own devices). An external member
+    /// stays warm and is not re-targeted.
+    #[tokio::test]
+    async fn own_companion_is_never_memoized_so_it_redistributes_every_send() {
+        use crate::sender_key_device_cache::SenderKeyDeviceMap;
+
+        let client = crate::test_utils::create_test_client().await;
+        let own_lid = Jid::from_str("888000888000888:1@lid").unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+
+        let group = "120363000000000009@g.us";
+        let own_companion = Jid::from_str("888000888000888:5@lid").unwrap();
+        let member = Jid::from_str("111000111000111@lid").unwrap();
+
+        // A send marks its full target set warm (own companion + external member).
+        client
+            .update_sender_key_devices(group, &[own_companion.clone(), member.clone()])
+            .await;
+
+        // Persisted: the external member is warm; our own companion was skipped.
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        let map = SenderKeyDeviceMap::from_db_rows(&rows);
+        assert_eq!(
+            map.device_has_key("111000111000111", 0),
+            Some(true),
+            "external member is memoized warm"
+        );
+        assert_eq!(
+            map.device_has_key("888000888000888", 5),
+            None,
+            "own companion is never memoized (re-distributed every send)"
+        );
+
+        // Next send: only the own companion is re-targeted; the member stays warm.
+        let devices = [own_companion.clone(), member];
+        let needs = client.filter_skdm_targets(group, &devices, &map, &own_lid);
+        assert_eq!(
+            needs,
+            vec![own_companion],
+            "own companion redistributes; external member stays warm"
         );
     }
 

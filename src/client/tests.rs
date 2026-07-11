@@ -143,7 +143,7 @@ async fn test_ack_waiter_resolves() {
         .build();
 
     // 3. Handle the ack
-    let handled = client.handle_ack_response(&ack_node.as_node_ref()).await;
+    let handled = client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack_node)));
     assert!(
         handled,
         "handle_ack_response should return true when waiter exists"
@@ -197,7 +197,7 @@ async fn test_ack_without_matching_waiter() {
         .build();
 
     // Should return false since there's no waiter
-    let handled = client.handle_ack_response(&ack_node.as_node_ref()).await;
+    let handled = client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack_node)));
     assert!(
         !handled,
         "handle_ack_response should return false when no waiter exists"
@@ -205,6 +205,181 @@ async fn test_ack_without_matching_waiter() {
 
     info!(
         "✅ test_ack_without_matching_waiter passed: ACK without matching waiter handled gracefully"
+    );
+}
+
+/// Round-trip a built `Node` into the raw-bytes shape `unpack()` produces
+/// from the network (marshal_ref prepends a 0x00 format byte that
+/// `OwnedNodeRef::new` does not expect).
+fn to_owned_node(node: &Node) -> wacore_binary::OwnedNodeRef {
+    wacore_binary::marshal::marshal_ref(&node.as_node_ref())
+        .and_then(|buf| wacore_binary::OwnedNodeRef::new(bytes::Bytes::from(buf).slice(1..)))
+        .expect("valid node")
+}
+
+fn owned_ack_node(id: &str) -> wacore_binary::OwnedNodeRef {
+    to_owned_node(
+        &NodeBuilder::new("ack")
+            .attr("id", id)
+            .attr("from", SERVER_JID)
+            .build(),
+    )
+}
+
+/// The Arc entry point must hand the waiter the SAME allocation it was given
+/// (no re-encode + re-parse round trip).
+#[tokio::test]
+async fn ack_arc_delivery_shares_allocation() {
+    let client = crate::test_utils::create_test_client().await;
+
+    let test_id = "ack-arc-456";
+    let (tx, rx) = oneshot::channel();
+    client
+        .response_waiters_guard()
+        .insert(test_id.to_string(), tx);
+
+    let node = Arc::new(owned_ack_node(test_id));
+    assert!(client.handle_ack_response_arc(&node));
+
+    let received = tokio::time::timeout(Duration::from_secs(1), rx)
+        .await
+        .expect("waiter should resolve")
+        .expect("sender must not drop");
+    assert!(
+        Arc::ptr_eq(&received, &node),
+        "waiter must receive the original allocation, not a re-encoded copy"
+    );
+
+    // No waiter: must report unhandled without consuming anything.
+    assert!(!client.handle_ack_response_arc(&Arc::new(owned_ack_node("ack-arc-none"))));
+}
+
+/// The owned entry point (read-loop fast path) resolves the waiter from the
+/// node it already owns.
+#[tokio::test]
+async fn ack_owned_delivery_resolves_waiter() {
+    let client = crate::test_utils::create_test_client().await;
+
+    let test_id = "ack-owned-789";
+    let (tx, rx) = oneshot::channel();
+    client
+        .response_waiters_guard()
+        .insert(test_id.to_string(), tx);
+
+    assert!(client.handle_ack_response_owned(owned_ack_node(test_id)));
+    let received = tokio::time::timeout(Duration::from_secs(1), rx)
+        .await
+        .expect("waiter should resolve")
+        .expect("sender must not drop");
+    assert!(
+        received
+            .get()
+            .get_attr("id")
+            .is_some_and(|v| v.as_str() == test_id),
+        "delivered node must carry the ack id"
+    );
+
+    assert!(!client.handle_ack_response_owned(owned_ack_node("ack-owned-none")));
+}
+
+/// Every server `<ack>` with an id dispatches an observe-only
+/// `Event::ServerAck` carrying the ack's class/from/t, independent of
+/// waiter state; a nack carries its error code. Lets consumers measure
+/// send → server-accept latency and see nack codes programmatically
+/// instead of scraping warn! logs.
+#[tokio::test]
+async fn test_ack_dispatches_server_ack_event() {
+    use wacore::types::events::{Event, EventHandler};
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client.register_handler(collector.clone() as Arc<dyn EventHandler>);
+
+    // Plain message ack (no waiter registered): event fires with the ack's
+    // class, from and server timestamp; error is None.
+    let ack_node = NodeBuilder::new("ack")
+        .attr("id", "ack-evt-1")
+        .attr("class", "message")
+        .attr("from", "123456789@s.whatsapp.net")
+        .attr("t", "1720000000")
+        .build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack_node)));
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(ack)
+                if ack.id == "ack-evt-1"
+                    && ack.class.as_deref() == Some("message")
+                    && ack.from.as_ref().is_some_and(|j| j.to_string() == "123456789@s.whatsapp.net")
+                    && ack.timestamp.is_some_and(|t| t.timestamp() == 1_720_000_000)
+                    && ack.error.is_none()
+        )),
+        "server <ack> should dispatch Event::ServerAck with class/from/t"
+    );
+
+    // Nack: the error code rides along; absent class/t stay None.
+    let nack_node = NodeBuilder::new("ack")
+        .attr("id", "ack-evt-2")
+        .attr("error", "479")
+        .attr("from", SERVER_JID)
+        .build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&nack_node)));
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(ack)
+                if ack.id == "ack-evt-2"
+                    && ack.class.is_none()
+                    && ack.timestamp.is_none()
+                    && ack.error.as_deref() == Some("479")
+        )),
+        "server nack should dispatch Event::ServerAck carrying the error code"
+    );
+
+    // An ack without an id (e.g. non-message acks) dispatches nothing.
+    let anon_ack = NodeBuilder::new("ack").attr("from", SERVER_JID).build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&anon_ack)));
+    assert_eq!(
+        collector
+            .events()
+            .iter()
+            .filter(|e| matches!(e.as_ref(), Event::ServerAck(_)))
+            .count(),
+        2,
+        "an <ack> without an id must not dispatch Event::ServerAck"
+    );
+
+    // The headline guarantee: with a waiter registered for the same id, the
+    // event STILL fires and the waiter STILL resolves — dispatch and waiter
+    // resolution are independent.
+    let (tx, rx) = oneshot::channel();
+    client
+        .response_waiters_guard()
+        .insert("ack-evt-3".to_string(), tx);
+    let waited_ack = NodeBuilder::new("ack")
+        .attr("id", "ack-evt-3")
+        .attr("class", "message")
+        .attr("from", SERVER_JID)
+        .build();
+    let handled = client.handle_ack_response_arc(&Arc::new(to_owned_node(&waited_ack)));
+    assert!(handled, "waiter for the id should have been resolved");
+    let resolved = tokio::time::timeout(Duration::from_secs(1), rx)
+        .await
+        .expect("timed out waiting for ack waiter")
+        .expect("waiter sender was dropped");
+    assert!(
+        resolved
+            .get()
+            .get_attr("id")
+            .is_some_and(|v| v.as_str() == "ack-evt-3"),
+        "waiter should receive the ack node"
+    );
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(ack) if ack.id == "ack-evt-3"
+        )),
+        "Event::ServerAck should fire even when a waiter consumes the ack"
     );
 }
 
@@ -804,6 +979,39 @@ async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
     );
 
     info!("✅ test_ensure_e2e_sessions_waits_for_offline_sync passed");
+}
+
+/// A warm session cache must satisfy the ensure without any network fetch:
+/// the client here is disconnected, so reaching the usync fetch would error.
+#[tokio::test]
+async fn ensure_sessions_warm_cache_short_circuits() {
+    use wacore::types::jid::JidExt;
+    let client = crate::test_utils::create_test_client().await;
+    let jid: Jid = "15550005555@s.whatsapp.net".parse().unwrap();
+
+    // Cold cache and disconnected: the probe misses, so the fetch runs and
+    // fails — proves the pre-filter does not silently skip unknown sessions.
+    assert!(
+        client
+            .ensure_e2e_sessions_resolved(std::slice::from_ref(&jid))
+            .await
+            .is_err(),
+        "unknown session must still attempt the fetch"
+    );
+
+    assert!(
+        client
+            .signal_cache
+            .try_put_session(
+                &jid.to_protocol_address(),
+                wacore::libsignal::protocol::SessionRecord::new_fresh(),
+            )
+            .is_ok()
+    );
+    client
+        .ensure_e2e_sessions_resolved(&[jid])
+        .await
+        .expect("cached session must satisfy ensure without network");
 }
 
 /// Integration test: Verify that the immediate session establishment does NOT
@@ -2713,6 +2921,191 @@ async fn disconnect_does_not_signal_connection_cleanup_before_outbound_flush() {
     );
 }
 
+fn receipt_test_info(id: &str) -> Arc<crate::types::message::MessageInfo> {
+    Arc::new(crate::types::message::MessageInfo {
+        id: id.to_string(),
+        source: crate::types::message::MessageSource {
+            chat: "15550001111@s.whatsapp.net".parse().unwrap(),
+            sender: "15550001111@s.whatsapp.net".parse().unwrap(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
+
+/// Live delivery receipts flow through the persistent worker: the receipt
+/// reaches the transport and the flush counter returns to zero afterwards.
+#[tokio::test]
+async fn delivery_receipt_worker_sends_and_releases_flush() {
+    use crate::socket::NoiseSocket;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use wacore::handshake::NoiseCipher;
+
+    struct CountingTransport {
+        sends: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::transport::Transport for CountingTransport {
+        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+    }
+
+    let client = crate::test_utils::create_test_client().await;
+    let sends = Arc::new(AtomicUsize::new(0));
+    let transport: Arc<dyn crate::transport::Transport> = Arc::new(CountingTransport {
+        sends: Arc::clone(&sends),
+    });
+    let key = [0u8; 32];
+    let noise_socket = NoiseSocket::new(
+        client.runtime.clone(),
+        Arc::clone(&transport),
+        NoiseCipher::new(&key).expect("valid key"),
+        NoiseCipher::new(&key).expect("valid key"),
+    );
+    *client.transport.lock().await = Some(transport);
+    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    client.is_connected.store(true, Ordering::Release);
+
+    client.ack_received_message(&receipt_test_info("RCPT-WORKER-1"));
+
+    let deadline = wacore::time::Instant::now() + Duration::from_secs(2);
+    while sends.load(Ordering::SeqCst) == 0 {
+        assert!(
+            wacore::time::Instant::now() < deadline,
+            "delivery receipt was never sent by the worker"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+
+    client
+        .outbound_flush
+        .flush(&*client.runtime, Duration::from_secs(1))
+        .await;
+    assert_eq!(
+        client.outbound_flush.pending(),
+        0,
+        "worker must release the flush guard after the send"
+    );
+}
+
+/// A closed flush scope (disconnect in progress) drops live receipts without
+/// leaking the flush counter — mirroring the previous spawn-per-receipt path.
+#[tokio::test]
+async fn delivery_receipt_dropped_when_flush_scope_closed() {
+    let client = crate::test_utils::create_test_client().await;
+    client.outbound_flush.close();
+
+    client.ack_received_message(&receipt_test_info("RCPT-CLOSED-1"));
+
+    assert_eq!(
+        client.outbound_flush.pending(),
+        0,
+        "closed scope must not track new receipts"
+    );
+    // The drop happens before the queue: with the scope closed nothing may be
+    // enqueued, so the lazy worker queue is never even created.
+    assert!(
+        client.delivery_receipt_queue.get().is_none(),
+        "a dropped receipt must not reach the worker queue"
+    );
+    // Finishing well under the 5s flush timeout proves nothing was tracked;
+    // the generous bound keeps this stable on oversubscribed CI runners.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .outbound_flush
+            .flush(&*client.runtime, Duration::from_secs(5)),
+    )
+    .await
+    .expect("flush must not wait when nothing was queued");
+}
+
+/// Issue #571 under the worker model: `flush()` must wait for receipts that
+/// are queued to the worker but not yet sent, including one queued behind an
+/// in-flight blocked send.
+#[tokio::test]
+async fn flush_waits_for_queued_delivery_receipts() {
+    use crate::socket::NoiseSocket;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use wacore::handshake::NoiseCipher;
+
+    struct BlockingTransport {
+        send_started: async_channel::Sender<()>,
+        release_send: async_channel::Receiver<()>,
+    }
+
+    #[async_trait]
+    impl crate::transport::Transport for BlockingTransport {
+        async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+            let _ = self.send_started.try_send(());
+            let _ = self.release_send.recv().await;
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+    }
+
+    let client = crate::test_utils::create_test_client().await;
+    let (send_started_tx, send_started_rx) = async_channel::bounded(2);
+    let (release_send_tx, release_send_rx) = async_channel::bounded(2);
+    let transport: Arc<dyn crate::transport::Transport> = Arc::new(BlockingTransport {
+        send_started: send_started_tx,
+        release_send: release_send_rx,
+    });
+    let key = [0u8; 32];
+    let noise_socket = NoiseSocket::new(
+        client.runtime.clone(),
+        Arc::clone(&transport),
+        NoiseCipher::new(&key).expect("valid key"),
+        NoiseCipher::new(&key).expect("valid key"),
+    );
+    *client.transport.lock().await = Some(transport);
+    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    client.is_connected.store(true, Ordering::Release);
+
+    client.ack_received_message(&receipt_test_info("RCPT-QUEUE-1"));
+    tokio::time::timeout(Duration::from_secs(1), send_started_rx.recv())
+        .await
+        .expect("first receipt send should start")
+        .expect("send_started sender should stay open");
+
+    // Second receipt queues behind the blocked one and must also be tracked.
+    client.ack_received_message(&receipt_test_info("RCPT-QUEUE-2"));
+    assert_eq!(
+        client.outbound_flush.pending(),
+        2,
+        "both the in-flight and the queued receipt must hold flush guards"
+    );
+
+    let flush_client = Arc::clone(&client);
+    let flush_task = tokio::spawn(async move {
+        flush_client
+            .outbound_flush
+            .flush(&*flush_client.runtime, Duration::from_secs(5))
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !flush_task.is_finished(),
+        "flush must wait while receipts are queued or in flight"
+    );
+
+    release_send_tx.send(()).await.expect("release first send");
+    release_send_tx.send(()).await.expect("release second send");
+
+    tokio::time::timeout(Duration::from_secs(2), flush_task)
+        .await
+        .expect("flush should finish once the queue drains")
+        .expect("flush task should not panic");
+    assert_eq!(client.outbound_flush.pending(), 0);
+}
+
 /// Verifies that `send_ack_for` returns an error (not silent Ok) when
 /// disconnected. This ensures the caller's `warn!` fires so dropped acks
 /// are visible in logs.
@@ -2891,11 +3284,7 @@ mod counting_alloc {
 async fn ack_miss_path_does_not_heap_allocate() {
     let client = crate::test_utils::create_test_client().await;
 
-    let ack_node = NodeBuilder::new("ack")
-        .attr("id", "3EB0A9252A8F12B7E2")
-        .attr("from", SERVER_JID)
-        .build();
-    let node_ref = ack_node.as_node_ref();
+    let node = Arc::new(owned_ack_node("3EB0A9252A8F12B7E2"));
 
     // Min-delta over many windows: sibling tests share the process-global
     // counter, but their allocations are sporadic. A per-call String shows up
@@ -2903,7 +3292,7 @@ async fn ack_miss_path_does_not_heap_allocate() {
     let mut min_delta = u64::MAX;
     for _ in 0..100 {
         let before = counting_alloc::ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
-        let handled = client.handle_ack_response(&node_ref).await;
+        let handled = client.handle_ack_response_arc(&node);
         let after = counting_alloc::ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
         assert!(!handled, "no waiter is registered for this id");
         min_delta = min_delta.min(after - before);

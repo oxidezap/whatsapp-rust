@@ -60,11 +60,14 @@ enum UserLookupKeys {
 
 impl UserLookupKeys {
     /// Returns all keys to try for lookups, in preference order.
-    fn all_keys(&self) -> Vec<&str> {
-        match self {
-            Self::LidWithPn { lid, pn } | Self::PnWithLid { lid, pn } => vec![lid, pn],
-            Self::Unknown { user } => vec![user],
-        }
+    fn all_keys(&self) -> impl Iterator<Item = &str> {
+        let (first, second) = match self {
+            Self::LidWithPn { lid, pn } | Self::PnWithLid { lid, pn } => {
+                (lid.as_str(), Some(pn.as_str()))
+            }
+            Self::Unknown { user } => (user.as_str(), None),
+        };
+        std::iter::once(first).chain(second)
     }
 
     /// Returns the canonical (preferred) key for storage.
@@ -311,7 +314,6 @@ impl Client {
         self.resolve_lookup_keys(user)
             .await
             .all_keys()
-            .into_iter()
             .map(String::from)
             .collect()
     }
@@ -329,19 +331,17 @@ impl Client {
             return true;
         }
 
-        // Borrowed `&str` keys (like get_devices_from_registry), bound once so both
-        // loops share one Vec<&str>: avoids the per-message get_lookup_keys churn.
+        // Borrowed keys avoid allocating the owned lookup variants on this hot path.
         let lookup = self.resolve_lookup_keys(user).await;
-        let keys = lookup.all_keys();
 
-        for &key in &keys {
+        for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
                 return record.devices.iter().any(|d| d.device_id == device_id);
             }
         }
 
         let backend = self.persistence_manager.backend();
-        for &key in &keys {
+        for key in lookup.all_keys() {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
                     let has_device = record.devices.iter().any(|d| d.device_id == device_id);
@@ -397,7 +397,6 @@ impl Client {
                 Arc::new(record_for_cache),
                 lookup
                     .all_keys()
-                    .into_iter()
                     .chain(std::iter::once(original_user.as_str())),
             )
             .await;
@@ -464,7 +463,6 @@ impl Client {
                     Arc::new(record_for_cache),
                     lookup
                         .all_keys()
-                        .into_iter()
                         .chain(std::iter::once(original_user.as_str())),
                 )
                 .await;

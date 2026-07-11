@@ -159,13 +159,29 @@ impl Client {
                                         // - Critical nodes (success/failure/stream:error): inline, required for state
                                         // - Message nodes: inline, preserves arrival order for per-chat queues
                                         //   (MessageHandler just enqueues + ACKs, heavy crypto runs in workers)
+                                        // - Acks/receipts: inline when unobserved; retry work detaches itself
                                         // - ib (in-band): inline, ensures offline sync tracking (expected count)
                                         //   is set up before offline messages are processed
                                         // - Everything else: spawned concurrently for parallelism
-                                        let process_inline = matches!(
-                                            node.tag(),
-                                            "success" | "failure" | "stream:error" | "message" | "ib"
-                                        );
+                                        let process_inline = match node.tag() {
+                                            "success" | "failure" | "stream:error" | "message" | "ib" => true,
+                                            // Preserve concurrent callback behavior when an app
+                                            // observes these events or every raw node.
+                                            "receipt" => {
+                                                !self.synchronous_ack
+                                                    && !self.raw_node_forwarding.load(Ordering::Relaxed)
+                                                    && !self.core.event_bus.has_handler_for(
+                                                        wacore::types::events::EventKind::Receipt,
+                                                    )
+                                            }
+                                            "ack" => {
+                                                !self.raw_node_forwarding.load(Ordering::Relaxed)
+                                                    && !self.core.event_bus.has_handler_for(
+                                                        wacore::types::events::EventKind::ServerAck,
+                                                    )
+                                            }
+                                            _ => false,
+                                        };
 
                                         if process_inline {
                                             self.process_decrypted_node(node).await;
@@ -284,6 +300,19 @@ impl Client {
         self: &Arc<Self>,
         node: wacore_binary::OwnedNodeRef,
     ) {
+        // ACKs need shared ownership only for opt-in raw/node observers. The
+        // usual response-waiter path borrows the node and can skip the Arc.
+        if node.tag() == "ack"
+            && !self.raw_node_forwarding.load(Ordering::Relaxed)
+            && self.node_waiter_count.load(Ordering::Acquire) == 0
+            && !self.offline_sync_metrics.active.load(Ordering::Acquire)
+        {
+            use wacore::xml::DisplayableNodeRef;
+            debug!(target: "Client/Recv", "{}", DisplayableNodeRef(node.get()));
+            self.handle_ack_response_owned(node);
+            return;
+        }
+
         // Wrap in Arc once - all handlers will share this same allocation
         let node_arc = Arc::new(node);
         self.process_node(node_arc).await;
@@ -438,13 +467,32 @@ impl Client {
             return;
         }
 
-        // Dispatch to appropriate handler using the router
-        // Clone Arc (cheap - just reference count) not the Node itself
-        if !self
-            .stanza_router
-            .dispatch(self.clone(), Arc::clone(&node), &mut cancelled)
-            .await
-        {
+        // Bypass async_trait's boxed future for the hot built-in handlers while
+        // retaining router registration for direct router callers.
+        let handled = match nr.tag.as_ref() {
+            "ack" => {
+                self.handle_ack_response_arc(&node);
+                true
+            }
+            "receipt" => {
+                self.handle_receipt_inline(Arc::clone(&node));
+                true
+            }
+            "message" => {
+                crate::handlers::message::MessageHandler::handle_inline(
+                    self.clone(),
+                    Arc::clone(&node),
+                    &mut cancelled,
+                )
+                .await
+            }
+            _ => {
+                self.stanza_router
+                    .dispatch(self.clone(), Arc::clone(&node), &mut cancelled)
+                    .await
+            }
+        };
+        if !handled {
             warn!(
                 "Received unknown top-level node: {}",
                 DisplayableNodeRef(nr)
@@ -1092,20 +1140,57 @@ impl Client {
         })).detach();
     }
 
-    /// Handles incoming `<ack/>` stanzas by resolving pending response waiters.
-    ///
-    /// If an ack with an ID that matches a pending task in `response_waiters`,
-    /// the task is resolved and the function returns `true`. Otherwise, returns `false`.
+    /// Ack entry point for callers that already share the node: the waiter
+    /// receives an `Arc` clone instead of a ~1 KB re-encode + re-parse.
+    pub(crate) fn handle_ack_response_arc(&self, node: &Arc<wacore_binary::OwnedNodeRef>) -> bool {
+        let Some(waiter) = self.take_ack_waiter(node.get()) else {
+            return false;
+        };
+        if let Err(rejected) = waiter.send(Arc::clone(node)) {
+            Self::warn_ack_waiter_dropped(&rejected);
+        }
+        true
+    }
+
+    /// Ack entry point for the read-loop fast path, which owns the node: the
+    /// `Arc` is built from the existing allocation, and only when a waiter is
+    /// actually waiting.
+    pub(crate) fn handle_ack_response_owned(&self, node: wacore_binary::OwnedNodeRef) -> bool {
+        let Some(waiter) = self.take_ack_waiter(node.get()) else {
+            return false;
+        };
+        if let Err(rejected) = waiter.send(Arc::new(node)) {
+            Self::warn_ack_waiter_dropped(&rejected);
+        }
+        true
+    }
+
+    fn warn_ack_waiter_dropped(rejected: &Arc<wacore_binary::OwnedNodeRef>) {
+        warn!(
+            target: "Client/Ack",
+            "Failed to send ACK response to waiter for ID {:?}. Receiver was likely dropped.",
+            rejected.get().get_attr("id")
+        );
+    }
+
+    /// Shared ack prologue: log nack codes, dispatch `ServerAck` when
+    /// observed, and pull the matching response waiter out of the map.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.conn.ack_response", level = "debug", skip_all)
     )]
-    pub(crate) async fn handle_ack_response(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+    fn take_ack_waiter(
+        &self,
+        node: &wacore_binary::NodeRef<'_>,
+    ) -> Option<futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>> {
+        let ack_id = node.get_attr("id");
+        let ack_error = node.get_attr("error");
+
         // Surface server nack codes for diagnosability. A nacked send still
         // resolves Ok to the caller, so without this the failure is invisible.
-        if let Some(error_code) = node.get_attr("error") {
+        if let Some(error_code) = &ack_error {
             let code = error_code.as_str();
-            let id = node.get_attr("id").map(|v| v.as_str());
+            let id = ack_id.as_ref().map(|v| v.as_str());
             match code.as_ref() {
                 "463" => {
                     warn!(
@@ -1136,28 +1221,32 @@ impl Client {
             }
         }
 
-        if let Some(id) = node.get_attr("id").map(|v| v.as_str())
-            && let Some(waiter) = self.response_waiters_guard().remove(id.as_ref())
+        // Dispatched before waiter resolution; gated on interest so the hot path
+        // allocates nothing when nobody is listening.
+        if self
+            .core
+            .event_bus
+            .has_handler_for(wacore::types::events::EventKind::ServerAck)
+            && let Some(id) = &ack_id
         {
-            // ACK responses are infrequent; re-encode into OwnedNodeRef for the channel.
-            // marshal_ref prepends a leading 0x00 format byte; OwnedNodeRef::new expects raw
-            // protocol bytes without it, matching what unpack() produces from the network.
-            // slice(1..) drops that byte as a zero-copy view instead of re-allocating.
-            match wacore_binary::marshal::marshal_ref(node).and_then(|buf| {
-                wacore_binary::OwnedNodeRef::new(bytes::Bytes::from(buf).slice(1..))
-            }) {
-                Ok(onr) => {
-                    if waiter.send(Arc::new(onr)).is_err() {
-                        warn!(target: "Client/Ack", "Failed to send ACK response to waiter for ID {id}. Receiver was likely dropped.");
-                    }
-                }
-                Err(e) => {
-                    warn!(target: "Client/Ack", "Failed to re-encode ACK node for waiter: {e}");
-                }
-            }
-            return true;
+            let ack = wacore::types::events::ServerAck::builder()
+                .id(id.as_str().to_string())
+                .maybe_class(node.get_attr("class").map(|v| v.as_str().to_string()))
+                .maybe_from(node.get_attr("from").and_then(|v| v.as_str().parse().ok()))
+                .maybe_timestamp(
+                    node.get_attr("t")
+                        .and_then(|v| v.as_str().parse::<i64>().ok())
+                        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0)),
+                )
+                .maybe_error(ack_error.as_ref().map(|v| v.as_str().to_string()))
+                .build();
+            self.core
+                .event_bus
+                .dispatch(wacore::types::events::Event::ServerAck(ack));
         }
-        false
+
+        let id = ack_id.map(|v| v.as_str())?;
+        self.response_waiters_guard().remove(id.as_ref())
     }
 
     #[cfg_attr(
@@ -1197,12 +1286,14 @@ impl Client {
             self.enable_auto_reconnect.store(false, Ordering::Relaxed);
 
             let event = if conflict_type == "replaced" {
-                Event::StreamReplaced(crate::types::events::StreamReplaced)
+                Event::StreamReplaced(crate::types::events::StreamReplaced::builder().build())
             } else {
-                Event::LoggedOut(crate::types::events::LoggedOut {
-                    on_connect: false,
-                    reason: ConnectFailureReason::LoggedOut,
-                })
+                Event::LoggedOut(
+                    crate::types::events::LoggedOut::builder()
+                        .on_connect(false)
+                        .reason(ConnectFailureReason::LoggedOut)
+                        .build(),
+                )
             };
             self.core.event_bus.dispatch(event);
             should_disconnect = true;
@@ -1220,10 +1311,10 @@ impl Client {
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::LoggedOut(
-                        crate::types::events::LoggedOut {
-                            on_connect: false,
-                            reason: ConnectFailureReason::LoggedOut,
-                        },
+                        crate::types::events::LoggedOut::builder()
+                            .on_connect(false)
+                            .reason(ConnectFailureReason::LoggedOut)
+                            .build(),
                     ));
                     should_disconnect = true;
                 }
@@ -1232,10 +1323,10 @@ impl Client {
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::LoggedOut(
-                        crate::types::events::LoggedOut {
-                            on_connect: false,
-                            reason: ConnectFailureReason::LoggedOut,
-                        },
+                        crate::types::events::LoggedOut::builder()
+                            .on_connect(false)
+                            .reason(ConnectFailureReason::LoggedOut)
+                            .build(),
                     ));
                     should_disconnect = true;
                 }
@@ -1243,9 +1334,9 @@ impl Client {
                     info!("Got 409 stream error (conflict). Another session replaced this one.");
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
-                    self.core
-                        .event_bus
-                        .dispatch(Event::StreamReplaced(crate::types::events::StreamReplaced));
+                    self.core.event_bus.dispatch(Event::StreamReplaced(
+                        crate::types::events::StreamReplaced::builder().build(),
+                    ));
                     should_disconnect = true;
                 }
                 "429" => {
@@ -1305,10 +1396,10 @@ impl Client {
                         warn!("Unknown stream error: {}", DisplayableNodeRef(node));
                     }
                     self.core.event_bus.dispatch(Event::StreamError(
-                        crate::types::events::StreamError {
-                            code: code.to_string(),
-                            raw: Some(node.to_owned()),
-                        },
+                        crate::types::events::StreamError::builder()
+                            .code(code.to_string())
+                            .raw(node.to_owned())
+                            .build(),
                     ));
                 }
             }
@@ -1360,10 +1451,10 @@ impl Client {
             self.core
                 .event_bus
                 .dispatch(wacore::types::events::Event::LoggedOut(
-                    crate::types::events::LoggedOut {
-                        on_connect: true,
-                        reason,
-                    },
+                    crate::types::events::LoggedOut::builder()
+                        .on_connect(true)
+                        .reason(reason)
+                        .build(),
                 ));
         } else if let ConnectFailureReason::TempBanned = reason {
             let ban_code = attrs.optional_u64("code").unwrap_or(0) as i32;
@@ -1374,29 +1465,25 @@ impl Client {
                 "Temporary ban connect failure: {}",
                 DisplayableNodeRef(node)
             );
-            self.core
-                .event_bus
-                .dispatch(Event::TemporaryBan(crate::types::events::TemporaryBan {
-                    code: crate::types::events::TempBanReason::from(ban_code),
-                    expire: expire_duration,
-                }));
+            self.core.event_bus.dispatch(Event::TemporaryBan(
+                crate::types::events::TemporaryBan::builder()
+                    .code(crate::types::events::TempBanReason::from(ban_code))
+                    .expire(expire_duration)
+                    .build(),
+            ));
         } else if let ConnectFailureReason::ClientOutdated = reason {
             error!("Client is outdated and was rejected by server.");
-            self.core
-                .event_bus
-                .dispatch(Event::ClientOutdated(crate::types::events::ClientOutdated));
+            self.core.event_bus.dispatch(Event::ClientOutdated(
+                crate::types::events::ClientOutdated::builder().build(),
+            ));
         } else {
             warn!("Unknown connect failure: {}", DisplayableNodeRef(node));
             self.core.event_bus.dispatch(Event::ConnectFailure(
-                crate::types::events::ConnectFailure {
-                    reason,
-                    message: attrs
-                        .optional_string("message")
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_string(),
-                    raw: Some(node.to_owned()),
-                },
+                crate::types::events::ConnectFailure::builder()
+                    .reason(reason)
+                    .maybe_message(attrs.optional_string("message").map(|m| m.into_owned()))
+                    .raw(node.to_owned())
+                    .build(),
             ));
         }
     }

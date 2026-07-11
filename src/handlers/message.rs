@@ -15,19 +15,12 @@ const MAX_MESSAGE_DELAY_MS: u64 = 20_000;
 #[derive(Default)]
 pub struct MessageHandler;
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl StanzaHandler for MessageHandler {
-    fn tag(&self) -> &'static str {
-        "message"
-    }
-
+impl MessageHandler {
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.recv.message_enqueue", level = "debug", skip_all)
     )]
-    async fn handle(
-        &self,
+    pub(crate) async fn handle_inline(
         client: Arc<Client>,
         node: Arc<wacore_binary::OwnedNodeRef>,
         cancelled: &mut bool,
@@ -59,6 +52,23 @@ impl StanzaHandler for MessageHandler {
         }
 
         true
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl StanzaHandler for MessageHandler {
+    fn tag(&self) -> &'static str {
+        "message"
+    }
+
+    async fn handle(
+        &self,
+        client: Arc<Client>,
+        node: Arc<wacore_binary::OwnedNodeRef>,
+        cancelled: &mut bool,
+    ) -> bool {
+        Self::handle_inline(client, node, cancelled).await
     }
 }
 

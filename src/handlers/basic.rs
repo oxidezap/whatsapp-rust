@@ -99,7 +99,7 @@ impl StanzaHandler for AckHandler {
         node: Arc<OwnedNodeRef>,
         _cancelled: &mut bool,
     ) -> bool {
-        client.handle_ack_response(node.get()).await;
+        client.handle_ack_response_arc(&node);
         true
     }
 }

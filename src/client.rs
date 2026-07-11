@@ -678,6 +678,15 @@ pub struct Client {
     /// so in-flight delivery receipts aren't dropped with `NotConnected`
     /// (issue #571).
     pub(crate) outbound_flush: Arc<crate::flush_scope::FlushScope>,
+    /// Feed of the persistent delivery-receipt worker (spawned on first use).
+    /// Queued items carry a [`crate::flush_scope::FlushGuard`] so `flush()`
+    /// still waits for receipts that are queued but not yet sent.
+    pub(crate) delivery_receipt_queue: std::sync::OnceLock<
+        async_channel::Sender<(
+            Arc<crate::types::message::MessageInfo>,
+            crate::flush_scope::FlushGuard,
+        )>,
+    >,
     /// Contacts with active presence subscriptions that must be re-subscribed on reconnect.
     pub(crate) presence_subscriptions: Arc<async_lock::Mutex<HashSet<Jid>>>,
     /// Metrics for granular offline sync logging

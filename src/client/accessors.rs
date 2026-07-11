@@ -323,11 +323,11 @@ impl Client {
             .await;
 
         self.core.event_bus.dispatch(Event::SelfPushNameUpdated(
-            crate::types::events::SelfPushNameUpdated {
-                from_server: true,
-                old_name,
-                new_name: new_name.clone(),
-            },
+            crate::types::events::SelfPushNameUpdated::builder()
+                .from_server(true)
+                .old_name(old_name)
+                .new_name(new_name.clone())
+                .build(),
         ));
 
         let client_clone = self.clone();

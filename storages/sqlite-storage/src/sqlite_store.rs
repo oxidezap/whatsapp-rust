@@ -51,7 +51,7 @@ fn is_retriable_sqlite_error(error: &DieselError) -> bool {
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
-type SqlitePool = Pool<ConnectionManager<SqliteConnection>>;
+pub(crate) type SqlitePool = Pool<ConnectionManager<SqliteConnection>>;
 
 /// Row representation for the `device` table.
 ///

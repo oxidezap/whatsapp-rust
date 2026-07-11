@@ -46,15 +46,16 @@ impl Client {
         // reach here without the processing permit, so enqueueing could
         // straddle the drain→live transition.
         if info.source.chat.is_newsletter() {
-            self.core
-                .event_bus
-                .dispatch(Event::Messages(wacore::types::events::MessageBatch {
-                    messages: Arc::from([wacore::types::events::InboundMessage {
-                        message: dispatch_msg,
-                        info,
-                    }]),
-                    origin: wacore::types::events::BatchOrigin::Live,
-                }));
+            self.core.event_bus.dispatch(Event::Messages(
+                wacore::types::events::MessageBatch::builder()
+                    .messages(Arc::from([wacore::types::events::InboundMessage::builder(
+                    )
+                    .message(dispatch_msg)
+                    .info(info)
+                    .build()]))
+                    .origin(wacore::types::events::BatchOrigin::Live)
+                    .build(),
+            ));
             return;
         }
 
@@ -62,10 +63,12 @@ impl Client {
         // offline drain the message joins the accumulating commit batch and
         // the event/ack fire only after its batch commits. Either way the
         // hook (when registered) gates everything observable.
-        self.commit_or_batch_inbound(wacore::types::events::InboundMessage {
-            message: dispatch_msg,
-            info,
-        })
+        self.commit_or_batch_inbound(
+            wacore::types::events::InboundMessage::builder()
+                .message(dispatch_msg)
+                .info(info)
+                .build(),
+        )
         .await;
     }
 
@@ -94,7 +97,12 @@ impl Client {
         }
     }
 
-    /// Spawn a delivery receipt, tracked so `disconnect()` can flush it (issue #571).
+    /// Queue a delivery receipt, tracked so `disconnect()` can flush it (issue #571).
+    ///
+    /// Live receipts feed a single persistent worker instead of one spawned
+    /// task each: the per-message cost drops to a channel slot plus a
+    /// [`crate::flush_scope::FlushGuard`], and `flush()` still waits because
+    /// the guard rides the queue until the send completes.
     ///
     /// Offline-drained messages are buffered instead and flushed as aggregate
     /// `<receipt>` stanzas when the offline sync completes, collapsing a
@@ -104,10 +112,39 @@ impl Client {
         if info.is_offline && self.try_buffer_offline_receipt(info) {
             return;
         }
-        let client = self.clone();
-        let info = Arc::clone(info);
-        self.outbound_flush.spawn(&*self.runtime, async move {
-            client.send_delivery_receipt(&info).await;
-        });
+        // A closed scope (disconnect in progress) drops the receipt, exactly
+        // like the previous spawn-per-receipt path.
+        let Some(guard) = self.outbound_flush.try_track() else {
+            return;
+        };
+        let tx = self
+            .delivery_receipt_queue
+            .get_or_init(|| self.start_delivery_receipt_worker());
+        // Only fails if the worker exited (client teardown); dropping the
+        // guard here keeps `flush()` honest.
+        let _ = tx.try_send((Arc::clone(info), guard));
+    }
+
+    /// Worker task shared by every live delivery receipt. Holds only a `Weak`
+    /// so a dropped `Client` closes the channel and ends the task instead of
+    /// keeping the client alive.
+    fn start_delivery_receipt_worker(
+        self: &Arc<Self>,
+    ) -> async_channel::Sender<(Arc<MessageInfo>, crate::flush_scope::FlushGuard)> {
+        let (tx, rx) =
+            async_channel::unbounded::<(Arc<MessageInfo>, crate::flush_scope::FlushGuard)>();
+        let client = Arc::downgrade(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                while let Ok((info, guard)) = rx.recv().await {
+                    let Some(client) = client.upgrade() else {
+                        break;
+                    };
+                    client.send_delivery_receipt(&info).await;
+                    drop(guard);
+                }
+            }))
+            .detach();
+        tx
     }
 }

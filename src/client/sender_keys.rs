@@ -489,6 +489,48 @@ mod tests {
         );
     }
 
+    // The WARM mark also excludes own devices (mirrors WA Web's `!isMeDevice` guard,
+    // applied to markHasSenderKey too). Our own companions must never be memoized, or
+    // the forget path (which also excludes own) could never un-mark one whose single
+    // SKDM encryption failed — a permanent orphan. The external member IS marked warm.
+    #[tokio::test]
+    async fn warm_mark_excludes_own_devices() {
+        let client = create_test_client().await;
+        let own_lid: Jid = "888000888000888:3@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+
+        let group = "120363000000000001@g.us";
+        let own_companion: Jid = "888000888000888:5@lid".parse().unwrap();
+        let member: Jid = "111000111000111:0@lid".parse().unwrap();
+
+        client
+            .set_sender_key_status_for_devices(group, &[own_companion, member], true, true)
+            .await
+            .unwrap();
+
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        let map = SenderKeyDeviceMap::from_db_rows(&rows);
+        assert_eq!(
+            map.device_has_key("111000111000111", 0),
+            Some(true),
+            "the external member is marked warm"
+        );
+        assert_eq!(
+            map.device_has_key("888000888000888", 5),
+            None,
+            "our own companion is never memoized"
+        );
+    }
+
     // When every named device is our own, nothing is kept: no DB write, no flip,
     // and (crucially) no generation bump that would churn the warm memo.
     #[tokio::test]

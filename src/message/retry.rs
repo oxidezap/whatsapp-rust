@@ -34,12 +34,12 @@ impl Client {
         if was_fresh {
             wacore::telemetry::recv("undecryptable");
             self.core.event_bus.dispatch(Event::UndecryptableMessage(
-                crate::types::events::UndecryptableMessage {
-                    info,
-                    is_unavailable,
-                    unavailable_type,
-                    decrypt_fail_mode,
-                },
+                crate::types::events::UndecryptableMessage::builder()
+                    .info(info)
+                    .is_unavailable(is_unavailable)
+                    .unavailable_type(unavailable_type)
+                    .decrypt_fail_mode(decrypt_fail_mode)
+                    .build(),
             ));
         } else {
             log::debug!(

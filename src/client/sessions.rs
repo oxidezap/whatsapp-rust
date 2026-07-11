@@ -129,9 +129,9 @@ impl Client {
             None => {}
         }
         self.offline_sync_notifier.notify(usize::MAX);
-        self.core
-            .event_bus
-            .dispatch(Event::OfflineSyncCompleted(OfflineSyncCompleted { count }));
+        self.core.event_bus.dispatch(Event::OfflineSyncCompleted(
+            OfflineSyncCompleted::builder().count(count).build(),
+        ));
     }
 
     /// Wait for offline message delivery to complete (with timeout).
@@ -291,6 +291,23 @@ impl Client {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_inner", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     async fn ensure_sessions_inner(&self, jids: Vec<Jid>) -> Result<()> {
         use wacore::types::jid::JidExt;
+
+        // Warm-cache pre-filter: a cached session answers synchronously, so
+        // the common live-send case skips the probe-stream machinery below
+        // entirely. Contended or unknown entries fall through to the probe.
+        let jids: Vec<Jid> = jids
+            .into_iter()
+            .filter(|jid| {
+                !matches!(
+                    self.signal_cache
+                        .try_has_session(&jid.to_protocol_address()),
+                    Some(true)
+                )
+            })
+            .collect();
+        if jids.is_empty() {
+            return Ok(());
+        }
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
 

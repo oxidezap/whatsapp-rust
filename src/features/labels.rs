@@ -50,12 +50,14 @@ pub(crate) fn dispatch_label_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = val.label_edit_action.as_option()
             {
-                event_bus.dispatch(Event::LabelEditUpdate(LabelEditUpdate {
-                    label_id,
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::LabelEditUpdate(
+                    LabelEditUpdate::builder()
+                        .label_id(label_id)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }
@@ -76,13 +78,15 @@ pub(crate) fn dispatch_label_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = val.label_association_action.as_option()
             {
-                event_bus.dispatch(Event::LabelAssociationUpdate(LabelAssociationUpdate {
-                    label_id,
-                    chat_jid,
-                    timestamp: time,
-                    action: Box::new(act.clone()),
-                    from_full_sync: full_sync,
-                }));
+                event_bus.dispatch(Event::LabelAssociationUpdate(
+                    LabelAssociationUpdate::builder()
+                        .label_id(label_id)
+                        .chat_jid(chat_jid)
+                        .timestamp(time)
+                        .action(Box::new(act.clone()))
+                        .from_full_sync(full_sync)
+                        .build(),
+                ));
             }
             true
         }

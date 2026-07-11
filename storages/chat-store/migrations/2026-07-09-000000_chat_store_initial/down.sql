@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS media_refs;
+DROP TABLE IF EXISTS message_receipts;
+DROP TABLE IF EXISTS contacts;
+DROP TABLE IF EXISTS reactions;
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS chats;

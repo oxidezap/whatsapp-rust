@@ -40,6 +40,23 @@ impl FlushScope {
         *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = false;
     }
 
+    /// Track a unit of outbound work without spawning a task (e.g. an item
+    /// handed to a persistent worker). Returns `None` when the scope is
+    /// closed — the work must be dropped, mirroring `spawn`. Dropping the
+    /// guard marks the work as finished for `flush`.
+    pub fn try_track(self: &Arc<Self>) -> Option<FlushGuard> {
+        {
+            let closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
+            if *closed {
+                return None;
+            }
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(FlushGuard {
+            scope: Arc::clone(self),
+        })
+    }
+
     /// Spawn a tracked task. The counter decrements on completion OR if the
     /// future is dropped (e.g. aborted, or dropped before its first poll), so
     /// `flush` can never deadlock waiting on a cancelled task.
@@ -49,22 +66,14 @@ impl FlushScope {
     where
         F: Future<Output = ()> + Spawnable,
     {
-        {
-            let closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
-            if *closed {
-                return;
-            }
-            self.count.fetch_add(1, Ordering::Relaxed);
-        }
-
         // Construct the guard outside the async block so it's captured as an
         // upvalue. This puts it in the future's state machine BEFORE the first
         // poll, so even if the runtime drops the future without polling it,
         // the guard's Drop runs and decrements the counter. Constructing the
         // guard inside the async body would delay it until the first poll,
         // which leaks the count if the future is dropped earlier.
-        let guard = DecrementOnDrop {
-            scope: Arc::clone(self),
+        let Some(guard) = self.try_track() else {
+            return;
         };
         rt.spawn(Box::pin(async move {
             let _guard = guard;
@@ -106,11 +115,13 @@ impl FlushScope {
     }
 }
 
-struct DecrementOnDrop {
+/// RAII guard for one tracked unit of outbound work. Obtained via
+/// [`FlushScope::try_track`]; `spawn` embeds one in the task it creates.
+pub struct FlushGuard {
     scope: Arc<FlushScope>,
 }
 
-impl Drop for DecrementOnDrop {
+impl Drop for FlushGuard {
     fn drop(&mut self) {
         if self.scope.count.fetch_sub(1, Ordering::Relaxed) == 1 {
             self.scope.idle.notify(usize::MAX);
@@ -207,7 +218,7 @@ mod tests {
 
         let scope_for_fut = Arc::clone(&scope);
         let mut fut: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
-            let _guard = DecrementOnDrop {
+            let _guard = FlushGuard {
                 scope: scope_for_fut,
             };
             futures::future::pending::<()>().await;
@@ -225,7 +236,7 @@ mod tests {
         assert_eq!(
             scope.pending(),
             0,
-            "DecrementOnDrop must fire when the in-flight future is dropped"
+            "FlushGuard must fire when the in-flight future is dropped"
         );
     }
 
@@ -242,7 +253,7 @@ mod tests {
         // so it's in the state machine from construction, not only after the
         // first poll.
         scope.count.fetch_add(1, Ordering::Relaxed);
-        let guard = DecrementOnDrop {
+        let guard = FlushGuard {
             scope: Arc::clone(&scope),
         };
         let never_polled_fut = async move {
@@ -258,6 +269,48 @@ mod tests {
             0,
             "guard must drop with the never-polled future"
         );
+    }
+
+    #[tokio::test]
+    async fn try_track_guard_blocks_flush_until_dropped() {
+        let scope = Arc::new(FlushScope::new());
+        let runtime = rt();
+
+        let guard = scope.try_track().expect("open scope must track");
+        assert_eq!(scope.pending(), 1);
+
+        let flush_scope = Arc::clone(&scope);
+        let flush_runtime = Arc::clone(&runtime);
+        let flush_task = tokio::spawn(async move {
+            flush_scope
+                .flush(&*flush_runtime, Duration::from_secs(5))
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !flush_task.is_finished(),
+            "flush must wait while a tracked guard is alive"
+        );
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), flush_task)
+            .await
+            .expect("flush should finish once the guard drops")
+            .expect("flush task should not panic");
+        assert_eq!(scope.pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn try_track_rejected_when_closed() {
+        let scope = Arc::new(FlushScope::new());
+        scope.close();
+        assert!(scope.try_track().is_none(), "closed scope must not track");
+        assert_eq!(scope.pending(), 0);
+
+        scope.reopen();
+        let guard = scope.try_track();
+        assert!(guard.is_some(), "reopened scope must track again");
+        assert_eq!(scope.pending(), 1);
     }
 
     #[tokio::test]

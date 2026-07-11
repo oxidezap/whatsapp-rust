@@ -310,6 +310,9 @@ impl PreKeySignalMessage {
             base_key: Some(base_key.serialize().to_vec()),
             identity_key: Some(identity_key.serialize().to_vec()),
             message: Some(Vec::from(message.as_ref())),
+            // Post-quantum (Kyber) prekeys are not implemented; classic X3DH only.
+            kyber_pre_key_id: None,
+            kyber_ciphertext: None,
         };
         let mut size_cache = buffa::SizeCache::new();
         let message_len = proto_message.compute_size(&mut size_cache) as usize;

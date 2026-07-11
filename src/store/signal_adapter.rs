@@ -22,6 +22,16 @@ where
     move |e| SignalProtocolError::BackendError(context, e.into())
 }
 
+/// Boxed future with the exact shape `#[async_trait]` expects, so the hot
+/// methods below can be hand-desugared: a cache hit completes synchronously
+/// and boxes only a tiny `Ready` instead of the full async state machine.
+#[cfg(not(target_arch = "wasm32"))]
+type BoxFut<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+#[cfg(target_arch = "wasm32")]
+type BoxFut<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + 'a>>;
+
+use std::future::{Future, ready};
+
 #[derive(Clone)]
 struct SharedDevice {
     device: Arc<RwLock<Device>>,
@@ -96,22 +106,50 @@ impl SessionStore for SessionAdapter {
             .map_err(signal_err("backend"))
     }
 
-    async fn has_session(&self, address: &ProtocolAddress) -> Result<bool, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        self.0
-            .cache
-            .has_session(address, &*device.backend)
-            .await
-            .map_err(signal_err("backend"))
+    // Hand-desugared (see `BoxFut`): a cached answer skips the device lock
+    // and returns a ready future.
+    fn has_session<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        address: &'life1 ProtocolAddress,
+    ) -> BoxFut<'async_trait, Result<bool, SignalProtocolError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        if let Some(known) = self.0.cache.try_has_session(address) {
+            return Box::pin(ready(Ok(known)));
+        }
+        Box::pin(async move {
+            let device = self.0.device.read().await;
+            self.0
+                .cache
+                .has_session(address, &*device.backend)
+                .await
+                .map_err(signal_err("backend"))
+        })
     }
 
-    async fn store_session(
-        &mut self,
-        address: &ProtocolAddress,
+    // Hand-desugared (see `BoxFut`): the record moves into the cache before
+    // the future is built, so the hot path never boxes the record-sized
+    // state machine. Contention (a flush commit) falls back to the async put.
+    fn store_session<'life0, 'life1, 'async_trait>(
+        &'life0 mut self,
+        address: &'life1 ProtocolAddress,
         record: SessionRecord,
-    ) -> Result<(), SignalProtocolError> {
-        self.0.cache.put_session(address, record).await;
-        Ok(())
+    ) -> BoxFut<'async_trait, Result<(), SignalProtocolError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        match self.0.cache.try_put_session(address, record) {
+            Ok(()) => Box::pin(ready(Ok(()))),
+            Err(record) => Box::pin(async move {
+                self.0.cache.put_session(address, record).await;
+                Ok(())
+            }),
+        }
     }
 }
 
@@ -132,27 +170,53 @@ impl IdentityKeyStore for IdentityAdapter {
             .map_err(signal_err("get_local_registration_id"))
     }
 
-    async fn save_identity(
-        &mut self,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
-    ) -> Result<IdentityChange, SignalProtocolError> {
-        let existing_identity = self.get_identity(address).await?;
-
-        // Cache-first: write to cache only. The cache flushes to the backend
-        // during flush_signal_cache(). This avoids a synchronous backend write
-        // on every encrypt/decrypt. is_trusted_identity always returns true
-        // (matching WA Web), so the Device-level save is redundant.
-        self.0
-            .cache
-            .put_identity(address, identity.public_key().public_key_bytes())
-            .await;
-
-        match existing_identity {
-            None => Ok(IdentityChange::NewOrUnchanged),
-            Some(existing) if &existing == identity => Ok(IdentityChange::NewOrUnchanged),
-            Some(_) => Ok(IdentityChange::ReplacedExisting),
+    // Hand-desugared (see `BoxFut`): with the previous value cached, the
+    // read+compare+write completes synchronously. A parse failure of the
+    // cached bytes errors BEFORE the write, like the async path.
+    fn save_identity<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 mut self,
+        address: &'life1 ProtocolAddress,
+        identity: &'life2 IdentityKey,
+    ) -> BoxFut<'async_trait, Result<IdentityChange, SignalProtocolError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        if let Some(prev) = self.0.cache.try_get_identity(address) {
+            let change = match parse_cached_identity(prev) {
+                Ok(None) => IdentityChange::NewOrUnchanged,
+                Ok(Some(existing)) if &existing == identity => IdentityChange::NewOrUnchanged,
+                Ok(Some(_)) => IdentityChange::ReplacedExisting,
+                Err(e) => return Box::pin(ready(Err(e))),
+            };
+            if self
+                .0
+                .cache
+                .try_put_identity(address, identity.public_key().public_key_bytes())
+            {
+                return Box::pin(ready(Ok(change)));
+            }
         }
+        Box::pin(async move {
+            let existing_identity = self.get_identity(address).await?;
+
+            // Cache-first: write to cache only. The cache flushes to the backend
+            // during flush_signal_cache(). This avoids a synchronous backend write
+            // on every encrypt/decrypt. is_trusted_identity always returns true
+            // (matching WA Web), so the Device-level save is redundant.
+            self.0
+                .cache
+                .put_identity(address, identity.public_key().public_key_bytes())
+                .await;
+
+            match existing_identity {
+                None => Ok(IdentityChange::NewOrUnchanged),
+                Some(existing) if &existing == identity => Ok(IdentityChange::NewOrUnchanged),
+                Some(_) => Ok(IdentityChange::ReplacedExisting),
+            }
+        })
     }
 
     async fn is_trusted_identity(
@@ -169,26 +233,45 @@ impl IdentityKeyStore for IdentityAdapter {
         Ok(true)
     }
 
-    async fn get_identity(
-        &self,
-        address: &ProtocolAddress,
-    ) -> Result<Option<IdentityKey>, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        match self
-            .0
-            .cache
-            .get_identity(address, &*device.backend)
-            .await
-            .map_err(signal_err("get_identity"))?
-        {
-            Some(data) if !data.is_empty() => {
-                // Cache and backend store raw 32-byte DJB public key bytes
-                let public_key =
-                    wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&data)?;
-                Ok(Some(IdentityKey::new(public_key)))
-            }
-            _ => Ok(None),
+    // Hand-desugared (see `BoxFut`): a cached entry (present OR known-absent)
+    // skips the device lock and returns a ready future.
+    fn get_identity<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        address: &'life1 ProtocolAddress,
+    ) -> BoxFut<'async_trait, Result<Option<IdentityKey>, SignalProtocolError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        if let Some(cached) = self.0.cache.try_get_identity(address) {
+            return Box::pin(ready(parse_cached_identity(cached)));
         }
+        Box::pin(async move {
+            let device = self.0.device.read().await;
+            let data = self
+                .0
+                .cache
+                .get_identity(address, &*device.backend)
+                .await
+                .map_err(signal_err("get_identity"))?;
+            parse_cached_identity(data)
+        })
+    }
+}
+
+/// Decode the cache's raw 32-byte DJB public key bytes; empty/absent = no
+/// identity (mirrors the previous inline match in `get_identity`).
+fn parse_cached_identity(
+    data: Option<std::sync::Arc<[u8]>>,
+) -> Result<Option<IdentityKey>, SignalProtocolError> {
+    match data {
+        Some(data) if !data.is_empty() => {
+            let public_key =
+                wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&data)?;
+            Ok(Some(IdentityKey::new(public_key)))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -385,6 +468,101 @@ mod tests {
         assert!(
             backend.load_prekey(PREKEY_ID).await.unwrap().is_none(),
             "remove_pre_key must delete from the backend immediately"
+        );
+    }
+
+    fn test_adapter() -> SignalProtocolStoreAdapter {
+        let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
+        let device = Arc::new(RwLock::new(Device::new(backend)));
+        SignalProtocolStoreAdapter::new(device, Arc::new(SignalStoreCache::new()))
+    }
+
+    /// The hand-desugared session methods must behave exactly like the trait's
+    /// async path: store → visible to has/load, both on cold and warm cache.
+    #[tokio::test]
+    async fn session_store_fast_paths_round_trip() {
+        use wacore::libsignal::protocol::SessionStore as _;
+        let mut adapter = test_adapter();
+        let addr = ProtocolAddress::new("15550002222".to_string(), 1.into());
+
+        // Cold cache: goes through the async fallback (backend consult).
+        assert!(!adapter.session_store.has_session(&addr).await.unwrap());
+
+        adapter
+            .session_store
+            .store_session(&addr, SessionRecord::new_fresh())
+            .await
+            .unwrap();
+
+        // Warm cache: answered by the sync fast path.
+        assert!(adapter.session_store.has_session(&addr).await.unwrap());
+        assert!(
+            adapter
+                .session_store
+                .load_session(&addr)
+                .await
+                .unwrap()
+                .is_some(),
+            "stored session must be loadable"
+        );
+    }
+
+    /// The hand-desugared identity methods must keep save_identity's change
+    /// semantics: new → NewOrUnchanged, same key → NewOrUnchanged, different
+    /// key → ReplacedExisting (the last two run on the warm-cache fast path).
+    #[tokio::test]
+    async fn identity_fast_paths_keep_change_semantics() {
+        use wacore::libsignal::protocol::{IdentityKeyPair, IdentityKeyStore as _};
+        let mut adapter = test_adapter();
+        let addr = ProtocolAddress::new("15550003333".to_string(), 1.into());
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let first = *IdentityKeyPair::generate(&mut rng).identity_key();
+        let second = *IdentityKeyPair::generate(&mut rng).identity_key();
+
+        assert!(
+            adapter
+                .identity_store
+                .get_identity(&addr)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            adapter
+                .identity_store
+                .save_identity(&addr, &first)
+                .await
+                .unwrap(),
+            IdentityChange::NewOrUnchanged
+        );
+        assert_eq!(
+            adapter
+                .identity_store
+                .save_identity(&addr, &first)
+                .await
+                .unwrap(),
+            IdentityChange::NewOrUnchanged,
+            "same key again must be NewOrUnchanged"
+        );
+        assert_eq!(
+            adapter
+                .identity_store
+                .save_identity(&addr, &second)
+                .await
+                .unwrap(),
+            IdentityChange::ReplacedExisting,
+            "a different key must be ReplacedExisting"
+        );
+        assert_eq!(
+            adapter
+                .identity_store
+                .get_identity(&addr)
+                .await
+                .unwrap()
+                .expect("identity must be cached"),
+            second,
+            "get_identity must observe the fast-path write"
         );
     }
 }

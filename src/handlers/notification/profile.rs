@@ -95,13 +95,15 @@ pub(crate) fn handle_picture_notification(client: &Arc<Client>, node: &NodeRef<'
         jid.observe(), author, picture_id
     );
 
-    let event = Event::PictureUpdate(PictureUpdate {
-        jid,
-        author,
-        timestamp,
-        removed,
-        picture_id,
-    });
+    let event = Event::PictureUpdate(
+        PictureUpdate::builder()
+            .jid(jid)
+            .maybe_author(author)
+            .timestamp(timestamp)
+            .removed(removed)
+            .maybe_picture_id(picture_id)
+            .build(),
+    );
     client.core.event_bus.dispatch(event);
 }
 
@@ -136,11 +138,13 @@ pub(crate) fn handle_status_notification(client: &Arc<Client>, node: &NodeRef<'_
             "Status update from {} (length={})", from.observe(), status_text.len()
         );
 
-        let event = Event::UserAboutUpdate(UserAboutUpdate {
-            jid: from,
-            status: status_text,
-            timestamp,
-        });
+        let event = Event::UserAboutUpdate(
+            UserAboutUpdate::builder()
+                .jid(from)
+                .status(status_text)
+                .timestamp(timestamp)
+                .build(),
+        );
         client.core.event_bus.dispatch(event);
     } else {
         debug!(
@@ -232,10 +236,12 @@ pub(crate) async fn handle_contacts_notification(client: &Arc<Client>, node: &No
             };
 
             debug!(target: "Client/Contacts", "Contact updated for {}", jid.observe());
-            client
-                .core
-                .event_bus
-                .dispatch(Event::ContactUpdated(ContactUpdated { jid, timestamp }));
+            client.core.event_bus.dispatch(Event::ContactUpdated(
+                ContactUpdated::builder()
+                    .jid(jid)
+                    .timestamp(timestamp)
+                    .build(),
+            ));
         }
         "modify" => {
             // WA Web: old/new are PN JIDs, old_lid/new_lid are optional LID JIDs.
@@ -265,16 +271,15 @@ pub(crate) async fn handle_contacts_notification(client: &Arc<Client>, node: &No
                 "Contact number changed: {} -> {} (old_lid={:?}, new_lid={:?})",
                 old_jid.observe(), new_jid.observe(), old_lid, new_lid
             );
-            client
-                .core
-                .event_bus
-                .dispatch(Event::ContactNumberChanged(ContactNumberChanged {
-                    old_jid,
-                    new_jid,
-                    old_lid,
-                    new_lid,
-                    timestamp,
-                }));
+            client.core.event_bus.dispatch(Event::ContactNumberChanged(
+                ContactNumberChanged::builder()
+                    .old_jid(old_jid)
+                    .new_jid(new_jid)
+                    .maybe_old_lid(old_lid)
+                    .maybe_new_lid(new_lid)
+                    .timestamp(timestamp)
+                    .build(),
+            ));
         }
         "sync" => {
             let after = child
@@ -287,13 +292,12 @@ pub(crate) async fn handle_contacts_notification(client: &Arc<Client>, node: &No
                 "Contact sync requested after {:?}",
                 after
             );
-            client
-                .core
-                .event_bus
-                .dispatch(Event::ContactSyncRequested(ContactSyncRequested {
-                    after,
-                    timestamp,
-                }));
+            client.core.event_bus.dispatch(Event::ContactSyncRequested(
+                ContactSyncRequested::builder()
+                    .maybe_after(after)
+                    .timestamp(timestamp)
+                    .build(),
+            ));
         }
         "add" | "remove" => {
             debug!(

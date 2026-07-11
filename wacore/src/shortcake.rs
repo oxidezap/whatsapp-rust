@@ -13,7 +13,7 @@
 //! (see the main crate's `passkey` module); it is NOT in this file.
 //!
 //! All constants/labels are reverse-engineered verbatim from WhatsApp Web
-//! (waVersion 2.3000.1042386815, modules `WAWebShortcakeLinking*`). Key facts the
+//! (modules `WAWebShortcakeLinking*`). Key facts the
 //! RE pinned down (and which are easy to get wrong):
 //! - companion ephemeral pubkey is RAW 32 bytes (no 0x05 Signal prefix).
 //! - commitment = SHA256(companionEphemeralIdentityBytes ‖ companionNonce).

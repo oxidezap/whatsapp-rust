@@ -5452,12 +5452,12 @@ fn test_undecryptable_event_has_no_pending_pdo_hint() {
         "SHAPE_MSG",
         "5511777776666@s.whatsapp.net",
     ));
-    let event = UndecryptableMessage {
-        info,
-        is_unavailable: false,
-        unavailable_type: UnavailableType::Unknown,
-        decrypt_fail_mode: DecryptFailMode::Show,
-    };
+    let event = UndecryptableMessage::builder()
+        .info(info)
+        .is_unavailable(false)
+        .unavailable_type(UnavailableType::Unknown)
+        .decrypt_fail_mode(DecryptFailMode::Show)
+        .build();
 
     let _ = (
         &event.info,

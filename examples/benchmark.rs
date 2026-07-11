@@ -102,7 +102,8 @@ fn main() {
                                     }
                                 }
                             }
-                            Event::PairingQrCode { code, .. } => {
+                            Event::PairingQrCode(qr) => {
+                                let code = &qr.code;
                                 // Mirrors tests/e2e/src/lib.rs::spawn_qr_autoresponder_http.
                                 // Auto-pair against the mock server's admin endpoint
                                 // when the configured WS URL looks like a mock

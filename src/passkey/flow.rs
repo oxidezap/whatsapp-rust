@@ -192,10 +192,10 @@ impl ShortcakeSession {
 
         self.encryption_key = Some(encryption_key);
         self.stage = Stage::AwaitingConfirmation;
-        Ok(PairPasskeyConfirmation {
-            code,
-            skip_handoff_ux: self.skip_handoff_ux,
-        })
+        Ok(PairPasskeyConfirmation::builder()
+            .code(code)
+            .skip_handoff_ux(self.skip_handoff_ux)
+            .build())
     }
 
     /// Encrypt the `PairingRequest` (companion static keys + rotated ADV secret)
@@ -507,10 +507,10 @@ pub(crate) async fn handle_passkey_notification(client: &Arc<Client>, node: Arc<
                         Err(e) => {
                             warn!("failed to fetch passkey request options: {e}");
                             client.core.event_bus.dispatch(Event::PairPasskeyError(
-                                PairPasskeyError {
-                                    error: e.to_string(),
-                                    continuation: false,
-                                },
+                                PairPasskeyError::builder()
+                                    .error(e.to_string())
+                                    .continuation(false)
+                                    .build(),
                             ));
                         }
                     }
@@ -536,12 +536,11 @@ async fn drive_passkey_request(client: &Arc<Client>, options_json: String) {
     };
     client.passkey_state.lock().await.handoff_key = handoff_key;
 
-    client
-        .core
-        .event_bus
-        .dispatch(Event::PairPasskeyRequest(PairPasskeyRequest {
-            request_options_json: options_json.clone(),
-        }));
+    client.core.event_bus.dispatch(Event::PairPasskeyRequest(
+        PairPasskeyRequest::builder()
+            .request_options_json(options_json.clone())
+            .build(),
+    ));
 
     if let Some(authenticator) = client.passkey_authenticator().await {
         let client = client.clone();
@@ -551,13 +550,12 @@ async fn drive_passkey_request(client: &Arc<Client>, options_json: String) {
             .spawn(Box::pin(async move {
                 if let Err(e) = auto_drive_response(&client, authenticator, &options_json).await {
                     warn!("passkey auto-drive failed: {e}");
-                    client
-                        .core
-                        .event_bus
-                        .dispatch(Event::PairPasskeyError(PairPasskeyError {
-                            error: e.to_string(),
-                            continuation: false,
-                        }));
+                    client.core.event_bus.dispatch(Event::PairPasskeyError(
+                        PairPasskeyError::builder()
+                            .error(e.to_string())
+                            .continuation(false)
+                            .build(),
+                    ));
                 }
             }))
             .detach();
@@ -590,13 +588,12 @@ pub(crate) async fn handle_passkey_continuation(client: &Arc<Client>, node: Arc<
         Some(bytes) => bytes,
         None => {
             warn!("passkey continuation missing primary_ephemeral_identity");
-            client
-                .core
-                .event_bus
-                .dispatch(Event::PairPasskeyError(PairPasskeyError {
-                    error: "missing primary_ephemeral_identity".into(),
-                    continuation: true,
-                }));
+            client.core.event_bus.dispatch(Event::PairPasskeyError(
+                PairPasskeyError::builder()
+                    .error("missing primary_ephemeral_identity".into())
+                    .continuation(true)
+                    .build(),
+            ));
             return;
         }
     };
@@ -608,13 +605,12 @@ pub(crate) async fn handle_passkey_continuation(client: &Arc<Client>, node: Arc<
         .spawn(Box::pin(async move {
             if let Err(e) = client.drive_continuation(primary_bytes).await {
                 warn!("passkey continuation failed: {e}");
-                client
-                    .core
-                    .event_bus
-                    .dispatch(Event::PairPasskeyError(PairPasskeyError {
-                        error: e.to_string(),
-                        continuation: true,
-                    }));
+                client.core.event_bus.dispatch(Event::PairPasskeyError(
+                    PairPasskeyError::builder()
+                        .error(e.to_string())
+                        .continuation(true)
+                        .build(),
+                ));
             }
         }))
         .detach();

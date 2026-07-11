@@ -764,7 +764,7 @@ mod tests {
     // A SHORTCAKE_PASSKEY (QR-less) login converges to the SAME pair-success as the
     // classic QR flow, but the node carries extra children: <jurisdiction>, a new
     // <encryption-metadata algorithm="aes-256-gcm"> block, <client-props>, <platform>.
-    // RE of WAWebHandlePairSuccess (waVersion 2.3000.1042386815) confirmed the
+    // RE of WAWebHandlePairSuccess confirmed the
     // companion PARSES but never DECRYPTS <encryption-metadata> — linking completes
     // purely via the classic <device-identity> HMAC vs the ADV secret. This guards
     // that our handler still extracts device-identity (ignoring the new children) and

@@ -40,10 +40,12 @@ impl Client {
             match backend.get_pending_inbound(&chat, &sender, &info.id).await {
                 Ok(Some(bytes)) => match waproto::codec::message_decode(&bytes) {
                     Ok(msg) => {
-                        self.commit_or_batch_inbound(InboundMessage {
-                            message: Arc::new(msg),
-                            info: Arc::clone(info),
-                        })
+                        self.commit_or_batch_inbound(
+                            InboundMessage::builder()
+                                .message(Arc::new(msg))
+                                .info(Arc::clone(info))
+                                .build(),
+                        )
                         .await;
                     }
                     Err(e) => {
@@ -127,13 +129,13 @@ mod tests {
     }
 
     fn test_item(id: &str) -> InboundMessage {
-        InboundMessage {
-            message: Arc::new(wa::Message {
+        InboundMessage::builder()
+            .message(Arc::new(wa::Message {
                 conversation: Some("hello".to_string()),
                 ..Default::default()
-            }),
-            info: test_info(id),
-        }
+            }))
+            .info(test_info(id))
+            .build()
     }
 
     // A successful batch commit acks the messages and clears every buffered copy.
@@ -182,13 +184,13 @@ mod tests {
         let info = test_info("MSG_ERR");
         client
             .commit_inbound_batch(
-                Arc::from([InboundMessage {
-                    message: Arc::new(wa::Message {
+                Arc::from([InboundMessage::builder()
+                    .message(Arc::new(wa::Message {
                         conversation: Some("hello".to_string()),
                         ..Default::default()
-                    }),
-                    info: Arc::clone(&info),
-                }]),
+                    }))
+                    .info(Arc::clone(&info))
+                    .build()]),
                 BatchOrigin::OfflineDrain,
             )
             .await;

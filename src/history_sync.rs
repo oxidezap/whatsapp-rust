@@ -211,6 +211,29 @@ impl Client {
                 self.store_history_sync_msg_secrets(sync_result.msg_secret_records)
                     .await;
 
+                // Bulk PN-LID identity seed from field 15; persist and migrations
+                // run detached, like the other batch learn paths. `Other`
+                // matches WA Web's `learningSource: "other"` for this harvest
+                // (WAWebHistorySyncChunk): a conservative seed that only adds
+                // new LIDs and never clobbers a live-learned mapping.
+                if !sync_result.lid_mappings.is_empty() {
+                    let pairs: Vec<(String, String)> = sync_result
+                        .lid_mappings
+                        .into_iter()
+                        .map(|m| (m.lid, m.phone_number))
+                        .collect();
+                    log::info!(
+                        "History sync provided {} PN-LID mappings; learning",
+                        pairs.len()
+                    );
+                    self.learn_lid_pn_mappings_batch(
+                        pairs,
+                        crate::lid_pn_cache::LearningSource::Other,
+                        false,
+                    )
+                    .await;
+                }
+
                 // No interest pre-check: dispatch() evaluates handler interest
                 // against a single bus snapshot (and skips materializing the
                 // Arc when nobody listens), so deferring to it removes the
@@ -547,6 +570,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, Some(secret));
+    }
+
+    #[tokio::test]
+    async fn process_history_sync_task_learns_lid_mappings() {
+        let client = crate::test_utils::create_test_client_with_name("history_lid_mappings").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let history_sync = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            phone_number_to_lid_mappings: vec![wa::PhoneNumberToLIDMapping {
+                pn_jid: Some("5511777776666@s.whatsapp.net".to_string()),
+                lid_jid: Some("111222333444555@lid".to_string()),
+            }],
+            ..Default::default()
+        };
+        let compressed = compress_history_sync(&history_sync);
+        let notification = HistorySyncNotification {
+            file_length: Some(compressed.len() as u64),
+            sync_type: Some(wa::message::HistorySyncType::INITIAL_BOOTSTRAP),
+            initial_hist_bootstrap_inline_payload: Some(compressed),
+            ..Default::default()
+        };
+
+        client
+            .process_history_sync_task("HIST_SYNC_LID".to_string(), notification)
+            .await;
+
+        assert_eq!(
+            client
+                .lid_pn_cache
+                .get_current_lid("5511777776666")
+                .await
+                .as_deref(),
+            Some("111222333444555"),
+            "history-sync mapping must be learned into the LID-PN cache"
+        );
     }
 
     #[tokio::test]

@@ -280,10 +280,12 @@ impl Client {
             .max(0) as u64;
         let remaining =
             PairCodeUtils::code_validity().saturating_sub(std::time::Duration::from_secs(elapsed));
-        self.core.event_bus.dispatch(Event::PairingCode {
-            code: code.clone(),
-            timeout: remaining,
-        });
+        self.core.event_bus.dispatch(Event::PairingCode(
+            crate::types::events::PairingCode::builder()
+                .code(code.clone())
+                .timeout(remaining)
+                .build(),
+        ));
 
         Ok(code)
     }
@@ -561,10 +563,11 @@ async fn handle_refresh_code(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> bo
         target: "Client/PairCode",
         "Server requested pair-code refresh (force_manual={force_manual})"
     );
-    client
-        .core
-        .event_bus
-        .dispatch(Event::PairingCodeRefresh { force_manual });
+    client.core.event_bus.dispatch(Event::PairingCodeRefresh(
+        crate::types::events::PairingCodeRefresh::builder()
+            .force_manual(force_manual)
+            .build(),
+    ));
     true
 }
 
@@ -852,7 +855,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(&**e, Event::PairingCodeRefresh { force_manual: true })),
+                .any(|e| matches!(&**e, Event::PairingCodeRefresh(r) if r.force_manual)),
             "expected PairingCodeRefresh{{force_manual:true}}, got: {events:?}"
         );
     }
@@ -876,9 +879,7 @@ mod tests {
         assert!(
             collector.events().iter().any(|e| matches!(
                 &**e,
-                Event::PairingCodeRefresh {
-                    force_manual: false
-                }
+                Event::PairingCodeRefresh(r) if !r.force_manual
             )),
             "absent force_manual_refresh must dispatch force_manual: false"
         );

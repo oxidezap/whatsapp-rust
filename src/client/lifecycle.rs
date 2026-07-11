@@ -70,9 +70,9 @@ impl Client {
     pub(crate) fn dispatch_connected(&self) {
         self.is_ready.store(true, Ordering::Relaxed);
         wacore::telemetry::set_connected(true);
-        self.core
-            .event_bus
-            .dispatch(Event::Connected(crate::types::events::Connected));
+        self.core.event_bus.dispatch(Event::Connected(
+            crate::types::events::Connected::builder().build(),
+        ));
         self.connected_notifier.notify(usize::MAX);
     }
 
@@ -230,6 +230,7 @@ impl Client {
             history_sync_tasks_in_flight: Arc::new(AtomicUsize::new(0)),
             history_sync_idle_notifier: Arc::new(event_listener::Event::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
+            delivery_receipt_queue: std::sync::OnceLock::new(),
             presence_subscriptions: Arc::new(async_lock::Mutex::new(HashSet::new())),
             socket_ready_notifier: Arc::new(event_listener::Event::new()),
             is_ready: Arc::new(AtomicBool::new(false)),
@@ -391,7 +392,9 @@ impl Client {
                 // Dispatch after cleanup so handlers see cleared connection state.
                 if let Some(reason) = unexpected_disconnect {
                     self.core.event_bus.dispatch(Event::Disconnected(
-                        crate::types::events::Disconnected { reason },
+                        crate::types::events::Disconnected::builder()
+                            .reason(reason)
+                            .build(),
                     ));
                 }
             }
@@ -597,12 +600,12 @@ impl Client {
 
         self.disconnect().await;
 
-        self.core
-            .event_bus
-            .dispatch(Event::LoggedOut(crate::types::events::LoggedOut {
-                on_connect: false,
-                reason: ConnectFailureReason::LoggedOut,
-            }));
+        self.core.event_bus.dispatch(Event::LoggedOut(
+            crate::types::events::LoggedOut::builder()
+                .on_connect(false)
+                .reason(ConnectFailureReason::LoggedOut)
+                .build(),
+        ));
 
         Ok(())
     }

@@ -14,6 +14,7 @@ members = [
     ".",
     "examples/voip-cli",
     "http_clients/ureq-client",
+    "storages/chat-store",
     "storages/sqlite-storage",
     "tests/bench-integration",
     "tests/e2e",
@@ -63,11 +64,14 @@ buffa-build = { version = "0.8.1", default-features = false }
 buffa-descriptor = { version = "0.8.1", default-features = false }
 bytemuck = { version = "1.25", default-features = false }
 bytes = { version = "1.12", default-features = false }
+bon = { version = "3.9.3", default-features = false, features = ["std"] }
 cbc = { version = "0.2", features = ["alloc"] }
 chrono = { version = "0.4", default-features = false }
 compact_str = { version = "0.9", default-features = false }
 ctr = { version = "0.10", default-features = false }
 divan = { package = "codspeed-divan-compat", version = "5.0.1" }
+diesel = { version = "2.3.10", default-features = false, features = ["sqlite", "r2d2", "32-column-tables"] }
+diesel_migrations = { version = "2.3.2", default-features = false, features = ["sqlite"] }
 env_logger = { version = "0.11", default-features = false }
 event-listener = { version = "5", default-features = false }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
