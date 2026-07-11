@@ -243,13 +243,18 @@ enum StringHint {
 pub(crate) struct StringHintCache {
     // Keys use (ptr, len) identity, so this cache is only valid while encoding
     // the same immutable node/strings it was built from.
-    hints: Vec<(StrKey, StringHint)>,
+    //
+    // Inline capacity covers a typical stanza's distinct strings without a
+    // heap allocation: the exact-marshal two-pass builds one of these per
+    // outgoing stanza, and it lives on the (sync) caller's stack, never in
+    // an async frame. Larger stanzas spill to the heap transparently.
+    hints: smallvec::SmallVec<[(StrKey, StringHint); 32]>,
 }
 
 impl Default for StringHintCache {
     fn default() -> Self {
         Self {
-            hints: Vec::with_capacity(32),
+            hints: smallvec::SmallVec::new(),
         }
     }
 }
