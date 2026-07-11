@@ -54,23 +54,32 @@ impl Client {
                 .await;
             return;
         };
-        let client = weak.clone();
+        let weak = weak.clone();
         let runtime = self.runtime.clone();
         self.runtime
             .spawn(Box::pin(async move {
-                runtime.sleep(SIGNAL_FLUSH_WINDOW).await;
-                let Some(client) = client.upgrade() else {
-                    return;
-                };
-                client.signal_flush_pending.store(false, Ordering::Release);
-                // Batch-safe: if an offline drain became active meanwhile,
-                // this routes under the processing permit like any
-                // out-of-band flush.
-                if let Err(e) = client.flush_signal_cache_batch_safe().await {
+                loop {
+                    // Hold only the Weak across the sleep so an armed fire
+                    // never extends the client's lifetime.
+                    runtime.sleep(SIGNAL_FLUSH_WINDOW).await;
+                    let Some(client) = weak.upgrade() else {
+                        return;
+                    };
+                    client.signal_flush_pending.store(false, Ordering::Release);
+                    // Batch-safe: if an offline drain became active meanwhile,
+                    // this routes under the processing permit like any
+                    // out-of-band flush.
+                    let Err(e) = client.flush_signal_cache_batch_safe().await else {
+                        return;
+                    };
                     log::error!("Coalesced signal flush failed; re-arming for retry: {e:?}");
-                    // Re-arm with the same window as the retry backoff; the
-                    // cache keeps its dirty entries until a flush succeeds.
-                    client.schedule_signal_flush().await;
+                    // Re-arm inline with the same window as the retry backoff;
+                    // the cache keeps its dirty entries until a flush
+                    // succeeds. If a concurrent request re-armed already, its
+                    // fire owns the retry.
+                    if client.signal_flush_pending.swap(true, Ordering::AcqRel) {
+                        return;
+                    }
                 }
             }))
             .detach();
