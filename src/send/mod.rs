@@ -157,6 +157,18 @@ struct SendBranchOutput {
     dm_phash: Option<String>,
 }
 
+/// True when every SKDM target belongs to our own account (PN or LID user).
+/// Own devices are never memoized warm (WA Web's `!isMeDevice` guard on
+/// `markHasSenderKey`), so an own-only `needs` set is the permanent
+/// warm-send steady state — not a cold-group signal.
+fn skdm_needs_only_own_devices(needs: &[Jid], own_pn: Option<&Jid>, own_lid: Option<&Jid>) -> bool {
+    !needs.is_empty()
+        && needs.iter().all(|j| {
+            own_pn.is_some_and(|p| j.is_same_user_as(p))
+                || own_lid.is_some_and(|l| j.is_same_user_as(l))
+        })
+}
+
 impl SendBranchOutput {
     fn stanza_only(node: Node) -> Self {
         Self {
@@ -1135,28 +1147,37 @@ impl Client {
         own_sending_jid: &Jid,
     ) -> Option<(std::sync::Arc<wacore::send::ResolvedGroupDevices>, Vec<Jid>)> {
         let cached_map = self.skdm_device_map(group_jid).await;
-        // Load BEFORE the filter: a cold flip racing after this stamps the memo
-        // as already stale (its stored generation lags the map's), so the next
-        // read re-runs the filter. Loading after would stamp a racing flip as seen.
-        let cached_map_gen = cached_map.generation();
         match self
             .resolve_group_devices_memoized(group, group_info, own_sending_jid)
             .await
         {
             Ok(all_devices) => {
+                // Load after the resolve await (so a cold flip during it is
+                // visible to the hit check below) but BEFORE the filter: a
+                // flip racing the filter stamps the inserted memo as already
+                // stale (its stored generation lags the map's), so the next
+                // read re-runs it. A flip after this load and before the send
+                // is the same bounded one-send window the unmemoized filter
+                // has, recovered by the retry-receipt resend.
+                let cached_map_gen = cached_map.generation();
                 // Skip the O(devices) filter_skdm_targets scan when the same
-                // (devices, sender-key-map) Arc pair AND generation were already
-                // fully warm. The devices Arc swaps on membership change; the
-                // cached-map Arc swaps on a warm-mark invalidation; the generation
-                // catches an in-place cold flip that keeps the same Arc. So a stale
-                // skip is impossible.
+                // (devices, sender-key-map) Arc pair, generation AND sending
+                // identity were already warm, reusing the memoized targets
+                // (empty, or the own devices that re-receive their SKDM every
+                // send). The devices Arc swaps on membership change; the
+                // cached-map Arc swaps on a warm-mark invalidation; the
+                // generation catches an in-place cold flip that keeps the
+                // same Arc; the memoized needs are a pure function of that
+                // identity.
                 if self.group_devices_memo_enabled
-                    && let Some((dw, cw, memo_gen)) = self.skdm_warm_memo.get(group).await
+                    && let Some((dw, cw, memo_gen, memo_sender, memo_needs)) =
+                        self.skdm_warm_memo.get(group).await
                     && std::ptr::eq(dw.as_ptr(), std::sync::Arc::as_ptr(&all_devices))
                     && std::ptr::eq(cw.as_ptr(), std::sync::Arc::as_ptr(&cached_map))
                     && memo_gen == cached_map_gen
+                    && &memo_sender == own_sending_jid
                 {
-                    return Some((all_devices, Vec::new()));
+                    return Some((all_devices, memo_needs));
                 }
                 let needs_skdm = self.filter_skdm_targets(
                     group_jid,
@@ -1164,7 +1185,16 @@ impl Client {
                     &cached_map,
                     own_sending_jid,
                 );
-                if needs_skdm.is_empty() && self.group_devices_memo_enabled {
+                if self.group_devices_memo_enabled
+                    && (needs_skdm.is_empty() || {
+                        let snapshot = self.persistence_manager.get_device_snapshot();
+                        skdm_needs_only_own_devices(
+                            &needs_skdm,
+                            snapshot.pn.as_ref(),
+                            snapshot.lid.as_ref(),
+                        )
+                    })
+                {
                     self.skdm_warm_memo
                         .insert(
                             group.clone(),
@@ -1172,6 +1202,8 @@ impl Client {
                                 std::sync::Arc::downgrade(&all_devices),
                                 std::sync::Arc::downgrade(&cached_map),
                                 cached_map_gen,
+                                own_sending_jid.clone(),
+                                needs_skdm.clone(),
                             ),
                         )
                         .await;
@@ -1213,6 +1245,10 @@ impl Client {
             return;
         }
 
+        // No invalidation on success: set_sender_key_status_for_devices
+        // already drops the cached map when it actually writes new warm marks,
+        // and an own-devices-only set (never memoized) writes nothing —
+        // invalidating for it would force a DB re-read on every warm send.
         if let Err(e) = self
             .set_sender_key_status_for_devices(group_jid, devices, true, true)
             .await
@@ -1222,8 +1258,11 @@ impl Client {
                 group_jid,
                 e
             );
+            // A failed write may still have partially landed (backend
+            // implementations are not required to be atomic), so drop the
+            // cached map rather than risk serving pre-write state.
+            self.sender_key_device_cache.invalidate(group_jid).await;
         }
-        self.sender_key_device_cache.invalidate(group_jid).await;
     }
 
     /// Spawn a background task to validate phash from server ack.
@@ -1717,6 +1756,15 @@ impl Client {
                     .await
                 {
                     Some((all, needs)) if needs.is_empty() => (Some(all), Some(needs)),
+                    // Own devices are never memoized warm, so they re-receive
+                    // their SKDM on every send by design — own-only needs IS
+                    // the warm steady state, not a cold group: no distribution
+                    // guard, no cache invalidation, no re-resolve.
+                    Some((all, needs))
+                        if skdm_needs_only_own_devices(&needs, Some(own_jid), Some(own_lid)) =>
+                    {
+                        (Some(all), Some(needs))
+                    }
                     Some((first_all, first_needs)) => {
                         // Cold: wait for any in-flight distribution, then
                         // re-resolve. The loser usually finds every device
@@ -1740,7 +1788,16 @@ impl Client {
                             .await
                         {
                             Some((all, needs)) => {
-                                if needs.is_empty() {
+                                // Fully warm OR down to the own-only steady
+                                // state: nothing left that needs the
+                                // single-flight, release it before the send.
+                                if needs.is_empty()
+                                    || skdm_needs_only_own_devices(
+                                        &needs,
+                                        Some(own_jid),
+                                        Some(own_lid),
+                                    )
+                                {
                                     distribution_guard = None;
                                 }
                                 (Some(all), Some(needs))
@@ -3084,6 +3141,99 @@ mod tests {
             needs,
             vec![own_companion],
             "own companion redistributes; external member stays warm"
+        );
+    }
+
+    /// The own-only re-distribution set is the warm steady state (WA Web:
+    /// `getGroupSenderKeyList` reads the in-memory map with no storage
+    /// re-read), so marking it after a send must NOT drop the cached device
+    /// map. A set with an external member writes a new warm mark and must.
+    #[tokio::test]
+    async fn own_only_skdm_mark_keeps_device_map_cached() {
+        use crate::sender_key_device_cache::SenderKeyDeviceMap;
+        use std::sync::Arc;
+
+        let client = crate::test_utils::create_test_client().await;
+        let own_lid = Jid::from_str("888000888000888:1@lid").unwrap();
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own_lid.clone(),
+            )))
+            .await;
+
+        let group = "120363000000000010@g.us";
+        let own_primary = Jid::from_str("888000888000888:0@lid").unwrap();
+        let member = Jid::from_str("111000111000111:0@lid").unwrap();
+
+        client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                Arc::new(SenderKeyDeviceMap::from_db_rows(&[]))
+            })
+            .await;
+
+        // Own-only mark (the every-send steady state): nothing written, cache kept.
+        client
+            .update_sender_key_devices(group, std::slice::from_ref(&own_primary))
+            .await;
+        client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                panic!("own-only SKDM mark must not invalidate the device map")
+            })
+            .await;
+
+        // An external member writes a warm mark: the cached map must drop so
+        // the next send re-reads the new state.
+        client
+            .update_sender_key_devices(group, &[own_primary, member])
+            .await;
+        let rebuilt = std::sync::atomic::AtomicBool::new(false);
+        client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                rebuilt.store(true, std::sync::atomic::Ordering::Relaxed);
+                Arc::new(SenderKeyDeviceMap::from_db_rows(&[]))
+            })
+            .await;
+        assert!(
+            rebuilt.load(std::sync::atomic::Ordering::Relaxed),
+            "a new external warm mark must invalidate the device map"
+        );
+    }
+
+    /// `skdm_needs_only_own_devices` gates the warm fast path in
+    /// `send_group_branch`: own-only sets qualify, anything external (or an
+    /// empty set, which has its own arm) does not.
+    #[test]
+    fn skdm_needs_only_own_devices_classification() {
+        let own_pn = Jid::from_str("5511999990000:2@s.whatsapp.net").unwrap();
+        let own_lid = Jid::from_str("888000888000888:2@lid").unwrap();
+        let own_primary_lid = Jid::from_str("888000888000888:0@lid").unwrap();
+        let own_primary_pn = Jid::from_str("5511999990000:0@s.whatsapp.net").unwrap();
+        let member = Jid::from_str("111000111000111:0@lid").unwrap();
+
+        assert!(skdm_needs_only_own_devices(
+            &[own_primary_lid.clone(), own_primary_pn],
+            Some(&own_pn),
+            Some(&own_lid)
+        ));
+        assert!(
+            !skdm_needs_only_own_devices(
+                &[own_primary_lid, member.clone()],
+                Some(&own_pn),
+                Some(&own_lid)
+            ),
+            "an external member must take the cold path"
+        );
+        assert!(
+            !skdm_needs_only_own_devices(&[], Some(&own_pn), Some(&own_lid)),
+            "the empty set is handled by its own (fully warm) arm"
+        );
+        assert!(
+            !skdm_needs_only_own_devices(&[member], Some(&own_pn), Some(&own_lid)),
+            "external-only must take the cold path"
         );
     }
 

@@ -147,6 +147,19 @@ use wacore::client::context::GroupInfo;
 /// shares the metadata (refcount bump) instead of deep-cloning the participant
 /// list and LID/PN maps on every group send.
 type GroupCache = TypedCache<Jid, Arc<GroupInfo>>;
+
+/// Memoized SKDM warm state per group: the `(devices, sender-key map)` Weak
+/// pair + map generation it was computed against, the exact sending identity
+/// the filter ran as (it excludes that device, and own-device classification
+/// depends on it — a mid-session identity change must miss), and the memoized
+/// `needs_skdm` targets (empty or own-devices-only). See `skdm_warm_memo`.
+pub(crate) type SkdmWarmMemoEntry = (
+    std::sync::Weak<wacore::send::ResolvedGroupDevices>,
+    std::sync::Weak<crate::sender_key_device_cache::SenderKeyDeviceMap>,
+    u64,
+    Jid,
+    Vec<Jid>,
+);
 use wacore::runtime::timeout as rt_timeout;
 use waproto::whatsapp as wa;
 
@@ -783,19 +796,15 @@ pub struct Client {
     /// finding everything warm. Warm sends never touch it.
     pub(crate) group_distribution_locks: Cache<Jid, Arc<async_lock::Mutex<()>>>,
 
-    /// Last `(devices, sender-key-device map)` Arc pair with an empty `needs_skdm`,
-    /// plus the map's generation at that point, so a warm repeat send skips
-    /// `filter_skdm_targets`. `Weak` keeps the pointer comparison ABA-safe
-    /// (matching `GroupDevicesMemo`); the generation catches an in-place cold
-    /// flip that leaves the `Arc` pointer unchanged.
-    pub(crate) skdm_warm_memo: Cache<
-        Jid,
-        (
-            std::sync::Weak<wacore::send::ResolvedGroupDevices>,
-            std::sync::Weak<crate::sender_key_device_cache::SenderKeyDeviceMap>,
-            u64,
-        ),
-    >,
+    /// Last `(devices, sender-key-device map)` Arc pair whose `needs_skdm`
+    /// was warm — empty, or only our own devices (which are never memoized
+    /// warm and re-receive their SKDM every send; WA Web `!isMeDevice`) —
+    /// plus the map's generation and that needs set, so a warm repeat send
+    /// skips `filter_skdm_targets` and reuses the memoized targets. `Weak`
+    /// keeps the pointer comparison ABA-safe (matching `GroupDevicesMemo`);
+    /// the generation catches an in-place cold flip that leaves the `Arc`
+    /// pointer unchanged.
+    pub(crate) skdm_warm_memo: Cache<Jid, SkdmWarmMemoEntry>,
 
     /// Router for dispatching stanzas to their appropriate handlers
     pub(crate) stanza_router: crate::handlers::router::StanzaRouter,
