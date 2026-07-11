@@ -240,6 +240,7 @@ impl Client {
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
             passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
             passkey_opening: AtomicBool::new(false),
+            signal_flush_pending: AtomicBool::new(false),
             custom_enc_handlers: std::sync::OnceLock::new(),
             inbound_durability_hook: std::sync::OnceLock::new(),
             retry_admission: std::sync::OnceLock::new(),

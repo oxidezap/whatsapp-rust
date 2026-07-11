@@ -836,6 +836,10 @@ pub struct Client {
     /// Initialized after `Arc::new(this)` in the constructor.
     pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Client>>,
 
+    /// Trailing-edge debounce flag for the coalesced Signal-cache flush
+    /// (see `signal_flush.rs`). True while a fire is armed.
+    pub(crate) signal_flush_pending: AtomicBool,
+
     /// Holds the background saver's AbortHandle so the task lifetime follows
     /// `Arc<Client>` ref count instead of the Bot wrapper's. Set once by
     /// `Bot::build`; on Client drop (last Arc), the handle drops and the saver

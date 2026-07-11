@@ -91,12 +91,6 @@ impl Client {
     /// WHOLE cache, including ratchet advances of drain entries that may not
     /// have a durable buffered row yet. Everything else must go through the
     /// `_batch_safe` variants below.
-    pub(crate) async fn flush_signal_cache_logged(&self, context: &str, id: Option<&str>) {
-        if let Err(e) = self.flush_signal_cache().await {
-            log_signal_flush_error(context, id, &e);
-        }
-    }
-
     /// Signal-cache flush that is safe while the offline drain is active.
     ///
     /// During the drain, decrypted messages accumulate in the commit batcher

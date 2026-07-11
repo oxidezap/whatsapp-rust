@@ -1552,9 +1552,11 @@ impl Client {
         // Warm marking is visible; a waiting cold send may now re-resolve.
         drop(distribution_guard);
 
-        // Flush cached Signal state to DB after encryption
-        self.flush_signal_cache_batch_safe_logged("send_message_impl", None)
-            .await;
+        // Schedule the coalesced Signal flush for the encryption's ratchet
+        // advance (one storage write per debounce window instead of one per
+        // send; recovery paths that need read-after-write keep their own
+        // synchronous flushes).
+        self.schedule_signal_flush().await;
 
         // Issue new tc token after send if a bucket boundary was crossed.
         // Fire-and-forget so send_message returns without waiting for the IQ
