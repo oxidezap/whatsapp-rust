@@ -32,6 +32,12 @@ use crate::client::Client;
 /// a full receive+reply cycle (and bursts) into one storage write.
 const SIGNAL_FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// Retry backoff ceiling for a failing flush. The backoff starts at the
+/// window and doubles per consecutive failure, so a long-lived storage
+/// outage settles at one attempt (and one error log) per ceiling instead of
+/// ~40/s at the raw window.
+const SIGNAL_FLUSH_RETRY_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Client {
     /// Request a Signal-cache flush without paying one storage transaction
     /// per stanza: the first request arms a fixed-window timer and every
@@ -58,10 +64,11 @@ impl Client {
         let runtime = self.runtime.clone();
         self.runtime
             .spawn(Box::pin(async move {
+                let mut backoff = SIGNAL_FLUSH_WINDOW;
                 loop {
                     // Hold only the Weak across the sleep so an armed fire
                     // never extends the client's lifetime.
-                    runtime.sleep(SIGNAL_FLUSH_WINDOW).await;
+                    runtime.sleep(backoff).await;
                     let Some(client) = weak.upgrade() else {
                         return;
                     };
@@ -72,11 +79,13 @@ impl Client {
                     let Err(e) = client.flush_signal_cache_batch_safe().await else {
                         return;
                     };
-                    log::error!("Coalesced signal flush failed; re-arming for retry: {e:?}");
-                    // Re-arm inline with the same window as the retry backoff;
-                    // the cache keeps its dirty entries until a flush
-                    // succeeds. If a concurrent request re-armed already, its
-                    // fire owns the retry.
+                    // Exponential backoff doubles per consecutive failure and
+                    // caps the error-log rate along with it; the cache keeps
+                    // its dirty entries until a flush succeeds.
+                    backoff = (backoff * 2).min(SIGNAL_FLUSH_RETRY_CEILING);
+                    log::error!("Coalesced signal flush failed; retrying in {backoff:?}: {e:?}");
+                    // If a concurrent request re-armed already, its fire owns
+                    // the retry.
                     if client.signal_flush_pending.swap(true, Ordering::AcqRel) {
                         return;
                     }
