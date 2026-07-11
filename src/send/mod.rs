@@ -1147,23 +1147,28 @@ impl Client {
         own_sending_jid: &Jid,
     ) -> Option<(std::sync::Arc<wacore::send::ResolvedGroupDevices>, Vec<Jid>)> {
         let cached_map = self.skdm_device_map(group_jid).await;
-        // Load BEFORE the filter: a cold flip racing after this stamps the memo
-        // as already stale (its stored generation lags the map's), so the next
-        // read re-runs the filter. Loading after would stamp a racing flip as seen.
-        let cached_map_gen = cached_map.generation();
         match self
             .resolve_group_devices_memoized(group, group_info, own_sending_jid)
             .await
         {
             Ok(all_devices) => {
+                // Load after the resolve await (so a cold flip during it is
+                // visible to the hit check below) but BEFORE the filter: a
+                // flip racing the filter stamps the inserted memo as already
+                // stale (its stored generation lags the map's), so the next
+                // read re-runs it. A flip after this load and before the send
+                // is the same bounded one-send window the unmemoized filter
+                // has, recovered by the retry-receipt resend.
+                let cached_map_gen = cached_map.generation();
                 // Skip the O(devices) filter_skdm_targets scan when the same
-                // (devices, sender-key-map) Arc pair AND generation were already
-                // warm, reusing the memoized targets (empty, or the own devices
-                // that re-receive their SKDM every send). The devices Arc swaps
-                // on membership change; the cached-map Arc swaps on a warm-mark
-                // invalidation; the generation catches an in-place cold flip
-                // that keeps the same Arc. So a stale skip is impossible, and
-                // the memoized needs are a pure function of that same identity.
+                // (devices, sender-key-map) Arc pair, generation AND sending
+                // identity were already warm, reusing the memoized targets
+                // (empty, or the own devices that re-receive their SKDM every
+                // send). The devices Arc swaps on membership change; the
+                // cached-map Arc swaps on a warm-mark invalidation; the
+                // generation catches an in-place cold flip that keeps the
+                // same Arc; the memoized needs are a pure function of that
+                // identity.
                 if self.group_devices_memo_enabled
                     && let Some((dw, cw, memo_gen, memo_sender, memo_needs)) =
                         self.skdm_warm_memo.get(group).await
