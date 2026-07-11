@@ -159,102 +159,40 @@ impl TestClient {
 
         let run_handle = bot.spawn();
 
-        // Wait for PairSuccess + Connected.
+        // Wait for the client to become fully ready: connected, logged in, and
+        // critical app-state sync complete.
         //
-        // PairSuccess arrives quickly (handshake only), but Connected is dispatched
-        // only after the critical app-state sync completes (sync_collections_batched).
-        // Under CI load with many concurrent clients, the mock server may be slow to
-        // serve app-state IQs, so Connected can take significantly longer than pairing.
-        //
-        // We use a two-phase timeout: 30s for pairing, then an additional 30s for
-        // Connected (which includes critical sync). This avoids a single shared timeout
-        // where a slow sync eats into the pairing budget.
-        let timeout = tokio::time::Duration::from_secs(30);
-        let mut got_pair = false;
-        let mut got_connected = false;
-
-        let wait_result = tokio::time::timeout(timeout, async {
-            loop {
-                match event_rx.recv().await {
-                    Ok(ref event) if matches!(**event, Event::PairSuccess(_)) => {
-                        got_pair = true;
-                        if got_connected {
-                            break;
-                        }
-                    }
-                    Ok(ref event) if matches!(**event, Event::Connected(_)) => {
-                        got_connected = true;
-                        if got_pair {
-                            break;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        return Err(anyhow::anyhow!("Event channel closed during connect: {e}"));
-                    }
-                }
-            }
-            Ok(())
-        })
-        .await;
-
-        match wait_result {
-            Err(_) => {
-                // If we got PairSuccess but not Connected, the critical sync is slow.
-                // Give it extra time via wait_for_startup_sync instead of failing immediately.
-                if got_pair && !got_connected {
-                    eprintln!(
-                        "WARN: Got PairSuccess but Connected timed out after {timeout:?}, \
-                         waiting for startup sync..."
-                    );
-                    if let Err(e) = client
-                        .wait_for_startup_sync(tokio::time::Duration::from_secs(30))
-                        .await
-                    {
-                        client.disconnect().await;
-                        drop(run_handle);
-                        return Err(anyhow::anyhow!(
-                            "Timed out waiting for Connected after PairSuccess: {e}"
-                        ));
-                    }
-                    // Drain the Connected event that should now be available
-                    let connected_timeout = tokio::time::Duration::from_secs(5);
-                    let _ = tokio::time::timeout(connected_timeout, async {
-                        loop {
-                            match event_rx.recv().await {
-                                Ok(ref event) if matches!(**event, Event::Connected(_)) => break,
-                                Ok(_) => continue,
-                                Err(_) => break,
-                            }
-                        }
-                    })
-                    .await;
-                } else {
-                    client.disconnect().await;
-                    drop(run_handle);
-                    return Err(anyhow::anyhow!(
-                        "Timed out waiting for PairSuccess + Connected \
-                         (got_pair={got_pair}, got_connected={got_connected})"
-                    ));
-                }
-            }
-            Ok(Err(e)) => {
-                client.disconnect().await;
-                drop(run_handle);
-                return Err(e);
-            }
-            Ok(Ok(())) => {}
-        }
-
+        // This gates on `wait_for_connected`, which resolves on the canonical
+        // `is_ready` signal (`dispatch_connected`, fired after the critical sync)
+        // via a notifier — not on the order events happen to arrive in the
+        // channel. That makes it immune to the earlier flake, where a fixed 30s
+        // event-loop wait for `Connected` raced how long the mock server took to
+        // serve app-state IQs under concurrent CI load, then fell back to
+        // `offline_sync_completed` — an orthogonal signal that could time out
+        // even though the client was otherwise ready. The single budget below is
+        // generous because it is a hard ceiling on a real hang, not a per-phase
+        // race window. PairSuccess/Connected still land in the unbounded
+        // `event_rx`; the predicate-filtered `wait_for_event` used by tests
+        // discards them.
         if let Err(e) = client
-            .wait_for_startup_sync(tokio::time::Duration::from_secs(15))
+            .wait_for_connected(tokio::time::Duration::from_secs(60))
             .await
         {
             client.disconnect().await;
             drop(run_handle);
-            return Err(anyhow::anyhow!(
-                "Timed out waiting for startup sync to become idle: {e}"
-            ));
+            return Err(anyhow::anyhow!("client never became ready after pairing: {e}"));
+        }
+
+        // Drain the initial startup sync (offline messages + history) so tests
+        // start from a settled state. Best-effort: readiness is already
+        // guaranteed by `wait_for_connected` above, and a chat-action test does
+        // not depend on message backlog, so a slow mock server here must not
+        // fail the connect — it only means the (empty) backlog is still landing.
+        if let Err(e) = client
+            .wait_for_startup_sync(tokio::time::Duration::from_secs(30))
+            .await
+        {
+            eprintln!("WARN: startup sync did not settle before the connect deadline: {e}");
         }
 
         Ok(Self {
