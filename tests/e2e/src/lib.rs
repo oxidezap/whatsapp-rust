@@ -180,7 +180,9 @@ impl TestClient {
         {
             client.disconnect().await;
             drop(run_handle);
-            return Err(anyhow::anyhow!("client never became ready after pairing: {e}"));
+            return Err(anyhow::anyhow!(
+                "client never became ready after pairing: {e}"
+            ));
         }
 
         // Drain the initial startup sync (offline messages + history) so tests
