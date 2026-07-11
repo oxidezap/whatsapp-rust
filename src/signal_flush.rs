@@ -23,19 +23,25 @@ use std::sync::atomic::Ordering;
 
 use crate::client::Client;
 
-/// Trailing-edge debounce for the coalesced flush. Small enough that the
-/// widened crash window stays negligible next to network RTTs; large enough
-/// to fold a full receive+reply cycle (and bursts) into one storage write.
-const SIGNAL_FLUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(25);
+/// Fixed coalescing window for the flush. The fire runs this long after the
+/// FIRST request; later requests inside the window ride the same fire (the
+/// deadline is deliberately not extended — a true trailing-edge debounce
+/// would defer the flush indefinitely under continuous traffic, while the
+/// fixed window bounds the maximum deferral). Small enough that the widened
+/// crash window stays negligible next to network RTTs; large enough to fold
+/// a full receive+reply cycle (and bursts) into one storage write.
+const SIGNAL_FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
 
 impl Client {
     /// Request a Signal-cache flush without paying one storage transaction
-    /// per stanza: the first request arms a trailing-edge timer and every
+    /// per stanza: the first request arms a fixed-window timer and every
     /// request inside the window rides the same fire.
     ///
     /// The pending flag clears BEFORE the fire's flush runs, so a request
     /// that lands mid-flush arms a new fire instead of being absorbed by a
-    /// flush that may already have snapshotted the dirty set.
+    /// flush that may already have snapshotted the dirty set. A failed flush
+    /// re-arms the window, so dirty state is retried instead of sitting
+    /// unwritten until unrelated traffic schedules again.
     pub(crate) async fn schedule_signal_flush(&self) {
         if self.signal_flush_pending.swap(true, Ordering::AcqRel) {
             return;
@@ -52,7 +58,7 @@ impl Client {
         let runtime = self.runtime.clone();
         self.runtime
             .spawn(Box::pin(async move {
-                runtime.sleep(SIGNAL_FLUSH_DEBOUNCE).await;
+                runtime.sleep(SIGNAL_FLUSH_WINDOW).await;
                 let Some(client) = client.upgrade() else {
                     return;
                 };
@@ -60,9 +66,12 @@ impl Client {
                 // Batch-safe: if an offline drain became active meanwhile,
                 // this routes under the processing permit like any
                 // out-of-band flush.
-                client
-                    .flush_signal_cache_batch_safe_logged("coalesced", None)
-                    .await;
+                if let Err(e) = client.flush_signal_cache_batch_safe().await {
+                    log::error!("Coalesced signal flush failed; re-arming for retry: {e:?}");
+                    // Re-arm with the same window as the retry backoff; the
+                    // cache keeps its dirty entries until a flush succeeds.
+                    client.schedule_signal_flush().await;
+                }
             }))
             .detach();
     }
