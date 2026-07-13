@@ -71,11 +71,13 @@ impl Client {
     /// Force any pending write-behind Signal cache state to the backend,
     /// returning once the flush completes (or fails).
     ///
-    /// Live sends and receives schedule a coalesced flush (see
-    /// `signal_flush.rs`) instead of writing through, so on success the backend
-    /// trails the in-memory cache by at most one coalescing window; a backend
-    /// outage extends that until the scheduler's retry loop succeeds. Use this
-    /// to settle durability deterministically before reading persisted state or
+    /// The live receive path schedules a coalesced flush (see `signal_flush.rs`)
+    /// instead of writing through (sends flush synchronously). On success the
+    /// backend normally trails the cache by about the coalescing window, but
+    /// that is not a hard wall-clock bound — the timer can slip under runtime
+    /// starvation and the flush can wait on locks or slow/failing storage (a
+    /// backend outage extends it until the retry loop succeeds). Use this to
+    /// settle durability deterministically before reading persisted state or
     /// ahead of a non-graceful shutdown — and check the returned `Result`, as a
     /// failure leaves state pending.
     ///

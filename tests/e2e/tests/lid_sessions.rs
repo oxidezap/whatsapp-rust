@@ -282,7 +282,8 @@ async fn test_stale_pn_session_does_not_break_lid_messaging() -> anyhow::Result<
     .await?;
     info!("Messaging works despite stale PN session in DB");
 
-    // Settle the coalesced flush from the post-inject sends before reading.
+    // Settle the coalesced receive-path flush (A received the post-inject
+    // reply) before reading.
     client_a.client.flush_pending_signal_state().await?;
     // LID session should still be authoritative
     assert!(
@@ -684,7 +685,7 @@ async fn test_pn_migration_is_durable_across_followup_messages() -> anyhow::Resu
         .await?;
     }
 
-    // Settle the coalesced flush from the follow-up sends before reading.
+    // Settle the coalesced receive-path flush (A received the follow-up messages) before reading.
     client_a.client.flush_pending_signal_state().await?;
     assert!(
         backend_a.get_session(&lid_addr).await?.is_some(),

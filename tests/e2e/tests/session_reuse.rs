@@ -61,15 +61,14 @@ async fn durable_sender_chain_index(
     Ok(None)
 }
 
-/// The outbound ratchet advance must be durable BEFORE send_message returns:
-/// a coalesced send could report success while the counter/chain-key advance
-/// is still only in the in-memory cache, so a crash before the flush would
-/// reuse the counter (and its message key + IV) on the next send. Read the
-/// backend directly after each send — with no explicit settle — and require
-/// the sender-chain counter to have already advanced, which is exactly what a
-/// crash at that instant would preserve.
+/// The outbound ratchet advance must be durable by the time `send_message`
+/// returns: reusing an outbound counter reuses its message key + IV, so a crash
+/// after a successful send must never leave the advance only in memory. This
+/// reads the backend IMMEDIATELY after `send_message` (no wait for delivery, no
+/// explicit settle): a coalesced send would still be inside its window and the
+/// counter would be stale, so only the synchronous outbound flush passes.
 #[tokio::test]
-async fn test_outbound_ratchet_is_durable_before_send_returns() -> anyhow::Result<()> {
+async fn test_outbound_ratchet_is_durable_when_send_returns() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let mut client_a = TestClient::connect("e2e_sig_durable_a").await?;
@@ -97,17 +96,14 @@ async fn test_outbound_ratchet_is_durable_before_send_returns() -> anyhow::Resul
         .await?
         .expect("an outbound session must exist after the roundtrip");
 
-    // Each send must leave a strictly higher counter durable in the backend
-    // WITHOUT any explicit flush — proving the synchronous outbound flush.
+    // send_message returns only after the synchronous pre-wire flush, so the
+    // advanced counter is already durable — read it with no delivery wait and
+    // no settle. A coalesced (window-deferred) flush would leave it unchanged.
     for i in 0..3 {
-        send_and_expect_text(
-            &client_a.client,
-            &mut client_b,
-            &jid_b,
-            &format!("m{i}"),
-            30,
-        )
-        .await?;
+        client_a
+            .client
+            .send_message(jid_b.clone(), e2e_tests::text_msg(&format!("m{i}")))
+            .await?;
         let now = read_index(&user, server)
             .await?
             .expect("session persists across sends");
@@ -227,10 +223,9 @@ async fn test_session_state_after_roundtrip() -> anyhow::Result<()> {
     send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "Session reply", 30).await?;
     info!("Roundtrip complete");
 
-    // Settle A's write-behind Signal cache to the backend before inspecting
-    // it: a live send schedules a coalesced flush rather than writing
-    // synchronously, so a plain send-and-read races the debounce window (and
-    // its timer can slip arbitrarily under CI load).
+    // Settle A's write-behind Signal cache before inspecting it: A's last op
+    // here is receiving B's reply, and the receive-path flush is coalesced, so
+    // a plain read races the coalescing window.
     client_a.client.flush_pending_signal_state().await?;
 
     // Inspect session state
@@ -319,9 +314,9 @@ async fn test_session_persistence() -> anyhow::Result<()> {
     .await?;
     info!("First message sent: {msg_id_1}");
 
-    // Settle the coalesced send flush before reading durable state (see the
-    // roundtrip test): a live send does not write through synchronously.
-    client_a.client.flush_pending_signal_state().await?;
+    // No settle: the send path flushes synchronously, so the session is durable
+    // in the backend by the time send_message returned. (A missing session here
+    // would catch a regression back to a coalesced/deferred send flush.)
 
     // Session may be under PN (c.us) or LID (lid) depending on whether
     // PN→LID mapping was resolved before encryption.
