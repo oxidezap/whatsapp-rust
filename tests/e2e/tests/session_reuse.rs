@@ -120,6 +120,75 @@ async fn test_outbound_ratchet_is_durable_when_send_returns() -> anyhow::Result<
     Ok(())
 }
 
+/// A send whose outbound-ratchet persistence fails must abort BEFORE the stanza
+/// reaches the wire: the flush precedes the send on the send path, so if the
+/// advance cannot be stored, `send_message` returns `Err` and the peer receives
+/// nothing. Otherwise a crash after a wire-committed send would leave the
+/// advance only in memory and the next send would reuse that counter's key + IV.
+#[tokio::test]
+async fn test_send_aborts_before_wire_when_persist_fails() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut client_a = TestClient::connect("e2e_sig_abort_a").await?;
+    let mut client_b = TestClient::connect("e2e_sig_abort_b").await?;
+    let jid_a = client_a.jid().await;
+    let jid_b = client_b.jid().await;
+
+    // Establish the session both ways so the next A→B send is a steady-state
+    // encrypt (its only new durable write is the ratchet advance we fail).
+    send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "establish", 30).await?;
+    send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "reply", 30).await?;
+
+    // Persisting the outbound advance now fails.
+    client_a.backend.set_fail_session_writes(true);
+    let writes_before = client_a.backend.session_batch_write_count();
+    let result = client_a
+        .client
+        .send_message(
+            jid_b.clone(),
+            e2e_tests::text_msg("must not reach the wire"),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "send must fail when the ratchet advance cannot be persisted, got {result:?}"
+    );
+    // The send reached the (failing) persistence step, proving the flush runs on
+    // the send path before the wire rather than being skipped or deferred.
+    assert!(
+        client_a.backend.session_batch_write_count() > writes_before,
+        "the send path must attempt to persist the ratchet advance before the wire"
+    );
+
+    // The stanza never went out: B must not see it.
+    client_b
+        .assert_no_event(
+            3,
+            |e| {
+                e.messages()
+                    .any(|m| m.message.conversation.as_deref() == Some("must not reach the wire"))
+            },
+            "a send that failed to persist must not deliver",
+        )
+        .await?;
+
+    // Recovery: once persistence works again, sends deliver normally, proving
+    // the failure aborted cleanly rather than wedging the session.
+    client_a.backend.set_fail_session_writes(false);
+    send_and_expect_text(
+        &client_a.client,
+        &mut client_b,
+        &jid_b,
+        "after recovery",
+        30,
+    )
+    .await?;
+
+    client_a.disconnect().await;
+    client_b.disconnect().await;
+    Ok(())
+}
+
 /// Multiple sequential sends without a reply should all be delivered.
 #[tokio::test]
 async fn test_one_way_multiple_sends() -> anyhow::Result<()> {

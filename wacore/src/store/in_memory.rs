@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use crate::appstate::hash::HashState;
 use crate::store::Device;
@@ -91,6 +91,13 @@ const MAX_SENT_MESSAGES: usize = 4096;
 pub struct InMemoryBackend {
     state: Mutex<InMemoryState>,
     next_device_id: AtomicI32,
+    /// Count of `put_sessions_batch` calls. Test hook: lets a harness prove the
+    /// receive-path flush coalesces (N receives collapse to fewer batch writes).
+    session_batch_writes: AtomicU32,
+    /// When set, `put_sessions_batch` fails. Test hook: lets a harness prove the
+    /// send path aborts (and never hits the wire) when the ratchet advance
+    /// cannot be persisted.
+    fail_session_writes: AtomicBool,
 }
 
 impl InMemoryBackend {
@@ -99,7 +106,19 @@ impl InMemoryBackend {
         Self {
             state: Mutex::new(InMemoryState::default()),
             next_device_id: AtomicI32::new(1),
+            session_batch_writes: AtomicU32::new(0),
+            fail_session_writes: AtomicBool::new(false),
         }
+    }
+
+    /// Number of `put_sessions_batch` calls since construction.
+    pub fn session_batch_write_count(&self) -> u32 {
+        self.session_batch_writes.load(Ordering::Relaxed)
+    }
+
+    /// Make every subsequent `put_sessions_batch` fail (or stop failing).
+    pub fn set_fail_session_writes(&self, fail: bool) {
+        self.fail_session_writes.store(fail, Ordering::Relaxed);
     }
 }
 
@@ -148,6 +167,12 @@ impl SignalStore for InMemoryBackend {
     }
 
     async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {
+        self.session_batch_writes.fetch_add(1, Ordering::Relaxed);
+        if self.fail_session_writes.load(Ordering::Relaxed) {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "put_sessions_batch failing (test hook)",
+            )));
+        }
         let mut state = self.state.lock().await;
         state.sessions.reserve(sessions.len());
         for (address, session) in sessions {

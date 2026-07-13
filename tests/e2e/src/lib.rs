@@ -97,6 +97,9 @@ pub struct TestClient {
     pub client: Arc<whatsapp_rust::client::Client>,
     pub event_rx: async_channel::Receiver<Arc<Event>>,
     pub run_handle: whatsapp_rust::bot::BotHandle,
+    /// The concrete backend, retained for its test hooks
+    /// (`session_batch_write_count`, `set_fail_session_writes`).
+    pub backend: Arc<InMemoryBackend>,
 }
 
 impl TestClient {
@@ -126,8 +129,9 @@ impl TestClient {
         let transport_factory = TokioWebSocketTransportFactory::new().with_url(mock_server_url());
         let (event_handler, event_rx) = ChannelEventHandler::new();
 
+        let backend = Arc::new(InMemoryBackend::new());
         let mut builder = Bot::builder()
-            .with_backend(InMemoryBackend::new())
+            .with_backend_arc(backend.clone())
             .with_transport_factory(transport_factory)
             .with_http_client(UreqHttpClient::new())
             .with_runtime(whatsapp_rust::TokioRuntime)
@@ -197,6 +201,7 @@ impl TestClient {
             client,
             event_rx,
             run_handle,
+            backend,
         })
     }
 
