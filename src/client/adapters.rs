@@ -105,14 +105,13 @@ impl Client {
             .map_err(|e| anyhow::anyhow!("Failed to flush signal cache: {e}"))
     }
 
-    /// [`flush_signal_cache`](Self::flush_signal_cache) with error logging instead of propagation.
-    ///
-    /// Both of these are safe only when the caller holds the message
-    /// processing permit or the batcher is known inactive: they persist the
-    /// WHOLE cache, including ratchet advances of drain entries that may not
-    /// have a durable buffered row yet. Everything else must go through the
-    /// `_batch_safe` variants below.
     /// Signal-cache flush that is safe while the offline drain is active.
+    ///
+    /// [`flush_signal_cache`](Self::flush_signal_cache) is safe only when the
+    /// caller holds the message processing permit or the batcher is known
+    /// inactive: it persists the WHOLE cache, including ratchet advances of
+    /// drain entries that may not have a durable buffered row yet. Everything
+    /// else must go through this `_batch_safe` variant.
     ///
     /// During the drain, decrypted messages accumulate in the commit batcher
     /// with no durable buffered copy; flushing the cache from an unrelated
