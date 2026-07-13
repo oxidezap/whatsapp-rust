@@ -241,6 +241,7 @@ impl Client {
             passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
             passkey_opening: AtomicBool::new(false),
             signal_flush_state: AtomicU64::new(0),
+            signal_flush_lifecycle: async_lock::Mutex::new(()),
             #[cfg(test)]
             signal_flush_test_failures: AtomicU32::new(0),
             #[cfg(test)]
@@ -840,6 +841,13 @@ impl Client {
         // the durable hook commit is what matters. Reached on every teardown
         // path, including the run loop's unexpected read-loop exit, which
         // never goes through disconnect().
+        //
+        // Hold the coalesced-flush barrier across the whole settle: a stale flush
+        // worker that already passed its generation check must not interleave a
+        // backend write between our commit and the next connection's drain, or it
+        // could persist that drain's rowless advances. The worker re-checks the
+        // generation (bumped above) once it gets the gate, so it stands down.
+        let flush_gate = self.signal_flush_lifecycle.lock().await;
         if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
             client
                 .teardown_inbound_commits_bounded(std::time::Duration::from_secs(5))
@@ -874,6 +882,8 @@ impl Client {
             );
             self.signal_cache.clear().await;
         }
+        // Cache is settled and any dropped entries cleared; a worker may run again.
+        drop(flush_gate);
         self.offline_batch.reset();
         self.offline_sync_metrics
             .active

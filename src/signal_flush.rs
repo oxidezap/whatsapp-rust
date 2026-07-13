@@ -18,12 +18,16 @@
 //!   keep their own synchronous flushes: those gate acks, receipts or
 //!   follow-up reads on durability and are not routed here.
 //!
-//! Single-flight scheduler: at most one worker exists at a time. The first
+//! Single-flight scheduler: at most one worker per generation. The first
 //! request arms it; requests that arrive while it runs only mark it dirty
-//! (never spawn a second worker), and it re-runs one more window if so. A
-//! failing flush is retried by that same worker with exponential backoff, so a
-//! backend outage cannot be reset to the base delay by concurrent traffic, and
-//! a generation change (reconnect/teardown) stands the worker down.
+//! (never spawn a second worker for that generation), and it re-runs one more
+//! window if so. A failing flush is retried by that same worker with
+//! exponential backoff, so a backend outage cannot be reset to the base delay
+//! by concurrent traffic. Across a reconnect a stale worker and the new
+//! generation's worker can briefly coexist; the stale one stands down at its
+//! generation check. Actual backend writes are additionally serialized against
+//! teardown's cache settle by the `signal_flush_lifecycle` gate, so at most one
+//! flush is ever mid-write — see `Client::signal_flush_lifecycle`.
 
 use std::sync::atomic::Ordering;
 
@@ -133,14 +137,23 @@ impl Client {
                     let Some(client) = weak.upgrade() else {
                         return;
                     };
-                    // A reconnect handed ownership to a new generation: stand
-                    // down before flushing. The generation-scoped exit CAS would
-                    // reject our mutation anyway, but skipping the flush avoids a
-                    // stale write after teardown settled the cache.
-                    if client.connection_generation.load(Ordering::Acquire) != generation {
-                        return;
-                    }
-                    match client.coalesced_flush_attempt().await {
+                    // Take the lifecycle barrier for the flush, then re-check the
+                    // generation under it. Teardown holds this same gate while it
+                    // settles the cache, so either we got here first (and flush
+                    // this generation's state before any settle) or teardown ran
+                    // and the generation moved (stand down). Without the gate the
+                    // bare generation check races: we could pass it, get preempted,
+                    // and resume the flush after teardown settled and the next
+                    // connection's drain dirtied the cache — persisting rowless
+                    // advances out of band.
+                    let flush_result = {
+                        let _gate = client.signal_flush_lifecycle.lock().await;
+                        if client.connection_generation.load(Ordering::Acquire) != generation {
+                            return;
+                        }
+                        client.coalesced_flush_attempt().await
+                    };
+                    match flush_result {
                         Ok(()) => {
                             backoff = SIGNAL_FLUSH_WINDOW;
                             // Settle ownership under a CAS scoped to our
@@ -548,5 +561,63 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         wait_for_backend_session(&client, &second).await;
+    }
+
+    /// The lifecycle gate is a hard barrier: while it is held (as teardown holds
+    /// it across the cache settle), a worker cannot write to the backend; once
+    /// released, it flushes. This is what stops a stale flush from interleaving
+    /// a backend write into teardown's settle.
+    #[tokio::test]
+    async fn lifecycle_gate_blocks_the_worker_flush_until_released() {
+        let client = crate::test_utils::create_test_client().await;
+        let s1 = dirty_session(&client, "15550009001");
+
+        // Hold the gate as teardown's settle would.
+        let gate = client.signal_flush_lifecycle.lock().await;
+
+        client.schedule_signal_flush_live();
+        // The worker arms, wakes after the window, and blocks acquiring the gate.
+        // It genuinely cannot proceed, so the dirty session never reaches the
+        // backend no matter how long we wait here.
+        tokio::time::sleep(SIGNAL_FLUSH_WINDOW * 3).await;
+        assert!(
+            backend_session(&client, &s1).await.is_none(),
+            "the worker must not flush while the lifecycle gate is held"
+        );
+
+        // Release as teardown would after settling; the worker proceeds.
+        drop(gate);
+        wait_for_backend_session(&client, &s1).await;
+    }
+
+    /// A worker that only reaches the gate after teardown bumped the generation
+    /// re-checks under the gate and stands down: it never enters the flush, so
+    /// the attempt counter stays 0 and the session is not persisted out of band.
+    #[tokio::test]
+    async fn worker_stands_down_if_it_reaches_the_gate_after_the_bump() {
+        let client = crate::test_utils::create_test_client().await;
+        let s1 = dirty_session(&client, "15550009101");
+
+        // Teardown-first: hold the gate, arm a worker for the current generation,
+        // then bump under the gate (mirrors cleanup_connection_state bumping the
+        // generation and holding the gate across the settle).
+        let gate = client.signal_flush_lifecycle.lock().await;
+        client.schedule_signal_flush_live();
+        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+
+        // Let the worker wake and block on the gate, then release it.
+        tokio::time::sleep(SIGNAL_FLUSH_WINDOW * 3).await;
+        drop(gate);
+        tokio::time::sleep(SIGNAL_FLUSH_WINDOW * 3).await;
+
+        assert_eq!(
+            client.signal_flush_test_in_attempt.load(Ordering::Acquire),
+            0,
+            "a worker reaching the gate after the bump must stand down before flushing"
+        );
+        assert!(
+            backend_session(&client, &s1).await.is_none(),
+            "the stale worker must not persist S1 after teardown"
+        );
     }
 }

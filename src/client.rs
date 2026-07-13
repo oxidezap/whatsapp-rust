@@ -840,6 +840,16 @@ pub struct Client {
     /// Single-flight state for the coalesced Signal-cache flush worker:
     /// `(connection_generation << 2) | RUNNING/DIRTY bits` (see `signal_flush.rs`).
     pub(crate) signal_flush_state: AtomicU64,
+    /// Barrier between a coalesced-flush worker's backend write and teardown's
+    /// Signal-cache settle. The generation-scoped atomic only orders
+    /// `signal_flush_state`, not the writes themselves: a worker that passed its
+    /// pre-flush generation check could still be mid-flush when teardown settles
+    /// the cache and the next connection's drain dirties it, persisting rowless
+    /// advances out of band. The worker holds this only across the flush (never
+    /// across sleep/backoff) and re-checks the generation under it; teardown
+    /// holds it around the settle. Lock order is always this-gate → processing
+    /// permit / sessions lock, so no inversion.
+    pub(crate) signal_flush_lifecycle: async_lock::Mutex<()>,
     /// Injected failures for the coalesced flush (consumed one per attempt),
     /// so tests can exercise the retry/backoff path deterministically.
     #[cfg(test)]
