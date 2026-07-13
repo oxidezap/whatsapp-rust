@@ -17,9 +17,13 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 
 use super::demux::{RelayPacketKind, classify_relay_packet};
-use super::session::{CallDirection, MediaPipeline, MediaPipelineParams};
+use super::h264::{VideoFrame, au_is_keyframe};
+use super::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_TS_STRIDE_15FPS, parse_rtp_header};
+use super::session::{
+    CallDirection, MediaPipeline, MediaPipelineParams, VideoPipeline, VideoPipelineParams,
+};
 use super::sframe::{SframeIn, SframeSession};
-use super::{is_standard_opus_frame, mlow, stun};
+use super::{is_standard_opus_frame, mlow, ssrc, stun};
 
 /// Monotonic milliseconds. The shell supplies it; the engine never reads a clock.
 pub type Millis = u64;
@@ -115,6 +119,9 @@ pub struct CallConfig {
     pub warp_mi_tag_len: usize,
     /// Run the media plane (MLow + playout). Off for the esp32 control plane.
     pub enable_media: bool,
+    /// Build the video plane at engine construction (a video-from-the-start call). An audio call
+    /// upgrades later via [`CallEngine::enable_video`]; both paths build the same pipeline.
+    pub enable_video: bool,
     /// Decrypt inbound SFrame, with a plaintext fallback (the Android peer may GCM-wrap its
     /// Opus/MLow). Recv-side only by design: outbound stays plain codec inside WAHKDF SRTP, which
     /// the peer accepts, matching the pre-refactor pipeline (`MediaPipeline`: "SFrame is omitted,
@@ -141,6 +148,7 @@ impl core::fmt::Debug for CallConfig {
             .field("integrity_key", &"[redacted]")
             .field("warp_mi_tag_len", &self.warp_mi_tag_len)
             .field("enable_media", &self.enable_media)
+            .field("enable_video", &self.enable_video)
             .field("enable_sframe", &self.enable_sframe)
             .finish()
     }
@@ -243,6 +251,7 @@ impl CallConfig {
             integrity_key,
             warp_mi_tag_len,
             enable_media: true,
+            enable_video: false,
             enable_sframe: true,
         })
     }
@@ -292,6 +301,9 @@ pub enum Input<'a> {
     /// A 60ms PCM frame captured from the local mic (16kHz mono). Must be exactly 960 samples (the
     /// MLow frame size); a wrong-length frame is silently dropped by the encoder (no RTP sent).
     MicFrame(&'a [i16]),
+    /// One pre-encoded H.264 Annex-B access unit to send. Dropped while the video plane is off
+    /// (audio-only call, or after a downgrade).
+    VideoFrame(&'a [u8]),
     /// The deadline that `poll_output`/`poll_timeout` last reported has fired.
     Timeout,
 }
@@ -304,6 +316,9 @@ pub enum Output {
     Transmit(Bytes),
     /// Decoded PCM for the speaker (16kHz mono).
     Playout(Vec<i16>),
+    /// A reassembled peer access unit for the video sink. Dedicated output (not a CallEvent) for
+    /// the same reason audio uses `Playout`: the event channel sheds on overflow, media must not.
+    VideoPlayout(VideoFrame),
     /// A call lifecycle / diagnostic event.
     Event(CallEvent),
     /// Drained: arm a timer for this monotonic-ms deadline ([`NEVER`] = no timer).
@@ -323,6 +338,14 @@ pub enum CallEvent {
     RelayAllocateFailed(u16),
     /// The relay never acked the allocate within the deadline (wedged relay). Terminal.
     RelayAllocateTimedOut,
+    /// The peer's `<video state=N>` signaling arrived (upgrade requested/accepted, stopped, ...).
+    /// Pushed by the signaling handler, not the engine; surfaced here so one event stream carries
+    /// the whole call. `UpgradeRequestV2` is the peer asking for video — answer with
+    /// `accept_video` or ignore to decline.
+    VideoStateChanged {
+        state: crate::types::call::VideoState,
+        orientation: Option<u8>,
+    },
 }
 
 /// The optional media plane: the SRTP pipeline, the MLow codec, an optional SFrame session, and
@@ -333,6 +356,16 @@ struct MediaState {
     /// Retained so the caller can re-derive the recv keys once the answering device is known (the
     /// callee's `<accept>` carries its device LID). See [`CallEngine::rekey_recv`].
     call_key: Vec<u8>,
+    /// Retained for a mid-call [`CallEngine::enable_video`]: the video pipeline derives its own
+    /// SSRC and send keys from these on demand.
+    self_lid: String,
+    /// The peer LID the recv keys are CURRENTLY derived from — starts as the dialed base LID and
+    /// moves to the answering device on [`CallEngine::rekey_recv`]. A video plane enabled after
+    /// that rekey must key its recv path from this, not the stale config LID.
+    recv_peer_lid: String,
+    warp_mi_tag_len: usize,
+    /// The video plane, present while video is enabled (from the start or via upgrade).
+    video: Option<VideoPlaneState>,
     sframe: Option<SframeSession>,
     encoder: mlow::MlowEncoder,
     decoder: mlow::MlowDecoder,
@@ -347,6 +380,50 @@ struct MediaState {
     /// Consecutive playout ticks spent priming; bounds the wait so a partial buffer (the peer sent one
     /// frame then went DTX) is flushed after `MAX_PRIME_TICKS` instead of being held silent forever.
     priming_ticks: u32,
+}
+
+/// The video half of the media plane. No jitter buffer or playout tick: an AU is handed to the
+/// sink the moment its marker packet reassembles it (the consumer's decoder does its own pacing).
+///
+/// The pipeline is built once per call and OUTLIVES a downgrade: `active` gates transmit/decode
+/// while the pipe (its SRTP send seq + ROC) is preserved. Rebuilding it on a re-upgrade would reset
+/// the packet index to zero under the same key+SSRC and repeat the AES-CTR keystream (a two-time
+/// pad), so a downgrade must not drop it.
+struct VideoPlaneState {
+    pipe: VideoPipeline,
+    active: bool,
+    /// When set, inbound video still decodes but OUTBOUND AUs are dropped: the initiator of an
+    /// upgrade holds its camera off the wire until the peer accepts (a `<video>` request the peer
+    /// ignores must not leak our video). Cleared on the peer's UpgradeAccept/Enabled.
+    send_gated: bool,
+}
+
+/// Build the video pipeline for `self_lid` sending / `recv_peer_lid` receiving. `None` on a
+/// malformed callKey (a setup invariant the audio plane already validated).
+fn make_video_plane(
+    call_id: &str,
+    call_key: &[u8],
+    self_lid: &str,
+    recv_peer_lid: &str,
+    warp_mi_tag_len: usize,
+) -> Option<VideoPlaneState> {
+    let video_ssrc = ssrc::derive_video_participant_ssrc(
+        call_id,
+        &ssrc::format_e2e_srtp_participant_id(self_lid),
+    );
+    let pipe = VideoPipeline::new(&VideoPipelineParams {
+        call_key,
+        self_lid,
+        peer_lid: recv_peer_lid,
+        ssrc: video_ssrc,
+        ts_stride: VIDEO_TS_STRIDE_15FPS,
+        warp_mi_tag_len,
+    })?;
+    Some(VideoPlaneState {
+        pipe,
+        active: true,
+        send_gated: false,
+    })
 }
 
 /// The sans-IO call engine. See the module docs for the drive contract.
@@ -370,6 +447,9 @@ pub struct CallEngine {
     terminated: bool,
     // Media plane (None = control plane only, e.g. esp32).
     media: Option<MediaState>,
+    /// Peer device orientation (0..3, ×90°) from the last `<video device_orientation>`; stamped on
+    /// every reassembled inbound AU so the sink can rotate.
+    peer_video_orientation: u8,
     outbox: VecDeque<Output>,
 }
 
@@ -408,9 +488,27 @@ impl CallEngine {
             } else {
                 None
             };
+            let video = if config.enable_video {
+                Some(
+                    make_video_plane(
+                        &config.call_id,
+                        &config.call_key,
+                        &config.self_lid,
+                        &config.peer_lid,
+                        config.warp_mi_tag_len,
+                    )
+                    .ok_or(EngineError::BadCallKey)?,
+                )
+            } else {
+                None
+            };
             Some(MediaState {
                 pipe,
                 call_key: config.call_key.clone(),
+                self_lid: config.self_lid.clone(),
+                recv_peer_lid: config.peer_lid.clone(),
+                warp_mi_tag_len: config.warp_mi_tag_len,
+                video,
                 sframe,
                 encoder: mlow::MlowEncoder::new(),
                 decoder: mlow::MlowDecoder::new(),
@@ -438,6 +536,7 @@ impl CallEngine {
             started: false,
             terminated: false,
             media,
+            peer_video_orientation: 0,
             outbox: VecDeque::new(),
         })
     }
@@ -469,7 +568,80 @@ impl CallEngine {
         let Some(m) = self.media.as_mut() else {
             return true;
         };
-        m.pipe.rekey_recv(&m.call_key, answering_peer_lid)
+        if !m.pipe.rekey_recv(&m.call_key, answering_peer_lid) {
+            return false;
+        }
+        // The video recv keys derive from the same participant id and go stale together with the
+        // audio ones; a video plane enabled after this rekey must also start from the new LID.
+        m.recv_peer_lid = answering_peer_lid.to_string();
+        if let Some(v) = m.video.as_mut() {
+            return v.pipe.rekey_recv(&m.call_key, answering_peer_lid);
+        }
+        true
+    }
+
+    /// Whether the video plane is currently up (sending is possible, inbound PT-97 decodes).
+    pub fn is_video_enabled(&self) -> bool {
+        self.media
+            .as_ref()
+            .and_then(|m| m.video.as_ref())
+            .is_some_and(|v| v.active)
+    }
+
+    /// Bring the video plane up (from-start call, or an accepted upgrade) with OUTBOUND allowed.
+    /// Idempotent; also ungates a previously send-gated plane. See [`enable_video_gated`].
+    pub fn enable_video(&mut self) -> bool {
+        self.enable_video_inner(false)
+    }
+
+    /// Bring the video plane up but hold OUTBOUND video off the wire (the initiator of an upgrade,
+    /// before the peer accepts). Inbound still decodes. [`enable_video`] later ungates it.
+    pub fn enable_video_gated(&mut self) -> bool {
+        self.enable_video_inner(true)
+    }
+
+    /// `false` when there is no media plane (control-only engine) or the stored callKey is malformed.
+    /// A plane built by an earlier upgrade is REACTIVATED, not rebuilt, so its SRTP send seq/ROC
+    /// continue (rebuilding would repeat the keystream under the same key+SSRC).
+    fn enable_video_inner(&mut self, send_gated: bool) -> bool {
+        let call_id = &self.call_id;
+        let Some(m) = self.media.as_mut() else {
+            return false;
+        };
+        if let Some(v) = m.video.as_mut() {
+            v.active = true;
+            v.send_gated = send_gated;
+            return true;
+        }
+        match make_video_plane(
+            call_id,
+            &m.call_key,
+            &m.self_lid,
+            &m.recv_peer_lid,
+            m.warp_mi_tag_len,
+        ) {
+            Some(mut v) => {
+                v.send_gated = send_gated;
+                m.video = Some(v);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Deactivate the video plane (downgrade): outbound AUs drop, inbound PT-97 is ignored. The
+    /// pipeline (and its SRTP send seq/ROC) is PRESERVED so a later re-upgrade continues the
+    /// keystream instead of resetting the packet index. The audio plane is untouched. Idempotent.
+    pub fn disable_video(&mut self) {
+        if let Some(v) = self.media.as_mut().and_then(|m| m.video.as_mut()) {
+            v.active = false;
+        }
+    }
+
+    /// Record the peer's device orientation (0..3, ×90°) from a `<video>` stanza; stamped on every
+    /// subsequently reassembled inbound AU.
+    pub fn set_peer_video_orientation(&mut self, orientation: u8) {
+        self.peer_video_orientation = orientation & 0x03;
     }
 
     /// Begin the media session: build and emit the initial STUN allocate and arm the keepalive
@@ -507,6 +679,7 @@ impl CallEngine {
             Input::Timeout => self.on_timeout(now),
             Input::RelayPacket(pkt) => self.on_packet(pkt),
             Input::MicFrame(pcm) => self.on_mic(pcm),
+            Input::VideoFrame(au) => self.on_video(au),
         }
     }
 
@@ -633,6 +806,25 @@ impl CallEngine {
         let Some(m) = self.media.as_mut() else {
             return;
         };
+        // Demux by payload type BEFORE unprotect: audio and video share E2E keys but have
+        // distinct SSRCs/ROC trackers, so feeding a video packet through the audio pipeline
+        // would fail its MI tag at best and desync at worst.
+        if parse_rtp_header(pkt).is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264) {
+            // A PT-97 packet with no ACTIVE video plane (not negotiated, or after a downgrade) is
+            // dropped. The pipe still advances its recv ROC on drop-free packets it never sees, but
+            // an inactive plane simply ignores them.
+            if let Some(v) = m.video.as_mut().filter(|v| v.active)
+                && let Some(au) = v.pipe.unprotect_video(pkt)
+            {
+                let keyframe = au_is_keyframe(&au);
+                self.outbox.push_back(Output::VideoPlayout(VideoFrame {
+                    data: au,
+                    keyframe,
+                    orientation: self.peer_video_orientation,
+                }));
+            }
+            return;
+        }
         let Some((_, payload)) = m.pipe.unprotect_audio(pkt) else {
             return;
         };
@@ -690,6 +882,23 @@ impl CallEngine {
         // pre-refactor send path; send-side SFrame is intentionally not wired.
         let packet = m.pipe.protect_audio(&coded);
         self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
+    }
+
+    fn on_video(&mut self, au: &[u8]) {
+        // Drop unless the plane is active AND ungated: an inactive plane (audio-only / post-
+        // downgrade) or a send-gated one (upgrade requested but not yet accepted) must not put video
+        // on the wire. Either way the pipe's send seq/ROC stay frozen for a later resume.
+        let Some(v) = self
+            .media
+            .as_mut()
+            .and_then(|m| m.video.as_mut())
+            .filter(|v| v.active && !v.send_gated)
+        else {
+            return;
+        };
+        for packet in v.pipe.protect_video(au) {
+            self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
+        }
     }
 }
 
@@ -775,6 +984,7 @@ mod tests {
             integrity_key: b"relay-key".to_vec(),
             warp_mi_tag_len: 4,
             enable_media,
+            enable_video: false,
             enable_sframe: false,
         }
     }
@@ -1612,6 +1822,343 @@ mod tests {
         assert!(
             f.iter().any(|&s| s != 0),
             "at the target playout starts real audio"
+        );
+    }
+
+    /// A mirrored peer engine's video plane (its self LID = our peer LID), used to craft real
+    /// inbound video packets for demux tests.
+    fn peer_video_pipe() -> crate::voip::session::VideoPipeline {
+        use crate::voip::session::{VideoPipeline, VideoPipelineParams};
+        let call_key: Vec<u8> = (0u8..32).collect();
+        VideoPipeline::new(&VideoPipelineParams {
+            call_key: &call_key,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: ssrc::derive_video_participant_ssrc(
+                "CID",
+                &ssrc::format_e2e_srtp_participant_id(PEER_LID),
+            ),
+            ts_stride: VIDEO_TS_STRIDE_15FPS,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap()
+    }
+
+    /// A synthetic Annex-B AU with one large IDR NAL (forces FU-A fragmentation).
+    fn video_au(nal_len: usize) -> Vec<u8> {
+        let mut au = vec![0, 0, 0, 1, 0x65];
+        au.extend((0..nal_len).map(|i| (i % 251) as u8));
+        au
+    }
+
+    #[test]
+    fn video_frame_dropped_when_video_disabled() {
+        let mut eng = engine(true); // enable_video: false
+        eng.start(0);
+        let _ = drain(&mut eng);
+        assert!(!eng.is_video_enabled());
+        eng.handle_input(1, Input::VideoFrame(&video_au(100)));
+        let (outs, _) = drain(&mut eng);
+        assert_eq!(
+            count_transmits(&outs),
+            0,
+            "an AU with video off must not transmit"
+        );
+    }
+
+    #[test]
+    fn video_from_start_transmits_pt97_packets() {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        assert!(eng.is_video_enabled());
+        eng.start(0);
+        let _ = drain(&mut eng);
+        eng.handle_input(1, Input::VideoFrame(&video_au(3000)));
+        let (outs, _) = drain(&mut eng);
+        let transmits: Vec<&Bytes> = outs
+            .iter()
+            .filter_map(|o| match o {
+                Output::Transmit(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            transmits.len() >= 4,
+            "a 3KB AU must fan out into FU-A packets"
+        );
+        for b in &transmits {
+            let h = parse_rtp_header(b).expect("valid RTP header");
+            assert_eq!(h.payload_type, RTP_PAYLOAD_TYPE_H264);
+        }
+    }
+
+    #[test]
+    fn enable_video_mid_call_then_disable() {
+        let mut eng = engine(true);
+        eng.start(0);
+        let _ = drain(&mut eng);
+        let au = video_au(200);
+        // Off: dropped.
+        eng.handle_input(1, Input::VideoFrame(&au));
+        assert_eq!(count_transmits(&drain(&mut eng).0), 0);
+        // Upgrade: transmits.
+        assert!(eng.enable_video());
+        assert!(eng.enable_video(), "enable_video must be idempotent");
+        eng.handle_input(2, Input::VideoFrame(&au));
+        assert_eq!(count_transmits(&drain(&mut eng).0), 1);
+        // Downgrade: dropped again, audio untouched.
+        eng.disable_video();
+        assert!(!eng.is_video_enabled());
+        eng.handle_input(3, Input::VideoFrame(&au));
+        assert_eq!(count_transmits(&drain(&mut eng).0), 0);
+        eng.handle_input(4, Input::MicFrame(&[0i16; SAMPLES as usize]));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            1,
+            "audio DTX must survive a video downgrade"
+        );
+    }
+
+    // SECURITY: a downgrade must PRESERVE the video SRTP send state, so a re-upgrade never repeats
+    // an (SSRC, ROC, seq) triple under the same key — that would repeat the AES-CTR keystream (a
+    // two-time pad). Pin it by checking the RTP sequence number strictly increases across the
+    // disable→enable cycle instead of resetting to 0.
+    #[test]
+    fn re_enabling_video_does_not_reset_the_srtp_packet_index() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        eng.start(0);
+        let _ = drain(&mut eng);
+
+        let seq_of = |outs: &[Output]| -> Vec<u16> {
+            outs.iter()
+                .filter_map(|o| match o {
+                    Output::Transmit(b) => parse_rtp_header(b)
+                        .filter(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264)
+                        .map(|h| h.sequence_number),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // First video AU: single NAL -> one packet at seq 0.
+        eng.handle_input(1, Input::VideoFrame(&video_au(100)));
+        let first = seq_of(&drain(&mut eng).0);
+        assert_eq!(first, vec![0]);
+
+        // Downgrade then re-upgrade: the plane is preserved, so the next packet's seq CONTINUES.
+        eng.disable_video();
+        assert!(!eng.is_video_enabled());
+        eng.handle_input(2, Input::VideoFrame(&video_au(100))); // dropped while inactive
+        assert!(seq_of(&drain(&mut eng).0).is_empty());
+        assert!(eng.enable_video());
+        eng.handle_input(3, Input::VideoFrame(&video_au(100)));
+        let after = seq_of(&drain(&mut eng).0);
+        assert_eq!(
+            after,
+            vec![1],
+            "re-enabled video must continue the sequence, not reset to 0 (keystream reuse)"
+        );
+    }
+
+    // The upgrade initiator holds outbound video until the peer accepts: a send-gated plane decodes
+    // inbound but transmits nothing, and a later ungating `enable_video` starts transmission.
+    #[test]
+    fn send_gated_video_plane_holds_outbound_until_ungated() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video_gated());
+        assert!(eng.is_video_enabled(), "a gated plane is still 'enabled'");
+        eng.start(0);
+        let _ = drain(&mut eng);
+
+        // Gated: local AUs are dropped (no PT-97 on the wire).
+        eng.handle_input(1, Input::VideoFrame(&video_au(200)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            0,
+            "a send-gated plane must not transmit our video"
+        );
+        // Inbound still decodes while gated.
+        let mut peer = peer_video_pipe();
+        for p in peer.protect_video(&video_au(120)) {
+            eng.handle_input(1, Input::RelayPacket(&p));
+        }
+        assert!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::VideoPlayout(_))),
+            "a gated plane must still decode inbound video"
+        );
+
+        // Peer accepted -> ungate -> our video flows.
+        assert!(eng.enable_video());
+        eng.handle_input(2, Input::VideoFrame(&video_au(200)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            1,
+            "ungating must let our video onto the wire"
+        );
+    }
+
+    #[test]
+    fn enable_video_fails_without_media_plane() {
+        let mut eng = engine(false); // control-plane only
+        assert!(!eng.enable_video(), "no media plane -> no video plane");
+        assert!(!eng.is_video_enabled());
+    }
+
+    #[test]
+    fn inbound_video_reassembles_into_video_playout() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        eng.start(0);
+        let _ = drain(&mut eng);
+        eng.set_peer_video_orientation(2);
+
+        let mut peer = peer_video_pipe();
+        let au = video_au(3000);
+        let packets = peer.protect_video(&au);
+        assert!(packets.len() >= 4);
+        let mut frames = Vec::new();
+        for p in &packets {
+            eng.handle_input(1, Input::RelayPacket(p));
+            let (outs, _) = drain(&mut eng);
+            frames.extend(outs.into_iter().filter_map(|o| match o {
+                Output::VideoPlayout(f) => Some(f),
+                _ => None,
+            }));
+        }
+        assert_eq!(frames.len(), 1, "N packets must reassemble into 1 AU");
+        assert_eq!(frames[0].data, au);
+        assert!(frames[0].keyframe, "IDR AU must be flagged as keyframe");
+        assert_eq!(frames[0].orientation, 2);
+        assert_eq!(
+            eng.jitter_len(),
+            0,
+            "video must not leak into the audio jitter buffer"
+        );
+    }
+
+    #[test]
+    fn inbound_video_dropped_when_video_disabled_and_audio_unaffected() {
+        let mut eng = engine(true); // video off
+        eng.start(0);
+        let _ = drain(&mut eng);
+        let mut peer = peer_video_pipe();
+        for p in peer.protect_video(&video_au(500)) {
+            eng.handle_input(1, Input::RelayPacket(&p));
+        }
+        let (outs, _) = drain(&mut eng);
+        assert!(
+            !outs
+                .iter()
+                .any(|o| matches!(o, Output::VideoPlayout(_) | Output::Event(_))),
+            "PT-97 with video off must be silently dropped"
+        );
+        // Audio still decodes (demux must not eat Opus packets).
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let mut peer_audio = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &call_key,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: SSRC,
+            samples_per_packet: SAMPLES,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap();
+        let mut enc = MlowEncoder::new();
+        let tone: Vec<f32> = (0..SAMPLES as usize)
+            .map(|i| 0.3 * (i as f32 * 0.07).sin())
+            .collect();
+        for _ in 0..2 {
+            let pkt = peer_audio.protect_audio(&enc.encode(&tone).unwrap());
+            eng.handle_input(2, Input::RelayPacket(&pkt));
+        }
+        let _ = drain(&mut eng);
+        assert!(eng.jitter_len() > 0, "audio path must keep decoding");
+    }
+
+    #[test]
+    fn rekey_recv_also_rekeys_the_video_plane() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        eng.start(0);
+        let _ = drain(&mut eng);
+
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let answering = "222222222222222:2@lid";
+        let mut answerer =
+            crate::voip::session::VideoPipeline::new(&crate::voip::session::VideoPipelineParams {
+                call_key: &call_key,
+                self_lid: answering,
+                peer_lid: SELF_LID,
+                ssrc: ssrc::derive_video_participant_ssrc(
+                    "CID",
+                    &ssrc::format_e2e_srtp_participant_id(answering),
+                ),
+                ts_stride: VIDEO_TS_STRIDE_15FPS,
+                warp_mi_tag_len: WARP_MI_TAG_LEN,
+            })
+            .unwrap();
+
+        let au = video_au(120);
+        for p in answerer.protect_video(&au) {
+            eng.handle_input(1, Input::RelayPacket(&p));
+        }
+        let (outs, _) = drain(&mut eng);
+        assert!(
+            !outs.iter().any(|o| matches!(o, Output::VideoPlayout(_))),
+            "pre-rekey: companion-keyed video must not decode"
+        );
+
+        assert!(eng.rekey_recv(answering));
+        for p in answerer.protect_video(&au) {
+            eng.handle_input(2, Input::RelayPacket(&p));
+        }
+        let (outs, _) = drain(&mut eng);
+        assert!(
+            outs.iter()
+                .any(|o| matches!(o, Output::VideoPlayout(f) if f.data == au)),
+            "post-rekey: the answering device's video must decode"
+        );
+    }
+
+    #[test]
+    fn video_enabled_after_rekey_keys_recv_from_answering_device() {
+        // Upgrade AFTER the answering device is known: the late-built video pipeline must key its
+        // recv path from the CURRENT (rekeyed) peer LID, not the stale dialed base.
+        let mut eng = engine(true);
+        eng.start(0);
+        let _ = drain(&mut eng);
+        let answering = "222222222222222:2@lid";
+        assert!(eng.rekey_recv(answering));
+        assert!(eng.enable_video(), "upgrade after rekey");
+
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let mut answerer =
+            crate::voip::session::VideoPipeline::new(&crate::voip::session::VideoPipelineParams {
+                call_key: &call_key,
+                self_lid: answering,
+                peer_lid: SELF_LID,
+                ssrc: ssrc::derive_video_participant_ssrc(
+                    "CID",
+                    &ssrc::format_e2e_srtp_participant_id(answering),
+                ),
+                ts_stride: VIDEO_TS_STRIDE_15FPS,
+                warp_mi_tag_len: WARP_MI_TAG_LEN,
+            })
+            .unwrap();
+        let au = video_au(80);
+        for p in answerer.protect_video(&au) {
+            eng.handle_input(1, Input::RelayPacket(&p));
+        }
+        let (outs, _) = drain(&mut eng);
+        assert!(
+            outs.iter()
+                .any(|o| matches!(o, Output::VideoPlayout(f) if f.data == au)),
+            "a video plane built after rekey must decode the answering device"
         );
     }
 

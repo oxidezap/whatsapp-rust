@@ -6,9 +6,10 @@ use super::e2e_srtp::{
     E2eSrtpKeys, RecvRocTracker, RocTracker, append_warp_mi_tag, crypt_payload, derive_e2e_keys,
     verify_warp_mi_tag,
 };
+use super::h264::{H264Depacketizer, packetize_au};
 use super::rtp::{
-    RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, encode_rtp_header_into, parse_rtp_header,
-    rtp_header_byte_length,
+    RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, VideoRtpStream, encode_rtp_header_into,
+    parse_rtp_header, rtp_header_byte_length,
 };
 use super::ssrc::format_e2e_srtp_participant_id;
 use wacore_binary::Jid;
@@ -225,38 +226,162 @@ impl MediaPipeline {
     /// into the rollover counter and permanently desync the receiver (RFC 3711
     /// §3.3.1 requires the index update to follow authentication).
     pub fn unprotect_audio(&mut self, packet: &[u8]) -> Option<(RtpHeader, Vec<u8>)> {
-        if packet.len() < RTP_FIXED_HEADER_LEN + self.warp_mi_tag_len {
-            return None;
-        }
-        let split = packet.len() - self.warp_mi_tag_len;
-        let without_tag = &packet[..split];
-        let received_tag = &packet[split..];
-        let header = parse_rtp_header(without_tag)?;
-        let header_len = rtp_header_byte_length(without_tag)?;
-        if without_tag.len() <= header_len {
-            return None;
-        }
-        let roc = self.recv_roc.estimate_roc(header.sequence_number);
-        if !verify_warp_mi_tag(
-            &self.recv_keys.auth_key,
-            without_tag,
-            roc,
-            self.warp_mi_tag_len,
-            received_tag,
-        ) {
-            return None;
-        }
-        // Authenticated: now it's safe to advance the rollover counter.
-        self.recv_roc.commit_roc(roc, header.sequence_number);
-        let cipher = &without_tag[header_len..];
-        let plain = crypt_payload(
+        unprotect_srtp_packet(
             &self.recv_keys,
-            header.ssrc,
+            &mut self.recv_roc,
+            self.warp_mi_tag_len,
+            packet,
+        )
+    }
+}
+
+/// Shared inbound SRTP step for the audio and video pipelines: verify the WARP
+/// MI tag against the *estimated* ROC BEFORE committing it, then decrypt. The
+/// order is load-bearing (RFC 3711 §3.3.1): an on-path relay must not be able
+/// to fold unauthenticated packets into the rollover counter and permanently
+/// desync the receiver.
+fn unprotect_srtp_packet(
+    recv_keys: &E2eSrtpKeys,
+    recv_roc: &mut RecvRocTracker,
+    warp_mi_tag_len: usize,
+    packet: &[u8],
+) -> Option<(RtpHeader, Vec<u8>)> {
+    if packet.len() < RTP_FIXED_HEADER_LEN + warp_mi_tag_len {
+        return None;
+    }
+    let split = packet.len() - warp_mi_tag_len;
+    let without_tag = &packet[..split];
+    let received_tag = &packet[split..];
+    let header = parse_rtp_header(without_tag)?;
+    let header_len = rtp_header_byte_length(without_tag)?;
+    if without_tag.len() <= header_len {
+        return None;
+    }
+    let roc = recv_roc.estimate_roc(header.sequence_number);
+    if !verify_warp_mi_tag(
+        &recv_keys.auth_key,
+        without_tag,
+        roc,
+        warp_mi_tag_len,
+        received_tag,
+    ) {
+        return None;
+    }
+    // Authenticated: now it's safe to advance the rollover counter.
+    recv_roc.commit_roc(roc, header.sequence_number);
+    let cipher = &without_tag[header_len..];
+    let plain = crypt_payload(recv_keys, header.ssrc, header.sequence_number, roc, cipher);
+    Some((header, plain))
+}
+
+/// Video sibling of [`MediaPipeline`]: same E2E-SRTP keys (per participant, not
+/// per media type) and WARP MI tag, but H.264 packetization on top and its own
+/// SSRC/sequencer. One access unit fans out to N RTP packets on send and is
+/// reassembled from them on receive.
+pub struct VideoPipeline {
+    send_keys: E2eSrtpKeys,
+    recv_keys: E2eSrtpKeys,
+    warp_mi_tag_len: usize,
+    rtp: VideoRtpStream,
+    send_roc: RocTracker,
+    recv_roc: RecvRocTracker,
+    depacketizer: H264Depacketizer,
+    pkt_scratch: Vec<Vec<u8>>,
+}
+
+/// Borrowed inputs for [`VideoPipeline::new`]. No `samples_per_packet`: the
+/// video timestamp advances by a fixed per-AU stride instead.
+#[derive(Clone, Copy)]
+pub struct VideoPipelineParams<'a> {
+    pub call_key: &'a [u8],
+    pub self_lid: &'a str,
+    pub peer_lid: &'a str,
+    pub ssrc: u32,
+    pub ts_stride: u32,
+    pub warp_mi_tag_len: usize,
+}
+
+impl VideoPipeline {
+    pub fn new(p: &VideoPipelineParams<'_>) -> Option<Self> {
+        // A zero stride would leave every AU at timestamp 0 (an unusable stream); reject it at
+        // setup rather than emit a frozen clock.
+        if !(1..=20).contains(&p.warp_mi_tag_len) || p.ts_stride == 0 {
+            return None;
+        }
+        Some(Self {
+            send_keys: derive_e2e_keys(p.call_key, &format_e2e_srtp_participant_id(p.self_lid))?,
+            recv_keys: derive_e2e_keys(p.call_key, &format_e2e_srtp_participant_id(p.peer_lid))?,
+            warp_mi_tag_len: p.warp_mi_tag_len,
+            rtp: VideoRtpStream::new(p.ssrc, p.ts_stride),
+            send_roc: RocTracker::default(),
+            recv_roc: RecvRocTracker::default(),
+            depacketizer: H264Depacketizer::default(),
+            pkt_scratch: Vec::new(),
+        })
+    }
+
+    /// Same answering-device rekey as [`MediaPipeline::rekey_recv`]; the video
+    /// recv keys are derived from the identical participant id, so they go
+    /// stale together with the audio ones. The in-flight reassembly state is
+    /// dropped: pre-rekey fragments decrypted to garbage anyway.
+    pub fn rekey_recv(&mut self, call_key: &[u8], answering_peer_lid: &str) -> bool {
+        let Some(keys) = derive_e2e_keys(
+            call_key,
+            &format_e2e_srtp_participant_id(answering_peer_lid),
+        ) else {
+            return false;
+        };
+        self.recv_keys = keys;
+        self.recv_roc = RecvRocTracker::default();
+        self.depacketizer.reset();
+        true
+    }
+
+    /// Outbound: packetize one Annex-B access unit and protect each RTP packet.
+    pub fn protect_video(&mut self, au: &[u8]) -> Vec<Vec<u8>> {
+        let mut payloads = std::mem::take(&mut self.pkt_scratch);
+        packetize_au(au, &mut payloads);
+        let mut packets = Vec::with_capacity(payloads.len());
+        let last = payloads.len().saturating_sub(1);
+        for (i, payload) in payloads.iter().enumerate() {
+            let header = self.rtp.next_video_packet(i == last);
+            let roc = self.send_roc.advance(header.sequence_number);
+            let encrypted = crypt_payload(
+                &self.send_keys,
+                header.ssrc,
+                header.sequence_number,
+                roc,
+                payload,
+            );
+            let mut packet = Vec::with_capacity(header.byte_size() + encrypted.len());
+            encode_rtp_header_into(&header, &mut packet);
+            packet.extend_from_slice(&encrypted);
+            packets.push(append_warp_mi_tag(
+                &self.send_keys.auth_key,
+                &packet,
+                roc,
+                self.warp_mi_tag_len,
+            ));
+        }
+        self.pkt_scratch = payloads;
+        packets
+    }
+
+    /// Inbound: authenticate+decrypt one RTP packet and feed the depacketizer;
+    /// the reassembled access unit is returned on the AU's marker packet.
+    pub fn unprotect_video(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+        let (header, payload) = unprotect_srtp_packet(
+            &self.recv_keys,
+            &mut self.recv_roc,
+            self.warp_mi_tag_len,
+            packet,
+        )?;
+        self.depacketizer.push(
             header.sequence_number,
-            roc,
-            cipher,
-        );
-        Some((header, plain))
+            header.timestamp,
+            &payload,
+            header.marker,
+        )
     }
 }
 
@@ -719,6 +844,165 @@ mod tests {
             Some(opus.as_slice()),
             "a recv/send tag-length mismatch must NOT recover the payload"
         );
+    }
+
+    fn video_params<'a>(
+        call_key: &'a [u8],
+        self_lid: &'a str,
+        peer_lid: &'a str,
+    ) -> VideoPipelineParams<'a> {
+        VideoPipelineParams {
+            call_key,
+            self_lid,
+            peer_lid,
+            ssrc: 0x0055_AA33,
+            ts_stride: crate::voip::rtp::VIDEO_TS_STRIDE_15FPS,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        }
+    }
+
+    /// A synthetic Annex-B AU big enough to force FU-A fragmentation.
+    fn video_au(nal_len: usize) -> Vec<u8> {
+        let mut au = vec![0, 0, 0, 1, 0x65];
+        au.extend((0..nal_len).map(|i| (i % 251) as u8));
+        au
+    }
+
+    #[test]
+    fn video_pipeline_round_trips_multi_packet_au() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        let au = video_au(3000);
+        let packets = tx.protect_video(&au);
+        assert!(packets.len() >= 4, "3KB AU must fragment into FU-A packets");
+        let mut got = None;
+        for (i, p) in packets.iter().enumerate() {
+            let out = rx.unprotect_video(p);
+            if i < packets.len() - 1 {
+                assert!(out.is_none(), "AU must only complete on the marker packet");
+            } else {
+                got = out;
+            }
+        }
+        assert_eq!(got, Some(au), "AU must reassemble byte-identical");
+
+        // Second AU keeps flowing (sequencer + ROC state stay consistent).
+        let au2 = video_au(100);
+        let packets2 = tx.protect_video(&au2);
+        assert_eq!(packets2.len(), 1);
+        assert_eq!(rx.unprotect_video(&packets2[0]), Some(au2));
+    }
+
+    #[test]
+    fn video_protect_uses_self_lid_and_video_headers() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let self_lid = "111111111111111:0@lid";
+        let peer_lid = "222222222222222:0@lid";
+        let mut pipe = VideoPipeline::new(&video_params(&call_key, self_lid, peer_lid)).unwrap();
+        let au = video_au(10);
+        let packets = pipe.protect_video(&au);
+        assert_eq!(packets.len(), 1);
+        let packet = &packets[0];
+        let without_tag = &packet[..packet.len() - WARP_MI_TAG_LEN];
+        let header = parse_rtp_header(without_tag).unwrap();
+        assert_eq!(header.payload_type, crate::voip::rtp::RTP_PAYLOAD_TYPE_H264);
+        assert!(header.marker, "single-packet AU carries the marker");
+        assert_eq!(header.sequence_number, 0, "video seq starts at 0");
+
+        // Pin the send keystream to the SELF lid (same inversion guard as audio).
+        let header_len = rtp_header_byte_length(without_tag).unwrap();
+        let body = &without_tag[header_len..];
+        let nal = &au[4..];
+        let expect = crypt_payload(
+            &derive_e2e_keys(&call_key, self_lid).unwrap(),
+            header.ssrc,
+            0,
+            0,
+            nal,
+        );
+        assert_eq!(body, expect.as_slice(), "video send must key on self LID");
+    }
+
+    #[test]
+    fn video_forged_tag_rejected_and_stream_survives() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        let au = video_au(50);
+        let packets = tx.protect_video(&au);
+        let mut forged = packets[0].clone();
+        let seq = u16::from_be_bytes([forged[2], forged[3]]);
+        forged[2..4].copy_from_slice(&seq.wrapping_add(0x4000).to_be_bytes());
+        assert!(
+            rx.unprotect_video(&forged).is_none(),
+            "tampered video packet must fail authentication"
+        );
+        assert_eq!(
+            rx.unprotect_video(&packets[0]),
+            Some(au),
+            "legit packet still decrypts after the forgery"
+        );
+        // Garbage never panics.
+        assert!(rx.unprotect_video(&[]).is_none());
+        assert!(rx.unprotect_video(&[0xff; 9]).is_none());
+    }
+
+    #[test]
+    fn video_rekey_recv_switches_to_answering_device() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let caller = "111111111111111:0@lid";
+        let callee_base = "222222222222222:0@lid";
+        let callee_answering = "222222222222222:2@lid";
+
+        let mut answerer_tx =
+            VideoPipeline::new(&video_params(&call_key, callee_answering, caller)).unwrap();
+        let mut caller_rx =
+            VideoPipeline::new(&video_params(&call_key, caller, callee_base)).unwrap();
+
+        let au = video_au(60);
+        let f1 = answerer_tx.protect_video(&au);
+        assert!(
+            caller_rx.unprotect_video(&f1[0]).is_none(),
+            "base-LID keys must reject the companion's video"
+        );
+        assert!(caller_rx.rekey_recv(&call_key, callee_answering));
+        let f2 = answerer_tx.protect_video(&au);
+        assert_eq!(caller_rx.unprotect_video(&f2[0]), Some(au));
+        // Malformed key refuses without clobbering state.
+        assert!(!caller_rx.rekey_recv(&[0u8; 4], callee_answering));
+    }
+
+    #[test]
+    fn video_pipeline_rejects_bad_setup() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let lid = "222222222222222:0@lid";
+        let mut p = video_params(&call_key, lid, lid);
+        p.warp_mi_tag_len = 0;
+        assert!(VideoPipeline::new(&p).is_none());
+        p.warp_mi_tag_len = 21;
+        assert!(VideoPipeline::new(&p).is_none());
+        let mut zero_stride = video_params(&call_key, lid, lid);
+        zero_stride.ts_stride = 0;
+        assert!(
+            VideoPipeline::new(&zero_stride).is_none(),
+            "a zero timestamp stride must be rejected"
+        );
+        let mut short = video_params(&[0u8; 8], lid, lid);
+        short.warp_mi_tag_len = WARP_MI_TAG_LEN;
+        assert!(
+            VideoPipeline::new(&short).is_none(),
+            "short callKey must be rejected"
+        );
+        // Empty AU produces no packets rather than a marker-only ghost.
+        let mut ok = VideoPipeline::new(&video_params(&call_key, lid, lid)).unwrap();
+        assert!(ok.protect_video(&[]).is_empty());
     }
 
     // The esp32 control/crypto plane. An embedded consumer with no UDP, no codec, and no audio

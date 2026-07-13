@@ -3,27 +3,35 @@
 //! Audio is bridged to the system through `cpal` (cross-platform; ALSA on Linux,
 //! CoreAudio on macOS, WASAPI on Windows). `cpal` is a dev-dependency, so it is
 //! linked only for this example and never reaches consumers of the library.
+//! VIDEO is bridged through `ffmpeg`/`ffplay` subprocesses (must be on PATH when
+//! `--video` is used): ffmpeg encodes the webcam / a file / a test pattern to H.264
+//! and ffplay renders the peer's stream — the library only transports encoded AUs.
 //!
-//! Subcommands:
-//!   loopback         Mic → Opus → E2E-SRTP protect → unprotect → Opus → speaker.
-//!                    Exercises the whole media stack locally; NO WhatsApp connection.
-//!                    Run it and you should hear yourself, processed by the voip pipeline.
-//!   listen [accept]  Connect to WhatsApp, print incoming calls; reject (default) or accept.
-//!   call <jid>       Connect, discover the peer's devices, encrypt the callKey per device,
-//!                    and send a `<call><offer>`; logs the signaling flow via raw nodes.
+//! Subcommands (all accept a trailing `--video`):
+//!   loopback [--video]  Mic → Opus → E2E-SRTP protect → unprotect → Opus → speaker.
+//!                       Exercises the whole media stack locally; NO WhatsApp connection.
+//!                       With --video: ffmpeg source → AU splitter → ffplay window instead.
+//!   listen [accept] [--video]  Connect, print incoming calls; reject (default) or accept.
+//!                       With --video an accepted call answers with video media too.
+//!   call <jid> [--video]  Place a call; with --video it is a video call from the start.
 //!
-//!   cargo run --example voip --features "voip sqlite-storage tokio-transport ureq-client tokio-native" -- loopback
+//!   cargo run -p whatsapp-rust-voip-cli --release -- loopback
+//!
+//! During a live call, single-key commands on stdin (terminal only): `v` toggles video
+//! (upgrade / accept a pending peer request / downgrade), `q` hangs up.
+//! Env: `WA_VIDEO_INPUT` = `testsrc` | file/URL | webcam device (default: OS webcam);
+//! `WA_VIDEO_SINK` = `window` (default) | `file` | `none`.
 //!
 //! The inbound MEDIA path is the library facade: `client.voip().accept(&call).audio(mic,
 //! speaker).start()` returns a `CallHandle` and the library owns the callKey decrypt, the relay
 //! socket, the sans-IO engine, and the task lifetime. This example only supplies the cpal audio
-//! device and reacts to engine events.
+//! device / ffmpeg pipes and reacts to engine events.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use log::{error, info, warn};
 use portable_atomic::AtomicU64;
 use wacore::stanza::call::{self as stanza, CAPABILITY_OFFER};
@@ -31,9 +39,12 @@ use wacore::types::call::{CallAction, IncomingCall};
 use wacore::types::events::{Event, EventHandler};
 use wacore::voip::CallEvent;
 use whatsapp_rust::prelude::*;
-use whatsapp_rust::voip::CallHandle;
 use whatsapp_rust::voip::audio::{WaOpusDecoder, WaOpusEncoder};
 use whatsapp_rust::voip::session::{MediaPipeline, MediaPipelineParams};
+use whatsapp_rust::voip::{CallHandle, VideoState};
+
+mod video;
+use video::VideoOpts;
 
 const FRAME_SAMPLES: usize = 960; // 60 ms @ 16 kHz
 const WA_RATE: u32 = 16_000;
@@ -87,26 +98,59 @@ async fn main() -> Result<()> {
     );
 
     let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("loopback") => run_loopback().await,
-        Some("listen") => {
-            run_bot(Mode::Listen {
-                accept: args.get(2).map(String::as_str) == Some("accept"),
-            })
-            .await
+    match parse_cli(&args) {
+        CliCommand::Loopback { video: true } => {
+            video::run_video_loopback(&VideoOpts::from_env()).await
         }
-        Some("call") => {
-            let jid = args
-                .get(2)
-                .context("usage: voip call <jid>")?
-                .parse::<Jid>()
-                .map_err(|e| anyhow!("bad jid: {e}"))?;
-            run_bot(Mode::Call(jid)).await
+        CliCommand::Loopback { video: false } => run_loopback().await,
+        CliCommand::Listen { accept, video } => run_bot(Mode::Listen { accept, video }).await,
+        CliCommand::Call { jid, video } => {
+            let jid = jid.parse::<Jid>().map_err(|e| anyhow!("bad jid: {e}"))?;
+            run_bot(Mode::Call { jid, video }).await
         }
-        _ => {
-            eprintln!("usage: voip <loopback | listen [accept] | call <jid>>");
+        CliCommand::Usage => {
+            eprintln!("usage: voip <loopback | listen [accept] | call <jid>> [--video]");
             Ok(())
         }
+    }
+}
+
+/// A parsed CLI invocation. Kept separate from `Mode` (and pure) so the argument classification —
+/// including the `--video`-implies-accept rule that bit a real test run — is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum CliCommand {
+    Loopback { video: bool },
+    Listen { accept: bool, video: bool },
+    Call { jid: String, video: bool },
+    Usage,
+}
+
+/// Classify `argv` (including `argv[0]`). `--video` may appear anywhere. On `listen`, `--video`
+/// IMPLIES `accept`: there is no reason to request video while rejecting every call, so
+/// `listen --video` means "accept video calls" rather than silently rejecting them (the footgun a
+/// user hit: the phone showed "no answer" because the reject went out).
+fn parse_cli(argv: &[String]) -> CliCommand {
+    let video = argv.iter().any(|a| a == "--video");
+    let pos: Vec<&str> = argv
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .filter(|a| *a != "--video")
+        .collect();
+    match pos.first().copied() {
+        Some("loopback") => CliCommand::Loopback { video },
+        Some("listen") => CliCommand::Listen {
+            accept: pos.get(1).copied() == Some("accept") || video,
+            video,
+        },
+        Some("call") => match pos.get(1) {
+            Some(jid) => CliCommand::Call {
+                jid: (*jid).to_string(),
+                video,
+            },
+            None => CliCommand::Usage,
+        },
+        _ => CliCommand::Usage,
     }
 }
 
@@ -626,8 +670,8 @@ async fn run_loopback() -> Result<()> {
 // ===================== live call / listen =====================
 
 enum Mode {
-    Listen { accept: bool },
-    Call(Jid),
+    Listen { accept: bool, video: bool },
+    Call { jid: Jid, video: bool },
 }
 
 /// Drives calls off the typed `Event::IncomingCall` (no raw-node forwarding needed): on an offer it
@@ -638,6 +682,8 @@ enum Mode {
 struct CallObserver {
     client: Arc<Client>,
     accept: bool,
+    /// `--video`: start/answer calls with video media and auto-accept peer upgrade requests.
+    video: bool,
     /// Whether this run ever starts a media call (auto-accept inbound OR an outbound `call`), so a
     /// `<terminate>` racing media startup is worth recording. A pure-reject run starts no media, so it
     /// must NOT record (the set would grow unbounded with nothing to consume it).
@@ -655,13 +701,24 @@ struct CallState {
     /// Call-ids that were terminated BEFORE their media handle finished starting, so a late
     /// `start_media()` hangs the call up instead of leaving an orphaned live call.
     terminated: HashSet<String>,
+    /// The stdin `v` toggle's view of each call's video: pending peer request vs our video live.
+    video_ui: HashMap<String, VideoUi>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum VideoUi {
+    /// The peer asked for video (`UpgradeRequestV2`); `v` accepts it.
+    PendingPeerRequest,
+    /// Our video plane is up; `v` downgrades.
+    Active,
 }
 
 impl CallObserver {
-    fn new(client: Arc<Client>, accept: bool, manages_media: bool) -> Self {
+    fn new(client: Arc<Client>, accept: bool, video: bool, manages_media: bool) -> Self {
         Self {
             client,
             accept,
+            video,
             manages_media,
             state: Arc::new(Mutex::new(CallState::default())),
         }
@@ -710,23 +767,27 @@ impl EventHandler for CallObserver {
     fn handle_event(&self, event: Arc<Event>) {
         if let Event::IncomingCall(call) = &*event {
             match &call.action {
-                CallAction::Offer { call_id, .. } => {
+                CallAction::Offer {
+                    call_id, is_video, ..
+                } => {
                     let client = self.client.clone();
                     let call = call.clone();
                     let accept = self.accept;
+                    // Only answer with video when we're allowed to AND the offer is actually a video
+                    // call; advertising `<video>` on an audio offer would be wrong.
+                    let video = self.video && *is_video;
                     let state = self.state.clone();
                     let cid = call_id.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = respond_to_offer(&client, &call, accept).await {
+                        if let Err(e) = respond_to_offer(&client, &call, accept, video).await {
                             error!("call signaling failed: {e}");
                             return;
                         }
                         if !accept {
                             return;
                         }
-                        match start_media(&client, &call).await {
+                        match start_media(&client, &call, video, &state).await {
                             Ok(handle) => {
-                                let handle = Arc::new(handle);
                                 // A <terminate> may have arrived while media was starting; if so, hang
                                 // up now instead of registering an orphaned live call.
                                 if !register_handle(&state, cid.clone(), handle.clone()) {
@@ -773,55 +834,106 @@ impl EventHandler for CallObserver {
     }
 }
 
-/// Drive the inbound MEDIA plane through the library facade: PipeWire mic in, PipeWire speaker out,
-/// the engine/relay/decrypt all internal. Replaces the ~180-line hand-rolled `run_inbound_media`.
-async fn start_media(client: &Arc<Client>, call: &IncomingCall) -> Result<CallHandle> {
+/// Drive the inbound MEDIA plane through the library facade: cpal mic in, cpal speaker out,
+/// the engine/relay/decrypt all internal. With `video`, ffmpeg/ffplay ride along as the codec.
+async fn start_media(
+    client: &Arc<Client>,
+    call: &IncomingCall,
+    video: bool,
+    state: &Arc<Mutex<CallState>>,
+) -> Result<Arc<CallHandle>> {
     let mic = spawn_mic()?;
     let speaker = spawn_speaker()?;
     info!("🔌 connecting media via client.voip().accept(..)…");
-    let handle = client
-        .voip()
-        .accept(call)
-        .audio(mic, speaker.clone())
+    let voip = client.voip();
+    let mut builder = voip.accept(call).audio(mic, speaker.clone());
+    if video {
+        let opts = VideoOpts::from_env();
+        let cid = call.action.call_id();
+        builder = builder.video(
+            video::spawn_video_source(&opts).await?,
+            video::spawn_video_sink(&opts, cid).await?,
+        );
+    }
+    let handle = builder
         .start()
         .await
         .map_err(|e| anyhow!("accept media: {e}"))?;
     info!(
-        "🎙  media flow live for call {} — speak into the mic.",
-        handle.call_id()
+        "🎙  media flow live for call {} — speak into the mic.{}",
+        handle.call_id(),
+        if video { " 🎥 video on." } else { "" }
     );
-    spawn_call_event_listener(&handle, speaker);
+    let handle = Arc::new(handle);
+    if video {
+        mark_video(state, handle.call_id(), Some(VideoUi::Active));
+    }
+    spawn_call_event_listener(handle.clone(), speaker, video, state.clone());
     Ok(handle)
 }
 
-/// Place an outgoing 1:1 call through the library facade: PipeWire mic/speaker, the device discovery,
+/// Place an outgoing 1:1 call through the library facade: cpal mic/speaker, the device discovery,
 /// callKey encrypt, offer send, ack-driven relay connect, engine, and task lifetime all internal. The
 /// returned handle is dormant until the server hands back the relay (live); the facade attaches the
 /// engine then. Mirrors `start_media` for the outbound direction.
-async fn place_outgoing_call(client: &Arc<Client>, peer: &Jid) -> Result<CallHandle> {
+async fn place_outgoing_call(
+    client: &Arc<Client>,
+    peer: &Jid,
+    video: bool,
+    state: &Arc<Mutex<CallState>>,
+) -> Result<Arc<CallHandle>> {
     let mic = spawn_mic()?;
     let speaker = spawn_speaker()?;
     info!("📞 placing call to {peer} via client.voip().call(..)…");
-    let handle = client
-        .voip()
-        .call(peer)
-        .audio(mic, speaker.clone())
+    let voip = client.voip();
+    let mut builder = voip.call(peer).audio(mic, speaker.clone());
+    if video {
+        let opts = VideoOpts::from_env();
+        builder = builder.video(
+            video::spawn_video_source(&opts).await?,
+            video::spawn_video_sink(&opts, "outgoing").await?,
+        );
+    }
+    let handle = builder
         .start()
         .await
         .map_err(|e| anyhow!("place call: {e}"))?;
     info!(
-        "☎  offer sent for call {} — waiting for the peer's relay to connect media.",
-        handle.call_id()
+        "☎  offer sent for call {} — waiting for the peer's relay to connect media.{}",
+        handle.call_id(),
+        if video { " 🎥 video call." } else { "" }
     );
-    spawn_call_event_listener(&handle, speaker);
+    let handle = Arc::new(handle);
+    if video {
+        mark_video(state, handle.call_id(), Some(VideoUi::Active));
+    }
+    spawn_call_event_listener(handle.clone(), speaker, video, state.clone());
     Ok(handle)
 }
 
-/// Surface the call's engine events: log relay-allocate outcomes, and decode any non-MLow (standard
-/// Opus) frame the core hands back and play it. The real peer is MLow-only, so ForeignAudio is a
-/// rare/diagnostic path; MLow audio is decoded inside the engine and arrives as playout on the
-/// speaker channel directly.
-fn spawn_call_event_listener(handle: &CallHandle, speaker: async_channel::Sender<Vec<i16>>) {
+/// Update (or clear) the stdin toggle's view of a call's video state.
+fn mark_video(state: &Arc<Mutex<CallState>>, call_id: &str, ui: Option<VideoUi>) {
+    let mut st = state.lock().unwrap();
+    match ui {
+        Some(ui) => {
+            st.video_ui.insert(call_id.to_string(), ui);
+        }
+        None => {
+            st.video_ui.remove(call_id);
+        }
+    }
+}
+
+/// Surface the call's engine events: log relay-allocate outcomes, decode any non-MLow (standard
+/// Opus) frame the core hands back and play it, and drive the video upgrade handshake (auto-accept
+/// under `--video`, otherwise park it for the stdin `v` toggle). MLow audio is decoded inside the
+/// engine and arrives as playout on the speaker channel directly.
+fn spawn_call_event_listener(
+    handle: Arc<CallHandle>,
+    speaker: async_channel::Sender<Vec<i16>>,
+    auto_video: bool,
+    state: Arc<Mutex<CallState>>,
+) {
     let events = handle.events();
     tokio::spawn(async move {
         let mut opus = WaOpusDecoder::new().ok();
@@ -843,13 +955,51 @@ fn spawn_call_event_listener(handle: &CallHandle, speaker: async_channel::Sender
                         let _ = speaker.try_send(pcm);
                     }
                 }
+                CallEvent::VideoStateChanged { state: vs, .. } => match vs {
+                    VideoState::UpgradeRequest | VideoState::UpgradeRequestV2 => {
+                        if auto_video {
+                            info!("🎥 peer asked for video — auto-accepting (--video)");
+                            if let Err(e) = accept_peer_video(&handle).await {
+                                warn!("accepting peer video failed: {e}");
+                            } else {
+                                mark_video(&state, handle.call_id(), Some(VideoUi::Active));
+                            }
+                        } else {
+                            info!("🎥 peer asked for video — press `v` + Enter to accept");
+                            mark_video(&state, handle.call_id(), Some(VideoUi::PendingPeerRequest));
+                        }
+                    }
+                    VideoState::UpgradeAccept | VideoState::Enabled => {
+                        info!("🎥 peer video {vs:?} — inbound video should start flowing");
+                    }
+                    VideoState::Stopped | VideoState::Disabled => {
+                        info!("🎥 peer stopped its video");
+                    }
+                    other => info!("🎥 peer video state: {other:?}"),
+                },
                 // CallEvent is #[non_exhaustive]: ignore variants newer core versions may add.
                 _ => {}
             }
         }
     });
 }
-async fn respond_to_offer(client: &Arc<Client>, call: &IncomingCall, accept: bool) -> Result<()> {
+
+/// Fresh ffmpeg/ffplay endpoints for a mid-call upgrade/accept on `handle`.
+async fn accept_peer_video(handle: &CallHandle) -> Result<()> {
+    let opts = VideoOpts::from_env();
+    let src = video::spawn_video_source(&opts).await?;
+    let sink = video::spawn_video_sink(&opts, handle.call_id()).await?;
+    handle
+        .accept_video(src, sink)
+        .await
+        .map_err(|e| anyhow!("accept_video: {e}"))
+}
+async fn respond_to_offer(
+    client: &Arc<Client>,
+    call: &IncomingCall,
+    accept: bool,
+    video: bool,
+) -> Result<()> {
     let CallAction::Offer {
         call_id,
         call_creator,
@@ -903,6 +1053,8 @@ async fn respond_to_offer(client: &Arc<Client>, call: &IncomingCall, accept: boo
         rte: None,
         voip_settings: None,
         capability: Some(&CAPABILITY_OFFER),
+        // Advertise video media in the accept when we're answering with video.
+        video,
     });
     client
         .send_node(accept_node)
@@ -911,13 +1063,108 @@ async fn respond_to_offer(client: &Arc<Client>, call: &IncomingCall, accept: boo
     Ok(())
 }
 
+/// Single-key commands on stdin during a live call: `v` toggles video (start an upgrade / accept a
+/// pending peer request / downgrade), `q` hangs up. Skipped when stdin is not a terminal (CI /
+/// piped input would EOF-spin).
+fn spawn_stdin_ui(client: Arc<Client>, state: Arc<Mutex<CallState>>) {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+    info!("⌨  during a call: `v` + Enter toggles video, `q` + Enter hangs up");
+    // Read stdin on a DETACHED std thread, not `tokio::io::stdin()`: the latter reads via a runtime
+    // blocking thread parked in `read()`, and the runtime drop on Ctrl+C waits for it forever — the
+    // process would never exit. A plain std thread is killed when the process exits, so shutdown
+    // stays clean; lines are forwarded over an async channel the cancellable UI task consumes.
+    let (line_tx, line_rx) = async_channel::unbounded::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if line_tx.send_blocking(line).is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(line) = line_rx.recv().await {
+            // The most recent live call is the toggle's target (this demo runs one call at a time).
+            let picked = {
+                let st = state.lock().unwrap();
+                st.handles
+                    .iter()
+                    .next()
+                    .map(|(cid, h)| (cid.clone(), h.clone(), st.video_ui.get(cid).copied()))
+            };
+            let Some((cid, handle, ui)) = picked else {
+                info!("⌨  no live call");
+                continue;
+            };
+            match line.trim() {
+                "v" => match ui {
+                    Some(VideoUi::Active) => {
+                        info!("🎥 stopping video (downgrade to audio)");
+                        if let Err(e) = handle.stop_video().await {
+                            warn!("stop_video failed: {e}");
+                        } else {
+                            mark_video(&state, &cid, None);
+                        }
+                    }
+                    Some(VideoUi::PendingPeerRequest) => {
+                        info!("🎥 accepting the peer's video request");
+                        if let Err(e) = accept_peer_video(&handle).await {
+                            warn!("accept_video failed: {e}");
+                        } else {
+                            mark_video(&state, &cid, Some(VideoUi::Active));
+                        }
+                    }
+                    None => {
+                        info!("🎥 requesting video upgrade");
+                        let started = async {
+                            let opts = VideoOpts::from_env();
+                            let src = video::spawn_video_source(&opts).await?;
+                            let sink = video::spawn_video_sink(&opts, &cid).await?;
+                            handle
+                                .start_video(src, sink)
+                                .await
+                                .map_err(|e| anyhow!("start_video: {e}"))
+                        }
+                        .await;
+                        match started {
+                            Ok(()) => mark_video(&state, &cid, Some(VideoUi::Active)),
+                            Err(e) => warn!("video upgrade failed: {e}"),
+                        }
+                    }
+                },
+                "q" => {
+                    info!("⌨  hanging up {cid}");
+                    // Signal the peer with a <terminate> (which also tears our media down), so it
+                    // sees a normal hangup instead of waiting for the transport to time out. Fall
+                    // back to a local-only hangup if the send fails.
+                    if let Err(e) = client
+                        .voip()
+                        .terminate(&cid, &handle.peer_jid(), handle.call_creator())
+                        .await
+                    {
+                        warn!("⌨  terminate failed ({e}); tearing down locally");
+                        handle.hangup().await;
+                    }
+                }
+                "" => {}
+                other => info!("⌨  unknown command {other:?} — `v` toggles video, `q` hangs up"),
+            }
+        }
+    });
+}
+
 async fn run_bot(mode: Mode) -> Result<()> {
     let store = SqliteStore::new("whatsapp.db")
         .await
         .map_err(|e| anyhow!("sqlite: {e}"))?;
-    let (accept, target) = match mode {
-        Mode::Listen { accept } => (accept, None),
-        Mode::Call(jid) => (false, Some(jid)),
+    let (accept, target, video) = match mode {
+        Mode::Listen { accept, video } => (accept, None, video),
+        Mode::Call { jid, video } => (false, Some(jid), video),
     };
 
     let builder = Bot::builder()
@@ -936,10 +1183,12 @@ async fn run_bot(mode: Mode) -> Result<()> {
     let client = bot.client();
     // The structured `Event::IncomingCall` (which now carries the offer's <enc>/<relay>) drives the
     // accept flow, so the raw-node-forwarding crutch the old hand-rolled inbound path needed is gone.
+    let manages_media = accept || target.is_some();
     let observer = Arc::new(CallObserver::new(
         client.clone(),
         accept,
-        accept || target.is_some(),
+        video,
+        manages_media,
     ));
     client.register_handler(observer.clone());
 
@@ -957,10 +1206,9 @@ async fn run_bot(mode: Mode) -> Result<()> {
                 warn!("not connected within 60s, skipping outgoing call: {e}");
                 return;
             }
-            match place_outgoing_call(&client2, &peer).await {
+            match place_outgoing_call(&client2, &peer, video, &state).await {
                 Ok(handle) => {
                     let cid = handle.call_id().to_string();
-                    let handle = Arc::new(handle);
                     if !register_handle(&state, cid.clone(), handle.clone()) {
                         handle.hangup().await;
                         info!("◾ call {cid} terminated during startup");
@@ -971,9 +1219,14 @@ async fn run_bot(mode: Mode) -> Result<()> {
         });
     } else {
         warn!(
-            "listening for calls ({}). Ctrl+C to exit.",
-            if accept { "auto-accept" } else { "auto-reject" }
+            "listening for calls ({}{}). Ctrl+C to exit.",
+            if accept { "auto-accept" } else { "auto-reject" },
+            if video { ", video" } else { "" }
         );
+    }
+
+    if manages_media {
+        spawn_stdin_ui(client.clone(), observer.state.clone());
     }
 
     tokio::select! {
@@ -982,4 +1235,85 @@ async fn run_bot(mode: Mode) -> Result<()> {
         _ = whatsapp_rust::shutdown_signal() => { info!("shutting down"); }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CliCommand, parse_cli};
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        std::iter::once("voip")
+            .chain(parts.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn listen_video_implies_accept() {
+        // The footgun that showed "no answer" on the phone: `listen --video` must ACCEPT (video is
+        // meaningless while rejecting), not silently reject.
+        assert_eq!(
+            parse_cli(&argv(&["listen", "--video"])),
+            CliCommand::Listen {
+                accept: true,
+                video: true
+            }
+        );
+    }
+
+    #[test]
+    fn listen_modes() {
+        assert_eq!(
+            parse_cli(&argv(&["listen"])),
+            CliCommand::Listen {
+                accept: false,
+                video: false
+            }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["listen", "accept"])),
+            CliCommand::Listen {
+                accept: true,
+                video: false
+            }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["listen", "accept", "--video"])),
+            CliCommand::Listen {
+                accept: true,
+                video: true
+            }
+        );
+        // `--video` may appear before the subcommand.
+        assert_eq!(
+            parse_cli(&argv(&["--video", "listen", "accept"])),
+            CliCommand::Listen {
+                accept: true,
+                video: true
+            }
+        );
+    }
+
+    #[test]
+    fn loopback_and_call_and_usage() {
+        assert_eq!(
+            parse_cli(&argv(&["loopback"])),
+            CliCommand::Loopback { video: false }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["loopback", "--video"])),
+            CliCommand::Loopback { video: true }
+        );
+        assert_eq!(
+            parse_cli(&argv(&["call", "123@lid", "--video"])),
+            CliCommand::Call {
+                jid: "123@lid".into(),
+                video: true
+            }
+        );
+        // `call` with no jid, and unknown/empty commands, are usage errors.
+        assert_eq!(parse_cli(&argv(&["call"])), CliCommand::Usage);
+        assert_eq!(parse_cli(&argv(&["bogus"])), CliCommand::Usage);
+        assert_eq!(parse_cli(&argv(&[])), CliCommand::Usage);
+    }
 }

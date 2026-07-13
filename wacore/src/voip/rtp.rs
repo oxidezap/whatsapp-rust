@@ -4,6 +4,13 @@
 use crate::voip::warp::audio_piggyback_extension_for;
 
 pub const RTP_PAYLOAD_TYPE_OPUS: u8 = 120;
+/// H.264 video payload type. Taken from the WaCalls/meowcaller reference,
+/// never validated against a live capture.
+pub const RTP_PAYLOAD_TYPE_H264: u8 = 97;
+/// Video RTP timestamp clock.
+pub const VIDEO_CLOCK_RATE: u32 = 90_000;
+/// Timestamp stride per access unit at the reference 15 fps (90000 / 15).
+pub const VIDEO_TS_STRIDE_15FPS: u32 = VIDEO_CLOCK_RATE / 15;
 pub const WHATSAPP_RTP_EXTENSION_PROFILE: u16 = 0xdebe;
 /// RFC 3550 fixed RTP header length, before any CSRC list or extension block.
 pub const RTP_FIXED_HEADER_LEN: usize = 12;
@@ -266,6 +273,46 @@ impl RtpStream {
     }
 }
 
+/// Send-side sequencer for the video stream: one header per RTP packet of an
+/// access unit, the timestamp is shared by every packet of the AU and advances
+/// by `ts_stride` only when the AU closes (marker packet). Plain 16-byte
+/// header — no WARP extension, no DTX, no speech latch.
+pub struct VideoRtpStream {
+    pub ssrc: u32,
+    seq: u16,
+    timestamp: u32,
+    ts_stride: u32,
+}
+
+impl VideoRtpStream {
+    pub fn new(ssrc: u32, ts_stride: u32) -> Self {
+        Self {
+            ssrc,
+            seq: 0,
+            timestamp: 0,
+            ts_stride,
+        }
+    }
+
+    /// Header for the next packet of the current AU; `last_in_au` sets the
+    /// marker and moves the timestamp to the next AU.
+    pub fn next_video_packet(&mut self, last_in_au: bool) -> RtpHeader {
+        let header = RtpHeader {
+            marker: last_in_au,
+            payload_type: RTP_PAYLOAD_TYPE_H264,
+            sequence_number: self.seq,
+            timestamp: self.timestamp,
+            ssrc: self.ssrc,
+            extension_word: None,
+        };
+        self.seq = self.seq.wrapping_add(1);
+        if last_in_au {
+            self.timestamp = self.timestamp.wrapping_add(self.ts_stride);
+        }
+        header
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +394,52 @@ mod tests {
         assert!(is_whatsapp_opus_rtp_payload(120));
         assert!(is_whatsapp_opus_rtp_payload(121));
         assert!(!is_whatsapp_opus_rtp_payload(96));
+    }
+
+    #[test]
+    fn video_stream_marker_and_timestamp_advance_per_au() {
+        let mut s = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS);
+        // 3-packet AU: ts shared, marker only on the last.
+        let p0 = s.next_video_packet(false);
+        let p1 = s.next_video_packet(false);
+        let p2 = s.next_video_packet(true);
+        assert_eq!(
+            (p0.sequence_number, p1.sequence_number, p2.sequence_number),
+            (0, 1, 2)
+        );
+        assert_eq!((p0.timestamp, p1.timestamp, p2.timestamp), (0, 0, 0));
+        assert_eq!((p0.marker, p1.marker, p2.marker), (false, false, true));
+        // Next AU: timestamp advanced by one stride.
+        let p3 = s.next_video_packet(true);
+        assert_eq!(p3.timestamp, VIDEO_TS_STRIDE_15FPS);
+        assert_eq!(p3.sequence_number, 3);
+        for p in [p0, p1, p2, p3] {
+            assert_eq!(p.payload_type, RTP_PAYLOAD_TYPE_H264);
+            assert_eq!(p.extension_word, None);
+            assert_eq!(p.byte_size(), WHATSAPP_RTP_HEADER_SIZE);
+        }
+    }
+
+    #[test]
+    fn video_header_round_trips_through_parse() {
+        let mut s = VideoRtpStream::new(0xdead_beef, VIDEO_TS_STRIDE_15FPS);
+        s.next_video_packet(true);
+        let h = s.next_video_packet(true);
+        let bytes = encode_rtp_header(&h);
+        assert_eq!(rtp_header_byte_length(&bytes), Some(16));
+        assert_eq!(parse_rtp_header(&bytes), Some(h));
+    }
+
+    #[test]
+    fn video_stream_wraps_seq_and_timestamp() {
+        let mut s = VideoRtpStream::new(1, u32::MAX);
+        s.seq = u16::MAX;
+        s.timestamp = u32::MAX;
+        let p = s.next_video_packet(true);
+        assert_eq!(p.sequence_number, u16::MAX);
+        let p = s.next_video_packet(false);
+        assert_eq!(p.sequence_number, 0, "seq must wrap, not panic");
+        assert_eq!(p.timestamp, u32::MAX - 1, "timestamp must wrap, not panic");
     }
 
     #[test]

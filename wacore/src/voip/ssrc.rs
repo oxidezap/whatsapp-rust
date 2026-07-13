@@ -13,6 +13,17 @@ pub fn derive_wasm_participant_ssrc(call_id: &str, lid: &str, slot_word: u32) ->
     u32::from_le_bytes(okm)
 }
 
+/// Relay stream slot used to derive the VIDEO SSRC. Taken from the
+/// WaCalls/meowcaller reference (audio is slot 0); our KATs only pin slots 0/1,
+/// so this value is unvalidated against a live capture — if interop shows the
+/// peer deriving a different video SSRC, this single constant is the fix.
+pub const VIDEO_SSRC_SLOT_WORD: u32 = 2;
+
+/// Video-stream SSRC for a participant: same HKDF as audio, video slot word.
+pub fn derive_video_participant_ssrc(call_id: &str, lid: &str) -> u32 {
+    derive_wasm_participant_ssrc(call_id, lid, VIDEO_SSRC_SLOT_WORD)
+}
+
 /// Device-qualified LID for E2E SRTP HKDF `info`: keep an existing `:N@lid`,
 /// bare `@lid` becomes `:0@lid`, everything else passes through. Intentionally a separate protocol
 /// surface from SFrame's variant; they coincide today, so both delegate to one helper. Un-shim here
@@ -38,6 +49,20 @@ mod tests {
         assert_eq!(
             derive_wasm_participant_ssrc(call_id, lid, 1) as u64,
             k["voip_crypto"]["ssrc_slot1"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn video_ssrc_differs_from_audio_ssrc() {
+        // Same call/participant must yield distinct per-stream SSRCs, or the
+        // engine's demux would collapse audio and video into one stream.
+        let audio = derive_wasm_participant_ssrc("CALL-ID-0001", "12345:0@lid", 0);
+        let video = derive_video_participant_ssrc("CALL-ID-0001", "12345:0@lid");
+        assert_ne!(audio, video);
+        assert_eq!(
+            video,
+            derive_wasm_participant_ssrc("CALL-ID-0001", "12345:0@lid", VIDEO_SSRC_SLOT_WORD),
+            "helper must be the slot-word derivation, nothing extra"
         );
     }
 

@@ -9,6 +9,7 @@ pub mod demux;
 pub mod driver;
 pub mod e2e_srtp;
 pub mod engine;
+pub mod h264;
 pub mod hbh_srtp;
 pub mod mlow;
 pub mod registry;
@@ -30,16 +31,20 @@ pub mod warp;
 // The sub-modules stay `pub` for fine-grained wire helpers (parsers, attr builders), but
 // these are the ones worth surfacing by name.
 pub use demux::{RelayPacketKind, classify_relay_packet};
-pub use driver::{CallChannels, run_call};
+pub use driver::{CallChannels, VideoControl, run_call};
 pub use engine::{
     CallConfig, CallEngine, CallEvent, EngineError, Input, Millis, NEVER, Output, SetupError,
     TxIdSource,
 };
+pub use h264::{AnnexBAuSplitter, VideoFrame};
 pub use mlow::{MlowDecoder, MlowEncoder};
 // Internal: the inbound router's standard-Opus vs mlow discriminator (engine reaches it via `super`).
 pub(crate) use mlow::is_standard_opus_frame;
 pub use registry::CallRegistry;
-pub use session::{CallDirection, CallPhase, CallSession, MediaPipeline, MediaPipelineParams};
+pub use session::{
+    CallDirection, CallPhase, CallSession, MediaPipeline, MediaPipelineParams, VideoPipeline,
+    VideoPipelineParams,
+};
 pub use transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
 };

@@ -112,6 +112,7 @@ fn config_for(self_lid: &str, peer_lid: &str, ssrc: u32, direction: CallDirectio
         integrity_key: b"relay-key".to_vec(),
         warp_mi_tag_len: 4,
         enable_media: true,
+        enable_video: false,
         enable_sframe: false,
     }
 }

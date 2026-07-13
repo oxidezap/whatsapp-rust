@@ -14,6 +14,8 @@ use std::sync::atomic::Ordering;
 use portable_atomic::AtomicU64;
 
 use crate::runtime::AbortHandle;
+use crate::voip::driver::VideoControl;
+use crate::voip::engine::CallEvent;
 use crate::voip::session::{CallPhase, CallSession};
 use wacore_binary::Jid;
 
@@ -41,6 +43,16 @@ struct CallEntry {
     /// Caller-only, one-shot: delivers the answering device LID to the drive loop so it can rekey
     /// recv. Taken on first use (a duplicate `<accept>` finds `None`); dropped with the entry.
     rekey_tx: Option<async_channel::Sender<String>>,
+    /// The call's consumer-facing event queue (same channel `CallHandle::events()` reads), so the
+    /// SIGNALING handler can surface `<video state>` changes next to the engine's events.
+    event_tx: Option<async_channel::Sender<CallEvent>>,
+    /// Mid-call video-plane control into the drive loop (enable/disable/orientation).
+    video_ctl_tx: Option<async_channel::Sender<VideoControl>>,
+    /// Fully release the local video endpoints (stop the camera feed, drop the sink). Runs when a
+    /// negotiation the caller started is refused (`<video state=UpgradeReject|UpgradeCancel>`), so a
+    /// dead upgrade doesn't leave the source encoding into a disabled plane. Built in the root crate
+    /// (it owns the endpoints), stored here so the wacore-side signaling handler can invoke it.
+    video_teardown: Option<Box<dyn Fn() + Send + Sync>>,
     /// Wakes this call's `wait_ended()` waiter on removal, even before a media task exists. Fires from
     /// `EndedNotify`'s Drop whenever the entry leaves the map.
     on_terminal: Option<EndedNotify>,
@@ -83,6 +95,9 @@ impl CallRegistry {
                     media_task: None,
                     generation,
                     rekey_tx: None,
+                    event_tx: None,
+                    video_ctl_tx: None,
+                    video_teardown: None,
                     on_terminal: None,
                 },
             )
@@ -153,6 +168,84 @@ impl CallRegistry {
             && entry.generation == generation
         {
             entry.rekey_tx = Some(tx);
+        }
+    }
+
+    /// Store the call's consumer-facing event sender, video-control sender, and the local-video
+    /// teardown hook, so the signaling handler can surface `<video state>` changes, steer the video
+    /// plane mid-call, and fully release the endpoints on a refused upgrade. Generation-guarded like
+    /// the rekey sender.
+    pub fn set_video_channels(
+        &self,
+        call_id: &str,
+        generation: u64,
+        event_tx: async_channel::Sender<CallEvent>,
+        video_ctl_tx: async_channel::Sender<VideoControl>,
+        video_teardown: Box<dyn Fn() + Send + Sync>,
+    ) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+            && entry.generation == generation
+        {
+            entry.event_tx = Some(event_tx);
+            entry.video_ctl_tx = Some(video_ctl_tx);
+            entry.video_teardown = Some(video_teardown);
+        }
+    }
+
+    /// Release the local video endpoints for `call_id` (a refused upgrade). Best-effort: a no-op if
+    /// the call is unknown or has no teardown hook registered.
+    pub fn run_video_teardown(&self, call_id: &str) {
+        let map = self.inner.lock().expect("registry lock poisoned");
+        // Invoke under the lock: the boxed Fn stays owned by the live entry. It only flips the
+        // root-crate VideoShared flags / aborts a feed — no re-entry into the registry — so this
+        // is safe.
+        if let Some(hook) = map.get(call_id).and_then(|e| e.video_teardown.as_ref()) {
+            hook();
+        }
+    }
+
+    /// Surface a call event on the consumer's event queue (best-effort: dropped when the queue is
+    /// full or the call is unknown, same loss policy as the driver's event posts).
+    pub fn send_call_event(&self, call_id: &str, event: CallEvent) {
+        let tx = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .and_then(|e| e.event_tx.clone());
+        if let Some(tx) = tx {
+            let _ = tx.try_send(event);
+        }
+    }
+
+    /// Send a mid-call video-plane command to the drive loop. Best-effort like
+    /// [`send_call_event`](Self::send_call_event).
+    pub fn send_video_ctl(&self, call_id: &str, ctl: VideoControl) {
+        let tx = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get(call_id)
+            .and_then(|e| e.video_ctl_tx.clone());
+        if let Some(tx) = tx {
+            let _ = tx.try_send(ctl);
+        }
+    }
+
+    /// Track whether the call currently has video negotiated (offer `<video>`, upgrade accepted, or
+    /// downgraded back). No-op for an unknown call.
+    pub fn set_is_video(&self, call_id: &str, is_video: bool) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("registry lock poisoned")
+            .get_mut(call_id)
+        {
+            entry.session.is_video = is_video;
         }
     }
 

@@ -65,6 +65,32 @@ pub struct CallAudioCodec {
     pub rate: u32,
 }
 
+/// In-call `<video state=N>` handshake states (audio→video upgrade, video→audio downgrade).
+/// Values verified against WA Web captures relayed by the mock server; unknown future states land
+/// in `Unknown` so a new server value degrades to an observable no-op instead of a parse failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
+#[wire(kind = "int")]
+pub enum VideoState {
+    #[wire = 0]
+    Disabled,
+    #[wire = 1]
+    Enabled,
+    #[wire = 3]
+    UpgradeRequest,
+    #[wire = 4]
+    UpgradeAccept,
+    #[wire = 5]
+    UpgradeReject,
+    #[wire = 6]
+    Stopped,
+    #[wire = 8]
+    UpgradeCancel,
+    #[wire = 11]
+    UpgradeRequestV2,
+    #[wire_fallback]
+    Unknown(i32),
+}
+
 /// Fields kept per-variant (not a shared `BasicCallMeta`) so the `serde` shape
 /// mirrors the stanza 1:1 for downstream JS consumers.
 #[derive(Debug, Clone, Serialize)]
@@ -138,6 +164,21 @@ pub enum CallAction {
         call_id: String,
         call_creator: Jid,
     },
+    /// In-call `<video state=N>` signaling: the audio→video upgrade / video→audio downgrade
+    /// handshake. Serde-renamed to the wire tag (`video`), like the other variants.
+    #[serde(rename = "video")]
+    VideoState {
+        call_id: String,
+        call_creator: Jid,
+        state: VideoState,
+        /// `device_orientation` attr (0..3, ×90° rotation of the sender's camera).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        orientation: Option<u8>,
+        /// `dec` attr: the codecs the sender can decode (`"H264"` on an upgrade request,
+        /// `"H264,AV1"` on an accept).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dec: Option<String>,
+    },
 }
 
 impl CallAction {
@@ -150,7 +191,8 @@ impl CallAction {
             | Self::Reject { call_id, .. }
             | Self::Terminate { call_id, .. }
             | Self::Transport { call_id, .. }
-            | Self::RelayLatency { call_id, .. } => call_id,
+            | Self::RelayLatency { call_id, .. }
+            | Self::VideoState { call_id, .. } => call_id,
         }
     }
 
@@ -163,7 +205,8 @@ impl CallAction {
             | Self::Reject { call_creator, .. }
             | Self::Terminate { call_creator, .. }
             | Self::Transport { call_creator, .. }
-            | Self::RelayLatency { call_creator, .. } => call_creator,
+            | Self::RelayLatency { call_creator, .. }
+            | Self::VideoState { call_creator, .. } => call_creator,
         }
     }
 
@@ -178,6 +221,7 @@ impl CallAction {
             Self::Terminate { .. } => "terminate",
             Self::Transport { .. } => "transport",
             Self::RelayLatency { .. } => "relaylatency",
+            Self::VideoState { .. } => "video",
         }
     }
 }

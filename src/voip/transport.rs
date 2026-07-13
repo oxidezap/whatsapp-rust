@@ -573,6 +573,7 @@ mod udp_relay_e2e {
             integrity_key: b"relay-key".to_vec(),
             warp_mi_tag_len: 4,
             enable_media: true,
+            enable_video: false,
             enable_sframe: false,
         }
     }
@@ -737,6 +738,9 @@ mod udp_relay_e2e {
                     speaker: spk_tx,
                     events: ev_tx,
                     rekey: None,
+                    video_in: async_channel::bounded(1).1,
+                    video_out: async_channel::bounded(1).0,
+                    video_ctl: async_channel::bounded(1).1,
                 },
                 eng,
             ));
