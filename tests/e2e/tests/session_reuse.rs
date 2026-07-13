@@ -142,9 +142,8 @@ async fn test_send_aborts_before_wire_when_persist_fails() -> anyhow::Result<()>
     // Persisting the outbound advance now fails.
     client_a.backend.set_fail_session_writes(true);
     let writes_before = client_a.backend.session_batch_write_count();
-    // Resolves the instant any `message` node is marshaled for the wire, which
-    // `send_node` does BEFORE `send_raw_bytes`; if the send aborts before that,
-    // it never fires.
+    // `send_node` resolves this before marshaling the node, so a still-pending
+    // waiter proves the send aborted before reaching the wire.
     let mut sent_waiter = client_a.next_sent_message_waiter();
     let result = client_a
         .client
