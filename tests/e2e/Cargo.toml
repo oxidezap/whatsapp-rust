@@ -17,7 +17,7 @@ dhat = { version = "0.3", optional = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { workspace = true, features = ["v4"] }
-wacore = { path = "../../wacore" }
+wacore = { path = "../../wacore", features = ["test-util"] }
 wacore-binary = { path = "../../wacore/binary" }
 whatsapp-rust = { path = "../..", default-features = false, features = [
   "danger-skip-cert-chain-verify",
