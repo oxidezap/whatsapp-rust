@@ -568,7 +568,7 @@ impl Client {
         if self.inbound_commit_batch.is_active() {
             self.maybe_flush_inbound_commits().await;
         } else {
-            self.schedule_signal_flush();
+            self.schedule_signal_flush(lane_generation);
         }
     }
 

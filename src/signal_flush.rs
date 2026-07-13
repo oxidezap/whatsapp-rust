@@ -57,28 +57,40 @@ fn pack_flush_state(generation: u64, flags: u64) -> u64 {
 }
 
 impl Client {
-    /// Request a coalesced flush of the receive-path Signal cache. The first
-    /// request for the current connection generation arms a single worker;
-    /// concurrent requests only mark it dirty.
-    pub(crate) fn schedule_signal_flush(&self) {
-        let generation = self.connection_generation.load(Ordering::Acquire);
+    /// Request a coalesced flush of the receive-path Signal cache for the
+    /// caller's already-validated `lane_generation`. The first request for the
+    /// live generation arms a single worker; concurrent requests only mark it
+    /// dirty. A request from a torn-down connection is a no-op — it can neither
+    /// arm a worker for a dead generation nor move the scheduler backwards.
+    pub(crate) fn schedule_signal_flush(&self, lane_generation: u64) {
         loop {
+            // A stale caller (its connection was torn down) must not touch the
+            // scheduler; the live generation is the source of truth.
+            if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+                return;
+            }
             let cur = self.signal_flush_state.load(Ordering::Acquire);
-            let running_this_generation = (cur >> 2) == generation && cur & FLUSH_RUNNING != 0;
+            let cur_gen = cur >> 2;
+            // The state never moves to an older generation: a newer worker
+            // already owns it, so this request is redundant.
+            if cur_gen > lane_generation {
+                return;
+            }
+            let running_this_generation = cur_gen == lane_generation && cur & FLUSH_RUNNING != 0;
             if !running_this_generation {
-                // Idle, or only a stale-generation worker is present → take
-                // over for this generation.
+                // Idle, or only an older generation's leftover state → take over
+                // for the live generation.
                 if self
                     .signal_flush_state
                     .compare_exchange_weak(
                         cur,
-                        pack_flush_state(generation, FLUSH_RUNNING),
+                        pack_flush_state(lane_generation, FLUSH_RUNNING),
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     )
                     .is_ok()
                 {
-                    self.spawn_signal_flush_worker(generation);
+                    self.spawn_signal_flush_worker(lane_generation);
                     return;
                 }
             } else {
@@ -208,6 +220,13 @@ impl Client {
     pub(crate) fn signal_flush_worker_alive(&self) -> bool {
         self.signal_flush_state.load(Ordering::Acquire) & FLUSH_RUNNING != 0
     }
+
+    /// Schedule for the live generation, as the receive path does with its
+    /// validated `lane_generation`.
+    #[cfg(test)]
+    pub(crate) fn schedule_signal_flush_live(&self) {
+        self.schedule_signal_flush(self.connection_generation.load(Ordering::Acquire));
+    }
 }
 
 #[cfg(test)]
@@ -261,7 +280,7 @@ mod tests {
         let mut addrs = Vec::new();
         for i in 0..10 {
             addrs.push(dirty_session(&client, &format!("155500011{i:02}")));
-            client.schedule_signal_flush();
+            client.schedule_signal_flush_live();
         }
         assert!(client.signal_flush_worker_alive(), "burst arms one worker");
 
@@ -286,14 +305,14 @@ mod tests {
         let client = crate::test_utils::create_test_client().await;
 
         let first = dirty_session(&client, "15550002001");
-        client.schedule_signal_flush();
+        client.schedule_signal_flush_live();
         wait_for_backend_session(&client, &first).await;
         while client.signal_flush_worker_alive() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
         let second = dirty_session(&client, "15550002002");
-        client.schedule_signal_flush();
+        client.schedule_signal_flush_live();
         wait_for_backend_session(&client, &second).await;
     }
 
@@ -310,7 +329,7 @@ mod tests {
             .store(3, Ordering::Release);
 
         for _ in 0..200 {
-            client.schedule_signal_flush();
+            client.schedule_signal_flush_live();
         }
         // RUNNING stays set for generation 0 the whole time — never a second
         // worker; only the two flag bits are ever set (generation 0 leaves the
@@ -335,7 +354,7 @@ mod tests {
             .signal_flush_test_failures
             .store(2, Ordering::Release);
 
-        client.schedule_signal_flush();
+        client.schedule_signal_flush_live();
 
         // Success comes only after both injected failures are consumed by the
         // retry loop (25 + 50 + 100 ms of backoff), proving the same worker
@@ -361,7 +380,7 @@ mod tests {
             .signal_flush_test_failures
             .store(1_000, Ordering::Release);
         dirty_session(&client, "15550006001");
-        client.schedule_signal_flush();
+        client.schedule_signal_flush_live();
         assert!(client.signal_flush_worker_alive());
 
         // Bump the generation as teardown does — no explicit scheduler reset.
@@ -372,7 +391,7 @@ mod tests {
             .signal_flush_test_failures
             .store(0, Ordering::Release);
         let addr = dirty_session(&client, "15550006002");
-        client.schedule_signal_flush();
+        client.schedule_signal_flush_live();
         wait_for_backend_session(&client, &addr).await;
 
         // The state must be tagged with the new generation, proving the
@@ -406,7 +425,7 @@ mod tests {
 
         // Arm worker A on generation 0 and wait until it is inside the flush.
         dirty_session(&client, "15550007001");
-        client.schedule_signal_flush();
+        client.schedule_signal_flush_live();
         let deadline = wacore::time::Instant::now() + Duration::from_secs(1);
         while client.signal_flush_test_in_attempt.load(Ordering::Acquire) == 0 {
             assert!(
@@ -420,7 +439,7 @@ mod tests {
         // arms worker B on the new generation (also blocked in the flush).
         let new_gen = client.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
         dirty_session(&client, "15550007002");
-        client.schedule_signal_flush();
+        client.schedule_signal_flush_live();
         let s = client.signal_flush_state.load(Ordering::Acquire);
         assert_eq!(s >> 2, new_gen, "worker B took over for the new generation");
 
@@ -441,5 +460,81 @@ mod tests {
         // And B still makes progress: its dirty entry lands.
         let addr = ProtocolAddress::new("15550007002".to_string(), 1.into());
         wait_for_backend_session(&client, &addr).await;
+    }
+
+    /// A schedule call carrying a torn-down connection's generation must not
+    /// move the scheduler backwards — the exact bit-state must be untouched.
+    #[tokio::test]
+    async fn stale_schedule_cannot_move_the_generation_backwards() {
+        let client = crate::test_utils::create_test_client().await;
+
+        // Live generation 1, with generation 1's running+dirty state installed.
+        client.connection_generation.store(1, Ordering::SeqCst);
+        let installed = pack_flush_state(1, FLUSH_RUNNING | FLUSH_DIRTY);
+        client
+            .signal_flush_state
+            .store(installed, Ordering::Release);
+
+        // A stale gen-0 schedule is a no-op (live-generation guard).
+        client.schedule_signal_flush(0);
+        assert_eq!(
+            client.signal_flush_state.load(Ordering::Acquire),
+            installed,
+            "a stale (gen-0) schedule must not alter gen-1 state"
+        );
+
+        // And the no-regress guard holds even if the live generation matched
+        // the lane while the state already carried a newer generation (the
+        // window between the live-generation check and the CAS).
+        client.connection_generation.store(0, Ordering::SeqCst);
+        client.schedule_signal_flush(0);
+        assert_eq!(
+            client.signal_flush_state.load(Ordering::Acquire),
+            installed,
+            "a schedule must never CAS gen-1 state down to gen-0"
+        );
+    }
+
+    /// A stale schedule arriving while a new-generation worker is mid-flush must
+    /// not steal the DIRTY bit — the pending update still gets its own window.
+    #[tokio::test]
+    async fn stale_schedule_does_not_starve_the_new_generation() {
+        let client = crate::test_utils::create_test_client().await;
+        client
+            .signal_flush_test_block
+            .store(true, Ordering::Release);
+
+        // Arm worker B on generation 1 and wait until it is inside the flush.
+        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        dirty_session(&client, "15550008001");
+        client.schedule_signal_flush_live();
+        let deadline = wacore::time::Instant::now() + Duration::from_secs(1);
+        while client.signal_flush_test_in_attempt.load(Ordering::Acquire) == 0 {
+            assert!(
+                wacore::time::Instant::now() < deadline,
+                "worker B must enter"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // A live request during the flush marks DIRTY; a stale gen-0 schedule
+        // must not clear it.
+        let second = dirty_session(&client, "15550008002");
+        client.schedule_signal_flush_live();
+        assert!(
+            client.signal_flush_state.load(Ordering::Acquire) & FLUSH_DIRTY != 0,
+            "the live request set DIRTY"
+        );
+        client.schedule_signal_flush(0);
+        assert!(
+            client.signal_flush_state.load(Ordering::Acquire) & FLUSH_DIRTY != 0,
+            "a stale schedule must not clear the pending DIRTY"
+        );
+
+        // Release: B sees DIRTY and runs another window that persists it.
+        client
+            .signal_flush_test_block
+            .store(false, Ordering::Release);
+        wait_for_backend_session(&client, &second).await;
     }
 }
