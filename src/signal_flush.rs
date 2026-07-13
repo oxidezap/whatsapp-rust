@@ -531,10 +531,22 @@ mod tests {
             "a stale schedule must not clear the pending DIRTY"
         );
 
-        // Release: B sees DIRTY and runs another window that persists it.
+        // Release: B's first (blocked) attempt completes, then — because DIRTY is
+        // still set — it runs a SECOND attempt. Proving the second window ran means
+        // requiring the attempt counter to reach 2, not just that `second` landed
+        // (the first attempt alone would persist it, since it was dirtied before
+        // the blocked flush actually executed).
         client
             .signal_flush_test_block
             .store(false, Ordering::Release);
+        let deadline = wacore::time::Instant::now() + Duration::from_secs(2);
+        while client.signal_flush_test_in_attempt.load(Ordering::Acquire) < 2 {
+            assert!(
+                wacore::time::Instant::now() < deadline,
+                "the pending DIRTY must trigger a second flush attempt"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         wait_for_backend_session(&client, &second).await;
     }
 }

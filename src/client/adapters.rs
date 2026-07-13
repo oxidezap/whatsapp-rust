@@ -95,8 +95,8 @@ impl Client {
     /// send path (synchronously, pre-wire), the receive-path coalescer, and the
     /// drain/retry/teardown recovery paths — not unconditionally per message.
     pub(crate) async fn flush_signal_cache(&self) -> Result<(), anyhow::Error> {
-        // Hold no device guard across the flush: this per-message batched SQLite
-        // write would otherwise block every concurrent Device write for its duration.
+        // Clone the backend before awaiting so a slow write cannot retain the
+        // device guard and stall every concurrent Device write.
         let backend = self
             .persistence_manager
             .get_device_snapshot()

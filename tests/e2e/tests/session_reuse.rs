@@ -142,6 +142,10 @@ async fn test_send_aborts_before_wire_when_persist_fails() -> anyhow::Result<()>
     // Persisting the outbound advance now fails.
     client_a.backend.set_fail_session_writes(true);
     let writes_before = client_a.backend.session_batch_write_count();
+    // Resolves the instant any `message` node is marshaled for the wire, which
+    // `send_node` does BEFORE `send_raw_bytes`; if the send aborts before that,
+    // it never fires.
+    let mut sent_waiter = client_a.next_sent_message_waiter();
     let result = client_a
         .client
         .send_message(
@@ -159,8 +163,14 @@ async fn test_send_aborts_before_wire_when_persist_fails() -> anyhow::Result<()>
         client_a.backend.session_batch_write_count() > writes_before,
         "the send path must attempt to persist the ratchet advance before the wire"
     );
+    // Deterministic: no `message` node was ever marshaled, so `send_node` (and
+    // thus the wire) was never reached. `Ok(None)` == pending, sender still alive.
+    assert!(
+        matches!(sent_waiter.try_recv(), Ok(None)),
+        "the send must abort before send_node marshals the stanza for the wire"
+    );
 
-    // The stanza never went out: B must not see it.
+    // End-to-end corroboration: the stanza never went out, so B never sees it.
     client_b
         .assert_no_event(
             3,
