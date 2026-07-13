@@ -39,29 +39,51 @@ const SIGNAL_FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_milli
 /// long-lived backend outage.
 const SIGNAL_FLUSH_RETRY_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// A worker is alive (armed or running/retrying).
-const FLUSH_RUNNING: u32 = 0b01;
+// Scheduler state is `(connection_generation << 2) | flags`. Embedding the
+// generation makes worker ownership generation-scoped: a worker from an old
+// connection cannot mutate state a new-connection worker owns, because its CAS
+// targets its own generation's exact value. So a reconnect during an in-flight
+// flush needs no teardown reset — the next request on the new generation takes
+// over via CAS, and the stale worker retires when it sees a foreign generation.
+const FLUSH_RUNNING: u64 = 0b01;
 /// A request arrived while the worker was mid-flush; it must run one more window.
-const FLUSH_DIRTY: u32 = 0b10;
+const FLUSH_DIRTY: u64 = 0b10;
+#[cfg(test)]
+const FLUSH_FLAGS: u64 = FLUSH_RUNNING | FLUSH_DIRTY;
+
+#[inline]
+fn pack_flush_state(generation: u64, flags: u64) -> u64 {
+    (generation << 2) | flags
+}
 
 impl Client {
     /// Request a coalesced flush of the receive-path Signal cache. The first
-    /// request arms a single worker; concurrent requests only mark it dirty.
+    /// request for the current connection generation arms a single worker;
+    /// concurrent requests only mark it dirty.
     pub(crate) fn schedule_signal_flush(&self) {
+        let generation = self.connection_generation.load(Ordering::Acquire);
         loop {
             let cur = self.signal_flush_state.load(Ordering::Acquire);
-            if cur & FLUSH_RUNNING == 0 {
-                // Idle → arm a worker.
+            let running_this_generation = (cur >> 2) == generation && cur & FLUSH_RUNNING != 0;
+            if !running_this_generation {
+                // Idle, or only a stale-generation worker is present → take
+                // over for this generation.
                 if self
                     .signal_flush_state
-                    .compare_exchange_weak(cur, FLUSH_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange_weak(
+                        cur,
+                        pack_flush_state(generation, FLUSH_RUNNING),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
                 {
-                    self.spawn_signal_flush_worker();
+                    self.spawn_signal_flush_worker(generation);
                     return;
                 }
             } else {
-                // A worker is alive: mark dirty so it runs one more window.
+                // A worker for this generation is alive: mark dirty so it runs
+                // one more window.
                 if self
                     .signal_flush_state
                     .compare_exchange_weak(
@@ -79,16 +101,16 @@ impl Client {
         }
     }
 
-    fn spawn_signal_flush_worker(&self) {
+    fn spawn_signal_flush_worker(&self, generation: u64) {
         let Some(weak) = self.self_weak.get() else {
             // Constructor edge: no Arc identity to hold from a timer task, so
-            // clear the arm and let the next post-construction request drive.
-            self.signal_flush_state.store(0, Ordering::Release);
+            // release the arm and let the next post-construction request drive.
+            self.signal_flush_state
+                .store(pack_flush_state(generation, 0), Ordering::Release);
             return;
         };
         let weak = weak.clone();
         let runtime = self.runtime.clone();
-        let generation = self.connection_generation.load(Ordering::Acquire);
         self.runtime
             .spawn(Box::pin(async move {
                 let mut backoff = SIGNAL_FLUSH_WINDOW;
@@ -99,35 +121,48 @@ impl Client {
                     let Some(client) = weak.upgrade() else {
                         return;
                     };
-                    // A reconnect/teardown owns the state now (it reset the
-                    // scheduler and the cache); stand down without touching the
-                    // state so a fresh worker on the new connection is intact.
-                    if client.connection_generation.load(Ordering::Acquire) != generation {
-                        return;
-                    }
                     match client.coalesced_flush_attempt().await {
                         Ok(()) => {
                             backoff = SIGNAL_FLUSH_WINDOW;
-                            // Exit only if no request arrived mid-flush. If one
-                            // did (DIRTY set), the RUNNING→IDLE CAS fails; clear
-                            // DIRTY and run one more window.
-                            if client
-                                .signal_flush_state
-                                .compare_exchange(
-                                    FLUSH_RUNNING,
-                                    0,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                )
-                                .is_ok()
+                            // Settle ownership under a CAS scoped to our
+                            // generation: exit to idle if nothing is dirty, run
+                            // one more window if it is, or stand down if a
+                            // reconnect handed the state to a new generation.
+                            loop {
+                                let cur = client.signal_flush_state.load(Ordering::Acquire);
+                                if (cur >> 2) != generation {
+                                    return;
+                                }
+                                let next = if cur & FLUSH_DIRTY != 0 {
+                                    pack_flush_state(generation, FLUSH_RUNNING)
+                                } else {
+                                    pack_flush_state(generation, 0)
+                                };
+                                if client
+                                    .signal_flush_state
+                                    .compare_exchange_weak(
+                                        cur,
+                                        next,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                                {
+                                    if next & FLUSH_RUNNING == 0 {
+                                        return;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // A reconnect handed the state to a new generation:
+                            // stand down instead of imposing a stale backoff.
+                            if (client.signal_flush_state.load(Ordering::Acquire) >> 2)
+                                != generation
                             {
                                 return;
                             }
-                            client
-                                .signal_flush_state
-                                .fetch_and(!FLUSH_DIRTY, Ordering::AcqRel);
-                        }
-                        Err(e) => {
                             // Same worker retries with a growing backoff, so
                             // concurrent traffic cannot reset it to the base
                             // delay. The cache keeps its dirty entries.
@@ -147,6 +182,11 @@ impl Client {
     async fn coalesced_flush_attempt(&self) -> Result<(), anyhow::Error> {
         #[cfg(test)]
         {
+            self.signal_flush_test_in_attempt
+                .fetch_add(1, Ordering::AcqRel);
+            while self.signal_flush_test_block.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
             let remaining = self.signal_flush_test_failures.load(Ordering::Acquire);
             if remaining > 0 {
                 self.signal_flush_test_failures
@@ -155,14 +195,6 @@ impl Client {
             }
         }
         self.flush_signal_cache_batch_safe().await
-    }
-
-    /// Reset the scheduler at connection teardown so a worker stuck in a long
-    /// retry backoff on the old connection can't delay the next connection's
-    /// traffic: the worker's generation guard stands it down, and this clears
-    /// the arm so fresh traffic spawns a worker at the base window.
-    pub(crate) fn reset_signal_flush_scheduler(&self) {
-        self.signal_flush_state.store(0, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -273,16 +305,13 @@ mod tests {
         for _ in 0..200 {
             client.schedule_signal_flush();
         }
-        // State only ever carries the two defined bits; RUNNING stays set once,
-        // never "two workers" (which the single-flight design makes
-        // unrepresentable — this asserts the invariant holds under the pile-up).
+        // RUNNING stays set for generation 0 the whole time — never a second
+        // worker; only the two flag bits are ever set (generation 0 leaves the
+        // high bits clear), so the pile-up never mints stray state.
         for _ in 0..50 {
             let s = client.signal_flush_state.load(Ordering::Acquire);
             assert!(s & FLUSH_RUNNING != 0, "a worker stays armed");
-            assert!(
-                s & !(FLUSH_RUNNING | FLUSH_DIRTY) == 0,
-                "no stray state bits"
-            );
+            assert_eq!(s & !FLUSH_FLAGS, 0, "generation 0: no stray high bits");
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         let addr = dirty_session(&client, "15550005001");
@@ -312,12 +341,15 @@ mod tests {
         );
     }
 
-    /// A generation bump (reconnect/teardown) stands the worker down instead of
-    /// imposing its retry backoff on the next connection.
+    /// A generation bump (reconnect/teardown) hands scheduler ownership to the
+    /// next connection without an explicit reset: the new request takes over
+    /// via a generation-scoped CAS while the stale worker is still looping, and
+    /// the stale worker cannot clobber the new worker's state.
     #[tokio::test]
-    async fn generation_bump_stands_the_worker_down() {
+    async fn generation_bump_hands_off_without_clobbering() {
         let client = crate::test_utils::create_test_client().await;
-        // Keep the worker failing so it stays in the retry loop across a bump.
+        // Keep the old worker failing so it stays in the retry loop across the
+        // bump (a stale worker that could still reach its exit CAS).
         client
             .signal_flush_test_failures
             .store(1_000, Ordering::Release);
@@ -325,17 +357,82 @@ mod tests {
         client.schedule_signal_flush();
         assert!(client.signal_flush_worker_alive());
 
-        // Simulate teardown: bump the generation and reset the scheduler.
+        // Bump the generation as teardown does — no explicit scheduler reset.
         client.connection_generation.fetch_add(1, Ordering::SeqCst);
-        client.reset_signal_flush_scheduler();
-
-        // The old worker exits on its next wake; the reset already cleared the
-        // arm, so a fresh request spawns a new worker immediately.
+        // The next connection's first request takes over for the new
+        // generation; stop injecting failures so its worker succeeds.
         client
             .signal_flush_test_failures
             .store(0, Ordering::Release);
         let addr = dirty_session(&client, "15550006002");
         client.schedule_signal_flush();
+        wait_for_backend_session(&client, &addr).await;
+
+        // The state must be tagged with the new generation, proving the
+        // hand-off (and that the stale worker did not reclaim it).
+        let new_gen = client.connection_generation.load(Ordering::Acquire);
+        let deadline = wacore::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let s = client.signal_flush_state.load(Ordering::Acquire);
+            if s >> 2 == new_gen {
+                break;
+            }
+            assert!(
+                wacore::time::Instant::now() < deadline,
+                "scheduler state must carry the new generation, got {s:#x}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The race the generation-scoped CAS closes: an old worker held INSIDE the
+    /// flush while a reconnect hands the scheduler to a new-generation worker
+    /// must not clobber the new worker's state when it finally completes.
+    #[tokio::test]
+    async fn stale_worker_inside_flush_cannot_clobber_new_generation() {
+        let client = crate::test_utils::create_test_client().await;
+
+        // Hold every flush attempt inside the flush until we release it.
+        client
+            .signal_flush_test_block
+            .store(true, Ordering::Release);
+
+        // Arm worker A on generation 0 and wait until it is inside the flush.
+        dirty_session(&client, "15550007001");
+        client.schedule_signal_flush();
+        let deadline = wacore::time::Instant::now() + Duration::from_secs(1);
+        while client.signal_flush_test_in_attempt.load(Ordering::Acquire) == 0 {
+            assert!(
+                wacore::time::Instant::now() < deadline,
+                "worker A must enter the flush"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Reconnect: bump the generation, then a new request takes over and
+        // arms worker B on the new generation (also blocked in the flush).
+        let new_gen = client.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        dirty_session(&client, "15550007002");
+        client.schedule_signal_flush();
+        let s = client.signal_flush_state.load(Ordering::Acquire);
+        assert_eq!(s >> 2, new_gen, "worker B took over for the new generation");
+
+        // Release both. The stale worker A completes its flush and tries to
+        // settle ownership — its generation-scoped CAS must fail, leaving B's
+        // state intact rather than reverting to generation 0.
+        client
+            .signal_flush_test_block
+            .store(false, Ordering::Release);
+        for _ in 0..100 {
+            let s = client.signal_flush_state.load(Ordering::Acquire);
+            assert!(
+                s >> 2 >= new_gen,
+                "stale worker A clobbered the new generation's state: {s:#x}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // And B still makes progress: its dirty entry lands.
+        let addr = ProtocolAddress::new("15550007002".to_string(), 1.into());
         wait_for_backend_session(&client, &addr).await;
     }
 }
