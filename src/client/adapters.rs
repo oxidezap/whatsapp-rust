@@ -91,8 +91,9 @@ impl Client {
         self.flush_signal_cache_batch_safe().await
     }
 
-    /// Flush the in-memory signal cache to the database backend.
-    /// Called after each message is decrypted or after encryption operations.
+    /// Flush the in-memory signal cache to the database backend. Invoked by the
+    /// send path (synchronously, pre-wire), the receive-path coalescer, and the
+    /// drain/retry/teardown recovery paths — not unconditionally per message.
     pub(crate) async fn flush_signal_cache(&self) -> Result<(), anyhow::Error> {
         // Hold no device guard across the flush: this per-message batched SQLite
         // write would otherwise block every concurrent Device write for its duration.

@@ -560,8 +560,9 @@ pub struct Client {
     pub(crate) unified_session: crate::unified_session::UnifiedSessionManager,
 
     /// In-memory cache for Signal protocol state (sessions, identities, sender keys).
-    /// Matches WhatsApp Web's SignalStoreCache pattern: crypto ops read/write this cache,
-    /// and DB writes are deferred to flush() after each message is processed.
+    /// Matches WhatsApp Web's SignalStoreCache pattern: crypto ops read/write this
+    /// cache, and DB writes are flushed out of it — synchronously on the send path
+    /// and coalesced on the receive path (see `signal_flush.rs`).
     pub(crate) signal_cache: Arc<crate::store::signal_cache::SignalStoreCache>,
 
     /// Limits message processing concurrency (1 permit during offline sync, N after).

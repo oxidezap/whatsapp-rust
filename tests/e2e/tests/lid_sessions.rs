@@ -526,10 +526,10 @@ async fn test_pn_only_session_causes_undecryptable_on_lid_lookup() -> anyhow::Re
     info!("Verified messaging works after first reconnect");
 
     // Settle before the backend surgery below: the step-3 message left a
-    // ratchet advance in the (write-behind) signal cache, and a reconnect
-    // teardown would flush it AFTER the surgery — resurrecting the LID
-    // session this test deletes. Same pattern as the durability test.
-    client_a.reconnect_and_wait().await?;
+    // receive-side ratchet advance in the coalesced signal cache, which a later
+    // flush would write AFTER the surgery — resurrecting the LID session this
+    // test deletes. Settle it directly (no full reconnect needed).
+    client_a.client.flush_pending_signal_state().await?;
     info!("Settled signal cache before backend surgery");
 
     // Step 4: Simulate legacy DB — move session from LID to PN address.
