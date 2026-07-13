@@ -1552,11 +1552,14 @@ impl Client {
         // Warm marking is visible; a waiting cold send may now re-resolve.
         drop(distribution_guard);
 
-        // Schedule the coalesced Signal flush for the encryption's ratchet
-        // advance (one storage write per debounce window instead of one per
-        // send; recovery paths that need read-after-write keep their own
-        // synchronous flushes).
-        self.schedule_signal_flush().await;
+        // Flush the outbound ratchet advance synchronously before returning:
+        // a coalesced flush here would let send_message report success while
+        // the counter/chain-key advance is still only in memory, so a crash
+        // before the flush would reuse the counter (and its message key + IV)
+        // on the next send. Only the receive path — where a lost advance
+        // re-derives forward — coalesces.
+        self.flush_signal_cache_batch_safe_logged("send_message_impl", None)
+            .await;
 
         // Issue new tc token after send if a bucket boundary was crossed.
         // Fire-and-forget so send_message returns without waiting for the IQ

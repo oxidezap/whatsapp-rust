@@ -836,9 +836,9 @@ pub struct Client {
     /// Initialized after `Arc::new(this)` in the constructor.
     pub(crate) self_weak: std::sync::OnceLock<std::sync::Weak<Client>>,
 
-    /// Coalescing-window flag for the Signal-cache flush
-    /// (see `signal_flush.rs`). True while a fire is armed.
-    pub(crate) signal_flush_pending: AtomicBool,
+    /// Single-flight state for the coalesced Signal-cache flush worker
+    /// (RUNNING/DIRTY bits; see `signal_flush.rs`).
+    pub(crate) signal_flush_state: AtomicU32,
     /// Injected failures for the coalesced flush (consumed one per attempt),
     /// so tests can exercise the retry/backoff path deterministically.
     #[cfg(test)]

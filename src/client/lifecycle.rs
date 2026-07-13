@@ -240,7 +240,7 @@ impl Client {
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
             passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
             passkey_opening: AtomicBool::new(false),
-            signal_flush_pending: AtomicBool::new(false),
+            signal_flush_state: AtomicU32::new(0),
             #[cfg(test)]
             signal_flush_test_failures: AtomicU32::new(0),
             custom_enc_handlers: std::sync::OnceLock::new(),
@@ -767,6 +767,11 @@ impl Client {
         // permit-held cache settle below, so no rowless ratchet advances can
         // dirty the cache behind teardown's back.
         self.connection_generation.fetch_add(1, Ordering::SeqCst);
+        // Stand down the coalesced-flush worker: its generation guard exits it
+        // on the next wake, and clearing the arm lets the next connection's
+        // traffic spawn a fresh worker at the base window instead of waiting
+        // out a stale retry backoff.
+        self.reset_signal_flush_scheduler();
         // Note: node_waiters are intentionally NOT cleared here — they are
         // cross-connection (callers may register a waiter before an action that
         // completes on a subsequent connection, e.g. after 515 reconnect).
