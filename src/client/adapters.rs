@@ -68,15 +68,23 @@ impl Client {
             .ok_or(ClientError::NotConnected)
     }
 
-    /// Force any pending write-behind Signal cache state to the backend and
-    /// wait for it to complete.
+    /// Force any pending write-behind Signal cache state to the backend,
+    /// returning once the flush completes (or fails).
     ///
     /// Live sends and receives schedule a coalesced flush (see
-    /// `signal_flush.rs`) rather than writing synchronously, so durable
-    /// storage lags the in-memory cache by up to one debounce window. Callers
-    /// that need read-after-write durability on the backend — e.g. before
-    /// inspecting persisted session state, or ahead of a non-graceful
-    /// shutdown — use this to settle it deterministically.
+    /// `signal_flush.rs`) instead of writing through, so on success the backend
+    /// trails the in-memory cache by at most one coalescing window; a backend
+    /// outage extends that until the scheduler's retry loop succeeds. Use this
+    /// to settle durability deterministically before reading persisted state or
+    /// ahead of a non-graceful shutdown — and check the returned `Result`, as a
+    /// failure leaves state pending.
+    ///
+    /// Call from a control task, never from inside an event handler or an
+    /// [`InboundDurabilityHook`]: during an offline-sync drain those run while
+    /// the processing permit is held, and settling routes through that same
+    /// permit — re-entering it would deadlock.
+    ///
+    /// [`InboundDurabilityHook`]: crate::types::durability_hook::InboundDurabilityHook
     pub async fn flush_pending_signal_state(&self) -> Result<(), anyhow::Error> {
         self.flush_signal_cache_batch_safe().await
     }

@@ -561,14 +561,15 @@ impl Client {
             self.handle_msmsg_payload(&info, payload).await;
         }
 
-        // Live: schedule the coalesced Signal flush (WA Web flushes per
-        // stanza via flushBufferToDiskIfNotMemOnlyMode; we trade a bounded
-        // debounce window for one storage write per burst — the ack above
-        // already preceded the flush, so ordering is unchanged). During the
-        // offline drain the commit batcher owns the flush — one per batch,
-        // before any ack (WA Web's bulk signal-store snapshot) — so here only
-        // the batch size/byte triggers are checked, while the global permit
-        // is still held.
+        // Live: schedule the coalesced Signal flush. WA Web flushes per stanza
+        // (flushBufferToDiskIfNotMemOnlyMode, inside decrypt BEFORE the caller
+        // sends the receipt); our live path already acked BEFORE the per-stanza
+        // flush pre-dating this change, so we don't reorder ack-vs-flush — we
+        // only widen the crash-replay gap it already had to one coalescing
+        // window. During the offline drain the commit batcher owns the flush —
+        // one per batch, before any ack (WA Web's bulk signal-store snapshot) —
+        // so here only the batch size/byte triggers are checked, while the
+        // global permit is still held.
         if self.inbound_commit_batch.is_active() {
             self.maybe_flush_inbound_commits().await;
         } else {
