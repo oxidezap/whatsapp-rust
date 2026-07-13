@@ -121,6 +121,13 @@ impl Client {
                     let Some(client) = weak.upgrade() else {
                         return;
                     };
+                    // A reconnect handed ownership to a new generation: stand
+                    // down before flushing. The generation-scoped exit CAS would
+                    // reject our mutation anyway, but skipping the flush avoids a
+                    // stale write after teardown settled the cache.
+                    if client.connection_generation.load(Ordering::Acquire) != generation {
+                        return;
+                    }
                     match client.coalesced_flush_attempt().await {
                         Ok(()) => {
                             backoff = SIGNAL_FLUSH_WINDOW;
