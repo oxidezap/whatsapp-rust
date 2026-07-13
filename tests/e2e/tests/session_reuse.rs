@@ -37,6 +37,93 @@ async fn scan_sessions(
     Ok(results)
 }
 
+/// Read the sender-chain counter of the first established session for `user`
+/// straight from the backend (no cache, no settle) — the durable outbound
+/// ratchet position.
+async fn durable_sender_chain_index(
+    backend: &dyn wacore::store::traits::SignalStore,
+    user: &str,
+    server: &str,
+) -> anyhow::Result<Option<u32>> {
+    for device_id in 0..=99u16 {
+        let addr = if device_id == 0 {
+            format!("{user}@{server}.0")
+        } else {
+            format!("{user}:{device_id}@{server}.0")
+        };
+        if let Some(data) = backend.get_session(&addr).await?
+            && let Some(state) = SessionRecord::deserialize(&data)?.session_state()
+            && let Ok(chain) = state.get_sender_chain_key()
+        {
+            return Ok(Some(chain.index()));
+        }
+    }
+    Ok(None)
+}
+
+/// The outbound ratchet advance must be durable BEFORE send_message returns:
+/// a coalesced send could report success while the counter/chain-key advance
+/// is still only in the in-memory cache, so a crash before the flush would
+/// reuse the counter (and its message key + IV) on the next send. Read the
+/// backend directly after each send — with no explicit settle — and require
+/// the sender-chain counter to have already advanced, which is exactly what a
+/// crash at that instant would preserve.
+#[tokio::test]
+async fn test_outbound_ratchet_is_durable_before_send_returns() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut client_a = TestClient::connect("e2e_sig_durable_a").await?;
+    let mut client_b = TestClient::connect("e2e_sig_durable_b").await?;
+    let jid_a = client_a.jid().await;
+    let jid_b = client_b.jid().await;
+    let lid_b = client_b.client.get_lid();
+
+    // Establish the outbound session A→B.
+    send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "establish", 30).await?;
+    send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "reply", 30).await?;
+
+    let backend_a = client_a.client.persistence_manager().backend();
+    let read_index = async |user: &str, server: &str| {
+        durable_sender_chain_index(&*backend_a, user, server).await
+    };
+
+    // The session may be keyed under LID (modern) or PN.
+    let (user, server) = match lid_b {
+        Some(ref lid) if read_index(&lid.user, "lid").await?.is_some() => (lid.user.clone(), "lid"),
+        _ => (jid_b.user.clone(), "c.us"),
+    };
+
+    let mut last = read_index(&user, server)
+        .await?
+        .expect("an outbound session must exist after the roundtrip");
+
+    // Each send must leave a strictly higher counter durable in the backend
+    // WITHOUT any explicit flush — proving the synchronous outbound flush.
+    for i in 0..3 {
+        send_and_expect_text(
+            &client_a.client,
+            &mut client_b,
+            &jid_b,
+            &format!("m{i}"),
+            30,
+        )
+        .await?;
+        let now = read_index(&user, server)
+            .await?
+            .expect("session persists across sends");
+        assert!(
+            now > last,
+            "send #{i} must persist the advanced sender-chain counter before returning \
+             (durable {last} -> {now}); a coalesced send would leave it stale"
+        );
+        last = now;
+    }
+
+    client_a.disconnect().await;
+    client_b.disconnect().await;
+    Ok(())
+}
+
 /// Multiple sequential sends without a reply should all be delivered.
 #[tokio::test]
 async fn test_one_way_multiple_sends() -> anyhow::Result<()> {

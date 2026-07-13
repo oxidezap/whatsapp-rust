@@ -159,20 +159,12 @@ impl TestClient {
 
         let run_handle = bot.spawn();
 
-        // Wait for the client to become fully ready: connected, logged in, and
-        // critical app-state sync complete.
-        //
-        // This gates on `wait_for_connected`, which resolves on the canonical
-        // `is_ready` signal (`dispatch_connected`, fired after the critical sync)
-        // via a notifier — not on the order events happen to arrive in the
-        // channel. That makes it immune to the earlier flake, where a fixed 30s
-        // event-loop wait for `Connected` raced how long the mock server took to
-        // serve app-state IQs under concurrent CI load, then fell back to
-        // `offline_sync_completed` — an orthogonal signal that could time out
-        // even though the client was otherwise ready. The single budget below is
-        // generous because it is a hard ceiling on a real hang, not a per-phase
-        // race window. PairSuccess/Connected still land in the unbounded
-        // `event_rx`; the predicate-filtered `wait_for_event` used by tests
+        // Readiness gate: `wait_for_connected` resolves on the canonical
+        // `is_ready` signal (`dispatch_connected`, after the critical sync) via
+        // a notifier, so it does not race event arrival order or fall back to an
+        // orthogonal signal — the earlier flake, where a fixed 30s wait for
+        // `Connected` timed out under CI load. PairSuccess/Connected still land
+        // in the unbounded `event_rx`; the predicate-filtered `wait_for_event`
         // discards them.
         if let Err(e) = client
             .wait_for_connected(tokio::time::Duration::from_secs(60))
@@ -186,15 +178,19 @@ impl TestClient {
         }
 
         // Drain the initial startup sync (offline messages + history) so tests
-        // start from a settled state. Best-effort: readiness is already
-        // guaranteed by `wait_for_connected` above, and a chat-action test does
-        // not depend on message backlog, so a slow mock server here must not
-        // fail the connect — it only means the (empty) backlog is still landing.
+        // start from a quiescent state. This is a hard requirement, not
+        // best-effort: a timeout here means a real startup hang or a mid-sync
+        // client that would make assertions race changing state, so it fails
+        // the connect.
         if let Err(e) = client
             .wait_for_startup_sync(tokio::time::Duration::from_secs(30))
             .await
         {
-            eprintln!("WARN: startup sync did not settle before the connect deadline: {e}");
+            client.disconnect().await;
+            drop(run_handle);
+            return Err(anyhow::anyhow!(
+                "startup sync did not settle before the connect deadline: {e}"
+            ));
         }
 
         Ok(Self {
