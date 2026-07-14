@@ -870,7 +870,7 @@ impl Client {
             let snapshot = self.persistence_manager.get_device_snapshot();
             let old = snapshot.push_name.clone();
             if old != new_name {
-                debug!(target: "Client/AppState", "Persisting push name from app state mutation: '{}' (old='{}')", new_name, old);
+                debug!(target: "Client/AppState", "Persisting changed push name from app state mutation");
                 self.persistence_manager
                     .process_command(DeviceCommand::SetPushName(new_name.clone()))
                     .await;
@@ -890,7 +890,7 @@ impl Client {
                     }
                 }
             } else {
-                debug!(target: "Client/AppState", "Push name mutation received but name unchanged: '{}'", new_name);
+                debug!(target: "Client/AppState", "Push name mutation received but name unchanged");
             }
         }
     }
