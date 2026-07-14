@@ -39,7 +39,9 @@ pub struct HistorySyncResult {
     /// Tctoken candidates extracted from 1:1 conversations during streaming.
     pub tc_token_candidates: Vec<TcTokenCandidate>,
     pub msg_secret_records: Vec<HistoryMsgSecretRecord>,
-    /// Includes conversation metadata when the bulk mapping is absent.
+    /// PN/LID pairs from the bulk mapping block and from per-conversation
+    /// metadata (both are harvested; conversations often carry pairs the
+    /// bulk block omits).
     pub lid_mappings: Vec<HistoryLidMapping>,
     /// The original zlib-compressed input, handed back (moved, never copied or
     /// re-inflated) only when event listeners exist. Wrapped in
