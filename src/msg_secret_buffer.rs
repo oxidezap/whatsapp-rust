@@ -26,7 +26,9 @@ use wacore::store::traits::MsgSecretEntry;
 type Key = (String, String, String);
 
 pub(crate) struct MsgSecretWriteBuffer {
-    pending: Mutex<HashMap<Key, MsgSecretEntry>>,
+    // Values are Arc so the flush snapshot (values().cloned()) is a refcount bump
+    // instead of a full deep clone of every pending entry (3 Strings + a Vec each).
+    pending: Mutex<HashMap<Key, Arc<MsgSecretEntry>>>,
     /// Set by the terminal disconnect. A sealed buffer writes every queue
     /// inline (the old synchronous semantics), so a lane worker still
     /// draining its backlog after the shutdown flush cannot strand a secret
@@ -89,7 +91,7 @@ impl MsgSecretWriteBuffer {
         self.schedule_or_flush().await;
     }
 
-    fn insert_pending(pending: &mut HashMap<Key, MsgSecretEntry>, mut entry: MsgSecretEntry) {
+    fn insert_pending(pending: &mut HashMap<Key, Arc<MsgSecretEntry>>, mut entry: MsgSecretEntry) {
         use wacore::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
 
         let key = (
@@ -102,7 +104,9 @@ impl MsgSecretWriteBuffer {
             entry.expires_at = merge_msg_secret_expiry(existing.expires_at, entry.expires_at);
             entry.message_ts = merge_msg_secret_message_ts(existing.message_ts, entry.message_ts);
         }
-        pending.insert(key, entry);
+        // Always a fresh Arc: finish_batch tells a recaptured entry from the one
+        // it wrote by pointer identity, so this must not switch to Arc::make_mut.
+        pending.insert(key, Arc::new(entry));
     }
 
     async fn schedule_or_flush(self: &Arc<Self>) {
@@ -167,14 +171,18 @@ impl MsgSecretWriteBuffer {
     /// harmlessly and [`Self::finish_batch`] only removes what was written.
     async fn flush_pending_once(&self) -> bool {
         let _write_guard = self.write_lock.lock().await;
-        let batch: Vec<MsgSecretEntry> = {
+        let batch: Vec<Arc<MsgSecretEntry>> = {
             let pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending.values().cloned().collect()
         };
         if batch.is_empty() {
             return false;
         }
-        if let Err(e) = self.backend.put_msg_secrets(batch.clone()).await {
+        // put_msg_secrets owns its Vec; unwrap the Arcs once here. The owned-map
+        // version deep-cloned the whole batch twice (snapshot + the put clone);
+        // now the snapshot is a refcount bump and only this unwrap deep-copies.
+        let owned: Vec<MsgSecretEntry> = batch.iter().map(|e| (**e).clone()).collect();
+        if let Err(e) = self.backend.put_msg_secrets(owned).await {
             // Same semantics as the previously awaited write: warn + drop.
             log::warn!("failed to persist messageSecrets: {e:?}");
         }
@@ -194,23 +202,17 @@ impl MsgSecretWriteBuffer {
     /// the one that was written: an edit recapture stores a NEW secret under
     /// the same (chat, sender, id), so a refresh queued while its predecessor
     /// was in flight must survive for the next drain iteration.
-    fn finish_batch(&self, written: &[MsgSecretEntry]) {
+    fn finish_batch(&self, written: &[Arc<MsgSecretEntry>]) {
+        // Remove a written entry only where pending still holds the exact Arc we
+        // snapshotted. A recapture during the flush replaces the value with a
+        // fresh Arc (insert_pending always allocates a new one), so pointer
+        // identity separates "written and untouched" from "superseded, must
+        // survive" without rebuilding the (chat, sender, id) key or deep-comparing
+        // the secret per entry. Relies on insert_pending storing a NEW Arc on
+        // every insert; if that ever mutates in place (Arc::make_mut), this must
+        // return to a content comparison.
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
-        for entry in written {
-            let key = (
-                entry.chat.clone(),
-                entry.sender.clone(),
-                entry.msg_id.clone(),
-            );
-            let unchanged = |current: &MsgSecretEntry| {
-                current.secret == entry.secret
-                    && current.expires_at == entry.expires_at
-                    && current.message_ts == entry.message_ts
-            };
-            if pending.get(&key).is_some_and(unchanged) {
-                pending.remove(&key);
-            }
-        }
+        pending.retain(|_key, current| !written.iter().any(|w| Arc::ptr_eq(current, w)));
     }
 
     #[cfg(test)]
@@ -313,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_queued_during_flush_survives_removal() {
         let buf = buffer().await;
-        let stale = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
+        let stale = Arc::new(entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11));
         // Simulate the drain having snapshotted `stale` while a refresh lands.
         buf.queue(vec![entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x22)])
             .await;
@@ -342,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_refresh_during_flush_survives_removal() {
         let buf = buffer().await;
-        let stale = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
+        let stale = Arc::new(entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11));
         let mut refreshed = entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11);
         refreshed.expires_at = 999;
         buf.queue(vec![refreshed]).await;
@@ -351,6 +353,81 @@ mod tests {
             buf.pending_len(),
             1,
             "a same-secret metadata refresh must stay pending"
+        );
+        buf.wait_flushed().await;
+    }
+
+    /// finish_batch keys removal on Arc identity, using the REAL Arc the drain
+    /// snapshots (not a hand-built stale entry): a recapture during the flush
+    /// replaces the value with a fresh Arc, so the in-flight batch must not evict
+    /// it. This is the exact race the pointer-identity check exists for.
+    #[tokio::test]
+    async fn recapture_survives_finish_batch_of_real_snapshot() {
+        let buf = buffer().await;
+        buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x11))
+            .await;
+        // The Arc a drain iteration would carry into put + finish_batch.
+        let snapshot: Vec<Arc<MsgSecretEntry>> =
+            buf.pending.lock().unwrap().values().cloned().collect();
+        // Recapture the same key with a new secret; insert_pending stores a fresh Arc.
+        buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "PARENT", 0x22))
+            .await;
+        // The stale batch's cleanup must leave the refresh in place.
+        buf.finish_batch(&snapshot);
+        assert_eq!(
+            buf.lookup("g@g.us", "a@s.whatsapp.net", "PARENT"),
+            Some((vec![0x22; 32], 7)),
+            "the recapture (a fresh Arc) survives the prior batch's finish_batch"
+        );
+        buf.wait_flushed().await;
+        let stored = buf
+            .backend
+            .get_msg_secret("g@g.us", "a@s.whatsapp.net", "PARENT")
+            .await
+            .expect("backend read");
+        assert_eq!(
+            stored.as_deref(),
+            Some(&[0x22u8; 32][..]),
+            "the refresh reaches the backend"
+        );
+    }
+
+    /// The invariant finish_batch relies on: insert_pending stores a NEW Arc on
+    /// every insert, so even a byte-identical recapture is a distinct allocation
+    /// and pointer identity (not content) decides removal. A regression that
+    /// reused/mutated the Arc in place would fail here.
+    #[tokio::test]
+    async fn identical_recapture_is_a_distinct_arc() {
+        let buf = buffer().await;
+        buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "K", 0x33))
+            .await;
+        let snapshot: Vec<Arc<MsgSecretEntry>> =
+            buf.pending.lock().unwrap().values().cloned().collect();
+        // Re-queue byte-identical content.
+        buf.queue_one(entry("g@g.us", "a@s.whatsapp.net", "K", 0x33))
+            .await;
+        let key = (
+            "g@g.us".to_string(),
+            "a@s.whatsapp.net".to_string(),
+            "K".to_string(),
+        );
+        let current = buf
+            .pending
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .expect("entry pending");
+        assert!(
+            !Arc::ptr_eq(&current, &snapshot[0]),
+            "an identical-content recapture must be a fresh Arc"
+        );
+        // Therefore the stale batch does not remove it.
+        buf.finish_batch(&snapshot);
+        assert_eq!(
+            buf.pending_len(),
+            1,
+            "the identical recapture survives the stale batch"
         );
         buf.wait_flushed().await;
     }

@@ -289,22 +289,21 @@ impl Client {
 
     /// Core session-check + prekey-fetch logic shared by both entry points.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_inner", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
-    async fn ensure_sessions_inner(&self, jids: Vec<Jid>) -> Result<()> {
+    async fn ensure_sessions_inner(&self, mut jids: Vec<Jid>) -> Result<()> {
         use wacore::types::jid::JidExt;
 
         // Warm-cache pre-filter: a cached session answers synchronously, so
         // the common live-send case skips the probe-stream machinery below
         // entirely. Contended or unknown entries fall through to the probe.
-        let jids: Vec<Jid> = jids
-            .into_iter()
-            .filter(|jid| {
-                !matches!(
-                    self.signal_cache
-                        .try_has_session(&jid.to_protocol_address()),
-                    Some(true)
-                )
-            })
-            .collect();
+        // Retain in place (reusing the input allocation) and rewrite one reusable
+        // address per jid instead of allocating a fresh ProtocolAddress for every
+        // lookup key. A plain local (not thread-local): the async probe below owns
+        // its own address per concurrent task.
+        let mut reusable_addr = wacore::types::jid::make_reusable_protocol_address();
+        jids.retain(|jid| {
+            jid.reset_protocol_address(&mut reusable_addr);
+            self.signal_cache.try_has_session(&reusable_addr) != Some(true)
+        });
         if jids.is_empty() {
             return Ok(());
         }

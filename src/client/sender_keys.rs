@@ -343,7 +343,6 @@ impl Client {
         // Avoids re-encoding when the send path already serialized `msg`.
         encoded: Option<std::sync::Arc<Vec<u8>>>,
     ) {
-        let key = self.make_chat_message_id(to, id).await;
         let shared =
             encoded.unwrap_or_else(|| std::sync::Arc::new(waproto::codec::message_to_vec(msg)));
         let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
@@ -352,6 +351,7 @@ impl Client {
             // L1 cache serves reads immediately; DB write can be backgrounded.
             // Share the serialized bytes via Arc so the cache and the DB task
             // hold the same buffer instead of memcpy-ing the whole message.
+            let key = self.make_chat_message_id(to, id).await;
             let chat_str = key.chat.to_string();
             let msg_id = key.id.clone();
             self.recent_messages
@@ -369,12 +369,16 @@ impl Client {
                 }))
                 .detach();
         } else {
-            // DB-only mode: await to guarantee the row exists before returning
-            let chat_str = key.chat.to_string();
+            // DB-only mode: await to guarantee the row exists before returning.
+            // Only chat + id are borrowed here, so resolve the chat directly and
+            // pass the caller's `id`, skipping make_chat_message_id's owned
+            // ChatMessageId whose id.to_owned() would just be borrowed away.
+            let chat = self.resolve_encryption_jid(to).await;
+            let chat_str = chat.to_string();
             if let Err(e) = self
                 .persistence_manager
                 .backend()
-                .store_sent_message(&chat_str, &key.id, &shared)
+                .store_sent_message(&chat_str, id, &shared)
                 .await
             {
                 log::warn!("Failed to store sent message to DB: {e}");
