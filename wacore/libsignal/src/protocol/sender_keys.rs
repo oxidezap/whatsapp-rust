@@ -203,6 +203,14 @@ pub struct SenderKeyState {
     /// `state.sender_message_keys` is kept empty in memory; this is the source of
     /// truth, reassembled into the protobuf only at `as_protobuf` (serialization).
     message_keys: std::sync::Arc<Vec<StoredMessageKey>>,
+    /// The current sender chain key, held as a `Copy` value instead of in the
+    /// protobuf. The chain seed is a `Bytes` in the generated structure, so
+    /// keeping it there made every record clone (and the copy-on-write on every
+    /// encrypt/decrypt advance) promote that `Bytes` to a shared allocation.
+    /// Same source-of-truth-outside-the-protobuf trick as `message_keys`:
+    /// `state.sender_chain_key` stays empty in memory, reassembled only at
+    /// `as_protobuf`. `None` only for a structurally invalid state.
+    sender_chain: Option<SenderChainKey>,
     /// Parsed signing key with its XEdDSA cache pre-derived, memoized so the
     /// per-send signature skips a basepoint multiplication (~18% of a warm
     /// group send when re-derived from bytes every message). Clones carry the
@@ -247,11 +255,12 @@ impl SenderKeyState {
         let chain_key_arr: [u8; 32] = chain_key
             .try_into()
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+        let sender_chain = Some(SenderChainKey::new(iteration, chain_key_arr));
         let state = SenderKeyStateStructure {
             sender_key_id: Some(chain_id),
-            sender_chain_key: MessageField::some(
-                SenderChainKey::new(iteration, chain_key_arr).as_protobuf(),
-            ),
+            // Source of truth is `sender_chain`; the protobuf field stays empty
+            // in memory and is reassembled at as_protobuf.
+            sender_chain_key: MessageField::none(),
             sender_signing_key: MessageField::some(sender_key_state_structure::SenderSigningKey {
                 public: Some(Bytes::copy_from_slice(&signature_key.serialize())),
                 private: signature_private_key
@@ -278,6 +287,7 @@ impl SenderKeyState {
         Ok(Self {
             state,
             message_keys: std::sync::Arc::new(Vec::new()),
+            sender_chain,
             signing_key_memo,
             verifying_key_memo,
         })
@@ -292,9 +302,16 @@ impl SenderKeyState {
                 .map(StoredMessageKey::from_protobuf)
                 .collect::<Vec<_>>(),
         );
+        // Likewise move the chain key out into the Copy field; the seed was
+        // validated at deserialize before this runs.
+        let sender_chain = state.sender_chain_key.take().and_then(|sc| {
+            let seed: [u8; 32] = sc.seed.as_deref()?.try_into().ok()?;
+            Some(SenderChainKey::new(sc.iteration.unwrap_or_default(), seed))
+        });
         Self {
             state,
             message_keys,
+            sender_chain,
             signing_key_memo: std::sync::OnceLock::new(),
             verifying_key_memo: std::sync::OnceLock::new(),
         }
@@ -309,21 +326,11 @@ impl SenderKeyState {
     }
 
     pub fn sender_chain_key(&self) -> Option<SenderChainKey> {
-        let sender_chain = self.state.sender_chain_key.as_option()?;
-        let seed: [u8; 32] = sender_chain
-            .seed
-            .as_deref()
-            .unwrap_or_default()
-            .try_into()
-            .ok()?;
-        Some(SenderChainKey::new(
-            sender_chain.iteration.unwrap_or_default(),
-            seed,
-        ))
+        self.sender_chain
     }
 
     pub fn set_sender_chain_key(&mut self, chain_key: SenderChainKey) {
-        self.state.sender_chain_key = MessageField::some(chain_key.as_protobuf());
+        self.sender_chain = Some(chain_key);
     }
 
     /// Advance the sender chain up to a reload's reserved iteration ceiling so no
@@ -414,8 +421,9 @@ impl SenderKeyState {
 
     pub(crate) fn as_protobuf(&self) -> SenderKeyStateStructure {
         debug_assert!(
-            self.state.sender_message_keys.is_empty(),
-            "backlog must live only in `message_keys`; the protobuf copy stays empty"
+            self.state.sender_message_keys.is_empty()
+                && self.state.sender_chain_key.as_option().is_none(),
+            "backlog and chain key must live only in their Copy/Arc fields; the protobuf copies stay empty"
         );
         let mut state = self.state.clone();
         state.sender_message_keys = self
@@ -423,6 +431,10 @@ impl SenderKeyState {
             .iter()
             .map(StoredMessageKey::as_protobuf)
             .collect();
+        state.sender_chain_key = self
+            .sender_chain
+            .as_ref()
+            .map_or_else(MessageField::none, |c| MessageField::some(c.as_protobuf()));
         state
     }
 
@@ -723,6 +735,8 @@ impl SenderKeyRecord {
             .map(|s| {
                 s.state.compute_size(&mut cache) as usize
                     + s.message_keys.len() * std::mem::size_of::<StoredMessageKey>()
+                    + s.sender_chain
+                        .map_or(0, |_| std::mem::size_of::<SenderChainKey>())
             })
             .sum()
     }
