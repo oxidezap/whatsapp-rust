@@ -236,6 +236,9 @@ async fn test_stale_pn_session_does_not_break_lid_messaging() -> anyhow::Result<
     )
     .await?;
 
+    // Settle the coalesced flush before reading durable session state: the
+    // reply above created A's inbound session in the write-behind cache.
+    client_a.client.flush_pending_signal_state().await?;
     let backend_a = client_a.client.persistence_manager().backend();
 
     // Read the existing LID session data at B's connected device (companion, not 0).
@@ -279,6 +282,9 @@ async fn test_stale_pn_session_does_not_break_lid_messaging() -> anyhow::Result<
     .await?;
     info!("Messaging works despite stale PN session in DB");
 
+    // Settle the coalesced receive-path flush (A received the post-inject
+    // reply) before reading.
+    client_a.client.flush_pending_signal_state().await?;
     // LID session should still be authoritative
     assert!(
         backend_a.get_session(&lid_addr).await?.is_some(),
@@ -339,7 +345,8 @@ async fn test_lid_session_survives_reconnect() -> anyhow::Result<()> {
     .await?;
     info!("Sessions established");
 
-    // Verify LID-only before reconnect
+    // Verify LID-only before reconnect (settle the coalesced flush first).
+    client_a.client.flush_pending_signal_state().await?;
     let backend_a = client_a.client.persistence_manager().backend();
     assert_lid_only_sessions(&*backend_a, &jid_b.user, &lid_b.user, "Before reconnect").await;
 
@@ -370,7 +377,8 @@ async fn test_lid_session_survives_reconnect() -> anyhow::Result<()> {
     .await?;
     info!("Post-reconnect delivery confirmed (2 messages)");
 
-    // Final check: still LID-only after post-reconnect sends
+    // Final check: still LID-only after post-reconnect sends (settle first).
+    client_a.client.flush_pending_signal_state().await?;
     assert_lid_only_sessions(
         &*backend_a,
         &jid_b.user,
@@ -517,6 +525,13 @@ async fn test_pn_only_session_causes_undecryptable_on_lid_lookup() -> anyhow::Re
     .await?;
     info!("Verified messaging works after first reconnect");
 
+    // Settle before the backend surgery below: the step-3 message left a
+    // receive-side ratchet advance in the coalesced signal cache, which a later
+    // flush would write AFTER the surgery — resurrecting the LID session this
+    // test deletes. Settle it directly (no full reconnect needed).
+    client_a.client.flush_pending_signal_state().await?;
+    info!("Settled signal cache before backend surgery");
+
     // Step 4: Simulate legacy DB — move session from LID to PN address.
     // Target B's connected device: under LID addressing a 1:1 peer sends from its
     // companion, never device 0, so the inbound session lives there (not at :0).
@@ -615,6 +630,8 @@ async fn test_inbound_1x1_session_keyed_at_companion_device() -> anyhow::Result<
         lid_b.device, 0,
         "a companion 1:1 peer must be addressed at a non-zero device"
     );
+    // Settle the coalesced flush before reading durable session state.
+    client_a.client.flush_pending_signal_state().await?;
     let backend_a = client_a.client.persistence_manager().backend();
     let addr = peer_session_addr(&lid_b.user, "lid", lid_b.device);
     assert!(
@@ -668,6 +685,8 @@ async fn test_pn_migration_is_durable_across_followup_messages() -> anyhow::Resu
         .await?;
     }
 
+    // Settle the coalesced receive-path flush (A received the follow-up messages) before reading.
+    client_a.client.flush_pending_signal_state().await?;
     assert!(
         backend_a.get_session(&lid_addr).await?.is_some(),
         "session stays under LID across follow-up messaging"

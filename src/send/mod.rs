@@ -962,6 +962,10 @@ impl Client {
             .ensure_status_participants(prepared.node, &group_info)
             .await?;
 
+        // Persist the sender-key ratchet advance before the stanza hits the
+        // wire (same rule as the DM/group send path); a failure aborts the send.
+        self.flush_signal_cache_batch_safe().await?;
+
         let ack = if let Some(phash) = stanza
             .attrs()
             .optional_string("phash")
@@ -990,9 +994,6 @@ impl Client {
         for user in &prepared.stale_device_users {
             self.invalidate_device_cache(user).await;
         }
-
-        self.flush_signal_cache_batch_safe_logged("send_status_message", None)
-            .await;
 
         Ok(SendResult {
             message_id: request_id,
@@ -1481,6 +1482,15 @@ impl Client {
             .await?
         };
 
+        // Persist the outbound ratchet advance BEFORE the stanza hits the wire
+        // (WA Web flushes the Signal store ahead of send). Reusing an outbound
+        // counter reuses its message key + IV, so the advance must be durable
+        // before anyone can act on the ciphertext — and a persistence failure
+        // must abort the send rather than transmit an advance we couldn't save.
+        // Only the receive path, where a lost advance re-derives forward,
+        // coalesces.
+        self.flush_signal_cache_batch_safe().await?;
+
         let ack = if let Some(phash) = dm_phash
             && let Some(msg_id) = stanza_to_send
                 .attrs()
@@ -1551,10 +1561,6 @@ impl Client {
         }
         // Warm marking is visible; a waiting cold send may now re-resolve.
         drop(distribution_guard);
-
-        // Flush cached Signal state to DB after encryption
-        self.flush_signal_cache_batch_safe_logged("send_message_impl", None)
-            .await;
 
         // Issue new tc token after send if a bucket boundary was crossed.
         // Fire-and-forget so send_message returns without waiting for the IQ

@@ -37,6 +37,167 @@ async fn scan_sessions(
     Ok(results)
 }
 
+/// Read the sender-chain counter of the first established session for `user`
+/// straight from the backend (no cache, no settle) — the durable outbound
+/// ratchet position.
+async fn durable_sender_chain_index(
+    backend: &dyn wacore::store::traits::SignalStore,
+    user: &str,
+    server: &str,
+) -> anyhow::Result<Option<u32>> {
+    for device_id in 0..=99u16 {
+        let addr = if device_id == 0 {
+            format!("{user}@{server}.0")
+        } else {
+            format!("{user}:{device_id}@{server}.0")
+        };
+        if let Some(data) = backend.get_session(&addr).await?
+            && let Some(state) = SessionRecord::deserialize(&data)?.session_state()
+            && let Ok(chain) = state.get_sender_chain_key()
+        {
+            return Ok(Some(chain.index()));
+        }
+    }
+    Ok(None)
+}
+
+/// The outbound ratchet advance must be durable by the time `send_message`
+/// returns: reusing an outbound counter reuses its message key + IV, so a crash
+/// after a successful send must never leave the advance only in memory. This
+/// reads the backend IMMEDIATELY after `send_message` (no wait for delivery, no
+/// explicit settle): a coalesced send would still be inside its window and the
+/// counter would be stale, so only the synchronous outbound flush passes.
+#[tokio::test]
+async fn test_outbound_ratchet_is_durable_when_send_returns() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut client_a = TestClient::connect("e2e_sig_durable_a").await?;
+    let mut client_b = TestClient::connect("e2e_sig_durable_b").await?;
+    let jid_a = client_a.jid().await;
+    let jid_b = client_b.jid().await;
+    let lid_b = client_b.client.get_lid();
+
+    // Establish the outbound session A→B.
+    send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "establish", 30).await?;
+    send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "reply", 30).await?;
+
+    let backend_a = client_a.client.persistence_manager().backend();
+    let read_index = async |user: &str, server: &str| {
+        durable_sender_chain_index(&*backend_a, user, server).await
+    };
+
+    // The session may be keyed under LID (modern) or PN.
+    let (user, server) = match lid_b {
+        Some(ref lid) if read_index(&lid.user, "lid").await?.is_some() => (lid.user.clone(), "lid"),
+        _ => (jid_b.user.clone(), "c.us"),
+    };
+
+    let mut last = read_index(&user, server)
+        .await?
+        .expect("an outbound session must exist after the roundtrip");
+
+    // send_message returns only after the synchronous pre-wire flush, so the
+    // advanced counter is already durable — read it with no delivery wait and
+    // no settle. A coalesced (window-deferred) flush would leave it unchanged.
+    for i in 0..3 {
+        client_a
+            .client
+            .send_message(jid_b.clone(), e2e_tests::text_msg(&format!("m{i}")))
+            .await?;
+        let now = read_index(&user, server)
+            .await?
+            .expect("session persists across sends");
+        assert!(
+            now > last,
+            "send #{i} must persist the advanced sender-chain counter before returning \
+             (durable {last} -> {now}); a coalesced send would leave it stale"
+        );
+        last = now;
+    }
+
+    client_a.disconnect().await;
+    client_b.disconnect().await;
+    Ok(())
+}
+
+/// A send whose outbound-ratchet persistence fails must abort BEFORE the stanza
+/// reaches the wire: the flush precedes the send on the send path, so if the
+/// advance cannot be stored, `send_message` returns `Err` and the peer receives
+/// nothing. Otherwise a crash after a wire-committed send would leave the
+/// advance only in memory and the next send would reuse that counter's key + IV.
+#[tokio::test]
+async fn test_send_aborts_before_wire_when_persist_fails() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let mut client_a = TestClient::connect("e2e_sig_abort_a").await?;
+    let mut client_b = TestClient::connect("e2e_sig_abort_b").await?;
+    let jid_a = client_a.jid().await;
+    let jid_b = client_b.jid().await;
+
+    // Establish the session both ways so the next A→B send is a steady-state
+    // encrypt (its only new durable write is the ratchet advance we fail).
+    send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "establish", 30).await?;
+    send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "reply", 30).await?;
+
+    // Persisting the outbound advance now fails.
+    client_a.backend.set_fail_session_writes(true);
+    let writes_before = client_a.backend.session_batch_write_count();
+    // `send_node` resolves this before marshaling the node, so a still-pending
+    // waiter proves the send aborted before reaching the wire.
+    let mut sent_waiter = client_a.next_sent_message_waiter();
+    let result = client_a
+        .client
+        .send_message(
+            jid_b.clone(),
+            e2e_tests::text_msg("must not reach the wire"),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "send must fail when the ratchet advance cannot be persisted, got {result:?}"
+    );
+    // The send reached the (failing) persistence step, proving the flush runs on
+    // the send path before the wire rather than being skipped or deferred.
+    assert!(
+        client_a.backend.session_batch_write_count() > writes_before,
+        "the send path must attempt to persist the ratchet advance before the wire"
+    );
+    // Deterministic: no `message` node was ever marshaled, so `send_node` (and
+    // thus the wire) was never reached. `Ok(None)` == pending, sender still alive.
+    assert!(
+        matches!(sent_waiter.try_recv(), Ok(None)),
+        "the send must abort before send_node marshals the stanza for the wire"
+    );
+
+    // End-to-end corroboration: the stanza never went out, so B never sees it.
+    client_b
+        .assert_no_event(
+            3,
+            |e| {
+                e.messages()
+                    .any(|m| m.message.conversation.as_deref() == Some("must not reach the wire"))
+            },
+            "a send that failed to persist must not deliver",
+        )
+        .await?;
+
+    // Recovery: once persistence works again, sends deliver normally, proving
+    // the failure aborted cleanly rather than wedging the session.
+    client_a.backend.set_fail_session_writes(false);
+    send_and_expect_text(
+        &client_a.client,
+        &mut client_b,
+        &jid_b,
+        "after recovery",
+        30,
+    )
+    .await?;
+
+    client_a.disconnect().await;
+    client_b.disconnect().await;
+    Ok(())
+}
+
 /// Multiple sequential sends without a reply should all be delivered.
 #[tokio::test]
 async fn test_one_way_multiple_sends() -> anyhow::Result<()> {
@@ -140,15 +301,10 @@ async fn test_session_state_after_roundtrip() -> anyhow::Result<()> {
     send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "Session reply", 30).await?;
     info!("Roundtrip complete");
 
-    // Force cache flush by sending another message
-    send_and_expect_text(
-        &client_a.client,
-        &mut client_b,
-        &jid_b,
-        "Post-roundtrip flush",
-        30,
-    )
-    .await?;
+    // Settle A's write-behind Signal cache before inspecting it: A's last op
+    // here is receiving B's reply, and the receive-path flush is coalesced, so
+    // a plain read races the coalescing window.
+    client_a.client.flush_pending_signal_state().await?;
 
     // Inspect session state
     let backend = client_a.client.persistence_manager().backend();
@@ -235,6 +391,10 @@ async fn test_session_persistence() -> anyhow::Result<()> {
     )
     .await?;
     info!("First message sent: {msg_id_1}");
+
+    // No settle: the send path flushes synchronously, so the session is durable
+    // in the backend by the time send_message returned. (A missing session here
+    // would catch a regression back to a coalesced/deferred send flush.)
 
     // Session may be under PN (c.us) or LID (lid) depending on whether
     // PN→LID mapping was resolved before encryption.

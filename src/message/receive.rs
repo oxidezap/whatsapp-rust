@@ -561,16 +561,14 @@ impl Client {
             self.handle_msmsg_payload(&info, payload).await;
         }
 
-        // Live: flush cached Signal state per stanza (WA Web's
-        // flushBufferToDiskIfNotMemOnlyMode). During the offline drain the
-        // commit batcher owns the flush — one per batch, before any ack (WA
-        // Web's bulk signal-store snapshot) — so here only the batch size/byte
-        // triggers are checked, while the global permit is still held.
+        // Live: coalesce the receive-side flush. A lost advance re-derives
+        // forward, so unlike the send path this tolerates the window (see
+        // `signal_flush.rs`). During the offline drain the commit batcher owns
+        // the flush instead, so only the batch size/byte triggers run here.
         if self.inbound_commit_batch.is_active() {
             self.maybe_flush_inbound_commits().await;
         } else {
-            self.flush_signal_cache_logged("message", Some(&info.id))
-                .await;
+            self.schedule_signal_flush(lane_generation);
         }
     }
 
